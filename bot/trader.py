@@ -26,7 +26,7 @@ class FuturesTrader:
                  leverage, margin_mode, dry_run):
         self.symbol       = symbol
         self.leverage     = leverage
-        self.margin_mode  = margin_mode
+        self.margin_mode  = margin_mode or "crossed"
         self.dry_run      = dry_run
         self.position     = None
         self.entry_price  = None
@@ -42,12 +42,14 @@ class FuturesTrader:
         self._api_key     = api_key
         self._api_secret  = api_secret
         self._passphrase  = passphrase
-        # ccxt solo se usa para fetch_ticker y fetch_ohlcv (endpoints públicos/no-Unified)
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
             "secret":   api_secret,
             "password": passphrase,
-            "options":  {"defaultType": "swap"},
+            "options":  {
+                "defaultType": "swap",
+                "accountType": "unified",
+            },
         })
 
     # ─────────────────────────────────────────────────────────────
@@ -113,6 +115,7 @@ class FuturesTrader:
         return 0.0
 
     async def _get_balance_direct(self) -> float:
+        # Intento 1 — v3 assets (Unified)
         for path in ["/api/v3/account/assets", "/api/v3/account/assets?coin=USDT"]:
             try:
                 r = await self._http_get(path)
@@ -123,7 +126,8 @@ class FuturesTrader:
                         return free
             except Exception as e:
                 logger.warning(f"[{self.symbol}] balance {path}: {e}")
-        # fallback mix
+
+        # Intento 2 — mix accounts
         try:
             r = await self._http_get("/api/v2/mix/account/accounts?productType=USDT-FUTURES")
             if r.get("code") == "00000":
@@ -136,24 +140,29 @@ class FuturesTrader:
                             return free
         except Exception as e:
             logger.warning(f"[{self.symbol}] balance mix: {e}")
+
+        # Intento 3 — ccxt unified
+        try:
+            data = await self.exchange.fetch_balance({"accountType": "unified"})
+            free = float((data.get("USDT") or {}).get("free") or 0)
+            if free > 0:
+                logger.info(f"[{self.symbol}] ✅ Balance USDT (ccxt/unified): {free}")
+                return free
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] balance ccxt: {e}")
+
         logger.warning(f"[{self.symbol}] ⚠️ Balance = 0 — todos los endpoints fallaron.")
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
     # ÓRDENES — HTTP directo (Bitget v2 Unified Account)
     #
-    # Endpoint: POST /api/v2/mix/order/place-order
-    # Documentación: https://www.bitget.com/api-doc/contract/trade/Place-Order
+    # Para Unified Account, Bitget exige:
+    #   POST /api/v2/mix/order/place-order
+    #   Con productType=USDT-FUTURES, marginMode, marginCoin, tradeSide
     #
-    # Campos obligatorios en Unified Account:
-    #   symbol       — formato Bitget: "BTCUSDT" (sin slash ni :USDT)
-    #   productType  — "USDT-FUTURES"
-    #   marginMode   — "crossed" | "isolated"
-    #   marginCoin   — "USDT"
-    #   size         — cantidad en contratos (string)
-    #   side         — "buy" | "sell"
-    #   tradeSide    — "open" | "close"
-    #   orderType    — "market"
+    # Si ese endpoint devuelve 40085, se intenta el endpoint UTA directo:
+    #   POST /api/v2/uta/order/place-order
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -161,40 +170,69 @@ class FuturesTrader:
         """Convierte 'BTC/USDT:USDT' → 'BTCUSDT'"""
         return ccxt_symbol.split("/")[0] + ccxt_symbol.split("/")[1].split(":")[0]
 
+    def _build_order_payload(self, side: str, trade_side: str, qty: float) -> dict:
+        return {
+            "symbol":      self._bitget_symbol(self.symbol),
+            "productType": "USDT-FUTURES",
+            "marginMode":  self.margin_mode,   # "crossed" | "isolated"
+            "marginCoin":  "USDT",
+            "size":        str(qty),
+            "side":        side,               # "buy" | "sell"
+            "tradeSide":   trade_side,         # "open" | "close"
+            "orderType":   "market",
+        }
+
     async def _place_order(self, side: str, trade_side: str, qty: float,
                            reduce_only: bool = False) -> dict:
         """
         Coloca una orden de mercado via HTTP directo.
-        side       : 'buy' | 'sell'
-        trade_side : 'open' | 'close'
-        qty        : cantidad en contratos
+        Intenta /api/v2/mix/order/place-order primero.
+        Si devuelve 40085 (Classic API not supported), intenta
+        /api/v2/uta/order/place-order (endpoint nativo Unified).
         """
-        path = "/api/v2/mix/order/place-order"
-        payload = {
-            "symbol":      self._bitget_symbol(self.symbol),
-            "productType": "USDT-FUTURES",
-            "marginMode":  self.margin_mode,
-            "marginCoin":  "USDT",
-            "size":        str(qty),
-            "side":        side,
-            "tradeSide":   trade_side,
-            "orderType":   "market",
-        }
-        resp = await self._http_post(path, payload)
-        if resp.get("code") != "00000":
-            raise Exception(f"place-order error {resp.get('code')}: {resp.get('msg')}")
-        logger.info(f"[{self.symbol}] 📤 Orden {side}/{trade_side} qty={qty} | orderId={resp.get('data',{}).get('orderId')}")
-        return resp
+        payload = self._build_order_payload(side, trade_side, qty)
+
+        # --- Intento 1: endpoint mix (v2) ---
+        path_mix = "/api/v2/mix/order/place-order"
+        try:
+            resp = await self._http_post(path_mix, payload)
+            code = resp.get("code")
+            if code == "00000":
+                logger.info(
+                    f"[{self.symbol}] 📤 Orden {side}/{trade_side} qty={qty} "
+                    f"| orderId={resp.get('data', {}).get('orderId')}"
+                )
+                return resp
+            if code != "40085":
+                # Error distinto al de cuenta unificada — lanzar directamente
+                raise Exception(f"place-order mix error {code}: {resp.get('msg')}")
+            logger.warning(
+                f"[{self.symbol}] ⚠️ 40085 en mix/order — intentando uta/order..."
+            )
+        except Exception as e:
+            if "40085" not in str(e):
+                raise
+            logger.warning(f"[{self.symbol}] ⚠️ mix/order exc: {e} — fallback uta/order")
+
+        # --- Intento 2: endpoint UTA nativo ---
+        # /api/v2/uta/order/place-order acepta los mismos campos
+        path_uta = "/api/v2/uta/order/place-order"
+        resp2 = await self._http_post(path_uta, payload)
+        if resp2.get("code") != "00000":
+            raise Exception(
+                f"place-order uta error {resp2.get('code')}: {resp2.get('msg')}"
+            )
+        logger.info(
+            f"[{self.symbol}] 📤 Orden UTA {side}/{trade_side} qty={qty} "
+            f"| orderId={resp2.get('data', {}).get('orderId')}"
+        )
+        return resp2
 
     # ─────────────────────────────────────────────────────────────
     # POSICIONES — HTTP directo
     # ─────────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list:
-        """
-        Retorna lista de posiciones abiertas para self.symbol.
-        Endpoint: GET /api/v2/mix/position/single-position
-        """
         sym   = self._bitget_symbol(self.symbol)
         path  = f"/api/v2/mix/position/single-position?symbol={sym}&productType=USDT-FUTURES&marginCoin=USDT"
         try:
@@ -206,6 +244,19 @@ class FuturesTrader:
                 return [p for p in data if float(p.get("total") or p.get("size", 0)) > 0]
         except Exception as e:
             logger.warning(f"[{self.symbol}] get_positions: {e}")
+
+        # Fallback: /api/v2/uta/position/single-position
+        try:
+            path2 = f"/api/v2/uta/position/single-position?symbol={sym}&productType=USDT-FUTURES&marginCoin=USDT"
+            r2 = await self._http_get(path2)
+            if r2.get("code") == "00000":
+                data2 = r2.get("data") or []
+                if isinstance(data2, dict):
+                    data2 = [data2]
+                return [p for p in data2 if float(p.get("total") or p.get("size", 0)) > 0]
+        except Exception as e2:
+            logger.warning(f"[{self.symbol}] get_positions uta: {e2}")
+
         return []
 
     # ─────────────────────────────────────────────────────────────
