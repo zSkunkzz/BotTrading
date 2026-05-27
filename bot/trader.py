@@ -37,7 +37,11 @@ class FuturesTrader:
             "apiKey":   api_key,
             "secret":   api_secret,
             "password": passphrase,
-            "options":  {"defaultType": "swap"},
+            "options":  {
+                "defaultType": "swap",
+                # Unified Account: indica a ccxt que use los endpoints correctos
+                "accountType": "unified",
+            },
         })
         self._trader_ref = self
 
@@ -49,9 +53,13 @@ class FuturesTrader:
         await self.exchange.load_markets()
         if not self.dry_run:
             try:
+                # Unified Account usa productType USDT-FUTURES
                 await self.exchange.set_leverage(
                     self.leverage, self.symbol,
-                    params={"marginMode": self.margin_mode}
+                    params={
+                        "marginMode":  self.margin_mode,
+                        "productType": "USDT-FUTURES",
+                    }
                 )
             except Exception as e:
                 logger.warning(f"[{self.symbol}] Leverage: {e}")
@@ -85,8 +93,13 @@ class FuturesTrader:
         if self.dry_run:
             return 1000.0
         try:
-            bal = await self.exchange.fetch_balance({"type": "swap"})
-            return float(bal.get("USDT", {}).get("free", 0))
+            # Unified Account: no pasar "type": "swap" — causa code40085
+            # fetch_balance sin parámetros usa la cuenta unificada correctamente
+            bal = await self.exchange.fetch_balance()
+            usdt = bal.get("USDT", {})
+            # "free" puede venir en diferentes keys según versión ccxt
+            free = usdt.get("free") or usdt.get("available") or 0
+            return float(free)
         except Exception as e:
             logger.error(f"[{self.symbol}] Balance: {e}")
             return 0
@@ -106,7 +119,11 @@ class FuturesTrader:
             return {"id": f"DRY_{side}", "price": price}
         return await self.exchange.create_order(
             self.symbol, "market", side, qty,
-            params={"reduceOnly": False, "marginMode": self.margin_mode}
+            params={
+                "reduceOnly":  False,
+                "marginMode":  self.margin_mode,
+                "productType": "USDT-FUTURES",
+            }
         )
 
     async def _partial_close_order(self, side, ratio: float):
@@ -115,7 +132,10 @@ class FuturesTrader:
             logger.warning(f"[DRY][{self.symbol}] PARTIAL CLOSE {ratio*100:.0f}% {side.upper()}")
             return
         try:
-            positions = await self.exchange.fetch_positions([self.symbol])
+            positions = await self.exchange.fetch_positions(
+                [self.symbol],
+                params={"productType": "USDT-FUTURES"}
+            )
             for p in positions:
                 contracts = float(p.get("contracts") or p.get("size", 0))
                 if contracts > 0:
@@ -123,7 +143,10 @@ class FuturesTrader:
                     close_side  = "sell" if p["side"] == "long" else "buy"
                     await self.exchange.create_order(
                         self.symbol, "market", close_side, partial_qty,
-                        params={"reduceOnly": True}
+                        params={
+                            "reduceOnly":  True,
+                            "productType": "USDT-FUTURES",
+                        }
                     )
                     logger.info(
                         f"[{self.symbol}] TP parcial ejecutado: "
@@ -221,7 +244,7 @@ class FuturesTrader:
 
         is_long = self.position == "long"
 
-        # ── SL ──────────────────────────────────────────────────
+        # ── SL ────────────────────────────────────────────────────
         if self.sl:
             sl_hit = (price <= self.sl) if is_long else (price >= self.sl)
             if sl_hit:
@@ -231,7 +254,7 @@ class FuturesTrader:
                     await global_risk.register_close(result.get("pnl_pct", 0))
                 return True
 
-        # ── TP2 parcial (50%) ────────────────────────────────────
+        # ── TP2 parcial (50%) ───────────────────────────────────────
         if self.tp2 and not self.tp2_hit:
             tp2_hit = (price >= self.tp2) if is_long else (price <= self.tp2)
             if tp2_hit:
@@ -249,7 +272,7 @@ class FuturesTrader:
                     pass
                 return False
 
-        # ── TP3 completo ─────────────────────────────────────────
+        # ── TP3 completo ────────────────────────────────────────────
         if self.tp3:
             tp3_hit = (price >= self.tp3) if is_long else (price <= self.tp3)
             if tp3_hit:
@@ -259,7 +282,7 @@ class FuturesTrader:
                     await global_risk.register_close(result.get("pnl_pct", 0))
                 return True
 
-        # ── TP1 (cierre total si no hay TP2/TP3) ─────────────────
+        # ── TP1 (cierre total si no hay TP2/TP3) ─────────────────────
         if self.tp1 and not self.tp2:
             tp1_hit = (price >= self.tp1) if is_long else (price <= self.tp1)
             if tp1_hit:
@@ -269,7 +292,7 @@ class FuturesTrader:
                     await global_risk.register_close(result.get("pnl_pct", 0))
                 return True
 
-        # ── Fallback % cuando no hay niveles ATR ─────────────────
+        # ── Fallback % cuando no hay niveles ATR ─────────────────────
         if not self.sl and not self.tp1:
             if is_long:
                 pnl = (price - self.entry_price) / self.entry_price * 100 * self.leverage
@@ -297,14 +320,20 @@ class FuturesTrader:
         price = await self.get_price()
         if not self.dry_run:
             try:
-                positions = await self.exchange.fetch_positions([self.symbol])
+                positions = await self.exchange.fetch_positions(
+                    [self.symbol],
+                    params={"productType": "USDT-FUTURES"}
+                )
                 for p in positions:
                     contracts = float(p.get("contracts") or p.get("size", 0))
                     if contracts > 0:
                         side = "sell" if p["side"] == "long" else "buy"
                         await self.exchange.create_order(
                             self.symbol, "market", side, contracts,
-                            params={"reduceOnly": True}
+                            params={
+                                "reduceOnly":  True,
+                                "productType": "USDT-FUTURES",
+                            }
                         )
                         break
             except Exception as e:
@@ -351,14 +380,14 @@ class FuturesTrader:
             try:
                 price = await self.get_price()
 
-                # ── 1. Gestión de posición abierta ──────────────
+                # ── 1. Gestión de posición abierta ─────────────────────
                 if self.position:
                     closed = await self._check_and_handle_sl_tp(price, risk, global_risk)
                     if closed:
                         await asyncio.sleep(interval)
                         continue
 
-                # ── 2. strategy.decide() ─────────────────────────
+                # ── 2. strategy.decide() ───────────────────────────────
                 async def _ai_fn(sym, ctx):
                     bars = await self.fetch_ohlcv(tf, limit=100)
                     return (await ai_decide(
@@ -379,9 +408,7 @@ class FuturesTrader:
                 sig    = decision["signal"]
                 reason = decision["reason"]
 
-                # ── 3. Ejecutar acción ───────────────────────────
-                # Las notificaciones SOLO se envían dentro de open_long/open_short
-                # y close_position. El loop no envía nada por sí mismo.
+                # ── 3. Ejecutar acción ──────────────────────────────────
 
                 if action == "CLOSE" and self.position:
                     result = await self.close_position(reason[:60])
@@ -391,7 +418,7 @@ class FuturesTrader:
 
                 elif action == "BUY":
                     if self.position == "short":
-                        result = await self.close_position("Reversión → LONG")
+                        result = await self.close_position("Regresión → LONG")
                         risk.on_trade_close(result.get("pnl_pct", 0))
                         if global_risk:
                             await global_risk.register_close(result.get("pnl_pct", 0))
@@ -416,7 +443,7 @@ class FuturesTrader:
 
                 elif action == "SELL":
                     if self.position == "long":
-                        result = await self.close_position("Reversión → SHORT")
+                        result = await self.close_position("Regresión → SHORT")
                         risk.on_trade_close(result.get("pnl_pct", 0))
                         if global_risk:
                             await global_risk.register_close(result.get("pnl_pct", 0))
