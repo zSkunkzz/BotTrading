@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-signal_engine.py — Motor de análisis técnico multi-timeframe
+signal_engine.py — Motor de análisis técnico multi-timeframe (ASYNC)
 Portado de SignalBot v5.0 y adaptado para BotTrading (Bitget swap)
 
 Uso:
     from bot.signal_engine import analyze_pair, SignalResult
 
-    result = analyze_pair(exch, "BTC/USDT:USDT")
+    result = await analyze_pair(exch, "BTC/USDT:USDT")
     if result.signal in ("LONG", "SHORT") and result.score >= 6:
         # ejecutar trade con result.entry, result.sl, result.tp1...
 """
@@ -70,12 +70,12 @@ class SignalResult:
         )
 
 
-# ── Utilidades OHLCV ────────────────────────────────────────────────────────
+# ── Utilidades OHLCV (ASYNC) ─────────────────────────────────────────────────
 
-def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataFrame:
+async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataFrame:
     """Devuelve DataFrame OHLCV con índice datetime UTC."""
     try:
-        raw = exch.fetch_ohlcv(symbol, tf, limit=limit)
+        raw = await exch.fetch_ohlcv(symbol, tf, limit=limit)
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         return df.set_index("ts").astype(float)
@@ -246,21 +246,21 @@ def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, int, str]:
     return score, min(sl, 10), direction
 
 
-# ── Función principal ────────────────────────────────────────────────────────
+# ── Función principal (ASYNC) ────────────────────────────────────────────────
 
-def analyze_pair(exch, symbol: str) -> SignalResult:
+async def analyze_pair(exch, symbol: str) -> SignalResult:
     """
     Analiza un par en 3 timeframes y devuelve un SignalResult.
 
-    exch    → instancia ccxt con options defaultType="swap" (Bitget)
+    exch    → instancia ccxt.async_support con options defaultType="swap" (Bitget)
     symbol  → p.ej. "BTC/USDT:USDT" (formato perpetuo Bitget)
     """
     result = SignalResult(symbol=symbol)
 
     try:
-        df15 = _fetch_ohlcv(exch, symbol, "15m", 200)
-        df1h = _fetch_ohlcv(exch, symbol, "1h",  200)
-        df4h = _fetch_ohlcv(exch, symbol, "4h",  200)
+        df15 = await _fetch_ohlcv(exch, symbol, "15m", 200)
+        df1h = await _fetch_ohlcv(exch, symbol, "1h",  200)
+        df4h = await _fetch_ohlcv(exch, symbol, "4h",  200)
 
         if df15.empty or len(df15) < 55:
             result.error = "Datos insuficientes 15m"
@@ -308,7 +308,6 @@ def analyze_pair(exch, symbol: str) -> SignalResult:
             return result  # R/R insuficiente
 
         pct_tp3    = round(abs(tp3 - entry) / entry * 100, 2)
-        # Apalancamiento sugerido: inverso de la volatilidad (1-10x)
         atr_pct    = atr / entry * 100
         suggested  = min(10, max(1, round(5 / atr_pct))) if atr_pct > 0 else 1
 
