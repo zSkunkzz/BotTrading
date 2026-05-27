@@ -1,6 +1,7 @@
 import logging
 import os
 import json
+import time
 import asyncio
 import aiohttp
 from bot.indicators import ema, rsi, macd, supertrend, atr
@@ -13,7 +14,53 @@ GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
+# ─────────────────────────────────────────────
+# CACHÉ DE DECISIONES POR SÍMBOLO
+# Evita llamar a la IA en cada ciclo del trader.
+# TTL configurable via AI_CACHE_TTL (segundos).
+# Con LOOP_INTERVAL=60 y AI_CACHE_TTL=300:
+#   - Cada símbolo llama a la IA 1 vez cada 5 min → máx 3 calls/min para 15 pares
+# ─────────────────────────────────────────────
+_decision_cache: dict = {}   # {symbol: {"decision": {...}, "ts": float, "position": str|None}}
+_cache_lock = asyncio.Lock()
 
+
+def _cache_ttl() -> int:
+    return int(os.getenv("AI_CACHE_TTL", "300"))  # default 5 min
+
+
+async def _get_cached(symbol: str, position) -> dict | None:
+    """Devuelve la decisión cacheada si sigue siendo válida.
+    Invalida la caché si la posición ha cambiado (apertura/cierre de trade)."""
+    async with _cache_lock:
+        entry = _decision_cache.get(symbol)
+        if not entry:
+            return None
+        # Invalidar si la posición cambió desde la última decisión
+        if entry.get("position") != position:
+            logger.debug(f"[{symbol}] Caché invalidada por cambio de posición")
+            del _decision_cache[symbol]
+            return None
+        age = time.time() - entry["ts"]
+        ttl = _cache_ttl()
+        if age < ttl:
+            logger.debug(f"[{symbol}] Caché hit ({age:.0f}s/{ttl}s)")
+            return entry["decision"]
+        return None
+
+
+async def _set_cached(symbol: str, decision: dict, position):
+    async with _cache_lock:
+        _decision_cache[symbol] = {
+            "decision": decision,
+            "ts": time.time(),
+            "position": position,
+        }
+
+
+# ─────────────────────────────────────────────
+# CONSTRUCCIÓN DEL CONTEXTO DE MERCADO
+# ─────────────────────────────────────────────
 def build_market_context(symbol, bars, position, entry_price, leverage):
     closes = [b[4] for b in bars]
     highs  = [b[2] for b in bars]
@@ -101,7 +148,6 @@ async def _call_gemini(context):
         logger.warning("Gemini: GEMINI_API_KEY no configurada")
         return None
     try:
-        # Verificar budget ANTES de adquirir el semáforo
         if not await budget.can_call_gemini():
             raise RateLimitExhausted("gemini")
 
@@ -156,7 +202,6 @@ async def _call_groq(context):
     if not key:
         return None
     try:
-        # Verificar budget ANTES de hacer la llamada
         if not await budget.can_call_groq():
             raise RateLimitExhausted("groq")
 
@@ -193,26 +238,69 @@ async def _call_groq(context):
         return None
 
 
+def _technical_fallback(context: dict) -> dict:
+    """Fallback técnico mejorado: usa EMA + Supertrend + RSI + MACD de forma combinada."""
+    ind = context["indicators"]
+    position = context.get("current_position", "NONE")
+    pnl = context.get("current_pnl_pct")
+
+    # Protección de posición abierta por PnL
+    if position != "NONE" and pnl is not None:
+        if pnl >= 3.0:
+            return {"action": "CLOSE", "confidence": 7,
+                    "reasoning": "Fallback técnico: PnL +3% alcanzado, cerrando para asegurar",
+                    "key_factors": ["pnl_protection"]}
+        if pnl <= -1.5:
+            return {"action": "CLOSE", "confidence": 7,
+                    "reasoning": "Fallback técnico: stop-loss -1.5% activado",
+                    "key_factors": ["stop_loss"]}
+
+    ema_bull  = ind["EMA_trend"] == "BULLISH"
+    ema_bear  = ind["EMA_trend"] == "BEARISH"
+    st_bull   = ind["Supertrend_direction"] == "BULLISH"
+    st_bear   = ind["Supertrend_direction"] == "BEARISH"
+    macd_bull = ind["MACD_trend"] == "BULLISH"
+    macd_bear = ind["MACD_trend"] == "BEARISH"
+    rsi_val   = ind["RSI_14"] or 50
+    vol_ok    = ind["volume_ratio_vs_avg"] >= 0.8
+
+    # Señal larga: los 3 indicadores alineados + RSI no sobrecomprado + volumen ok
+    if ema_bull and st_bull and macd_bull and rsi_val < 65 and vol_ok:
+        return {"action": "BUY", "confidence": 6,
+                "reasoning": "Fallback técnico: EMA+Supertrend+MACD alcistas alineados",
+                "key_factors": ["EMA_trend", "Supertrend", "MACD"]}
+
+    # Señal corta: los 3 indicadores alineados + RSI no sobrevendido + volumen ok
+    if ema_bear and st_bear and macd_bear and rsi_val > 35 and vol_ok:
+        return {"action": "SELL", "confidence": 6,
+                "reasoning": "Fallback técnico: EMA+Supertrend+MACD bajistas alineados",
+                "key_factors": ["EMA_trend", "Supertrend", "MACD"]}
+
+    return {"action": "HOLD", "confidence": 4,
+            "reasoning": "Fallback técnico: señales mixtas, sin entrada clara",
+            "key_factors": []}
+
+
 async def ai_decide(symbol, bars, position, entry_price, leverage):
+    # ── 1. Comprobar caché ───────────────────────────────────────────
+    cached = await _get_cached(symbol, position)
+    if cached:
+        logger.debug(f"[{symbol}] Usando decisión cacheada: {cached['action']}")
+        return cached
+
     context = build_market_context(symbol, bars, position, entry_price, leverage)
 
-    # 1. Gemini primero
+    # ── 2. Gemini primero (pagado = mayor límite) ─────────────────────
     result = await _call_gemini(context)
-    # 2. Groq como fallback
+    # ── 3. Groq como fallback ─────────────────────────────────────────
     if not result:
         result = await _call_groq(context)
-    # 3. Fallback técnico
+    # ── 4. Fallback técnico mejorado ──────────────────────────────────
     if not result:
         logger.warning(f"[{symbol}] Sin IA — fallback técnico")
-        ind = context["indicators"]
-        if ind["EMA_trend"] == "BULLISH" and ind["Supertrend_direction"] == "BULLISH" and ind["RSI_14"] < 65:
-            action = "BUY"
-        elif ind["EMA_trend"] == "BEARISH" and ind["Supertrend_direction"] == "BEARISH" and ind["RSI_14"] > 35:
-            action = "SELL"
-        else:
-            action = "HOLD"
-        result = {"action": action, "confidence": 5, "reasoning": "Fallback técnico", "key_factors": []}
+        result = _technical_fallback(context)
 
+    # ── 5. Filtro de confianza mínima ─────────────────────────────────
     confidence = result.get("confidence", 5)
     min_conf = int(os.getenv("AI_MIN_CONFIDENCE", "6"))
     if confidence < min_conf and result["action"] in ("BUY", "SELL"):
@@ -222,4 +310,9 @@ async def ai_decide(symbol, bars, position, entry_price, leverage):
     logger.info(
         f"🤖 [{symbol}] {result['action']} (confianza: {confidence}/10) | {result.get('reasoning', '')}"
     )
+
+    # ── 6. Guardar en caché (solo si no es CLOSE — el CLOSE es urgente y no se cachea) ─
+    if result["action"] != "CLOSE":
+        await _set_cached(symbol, result, position)
+
     return result
