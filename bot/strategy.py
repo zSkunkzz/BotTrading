@@ -13,7 +13,6 @@ Variables de entorno opcionales:
   MIN_RR_REQUIRED   (default: 1.8) — R/R mínimo para activar IA
 """
 
-import asyncio
 import logging
 import os
 from typing import Optional
@@ -50,16 +49,13 @@ async def decide(
         signal_block: str  — bloque Markdown para Telegram
     """
 
-    # ── 1. Si hay posición abierta, no abrimos otra ───────────────────────────
+    # ── 1. Si hay posición abierta, no abrimos otra ─────────────────────────
     if has_open_position:
         return _result("HOLD", None, False, "Posición ya abierta — esperando cierre")
 
-    # ── 2. Análisis técnico en executor (bloqueante → async) ─────────────────
-    loop = asyncio.get_event_loop()
+    # ── 2. Análisis técnico async ────────────────────────────────────────────
     try:
-        signal: SignalResult = await loop.run_in_executor(
-            None, analyze_pair, exch, symbol
-        )
+        signal: SignalResult = await analyze_pair(exch, symbol)
     except Exception as e:
         log.error(f"[strategy] analyze_pair error: {e}")
         return _result("HOLD", None, False, f"Error en análisis técnico: {e}")
@@ -82,14 +78,14 @@ async def decide(
     if signal.signal == "NEUTRAL":
         return _result("HOLD", signal, False, "Señal técnica neutral — sin consenso")
 
-    # ── 4. Llamada a la IA con contexto enriquecido ───────────────────────────
+    # ── 4. Llamada a la IA con contexto enriquecido ─────────────────────────
     i15 = signal.indicators.get("15m", {})
     i1h = signal.indicators.get("1h",  {})
     i4h = signal.indicators.get("4h",  {})
 
     context = {
         "symbol":        symbol,
-        "signal":        signal.signal,       # LONG / SHORT
+        "signal":        signal.signal,
         "score":         signal.score,
         "rr":            signal.rr,
         "entry":         signal.entry,
@@ -115,7 +111,6 @@ async def decide(
         ai_action = await ai_decide_fn(symbol, context)
     except Exception as e:
         log.warning(f"[strategy] IA falló, usando señal técnica directa: {e}")
-        # Fallback: si la IA falla, usar la señal técnica directamente
         ai_action = "BUY" if signal.signal == "LONG" else "SELL"
 
     action = ai_action.upper().strip()
