@@ -15,7 +15,6 @@ logger = logging.getLogger("Trader")
 
 # Fracción del contrato que se cierra en TP2 (50% por defecto)
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
-# Fracción restante que se cierra en TP3 (el otro 50%)
 
 
 class FuturesTrader:
@@ -31,7 +30,7 @@ class FuturesTrader:
         self.tp1          = None
         self.tp2          = None
         self.tp3          = None
-        self.tp2_hit      = False   # TP2 parcial ya ejecutado
+        self.tp2_hit      = False
         self.usdt_amount  = None
         self.trade_count  = 0
         self.win_count    = 0
@@ -42,6 +41,8 @@ class FuturesTrader:
             "password": passphrase,
             "options":  {"defaultType": "swap"},
         })
+        # Referencia directa para que el webhook pueda llamar métodos
+        self._trader_ref = self
 
     # ─────────────────────────────────────────────────────────────
     # INIT + RECUPERACIÓN DE ESTADO
@@ -58,7 +59,6 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning(f"[{self.symbol}] Leverage: {e}")
 
-        # Recuperar estado persistido (si Railway reinició)
         saved = load_position(self.symbol)
         if saved:
             self.position    = saved["position"]
@@ -137,6 +137,47 @@ class FuturesTrader:
             logger.error(f"[{self.symbol}] Partial close error: {e}")
 
     # ─────────────────────────────────────────────────────────────
+    # SINCRONIZACIÓN DESDE WEBHOOK (cierre externo)
+    # ─────────────────────────────────────────────────────────────
+
+    async def _sync_closed_from_exchange(self, fill_price: float, reason: str):
+        """
+        Llamado por el webhook cuando Bitget confirma un cierre externo
+        (liquidación, SL en exchange, cierre manual desde app Bitget).
+        Limpia el estado interno sin enviar nueva orden al exchange.
+        """
+        if not self.position:
+            return
+        entry = self.entry_price or fill_price
+        if fill_price and entry:
+            if self.position == "long":
+                pnl = (fill_price - entry) / entry * 100 * self.leverage
+            else:
+                pnl = (entry - fill_price) / entry * 100 * self.leverage
+        else:
+            pnl = 0.0
+
+        self.total_pnl += pnl
+        if pnl > 0:
+            self.win_count += 1
+        logger.warning(
+            f"[Webhook] [{self.symbol}] Posición sincronizada cerrada | "
+            f"{reason} | PnL estimado: {pnl:+.2f}%"
+        )
+        await notify_close(
+            self.symbol, self.position, entry,
+            fill_price, pnl, reason, self.dry_run
+        )
+        self.position    = None
+        self.entry_price = None
+        self.sl          = None
+        self.tp1         = None
+        self.tp2         = None
+        self.tp3         = None
+        self.tp2_hit     = False
+        clear_position(self.symbol)
+
+    # ─────────────────────────────────────────────────────────────
     # ABRIR POSICIÓN
     # ─────────────────────────────────────────────────────────────
 
@@ -179,10 +220,6 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
 
     async def _check_and_handle_sl_tp(self, price: float, risk, global_risk) -> bool:
-        """
-        Gestiona SL, TP1, TP2 parcial y TP3 completo.
-        Devuelve True si se cerró la posición (total o parcialmente y hay que continuar).
-        """
         if not self.position or not self.entry_price:
             return False
 
@@ -208,15 +245,13 @@ class FuturesTrader:
                 )
                 self.tp2_hit = True
                 mark_tp2_hit(self.symbol)
-                # Mover SL a break-even
-                self.sl = self.entry_price
-                # Notificar por Telegram
+                self.sl = self.entry_price  # break-even
                 try:
                     from bot.telegram_bot import notify_tp_partial
                     await notify_tp_partial(self.symbol, self.position, price, 2, TP2_PARTIAL_RATIO)
                 except Exception:
                     pass
-                return False  # No cerrar todo, seguir vigilando TP3
+                return False
 
         # ── TP3 completo ─────────────────────────────────────────
         if self.tp3:
@@ -228,7 +263,7 @@ class FuturesTrader:
                     await global_risk.register_close(result.get("pnl_pct", 0))
                 return True
 
-        # ── TP1 (si no hay TP2/TP3, cierre total en TP1) ─────────
+        # ── TP1 (cierre total si no hay TP2/TP3) ─────────────────
         if self.tp1 and not self.tp2:
             tp1_hit = (price >= self.tp1) if is_long else (price <= self.tp1)
             if tp1_hit:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BitgetProBot v5.2 — IA decisions + Scanner dinámico + Telegram + Rate Limiter"""
+"""BitgetProBot v5.3 — IA + Scanner + Telegram + RateLimiter + Webhook"""
 
 import asyncio
 import logging
@@ -13,12 +13,16 @@ from bot.ai_filter import ai_rank_pairs
 from bot.logger import setup_logger
 from bot.telegram_bot import notify_startup, notify_scanner_update
 from ai_rate_limiter import start_traders_staggered, telegram_ai_status
+from webhook import start_webhook_server, register_traders
 
 load_dotenv()
 logger = setup_logger()
 
 active_traders: dict = {}
 global_risk: GlobalRisk = None
+
+# Mapa símbolo → instancia FuturesTrader (para el webhook)
+_trader_instances: dict = {}
 
 
 def make_risk():
@@ -47,6 +51,10 @@ async def _start_single_pair(symbol: str):
         margin_mode=os.getenv("MARGIN_MODE", "isolated"),
         dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
     )
+    # Registrar instancia para el webhook
+    _trader_instances[symbol] = trader
+    register_traders(_trader_instances)
+
     task = asyncio.create_task(
         trader.run(make_risk(), global_risk=global_risk)
     )
@@ -61,6 +69,8 @@ async def stop_pair(symbol: str):
     if symbol not in active_traders:
         return
     task = active_traders.pop(symbol)
+    _trader_instances.pop(symbol, None)
+    register_traders(_trader_instances)
     task.cancel()
     logger.info(f"⏹ Trader detenido: {symbol}")
 
@@ -85,13 +95,16 @@ async def main():
     global global_risk
 
     logger.info("=" * 60)
-    logger.info("  BitgetProBot v5.2 — IA + Scanner + Telegram + RateLimiter")
+    logger.info("  BitgetProBot v5.3 — IA + Scanner + Telegram + Webhook")
     logger.info("=" * 60)
 
     global_risk = GlobalRisk(
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
         max_global_daily_loss_pct=float(os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")),
     )
+
+    # Arrancar webhook server en paralelo
+    webhook_runner = await start_webhook_server()
 
     scanner = PairScanner(
         api_key=os.getenv("BITGET_API_KEY"),
@@ -131,7 +144,10 @@ async def main():
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     await notify_startup(final_pairs, dry_run, top_n)
 
-    await scanner.run_scanner_loop(on_pairs_updated)
+    try:
+        await scanner.run_scanner_loop(on_pairs_updated)
+    finally:
+        await webhook_runner.cleanup()
 
 
 if __name__ == "__main__":
