@@ -51,7 +51,6 @@ class FuturesTrader:
 
     # ─────────────────────────────────────────────────────────────
     # BALANCE — Unified Account v2
-    # Docs: GET /api/v2/account/assets?coin=USDT
     # ─────────────────────────────────────────────────────────────
 
     def _make_sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
@@ -78,27 +77,24 @@ class FuturesTrader:
     async def _get_balance_direct(self) -> float:
         """
         Bitget Unified Account v2.
-        Endpoint correcto: GET /api/v2/account/assets?coin=USDT
-        (NO /unified/account/assets — ese es 404 en Unified mode)
-        (NO /mix/account/accounts — ese devuelve 40085 en Unified mode)
+        Los endpoints Classic (/api/v2/account/assets y /api/v2/account/all-account-balance)
+        devuelven error 40085 en modo Unified. Usamos los endpoints correctos.
         """
-        # Intento 1: ccxt con type=spot para forzar ruta v2/account (unified)
-        # ccxt no tiene soporte directo para unified account assets,
-        # pero fetch_balance con type=spot usa /api/v2/account/assets internamente
+        import json as _json
+
+        # Intento 1: ccxt con accountType=UNIFIED (mayúsculas requeridas por Bitget)
         try:
-            data = await self.exchange.fetch_balance({"type": "spot"})
+            data = await self.exchange.fetch_balance({"accountType": "UNIFIED"})
             usdt = data.get("USDT") or {}
             free = float(usdt.get("free") or 0)
-            total = float(usdt.get("total") or 0)
-            logger.warning(f"[{self.symbol}] 📊 Balance ccxt/spot: free={free} total={total} USDT")
             if free > 0:
+                logger.info(f"[{self.symbol}] ✅ Balance USDT (unified/ccxt): {free}")
                 return free
         except Exception as e:
-            logger.warning(f"[{self.symbol}] ❌ fetch_balance spot error: {e}")
+            logger.warning(f"[{self.symbol}] ❌ ccxt UNIFIED error: {e}")
 
-        # Intento 2: HTTP directo al endpoint correcto para Unified Account
-        # GET /api/v2/account/assets?coin=USDT
-        path = "/api/v2/account/assets?coin=USDT"
+        # Intento 2: HTTP directo a /api/v2/unified/account/assets (endpoint correcto Unified)
+        path = "/api/v2/unified/account/assets?coin=USDT"
         try:
             headers = self._auth_headers("GET", path)
             async with aiohttp.ClientSession() as s:
@@ -113,7 +109,6 @@ class FuturesTrader:
                         f"status={resp.status} body={body[:300]}"
                     )
                     if resp.status == 200 and "00000" in body:
-                        import json as _json
                         jdata = _json.loads(body)
                         assets = jdata.get("data") or []
                         if isinstance(assets, dict):
@@ -127,53 +122,50 @@ class FuturesTrader:
                                 free = float(
                                     asset.get("available") or
                                     asset.get("availableAmount") or
-                                    asset.get("frozen") and 0 or  # avoid frozen
                                     0
                                 )
-                                logger.warning(
-                                    f"[{self.symbol}] ✅ Balance HTTP unified: {free} USDT "
-                                    f"(raw={asset})"
+                                logger.info(
+                                    f"[{self.symbol}] ✅ Balance HTTP unified/assets: {free} USDT"
                                 )
                                 return free
         except Exception as e:
             logger.warning(f"[{self.symbol}] ❌ HTTP {path} error: {e}")
 
-        # Intento 3: GET /api/v2/account/all-account-balance (otro endpoint unified)
-        path2 = "/api/v2/account/all-account-balance"
+        # Intento 3: GET /api/v2/mix/account/account con productType=USDT-FUTURES
+        path3 = "/api/v2/mix/account/account?productType=USDT-FUTURES&marginCoin=USDT"
         try:
-            headers2 = self._auth_headers("GET", path2)
+            headers3 = self._auth_headers("GET", path3)
             async with aiohttp.ClientSession() as s:
                 async with s.get(
-                    "https://api.bitget.com" + path2,
-                    headers=headers2,
+                    "https://api.bitget.com" + path3,
+                    headers=headers3,
                     timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp2:
-                    body2 = await resp2.text()
+                ) as resp3:
+                    body3 = await resp3.text()
                     logger.warning(
-                        f"[{self.symbol}] 🌐 HTTP {path2} → "
-                        f"status={resp2.status} body={body2[:400]}"
+                        f"[{self.symbol}] 🌐 HTTP {path3} → "
+                        f"status={resp3.status} body={body3[:300]}"
                     )
-                    if resp2.status == 200 and "00000" in body2:
-                        import json as _json
-                        jdata2 = _json.loads(body2)
-                        # data puede ser dict con campo usdtBalance o similar
-                        d = jdata2.get("data") or {}
-                        usdt_bal = float(
-                            d.get("usdtBalance") or
+                    if resp3.status == 200 and "00000" in body3:
+                        jdata3 = _json.loads(body3)
+                        d = jdata3.get("data") or {}
+                        free3 = float(
+                            d.get("available") or
                             d.get("availableAmount") or
-                            d.get("available") or 0
+                            d.get("usdtAvailable") or
+                            0
                         )
-                        if usdt_bal > 0:
-                            logger.warning(
-                                f"[{self.symbol}] ✅ Balance all-account: {usdt_bal} USDT"
+                        if free3 > 0:
+                            logger.info(
+                                f"[{self.symbol}] ✅ Balance HTTP mix/account: {free3} USDT"
                             )
-                            return usdt_bal
+                            return free3
         except Exception as e:
-            logger.warning(f"[{self.symbol}] ❌ HTTP {path2} error: {e}")
+            logger.warning(f"[{self.symbol}] ❌ HTTP {path3} error: {e}")
 
         logger.warning(
             f"[{self.symbol}] Balance = 0 — todos los endpoints fallaron. "
-            "Verifica permisos API Key (Read Account + Trade)."
+            "Verifica permisos API Key (Read Account + Trade) y que la cuenta sea Unified."
         )
         return 0.0
 
