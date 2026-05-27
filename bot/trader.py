@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 import ccxt.async_support as ccxt
 from bot.strategy import decide
 from bot.ai_trader import ai_decide
@@ -15,6 +16,28 @@ logger = logging.getLogger("Trader")
 
 # Fracción del contrato que se cierra en TP2 (50% por defecto)
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
+
+# Cooldown mínimo en segundos entre notificaciones del mismo tipo para el mismo par.
+# Evita spam cuando la señal se repite ciclo a ciclo sin que cambie nada.
+_NOTIFY_COOLDOWN = int(os.getenv("NOTIFY_COOLDOWN", "300"))   # 5 min por defecto
+_last_notify: dict[str, float] = {}   # clave: "symbol:action"
+
+
+def _can_notify(symbol: str, action: str) -> bool:
+    """Devuelve True si ha pasado el cooldown desde la última notificación igual."""
+    key = f"{symbol}:{action}"
+    now = time.monotonic()
+    last = _last_notify.get(key, 0.0)
+    if now - last >= _NOTIFY_COOLDOWN:
+        _last_notify[key] = now
+        return True
+    return False
+
+
+def _reset_notify(symbol: str):
+    """Limpia el cooldown de un símbolo (p.ej. al abrir/cerrar posición real)."""
+    for action in ("BUY", "SELL", "CLOSE", "RISK_BLOCK"):
+        _last_notify.pop(f"{symbol}:{action}", None)
 
 
 class FuturesTrader:
@@ -176,6 +199,7 @@ class FuturesTrader:
         self.tp3         = None
         self.tp2_hit     = False
         clear_position(self.symbol)
+        _reset_notify(self.symbol)
 
     # ─────────────────────────────────────────────────────────────
     # ABRIR POSICIÓN
@@ -197,6 +221,7 @@ class FuturesTrader:
         logger.warning(f"📈 [{self.symbol}] LONG @ {self.entry_price} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}")
         await notify_open(self.symbol, "long", self.entry_price,
                           self.leverage, usdt_amount, self.dry_run)
+        _reset_notify(self.symbol)
 
     async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None):
         await self._open_order("sell", usdt_amount)
@@ -214,6 +239,7 @@ class FuturesTrader:
         logger.warning(f"📉 [{self.symbol}] SHORT @ {self.entry_price} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}")
         await notify_open(self.symbol, "short", self.entry_price,
                           self.leverage, usdt_amount, self.dry_run)
+        _reset_notify(self.symbol)
 
     # ─────────────────────────────────────────────────────────────
     # SL / TP CHECK — incluye TP2 parcial y TP3 completo
@@ -339,6 +365,7 @@ class FuturesTrader:
         self.tp3         = None
         self.tp2_hit     = False
         clear_position(self.symbol)
+        _reset_notify(self.symbol)
         return result
 
     # ─────────────────────────────────────────────────────────────
@@ -384,7 +411,8 @@ class FuturesTrader:
                 reason       = decision["reason"]
                 signal_block = decision["signal_block"]
 
-                if action != "HOLD":
+                # ── Notificar decisión IA solo si pasa el cooldown ──
+                if action != "HOLD" and _can_notify(self.symbol, action):
                     await notify_ai_decision(
                         self.symbol, action,
                         sig.score if sig else 0,
@@ -420,9 +448,11 @@ class FuturesTrader:
                             if global_risk:
                                 await global_risk.register_open()
                         else:
-                            reason = r1 if not can_l else r2
-                            logger.info(f"[{self.symbol}] ⛔ {reason}")
-                            await notify_risk_block(self.symbol, reason)
+                            block_reason = r1 if not can_l else r2
+                            logger.info(f"[{self.symbol}] ⛔ {block_reason}")
+                            # Notificar bloqueo de riesgo máximo una sola vez por cooldown
+                            if _can_notify(self.symbol, "RISK_BLOCK"):
+                                await notify_risk_block(self.symbol, block_reason)
 
                 elif action == "SELL":
                     if self.position == "long":
@@ -446,9 +476,11 @@ class FuturesTrader:
                             if global_risk:
                                 await global_risk.register_open()
                         else:
-                            reason = r1 if not can_l else r2
-                            logger.info(f"[{self.symbol}] ⛔ {reason}")
-                            await notify_risk_block(self.symbol, reason)
+                            block_reason = r1 if not can_l else r2
+                            logger.info(f"[{self.symbol}] ⛔ {block_reason}")
+                            # Notificar bloqueo de riesgo máximo una sola vez por cooldown
+                            if _can_notify(self.symbol, "RISK_BLOCK"):
+                                await notify_risk_block(self.symbol, block_reason)
 
             except ccxt.NetworkError as e:
                 logger.error(f"[{self.symbol}] Red: {e}")
