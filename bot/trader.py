@@ -75,15 +75,60 @@ class FuturesTrader:
         }
 
     # ─────────────────────────────────────────────────────────────
-    # BALANCE — API v3 Unified Account (único endpoint válido)
+    # BALANCE — API v3 Unified Account
     # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_usdt_available(data) -> float:
+        """
+        Extrae el campo 'available' de USDT de la respuesta v3.
+
+        La API v3 de Bitget devuelve DOS formatos posibles:
+          Formato A (lista plana):  data = [{'coin':'USDT','available':'304.06',...}, ...]
+          Formato B (dict anidado): data = [{'accountEquity':'...','assets':[{'coin':'USDT','available':'304.06'},...]}]
+
+        Este método maneja ambos.
+        """
+        if not data:
+            return 0.0
+
+        # Normalizar a lista
+        if isinstance(data, dict):
+            data = [data]
+
+        for item in data:
+            # Formato A — el item tiene directamente 'coin'
+            coin = str(item.get("coin") or "").upper()
+            if coin == "USDT":
+                return float(
+                    item.get("available") or
+                    item.get("availableAmount") or
+                    item.get("crossMaxAvailable") or
+                    0
+                )
+
+            # Formato B — el item tiene 'assets' anidado
+            nested = item.get("assets") or []
+            if isinstance(nested, dict):
+                nested = [nested]
+            for asset in nested:
+                acoin = str(asset.get("coin") or "").upper()
+                if acoin == "USDT":
+                    return float(
+                        asset.get("available") or
+                        asset.get("availableAmount") or
+                        asset.get("crossMaxAvailable") or
+                        0
+                    )
+
+        return 0.0
 
     async def _get_balance_direct(self) -> float:
         """
         Bitget Unified Account — usa API v3 exclusivamente.
-        /api/v3/account/assets  →  devuelve lista de coins con campo 'available'
+        Maneja tanto el formato plano como el formato anidado con 'assets'.
         """
-        # ── Intento 1: API v3 /account/assets (el correcto para UTA) ──────
+        # ── Intento 1: GET /api/v3/account/assets ────────────────────────
         path_v3 = "/api/v3/account/assets"
         try:
             headers = self._auth_headers("GET", path_v3)
@@ -97,24 +142,14 @@ class FuturesTrader:
                     if resp.status == 200:
                         jdata = _json.loads(body)
                         if jdata.get("code") == "00000":
-                            assets = jdata.get("data") or []
-                            if isinstance(assets, dict):
-                                assets = [assets]
-                            for asset in assets:
-                                coin = str(asset.get("coin") or "").upper()
-                                if coin == "USDT":
-                                    free = float(
-                                        asset.get("available") or
-                                        asset.get("availableAmount") or
-                                        asset.get("crossMaxAvailable") or
-                                        0
-                                    )
-                                    logger.info(
-                                        f"[{self.symbol}] ✅ Balance USDT (v3/assets): {free}"
-                                    )
-                                    return free
+                            free = self._extract_usdt_available(jdata.get("data"))
+                            if free > 0:
+                                logger.info(
+                                    f"[{self.symbol}] ✅ Balance USDT (v3/assets): {free}"
+                                )
+                                return free
                             logger.warning(
-                                f"[{self.symbol}] v3/assets: USDT no encontrado. data={assets[:3]}"
+                                f"[{self.symbol}] v3/assets: USDT=0 o no encontrado."
                             )
                         else:
                             logger.warning(
@@ -122,12 +157,12 @@ class FuturesTrader:
                             )
                     else:
                         logger.warning(
-                            f"[{self.symbol}] v3/assets HTTP {resp.status}: {body[:300]}"
+                            f"[{self.symbol}] v3/assets HTTP {resp.status}: {body[:200]}"
                         )
         except Exception as e:
             logger.warning(f"[{self.symbol}] v3/assets error: {e}")
 
-        # ── Intento 2: API v3 /account/assets?coin=USDT ───────────────────
+        # ── Intento 2: GET /api/v3/account/assets?coin=USDT ──────────────
         path_v3_coin = "/api/v3/account/assets?coin=USDT"
         try:
             headers = self._auth_headers("GET", path_v3_coin)
@@ -141,24 +176,16 @@ class FuturesTrader:
                     if resp.status == 200:
                         jdata = _json.loads(body)
                         if jdata.get("code") == "00000":
-                            assets = jdata.get("data") or []
-                            if isinstance(assets, dict):
-                                assets = [assets]
-                            for asset in assets:
-                                free = float(
-                                    asset.get("available") or
-                                    asset.get("availableAmount") or
-                                    0
+                            free = self._extract_usdt_available(jdata.get("data"))
+                            if free > 0:
+                                logger.info(
+                                    f"[{self.symbol}] ✅ Balance USDT (v3/assets?coin): {free}"
                                 )
-                                if free > 0:
-                                    logger.info(
-                                        f"[{self.symbol}] ✅ Balance USDT (v3/assets?coin=USDT): {free}"
-                                    )
-                                    return free
+                                return free
         except Exception as e:
             logger.warning(f"[{self.symbol}] v3/assets?coin error: {e}")
 
-        # ── Intento 3: mix/account/accounts (futuros USDT-FUTURES) ────────
+        # ── Intento 3: GET /api/v2/mix/account/accounts ──────────────────
         path_mix = "/api/v2/mix/account/accounts?productType=USDT-FUTURES"
         try:
             headers = self._auth_headers("GET", path_mix)
@@ -258,10 +285,6 @@ class FuturesTrader:
         )
 
     async def _partial_close_order(self, side, ratio: float):
-        """
-        Cierre parcial — Bitget Unified Account requiere tradeSide=close
-        para distinguir cierre de apertura nueva.
-        """
         if self.dry_run:
             logger.warning(f"[DRY][{self.symbol}] PARTIAL CLOSE {ratio*100:.0f}% {side.upper()}")
             return
@@ -280,7 +303,7 @@ class FuturesTrader:
                         params={
                             "reduceOnly":  True,
                             "productType": "USDT-FUTURES",
-                            "tradeSide":   "close",   # ← requerido en Unified Account
+                            "tradeSide":   "close",
                         }
                     )
                     logger.info(f"[{self.symbol}] TP parcial {ratio*100:.0f}% ({partial_qty} contratos)")
@@ -428,7 +451,7 @@ class FuturesTrader:
                             params={
                                 "reduceOnly":  True,
                                 "productType": "USDT-FUTURES",
-                                "tradeSide":   "close",   # ← requerido en Unified Account
+                                "tradeSide":   "close",
                             }
                         )
                         break
