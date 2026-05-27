@@ -1,6 +1,11 @@
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
+import time
+import aiohttp
 import ccxt.async_support as ccxt
 from bot.strategy import decide
 from bot.ai_trader import ai_decide
@@ -11,7 +16,6 @@ from bot.state import (
 
 logger = logging.getLogger("Trader")
 
-# Fracción del contrato que se cierra en TP2 (50% por defecto)
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 
 
@@ -33,17 +37,68 @@ class FuturesTrader:
         self.trade_count  = 0
         self.win_count    = 0
         self.total_pnl    = 0.0
+        self._api_key     = api_key
+        self._api_secret  = api_secret
+        self._passphrase  = passphrase
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
             "secret":   api_secret,
             "password": passphrase,
             "options":  {
                 "defaultType": "swap",
-                # Unified Account: indica a ccxt que use los endpoints correctos
                 "accountType": "unified",
             },
         })
         self._trader_ref = self
+
+    # ─────────────────────────────────────────────────────────────
+    # BITGET UNIFIED — llamada REST directa (evita bug ccxt 40085)
+    # ─────────────────────────────────────────────────────────────
+
+    def _bitget_sign(self, timestamp: str, method: str, path: str, body: str) -> str:
+        msg = timestamp + method.upper() + path + body
+        return hmac.new(
+            self._api_secret.encode("utf-8"),
+            msg.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    async def _set_leverage_direct(self):
+        """
+        Llama a POST /api/v2/mix/account/set-leverage directamente.
+        Compatibile con Unified Account (productType=USDT-FUTURES).
+        """
+        # ccxt usa el formato BASE/QUOTE:SETTLE → extraer solo "BASEQUOTE"
+        base_symbol = self.symbol.split("/")[0] + "USDT"
+        payload = {
+            "symbol":      base_symbol,
+            "productType": "USDT-FUTURES",
+            "marginCoin":  "USDT",
+            "leverage":    str(self.leverage),
+        }
+        body      = json.dumps(payload, separators=(",", ":"))
+        path      = "/api/v2/mix/account/set-leverage"
+        ts        = str(int(time.time() * 1000))
+        signature = self._bitget_sign(ts, "POST", path, body)
+        headers   = {
+            "ACCESS-KEY":        self._api_key,
+            "ACCESS-SIGN":       signature,
+            "ACCESS-TIMESTAMP":  ts,
+            "ACCESS-PASSPHRASE": self._passphrase,
+            "Content-Type":      "application/json",
+            "locale":            "en-US",
+        }
+        url = "https://api.bitget.com" + path
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=body) as resp:
+                data = await resp.json()
+                if str(data.get("code", "0")) != "00000":
+                    logger.warning(
+                        f"[{self.symbol}] set_leverage respuesta: "
+                        f"code={data.get('code')} msg={data.get('msg')}"
+                    )
+                else:
+                    logger.debug(f"[{self.symbol}] Leverage x{self.leverage} OK (Unified)")
 
     # ─────────────────────────────────────────────────────────────
     # INIT + RECUPERACIÓN DE ESTADO
@@ -53,14 +108,7 @@ class FuturesTrader:
         await self.exchange.load_markets()
         if not self.dry_run:
             try:
-                # Unified Account usa productType USDT-FUTURES
-                await self.exchange.set_leverage(
-                    self.leverage, self.symbol,
-                    params={
-                        "marginMode":  self.margin_mode,
-                        "productType": "USDT-FUTURES",
-                    }
-                )
+                await self._set_leverage_direct()
             except Exception as e:
                 logger.warning(f"[{self.symbol}] Leverage: {e}")
 
@@ -93,11 +141,8 @@ class FuturesTrader:
         if self.dry_run:
             return 1000.0
         try:
-            # Unified Account: no pasar "type": "swap" — causa code40085
-            # fetch_balance sin parámetros usa la cuenta unificada correctamente
-            bal = await self.exchange.fetch_balance()
+            bal  = await self.exchange.fetch_balance()
             usdt = bal.get("USDT", {})
-            # "free" puede venir en diferentes keys según versión ccxt
             free = usdt.get("free") or usdt.get("available") or 0
             return float(free)
         except Exception as e:
@@ -127,7 +172,6 @@ class FuturesTrader:
         )
 
     async def _partial_close_order(self, side, ratio: float):
-        """Cierra una fracción 'ratio' de la posición abierta."""
         if self.dry_run:
             logger.warning(f"[DRY][{self.symbol}] PARTIAL CLOSE {ratio*100:.0f}% {side.upper()}")
             return
@@ -161,10 +205,6 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
 
     async def _sync_closed_from_exchange(self, fill_price: float, reason: str):
-        """
-        Llamado por el webhook cuando Bitget confirma un cierre externo.
-        Limpia el estado interno sin enviar nueva orden al exchange.
-        """
         if not self.position:
             return
         entry = self.entry_price or fill_price
@@ -235,7 +275,7 @@ class FuturesTrader:
                           self.leverage, usdt_amount, self.dry_run)
 
     # ─────────────────────────────────────────────────────────────
-    # SL / TP CHECK — incluye TP2 parcial y TP3 completo
+    # SL / TP CHECK
     # ─────────────────────────────────────────────────────────────
 
     async def _check_and_handle_sl_tp(self, price: float, risk, global_risk) -> bool:
@@ -244,7 +284,6 @@ class FuturesTrader:
 
         is_long = self.position == "long"
 
-        # ── SL ────────────────────────────────────────────────────
         if self.sl:
             sl_hit = (price <= self.sl) if is_long else (price >= self.sl)
             if sl_hit:
@@ -254,7 +293,6 @@ class FuturesTrader:
                     await global_risk.register_close(result.get("pnl_pct", 0))
                 return True
 
-        # ── TP2 parcial (50%) ───────────────────────────────────────
         if self.tp2 and not self.tp2_hit:
             tp2_hit = (price >= self.tp2) if is_long else (price <= self.tp2)
             if tp2_hit:
@@ -264,7 +302,7 @@ class FuturesTrader:
                 )
                 self.tp2_hit = True
                 mark_tp2_hit(self.symbol)
-                self.sl = self.entry_price  # break-even
+                self.sl = self.entry_price
                 try:
                     from bot.telegram_bot import notify_tp_partial
                     await notify_tp_partial(self.symbol, self.position, price, 2, TP2_PARTIAL_RATIO)
@@ -272,7 +310,6 @@ class FuturesTrader:
                     pass
                 return False
 
-        # ── TP3 completo ────────────────────────────────────────────
         if self.tp3:
             tp3_hit = (price >= self.tp3) if is_long else (price <= self.tp3)
             if tp3_hit:
@@ -282,7 +319,6 @@ class FuturesTrader:
                     await global_risk.register_close(result.get("pnl_pct", 0))
                 return True
 
-        # ── TP1 (cierre total si no hay TP2/TP3) ─────────────────────
         if self.tp1 and not self.tp2:
             tp1_hit = (price >= self.tp1) if is_long else (price <= self.tp1)
             if tp1_hit:
@@ -292,7 +328,6 @@ class FuturesTrader:
                     await global_risk.register_close(result.get("pnl_pct", 0))
                 return True
 
-        # ── Fallback % cuando no hay niveles ATR ─────────────────────
         if not self.sl and not self.tp1:
             if is_long:
                 pnl = (price - self.entry_price) / self.entry_price * 100 * self.leverage
@@ -380,14 +415,12 @@ class FuturesTrader:
             try:
                 price = await self.get_price()
 
-                # ── 1. Gestión de posición abierta ─────────────────────
                 if self.position:
                     closed = await self._check_and_handle_sl_tp(price, risk, global_risk)
                     if closed:
                         await asyncio.sleep(interval)
                         continue
 
-                # ── 2. strategy.decide() ───────────────────────────────
                 async def _ai_fn(sym, ctx):
                     bars = await self.fetch_ohlcv(tf, limit=100)
                     return (await ai_decide(
@@ -407,8 +440,6 @@ class FuturesTrader:
                 action = decision["action"]
                 sig    = decision["signal"]
                 reason = decision["reason"]
-
-                # ── 3. Ejecutar acción ──────────────────────────────────
 
                 if action == "CLOSE" and self.position:
                     result = await self.close_position(reason[:60])
