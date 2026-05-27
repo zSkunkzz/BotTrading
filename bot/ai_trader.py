@@ -14,33 +14,28 @@ GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:
 GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-SYSTEM_PROMPT = """Trader experto futuros crypto. Confirma señal técnica recibida.
-Reglas: CLOSE si pnl>+3% o pnl<-1.5% | No BUY si rsi>70 | No SELL si rsi<30
-Vol_ratio>1.5 confirma, <0.7 debilita. Si duda → HOLD.
-Responde SOLO con JSON válido, sin texto antes ni después, sin markdown:
-{"action":"BUY"|"SELL"|"HOLD"|"CLOSE","confidence":1-10,"reason":"max 1 frase"}"""
+# Prompt ultra-estricto: sin prefijos, solo JSON
+SYSTEM_PROMPT = """You are a crypto futures trading expert. Analyze the provided market data and return ONLY a JSON object with no text before or after it.
+Rules: CLOSE if pnl>+3% or pnl<-1.5% | No BUY if rsi>70 | No SELL if rsi<30 | vol_ratio>1.5 confirms, <0.7 weakens | If unsure -> HOLD
+Output MUST be exactly this JSON and nothing else:
+{"action":"BUY"|"SELL"|"HOLD"|"CLOSE","confidence":1-10,"reason":"max 1 sentence"}"""
 
 
 def _parse_ai_json(raw: str) -> dict:
     """
-    Extrae JSON de respuesta IA de forma robusta:
-    1. Elimina markdown fences (```json ... ```)
-    2. Busca el primer '{' y el último '}' para aislar el objeto JSON
-       aunque la IA anteponga texto libre como 'Here is the JSON:'
-    3. Lanza ValueError si no hay JSON válido
+    Extrae JSON de respuesta IA de forma robusta.
+    Elimina markdown fences y cualquier texto antes del primer '{'.
     """
     raw = raw.strip()
-    # Paso 1: quitar fences de markdown
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     raw = raw.strip()
     if not raw:
-        raise ValueError("Respuesta IA vacía tras strip")
-    # Paso 2: extraer contenido entre primer '{' y último '}'
+        raise ValueError("Respuesta IA vacia tras strip")
     start = raw.find("{")
     end   = raw.rfind("}")
     if start == -1 or end == -1 or end < start:
-        raise ValueError(f"No se encontró JSON en la respuesta: {raw[:120]!r}")
+        raise ValueError(f"No JSON en respuesta: {raw[:120]!r}")
     return json.loads(raw[start:end + 1])
 
 
@@ -100,8 +95,10 @@ async def _call_gemini(context: dict):
             raise RateLimitExhausted("gemini")
         async with budget.gemini_semaphore:
             await budget.register_gemini_call()
-            url    = GEMINI_URL.format(model=GEMINI_MODEL) + f"?key={key}"
-            prompt = SYSTEM_PROMPT + "\nDATA:" + json.dumps(context, ensure_ascii=False, separators=(',', ':'))
+            url = GEMINI_URL.format(model=GEMINI_MODEL) + f"?key={key}"
+            # Prompt compacto: solo datos sin explicaciones para minimizar tokens de entrada
+            data_str = json.dumps(context, ensure_ascii=False, separators=(',', ':'))
+            prompt   = f"{SYSTEM_PROMPT}\nDATA:{data_str}"
 
             for attempt in range(1, max_retries + 2):
                 async with aiohttp.ClientSession() as s:
@@ -110,9 +107,18 @@ async def _call_gemini(context: dict):
                         json={
                             "contents": [{"parts": [{"text": prompt}]}],
                             "generationConfig": {
-                                "temperature": 0.1,
-                                "maxOutputTokens": 150,
+                                "temperature":      0.0,
+                                "maxOutputTokens":  400,
                                 "responseMimeType": "application/json",
+                                "responseSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "action":     {"type": "string", "enum": ["BUY", "SELL", "HOLD", "CLOSE"]},
+                                        "confidence": {"type": "integer"},
+                                        "reason":     {"type": "string"},
+                                    },
+                                    "required": ["action", "confidence", "reason"],
+                                },
                             },
                         },
                         timeout=aiohttp.ClientTimeout(total=15),
@@ -127,7 +133,7 @@ async def _call_gemini(context: dict):
                         return None
 
                     if resp.status == 429:
-                        logger.warning("Gemini HTTP 429 — rate limit")
+                        logger.warning("Gemini HTTP 429 rate limit")
                         await asyncio.sleep(5)
                         return None
 
@@ -138,7 +144,7 @@ async def _call_gemini(context: dict):
 
                     data = await resp.json()
                     if "candidates" not in data or not data["candidates"]:
-                        logger.warning("Gemini: respuesta sin candidates")
+                        logger.warning("Gemini: sin candidates")
                         return None
 
                     finish_reason = data["candidates"][0].get("finishReason", "STOP")
@@ -150,8 +156,10 @@ async def _call_gemini(context: dict):
                     try:
                         return _parse_ai_json(raw)
                     except (json.JSONDecodeError, ValueError) as e:
-                        logger.warning(f"Gemini fall {e} | raw={raw[:120]!r}")
+                        logger.warning(f"Gemini JSON error: {e} | raw={raw[:120]!r}")
                         return None
+
+                    break  # exito, salir del loop de reintentos
 
     except RateLimitExhausted as e:
         logger.warning(f"[Gemini] {e}")
@@ -180,8 +188,8 @@ async def _call_groq(context: dict):
                             {"role": "system",  "content": SYSTEM_PROMPT},
                             {"role": "user",    "content": json.dumps(context, ensure_ascii=False, separators=(',', ':'))},
                         ],
-                        "max_tokens": 120,
-                        "temperature": 0.1,
+                        "max_tokens": 200,
+                        "temperature": 0.0,
                         "response_format": {"type": "json_object"},
                     },
                     timeout=aiohttp.ClientTimeout(total=10),
@@ -195,7 +203,7 @@ async def _call_groq(context: dict):
                 try:
                     return _parse_ai_json(raw)
                 except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"Groq fall {e} | raw={raw[:120]!r}")
+                    logger.warning(f"Groq JSON error: {e} | raw={raw[:120]!r}")
                     return None
     except RateLimitExhausted as e:
         logger.warning(f"[Groq] {e}")
@@ -260,41 +268,41 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
             logger.info(f"📊 [{symbol}] CLOSE | {close_reason}")
             return {"action": "CLOSE", "confidence": 9,
                     "reasoning": close_reason, "key_factors": ["pnl_management"]}
-        logger.debug(f"[{symbol}] Posición activa, PnL ok → HOLD")
+        logger.debug(f"[{symbol}] Posicion activa, PnL ok -> HOLD")
         return {"action": "HOLD", "confidence": 5,
-                "reasoning": "Posición abierta, PnL dentro de rango", "key_factors": []}
+                "reasoning": "Posicion abierta, PnL dentro de rango", "key_factors": []}
 
     if context_override:
         context = context_override
         tech_signal = context_override.get("signal", "NEUTRAL")
         fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
-        logger.info(f"[{symbol}] Context override (score={context.get('score')}/10) → consultando IA")
+        logger.info(f"[{symbol}] Context override (score={context.get('score')}/10) -> consultando IA")
     else:
         tech = _technical_signal(bars)
         if tech["signal"] == "HOLD":
-            logger.debug(f"[{symbol}] Técnico HOLD → sin IA")
+            logger.debug(f"[{symbol}] Tecnico HOLD -> sin IA")
             return {"action": "HOLD", "confidence": tech["confidence"],
-                    "reasoning": "Sin señal técnica clara", "key_factors": []}
+                    "reasoning": "Sin senal tecnica clara", "key_factors": []}
         context = build_market_context(symbol, bars, position, entry_price, leverage)
         fallback_action = tech["signal"]
-        logger.info(f"[{symbol}] Señal técnica {tech['signal']} → consultando IA")
+        logger.info(f"[{symbol}] Senal tecnica {tech['signal']} -> consultando IA")
 
     result = await _call_gemini(context)
     if not result:
         result = await _call_groq(context)
     if not result:
-        logger.warning(f"[{symbol}] Sin IA — usando señal técnica directa")
+        logger.warning(f"[{symbol}] Sin IA fallback tecnico directo")
         result = {
             "action":     fallback_action,
             "confidence": 7,
-            "reasoning":  "Fallback técnico (IA no disponible)",
+            "reasoning":  "Fallback tecnico (IA no disponible)",
             "key_factors": [],
         }
 
     confidence = result.get("confidence", 5)
     min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "6"))
     if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
-        logger.info(f"[{symbol}] IA {result['action']} confianza {confidence}<{min_conf} → HOLD")
+        logger.info(f"[{symbol}] IA {result['action']} confianza {confidence}<{min_conf} -> HOLD")
         result["action"] = "HOLD"
 
     logger.info(f"🤖 [{symbol}] {result['action']} ({confidence}/10) | {result.get('reasoning', '')}")

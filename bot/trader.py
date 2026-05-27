@@ -52,7 +52,7 @@ class FuturesTrader:
         self._trader_ref = self
 
     # ─────────────────────────────────────────────────────────────
-    # BITGET UNIFIED — llamada REST directa (evita bug ccxt 40085)
+    # BITGET UNIFIED — llamadas REST directas
     # ─────────────────────────────────────────────────────────────
 
     def _bitget_sign(self, timestamp: str, method: str, path: str, body: str) -> str:
@@ -64,8 +64,8 @@ class FuturesTrader:
         ).hexdigest()
 
     async def _bitget_get(self, path: str, params: dict) -> dict:
-        """GET autenticado contra la API Bitget Unified."""
-        qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        """GET autenticado contra la API Bitget."""
+        qs        = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         full_path = f"{path}?{qs}" if qs else path
         ts        = str(int(time.time() * 1000))
         signature = self._bitget_sign(ts, "GET", full_path, "")
@@ -84,8 +84,9 @@ class FuturesTrader:
 
     async def _set_leverage_direct(self):
         """
-        Llama a POST /api/v2/mix/account/set-leverage directamente.
-        Compatible con Unified Account (productType=USDT-FUTURES).
+        Intenta setear leverage via API directa.
+        En Unified Account puede devolver code=40085 (no soportado) — es esperado,
+        no es un error real: el leverage ya fue configurado manualmente en la cuenta.
         """
         base_symbol = self.symbol.split("/")[0] + "USDT"
         payload = {
@@ -110,21 +111,24 @@ class FuturesTrader:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, data=body) as resp:
                 data = await resp.json()
-                if str(data.get("code", "0")) != "00000":
-                    logger.warning(
-                        f"[{self.symbol}] set_leverage respuesta: "
-                        f"code={data.get('code')} msg={data.get('msg')}"
-                    )
+                code = str(data.get("code", "0"))
+                if code == "00000":
+                    logger.debug(f"[{self.symbol}] Leverage x{self.leverage} OK")
+                elif code == "40085":
+                    # Unified Account no soporta este endpoint — es normal, no logear como warning
+                    logger.debug(f"[{self.symbol}] Leverage skip (Unified Account mode)")
                 else:
-                    logger.debug(f"[{self.symbol}] Leverage x{self.leverage} OK (Unified)")
+                    logger.warning(
+                        f"[{self.symbol}] set_leverage code={code} msg={data.get('msg')}"
+                    )
 
     async def _get_balance_direct(self) -> float:
         """
-        Obtiene el balance USDT disponible usando el endpoint Unified Account.
-        GET /api/v2/unified/account/assets — evita code40085 de la API clásica.
-        Si falla, intenta con /api/v2/mix/account/accounts como fallback.
+        Balance USDT via Unified Account API.
+        Intento 1: /api/v2/unified/account/assets
+        Intento 2: /api/v2/mix/account/accounts (fallback)
         """
-        # Intento 1: endpoint Unified
+        # Intento 1: Unified
         try:
             data = await self._bitget_get(
                 "/api/v2/unified/account/assets",
@@ -141,9 +145,9 @@ class FuturesTrader:
                     free = assets.get("available") or assets.get("availableAmount") or 0
                     return float(free)
         except Exception as e:
-            logger.debug(f"[{self.symbol}] Balance unified endpoint error: {e}")
+            logger.debug(f"[{self.symbol}] Balance unified error: {e}")
 
-        # Intento 2: endpoint mix (futures clásico) como fallback
+        # Intento 2: Mix/futures
         try:
             data = await self._bitget_get(
                 "/api/v2/mix/account/accounts",
@@ -156,7 +160,7 @@ class FuturesTrader:
                         free = acc.get("available") or acc.get("availableAmount") or 0
                         return float(free)
         except Exception as e:
-            logger.debug(f"[{self.symbol}] Balance mix endpoint error: {e}")
+            logger.debug(f"[{self.symbol}] Balance mix error: {e}")
 
         logger.warning(f"[{self.symbol}] No se pudo obtener balance — devolviendo 0")
         return 0.0
@@ -171,7 +175,7 @@ class FuturesTrader:
             try:
                 await self._set_leverage_direct()
             except Exception as e:
-                logger.warning(f"[{self.symbol}] Leverage: {e}")
+                logger.debug(f"[{self.symbol}] Leverage skip: {e}")
 
         saved = load_position(self.symbol)
         if saved:
@@ -204,7 +208,7 @@ class FuturesTrader:
         try:
             return await self._get_balance_direct()
         except Exception as e:
-            logger.error(f"[{self.symbol}] Balance bitget {e}")
+            logger.error(f"[{self.symbol}] Balance error: {e}")
             return 0
 
     async def get_price(self):
@@ -278,8 +282,8 @@ class FuturesTrader:
         if pnl > 0:
             self.win_count += 1
         logger.warning(
-            f"[Webhook] [{self.symbol}] Posición sincronizada cerrada | "
-            f"{reason} | PnL estimado: {pnl:+.2f}%"
+            f"[Webhook] [{self.symbol}] Posición cerrada | "
+            f"{reason} | PnL: {pnl:+.2f}%"
         )
         await notify_close(
             self.symbol, self.position, entry,
