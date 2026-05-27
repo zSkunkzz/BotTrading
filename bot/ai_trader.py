@@ -12,6 +12,9 @@ GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
+# Semáforo global: máx 10 llamadas simultáneas a Gemini
+_gemini_semaphore = asyncio.Semaphore(10)
+
 
 def build_market_context(symbol, bars, position, entry_price, leverage):
     closes = [b[4] for b in bars]
@@ -100,47 +103,47 @@ async def _call_gemini(context):
         logger.warning("Gemini: GEMINI_API_KEY no configurada")
         return None
     try:
-        url = GEMINI_URL.format(model=GEMINI_MODEL) + f"?key={key}"
-        prompt = SYSTEM_PROMPT + "\n\nDATOS:\n" + json.dumps(context, ensure_ascii=False)
-        async with aiohttp.ClientSession() as s:
-            resp = await s.post(
-                url,
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 300},
-                },
-                timeout=aiohttp.ClientTimeout(total=15),
-            )
-            # Log HTTP status si no es 200
-            if resp.status != 200:
-                body = await resp.text()
-                logger.warning(f"Gemini HTTP {resp.status}: {body[:300]}")
-                # Reintento tras rate limit
-                if resp.status == 429:
-                    await asyncio.sleep(2)
-                return None
+        async with _gemini_semaphore:
+            url = GEMINI_URL.format(model=GEMINI_MODEL) + f"?key={key}"
+            prompt = SYSTEM_PROMPT + "\n\nDATOS:\n" + json.dumps(context, ensure_ascii=False)
+            async with aiohttp.ClientSession() as s:
+                resp = await s.post(
+                    url,
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 300},
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                )
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(f"Gemini HTTP {resp.status}: {body[:300]}")
+                    if resp.status == 429:
+                        await asyncio.sleep(2)
+                    return None
 
-            data = await resp.json()
+                data = await resp.json()
 
-            # Log respuesta completa si no tiene candidates
-            if "candidates" not in data:
-                logger.warning(f"Gemini sin candidates: {json.dumps(data)[:300]}")
-                return None
+                if "candidates" not in data:
+                    logger.warning(f"Gemini sin candidates: {json.dumps(data)[:300]}")
+                    return None
 
-            candidates = data["candidates"]
-            if not candidates:
-                logger.warning("Gemini: candidates vacío")
-                return None
+                candidates = data["candidates"]
+                if not candidates:
+                    logger.warning("Gemini: candidates vacío")
+                    return None
 
-            # Safety check: finish_reason puede ser SAFETY o RECITATION
-            finish_reason = candidates[0].get("finishReason", "STOP")
-            if finish_reason not in ("STOP", "MAX_TOKENS"):
-                logger.warning(f"Gemini finishReason={finish_reason}, descartando")
-                return None
+                finish_reason = candidates[0].get("finishReason", "STOP")
+                if finish_reason not in ("STOP", "MAX_TOKENS"):
+                    logger.warning(f"Gemini finishReason={finish_reason}, descartando")
+                    return None
 
-            raw = candidates[0]["content"]["parts"][0]["text"]
-            raw = raw.strip().strip("```json").strip("```").strip()
-            return json.loads(raw)
+                raw = candidates[0]["content"]["parts"][0]["text"]
+                raw = raw.strip().strip("```json").strip("```").strip()
+                return json.loads(raw)
+
+            # Pequeña pausa al soltar el semáforo para no saturar el minuto siguiente
+            await asyncio.sleep(0.1)
 
     except json.JSONDecodeError as e:
         logger.warning(f"Gemini JSON inválido: {e}")
@@ -185,7 +188,7 @@ async def _call_groq(context):
 async def ai_decide(symbol, bars, position, entry_price, leverage):
     context = build_market_context(symbol, bars, position, entry_price, leverage)
 
-    # 1. Gemini primero
+    # 1. Gemini primero (con semáforo de concurrencia)
     result = await _call_gemini(context)
     # 2. Groq como fallback
     if not result:
