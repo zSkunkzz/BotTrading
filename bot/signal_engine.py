@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
 signal_engine.py — Motor de análisis técnico multi-timeframe (ASYNC)
-Portado de SignalBot v5.0 y adaptado para BotTrading (Bitget swap)
 
-Uso:
-    from bot.signal_engine import analyze_pair, SignalResult
-
-    result = await analyze_pair(exch, "BTC/USDT:USDT")
-    if result.signal in ("LONG", "SHORT") and result.score >= 6:
-        # ejecutar trade con result.entry, result.sl, result.tp1...
+Modos de entrada (se exporta entry_mode en SignalResult):
+  EARLY   score 5-6, 4h neutral/débil, 1h+15m alineados → lev 5-8x
+  NORMAL  score 6-7, todos los TF alineados               → lev 8-14x
+  STRONG  score 8+, confluencia máxima                    → lev 14-20x
 """
 
 from __future__ import annotations
@@ -27,44 +24,64 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-MIN_SCORE   = 6
-MIN_RR      = 1.8
-ATR_MULT_SL = 1.5
-TP1_MULT    = 2.5
-TP2_MULT    = 4.0
-TP3_MULT    = 7.0
+MIN_SCORE       = 5          # mínimo para Early
+MIN_SCORE_FULL  = 6          # mínimo para Normal/Strong
+MIN_RR          = 1.8
+ATR_MULT_SL     = 1.2        # ajustado: entry más cercano al precio (antes 1.5)
+TP1_MULT        = 2.5
+TP2_MULT        = 4.0
+TP3_MULT        = 7.0
+
+# Leverage por modo (rango 5-20x)
+LEV_EARLY_MIN   = 5
+LEV_EARLY_MAX   = 8
+LEV_NORMAL_MIN  = 8
+LEV_NORMAL_MAX  = 14
+LEV_STRONG_MIN  = 14
+LEV_STRONG_MAX  = 20
+
+# Size relativo del modo Early
+EARLY_SIZE_RATIO = 0.5       # entra con 50% del size normal
 
 
 @dataclass
 class SignalResult:
     symbol: str
-    signal: str = "NEUTRAL"
-    score: int = 0
-    max_score: int = 10
-    entry: float = 0.0
-    sl: float = 0.0
-    tp1: float = 0.0
-    tp2: float = 0.0
-    tp3: float = 0.0
-    rr: float = 0.0
-    atr: float = 0.0
-    suggested_lev: int = 1
-    pct_tp3: float = 0.0
-    indicators: dict = field(default_factory=dict)
+    signal: str      = "NEUTRAL"
+    score: int       = 0
+    max_score: int   = 10
+    entry_mode: str  = "NONE"    # "EARLY" | "NORMAL" | "STRONG" | "NONE"
+    entry: float     = 0.0
+    sl: float        = 0.0
+    tp1: float       = 0.0
+    tp2: float       = 0.0
+    tp3: float       = 0.0
+    rr: float        = 0.0
+    atr: float       = 0.0
+    suggested_lev: int  = 1
+    size_ratio: float   = 1.0    # 0.5 en EARLY, 1.0 en NORMAL/STRONG
+    pct_tp3: float      = 0.0
+    indicators: dict    = field(default_factory=dict)
     error: Optional[str] = None
 
     @property
     def is_valid(self) -> bool:
-        return self.signal in ("LONG", "SHORT") and self.score >= MIN_SCORE and self.rr >= MIN_RR
+        return (
+            self.signal in ("LONG", "SHORT")
+            and self.score >= MIN_SCORE
+            and self.rr >= MIN_RR
+            and self.entry_mode != "NONE"
+        )
 
     def summary(self) -> str:
         if not self.is_valid:
             return f"{self.symbol} · NEUTRAL · Score {self.score}/10"
-        dir_emoji = "🟢" if self.signal == "LONG" else "🔴"
+        em   = f"[{self.entry_mode}]"
+        icon = "🟢" if self.signal == "LONG" else "🔴"
         return (
-            f"{dir_emoji} {self.symbol} · {self.signal} · Score {self.score}/10 · "
-            f"R/R {self.rr:.1f} · Entry {self.entry:.4f} · "
-            f"SL {self.sl:.4f} · TP1 {self.tp1:.4f}"
+            f"{icon} {self.symbol} · {self.signal} {em} · Score {self.score}/10 · "
+            f"R/R {self.rr:.1f} · Lev {self.suggested_lev}x · "
+            f"Entry {self.entry:.4f} · SL {self.sl:.4f} · TP1 {self.tp1:.4f}"
         )
 
 
@@ -80,9 +97,7 @@ async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataF
 
 
 def _supertrend_dir(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> int:
-    """Devuelve 1 (bullish), -1 (bearish) o 0 (indeterminado).
-    Usa arrays numpy para evitar ChainedAssignmentError en pandas >= 2.0.
-    """
+    """Devuelve 1 (bullish), -1 (bearish) o 0 (indeterminado)."""
     try:
         h = df["high"].values
         l = df["low"].values
@@ -90,26 +105,20 @@ def _supertrend_dir(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> in
         if len(c) < period + 5:
             return 0
 
-        # ATR manual con numpy
         tr = np.maximum(
             h[1:] - l[1:],
-            np.maximum(
-                np.abs(h[1:] - c[:-1]),
-                np.abs(l[1:] - c[:-1])
-            )
+            np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1]))
         )
-        # Prepend NaN para alinear índices
         tr_full = np.concatenate([[np.nan], tr])
 
         atr = np.full(len(c), np.nan)
-        # Seed con media simple del primer periodo
         atr[period] = np.nanmean(tr_full[1:period + 1])
         for i in range(period + 1, len(c)):
             atr[i] = (atr[i - 1] * (period - 1) + tr_full[i]) / period
 
-        hl2  = (h + l) / 2.0
-        ub   = hl2 + mult * atr
-        lb   = hl2 - mult * atr
+        hl2 = (h + l) / 2.0
+        ub  = hl2 + mult * atr
+        lb  = hl2 - mult * atr
 
         st_arr    = np.full(len(c), np.nan)
         trend_arr = np.ones(len(c), dtype=int)
@@ -241,10 +250,56 @@ def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, int, str]:
     if s15.get("bb", 0) == 1  and s1h.get("bb", 0) == 1:  sl += 1
     if s15.get("bb", 0) == -1 and s1h.get("bb", 0) == -1: ss += 1
 
-    best  = max(sl, ss)
-    score = min(best, 10)
+    best      = max(sl, ss)
+    score     = min(best, 10)
     direction = "LONG" if sl >= ss else "SHORT"
     return score, min(sl, 10), direction
+
+
+def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction: str) -> tuple[str, int, float]:
+    """
+    Clasifica el modo de entrada y devuelve (mode, leverage, size_ratio).
+
+    EARLY  → score 5-6 + 4h neutral o débil + 1h y 15m alineados
+    NORMAL → score 6-7, todos TF con señal
+    STRONG → score 8+, confluencia máxima
+
+    Leverage escala linealmente dentro del rango de cada modo:
+      EARLY  5–8x  | NORMAL 8–14x  | STRONG 14–20x
+    """
+    sign = 1 if direction == "LONG" else -1
+
+    # alineación por TF
+    tf4h_aligned = s4h.get("ema_trend", 0) * sign
+    tf1h_aligned = s1h.get("ema_trend", 0) * sign
+    tf15_aligned = s15.get("ema_trend", 0) * sign
+
+    # señales adicionales 1h y 15m
+    extra_1h  = sum(1 for k in ("rsi", "supertrend", "macd") if s1h.get(k, 0) * sign > 0)
+    extra_15m = sum(1 for k in ("macd", "stoch", "volume") if s15.get(k, 0) * sign > 0)
+
+    if score >= 8:
+        mode = "STRONG"
+        # leverage lineal dentro del rango: 8 → 14x, 10 → 20x
+        ratio = min((score - 8) / 2.0, 1.0)  # 0.0 a 1.0
+        lev   = round(LEV_STRONG_MIN + ratio * (LEV_STRONG_MAX - LEV_STRONG_MIN))
+        return mode, lev, 1.0
+
+    if score >= MIN_SCORE_FULL:  # 6-7
+        mode  = "NORMAL"
+        ratio = min((score - MIN_SCORE_FULL) / 2.0, 1.0)
+        lev   = round(LEV_NORMAL_MIN + ratio * (LEV_NORMAL_MAX - LEV_NORMAL_MIN))
+        return mode, lev, 1.0
+
+    # score == 5: EARLY solo si 4h es neutral/débil y 1h+15m alineados
+    if score == 5 and tf1h_aligned > 0 and tf15_aligned > 0 and tf4h_aligned <= 0:
+        # leverage dentro del rango Early según calidad de 1h+15m
+        quality = extra_1h + extra_15m  # 0-6
+        ratio   = min(quality / 6.0, 1.0)
+        lev     = round(LEV_EARLY_MIN + ratio * (LEV_EARLY_MAX - LEV_EARLY_MIN))
+        return "EARLY", lev, EARLY_SIZE_RATIO
+
+    return "NONE", 1, 0.0
 
 
 async def analyze_pair(exch, symbol: str) -> SignalResult:
@@ -267,7 +322,10 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         score, _, direction = _compute_score(s4h, s1h, s15)
         result.score = score
 
-        if score < MIN_SCORE:
+        # clasificar modo antes de filtrar
+        mode, lev, size_ratio = _classify_entry_mode(score, s4h, s1h, s15, direction)
+
+        if mode == "NONE":
             return result
 
         try:
@@ -299,11 +357,10 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         if rr < MIN_RR:
             return result
 
-        pct_tp3   = round(abs(tp3 - entry) / entry * 100, 2)
-        atr_pct   = atr / entry * 100
-        suggested = min(10, max(1, round(5 / atr_pct))) if atr_pct > 0 else 1
+        pct_tp3 = round(abs(tp3 - entry) / entry * 100, 2)
 
         result.signal        = direction
+        result.entry_mode    = mode
         result.entry         = round(entry, 6)
         result.sl            = round(sl,    6)
         result.tp1           = round(tp1,   6)
@@ -311,7 +368,8 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         result.tp3           = round(tp3,   6)
         result.rr            = rr
         result.pct_tp3       = pct_tp3
-        result.suggested_lev = suggested
+        result.suggested_lev = lev
+        result.size_ratio    = size_ratio
 
     except Exception as e:
         result.error = str(e)
@@ -324,6 +382,10 @@ def _ei(v: int) -> str:
     return "🟢" if v == 1 else ("🔴" if v == -1 else "⚪")
 
 
+def _mode_emoji(mode: str) -> str:
+    return {"EARLY": "🔸", "NORMAL": "🔷", "STRONG": "💥"}.get(mode, "⚪")
+
+
 def format_signal_block(r: SignalResult) -> str:
     if not r.is_valid:
         return f"📊 Score técnico: `{r.score}/10` — sin señal clara"
@@ -332,10 +394,13 @@ def format_signal_block(r: SignalResult) -> str:
     i1h = r.indicators.get("1h",  {})
     i4h = r.indicators.get("4h",  {})
     d   = r.signal
+    me  = _mode_emoji(r.entry_mode)
+
+    size_txt = f" · Size `{int(r.size_ratio*100)}%`" if r.size_ratio < 1.0 else ""
 
     lines = [
         f"📊 *Análisis técnico* · Score `{r.score}/10` · R/R `{r.rr}:1`",
-        f"{'🟢 LONG' if d == 'LONG' else '🔴 SHORT'} · Lev sugerido `{r.suggested_lev}x`",
+        f"{'🟢 LONG' if d == 'LONG' else '🔴 SHORT'} · Modo {me}`{r.entry_mode}` · Lev `{r.suggested_lev}x`{size_txt}",
         f"",
         f"  Entry `{r.entry}` · SL `{r.sl}` · TP1 `{r.tp1}`",
         f"",
