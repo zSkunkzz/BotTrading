@@ -12,30 +12,26 @@ logger = logging.getLogger("AITrader")
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
 
-# Prompt ultra-estricto: sin prefijos, solo JSON
-SYSTEM_PROMPT = """You are a crypto futures trading expert. Analyze the provided market data and return ONLY a JSON object with no text before or after it.
+SYSTEM_PROMPT = """You are a crypto futures trading expert. Reply ONLY with a JSON object, nothing else.
 Rules: CLOSE if pnl>+3% or pnl<-1.5% | No BUY if rsi>70 | No SELL if rsi<30 | vol_ratio>1.5 confirms, <0.7 weakens | If unsure -> HOLD
-Output MUST be exactly this JSON and nothing else:
-{"action":"BUY"|"SELL"|"HOLD"|"CLOSE","confidence":1-10,"reason":"max 1 sentence"}"""
+JSON format (no extra text, no markdown):
+{"action":"BUY","confidence":8,"reason":"short reason"}
+action must be one of: BUY SELL HOLD CLOSE"""
 
 
 def _parse_ai_json(raw: str) -> dict:
-    """
-    Extrae JSON de respuesta IA de forma robusta.
-    Elimina markdown fences y cualquier texto antes del primer '{'.
-    """
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     raw = raw.strip()
     if not raw:
-        raise ValueError("Respuesta IA vacia tras strip")
+        raise ValueError("Empty AI response")
     start = raw.find("{")
     end   = raw.rfind("}")
     if start == -1 or end == -1 or end < start:
-        raise ValueError(f"No JSON en respuesta: {raw[:120]!r}")
+        raise ValueError(f"No JSON found: {raw[:120]!r}")
     return json.loads(raw[start:end + 1])
 
 
@@ -45,41 +41,39 @@ def build_market_context(symbol, bars, position, entry_price, leverage):
     lows   = [b[3] for b in bars]
     vols   = [b[5] for b in bars]
 
-    ema21      = ema(closes, 21)
-    ema50      = ema(closes, 50)
-    rsi14      = rsi(closes, 14)
+    ema21         = ema(closes, 21)
+    ema50         = ema(closes, 50)
+    rsi14         = rsi(closes, 14)
     m_line, s_line, hist = macd(closes, 12, 26, 9)
-    st_dir, _  = supertrend(highs, lows, closes, 10, 3.0)
-    atr14      = atr(highs, lows, closes, 14)
-    avg_vol    = sum(vols[-20:]) / 20 if len(vols) >= 20 else sum(vols) / len(vols)
-    vol_ratio  = round(vols[-1] / avg_vol, 2) if avg_vol > 0 else 1
-    last_3     = [
-        {"open": bars[i][1], "high": bars[i][2], "low": bars[i][3],
-         "close": bars[i][4], "volume": round(bars[i][5], 2)}
+    st_dir, _     = supertrend(highs, lows, closes, 10, 3.0)
+    atr14         = atr(highs, lows, closes, 14)
+    avg_vol       = sum(vols[-20:]) / 20 if len(vols) >= 20 else sum(vols) / len(vols)
+    vol_ratio     = round(vols[-1] / avg_vol, 2) if avg_vol > 0 else 1
+    last_3        = [
+        {"o": bars[i][1], "h": bars[i][2], "l": bars[i][3],
+         "c": bars[i][4], "v": round(bars[i][5], 2)}
         for i in range(-3, 0)
     ]
     ctx = {
-        "symbol":   symbol,
-        "price":    closes[-1],
-        "ind": {
-            "ema_trend":  "UP" if (ema21 and ema50 and ema21[-1] > ema50[-1]) else "DOWN",
-            "rsi":        rsi14,
-            "macd":       "UP" if hist > 0 else "DOWN",
-            "supertrend": "UP" if st_dir == 1 else "DOWN",
-            "atr":        round(atr14, 4),
-            "vol_ratio":  vol_ratio,
-        },
-        "candles_3": last_3,
-        "position":  position or "NONE",
-        "entry":     entry_price,
-        "leverage":  leverage,
+        "sym":  symbol,
+        "px":   closes[-1],
+        "ema":  "UP" if (ema21 and ema50 and ema21[-1] > ema50[-1]) else "DOWN",
+        "rsi":  rsi14,
+        "macd": "UP" if hist > 0 else "DOWN",
+        "st":   "UP" if st_dir == 1 else "DOWN",
+        "atr":  round(atr14, 4),
+        "vr":   vol_ratio,
+        "c3":   last_3,
+        "pos":  position or "NONE",
+        "ep":   entry_price,
+        "lev":  leverage,
     }
     if position and entry_price:
         if position == "long":
             pnl = (closes[-1] - entry_price) / entry_price * 100 * leverage
         else:
             pnl = (entry_price - closes[-1]) / entry_price * 100 * leverage
-        ctx["pnl_pct"] = round(pnl, 2)
+        ctx["pnl"] = round(pnl, 2)
     return ctx
 
 
@@ -87,85 +81,64 @@ async def _call_gemini(context: dict):
     key = os.getenv("GEMINI_API_KEY", "")
     if not key:
         return None
-
-    max_retries = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
-
     try:
         if not await budget.can_call_gemini():
             raise RateLimitExhausted("gemini")
         async with budget.gemini_semaphore:
             await budget.register_gemini_call()
-            url = GEMINI_URL.format(model=GEMINI_MODEL) + f"?key={key}"
-            # Prompt compacto: solo datos sin explicaciones para minimizar tokens de entrada
+            url      = GEMINI_URL.format(model=GEMINI_MODEL) + f"?key={key}"
             data_str = json.dumps(context, ensure_ascii=False, separators=(',', ':'))
             prompt   = f"{SYSTEM_PROMPT}\nDATA:{data_str}"
 
-            for attempt in range(1, max_retries + 2):
+            for attempt in range(1, 4):
                 async with aiohttp.ClientSession() as s:
                     resp = await s.post(
                         url,
                         json={
                             "contents": [{"parts": [{"text": prompt}]}],
                             "generationConfig": {
-                                "temperature":      0.0,
-                                "maxOutputTokens":  400,
-                                "responseMimeType": "application/json",
-                                "responseSchema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "action":     {"type": "string", "enum": ["BUY", "SELL", "HOLD", "CLOSE"]},
-                                        "confidence": {"type": "integer"},
-                                        "reason":     {"type": "string"},
-                                    },
-                                    "required": ["action", "confidence", "reason"],
-                                },
+                                "temperature":     0.0,
+                                "maxOutputTokens": 256,
                             },
                         },
                         timeout=aiohttp.ClientTimeout(total=15),
                     )
-
                     if resp.status == 503:
-                        body = await resp.text()
-                        logger.warning(f"Gemini HTTP 503 (intento {attempt}/{max_retries+1}): {body[:200]}")
-                        if attempt <= max_retries:
+                        logger.warning(f"Gemini 503 intento {attempt}/3")
+                        if attempt < 3:
                             await asyncio.sleep(3 * attempt)
                             continue
                         return None
-
                     if resp.status == 429:
-                        logger.warning("Gemini HTTP 429 rate limit")
-                        await asyncio.sleep(5)
+                        logger.warning("Gemini 429 rate limit")
                         return None
-
                     if resp.status != 200:
                         body = await resp.text()
-                        logger.warning(f"Gemini HTTP {resp.status}: {body[:300]}")
+                        logger.warning(f"Gemini HTTP {resp.status}: {body[:200]}")
                         return None
 
                     data = await resp.json()
-                    if "candidates" not in data or not data["candidates"]:
+                    cands = data.get("candidates", [])
+                    if not cands:
                         logger.warning("Gemini: sin candidates")
                         return None
-
-                    finish_reason = data["candidates"][0].get("finishReason", "STOP")
-                    if finish_reason not in ("STOP", "MAX_TOKENS"):
-                        logger.warning(f"Gemini finishReason inesperado: {finish_reason}")
+                    finish = cands[0].get("finishReason", "STOP")
+                    if finish not in ("STOP", "MAX_TOKENS"):
+                        logger.warning(f"Gemini finishReason={finish}")
                         return None
-
-                    raw = data["candidates"][0]["content"]["parts"][0]["text"]
+                    raw = cands[0]["content"]["parts"][0]["text"]
                     try:
-                        return _parse_ai_json(raw)
+                        result = _parse_ai_json(raw)
+                        logger.debug(f"Gemini OK: {raw[:80]}")
+                        return result
                     except (json.JSONDecodeError, ValueError) as e:
-                        logger.warning(f"Gemini JSON error: {e} | raw={raw[:120]!r}")
+                        logger.warning(f"Gemini JSON error: {e} | raw={raw!r}")
                         return None
-
-                    break  # exito, salir del loop de reintentos
-
     except RateLimitExhausted as e:
         logger.warning(f"[Gemini] {e}")
         return None
     except Exception as e:
-        logger.warning(f"Gemini error inesperado: {e}")
+        logger.warning(f"Gemini error: {e}")
         return None
 
 
@@ -185,10 +158,10 @@ async def _call_groq(context: dict):
                     json={
                         "model": GROQ_MODEL,
                         "messages": [
-                            {"role": "system",  "content": SYSTEM_PROMPT},
-                            {"role": "user",    "content": json.dumps(context, ensure_ascii=False, separators=(',', ':'))},
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user",   "content": json.dumps(context, separators=(',', ':'))},
                         ],
-                        "max_tokens": 200,
+                        "max_tokens": 150,
                         "temperature": 0.0,
                         "response_format": {"type": "json_object"},
                     },
@@ -199,7 +172,7 @@ async def _call_groq(context: dict):
                     logger.warning(f"Groq HTTP {resp.status}: {body[:200]}")
                     return None
                 data = await resp.json()
-                raw = data["choices"][0]["message"]["content"]
+                raw  = data["choices"][0]["message"]["content"]
                 try:
                     return _parse_ai_json(raw)
                 except (json.JSONDecodeError, ValueError) as e:
@@ -209,7 +182,7 @@ async def _call_groq(context: dict):
         logger.warning(f"[Groq] {e}")
         return None
     except Exception as e:
-        logger.warning(f"Groq error inesperado: {e}")
+        logger.warning(f"Groq error: {e}")
         return None
 
 
@@ -251,10 +224,10 @@ def _pnl_check(position, entry_price, current_price, leverage) -> str | None:
         pnl = (current_price - entry_price) / entry_price * 100 * leverage
     else:
         pnl = (entry_price - current_price) / entry_price * 100 * leverage
-    tp  = float(os.getenv("AI_TP_PCT",  "3.0"))
-    sl  = float(os.getenv("AI_SL_PCT", "-1.5"))
-    if pnl >= tp:  return f"TP +{pnl:.2f}% alcanzado"
-    if pnl <= sl:  return f"SL {pnl:.2f}% activado"
+    tp = float(os.getenv("AI_TP_PCT",  "3.0"))
+    sl = float(os.getenv("AI_SL_PCT", "-1.5"))
+    if pnl >= tp:  return f"TP +{pnl:.2f}%"
+    if pnl <= sl:  return f"SL {pnl:.2f}%"
     return None
 
 
@@ -266,44 +239,33 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         close_reason = _pnl_check(position, entry_price, current_price, leverage)
         if close_reason:
             logger.info(f"📊 [{symbol}] CLOSE | {close_reason}")
-            return {"action": "CLOSE", "confidence": 9,
-                    "reasoning": close_reason, "key_factors": ["pnl_management"]}
-        logger.debug(f"[{symbol}] Posicion activa, PnL ok -> HOLD")
-        return {"action": "HOLD", "confidence": 5,
-                "reasoning": "Posicion abierta, PnL dentro de rango", "key_factors": []}
+            return {"action": "CLOSE", "confidence": 9, "reasoning": close_reason, "key_factors": ["pnl"]}
+        return {"action": "HOLD", "confidence": 5, "reasoning": "PnL dentro de rango", "key_factors": []}
 
     if context_override:
         context = context_override
         tech_signal = context_override.get("signal", "NEUTRAL")
         fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
-        logger.info(f"[{symbol}] Context override (score={context.get('score')}/10) -> consultando IA")
+        logger.info(f"[{symbol}] IA consultada (score={context.get('score')}/10)")
     else:
         tech = _technical_signal(bars)
         if tech["signal"] == "HOLD":
-            logger.debug(f"[{symbol}] Tecnico HOLD -> sin IA")
-            return {"action": "HOLD", "confidence": tech["confidence"],
-                    "reasoning": "Sin senal tecnica clara", "key_factors": []}
+            return {"action": "HOLD", "confidence": tech["confidence"], "reasoning": "Sin señal técnica", "key_factors": []}
         context = build_market_context(symbol, bars, position, entry_price, leverage)
         fallback_action = tech["signal"]
-        logger.info(f"[{symbol}] Senal tecnica {tech['signal']} -> consultando IA")
+        logger.info(f"[{symbol}] Técnico {tech['signal']} → IA")
 
     result = await _call_gemini(context)
     if not result:
         result = await _call_groq(context)
     if not result:
-        logger.warning(f"[{symbol}] Sin IA fallback tecnico directo")
-        result = {
-            "action":     fallback_action,
-            "confidence": 7,
-            "reasoning":  "Fallback tecnico (IA no disponible)",
-            "key_factors": [],
-        }
+        logger.warning(f"[{symbol}] Sin IA → fallback técnico")
+        result = {"action": fallback_action, "confidence": 7, "reasoning": "Fallback técnico", "key_factors": []}
 
     confidence = result.get("confidence", 5)
     min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "6"))
     if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
-        logger.info(f"[{symbol}] IA {result['action']} confianza {confidence}<{min_conf} -> HOLD")
         result["action"] = "HOLD"
 
-    logger.info(f"🤖 [{symbol}] {result['action']} ({confidence}/10) | {result.get('reasoning', '')}")
+    logger.info(f"🤖 [{symbol}] {result['action']} ({confidence}/10) | {result.get('reasoning', result.get('reason', ''))}")
     return result
