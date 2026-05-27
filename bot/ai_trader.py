@@ -4,6 +4,7 @@ import json
 import asyncio
 import aiohttp
 from bot.indicators import ema, rsi, macd, supertrend, atr
+from ai_rate_limiter import budget, RateLimitExhausted
 
 logger = logging.getLogger("AITrader")
 
@@ -11,9 +12,6 @@ GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-
-# Semáforo global: máx 10 llamadas simultáneas a Gemini
-_gemini_semaphore = asyncio.Semaphore(10)
 
 
 def build_market_context(symbol, bars, position, entry_price, leverage):
@@ -103,7 +101,12 @@ async def _call_gemini(context):
         logger.warning("Gemini: GEMINI_API_KEY no configurada")
         return None
     try:
-        async with _gemini_semaphore:
+        # Verificar budget ANTES de adquirir el semáforo
+        if not await budget.can_call_gemini():
+            raise RateLimitExhausted("gemini")
+
+        async with budget.gemini_semaphore:
+            await budget.register_gemini_call()
             url = GEMINI_URL.format(model=GEMINI_MODEL) + f"?key={key}"
             prompt = SYSTEM_PROMPT + "\n\nDATOS:\n" + json.dumps(context, ensure_ascii=False)
             async with aiohttp.ClientSession() as s:
@@ -119,32 +122,27 @@ async def _call_gemini(context):
                     body = await resp.text()
                     logger.warning(f"Gemini HTTP {resp.status}: {body[:300]}")
                     if resp.status == 429:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(5)
                     return None
 
                 data = await resp.json()
 
-                if "candidates" not in data:
+                if "candidates" not in data or not data["candidates"]:
                     logger.warning(f"Gemini sin candidates: {json.dumps(data)[:300]}")
                     return None
 
-                candidates = data["candidates"]
-                if not candidates:
-                    logger.warning("Gemini: candidates vacío")
-                    return None
-
-                finish_reason = candidates[0].get("finishReason", "STOP")
+                finish_reason = data["candidates"][0].get("finishReason", "STOP")
                 if finish_reason not in ("STOP", "MAX_TOKENS"):
                     logger.warning(f"Gemini finishReason={finish_reason}, descartando")
                     return None
 
-                raw = candidates[0]["content"]["parts"][0]["text"]
+                raw = data["candidates"][0]["content"]["parts"][0]["text"]
                 raw = raw.strip().strip("```json").strip("```").strip()
                 return json.loads(raw)
 
-            # Pequeña pausa al soltar el semáforo para no saturar el minuto siguiente
-            await asyncio.sleep(0.1)
-
+    except RateLimitExhausted as e:
+        logger.warning(f"[Gemini] {e} — usando fallback")
+        return None
     except json.JSONDecodeError as e:
         logger.warning(f"Gemini JSON inválido: {e}")
         return None
@@ -158,28 +156,38 @@ async def _call_groq(context):
     if not key:
         return None
     try:
-        async with aiohttp.ClientSession() as s:
-            resp = await s.post(
-                GROQ_URL,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
-                    ],
-                    "max_tokens": 200,
-                    "temperature": 0.1,
-                    "response_format": {"type": "json_object"},
-                },
-                timeout=aiohttp.ClientTimeout(total=10),
-            )
-            if resp.status != 200:
-                body = await resp.text()
-                logger.warning(f"Groq HTTP {resp.status}: {body[:200]}")
-                return None
-            data = await resp.json()
-            return json.loads(data["choices"][0]["message"]["content"])
+        # Verificar budget ANTES de hacer la llamada
+        if not await budget.can_call_groq():
+            raise RateLimitExhausted("groq")
+
+        async with budget.groq_semaphore:
+            await budget.register_groq_call()
+            async with aiohttp.ClientSession() as s:
+                resp = await s.post(
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json={
+                        "model": GROQ_MODEL,
+                        "messages": [
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+                        ],
+                        "max_tokens": 200,
+                        "temperature": 0.1,
+                        "response_format": {"type": "json_object"},
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(f"Groq HTTP {resp.status}: {body[:200]}")
+                    return None
+                data = await resp.json()
+                return json.loads(data["choices"][0]["message"]["content"])
+
+    except RateLimitExhausted as e:
+        logger.warning(f"[Groq] {e} — usando fallback")
+        return None
     except Exception as e:
         logger.warning(f"Groq falló: {e}")
         return None
@@ -188,7 +196,7 @@ async def _call_groq(context):
 async def ai_decide(symbol, bars, position, entry_price, leverage):
     context = build_market_context(symbol, bars, position, entry_price, leverage)
 
-    # 1. Gemini primero (con semáforo de concurrencia)
+    # 1. Gemini primero
     result = await _call_gemini(context)
     # 2. Groq como fallback
     if not result:
