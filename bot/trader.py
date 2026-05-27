@@ -20,6 +20,10 @@ logger = logging.getLogger("Trader")
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 BITGET_BASE = "https://api.bitget.com"
 
+# Cache de marginMode por símbolo: {symbol: 'isolated' | 'crossed'}
+# Evita reintentos innecesarios una vez sabemos qué acepta cada par.
+_margin_mode_cache: dict = {}
+
 
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
@@ -154,9 +158,10 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
     # ÓRDENES — Unified Account: /api/v3/trade/place-order
     #
-    # La cuenta está en modo ONE-WAY (unilateral).
-    # En one-way mode NO se envía tradeSide — causa error 25236.
-    # Para cerrar se usa reduceOnly=YES en lugar de tradeSide=close.
+    # Error 25236 "Incorrect position open type":
+    #   Algunos pares solo aceptan marginMode=crossed, no isolated.
+    #   Solución: si falla con 25236, reintentar con crossed y cachear
+    #   el modo correcto para ese símbolo.
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -164,30 +169,30 @@ class FuturesTrader:
         """Convierte 'BTC/USDT:USDT' → 'BTCUSDT'"""
         return ccxt_symbol.split("/")[0] + ccxt_symbol.split("/")[1].split(":")[0]
 
+    def _effective_margin_mode(self) -> str:
+        """Devuelve el marginMode conocido para este símbolo, o el configurado por defecto."""
+        return _margin_mode_cache.get(self.symbol, self.margin_mode)
+
     async def _place_order(self, side: str, trade_side: str, qty: float,
                            reduce_only: bool = False) -> dict:
         """
-        Coloca orden de mercado via /api/v3/trade/place-order (Unified Account API).
-        side        : 'buy' | 'sell'
-        trade_side  : 'open' | 'close'  — solo se usa para logging; en one-way mode
-                      NO se envía a la API (error 25236).
-        qty         : cantidad en contratos
-        reduce_only : True para cerrar posición (one-way mode)
+        Coloca orden de mercado via /api/v3/trade/place-order.
+        Si recibe error 25236 con isolated, reintenta con crossed y lo cachea.
         """
         sym = self._bitget_symbol(self.symbol)
         path = "/api/v3/trade/place-order"
 
-        # One-way mode: NO incluir tradeSide en el payload
+        margin_mode = self._effective_margin_mode()
+
         payload = {
             "symbol":     sym,
             "category":   "USDT-FUTURES",
-            "marginMode": self.margin_mode,
+            "marginMode": margin_mode,
             "marginCoin": "USDT",
             "qty":        str(qty),
             "side":       side,
             "orderType":  "market",
         }
-        # Para cerrar en one-way mode se usa reduceOnly en lugar de tradeSide
         if reduce_only or trade_side == "close":
             payload["reduceOnly"] = "YES"
 
@@ -195,10 +200,24 @@ class FuturesTrader:
         resp = await self._http_post(path, payload)
         logger.info(f"[{self.symbol}] 📥 v3 order response: {resp}")
 
+        # Error 25236: marginMode incorrecto para este par → reintentar con crossed
+        if resp.get("code") == "25236" and margin_mode != "crossed":
+            logger.warning(
+                f"[{self.symbol}] ⚠️ 25236 con marginMode={margin_mode} → "
+                f"reintentando con crossed (solo este par)"
+            )
+            _margin_mode_cache[self.symbol] = "crossed"
+            payload["marginMode"] = "crossed"
+            logger.info(f"[{self.symbol}] 📤 v3 retry payload: {payload}")
+            resp = await self._http_post(path, payload)
+            logger.info(f"[{self.symbol}] 📥 v3 retry response: {resp}")
+
         if resp.get("code") == "00000":
             order_id = (resp.get("data") or {}).get("orderId", "?")
+            effective = payload["marginMode"]
             logger.info(
-                f"[{self.symbol}] ✅ Orden v3 {side}/{trade_side} qty={qty} | orderId={order_id}"
+                f"[{self.symbol}] ✅ Orden v3 {side}/{trade_side} qty={qty} "
+                f"marginMode={effective} | orderId={order_id}"
             )
             return resp
 
@@ -303,7 +322,6 @@ class FuturesTrader:
                     partial_qty  = round(size * ratio, 4)
                     pos_side     = str(p.get("holdSide") or p.get("side") or "").lower()
                     close_side   = "sell" if pos_side in ("long", "buy") else "buy"
-                    # one-way mode: usar reduceOnly en lugar de tradeSide=close
                     await self._place_order(close_side, "close", partial_qty, reduce_only=True)
                     logger.info(f"[{self.symbol}] TP parcial {ratio*100:.0f}% ({partial_qty} contratos)")
                     break
@@ -440,7 +458,6 @@ class FuturesTrader:
                     pos_side = str(p.get("holdSide") or p.get("side") or "").lower()
                     if size > 0:
                         close_side = "sell" if pos_side in ("long", "buy") else "buy"
-                        # one-way mode: reduceOnly=YES cierra la posición
                         await self._place_order(close_side, "close", size, reduce_only=True)
                         break
             except Exception as e:
