@@ -77,91 +77,108 @@ class FuturesTrader:
     async def _get_balance_direct(self) -> float:
         """
         Bitget Unified Account v2.
-        Los endpoints Classic (/api/v2/account/assets y /api/v2/account/all-account-balance)
-        devuelven error 40085 en modo Unified. Usamos los endpoints correctos.
+        Endpoint correcto: GET /api/v2/account/all-account-balance
+        Devuelve lista de assets de la cuenta Unified.
         """
         import json as _json
 
-        # Intento 1: ccxt con accountType=UNIFIED (mayúsculas requeridas por Bitget)
+        # Intento 1: GET /api/v2/account/all-account-balance (endpoint Unified real)
+        path1 = "/api/v2/account/all-account-balance?coin=USDT"
         try:
-            data = await self.exchange.fetch_balance({"accountType": "UNIFIED"})
-            usdt = data.get("USDT") or {}
-            free = float(usdt.get("free") or 0)
-            if free > 0:
-                logger.info(f"[{self.symbol}] ✅ Balance USDT (unified/ccxt): {free}")
-                return free
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] ❌ ccxt UNIFIED error: {e}")
-
-        # Intento 2: HTTP directo a /api/v2/unified/account/assets (endpoint correcto Unified)
-        path = "/api/v2/unified/account/assets?coin=USDT"
-        try:
-            headers = self._auth_headers("GET", path)
+            headers = self._auth_headers("GET", path1)
             async with aiohttp.ClientSession() as s:
                 async with s.get(
-                    "https://api.bitget.com" + path,
+                    "https://api.bitget.com" + path1,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     body = await resp.text()
-                    logger.warning(
-                        f"[{self.symbol}] 🌐 HTTP {path} → "
-                        f"status={resp.status} body={body[:300]}"
-                    )
-                    if resp.status == 200 and "00000" in body:
+                    if resp.status == 200:
                         jdata = _json.loads(body)
-                        assets = jdata.get("data") or []
-                        if isinstance(assets, dict):
-                            assets = [assets]
-                        for asset in assets:
-                            coin = str(
-                                asset.get("coin") or
-                                asset.get("coinName") or ""
-                            ).upper()
-                            if coin == "USDT":
-                                free = float(
-                                    asset.get("available") or
-                                    asset.get("availableAmount") or
-                                    0
-                                )
-                                logger.info(
-                                    f"[{self.symbol}] ✅ Balance HTTP unified/assets: {free} USDT"
-                                )
-                                return free
+                        if jdata.get("code") == "00000":
+                            assets = jdata.get("data") or []
+                            if isinstance(assets, dict):
+                                assets = [assets]
+                            for asset in assets:
+                                coin = str(asset.get("coin") or "").upper()
+                                if coin == "USDT":
+                                    free = float(
+                                        asset.get("available") or
+                                        asset.get("availableAmount") or
+                                        asset.get("cashBalance") or
+                                        0
+                                    )
+                                    logger.info(
+                                        f"[{self.symbol}] ✅ Balance USDT (all-account-balance): {free}"
+                                    )
+                                    return free
+                            # Si no hay coin=USDT en la lista, intenta con el primer item
+                            if assets:
+                                logger.warning(f"[{self.symbol}] all-account-balance data: {assets[:2]}")
+                        else:
+                            logger.warning(
+                                f"[{self.symbol}] all-account-balance error: {jdata.get('code')} {jdata.get('msg')}"
+                            )
+                    else:
+                        logger.warning(
+                            f"[{self.symbol}] all-account-balance HTTP {resp.status}: {body[:200]}"
+                        )
         except Exception as e:
-            logger.warning(f"[{self.symbol}] ❌ HTTP {path} error: {e}")
+            logger.warning(f"[{self.symbol}] ❌ all-account-balance error: {e}")
 
-        # Intento 3: GET /api/v2/mix/account/account con productType=USDT-FUTURES
-        path3 = "/api/v2/mix/account/account?productType=USDT-FUTURES&marginCoin=USDT"
+        # Intento 2: GET /api/v2/account/assets (Unified assets sin coin filter)
+        path2 = "/api/v2/account/assets?coin=USDT"
         try:
-            headers3 = self._auth_headers("GET", path3)
+            headers2 = self._auth_headers("GET", path2)
             async with aiohttp.ClientSession() as s:
                 async with s.get(
-                    "https://api.bitget.com" + path3,
-                    headers=headers3,
+                    "https://api.bitget.com" + path2,
+                    headers=headers2,
                     timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp3:
-                    body3 = await resp3.text()
-                    logger.warning(
-                        f"[{self.symbol}] 🌐 HTTP {path3} → "
-                        f"status={resp3.status} body={body3[:300]}"
-                    )
-                    if resp3.status == 200 and "00000" in body3:
-                        jdata3 = _json.loads(body3)
-                        d = jdata3.get("data") or {}
-                        free3 = float(
-                            d.get("available") or
-                            d.get("availableAmount") or
-                            d.get("usdtAvailable") or
-                            0
-                        )
-                        if free3 > 0:
-                            logger.info(
-                                f"[{self.symbol}] ✅ Balance HTTP mix/account: {free3} USDT"
+                ) as resp:
+                    body2 = await resp.text()
+                    if resp.status == 200:
+                        jdata2 = _json.loads(body2)
+                        if jdata2.get("code") == "00000":
+                            data2 = jdata2.get("data") or []
+                            if isinstance(data2, dict):
+                                data2 = [data2]
+                            for asset in data2:
+                                coin = str(asset.get("coin") or "").upper()
+                                if coin == "USDT":
+                                    free = float(
+                                        asset.get("available") or
+                                        asset.get("availableAmount") or
+                                        0
+                                    )
+                                    logger.info(
+                                        f"[{self.symbol}] ✅ Balance USDT (account/assets): {free}"
+                                    )
+                                    return free
+                        else:
+                            logger.warning(
+                                f"[{self.symbol}] account/assets: {jdata2.get('code')} {jdata2.get('msg')}"
                             )
-                            return free3
+                    else:
+                        logger.warning(
+                            f"[{self.symbol}] account/assets HTTP {resp.status}: {body2[:200]}"
+                        )
         except Exception as e:
-            logger.warning(f"[{self.symbol}] ❌ HTTP {path3} error: {e}")
+            logger.warning(f"[{self.symbol}] ❌ account/assets error: {e}")
+
+        # Intento 3: ccxt fetch_balance sin accountType (deja que ccxt detecte el tipo)
+        try:
+            data = await self.exchange.fetch_balance()
+            usdt = data.get("USDT") or {}
+            free = float(usdt.get("free") or 0)
+            if free > 0:
+                logger.info(f"[{self.symbol}] ✅ Balance USDT (ccxt default): {free}")
+                return free
+            # Loguea el total para debug
+            total = float(usdt.get("total") or 0)
+            logger.warning(f"[{self.symbol}] ccxt fetch_balance USDT free={free} total={total}")
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] ❌ ccxt fetch_balance error: {e}")
 
         logger.warning(
             f"[{self.symbol}] Balance = 0 — todos los endpoints fallaron. "
