@@ -2,16 +2,18 @@
 """
 strategy.py — Lógica de decisión de BotTrading
 
-Flujo:
-  1. analyze_pair → SignalResult con entry_mode (EARLY/NORMAL/STRONG/NONE)
-  2. STRONG (score>=8) → salta la IA, entra directo
-  3. NORMAL/EARLY     → confirma con IA
-  4. NONE             → HOLD
+Flujo y coste IA:
+  NONE   (score<5)  → HOLD directo, sin IA
+  EARLY  (score 5-6) → HOLD directo, sin IA  (éste era el mayor gasto)
+  NORMAL (score 7)   → HOLD directo, sin IA  (score insuficiente para arriesgarse)
+  NORMAL (score >=8) → confirma con IA
+  STRONG (score >=8) → entra directo, sin IA (máxima confluencia)
 
 Variables de entorno:
-  MIN_SIGNAL_SCORE  (default: 5)  — mínimo absoluto para activar cualquier modo
-  MIN_RR_REQUIRED   (default: 1.8)
-  SKIP_AI_ON_STRONG (default: true) — omite llamada a IA cuando modo=STRONG
+  MIN_SIGNAL_SCORE   (default: 5)   — mínimo para activar cualquier modo
+  MIN_RR_REQUIRED    (default: 1.8)
+  SKIP_AI_ON_STRONG  (default: true) — omite IA cuando modo=STRONG
+  AI_CALL_MIN_SCORE  (default: 8)    — score mínimo para llamar a la IA
 """
 
 import logging
@@ -31,6 +33,8 @@ log = logging.getLogger(__name__)
 MIN_SIGNAL_SCORE  = int(os.getenv("MIN_SIGNAL_SCORE",  str(MIN_SCORE)))
 MIN_RR_REQUIRED   = float(os.getenv("MIN_RR_REQUIRED", str(MIN_RR)))
 SKIP_AI_ON_STRONG = os.getenv("SKIP_AI_ON_STRONG", "true").lower() != "false"
+# Score mínimo para que vale la pena pagar una llamada a Gemini
+AI_CALL_MIN_SCORE = int(os.getenv("AI_CALL_MIN_SCORE", "8"))
 
 
 async def decide(
@@ -79,7 +83,7 @@ async def decide(
     if signal.signal == "NEUTRAL":
         return _result("HOLD", signal, False, "Señal técnica neutral")
 
-    # STRONG: si la confluencia es máxima (score>=8), entra sin IA
+    # STRONG: confluencia máxima → entra directo sin IA
     if signal.entry_mode == "STRONG" and SKIP_AI_ON_STRONG:
         action = "BUY" if signal.signal == "LONG" else "SELL"
         return _result(
@@ -87,7 +91,21 @@ async def decide(
             f"💥 STRONG entry directo · score={signal.score}/10 · lev={signal.suggested_lev}x"
         )
 
-    # EARLY / NORMAL: confirma con IA
+    # EARLY: score bajo (5-6), nunca justifica pagar llamada a IA → HOLD
+    if signal.entry_mode == "EARLY":
+        return _result(
+            "HOLD", signal, False,
+            f"⏭️ EARLY score={signal.score}/10 → HOLD sin IA (ahorro Gemini)"
+        )
+
+    # NORMAL: solo llamar a IA si el score es suficientemente alto
+    if signal.score < AI_CALL_MIN_SCORE:
+        return _result(
+            "HOLD", signal, False,
+            f"⏭️ NORMAL score={signal.score}/10 < {AI_CALL_MIN_SCORE} → HOLD sin IA (ahorro Gemini)"
+        )
+
+    # NORMAL con score >= AI_CALL_MIN_SCORE: confirma con IA
     i15 = signal.indicators.get("15m", {})
     i1h = signal.indicators.get("1h",  {})
     i4h = signal.indicators.get("4h",  {})
@@ -117,6 +135,8 @@ async def decide(
         "vol_ratio":     i15.get("vol_ratio", 1.0),
         "rsi_15m":       i15.get("rsi_val", 50),
     }
+
+    log.info(f"[strategy] {symbol} 🤖 Consultando IA (score={signal.score}/10, mode=NORMAL)")
 
     try:
         ai_action = await ai_decide_fn(symbol, context)
