@@ -14,37 +14,34 @@ GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:
 GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# ──────────────────────────────────────────────────────────────────────────────────
-# FLUJO (sin context_override):
-#   velas crudas → _technical_signal() → si HOLD: 0 IA
-#                                        → si BUY/SELL: 1 llamada IA
-#
-# FLUJO (con context_override desde signal_engine):
-#   contexto rico (score/10, 3TF, niveles ATR) → 1 llamada IA directo
-#   Salta _technical_signal() porque signal_engine ya lo hizo mejor
-# ──────────────────────────────────────────────────────────────────────────────────
-
 SYSTEM_PROMPT = """Trader experto futuros crypto. Confirma señal técnica recibida.
 Reglas: CLOSE si pnl>+3% o pnl<-1.5% | No BUY si rsi>70 | No SELL si rsi<30
 Vol_ratio>1.5 confirma, <0.7 debilita. Si duda → HOLD.
-JSON: {"action":"BUY"|"SELL"|"HOLD"|"CLOSE","confidence":1-10,"reason":"max 1 frase"}"""
+Responde SOLO con JSON válido, sin texto antes ni después, sin markdown:
+{"action":"BUY"|"SELL"|"HOLD"|"CLOSE","confidence":1-10,"reason":"max 1 frase"}"""
 
 
 def _parse_ai_json(raw: str) -> dict:
     """
-    Parsea JSON de respuesta IA de forma robusta:
-    - Elimina markdown fences (```json ... ``` o ``` ... ```)
-    - Elimina whitespace residual
-    - Lanza ValueError si vacío o inválido
+    Extrae JSON de respuesta IA de forma robusta:
+    1. Elimina markdown fences (```json ... ```)
+    2. Busca el primer '{' y el último '}' para aislar el objeto JSON
+       aunque la IA anteponga texto libre como 'Here is the JSON:'
+    3. Lanza ValueError si no hay JSON válido
     """
     raw = raw.strip()
-    # Eliminar fences al inicio y al final
+    # Paso 1: quitar fences de markdown
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     raw = raw.strip()
     if not raw:
         raise ValueError("Respuesta IA vacía tras strip")
-    return json.loads(raw)
+    # Paso 2: extraer contenido entre primer '{' y último '}'
+    start = raw.find("{")
+    end   = raw.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(f"No se encontró JSON en la respuesta: {raw[:120]!r}")
+    return json.loads(raw[start:end + 1])
 
 
 def build_market_context(symbol, bars, position, entry_price, leverage):
@@ -96,7 +93,6 @@ async def _call_gemini(context: dict):
     if not key:
         return None
 
-    # Número de reintentos ante 503 (modelo sobrecargado)
     max_retries = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
 
     try:
@@ -116,7 +112,6 @@ async def _call_gemini(context: dict):
                             "generationConfig": {
                                 "temperature": 0.1,
                                 "maxOutputTokens": 150,
-                                # Forzar respuesta JSON pura — evita markdown fences
                                 "responseMimeType": "application/json",
                             },
                         },
@@ -211,10 +206,6 @@ async def _call_groq(context: dict):
 
 
 def _technical_signal(bars) -> dict:
-    """
-    Evaluación técnica básica (1 TF) — solo se usa si NO viene context_override.
-    Cuando viene context_override (signal_engine, 3TF) este método se salta.
-    """
     closes = [b[4] for b in bars]
     highs  = [b[2] for b in bars]
     lows   = [b[3] for b in bars]
@@ -261,14 +252,8 @@ def _pnl_check(position, entry_price, current_price, leverage) -> str | None:
 
 async def ai_decide(symbol, bars, position, entry_price, leverage,
                     context_override: dict | None = None):
-    """
-    context_override: si viene del signal_engine (vía strategy.decide),
-    contiene score, dirección, niveles ATR, indicadores 3TF.
-    En ese caso se salta _technical_signal() y se va directo a la IA.
-    """
     current_price = bars[-1][4] if bars else (entry_price or 0)
 
-    # ── 1. Gestión posición abierta (sin IA) ────────────────────────────
     if position:
         close_reason = _pnl_check(position, entry_price, current_price, leverage)
         if close_reason:
@@ -279,7 +264,6 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         return {"action": "HOLD", "confidence": 5,
                 "reasoning": "Posición abierta, PnL dentro de rango", "key_factors": []}
 
-    # ── 2. Sin posición ────────────────────────────────────────────────────
     if context_override:
         context = context_override
         tech_signal = context_override.get("signal", "NEUTRAL")
@@ -295,7 +279,6 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         fallback_action = tech["signal"]
         logger.info(f"[{symbol}] Señal técnica {tech['signal']} → consultando IA")
 
-    # ── 3. Llamada IA (Gemini → Groq fallback) ────────────────────────────
     result = await _call_gemini(context)
     if not result:
         result = await _call_groq(context)
@@ -308,7 +291,6 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
             "key_factors": [],
         }
 
-    # ── 4. Filtro confianza mínima ──────────────────────────────────────────
     confidence = result.get("confidence", 5)
     min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "6"))
     if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
