@@ -51,9 +51,8 @@ class FuturesTrader:
         })
 
     # ─────────────────────────────────────────────────────────────
-    # BALANCE — Unified Account REST directa (sin ccxt fetch_balance)
-    # La Unified Account de Bitget NO soporta /api/v2/mix/account/accounts
-    # El endpoint correcto es /api/v2/unified/account/assets
+    # BALANCE — Unified Account REST directa
+    # Endpoint: GET /api/v2/unified/account/assets?coinName=USDT
     # ─────────────────────────────────────────────────────────────
 
     def _sign(self, ts: str, method: str, path: str, body: str = "") -> str:
@@ -67,12 +66,13 @@ class FuturesTrader:
     async def _get_balance_direct(self) -> float:
         """
         Obtiene balance USDT disponible en Unified Account.
-        Endpoint: GET /api/v2/unified/account/assets
+        Se añade coinName=USDT como query param para evitar
+        respuestas 404/text-plain que ocurren sin filtro.
         """
-        path = "/api/v2/unified/account/assets"
+        path_with_qs = "/api/v2/unified/account/assets?coinName=USDT"
+        path_for_sign = "/api/v2/unified/account/assets?coinName=USDT"
         ts   = str(int(time.time() * 1000))
-        # Sin query params para obtener todos los assets
-        sig  = self._sign(ts, "GET", path)
+        sig  = self._sign(ts, "GET", path_for_sign)
         headers = {
             "ACCESS-KEY":        self._api_key,
             "ACCESS-SIGN":       sig,
@@ -84,10 +84,18 @@ class FuturesTrader:
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.get(
-                    "https://api.bitget.com" + path,
+                    "https://api.bitget.com" + path_with_qs,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "json" not in content_type:
+                        body_text = await resp.text()
+                        logger.warning(
+                            f"[{self.symbol}] Balance: respuesta no-JSON "
+                            f"(status={resp.status}, ct={content_type}): {body_text[:120]}"
+                        )
+                        return 0.0
                     data = await resp.json()
 
             code = str(data.get("code", ""))
@@ -96,7 +104,6 @@ class FuturesTrader:
                 return 0.0
 
             assets = data.get("data") or []
-            # data puede ser lista o dict
             if isinstance(assets, dict):
                 assets = [assets]
             for asset in assets:
