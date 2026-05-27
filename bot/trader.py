@@ -154,19 +154,7 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
     # ÓRDENES — Unified Account: /api/v3/trade/place-order
     #
-    # Las Unified Accounts de Bitget usan la API v3 para trading.
-    # /api/v2/mix/order/* → error 40085 (Classic Account API, no soportada)
-    # /api/v3/trade/place-order → endpoint correcto para Unified Account
-    #
-    # Campos requeridos:
-    #   symbol      → "BTCUSDT" (sin /)
-    #   category    → "USDT-FUTURES" (mayúsculas, campo v3)
-    #   marginMode  → "crossed" | "isolated"
-    #   marginCoin  → "USDT"
-    #   size        → cantidad en contratos (string)
-    #   side        → "buy" | "sell"
-    #   tradeSide   → "open" | "close"
-    #   orderType   → "market"
+    # Bitget v3 Unified Account usa "qty" (no "size") para la cantidad.
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -183,14 +171,13 @@ class FuturesTrader:
         qty        : cantidad en contratos
         """
         sym = self._bitget_symbol(self.symbol)
-        # Unified Account usa /api/v3/trade/place-order con campo 'category'
         path = "/api/v3/trade/place-order"
         payload = {
             "symbol":     sym,
-            "category":   "USDT-FUTURES",  # campo v3, mayusculas
+            "category":   "USDT-FUTURES",
             "marginMode": self.margin_mode,
             "marginCoin": "USDT",
-            "size":       str(qty),
+            "qty":        str(qty),        # v3 usa "qty", no "size"
             "side":       side,
             "tradeSide":  trade_side,
             "orderType":  "market",
