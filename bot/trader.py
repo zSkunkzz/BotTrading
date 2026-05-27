@@ -63,12 +63,30 @@ class FuturesTrader:
             hashlib.sha256,
         ).hexdigest()
 
+    async def _bitget_get(self, path: str, params: dict) -> dict:
+        """GET autenticado contra la API Bitget Unified."""
+        qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        full_path = f"{path}?{qs}" if qs else path
+        ts        = str(int(time.time() * 1000))
+        signature = self._bitget_sign(ts, "GET", full_path, "")
+        headers   = {
+            "ACCESS-KEY":        self._api_key,
+            "ACCESS-SIGN":       signature,
+            "ACCESS-TIMESTAMP":  ts,
+            "ACCESS-PASSPHRASE": self._passphrase,
+            "Content-Type":      "application/json",
+            "locale":            "en-US",
+        }
+        url = "https://api.bitget.com" + full_path
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                return await resp.json()
+
     async def _set_leverage_direct(self):
         """
         Llama a POST /api/v2/mix/account/set-leverage directamente.
-        Compatibile con Unified Account (productType=USDT-FUTURES).
+        Compatible con Unified Account (productType=USDT-FUTURES).
         """
-        # ccxt usa el formato BASE/QUOTE:SETTLE → extraer solo "BASEQUOTE"
         base_symbol = self.symbol.split("/")[0] + "USDT"
         payload = {
             "symbol":      base_symbol,
@@ -99,6 +117,49 @@ class FuturesTrader:
                     )
                 else:
                     logger.debug(f"[{self.symbol}] Leverage x{self.leverage} OK (Unified)")
+
+    async def _get_balance_direct(self) -> float:
+        """
+        Obtiene el balance USDT disponible usando el endpoint Unified Account.
+        GET /api/v2/unified/account/assets — evita code40085 de la API clásica.
+        Si falla, intenta con /api/v2/mix/account/accounts como fallback.
+        """
+        # Intento 1: endpoint Unified
+        try:
+            data = await self._bitget_get(
+                "/api/v2/unified/account/assets",
+                {"assetType": "USDT"}
+            )
+            if str(data.get("code")) == "00000":
+                assets = data.get("data") or []
+                if isinstance(assets, list):
+                    for asset in assets:
+                        if asset.get("coin", "").upper() == "USDT":
+                            free = asset.get("available") or asset.get("availableAmount") or 0
+                            return float(free)
+                elif isinstance(assets, dict):
+                    free = assets.get("available") or assets.get("availableAmount") or 0
+                    return float(free)
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] Balance unified endpoint error: {e}")
+
+        # Intento 2: endpoint mix (futures clásico) como fallback
+        try:
+            data = await self._bitget_get(
+                "/api/v2/mix/account/accounts",
+                {"productType": "USDT-FUTURES"}
+            )
+            if str(data.get("code")) == "00000":
+                accounts = data.get("data") or []
+                for acc in accounts:
+                    if acc.get("marginCoin", "").upper() == "USDT":
+                        free = acc.get("available") or acc.get("availableAmount") or 0
+                        return float(free)
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] Balance mix endpoint error: {e}")
+
+        logger.warning(f"[{self.symbol}] No se pudo obtener balance — devolviendo 0")
+        return 0.0
 
     # ─────────────────────────────────────────────────────────────
     # INIT + RECUPERACIÓN DE ESTADO
@@ -141,12 +202,9 @@ class FuturesTrader:
         if self.dry_run:
             return 1000.0
         try:
-            bal  = await self.exchange.fetch_balance()
-            usdt = bal.get("USDT", {})
-            free = usdt.get("free") or usdt.get("available") or 0
-            return float(free)
+            return await self._get_balance_direct()
         except Exception as e:
-            logger.error(f"[{self.symbol}] Balance: {e}")
+            logger.error(f"[{self.symbol}] Balance bitget {e}")
             return 0
 
     async def get_price(self):
