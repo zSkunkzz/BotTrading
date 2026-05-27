@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import json
 import asyncio
 import aiohttp
@@ -27,6 +28,23 @@ SYSTEM_PROMPT = """Trader experto futuros crypto. Confirma señal técnica recib
 Reglas: CLOSE si pnl>+3% o pnl<-1.5% | No BUY si rsi>70 | No SELL si rsi<30
 Vol_ratio>1.5 confirma, <0.7 debilita. Si duda → HOLD.
 JSON: {"action":"BUY"|"SELL"|"HOLD"|"CLOSE","confidence":1-10,"reason":"max 1 frase"}"""
+
+
+def _parse_ai_json(raw: str) -> dict:
+    """
+    Parsea JSON de respuesta IA de forma robusta:
+    - Elimina markdown fences (```json ... ``` o ``` ... ```)
+    - Elimina whitespace residual
+    - Lanza ValueError si vacío o inválido
+    """
+    raw = raw.strip()
+    # Eliminar fences al inicio y al final
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
+    if not raw:
+        raise ValueError("Respuesta IA vacía tras strip")
+    return json.loads(raw)
 
 
 def build_market_context(symbol, bars, position, entry_price, leverage):
@@ -77,6 +95,10 @@ async def _call_gemini(context: dict):
     key = os.getenv("GEMINI_API_KEY", "")
     if not key:
         return None
+
+    # Número de reintentos ante 503 (modelo sobrecargado)
+    max_retries = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
+
     try:
         if not await budget.can_call_gemini():
             raise RateLimitExhausted("gemini")
@@ -84,35 +106,63 @@ async def _call_gemini(context: dict):
             await budget.register_gemini_call()
             url    = GEMINI_URL.format(model=GEMINI_MODEL) + f"?key={key}"
             prompt = SYSTEM_PROMPT + "\nDATA:" + json.dumps(context, ensure_ascii=False, separators=(',', ':'))
-            async with aiohttp.ClientSession() as s:
-                resp = await s.post(
-                    url,
-                    json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 150},
-                    },
-                    timeout=aiohttp.ClientTimeout(total=15),
-                )
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.warning(f"Gemini HTTP {resp.status}: {body[:300]}")
+
+            for attempt in range(1, max_retries + 2):
+                async with aiohttp.ClientSession() as s:
+                    resp = await s.post(
+                        url,
+                        json={
+                            "contents": [{"parts": [{"text": prompt}]}],
+                            "generationConfig": {
+                                "temperature": 0.1,
+                                "maxOutputTokens": 150,
+                                # Forzar respuesta JSON pura — evita markdown fences
+                                "responseMimeType": "application/json",
+                            },
+                        },
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    )
+
+                    if resp.status == 503:
+                        body = await resp.text()
+                        logger.warning(f"Gemini HTTP 503 (intento {attempt}/{max_retries+1}): {body[:200]}")
+                        if attempt <= max_retries:
+                            await asyncio.sleep(3 * attempt)
+                            continue
+                        return None
+
                     if resp.status == 429:
+                        logger.warning("Gemini HTTP 429 — rate limit")
                         await asyncio.sleep(5)
-                    return None
-                data = await resp.json()
-                if "candidates" not in data or not data["candidates"]:
-                    return None
-                finish_reason = data["candidates"][0].get("finishReason", "STOP")
-                if finish_reason not in ("STOP", "MAX_TOKENS"):
-                    return None
-                raw = data["candidates"][0]["content"]["parts"][0]["text"]
-                raw = raw.strip().strip("```json").strip("```").strip()
-                return json.loads(raw)
+                        return None
+
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.warning(f"Gemini HTTP {resp.status}: {body[:300]}")
+                        return None
+
+                    data = await resp.json()
+                    if "candidates" not in data or not data["candidates"]:
+                        logger.warning("Gemini: respuesta sin candidates")
+                        return None
+
+                    finish_reason = data["candidates"][0].get("finishReason", "STOP")
+                    if finish_reason not in ("STOP", "MAX_TOKENS"):
+                        logger.warning(f"Gemini finishReason inesperado: {finish_reason}")
+                        return None
+
+                    raw = data["candidates"][0]["content"]["parts"][0]["text"]
+                    try:
+                        return _parse_ai_json(raw)
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.warning(f"Gemini fall {e} | raw={raw[:120]!r}")
+                        return None
+
     except RateLimitExhausted as e:
         logger.warning(f"[Gemini] {e}")
         return None
     except Exception as e:
-        logger.warning(f"Gemini falló: {e}")
+        logger.warning(f"Gemini error inesperado: {e}")
         return None
 
 
@@ -146,12 +196,17 @@ async def _call_groq(context: dict):
                     logger.warning(f"Groq HTTP {resp.status}: {body[:200]}")
                     return None
                 data = await resp.json()
-                return json.loads(data["choices"][0]["message"]["content"])
+                raw = data["choices"][0]["message"]["content"]
+                try:
+                    return _parse_ai_json(raw)
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"Groq fall {e} | raw={raw[:120]!r}")
+                    return None
     except RateLimitExhausted as e:
         logger.warning(f"[Groq] {e}")
         return None
     except Exception as e:
-        logger.warning(f"Groq falló: {e}")
+        logger.warning(f"Groq error inesperado: {e}")
         return None
 
 
