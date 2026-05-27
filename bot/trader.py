@@ -1,9 +1,9 @@
 import asyncio
+import base64
 import logging
 import os
 import hmac
 import hashlib
-import json
 import time
 import aiohttp
 import ccxt.async_support as ccxt
@@ -46,101 +46,109 @@ class FuturesTrader:
             "password": passphrase,
             "options":  {
                 "defaultType": "swap",
-                "accountType": "unified",
             },
         })
 
     # ─────────────────────────────────────────────────────────────
-    # BALANCE
-    # Intenta en orden:
-    #   1. /api/v2/unified/account/assets  (sin query params — firma sobre path limpio)
-    #   2. /api/v2/mix/account/accounts?productType=USDT-FUTURES  (fallback futures)
+    # BALANCE via ccxt (método correcto para Bitget Unified)
     # ─────────────────────────────────────────────────────────────
 
-    def _sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
-        """HMAC-SHA256. path_with_qs debe incluir el query string si lo hay."""
+    async def _get_balance_direct(self) -> float:
+        """
+        Bitget Unified Account: fetch_balance con accountType=unified.
+        Fallback: productType USDT-FUTURES via mix endpoint ccxt.
+        ACCESS-SIGN debe ser Base64(HMAC-SHA256), no hex.
+        """
+        # Intento 1: Unified Account via ccxt
+        try:
+            data = await self.exchange.fetch_balance({"accountType": "unified"})
+            free = float(data.get("USDT", {}).get("free") or 0)
+            if free > 0:
+                logger.debug(f"[{self.symbol}] Balance USDT (unified/ccxt): {free}")
+                return free
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] fetch_balance unified error: {e}")
+
+        # Intento 2: USDT-FUTURES via ccxt
+        try:
+            data2 = await self.exchange.fetch_balance({"productType": "USDT-FUTURES"})
+            free2 = float(data2.get("USDT", {}).get("free") or 0)
+            if free2 > 0:
+                logger.debug(f"[{self.symbol}] Balance USDT (futures/ccxt): {free2}")
+                return free2
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] fetch_balance futures error: {e}")
+
+        # Intento 3: HTTP directo con firma Base64 correcta
+        try:
+            result = await self._fetch_balance_direct_http()
+            if result > 0:
+                return result
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] fetch_balance http error: {e}")
+
+        logger.warning(
+            f"[{self.symbol}] Balance = 0 — los 3 endpoints fallaron. "
+            "Verifica permisos API Key en Bitget."
+        )
+        return 0.0
+
+    def _sign_base64(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
+        """Bitget v2 requiere ACCESS-SIGN como Base64(HMAC-SHA256), no hex."""
         msg = ts + method.upper() + path_with_qs + body
-        return hmac.new(
+        raw = hmac.new(
             self._api_secret.encode(),
             msg.encode(),
             hashlib.sha256,
-        ).hexdigest()
+        ).digest()  # bytes, no hexdigest
+        return base64.b64encode(raw).decode()
 
     def _auth_headers(self, method: str, path_with_qs: str) -> dict:
         ts = str(int(time.time() * 1000))
         return {
             "ACCESS-KEY":        self._api_key,
-            "ACCESS-SIGN":       self._sign(ts, method, path_with_qs),
+            "ACCESS-SIGN":       self._sign_base64(ts, method, path_with_qs),
             "ACCESS-TIMESTAMP":  ts,
             "ACCESS-PASSPHRASE": self._passphrase,
             "Content-Type":      "application/json",
             "locale":            "en-US",
         }
 
-    async def _fetch_json(self, path_with_qs: str) -> dict | None:
-        """GET autenticado. Devuelve el JSON o None si la respuesta no es JSON."""
-        headers = self._auth_headers("GET", path_with_qs)
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://api.bitget.com" + path_with_qs,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    ct = resp.headers.get("Content-Type", "")
-                    if "json" not in ct:
-                        text = await resp.text()
-                        logger.debug(
-                            f"[{self.symbol}] {path_with_qs} → "
-                            f"status={resp.status} ct={ct} body={text[:80]}"
-                        )
-                        return None
-                    return await resp.json()
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] _fetch_json({path_with_qs}) error: {e}")
-            return None
-
-    async def _get_balance_direct(self) -> float:
-        # ——— Intento 1: Unified Account (sin query string; firma sobre path limpio) ———
-        data = await self._fetch_json("/api/v2/unified/account/assets")
-        if data and str(data.get("code", "")) == "00000":
-            assets = data.get("data") or []
-            if isinstance(assets, dict):
-                assets = [assets]
-            for asset in assets:
-                coin = (asset.get("coin") or asset.get("coinName") or "").upper()
-                if coin == "USDT":
-                    free = float(
-                        asset.get("available")
-                        or asset.get("availableAmount")
-                        or asset.get("available_amount")
-                        or 0
-                    )
-                    logger.debug(f"[{self.symbol}] Balance USDT (unified): {free}")
-                    return free
-
-        # ——— Intento 2: Futures mix account ———
-        qs = "?productType=USDT-FUTURES"
-        data2 = await self._fetch_json("/api/v2/mix/account/accounts" + qs)
-        if data2 and str(data2.get("code", "")) == "00000":
-            assets2 = data2.get("data") or []
-            if isinstance(assets2, dict):
-                assets2 = [assets2]
-            for asset in assets2:
-                coin = (asset.get("marginCoin") or asset.get("coin") or "").upper()
-                if coin == "USDT":
-                    free = float(
-                        asset.get("available")
-                        or asset.get("availableAmount")
-                        or 0
-                    )
-                    logger.debug(f"[{self.symbol}] Balance USDT (mix/futures): {free}")
-                    return free
-
-        logger.warning(
-            f"[{self.symbol}] Balance = 0 — ambos endpoints fallaron. "
-            "Revisa permisos API Key (Read en Unified Account + Futures)."
-        )
+    async def _fetch_balance_direct_http(self) -> float:
+        """Fallback HTTP directo con firma Base64 correcta."""
+        for path in [
+            "/api/v2/unified/account/assets",
+            "/api/v2/mix/account/accounts?productType=USDT-FUTURES",
+        ]:
+            headers = self._auth_headers("GET", path)
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(
+                        "https://api.bitget.com" + path,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        if "json" not in resp.headers.get("Content-Type", ""):
+                            continue
+                        data = await resp.json()
+                        if str(data.get("code")) != "00000":
+                            logger.debug(f"[{self.symbol}] HTTP balance {path} → code={data.get('code')} msg={data.get('msg')}")
+                            continue
+                        assets = data.get("data") or []
+                        if isinstance(assets, dict):
+                            assets = [assets]
+                        for asset in assets:
+                            coin = (asset.get("coin") or asset.get("marginCoin") or asset.get("coinName") or "").upper()
+                            if coin == "USDT":
+                                free = float(
+                                    asset.get("available")
+                                    or asset.get("availableAmount")
+                                    or 0
+                                )
+                                logger.debug(f"[{self.symbol}] Balance USDT (http/{path}): {free}")
+                                return free
+            except Exception as e:
+                logger.debug(f"[{self.symbol}] HTTP {path} error: {e}")
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
@@ -480,4 +488,8 @@ class FuturesTrader:
             await asyncio.sleep(interval)
 
     async def close(self):
-        await self.exchange.close()
+        """Cierra limpiamente la sesión ccxt al parar el trader."""
+        try:
+            await self.exchange.close()
+        except Exception:
+            pass
