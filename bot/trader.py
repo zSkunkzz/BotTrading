@@ -1,6 +1,10 @@
 import asyncio
 import logging
 import os
+import hmac
+import hashlib
+import json
+import time
 import aiohttp
 import ccxt.async_support as ccxt
 from bot.strategy import decide
@@ -47,44 +51,72 @@ class FuturesTrader:
         })
 
     # ─────────────────────────────────────────────────────────────
-    # BALANCE — via ccxt fetch_balance (fiable, sin firma manual)
+    # BALANCE — Unified Account REST directa (sin ccxt fetch_balance)
+    # La Unified Account de Bitget NO soporta /api/v2/mix/account/accounts
+    # El endpoint correcto es /api/v2/unified/account/assets
     # ─────────────────────────────────────────────────────────────
+
+    def _sign(self, ts: str, method: str, path: str, body: str = "") -> str:
+        msg = ts + method.upper() + path + body
+        return hmac.new(
+            self._api_secret.encode(),
+            msg.encode(),
+            hashlib.sha256,
+        ).hexdigest()
 
     async def _get_balance_direct(self) -> float:
         """
-        Obtiene el balance USDT disponible via ccxt fetch_balance.
-        Prueba primero con productType USDT-FUTURES, luego sin params.
+        Obtiene balance USDT disponible en Unified Account.
+        Endpoint: GET /api/v2/unified/account/assets
         """
-        for params in [
-            {"productType": "USDT-FUTURES"},
-            {"type": "swap"},
-            {},
-        ]:
-            try:
-                bal = await self.exchange.fetch_balance(params=params)
-                usdt = bal.get("USDT") or bal.get("usdt")
-                if usdt:
-                    free = usdt.get("free") or usdt.get("available") or 0
-                    if float(free) > 0:
-                        logger.debug(f"[{self.symbol}] Balance USDT: {free} (params={params})")
-                        return float(free)
-            except Exception as e:
-                logger.debug(f"[{self.symbol}] fetch_balance({params}) error: {e}")
-                continue
-
-        # último intento: leer total en vez de free
+        path = "/api/v2/unified/account/assets"
+        ts   = str(int(time.time() * 1000))
+        # Sin query params para obtener todos los assets
+        sig  = self._sign(ts, "GET", path)
+        headers = {
+            "ACCESS-KEY":        self._api_key,
+            "ACCESS-SIGN":       sig,
+            "ACCESS-TIMESTAMP":  ts,
+            "ACCESS-PASSPHRASE": self._passphrase,
+            "Content-Type":      "application/json",
+            "locale":            "en-US",
+        }
         try:
-            bal = await self.exchange.fetch_balance(params={"productType": "USDT-FUTURES"})
-            usdt = bal.get("USDT") or {}
-            total = usdt.get("total") or 0
-            if float(total) > 0:
-                logger.debug(f"[{self.symbol}] Balance USDT total: {total}")
-                return float(total)
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] Balance total error: {e}")
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    "https://api.bitget.com" + path,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = await resp.json()
 
-        logger.warning(f"[{self.symbol}] Balance USDT = 0 — revisa permisos API Key")
-        return 0.0
+            code = str(data.get("code", ""))
+            if code != "00000":
+                logger.warning(f"[{self.symbol}] Balance unified error: code={code} msg={data.get('msg')}")
+                return 0.0
+
+            assets = data.get("data") or []
+            # data puede ser lista o dict
+            if isinstance(assets, dict):
+                assets = [assets]
+            for asset in assets:
+                coin = (asset.get("coin") or asset.get("coinName") or "").upper()
+                if coin == "USDT":
+                    free = float(
+                        asset.get("available")
+                        or asset.get("availableAmount")
+                        or asset.get("available_amount")
+                        or 0
+                    )
+                    logger.debug(f"[{self.symbol}] Balance USDT disponible: {free}")
+                    return free
+
+            logger.warning(f"[{self.symbol}] USDT no encontrado en assets: {assets}")
+            return 0.0
+
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] _get_balance_direct error: {e}")
+            return 0.0
 
     # ─────────────────────────────────────────────────────────────
     # INIT
@@ -121,11 +153,11 @@ class FuturesTrader:
     async def get_balance(self):
         if self.dry_run:
             return 1000.0
-        try:
-            return await self._get_balance_direct()
-        except Exception as e:
-            logger.error(f"[{self.symbol}] Balance error: {e}")
-            return 0.0
+        bal = await self._get_balance_direct()
+        if bal > 0:
+            return bal
+        logger.warning(f"[{self.symbol}] Balance = 0 — revisa permisos API Key (necesita 'Read' en Unified Account)")
+        return 0.0
 
     async def get_price(self):
         t = await self.exchange.fetch_ticker(self.symbol)
