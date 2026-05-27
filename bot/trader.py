@@ -7,8 +7,15 @@ from bot.ai_trader import ai_decide
 from bot.telegram_bot import (
     notify_open, notify_close, notify_ai_decision, notify_risk_block
 )
+from bot.state import (
+    save_position, load_position, clear_position, mark_tp2_hit
+)
 
 logger = logging.getLogger("Trader")
+
+# Fracción del contrato que se cierra en TP2 (50% por defecto)
+TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
+# Fracción restante que se cierra en TP3 (el otro 50%)
 
 
 class FuturesTrader:
@@ -23,6 +30,9 @@ class FuturesTrader:
         self.sl           = None
         self.tp1          = None
         self.tp2          = None
+        self.tp3          = None
+        self.tp2_hit      = False   # TP2 parcial ya ejecutado
+        self.usdt_amount  = None
         self.trade_count  = 0
         self.win_count    = 0
         self.total_pnl    = 0.0
@@ -33,7 +43,11 @@ class FuturesTrader:
             "options":  {"defaultType": "swap"},
         })
 
-    async def _init(self):
+    # ─────────────────────────────────────────────────────────────
+    # INIT + RECUPERACIÓN DE ESTADO
+    # ─────────────────────────────────────────────────────────────
+
+    async def _init(self, usdt_amount: float):
         await self.exchange.load_markets()
         if not self.dry_run:
             try:
@@ -43,8 +57,32 @@ class FuturesTrader:
                 )
             except Exception as e:
                 logger.warning(f"[{self.symbol}] Leverage: {e}")
-        mode = "\U0001f9ea DRY" if self.dry_run else "\U0001f4b0 REAL"
-        logger.info(f"\u2705 [{self.symbol}] Listo | x{self.leverage} | {mode}")
+
+        # Recuperar estado persistido (si Railway reinició)
+        saved = load_position(self.symbol)
+        if saved:
+            self.position    = saved["position"]
+            self.entry_price = saved["entry_price"]
+            self.sl          = saved.get("sl")
+            self.tp1         = saved.get("tp1")
+            self.tp2         = saved.get("tp2")
+            self.tp3         = saved.get("tp3")
+            self.tp2_hit     = saved.get("tp2_hit", False)
+            self.usdt_amount = saved.get("usdt_amount", usdt_amount)
+            logger.warning(
+                f"[{self.symbol}] ♻️  Estado recuperado: "
+                f"{self.position} @ {self.entry_price} | "
+                f"SL={self.sl} TP1={self.tp1} TP2={self.tp2} TP3={self.tp3}"
+            )
+        else:
+            self.usdt_amount = usdt_amount
+
+        mode = "🧪 DRY" if self.dry_run else "💰 REAL"
+        logger.info(f"✅ [{self.symbol}] Listo | x{self.leverage} | {mode}")
+
+    # ─────────────────────────────────────────────────────────────
+    # EXCHANGE HELPERS
+    # ─────────────────────────────────────────────────────────────
 
     async def get_balance(self):
         if self.dry_run:
@@ -74,58 +112,153 @@ class FuturesTrader:
             params={"reduceOnly": False, "marginMode": self.margin_mode}
         )
 
-    async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None):
+    async def _partial_close_order(self, side, ratio: float):
+        """Cierra una fracción 'ratio' de la posición abierta."""
+        if self.dry_run:
+            logger.warning(f"[DRY][{self.symbol}] PARTIAL CLOSE {ratio*100:.0f}% {side.upper()}")
+            return
+        try:
+            positions = await self.exchange.fetch_positions([self.symbol])
+            for p in positions:
+                contracts = float(p.get("contracts") or p.get("size", 0))
+                if contracts > 0:
+                    partial_qty = round(contracts * ratio, 4)
+                    close_side  = "sell" if p["side"] == "long" else "buy"
+                    await self.exchange.create_order(
+                        self.symbol, "market", close_side, partial_qty,
+                        params={"reduceOnly": True}
+                    )
+                    logger.info(
+                        f"[{self.symbol}] TP parcial ejecutado: "
+                        f"{ratio*100:.0f}% ({partial_qty} contratos)"
+                    )
+                    break
+        except Exception as e:
+            logger.error(f"[{self.symbol}] Partial close error: {e}")
+
+    # ─────────────────────────────────────────────────────────────
+    # ABRIR POSICIÓN
+    # ─────────────────────────────────────────────────────────────
+
+    async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None):
         await self._open_order("buy", usdt_amount)
         self.position    = "long"
         self.entry_price = await self.get_price()
         self.sl          = sl
         self.tp1         = tp1
         self.tp2         = tp2
+        self.tp3         = tp3
+        self.tp2_hit     = False
+        self.usdt_amount = usdt_amount
         self.trade_count += 1
-        logger.warning(f"\U0001f4c8 [{self.symbol}] LONG @ {self.entry_price} | SL={sl} TP1={tp1}")
+        save_position(self.symbol, self.position, self.entry_price,
+                      self.sl, self.tp1, self.tp2, self.tp3, usdt_amount, self.leverage)
+        logger.warning(f"📈 [{self.symbol}] LONG @ {self.entry_price} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}")
         await notify_open(self.symbol, "long", self.entry_price,
                           self.leverage, usdt_amount, self.dry_run)
 
-    async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None):
+    async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None):
         await self._open_order("sell", usdt_amount)
         self.position    = "short"
         self.entry_price = await self.get_price()
         self.sl          = sl
         self.tp1         = tp1
         self.tp2         = tp2
+        self.tp3         = tp3
+        self.tp2_hit     = False
+        self.usdt_amount = usdt_amount
         self.trade_count += 1
-        logger.warning(f"\U0001f4c9 [{self.symbol}] SHORT @ {self.entry_price} | SL={sl} TP1={tp1}")
+        save_position(self.symbol, self.position, self.entry_price,
+                      self.sl, self.tp1, self.tp2, self.tp3, usdt_amount, self.leverage)
+        logger.warning(f"📉 [{self.symbol}] SHORT @ {self.entry_price} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}")
         await notify_open(self.symbol, "short", self.entry_price,
                           self.leverage, usdt_amount, self.dry_run)
 
-    def _check_sl_tp(self, price: float) -> str | None:
+    # ─────────────────────────────────────────────────────────────
+    # SL / TP CHECK — incluye TP2 parcial y TP3 completo
+    # ─────────────────────────────────────────────────────────────
+
+    async def _check_and_handle_sl_tp(self, price: float, risk, global_risk) -> bool:
+        """
+        Gestiona SL, TP1, TP2 parcial y TP3 completo.
+        Devuelve True si se cerró la posición (total o parcialmente y hay que continuar).
+        """
         if not self.position or not self.entry_price:
-            return None
+            return False
 
-        if self.sl and self.tp1:
-            if self.position == "long":
-                if price <= self.sl:
-                    return f"SL ATR tocado @ {price:.4f}"
-                if price >= self.tp1:
-                    return f"TP1 ATR alcanzado @ {price:.4f}"
+        is_long = self.position == "long"
+
+        # ── SL ──────────────────────────────────────────────────
+        if self.sl:
+            sl_hit = (price <= self.sl) if is_long else (price >= self.sl)
+            if sl_hit:
+                result = await self.close_position(f"SL @ {price:.4f}")
+                risk.on_trade_close(result.get("pnl_pct", 0))
+                if global_risk:
+                    await global_risk.register_close(result.get("pnl_pct", 0))
+                return True
+
+        # ── TP2 parcial (50%) ────────────────────────────────────
+        if self.tp2 and not self.tp2_hit:
+            tp2_hit = (price >= self.tp2) if is_long else (price <= self.tp2)
+            if tp2_hit:
+                logger.warning(f"[{self.symbol}] ✂️  TP2 parcial @ {price:.4f}")
+                await self._partial_close_order(
+                    "sell" if is_long else "buy", TP2_PARTIAL_RATIO
+                )
+                self.tp2_hit = True
+                mark_tp2_hit(self.symbol)
+                # Mover SL a break-even
+                self.sl = self.entry_price
+                # Notificar por Telegram
+                try:
+                    from bot.telegram_bot import notify_tp_partial
+                    await notify_tp_partial(self.symbol, self.position, price, 2, TP2_PARTIAL_RATIO)
+                except Exception:
+                    pass
+                return False  # No cerrar todo, seguir vigilando TP3
+
+        # ── TP3 completo ─────────────────────────────────────────
+        if self.tp3:
+            tp3_hit = (price >= self.tp3) if is_long else (price <= self.tp3)
+            if tp3_hit:
+                result = await self.close_position(f"TP3 @ {price:.4f}")
+                risk.on_trade_close(result.get("pnl_pct", 0))
+                if global_risk:
+                    await global_risk.register_close(result.get("pnl_pct", 0))
+                return True
+
+        # ── TP1 (si no hay TP2/TP3, cierre total en TP1) ─────────
+        if self.tp1 and not self.tp2:
+            tp1_hit = (price >= self.tp1) if is_long else (price <= self.tp1)
+            if tp1_hit:
+                result = await self.close_position(f"TP1 @ {price:.4f}")
+                risk.on_trade_close(result.get("pnl_pct", 0))
+                if global_risk:
+                    await global_risk.register_close(result.get("pnl_pct", 0))
+                return True
+
+        # ── Fallback % cuando no hay niveles ATR ─────────────────
+        if not self.sl and not self.tp1:
+            if is_long:
+                pnl = (price - self.entry_price) / self.entry_price * 100 * self.leverage
             else:
-                if price >= self.sl:
-                    return f"SL ATR tocado @ {price:.4f}"
-                if price <= self.tp1:
-                    return f"TP1 ATR alcanzado @ {price:.4f}"
-            return None
+                pnl = (self.entry_price - price) / self.entry_price * 100 * self.leverage
+            tp_pct = float(os.getenv("AI_TP_PCT",  "3.0"))
+            sl_pct = float(os.getenv("AI_SL_PCT", "-1.5"))
+            if pnl >= tp_pct or pnl <= sl_pct:
+                tag = f"TP +{pnl:.2f}%" if pnl >= tp_pct else f"SL {pnl:.2f}%"
+                result = await self.close_position(tag)
+                risk.on_trade_close(result.get("pnl_pct", 0))
+                if global_risk:
+                    await global_risk.register_close(result.get("pnl_pct", 0))
+                return True
 
-        if self.position == "long":
-            pnl = (price - self.entry_price) / self.entry_price * 100 * self.leverage
-        else:
-            pnl = (self.entry_price - price) / self.entry_price * 100 * self.leverage
-        tp_pct = float(os.getenv("AI_TP_PCT",  "3.0"))
-        sl_pct = float(os.getenv("AI_SL_PCT", "-1.5"))
-        if pnl >= tp_pct:
-            return f"TP +{pnl:.2f}% (fallback %)"
-        if pnl <= sl_pct:
-            return f"SL {pnl:.2f}% (fallback %)"
-        return None
+        return False
+
+    # ─────────────────────────────────────────────────────────────
+    # CERRAR POSICIÓN (completo)
+    # ─────────────────────────────────────────────────────────────
 
     async def close_position(self, reason=""):
         if not self.position:
@@ -156,7 +289,7 @@ class FuturesTrader:
             self.win_count += 1
         wr = self.win_count / self.trade_count * 100 if self.trade_count else 0
         logger.warning(
-            f"\U0001f512 [{self.symbol}] {self.position.upper()} cerrado | {reason} | "
+            f"🔒 [{self.symbol}] {self.position.upper()} cerrado | {reason} | "
             f"PnL: {pnl:+.2f}% | WR: {wr:.1f}%"
         )
         await notify_close(self.symbol, self.position, self.entry_price,
@@ -168,10 +301,17 @@ class FuturesTrader:
         self.sl          = None
         self.tp1         = None
         self.tp2         = None
+        self.tp3         = None
+        self.tp2_hit     = False
+        clear_position(self.symbol)
         return result
 
+    # ─────────────────────────────────────────────────────────────
+    # LOOP PRINCIPAL
+    # ─────────────────────────────────────────────────────────────
+
     async def run(self, risk, global_risk=None):
-        await self._init()
+        await self._init(risk.usdt_per_trade)
         interval = int(os.getenv("LOOP_INTERVAL", "60"))
         usdt     = risk.usdt_per_trade
         tf       = os.getenv("TIMEFRAME", "15m")
@@ -180,19 +320,14 @@ class FuturesTrader:
             try:
                 price = await self.get_price()
 
-                # ── 1. Gestión de posición abierta ──────────────────────────
+                # ── 1. Gestión de posición abierta ──────────────
                 if self.position:
-                    close_reason = self._check_sl_tp(price)
-                    if close_reason:
-                        logger.info(f"[{self.symbol}] Cierre automático: {close_reason}")
-                        result = await self.close_position(close_reason)
-                        risk.on_trade_close(result.get("pnl_pct", 0))
-                        if global_risk:
-                            await global_risk.register_close(result.get("pnl_pct", 0))
+                    closed = await self._check_and_handle_sl_tp(price, risk, global_risk)
+                    if closed:
                         await asyncio.sleep(interval)
                         continue
 
-                # ── 2. strategy.decide() → signal_engine + IA ───────────────
+                # ── 2. strategy.decide() ─────────────────────────
                 async def _ai_fn(sym, ctx):
                     bars = await self.fetch_ohlcv(tf, limit=100)
                     return (await ai_decide(
@@ -202,11 +337,11 @@ class FuturesTrader:
                     ))["action"]
 
                 decision = await decide(
-                    exch             = self.exchange,
-                    symbol           = self.symbol,
-                    ai_decide_fn     = _ai_fn,
-                    has_open_position= self.position is not None,
-                    current_pnl      = None,
+                    exch              = self.exchange,
+                    symbol            = self.symbol,
+                    ai_decide_fn      = _ai_fn,
+                    has_open_position = self.position is not None,
+                    current_pnl       = None,
                 )
 
                 action       = decision["action"]
@@ -221,7 +356,7 @@ class FuturesTrader:
                         f"{reason}\n{signal_block}"
                     )
 
-                # ── 3. Ejecutar acción ──────────────────────────────────────
+                # ── 3. Ejecutar acción ───────────────────────────
                 if action == "CLOSE" and self.position:
                     result = await self.close_position(reason[:60])
                     risk.on_trade_close(result.get("pnl_pct", 0))
@@ -244,6 +379,7 @@ class FuturesTrader:
                                 sl  = sig.sl   if sig else None,
                                 tp1 = sig.tp1  if sig else None,
                                 tp2 = sig.tp2  if sig else None,
+                                tp3 = sig.tp3  if sig else None,
                             )
                             risk.on_trade_open(self.entry_price, "long")
                             if global_risk:
@@ -269,6 +405,7 @@ class FuturesTrader:
                                 sl  = sig.sl   if sig else None,
                                 tp1 = sig.tp1  if sig else None,
                                 tp2 = sig.tp2  if sig else None,
+                                tp3 = sig.tp3  if sig else None,
                             )
                             risk.on_trade_open(self.entry_price, "short")
                             if global_risk:
