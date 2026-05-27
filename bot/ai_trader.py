@@ -1,6 +1,7 @@
 import logging
 import os
 import json
+import asyncio
 import aiohttp
 from bot.indicators import ema, rsi, macd, supertrend, atr
 
@@ -93,6 +94,62 @@ RESPONDE SOLO CON JSON VÁLIDO:
 }"""
 
 
+async def _call_gemini(context):
+    key = os.getenv("GEMINI_API_KEY", "")
+    if not key:
+        logger.warning("Gemini: GEMINI_API_KEY no configurada")
+        return None
+    try:
+        url = GEMINI_URL.format(model=GEMINI_MODEL) + f"?key={key}"
+        prompt = SYSTEM_PROMPT + "\n\nDATOS:\n" + json.dumps(context, ensure_ascii=False)
+        async with aiohttp.ClientSession() as s:
+            resp = await s.post(
+                url,
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 300},
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            )
+            # Log HTTP status si no es 200
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning(f"Gemini HTTP {resp.status}: {body[:300]}")
+                # Reintento tras rate limit
+                if resp.status == 429:
+                    await asyncio.sleep(2)
+                return None
+
+            data = await resp.json()
+
+            # Log respuesta completa si no tiene candidates
+            if "candidates" not in data:
+                logger.warning(f"Gemini sin candidates: {json.dumps(data)[:300]}")
+                return None
+
+            candidates = data["candidates"]
+            if not candidates:
+                logger.warning("Gemini: candidates vacío")
+                return None
+
+            # Safety check: finish_reason puede ser SAFETY o RECITATION
+            finish_reason = candidates[0].get("finishReason", "STOP")
+            if finish_reason not in ("STOP", "MAX_TOKENS"):
+                logger.warning(f"Gemini finishReason={finish_reason}, descartando")
+                return None
+
+            raw = candidates[0]["content"]["parts"][0]["text"]
+            raw = raw.strip().strip("```json").strip("```").strip()
+            return json.loads(raw)
+
+    except json.JSONDecodeError as e:
+        logger.warning(f"Gemini JSON inválido: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"Gemini falló: {e}")
+        return None
+
+
 async def _call_groq(context):
     key = os.getenv("GROQ_API_KEY", "")
     if not key:
@@ -114,33 +171,14 @@ async def _call_groq(context):
                 },
                 timeout=aiohttp.ClientTimeout(total=10),
             )
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning(f"Groq HTTP {resp.status}: {body[:200]}")
+                return None
             data = await resp.json()
             return json.loads(data["choices"][0]["message"]["content"])
     except Exception as e:
         logger.warning(f"Groq falló: {e}")
-        return None
-
-
-async def _call_gemini(context):
-    key = os.getenv("GEMINI_API_KEY", "")
-    if not key:
-        return None
-    try:
-        url = GEMINI_URL.format(model=GEMINI_MODEL) + f"?key={key}"
-        prompt = SYSTEM_PROMPT + "\n\nDATOS:\n" + json.dumps(context, ensure_ascii=False)
-        async with aiohttp.ClientSession() as s:
-            resp = await s.post(
-                url,
-                json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 0.1, "maxOutputTokens": 200}},
-                timeout=aiohttp.ClientTimeout(total=12),
-            )
-            data = await resp.json()
-            raw = data["candidates"][0]["content"]["parts"][0]["text"]
-            raw = raw.strip().strip("```json").strip("```").strip()
-            return json.loads(raw)
-    except Exception as e:
-        logger.warning(f"Gemini falló: {e}")
         return None
 
 
