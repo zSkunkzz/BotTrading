@@ -5,7 +5,7 @@ signal_engine.py — Motor de análisis técnico multi-timeframe (ASYNC)
 Modos de entrada (se exporta entry_mode en SignalResult):
   EARLY   score 5-6, 4h neutral/débil, 1h+15m alineados → lev 5-8x
   NORMAL  score 6-7, todos los TF alineados               → lev 8-14x
-  STRONG  score 8+, confluencia máxima                    → lev 14-20x
+  STRONG  score 8+, confluencia máxima                    → lev 14-15x
 """
 
 from __future__ import annotations
@@ -24,24 +24,23 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-MIN_SCORE       = 5          # mínimo para Early
-MIN_SCORE_FULL  = 6          # mínimo para Normal/Strong
+MIN_SCORE       = 5
+MIN_SCORE_FULL  = 6
 MIN_RR          = 1.8
-ATR_MULT_SL     = 1.2        # ajustado: entry más cercano al precio (antes 1.5)
+ATR_MULT_SL     = 1.2
 TP1_MULT        = 2.5
 TP2_MULT        = 4.0
 TP3_MULT        = 7.0
 
-# Leverage por modo (rango 5-20x)
+# Leverage por modo (rango 5-15x)
 LEV_EARLY_MIN   = 5
 LEV_EARLY_MAX   = 8
 LEV_NORMAL_MIN  = 8
 LEV_NORMAL_MAX  = 14
 LEV_STRONG_MIN  = 14
-LEV_STRONG_MAX  = 20
+LEV_STRONG_MAX  = 15   # techo bajado de 20x a 15x
 
-# Size relativo del modo Early
-EARLY_SIZE_RATIO = 0.5       # entra con 50% del size normal
+EARLY_SIZE_RATIO = 0.5
 
 
 @dataclass
@@ -50,7 +49,7 @@ class SignalResult:
     signal: str      = "NEUTRAL"
     score: int       = 0
     max_score: int   = 10
-    entry_mode: str  = "NONE"    # "EARLY" | "NORMAL" | "STRONG" | "NONE"
+    entry_mode: str  = "NONE"
     entry: float     = 0.0
     sl: float        = 0.0
     tp1: float       = 0.0
@@ -59,7 +58,7 @@ class SignalResult:
     rr: float        = 0.0
     atr: float       = 0.0
     suggested_lev: int  = 1
-    size_ratio: float   = 1.0    # 0.5 en EARLY, 1.0 en NORMAL/STRONG
+    size_ratio: float   = 1.0
     pct_tp3: float      = 0.0
     indicators: dict    = field(default_factory=dict)
     error: Optional[str] = None
@@ -97,7 +96,6 @@ async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataF
 
 
 def _supertrend_dir(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> int:
-    """Devuelve 1 (bullish), -1 (bearish) o 0 (indeterminado)."""
     try:
         h = df["high"].values
         l = df["low"].values
@@ -146,7 +144,6 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
     s: dict = {}
 
-    # 1. EMA Trend 9/21/50/200
     try:
         e9   = ta_lib.trend.ema_indicator(c, window=9).iloc[-1]
         e21  = ta_lib.trend.ema_indicator(c, window=21).iloc[-1]
@@ -161,7 +158,6 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     except Exception:
         s["ema_trend"] = s["ema200"] = 0
 
-    # 2. RSI 14
     try:
         r = ta_lib.momentum.rsi(c, window=14).iloc[-1]
         s["rsi_val"] = round(r, 1)
@@ -173,7 +169,6 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     except Exception:
         s["rsi"] = 0; s["rsi_val"] = 50
 
-    # 3. MACD 12/26/9
     try:
         macd_ind = ta_lib.trend.MACD(c, window_slow=26, window_fast=12, window_sign=9)
         ml  = macd_ind.macd().iloc[-1]
@@ -186,7 +181,6 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     except Exception:
         s["macd"] = 0
 
-    # 4. Bollinger Bands 20/2
     try:
         bb = ta_lib.volatility.BollingerBands(c, window=20, window_dev=2)
         mid  = bb.bollinger_mavg().iloc[-1]
@@ -202,7 +196,6 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     except Exception:
         s["bb"] = 0
 
-    # 5. Stochastic RSI 14/3/3
     try:
         stoch = ta_lib.momentum.StochRSIIndicator(c, window=14, smooth1=3, smooth2=3)
         k = stoch.stochrsi_k().iloc[-1] * 100
@@ -216,10 +209,8 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     except Exception:
         s["stoch"] = 0; s["stoch_k"] = s["stoch_d"] = 50
 
-    # 6. SuperTrend
     s["supertrend"] = _supertrend_dir(df)
 
-    # 7. Volumen
     try:
         vm = v.rolling(20).mean().iloc[-1]
         vr = v.iloc[-1] / vm if vm > 0 else 1.0
@@ -257,44 +248,29 @@ def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, int, str]:
 
 
 def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction: str) -> tuple[str, int, float]:
-    """
-    Clasifica el modo de entrada y devuelve (mode, leverage, size_ratio).
-
-    EARLY  → score 5-6 + 4h neutral o débil + 1h y 15m alineados
-    NORMAL → score 6-7, todos TF con señal
-    STRONG → score 8+, confluencia máxima
-
-    Leverage escala linealmente dentro del rango de cada modo:
-      EARLY  5–8x  | NORMAL 8–14x  | STRONG 14–20x
-    """
     sign = 1 if direction == "LONG" else -1
 
-    # alineación por TF
     tf4h_aligned = s4h.get("ema_trend", 0) * sign
     tf1h_aligned = s1h.get("ema_trend", 0) * sign
     tf15_aligned = s15.get("ema_trend", 0) * sign
 
-    # señales adicionales 1h y 15m
     extra_1h  = sum(1 for k in ("rsi", "supertrend", "macd") if s1h.get(k, 0) * sign > 0)
     extra_15m = sum(1 for k in ("macd", "stoch", "volume") if s15.get(k, 0) * sign > 0)
 
     if score >= 8:
-        mode = "STRONG"
-        # leverage lineal dentro del rango: 8 → 14x, 10 → 20x
-        ratio = min((score - 8) / 2.0, 1.0)  # 0.0 a 1.0
+        mode  = "STRONG"
+        ratio = min((score - 8) / 2.0, 1.0)
         lev   = round(LEV_STRONG_MIN + ratio * (LEV_STRONG_MAX - LEV_STRONG_MIN))
         return mode, lev, 1.0
 
-    if score >= MIN_SCORE_FULL:  # 6-7
+    if score >= MIN_SCORE_FULL:
         mode  = "NORMAL"
         ratio = min((score - MIN_SCORE_FULL) / 2.0, 1.0)
         lev   = round(LEV_NORMAL_MIN + ratio * (LEV_NORMAL_MAX - LEV_NORMAL_MIN))
         return mode, lev, 1.0
 
-    # score == 5: EARLY solo si 4h es neutral/débil y 1h+15m alineados
     if score == 5 and tf1h_aligned > 0 and tf15_aligned > 0 and tf4h_aligned <= 0:
-        # leverage dentro del rango Early según calidad de 1h+15m
-        quality = extra_1h + extra_15m  # 0-6
+        quality = extra_1h + extra_15m
         ratio   = min(quality / 6.0, 1.0)
         lev     = round(LEV_EARLY_MIN + ratio * (LEV_EARLY_MAX - LEV_EARLY_MIN))
         return "EARLY", lev, EARLY_SIZE_RATIO
@@ -322,7 +298,6 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         score, _, direction = _compute_score(s4h, s1h, s15)
         result.score = score
 
-        # clasificar modo antes de filtrar
         mode, lev, size_ratio = _classify_entry_mode(score, s4h, s1h, s15, direction)
 
         if mode == "NONE":
