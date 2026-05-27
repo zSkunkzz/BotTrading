@@ -3,6 +3,9 @@ import logging
 import os
 import ccxt.async_support as ccxt
 from bot.ai_trader import ai_decide
+from bot.telegram_bot import (
+    notify_open, notify_close, notify_ai_decision, notify_risk_block
+)
 
 logger = logging.getLogger("Trader")
 
@@ -36,8 +39,8 @@ class FuturesTrader:
                 )
             except Exception as e:
                 logger.warning(f"[{self.symbol}] Leverage: {e}")
-        mode = "🧪 DRY" if self.dry_run else "💰 REAL"
-        logger.info(f"✅ [{self.symbol}] Listo | x{self.leverage} | {mode}")
+        mode = "\U0001f9ea DRY" if self.dry_run else "\U0001f4b0 REAL"
+        logger.info(f"\u2705 [{self.symbol}] Listo | x{self.leverage} | {mode}")
 
     async def get_balance(self):
         if self.dry_run:
@@ -72,14 +75,18 @@ class FuturesTrader:
         self.position = "long"
         self.entry_price = await self.get_price()
         self.trade_count += 1
-        logger.warning(f"📈 [{self.symbol}] LONG abierto @ {self.entry_price}")
+        logger.warning(f"\U0001f4c8 [{self.symbol}] LONG abierto @ {self.entry_price}")
+        await notify_open(self.symbol, "long", self.entry_price,
+                          self.leverage, usdt_amount, self.dry_run)
 
     async def open_short(self, usdt_amount):
         await self._open_order("sell", usdt_amount)
         self.position = "short"
         self.entry_price = await self.get_price()
         self.trade_count += 1
-        logger.warning(f"📉 [{self.symbol}] SHORT abierto @ {self.entry_price}")
+        logger.warning(f"\U0001f4c9 [{self.symbol}] SHORT abierto @ {self.entry_price}")
+        await notify_open(self.symbol, "short", self.entry_price,
+                          self.leverage, usdt_amount, self.dry_run)
 
     async def close_position(self, reason=""):
         if not self.position:
@@ -108,9 +115,11 @@ class FuturesTrader:
             self.win_count += 1
         wr = self.win_count / self.trade_count * 100 if self.trade_count else 0
         logger.warning(
-            f"🔒 [{self.symbol}] {self.position.upper()} cerrado | {reason} | "
+            f"\U0001f512 [{self.symbol}] {self.position.upper()} cerrado | {reason} | "
             f"PnL: {pnl:+.2f}% | WR: {wr:.1f}%"
         )
+        await notify_close(self.symbol, self.position, self.entry_price,
+                           price, pnl, reason, self.dry_run)
         result = {"side": self.position, "entry": self.entry_price,
                   "exit": price, "pnl_pct": round(pnl, 2), "reason": reason}
         self.position = None
@@ -131,16 +140,20 @@ class FuturesTrader:
                     self.leverage
                 )
                 action = decision["action"]
+                confidence = decision.get("confidence", 5)
+                reasoning = decision.get("reasoning", "")
+
+                await notify_ai_decision(self.symbol, action, confidence, reasoning)
 
                 if action == "CLOSE" and self.position:
-                    result = await self.close_position(f"IA: {decision.get('reasoning','')[:50]}")
+                    result = await self.close_position(f"IA: {reasoning[:50]}")
                     risk.on_trade_close(result.get("pnl_pct", 0))
                     if global_risk:
                         await global_risk.register_close(result.get("pnl_pct", 0))
 
                 elif action == "BUY":
                     if self.position == "short":
-                        result = await self.close_position("IA reversión → LONG")
+                        result = await self.close_position("IA reversi\u00f3n \u2192 LONG")
                         risk.on_trade_close(result.get("pnl_pct", 0))
                         if global_risk:
                             await global_risk.register_close(result.get("pnl_pct", 0))
@@ -154,11 +167,13 @@ class FuturesTrader:
                             if global_risk:
                                 await global_risk.register_open()
                         else:
-                            logger.info(f"[{self.symbol}] ⛔ {r1 if not can_l else r2}")
+                            reason = r1 if not can_l else r2
+                            logger.info(f"[{self.symbol}] \u26d4 {reason}")
+                            await notify_risk_block(self.symbol, reason)
 
                 elif action == "SELL":
                     if self.position == "long":
-                        result = await self.close_position("IA reversión → SHORT")
+                        result = await self.close_position("IA reversi\u00f3n \u2192 SHORT")
                         risk.on_trade_close(result.get("pnl_pct", 0))
                         if global_risk:
                             await global_risk.register_close(result.get("pnl_pct", 0))
@@ -172,7 +187,9 @@ class FuturesTrader:
                             if global_risk:
                                 await global_risk.register_open()
                         else:
-                            logger.info(f"[{self.symbol}] ⛔ {r1 if not can_l else r2}")
+                            reason = r1 if not can_l else r2
+                            logger.info(f"[{self.symbol}] \u26d4 {reason}")
+                            await notify_risk_block(self.symbol, reason)
 
             except ccxt.NetworkError as e:
                 logger.error(f"[{self.symbol}] Red: {e}")

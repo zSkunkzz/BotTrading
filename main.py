@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-BitgetProBot v5.0 — IA decide BUY/SELL/HOLD/CLOSE + scanner dinámico multi-par
-"""
+"""BitgetProBot v5.1 \u2014 IA decisions + Scanner din\u00e1mico + Telegram"""
 
 import asyncio
 import logging
@@ -13,6 +11,7 @@ from bot.global_risk import GlobalRisk
 from bot.pair_scanner import PairScanner
 from bot.ai_filter import ai_rank_pairs
 from bot.logger import setup_logger
+from bot.telegram_bot import notify_startup, notify_scanner_update
 
 load_dotenv()
 logger = setup_logger()
@@ -37,7 +36,7 @@ def make_risk():
 async def start_pair(symbol: str):
     if symbol in active_traders:
         return
-    logger.info(f"🚀 Iniciando trader: {symbol}")
+    logger.info(f"\U0001f680 Iniciando trader: {symbol}")
     trader = FuturesTrader(
         api_key=os.getenv("BITGET_API_KEY"),
         api_secret=os.getenv("BITGET_API_SECRET"),
@@ -58,25 +57,28 @@ async def stop_pair(symbol: str):
         return
     task = active_traders.pop(symbol)
     task.cancel()
-    logger.info(f"⏹ Trader detenido: {symbol}")
+    logger.info(f"\u23f9 Trader detenido: {symbol}")
 
 
 async def on_pairs_updated(new_pairs: list):
     current = set(active_traders.keys())
     updated = set(new_pairs)
-    for sym in updated - current:
+    added   = updated - current
+    removed = current - updated
+    for sym in added:
         await asyncio.sleep(1)
         await start_pair(sym)
-    for sym in current - updated:
+    for sym in removed:
         await stop_pair(sym)
-    logger.info(f"📊 Traders activos: {len(active_traders)}")
+    await notify_scanner_update(added, removed, len(active_traders))
+    logger.info(f"\U0001f4ca Traders activos: {len(active_traders)}")
 
 
 async def main():
     global global_risk
 
     logger.info("=" * 60)
-    logger.info("  BitgetProBot v5.0 — IA decisions + Scanner dinámico")
+    logger.info("  BitgetProBot v5.1 \u2014 IA + Scanner + Telegram")
     logger.info("=" * 60)
 
     global_risk = GlobalRisk(
@@ -94,7 +96,7 @@ async def main():
         refresh_interval_min=int(os.getenv("SCANNER_REFRESH_MIN", "30")),
     )
 
-    logger.info("🔍 Escaneando mercado inicial...")
+    logger.info("\U0001f50d Escaneando mercado inicial...")
     initial_pairs = await scanner.scan()
 
     scored_data = []
@@ -110,13 +112,17 @@ async def main():
         except Exception:
             pass
 
-    logger.info("🤖 Filtrando con IA...")
+    logger.info("\U0001f916 Filtrando con IA...")
     ai_ranked = await ai_rank_pairs(scored_data)
     top_n = int(os.getenv("TOP_PAIRS", "15"))
     final_pairs = ai_ranked[:top_n]
 
-    logger.info(f"✅ Pares finales ({len(final_pairs)}): {', '.join(final_pairs)}")
+    logger.info(f"\u2705 Pares finales ({len(final_pairs)}): {', '.join(final_pairs)}")
     await on_pairs_updated(final_pairs)
+
+    dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+    await notify_startup(final_pairs, dry_run, top_n)
+
     await scanner.run_scanner_loop(on_pairs_updated)
 
 
