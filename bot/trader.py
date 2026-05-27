@@ -5,6 +5,7 @@ import os
 import hmac
 import hashlib
 import time
+import json as _json
 import aiohttp
 import ccxt.async_support as ccxt
 from bot.strategy import decide
@@ -50,11 +51,10 @@ class FuturesTrader:
         })
 
     # ─────────────────────────────────────────────────────────────
-    # BALANCE — Unified Account v2
+    # FIRMA
     # ─────────────────────────────────────────────────────────────
 
     def _make_sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
-        """Bitget v2: ACCESS-SIGN = Base64(HMAC-SHA256(ts+method+path+body))"""
         msg = ts + method.upper() + path_with_qs + body
         raw = hmac.new(
             self._api_secret.encode(),
@@ -63,74 +63,33 @@ class FuturesTrader:
         ).digest()
         return base64.b64encode(raw).decode()
 
-    def _auth_headers(self, method: str, path_with_qs: str) -> dict:
+    def _auth_headers(self, method: str, path_with_qs: str, body: str = "") -> dict:
         ts = str(int(time.time() * 1000))
         return {
             "ACCESS-KEY":        self._api_key,
-            "ACCESS-SIGN":       self._make_sign(ts, method, path_with_qs),
+            "ACCESS-SIGN":       self._make_sign(ts, method, path_with_qs, body),
             "ACCESS-TIMESTAMP":  ts,
             "ACCESS-PASSPHRASE": self._passphrase,
             "Content-Type":      "application/json",
             "locale":            "en-US",
         }
 
+    # ─────────────────────────────────────────────────────────────
+    # BALANCE — API v3 Unified Account (único endpoint válido)
+    # ─────────────────────────────────────────────────────────────
+
     async def _get_balance_direct(self) -> float:
         """
-        Bitget Unified Account v2.
-        Intentos en orden:
-          1. GET /api/v2/uta/account/account  (UTA nativo — el correcto para Unified Account)
-          2. GET /api/v2/unified/account/assets?coin=USDT
-          3. ccxt fetch_balance con accountType=unified
-          4. ccxt fetch_balance sin parametros
+        Bitget Unified Account — usa API v3 exclusivamente.
+        /api/v3/account/assets  →  devuelve lista de coins con campo 'available'
         """
-        import json as _json
-
-        # ── Intento 1: /api/v2/uta/account/account ─────────────────────────
-        # Endpoint nativo para cuentas Unified Trading Account (UTA)
-        path0 = "/api/v2/uta/account/account"
+        # ── Intento 1: API v3 /account/assets (el correcto para UTA) ──────
+        path_v3 = "/api/v3/account/assets"
         try:
-            headers0 = self._auth_headers("GET", path0)
+            headers = self._auth_headers("GET", path_v3)
             async with aiohttp.ClientSession() as s:
                 async with s.get(
-                    "https://api.bitget.com" + path0,
-                    headers=headers0,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    body0 = await resp.text()
-                    if resp.status == 200:
-                        jdata0 = _json.loads(body0)
-                        if jdata0.get("code") == "00000":
-                            d = jdata0.get("data") or {}
-                            free = float(
-                                d.get("usdtAvailableBalance") or
-                                d.get("availableBalance") or
-                                d.get("usdtMarginAvailable") or
-                                d.get("available") or
-                                0
-                            )
-                            logger.info(
-                                f"[{self.symbol}] ✅ Balance USDT (uta/account): {free}"
-                            )
-                            return free
-                        else:
-                            logger.warning(
-                                f"[{self.symbol}] uta/account "
-                                f"code={jdata0.get('code')}, msg={jdata0.get('msg')}"
-                            )
-                    else:
-                        logger.warning(
-                            f"[{self.symbol}] uta/account HTTP {resp.status}: {body0[:300]}"
-                        )
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] uta/account error: {e}")
-
-        # ── Intento 2: /api/v2/unified/account/assets ──────────────────────
-        path1 = "/api/v2/unified/account/assets?coin=USDT"
-        try:
-            headers = self._auth_headers("GET", path1)
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://api.bitget.com" + path1,
+                    "https://api.bitget.com" + path_v3,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
@@ -151,46 +110,87 @@ class FuturesTrader:
                                         0
                                     )
                                     logger.info(
-                                        f"[{self.symbol}] ✅ Balance USDT (unified/assets): {free}"
+                                        f"[{self.symbol}] ✅ Balance USDT (v3/assets): {free}"
                                     )
                                     return free
-                            if assets:
-                                logger.warning(f"[{self.symbol}] unified/assets data: {assets[:2]}")
+                            logger.warning(
+                                f"[{self.symbol}] v3/assets: USDT no encontrado. data={assets[:3]}"
+                            )
                         else:
                             logger.warning(
-                                f"[{self.symbol}] unified/assets "
-                                f"code={jdata.get('code')},msg={jdata.get('msg')}"
+                                f"[{self.symbol}] v3/assets code={jdata.get('code')} msg={jdata.get('msg')}"
                             )
                     else:
                         logger.warning(
-                            f"[{self.symbol}] unified/assets HTTP {resp.status}: {body[:300]}"
+                            f"[{self.symbol}] v3/assets HTTP {resp.status}: {body[:300]}"
                         )
         except Exception as e:
-            logger.warning(f"[{self.symbol}] unified/assets error: {e}")
+            logger.warning(f"[{self.symbol}] v3/assets error: {e}")
 
-        # ── Intento 3: ccxt con accountType=unified ───────────────────────
+        # ── Intento 2: API v3 /account/assets?coin=USDT ───────────────────
+        path_v3_coin = "/api/v3/account/assets?coin=USDT"
         try:
-            data = await self.exchange.fetch_balance({"accountType": "unified"})
-            usdt = data.get("USDT") or {}
-            free = float(usdt.get("free") or 0)
-            if free > 0:
-                logger.info(f"[{self.symbol}] ✅ Balance USDT (ccxt unified): {free}")
-                return free
-            total = float(usdt.get("total") or 0)
-            logger.warning(f"[{self.symbol}] ccxt unified free={free} total={total}")
+            headers = self._auth_headers("GET", path_v3_coin)
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    "https://api.bitget.com" + path_v3_coin,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        jdata = _json.loads(body)
+                        if jdata.get("code") == "00000":
+                            assets = jdata.get("data") or []
+                            if isinstance(assets, dict):
+                                assets = [assets]
+                            for asset in assets:
+                                free = float(
+                                    asset.get("available") or
+                                    asset.get("availableAmount") or
+                                    0
+                                )
+                                if free > 0:
+                                    logger.info(
+                                        f"[{self.symbol}] ✅ Balance USDT (v3/assets?coin=USDT): {free}"
+                                    )
+                                    return free
         except Exception as e:
-            logger.warning(f"[{self.symbol}] ccxt unified error: {e}")
+            logger.warning(f"[{self.symbol}] v3/assets?coin error: {e}")
 
-        # ── Intento 4: ccxt sin params ────────────────────────────────────
+        # ── Intento 3: mix/account/accounts (futuros USDT-FUTURES) ────────
+        path_mix = "/api/v2/mix/account/accounts?productType=USDT-FUTURES"
         try:
-            data = await self.exchange.fetch_balance()
-            usdt = data.get("USDT") or {}
-            free = float(usdt.get("free") or 0)
-            if free > 0:
-                logger.info(f"[{self.symbol}] ✅ Balance USDT (ccxt default): {free}")
-                return free
+            headers = self._auth_headers("GET", path_mix)
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    "https://api.bitget.com" + path_mix,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        jdata = _json.loads(body)
+                        if jdata.get("code") == "00000":
+                            accounts = jdata.get("data") or []
+                            if isinstance(accounts, dict):
+                                accounts = [accounts]
+                            for acc in accounts:
+                                coin = str(acc.get("marginCoin") or acc.get("coin") or "").upper()
+                                if coin == "USDT":
+                                    free = float(
+                                        acc.get("available") or
+                                        acc.get("crossMaxAvailable") or
+                                        acc.get("availableAmount") or
+                                        0
+                                    )
+                                    if free > 0:
+                                        logger.info(
+                                            f"[{self.symbol}] ✅ Balance USDT (mix/accounts): {free}"
+                                        )
+                                        return free
         except Exception as e:
-            logger.warning(f"[{self.symbol}] ccxt default error: {e}")
+            logger.warning(f"[{self.symbol}] mix/accounts error: {e}")
 
         logger.warning(
             f"[{self.symbol}] ⚠️ Balance = 0 — todos los endpoints fallaron."
@@ -253,10 +253,15 @@ class FuturesTrader:
                 "reduceOnly":  False,
                 "marginMode":  self.margin_mode,
                 "productType": "USDT-FUTURES",
+                "tradeSide":   "open",
             }
         )
 
     async def _partial_close_order(self, side, ratio: float):
+        """
+        Cierre parcial — Bitget Unified Account requiere tradeSide=close
+        para distinguir cierre de apertura nueva.
+        """
         if self.dry_run:
             logger.warning(f"[DRY][{self.symbol}] PARTIAL CLOSE {ratio*100:.0f}% {side.upper()}")
             return
@@ -272,7 +277,11 @@ class FuturesTrader:
                     close_side  = "sell" if p["side"] == "long" else "buy"
                     await self.exchange.create_order(
                         self.symbol, "market", close_side, partial_qty,
-                        params={"reduceOnly": True, "productType": "USDT-FUTURES"}
+                        params={
+                            "reduceOnly":  True,
+                            "productType": "USDT-FUTURES",
+                            "tradeSide":   "close",   # ← requerido en Unified Account
+                        }
                     )
                     logger.info(f"[{self.symbol}] TP parcial {ratio*100:.0f}% ({partial_qty} contratos)")
                     break
@@ -416,7 +425,11 @@ class FuturesTrader:
                         side = "sell" if p["side"] == "long" else "buy"
                         await self.exchange.create_order(
                             self.symbol, "market", side, contracts,
-                            params={"reduceOnly": True, "productType": "USDT-FUTURES"}
+                            params={
+                                "reduceOnly":  True,
+                                "productType": "USDT-FUTURES",
+                                "tradeSide":   "close",   # ← requerido en Unified Account
+                            }
                         )
                         break
             except Exception as e:
