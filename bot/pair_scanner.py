@@ -1,19 +1,36 @@
 import logging
 import asyncio
+import os
 import ccxt.async_support as ccxt
 
 logger = logging.getLogger("PairScanner")
+
+# Activos NO-crypto: acciones tokenizadas, ETFs, commodities, índices
+# Bitget los lista como swaps pero su comportamiento es distinto
+NON_CRYPTO_BASES = {
+    # Acciones tech
+    "AAPL", "TSLA", "NVDA", "AMZN", "GOOGL", "META", "MSFT", "NFLX",
+    "AMD", "INTC", "MU", "SNDK", "QCOM", "AVGO", "CRM", "ORCL",
+    # Commodities
+    "CL", "GC", "SI", "NG", "HG", "ZC", "ZW", "ZS",
+    # Índices
+    "SPX", "NDX", "DJI", "VIX",
+    # Acciones variadas
+    "COIN", "MSTR", "MARA", "RIOT", "BSB", "GME", "AMC",
+    "ABNB", "UBER", "LYFT", "SNAP", "PINS", "TWTR",
+}
 
 
 class PairScanner:
     """
     Escanea en tiempo real todos los pares USDT de futuros perpetuos en Bitget.
     Filtra por volumen, volatilidad y tendencia para elegir los mejores.
+    Solo opera pares crypto puros — excluye acciones tokenizadas y commodities.
     Se refresca cada X minutos para detectar pares nuevos automáticamente.
     """
 
     def __init__(self, api_key, api_secret, passphrase,
-                 min_volume_usdt=5_000_000,
+                 min_volume_usdt=20_000_000,
                  min_price_change_pct=1.5,
                  top_n=15,
                  refresh_interval_min=30):
@@ -28,6 +45,26 @@ class PairScanner:
         self.top_n = top_n
         self.refresh_interval = refresh_interval_min * 60
         self.active_pairs: list = []
+        # Blacklist adicional configurable via .env
+        # Ej: SYMBOL_BLACKLIST=ZEC,BSB,MU
+        extra = os.getenv("SYMBOL_BLACKLIST", "")
+        self.blacklist = NON_CRYPTO_BASES | {
+            s.strip().upper() for s in extra.split(",") if s.strip()
+        }
+
+    def _is_crypto_pair(self, symbol: str, market: dict) -> bool:
+        """Devuelve True solo si el par es crypto pura, no accion/commodity"""
+        base = market.get("base", "").upper()
+        # Excluir si el base está en la lista negra
+        if base in self.blacklist:
+            return False
+        # Los pares de acciones tokenizadas suelen tener / seguido de USDT:USDT
+        # pero el base tiene solo 2-5 letras que coinciden con tickers de bolsa.
+        # Heurística adicional: si el base tiene menos de 2 o más de 10 chars
+        # y no es crypto conocida, excluir.
+        if len(base) < 2 or len(base) > 10:
+            return False
+        return True
 
     async def get_all_usdt_perp_pairs(self) -> list:
         markets = await self.exchange.load_markets(reload=True)
@@ -37,8 +74,9 @@ class PairScanner:
             and m.get("type") == "swap"
             and m.get("active", True)
             and not m.get("expiry")
+            and self._is_crypto_pair(s, m)
         ]
-        logger.info(f"📋 Total pares USDT perp disponibles: {len(pairs)}")
+        logger.info(f"📋 Pares USDT perp crypto disponibles: {len(pairs)}")
         return pairs
 
     async def score_pair(self, symbol: str) -> dict | None:
@@ -75,10 +113,10 @@ class PairScanner:
             await asyncio.sleep(0.5)
         scored.sort(key=lambda x: x["score"], reverse=True)
         top = scored[:self.top_n]
-        logger.info(f"🏆 Top {len(top)} pares seleccionados:")
+        logger.info(f"🏆 Top {len(top)} pares crypto seleccionados:")
         for p in top[:5]:
             logger.info(
-                f"  {p['symbol']:<15} Vol: ${p['volume_usdt']}M | "
+                f"  {p['symbol']:<20} Vol: ${p['volume_usdt']}M | "
                 f"Cambio: {p['change_pct']}% | Score: {p['score']}"
             )
         return [p["symbol"] for p in top]
