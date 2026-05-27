@@ -42,12 +42,14 @@ class FuturesTrader:
         self._api_key     = api_key
         self._api_secret  = api_secret
         self._passphrase  = passphrase
+        # ccxt con opciones Unified Account
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
             "secret":   api_secret,
             "password": passphrase,
             "options":  {
                 "defaultType": "swap",
+                "defaultSubType": "linear",
                 "accountType": "unified",
             },
         })
@@ -79,7 +81,12 @@ class FuturesTrader:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, headers=headers,
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
-                return _json.loads(await r.text())
+                text = await r.text()
+                try:
+                    return _json.loads(text)
+                except Exception:
+                    logger.warning(f"_http_get non-JSON ({r.status}): {text[:200]}")
+                    return {"code": "ERR", "msg": text[:200]}
 
     async def _http_post(self, path: str, payload: dict) -> dict:
         body = _json.dumps(payload)
@@ -87,7 +94,12 @@ class FuturesTrader:
         async with aiohttp.ClientSession() as s:
             async with s.post(BITGET_BASE + path, headers=headers, data=body,
                               timeout=aiohttp.ClientTimeout(total=10)) as r:
-                return _json.loads(await r.text())
+                text = await r.text()
+                try:
+                    return _json.loads(text)
+                except Exception:
+                    logger.warning(f"_http_post non-JSON ({r.status}): {text[:200]}")
+                    return {"code": "ERR", "msg": text[:200]}
 
     # ─────────────────────────────────────────────────────────────
     # BALANCE
@@ -155,14 +167,14 @@ class FuturesTrader:
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
-    # ÓRDENES — HTTP directo (Bitget v2 Unified Account)
+    # ÓRDENES — ccxt con params Unified Account
     #
-    # Para Unified Account, Bitget exige:
-    #   POST /api/v2/mix/order/place-order
-    #   Con productType=USDT-FUTURES, marginMode, marginCoin, tradeSide
-    #
-    # Si ese endpoint devuelve 40085, se intenta el endpoint UTA directo:
-    #   POST /api/v2/uta/order/place-order
+    # ccxt.bitget.create_order acepta params extra que se pasan
+    # directamente al body de la request v2:
+    #   productType  → "USDT-FUTURES"
+    #   marginMode   → "crossed" | "isolated"
+    #   marginCoin   → "USDT"
+    #   tradeSide    → "open" | "close"
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -170,60 +182,62 @@ class FuturesTrader:
         """Convierte 'BTC/USDT:USDT' → 'BTCUSDT'"""
         return ccxt_symbol.split("/")[0] + ccxt_symbol.split("/")[1].split(":")[0]
 
-    def _build_order_payload(self, side: str, trade_side: str, qty: float) -> dict:
-        return {
-            "symbol":      self._bitget_symbol(self.symbol),
-            "productType": "USDT-FUTURES",
-            "marginMode":  self.margin_mode,   # "crossed" | "isolated"
-            "marginCoin":  "USDT",
-            "size":        str(qty),
-            "side":        side,               # "buy" | "sell"
-            "tradeSide":   trade_side,         # "open" | "close"
-            "orderType":   "market",
-        }
-
     async def _place_order(self, side: str, trade_side: str, qty: float,
                            reduce_only: bool = False) -> dict:
         """
-        Coloca una orden de mercado via HTTP directo.
-        Intenta /api/v2/mix/order/place-order primero.
-        Si devuelve 40085 (Classic API not supported), intenta
-        /api/v2/uta/order/place-order (endpoint nativo Unified).
+        Coloca una orden de mercado via ccxt con params Unified Account.
+        Si ccxt falla, intenta HTTP directo como fallback.
+        side       : 'buy' | 'sell'
+        trade_side : 'open' | 'close'
+        qty        : cantidad en contratos
         """
-        payload = self._build_order_payload(side, trade_side, qty)
+        params = {
+            "productType": "USDT-FUTURES",
+            "marginMode":  self.margin_mode,
+            "marginCoin":  "USDT",
+            "tradeSide":   trade_side,
+        }
+        if reduce_only:
+            params["reduceOnly"] = True
 
-        # --- Intento 1: endpoint mix (v2) ---
-        path_mix = "/api/v2/mix/order/place-order"
+        # --- Intento 1: ccxt ---
         try:
-            resp = await self._http_post(path_mix, payload)
-            code = resp.get("code")
-            if code == "00000":
-                logger.info(
-                    f"[{self.symbol}] 📤 Orden {side}/{trade_side} qty={qty} "
-                    f"| orderId={resp.get('data', {}).get('orderId')}"
-                )
-                return resp
-            if code != "40085":
-                # Error distinto al de cuenta unificada — lanzar directamente
-                raise Exception(f"place-order mix error {code}: {resp.get('msg')}")
-            logger.warning(
-                f"[{self.symbol}] ⚠️ 40085 en mix/order — intentando uta/order..."
+            resp = await self.exchange.create_order(
+                symbol=self.symbol,
+                type="market",
+                side=side,
+                amount=qty,
+                params=params,
             )
+            order_id = resp.get("id") or resp.get("info", {}).get("orderId", "?")
+            logger.info(
+                f"[{self.symbol}] 📤 Orden ccxt {side}/{trade_side} qty={qty} | orderId={order_id}"
+            )
+            return resp
         except Exception as e:
-            if "40085" not in str(e):
-                raise
-            logger.warning(f"[{self.symbol}] ⚠️ mix/order exc: {e} — fallback uta/order")
+            logger.warning(f"[{self.symbol}] ccxt create_order falló: {e} — intentando HTTP directo")
 
-        # --- Intento 2: endpoint UTA nativo ---
-        # /api/v2/uta/order/place-order acepta los mismos campos
-        path_uta = "/api/v2/uta/order/place-order"
-        resp2 = await self._http_post(path_uta, payload)
+        # --- Intento 2: HTTP directo ---
+        path = "/api/v2/mix/order/place-order"
+        payload = {
+            "symbol":      self._bitget_symbol(self.symbol),
+            "productType": "USDT-FUTURES",
+            "marginMode":  self.margin_mode,
+            "marginCoin":  "USDT",
+            "size":        str(qty),
+            "side":        side,
+            "tradeSide":   trade_side,
+            "orderType":   "market",
+        }
+        logger.info(f"[{self.symbol}] 📤 HTTP payload: {payload}")
+        resp2 = await self._http_post(path, payload)
+        logger.info(f"[{self.symbol}] 📥 HTTP response: {resp2}")
         if resp2.get("code") != "00000":
             raise Exception(
-                f"place-order uta error {resp2.get('code')}: {resp2.get('msg')}"
+                f"place-order HTTP error {resp2.get('code')}: {resp2.get('msg')}"
             )
         logger.info(
-            f"[{self.symbol}] 📤 Orden UTA {side}/{trade_side} qty={qty} "
+            f"[{self.symbol}] 📤 Orden HTTP {side}/{trade_side} qty={qty} "
             f"| orderId={resp2.get('data', {}).get('orderId')}"
         )
         return resp2
@@ -245,17 +259,12 @@ class FuturesTrader:
         except Exception as e:
             logger.warning(f"[{self.symbol}] get_positions: {e}")
 
-        # Fallback: /api/v2/uta/position/single-position
+        # Fallback ccxt
         try:
-            path2 = f"/api/v2/uta/position/single-position?symbol={sym}&productType=USDT-FUTURES&marginCoin=USDT"
-            r2 = await self._http_get(path2)
-            if r2.get("code") == "00000":
-                data2 = r2.get("data") or []
-                if isinstance(data2, dict):
-                    data2 = [data2]
-                return [p for p in data2 if float(p.get("total") or p.get("size", 0)) > 0]
+            positions = await self.exchange.fetch_positions([self.symbol])
+            return [p for p in positions if float(p.get("contracts") or 0) > 0]
         except Exception as e2:
-            logger.warning(f"[{self.symbol}] get_positions uta: {e2}")
+            logger.warning(f"[{self.symbol}] get_positions ccxt: {e2}")
 
         return []
 
@@ -321,11 +330,11 @@ class FuturesTrader:
         try:
             positions = await self._get_positions()
             for p in positions:
-                size = float(p.get("total") or p.get("size", 0))
+                size = float(p.get("total") or p.get("contracts") or p.get("size", 0))
                 if size > 0:
                     partial_qty  = round(size * ratio, 4)
                     pos_side     = str(p.get("holdSide") or p.get("side") or "").lower()
-                    close_side   = "sell" if pos_side == "long" else "buy"
+                    close_side   = "sell" if pos_side in ("long", "buy") else "buy"
                     await self._place_order(close_side, "close", partial_qty)
                     logger.info(f"[{self.symbol}] TP parcial {ratio*100:.0f}% ({partial_qty} contratos)")
                     break
@@ -458,10 +467,10 @@ class FuturesTrader:
             try:
                 positions = await self._get_positions()
                 for p in positions:
-                    size     = float(p.get("total") or p.get("size", 0))
+                    size     = float(p.get("total") or p.get("contracts") or p.get("size", 0))
                     pos_side = str(p.get("holdSide") or p.get("side") or "").lower()
                     if size > 0:
-                        close_side = "sell" if pos_side == "long" else "buy"
+                        close_side = "sell" if pos_side in ("long", "buy") else "buy"
                         await self._place_order(close_side, "close", size)
                         break
             except Exception as e:
