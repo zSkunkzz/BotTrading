@@ -77,13 +77,16 @@ class FuturesTrader:
     async def _get_balance_direct(self) -> float:
         """
         Bitget Unified Account v2.
-        Endpoint correcto: GET /api/v2/account/all-account-balance
-        Devuelve lista de assets de la cuenta Unified.
+        Intentos en orden:
+          1. GET /api/v2/unified/account/assets?coin=USDT  (Unified Account nativo)
+          2. GET /api/v2/mix/account/account?symbol=BTCUSDT&productType=USDT-FUTURES&marginCoin=USDT
+          3. ccxt fetch_balance con accountType=unified
+          4. ccxt fetch_balance sin parametros
         """
         import json as _json
 
-        # Intento 1: GET /api/v2/account/all-account-balance (endpoint Unified real)
-        path1 = "/api/v2/account/all-account-balance?coin=USDT"
+        # ── Intento 1: /api/v2/unified/account/assets ──────────────────────────
+        path1 = "/api/v2/unified/account/assets?coin=USDT"
         try:
             headers = self._auth_headers("GET", path1)
             async with aiohttp.ClientSession() as s:
@@ -105,29 +108,29 @@ class FuturesTrader:
                                     free = float(
                                         asset.get("available") or
                                         asset.get("availableAmount") or
-                                        asset.get("cashBalance") or
+                                        asset.get("crossMaxAvailable") or
                                         0
                                     )
                                     logger.info(
-                                        f"[{self.symbol}] ✅ Balance USDT (all-account-balance): {free}"
+                                        f"[{self.symbol}] ✅ Balance USDT (unified/assets): {free}"
                                     )
                                     return free
-                            # Si no hay coin=USDT en la lista, intenta con el primer item
                             if assets:
-                                logger.warning(f"[{self.symbol}] all-account-balance data: {assets[:2]}")
+                                logger.warning(f"[{self.symbol}] unified/assets data: {assets[:2]}")
                         else:
                             logger.warning(
-                                f"[{self.symbol}] all-account-balance error: {jdata.get('code')} {jdata.get('msg')}"
+                                f"[{self.symbol}] unified/assets "
+                                f"code={jdata.get('code')},msg={jdata.get('msg')}"
                             )
                     else:
                         logger.warning(
-                            f"[{self.symbol}] all-account-balance HTTP {resp.status}: {body[:200]}"
+                            f"[{self.symbol}] unified/assets HTTP {resp.status}: {body[:300]}"
                         )
         except Exception as e:
-            logger.warning(f"[{self.symbol}] ❌ all-account-balance error: {e}")
+            logger.warning(f"[{self.symbol}] unified/assets error: {e}")
 
-        # Intento 2: GET /api/v2/account/assets (Unified assets sin coin filter)
-        path2 = "/api/v2/account/assets?coin=USDT"
+        # ── Intento 2: /api/v2/mix/account/account ────────────────────────────
+        path2 = "/api/v2/mix/account/account?symbol=BTCUSDT&productType=USDT-FUTURES&marginCoin=USDT"
         try:
             headers2 = self._auth_headers("GET", path2)
             async with aiohttp.ClientSession() as s:
@@ -140,33 +143,47 @@ class FuturesTrader:
                     if resp.status == 200:
                         jdata2 = _json.loads(body2)
                         if jdata2.get("code") == "00000":
-                            data2 = jdata2.get("data") or []
-                            if isinstance(data2, dict):
-                                data2 = [data2]
-                            for asset in data2:
-                                coin = str(asset.get("coin") or "").upper()
-                                if coin == "USDT":
-                                    free = float(
-                                        asset.get("available") or
-                                        asset.get("availableAmount") or
-                                        0
-                                    )
-                                    logger.info(
-                                        f"[{self.symbol}] ✅ Balance USDT (account/assets): {free}"
-                                    )
-                                    return free
+                            d = jdata2.get("data") or {}
+                            free = float(
+                                d.get("available") or
+                                d.get("availableAmount") or
+                                d.get("crossMaxAvailable") or
+                                0
+                            )
+                            if free > 0:
+                                logger.info(
+                                    f"[{self.symbol}] ✅ Balance USDT (mix/account): {free}"
+                                )
+                                return free
+                            logger.warning(
+                                f"[{self.symbol}] mix/account data: {d}"
+                            )
                         else:
                             logger.warning(
-                                f"[{self.symbol}] account/assets: {jdata2.get('code')} {jdata2.get('msg')}"
+                                f"[{self.symbol}] mix/account "
+                                f"code={jdata2.get('code')},msg={jdata2.get('msg')}"
                             )
                     else:
                         logger.warning(
-                            f"[{self.symbol}] account/assets HTTP {resp.status}: {body2[:200]}"
+                            f"[{self.symbol}] mix/account HTTP {resp.status}: {body2[:300]}"
                         )
         except Exception as e:
-            logger.warning(f"[{self.symbol}] ❌ account/assets error: {e}")
+            logger.warning(f"[{self.symbol}] mix/account error: {e}")
 
-        # Intento 3: ccxt fetch_balance sin accountType (deja que ccxt detecte el tipo)
+        # ── Intento 3: ccxt con accountType=unified ───────────────────────────
+        try:
+            data = await self.exchange.fetch_balance({"accountType": "unified"})
+            usdt = data.get("USDT") or {}
+            free = float(usdt.get("free") or 0)
+            if free > 0:
+                logger.info(f"[{self.symbol}] ✅ Balance USDT (ccxt unified): {free}")
+                return free
+            total = float(usdt.get("total") or 0)
+            logger.warning(f"[{self.symbol}] ccxt unified free={free} total={total}")
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] ccxt unified error: {e}")
+
+        # ── Intento 4: ccxt sin params ────────────────────────────────────────
         try:
             data = await self.exchange.fetch_balance()
             usdt = data.get("USDT") or {}
@@ -174,15 +191,11 @@ class FuturesTrader:
             if free > 0:
                 logger.info(f"[{self.symbol}] ✅ Balance USDT (ccxt default): {free}")
                 return free
-            # Loguea el total para debug
-            total = float(usdt.get("total") or 0)
-            logger.warning(f"[{self.symbol}] ccxt fetch_balance USDT free={free} total={total}")
         except Exception as e:
-            logger.warning(f"[{self.symbol}] ❌ ccxt fetch_balance error: {e}")
+            logger.warning(f"[{self.symbol}] ccxt default error: {e}")
 
         logger.warning(
-            f"[{self.symbol}] Balance = 0 — todos los endpoints fallaron. "
-            "Verifica permisos API Key (Read Account + Trade) y que la cuenta sea Unified."
+            f"[{self.symbol}] ⚠️ Balance = 0 — todos los endpoints fallaron."
         )
         return 0.0
 
