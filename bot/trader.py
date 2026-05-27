@@ -51,36 +51,35 @@ class FuturesTrader:
         })
 
     # ─────────────────────────────────────────────────────────────
-    # BALANCE — Unified Account REST directa
-    # Endpoint: GET /api/v2/unified/account/assets?coinName=USDT
+    # BALANCE
+    # Intenta en orden:
+    #   1. /api/v2/unified/account/assets  (sin query params — firma sobre path limpio)
+    #   2. /api/v2/mix/account/accounts?productType=USDT-FUTURES  (fallback futures)
     # ─────────────────────────────────────────────────────────────
 
-    def _sign(self, ts: str, method: str, path: str, body: str = "") -> str:
-        msg = ts + method.upper() + path + body
+    def _sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
+        """HMAC-SHA256. path_with_qs debe incluir el query string si lo hay."""
+        msg = ts + method.upper() + path_with_qs + body
         return hmac.new(
             self._api_secret.encode(),
             msg.encode(),
             hashlib.sha256,
         ).hexdigest()
 
-    async def _get_balance_direct(self) -> float:
-        """
-        Obtiene balance USDT disponible en Unified Account.
-        Se añade coinName=USDT como query param para evitar
-        respuestas 404/text-plain que ocurren sin filtro.
-        """
-        path_with_qs = "/api/v2/unified/account/assets?coinName=USDT"
-        path_for_sign = "/api/v2/unified/account/assets?coinName=USDT"
-        ts   = str(int(time.time() * 1000))
-        sig  = self._sign(ts, "GET", path_for_sign)
-        headers = {
+    def _auth_headers(self, method: str, path_with_qs: str) -> dict:
+        ts = str(int(time.time() * 1000))
+        return {
             "ACCESS-KEY":        self._api_key,
-            "ACCESS-SIGN":       sig,
+            "ACCESS-SIGN":       self._sign(ts, method, path_with_qs),
             "ACCESS-TIMESTAMP":  ts,
             "ACCESS-PASSPHRASE": self._passphrase,
             "Content-Type":      "application/json",
             "locale":            "en-US",
         }
+
+    async def _fetch_json(self, path_with_qs: str) -> dict | None:
+        """GET autenticado. Devuelve el JSON o None si la respuesta no es JSON."""
+        headers = self._auth_headers("GET", path_with_qs)
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.get(
@@ -88,21 +87,23 @@ class FuturesTrader:
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
-                    content_type = resp.headers.get("Content-Type", "")
-                    if "json" not in content_type:
-                        body_text = await resp.text()
-                        logger.warning(
-                            f"[{self.symbol}] Balance: respuesta no-JSON "
-                            f"(status={resp.status}, ct={content_type}): {body_text[:120]}"
+                    ct = resp.headers.get("Content-Type", "")
+                    if "json" not in ct:
+                        text = await resp.text()
+                        logger.debug(
+                            f"[{self.symbol}] {path_with_qs} → "
+                            f"status={resp.status} ct={ct} body={text[:80]}"
                         )
-                        return 0.0
-                    data = await resp.json()
+                        return None
+                    return await resp.json()
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] _fetch_json({path_with_qs}) error: {e}")
+            return None
 
-            code = str(data.get("code", ""))
-            if code != "00000":
-                logger.warning(f"[{self.symbol}] Balance unified error: code={code} msg={data.get('msg')}")
-                return 0.0
-
+    async def _get_balance_direct(self) -> float:
+        # ——— Intento 1: Unified Account (sin query string; firma sobre path limpio) ———
+        data = await self._fetch_json("/api/v2/unified/account/assets")
+        if data and str(data.get("code", "")) == "00000":
             assets = data.get("data") or []
             if isinstance(assets, dict):
                 assets = [assets]
@@ -115,15 +116,32 @@ class FuturesTrader:
                         or asset.get("available_amount")
                         or 0
                     )
-                    logger.debug(f"[{self.symbol}] Balance USDT disponible: {free}")
+                    logger.debug(f"[{self.symbol}] Balance USDT (unified): {free}")
                     return free
 
-            logger.warning(f"[{self.symbol}] USDT no encontrado en assets: {assets}")
-            return 0.0
+        # ——— Intento 2: Futures mix account ———
+        qs = "?productType=USDT-FUTURES"
+        data2 = await self._fetch_json("/api/v2/mix/account/accounts" + qs)
+        if data2 and str(data2.get("code", "")) == "00000":
+            assets2 = data2.get("data") or []
+            if isinstance(assets2, dict):
+                assets2 = [assets2]
+            for asset in assets2:
+                coin = (asset.get("marginCoin") or asset.get("coin") or "").upper()
+                if coin == "USDT":
+                    free = float(
+                        asset.get("available")
+                        or asset.get("availableAmount")
+                        or 0
+                    )
+                    logger.debug(f"[{self.symbol}] Balance USDT (mix/futures): {free}")
+                    return free
 
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] _get_balance_direct error: {e}")
-            return 0.0
+        logger.warning(
+            f"[{self.symbol}] Balance = 0 — ambos endpoints fallaron. "
+            "Revisa permisos API Key (Read en Unified Account + Futures)."
+        )
+        return 0.0
 
     # ─────────────────────────────────────────────────────────────
     # INIT
@@ -160,11 +178,7 @@ class FuturesTrader:
     async def get_balance(self):
         if self.dry_run:
             return 1000.0
-        bal = await self._get_balance_direct()
-        if bal > 0:
-            return bal
-        logger.warning(f"[{self.symbol}] Balance = 0 — revisa permisos API Key (necesita 'Read' en Unified Account)")
-        return 0.0
+        return await self._get_balance_direct()
 
     async def get_price(self):
         t = await self.exchange.fetch_ticker(self.symbol)

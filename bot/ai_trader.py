@@ -12,7 +12,7 @@ logger = logging.getLogger("AITrader")
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-05-20")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 SYSTEM_PROMPT = """You are a crypto futures trading expert. Reply ONLY with a JSON object, nothing else.
 Rules: CLOSE if pnl>+3% or pnl<-1.5% | No BUY if rsi>70 | No SELL if rsi<30 | vol_ratio>1.5 confirms, <0.7 weakens | If unsure -> HOLD
