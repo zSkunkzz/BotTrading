@@ -20,9 +20,9 @@ class FuturesTrader:
         self.dry_run      = dry_run
         self.position     = None
         self.entry_price  = None
-        self.sl           = None   # Stop-loss calculado por ATR (signal_engine)
-        self.tp1          = None   # Take-profit 1 calculado por ATR
-        self.tp2          = None   # Take-profit 2 calculado por ATR
+        self.sl           = None
+        self.tp1          = None
+        self.tp2          = None
         self.trade_count  = 0
         self.win_count    = 0
         self.total_pnl    = 0.0
@@ -99,28 +99,22 @@ class FuturesTrader:
                           self.leverage, usdt_amount, self.dry_run)
 
     def _check_sl_tp(self, price: float) -> str | None:
-        """
-        Comprueba SL/TP por precio absoluto (signal_engine ATR).
-        Fallback a PnL % si no hay niveles guardados.
-        """
         if not self.position or not self.entry_price:
             return None
 
-        # ── Niveles por precio absoluto (signal_engine) ─────────────────
         if self.sl and self.tp1:
             if self.position == "long":
                 if price <= self.sl:
                     return f"SL ATR tocado @ {price:.4f}"
                 if price >= self.tp1:
                     return f"TP1 ATR alcanzado @ {price:.4f}"
-            else:  # short
+            else:
                 if price >= self.sl:
                     return f"SL ATR tocado @ {price:.4f}"
                 if price <= self.tp1:
                     return f"TP1 ATR alcanzado @ {price:.4f}"
             return None
 
-        # ── Fallback: PnL % (env vars) ────────────────────────────────
         if self.position == "long":
             pnl = (price - self.entry_price) / self.entry_price * 100 * self.leverage
         else:
@@ -176,7 +170,7 @@ class FuturesTrader:
         self.tp2         = None
         return result
 
-    async def run(self, strategy, risk, global_risk=None):
+    async def run(self, risk, global_risk=None):
         await self._init()
         interval = int(os.getenv("LOOP_INTERVAL", "60"))
         usdt     = risk.usdt_per_trade
@@ -186,7 +180,7 @@ class FuturesTrader:
             try:
                 price = await self.get_price()
 
-                # ── 1. Gestión de posición abierta por precio (SL/TP ATR) ───────
+                # ── 1. Gestión de posición abierta ──────────────────────────
                 if self.position:
                     close_reason = self._check_sl_tp(price)
                     if close_reason:
@@ -198,9 +192,8 @@ class FuturesTrader:
                         await asyncio.sleep(interval)
                         continue
 
-                # ── 2. strategy.decide() → signal_engine + IA ─────────────────
+                # ── 2. strategy.decide() → signal_engine + IA ───────────────
                 async def _ai_fn(sym, ctx):
-                    """Wrapper que pasa el context enriquecido a ai_decide."""
                     bars = await self.fetch_ohlcv(tf, limit=100)
                     return (await ai_decide(
                         sym, bars,

@@ -23,23 +23,22 @@ import pandas as pd
 try:
     import ta as ta_lib
 except ImportError:
-    ta_lib = None  # se lanza error claro más abajo
+    ta_lib = None
 
 log = logging.getLogger(__name__)
 
-# ── Parámetros por defecto (sobreescribibles por env) ────────────────────────
-MIN_SCORE   = 6      # Score mínimo /10 para considerar señal válida
-MIN_RR      = 1.8    # Ratio Riesgo/Beneficio mínimo
-ATR_MULT_SL = 1.5    # Multiplicador ATR para Stop Loss
-TP1_MULT    = 2.5    # R×2.5 → cerrar 40%
-TP2_MULT    = 4.0    # R×4.0 → cerrar 35%
-TP3_MULT    = 7.0    # R×7.0 → dejar correr 25%
+MIN_SCORE   = 6
+MIN_RR      = 1.8
+ATR_MULT_SL = 1.5
+TP1_MULT    = 2.5
+TP2_MULT    = 4.0
+TP3_MULT    = 7.0
 
 
 @dataclass
 class SignalResult:
     symbol: str
-    signal: str = "NEUTRAL"   # LONG | SHORT | NEUTRAL
+    signal: str = "NEUTRAL"
     score: int = 0
     max_score: int = 10
     entry: float = 0.0
@@ -59,7 +58,6 @@ class SignalResult:
         return self.signal in ("LONG", "SHORT") and self.score >= MIN_SCORE and self.rr >= MIN_RR
 
     def summary(self) -> str:
-        """Texto corto para logs / notificaciones."""
         if not self.is_valid:
             return f"{self.symbol} · NEUTRAL · Score {self.score}/10"
         dir_emoji = "🟢" if self.signal == "LONG" else "🔴"
@@ -70,10 +68,7 @@ class SignalResult:
         )
 
 
-# ── Utilidades OHLCV (ASYNC) ─────────────────────────────────────────────────
-
 async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataFrame:
-    """Devuelve DataFrame OHLCV con índice datetime UTC."""
     try:
         raw = await exch.fetch_ohlcv(symbol, tf, limit=limit)
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -84,40 +79,56 @@ async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataF
         return pd.DataFrame()
 
 
-# ── SuperTrend manual ────────────────────────────────────────────────────────
-
 def _supertrend_dir(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> int:
-    """Devuelve 1 (bullish), -1 (bearish) o 0 (indeterminado)."""
+    """Devuelve 1 (bullish), -1 (bearish) o 0 (indeterminado).
+    Usa arrays numpy para evitar ChainedAssignmentError en pandas >= 2.0.
+    """
     try:
-        h, l, c = df["high"], df["low"], df["close"]
+        h = df["high"].values
+        l = df["low"].values
+        c = df["close"].values
         if len(c) < period + 5:
             return 0
-        tr = pd.concat(
-            [h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1
-        ).max(axis=1)
-        atr = tr.rolling(period).mean()
-        hl2 = (h + l) / 2
-        ub = hl2 + mult * atr
-        lb = hl2 - mult * atr
-        st = pd.Series(np.nan, index=c.index)
-        trend = pd.Series(1, index=c.index)
+
+        # ATR manual con numpy
+        tr = np.maximum(
+            h[1:] - l[1:],
+            np.maximum(
+                np.abs(h[1:] - c[:-1]),
+                np.abs(l[1:] - c[:-1])
+            )
+        )
+        # Prepend NaN para alinear índices
+        tr_full = np.concatenate([[np.nan], tr])
+
+        atr = np.full(len(c), np.nan)
+        # Seed con media simple del primer periodo
+        atr[period] = np.nanmean(tr_full[1:period + 1])
+        for i in range(period + 1, len(c)):
+            atr[i] = (atr[i - 1] * (period - 1) + tr_full[i]) / period
+
+        hl2  = (h + l) / 2.0
+        ub   = hl2 + mult * atr
+        lb   = hl2 - mult * atr
+
+        st_arr    = np.full(len(c), np.nan)
+        trend_arr = np.ones(len(c), dtype=int)
+
         for i in range(1, len(c)):
-            prev = st.iloc[i - 1] if not pd.isna(st.iloc[i - 1]) else lb.iloc[i]
-            if c.iloc[i] > prev:
-                st.iloc[i] = lb.iloc[i]
-                trend.iloc[i] = 1
+            prev_st = st_arr[i - 1] if not np.isnan(st_arr[i - 1]) else lb[i]
+            if c[i] > prev_st:
+                st_arr[i]    = lb[i]
+                trend_arr[i] = 1
             else:
-                st.iloc[i] = ub.iloc[i]
-                trend.iloc[i] = -1
-        return int(trend.iloc[-1])
+                st_arr[i]    = ub[i]
+                trend_arr[i] = -1
+
+        return int(trend_arr[-1])
     except Exception:
         return 0
 
 
-# ── Análisis de un timeframe ─────────────────────────────────────────────────
-
 def _analyze_tf(df: pd.DataFrame) -> dict:
-    """Calcula todos los indicadores para un DataFrame OHLCV."""
     if ta_lib is None:
         raise ImportError("Instala 'ta': pip install ta")
     if df.empty or len(df) < 55:
@@ -212,49 +223,31 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     return s
 
 
-# ── Scoring ponderado multi-TF ───────────────────────────────────────────────
-
 def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, int, str]:
-    """
-    Retorna (score_long, score_short, direction).
-    Distribución: 4h=3pts, 1h=3pts, 15m=4pts + bonus BB = max 11 → cap 10
-    """
     sl = ss = 0
 
-    # 4H: EMA trend + MACD + EMA200
     for key in ("ema_trend", "macd", "ema200"):
         sl += max(0,  s4h.get(key, 0))
         ss += max(0, -s4h.get(key, 0))
 
-    # 1H: EMA trend + RSI + SuperTrend
     for key in ("ema_trend", "rsi", "supertrend"):
         sl += max(0,  s1h.get(key, 0))
         ss += max(0, -s1h.get(key, 0))
 
-    # 15M: EMA trend + MACD + StochRSI + Volumen
     for key in ("ema_trend", "macd", "stoch", "volume"):
         sl += max(0,  s15.get(key, 0))
         ss += max(0, -s15.get(key, 0))
 
-    # Bonus Bollinger doble confirmación
     if s15.get("bb", 0) == 1  and s1h.get("bb", 0) == 1:  sl += 1
     if s15.get("bb", 0) == -1 and s1h.get("bb", 0) == -1: ss += 1
 
     best  = max(sl, ss)
-    score = min(best, 10)  # cap a 10
+    score = min(best, 10)
     direction = "LONG" if sl >= ss else "SHORT"
     return score, min(sl, 10), direction
 
 
-# ── Función principal (ASYNC) ────────────────────────────────────────────────
-
 async def analyze_pair(exch, symbol: str) -> SignalResult:
-    """
-    Analiza un par en 3 timeframes y devuelve un SignalResult.
-
-    exch    → instancia ccxt.async_support con options defaultType="swap" (Bitget)
-    symbol  → p.ej. "BTC/USDT:USDT" (formato perpetuo Bitget)
-    """
     result = SignalResult(symbol=symbol)
 
     try:
@@ -275,9 +268,8 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         result.score = score
 
         if score < MIN_SCORE:
-            return result  # NEUTRAL, score bajo
+            return result
 
-        # ── Calcular ATR y niveles ────────────────────────────────────────────
         try:
             atr_s = ta_lib.volatility.AverageTrueRange(
                 df15["high"], df15["low"], df15["close"], window=14
@@ -305,11 +297,11 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         rr = round(abs(tp1 - entry) / dist_entry_sl, 2) if dist_entry_sl > 0 else 0
 
         if rr < MIN_RR:
-            return result  # R/R insuficiente
+            return result
 
-        pct_tp3    = round(abs(tp3 - entry) / entry * 100, 2)
-        atr_pct    = atr / entry * 100
-        suggested  = min(10, max(1, round(5 / atr_pct))) if atr_pct > 0 else 1
+        pct_tp3   = round(abs(tp3 - entry) / entry * 100, 2)
+        atr_pct   = atr / entry * 100
+        suggested = min(10, max(1, round(5 / atr_pct))) if atr_pct > 0 else 1
 
         result.signal        = direction
         result.entry         = round(entry, 6)
@@ -328,14 +320,11 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
     return result
 
 
-# ── Helper: formato indicadores para Telegram ────────────────────────────────
-
 def _ei(v: int) -> str:
     return "🟢" if v == 1 else ("🔴" if v == -1 else "⚪")
 
 
 def format_signal_block(r: SignalResult) -> str:
-    """Bloque de texto Markdown para añadir a notificaciones de BotTrading."""
     if not r.is_valid:
         return f"📊 Score técnico: `{r.score}/10` — sin señal clara"
 

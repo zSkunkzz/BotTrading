@@ -1,7 +1,6 @@
 import logging
 import os
 import json
-import asyncio
 import aiohttp
 from ai_rate_limiter import budget, RateLimitExhausted
 
@@ -11,12 +10,26 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
 
+def _clean_json_response(content: str) -> str:
+    """Elimina markdown fences y texto extra que Groq a veces añade."""
+    content = content.strip()
+    # Quitar ```json ... ``` o ``` ... ```
+    if content.startswith("```"):
+        lines = content.splitlines()
+        # Eliminar primera y última línea si son fences
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        content = "\n".join(lines).strip()
+    return content
+
+
 async def ai_rank_pairs(pairs_data: list) -> list:
     groq_key = os.getenv("GROQ_API_KEY", "")
     if not groq_key:
         return [p["symbol"] for p in pairs_data]
 
-    # Verificar budget antes de llamar
     if not await budget.can_call_groq():
         logger.warning("AIFilter: budget Groq agotado — devolviendo orden por score")
         return [p["symbol"] for p in sorted(pairs_data, key=lambda x: x.get("score", 0), reverse=True)]
@@ -56,9 +69,14 @@ DATOS:\n{summary}"""
                 if resp.status == 429:
                     logger.warning("AIFilter: Groq 429 — devolviendo orden por score")
                     return [p["symbol"] for p in sorted(pairs_data, key=lambda x: x.get("score", 0), reverse=True)]
-                data = await resp.json()
-                content = data["choices"][0]["message"]["content"].strip()
-                return json.loads(content)
+                data    = await resp.json()
+                content = data["choices"][0]["message"]["content"]
+                content = _clean_json_response(content)
+                ranked  = json.loads(content)
+                # Validar que es una lista de strings
+                if not isinstance(ranked, list) or not all(isinstance(s, str) for s in ranked):
+                    raise ValueError(f"Formato inesperado: {ranked!r}")
+                return ranked
     except Exception as e:
-        logger.warning(f"AI filter falló ({e})")
+        logger.warning(f"AI filter falló ({e}) — devolviendo orden original")
         return [p["symbol"] for p in pairs_data]

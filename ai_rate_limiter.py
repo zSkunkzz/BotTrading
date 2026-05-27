@@ -9,33 +9,18 @@ import logging
 
 logger = logging.getLogger("AIRateLimiter")
 
-
-# ─────────────────────────────────────────────
-# CONFIGURACIÓN DE LÍMITES
-# Gemini pagado (Pay-as-you-go) tiene límites mucho más altos.
-# Groq free: 100k tokens/día, 30 RPM.
-# Con AI_CACHE_TTL=300 (5 min) y 15 pares:
-#   - Máx 3 calls/min reales → muy lejos de cualquier límite
-# ─────────────────────────────────────────────
-
 # ── Groq free tier ──────────────────────────
-GROQ_TPD_LIMIT       = 100_000   # tokens/día
-GROQ_RPM_LIMIT       = 30        # requests/minuto
-TOKENS_PER_CALL_GROQ = 800       # estimado por llamada
-GROQ_SAFE_DAILY_CALLS = int(GROQ_TPD_LIMIT / TOKENS_PER_CALL_GROQ)  # ~125 calls/día
+GROQ_TPD_LIMIT        = 100_000
+GROQ_RPM_LIMIT        = 30
+TOKENS_PER_CALL_GROQ  = 800
+GROQ_SAFE_DAILY_CALLS = int(GROQ_TPD_LIMIT / TOKENS_PER_CALL_GROQ)  # ~125
 
-# ── Gemini pagado (Pay-as-you-go) ───────────
-# Flash 2.0: 4000 RPM, 4M tokens/min, sin límite diario fijo
-# Ponemos límites conservadores para evitar costes inesperados
-GEMINI_RPM_LIMIT     = 60        # requests/minuto (muy por debajo de 4000)
-GEMINI_RPD_LIMIT     = 5_000     # requests/día (tope de seguridad de gasto)
+# ── Gemini pagado ───────────────────────────
+GEMINI_RPM_LIMIT = 60
+GEMINI_RPD_LIMIT = 5_000
 
 
 class AIBudgetManager:
-    """
-    Gestor centralizado de cuotas de IA.
-    Singleton compartido entre todos los traders.
-    """
     _instance = None
 
     def __new__(cls):
@@ -49,17 +34,14 @@ class AIBudgetManager:
             return
         self._initialized = True
 
-        # Semáforos de concurrencia
-        self.groq_semaphore   = asyncio.Semaphore(2)   # máx 2 llamadas Groq simultáneas
-        self.gemini_semaphore = asyncio.Semaphore(3)   # máx 3 llamadas Gemini simultáneas (pagado)
+        self.groq_semaphore   = asyncio.Semaphore(2)
+        self.gemini_semaphore = asyncio.Semaphore(3)
 
-        # Contadores diarios (reset a medianoche UTC)
         self._groq_calls_today   = 0
         self._gemini_calls_today = 0
         self._day_start          = self._today()
 
-        # Rate per-minute tracking
-        self._groq_minute_calls   = []   # timestamps del último minuto
+        self._groq_minute_calls   = []
         self._gemini_minute_calls = []
 
         self._lock = asyncio.Lock()
@@ -135,22 +117,18 @@ class AIBudgetManager:
             self._cleanup_minute_window(self._groq_minute_calls)
             self._cleanup_minute_window(self._gemini_minute_calls)
             return {
-                "groq_calls_today":    self._groq_calls_today,
-                "groq_daily_limit":    GROQ_SAFE_DAILY_CALLS,
-                "groq_rpm_used":       len(self._groq_minute_calls),
-                "gemini_calls_today":  self._gemini_calls_today,
-                "gemini_daily_limit":  GEMINI_RPD_LIMIT,
-                "gemini_rpm_used":     len(self._gemini_minute_calls),
+                "groq_calls_today":   self._groq_calls_today,
+                "groq_daily_limit":   GROQ_SAFE_DAILY_CALLS,
+                "groq_rpm_used":      len(self._groq_minute_calls),
+                "gemini_calls_today": self._gemini_calls_today,
+                "gemini_daily_limit": GEMINI_RPD_LIMIT,
+                "gemini_rpm_used":    len(self._gemini_minute_calls),
             }
 
 
-# Instancia global
 budget = AIBudgetManager()
 
 
-# ─────────────────────────────────────────────
-# WRAPPERS (mantenidos por compatibilidad)
-# ─────────────────────────────────────────────
 async def call_groq_safe(groq_client, model: str, messages: list, **kwargs):
     if not await budget.can_call_groq():
         raise RateLimitExhausted("groq")
@@ -176,9 +154,6 @@ class RateLimitExhausted(Exception):
         super().__init__(f"Budget {provider} agotado — usando fallback técnico")
 
 
-# ─────────────────────────────────────────────
-# ARRANQUE ESCALONADO DE TRADERS
-# ─────────────────────────────────────────────
 async def start_traders_staggered(pairs: list, start_trader_fn, delay: float = 2.0):
     logger.info(
         f"Iniciando {len(pairs)} traders escalonados "
@@ -191,9 +166,6 @@ async def start_traders_staggered(pairs: list, start_trader_fn, delay: float = 2
             await asyncio.sleep(delay)
 
 
-# ─────────────────────────────────────────────
-# COMANDO TELEGRAM: /ai_status
-# ─────────────────────────────────────────────
 async def telegram_ai_status(update, context):
     s = await budget.status()
     groq_pct   = s['groq_calls_today']   / max(s['groq_daily_limit'], 1)   * 100
@@ -204,9 +176,9 @@ async def telegram_ai_status(update, context):
         if pct < 80:  return "🟡"
         return "🔴"
 
-    from bot.ai_trader import _decision_cache, _cache_ttl
-    cache_count = len(_decision_cache)
-    ttl = _cache_ttl()
+    # Caché no implementada en este módulo — mostrar N/A
+    cache_count = 0
+    cache_ttl   = "N/A"
 
     text = (
         f"📊 *Estado IA — BitgetProBot*\n\n"
@@ -217,7 +189,7 @@ async def telegram_ai_status(update, context):
         f"{bar(groq_pct)} Hoy: {s['groq_calls_today']}/{s['groq_daily_limit']} calls ({groq_pct:.1f}%)\n"
         f"⏱ Último minuto: {s['groq_rpm_used']}/{GROQ_RPM_LIMIT} RPM\n\n"
         f"*Caché*\n"
-        f"🗂 Símbolos en caché: {cache_count} | TTL: {ttl}s\n\n"
+        f"🗂 Símbolos en caché: {cache_count} | TTL: {cache_ttl}\n\n"
         f"_Reset a medianoche UTC_"
     )
     await update.message.reply_text(text, parse_mode="Markdown")

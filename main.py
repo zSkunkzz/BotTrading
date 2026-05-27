@@ -35,7 +35,6 @@ def make_risk():
 
 
 async def _start_single_pair(symbol: str):
-    """Inicia un trader para un par (llamado desde start_traders_staggered)."""
     if symbol in active_traders:
         return
     logger.info(f"🚀 Iniciando trader: {symbol}")
@@ -49,7 +48,7 @@ async def _start_single_pair(symbol: str):
         dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
     )
     task = asyncio.create_task(
-        trader.run(None, make_risk(), global_risk=global_risk)
+        trader.run(make_risk(), global_risk=global_risk)
     )
     active_traders[symbol] = task
 
@@ -72,7 +71,6 @@ async def on_pairs_updated(new_pairs: list):
     added   = updated - current
     removed = current - updated
 
-    # Arranque escalonado de nuevos pares (2s entre cada uno)
     if added:
         await start_traders_staggered(list(added), _start_single_pair, delay=2.0)
 
@@ -128,7 +126,6 @@ async def main():
 
     logger.info(f"✅ Pares finales ({len(final_pairs)}): {', '.join(final_pairs)}")
 
-    # Arranque escalonado: evita el spike de 15 llamadas simultáneas a Gemini al inicio
     await start_traders_staggered(final_pairs, _start_single_pair, delay=2.0)
 
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
