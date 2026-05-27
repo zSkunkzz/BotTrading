@@ -153,14 +153,14 @@ class FuturesTrader:
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
-    # ÓRDENES — Unified Account: /api/v2/unified/order/place-order
+    # ÓRDENES — /api/v2/mix/order/place-order
     #
-    # Este es el Único endpoint válido para cuentas Unified en Bitget.
-    # /api/v2/mix/order/* da error 40085 en cuentas Unified.
+    # Endpoint correcto para futuros perpetuos Bitget v2.
+    # /api/v2/unified/order/* no existe (404).
     #
     # Campos requeridos:
     #   symbol       → "BTCUSDT" (sin /)
-    #   productType  → "USDT-FUTURES"
+    #   productType  → "usdt-futures" (minúsculas)
     #   marginMode   → "crossed" | "isolated"
     #   marginCoin   → "USDT"
     #   size         → cantidad en contratos (string)
@@ -177,17 +177,17 @@ class FuturesTrader:
     async def _place_order(self, side: str, trade_side: str, qty: float,
                            reduce_only: bool = False) -> dict:
         """
-        Coloca orden de mercado via /api/v2/unified/order/place-order.
-        Si falla, intenta /api/v2/unified/order/place-order con reduceOnly.
+        Coloca orden de mercado via /api/v2/mix/order/place-order.
         side       : 'buy' | 'sell'
         trade_side : 'open' | 'close'
         qty        : cantidad en contratos
         """
         sym = self._bitget_symbol(self.symbol)
-        path = "/api/v2/unified/order/place-order"
+        # CORRECTO: /api/v2/mix/order/place-order (no /unified/order/)
+        path = "/api/v2/mix/order/place-order"
         payload = {
             "symbol":      sym,
-            "productType": "USDT-FUTURES",
+            "productType": "usdt-futures",   # minúsculas requeridas por /mix/
             "marginMode":  self.margin_mode,
             "marginCoin":  "USDT",
             "size":        str(qty),
@@ -198,31 +198,31 @@ class FuturesTrader:
         if reduce_only:
             payload["reduceOnly"] = "YES"
 
-        logger.info(f"[{self.symbol}] 📤 Unified order payload: {payload}")
+        logger.info(f"[{self.symbol}] 📤 Mix order payload: {payload}")
         resp = await self._http_post(path, payload)
-        logger.info(f"[{self.symbol}] 📥 Unified order response: {resp}")
+        logger.info(f"[{self.symbol}] 📥 Mix order response: {resp}")
 
         if resp.get("code") == "00000":
             order_id = (resp.get("data") or {}).get("orderId", "?")
             logger.info(
-                f"[{self.symbol}] ✅ Orden Unified {side}/{trade_side} qty={qty} | orderId={order_id}"
+                f"[{self.symbol}] ✅ Orden {side}/{trade_side} qty={qty} | orderId={order_id}"
             )
             return resp
 
         raise Exception(
-            f"place-order Unified error {resp.get('code')}: {resp.get('msg')}"
+            f"place-order error {resp.get('code')}: {resp.get('msg')}"
         )
 
     # ─────────────────────────────────────────────────────────────
-    # POSICIONES — Unified Account
+    # POSICIONES — /api/v2/mix/position/single-position
     # ─────────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list:
         sym = self._bitget_symbol(self.symbol)
 
-        # Intento 1 — Unified positions
+        # Intento 1 — Mix positions v2
         try:
-            path = f"/api/v2/unified/position/single-position?symbol={sym}&productType=USDT-FUTURES&marginCoin=USDT"
+            path = f"/api/v2/mix/position/single-position?symbol={sym}&productType=usdt-futures&marginCoin=USDT"
             r = await self._http_get(path)
             if r.get("code") == "00000":
                 data = r.get("data") or []
@@ -232,7 +232,7 @@ class FuturesTrader:
                 if result:
                     return result
         except Exception as e:
-            logger.warning(f"[{self.symbol}] get_positions unified: {e}")
+            logger.warning(f"[{self.symbol}] get_positions mix/v2: {e}")
 
         # Intento 2 — ccxt fetch_positions
         try:
