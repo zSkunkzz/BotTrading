@@ -1,80 +1,135 @@
+#!/usr/bin/env python3
+"""
+strategy.py — Lógica de decisión de BotTrading
+
+Flujo de decisión:
+  1. signal_engine analiza el par técnicamente (multi-TF, scoring /10)
+  2. Si score < MIN_SIGNAL_SCORE  → devuelve HOLD sin llamar a la IA
+  3. Si score >= MIN_SIGNAL_SCORE → confirma con IA (1 sola llamada)
+  4. La IA recibe el contexto completo + niveles de signal_engine
+
+Variables de entorno opcionales:
+  MIN_SIGNAL_SCORE  (default: 6)  — score mínimo para activar IA
+  MIN_RR_REQUIRED   (default: 1.8) — R/R mínimo para activar IA
+"""
+
+import asyncio
 import logging
-from bot.indicators import ema, rsi, macd, supertrend
+import os
+from typing import Optional
 
-logger = logging.getLogger("Strategy")
+from bot.signal_engine import (
+    SignalResult,
+    analyze_pair,
+    format_signal_block,
+    MIN_SCORE,
+    MIN_RR,
+)
+
+log = logging.getLogger(__name__)
+
+MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", str(MIN_SCORE)))
+MIN_RR_REQUIRED  = float(os.getenv("MIN_RR_REQUIRED", str(MIN_RR)))
 
 
-class MultiStrategy:
-    def __init__(self, timeframe, st_atr_period, st_factor,
-                 ema_fast, ema_slow, rsi_period, rsi_ob, rsi_os,
-                 macd_fast, macd_slow, macd_signal, min_confirmations):
-        self.timeframe = timeframe
-        self.st_atr_period = st_atr_period
-        self.st_factor = st_factor
-        self.ema_fast = ema_fast
-        self.ema_slow = ema_slow
-        self.rsi_period = rsi_period
-        self.rsi_ob = rsi_ob
-        self.rsi_os = rsi_os
-        self.macd_fast = macd_fast
-        self.macd_slow = macd_slow
-        self.macd_signal = macd_signal
-        self.min_confirmations = min_confirmations
+async def decide(
+    exch,
+    symbol: str,
+    ai_decide_fn,          # función async (symbol, context_dict) -> "BUY"|"SELL"|"HOLD"
+    has_open_position: bool = False,
+    current_pnl: Optional[float] = None,
+) -> dict:
+    """
+    Punto de entrada principal para la estrategia.
 
-    def analyze(self, bars: list) -> dict:
-        if len(bars) < self.macd_slow + self.macd_signal + 5:
-            return {"signal": "HOLD", "reason": "Datos insuficientes",
-                    "long_score": 0, "short_score": 0, "close": bars[-1][4] if bars else 0}
+    Retorna un dict con:
+        action      : "BUY" | "SELL" | "HOLD"
+        signal      : SignalResult (siempre presente)
+        ai_used     : bool — si se llamó a la IA
+        reason      : str  — motivo legible
+        signal_block: str  — bloque Markdown para Telegram
+    """
 
-        highs  = [b[2] for b in bars]
-        lows   = [b[3] for b in bars]
-        closes = [b[4] for b in bars]
+    # ── 1. Si hay posición abierta, no abrimos otra ───────────────────────────
+    if has_open_position:
+        return _result("HOLD", None, False, "Posición ya abierta — esperando cierre")
 
-        st_dir, st_val = supertrend(highs, lows, closes, self.st_atr_period, self.st_factor)
-        st_bull = st_dir == 1
-
-        ema_f = ema(closes, self.ema_fast)
-        ema_s = ema(closes, self.ema_slow)
-        ema_bull = ema_f[-1] > ema_s[-1] if (ema_f and ema_s) else False
-        cross_up   = len(ema_f) >= 2 and len(ema_s) >= 2 and ema_f[-2] <= ema_s[-2] and ema_f[-1] > ema_s[-1]
-        cross_down = len(ema_f) >= 2 and len(ema_s) >= 2 and ema_f[-2] >= ema_s[-2] and ema_f[-1] < ema_s[-1]
-
-        rsi_val = rsi(closes, self.rsi_period)
-        rsi_bull = rsi_val < self.rsi_ob
-        rsi_bear = rsi_val > self.rsi_os
-
-        _, _, hist = macd(closes, self.macd_fast, self.macd_slow, self.macd_signal)
-        macd_bull = hist > 0
-        macd_bear = hist < 0
-
-        long_score  = sum([st_bull,      ema_bull,      rsi_bull, macd_bull]) + (1 if cross_up   else 0)
-        short_score = sum([not st_bull,  not ema_bull,  rsi_bear, macd_bear]) + (1 if cross_down else 0)
-
-        if long_score >= self.min_confirmations and long_score > short_score:
-            signal = "BUY"
-        elif short_score >= self.min_confirmations and short_score > long_score:
-            signal = "SELL"
-        else:
-            signal = "HOLD"
-
-        result = {
-            "signal": signal,
-            "close": closes[-1],
-            "supertrend_dir": "BULL" if st_bull else "BEAR",
-            "supertrend_val": st_val,
-            "ema_fast": round(ema_f[-1], 4) if ema_f else 0,
-            "ema_slow": round(ema_s[-1], 4) if ema_s else 0,
-            "ema_trend": "BULL" if ema_bull else "BEAR",
-            "ema_cross": "CRUCE UP" if cross_up else ("CRUCE DOWN" if cross_down else "-"),
-            "rsi": rsi_val,
-            "macd_hist": hist,
-            "long_score": long_score,
-            "short_score": short_score,
-        }
-
-        logger.info(
-            f"SIGNAL:{signal} | ST:{result['supertrend_dir']} | "
-            f"EMA:{result['ema_trend']} | RSI:{rsi_val} | MACD hist:{hist:.5f} | "
-            f"Score L:{long_score}/S:{short_score}"
+    # ── 2. Análisis técnico en executor (bloqueante → async) ─────────────────
+    loop = asyncio.get_event_loop()
+    try:
+        signal: SignalResult = await loop.run_in_executor(
+            None, analyze_pair, exch, symbol
         )
-        return result
+    except Exception as e:
+        log.error(f"[strategy] analyze_pair error: {e}")
+        return _result("HOLD", None, False, f"Error en análisis técnico: {e}")
+
+    log.info(f"[strategy] {symbol} · score={signal.score}/10 · {signal.signal} · RR={signal.rr}")
+
+    # ── 3. Filtro de score y R/R ─────────────────────────────────────────────
+    if signal.score < MIN_SIGNAL_SCORE:
+        return _result(
+            "HOLD", signal, False,
+            f"Score insuficiente ({signal.score}/10 < {MIN_SIGNAL_SCORE}) — sin señal"
+        )
+
+    if signal.rr < MIN_RR_REQUIRED:
+        return _result(
+            "HOLD", signal, False,
+            f"R/R insuficiente ({signal.rr:.1f} < {MIN_RR_REQUIRED}) — no merece la pena"
+        )
+
+    if signal.signal == "NEUTRAL":
+        return _result("HOLD", signal, False, "Señal técnica neutral — sin consenso")
+
+    # ── 4. Llamada a la IA con contexto enriquecido ───────────────────────────
+    i15 = signal.indicators.get("15m", {})
+    i1h = signal.indicators.get("1h",  {})
+    i4h = signal.indicators.get("4h",  {})
+
+    context = {
+        "symbol":        symbol,
+        "signal":        signal.signal,       # LONG / SHORT
+        "score":         signal.score,
+        "rr":            signal.rr,
+        "entry":         signal.entry,
+        "sl":            signal.sl,
+        "tp1":           signal.tp1,
+        "tp2":           signal.tp2,
+        "atr":           signal.atr,
+        "suggested_lev": signal.suggested_lev,
+        "ema_4h":        i4h.get("ema_trend", 0),
+        "macd_4h":       i4h.get("macd", 0),
+        "ema_1h":        i1h.get("ema_trend", 0),
+        "rsi_1h":        i1h.get("rsi_val", 50),
+        "supertrend_1h": i1h.get("supertrend", 0),
+        "ema_15m":       i15.get("ema_trend", 0),
+        "macd_15m":      i15.get("macd", 0),
+        "stoch_15m":     i15.get("stoch", 0),
+        "volume_15m":    i15.get("volume", 0),
+        "vol_ratio":     i15.get("vol_ratio", 1.0),
+        "rsi_15m":       i15.get("rsi_val", 50),
+    }
+
+    try:
+        ai_action = await ai_decide_fn(symbol, context)
+    except Exception as e:
+        log.warning(f"[strategy] IA falló, usando señal técnica directa: {e}")
+        # Fallback: si la IA falla, usar la señal técnica directamente
+        ai_action = "BUY" if signal.signal == "LONG" else "SELL"
+
+    action = ai_action.upper().strip()
+    if action not in ("BUY", "SELL", "HOLD"):
+        action = "HOLD"
+
+    return _result(action, signal, True, f"IA confirmó {action} · técnico {signal.signal} {signal.score}/10")
+
+
+def _result(action: str, signal: Optional[SignalResult], ai_used: bool, reason: str) -> dict:
+    return {
+        "action":       action,
+        "signal":       signal,
+        "ai_used":      ai_used,
+        "reason":       reason,
+        "signal_block": format_signal_block(signal) if signal else "",
+    }
