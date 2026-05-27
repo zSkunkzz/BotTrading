@@ -19,6 +19,12 @@ logger = logging.getLogger("Trader")
 
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 
+# Params comunes para todas las órdenes en Unified Account
+_ORDER_PARAMS_BASE = {
+    "productType": "USDT-FUTURES",
+    "marginCoin":  "USDT",
+}
+
 
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
@@ -41,12 +47,14 @@ class FuturesTrader:
         self._api_key     = api_key
         self._api_secret  = api_secret
         self._passphrase  = passphrase
+        # ── ccxt: Unified Account requiere unified=True ──────────────────
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
             "secret":   api_secret,
             "password": passphrase,
             "options":  {
                 "defaultType": "swap",
+                "unified":     True,   # ← CRÍTICO para Unified Account
             },
         })
 
@@ -277,10 +285,10 @@ class FuturesTrader:
         return await self.exchange.create_order(
             self.symbol, "market", side, qty,
             params={
-                "reduceOnly":  False,
-                "marginMode":  self.margin_mode,
-                "productType": "USDT-FUTURES",
-                "tradeSide":   "open",
+                **_ORDER_PARAMS_BASE,
+                "reduceOnly": False,
+                "marginMode": self.margin_mode,
+                "tradeSide":  "open",
             }
         )
 
@@ -291,7 +299,7 @@ class FuturesTrader:
         try:
             positions = await self.exchange.fetch_positions(
                 [self.symbol],
-                params={"productType": "USDT-FUTURES"}
+                params={**_ORDER_PARAMS_BASE}
             )
             for p in positions:
                 contracts = float(p.get("contracts") or p.get("size", 0))
@@ -301,9 +309,9 @@ class FuturesTrader:
                     await self.exchange.create_order(
                         self.symbol, "market", close_side, partial_qty,
                         params={
-                            "reduceOnly":  True,
-                            "productType": "USDT-FUTURES",
-                            "tradeSide":   "close",
+                            **_ORDER_PARAMS_BASE,
+                            "reduceOnly": True,
+                            "tradeSide":  "close",
                         }
                     )
                     logger.info(f"[{self.symbol}] TP parcial {ratio*100:.0f}% ({partial_qty} contratos)")
@@ -440,7 +448,7 @@ class FuturesTrader:
         if not self.dry_run:
             try:
                 positions = await self.exchange.fetch_positions(
-                    [self.symbol], params={"productType": "USDT-FUTURES"}
+                    [self.symbol], params={**_ORDER_PARAMS_BASE}
                 )
                 for p in positions:
                     contracts = float(p.get("contracts") or p.get("size", 0))
@@ -449,9 +457,9 @@ class FuturesTrader:
                         await self.exchange.create_order(
                             self.symbol, "market", side, contracts,
                             params={
-                                "reduceOnly":  True,
-                                "productType": "USDT-FUTURES",
-                                "tradeSide":   "close",
+                                **_ORDER_PARAMS_BASE,
+                                "reduceOnly": True,
+                                "tradeSide":  "close",
                             }
                         )
                         break
