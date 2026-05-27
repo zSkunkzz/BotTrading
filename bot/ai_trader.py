@@ -32,6 +32,14 @@ def _parse_ai_json(raw: str) -> dict:
     start = raw.find("{")
     end   = raw.rfind("}")
     if start == -1 or end == -1 or end < start:
+        # Intentar recuperar JSON truncado: extraer action y confidence con regex
+        action_m = re.search(r'"action"\s*:\s*"(BUY|SELL|HOLD|CLOSE)"', raw)
+        conf_m   = re.search(r'"confidence"\s*:\s*(\d+)', raw)
+        if action_m:
+            action = action_m.group(1)
+            conf   = int(conf_m.group(1)) if conf_m else 5
+            logger.debug(f"JSON truncado recuperado: action={action} conf={conf}")
+            return {"action": action, "confidence": conf, "reason": "truncated response"}
         raise ValueError(f"No JSON found: {raw[:120]!r}")
     return json.loads(raw[start:end + 1])
 
@@ -99,7 +107,7 @@ async def _call_gemini(context: dict):
                             "contents": [{"parts": [{"text": prompt}]}],
                             "generationConfig": {
                                 "temperature":     0.0,
-                                "maxOutputTokens": 256,
+                                "maxOutputTokens": 512,
                             },
                         },
                         timeout=aiohttp.ClientTimeout(total=15),
