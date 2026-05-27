@@ -42,7 +42,6 @@ class FuturesTrader:
         self._api_key     = api_key
         self._api_secret  = api_secret
         self._passphrase  = passphrase
-        # ccxt solo para precio/OHLCV/mercados (no para ordenes en Unified Account)
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
             "secret":   api_secret,
@@ -54,7 +53,7 @@ class FuturesTrader:
         })
 
     # ─────────────────────────────────────────────────────────────
-    # FIRMA HTTP DIRECTA (Base64 — requerido por Bitget v2)
+    # FIRMA HTTP DIRECTA (Base64 — requerido por Bitget v2/v3)
     # ─────────────────────────────────────────────────────────────
 
     def _sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
@@ -126,7 +125,7 @@ class FuturesTrader:
         return 0.0
 
     async def _get_balance_direct(self) -> float:
-        # Intento 1 — Unified Account assets
+        # Intento 1 — Unified Account v3 assets
         for path in ["/api/v3/account/assets", "/api/v3/account/assets?coin=USDT"]:
             try:
                 r = await self._http_get(path)
@@ -138,7 +137,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning(f"[{self.symbol}] balance {path}: {e}")
 
-        # Intento 2 — Unified Account assets v2
+        # Intento 2 — Unified Account v2 assets
         try:
             r = await self._http_get("/api/v2/unified/account/assets?coin=USDT")
             if r.get("code") == "00000":
@@ -153,20 +152,21 @@ class FuturesTrader:
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
-    # ÓRDENES — /api/v2/mix/order/place-order
+    # ÓRDENES — Unified Account: /api/v3/trade/place-order
     #
-    # Endpoint correcto para futuros perpetuos Bitget v2.
-    # /api/v2/unified/order/* no existe (404).
+    # Las Unified Accounts de Bitget usan la API v3 para trading.
+    # /api/v2/mix/order/* → error 40085 (Classic Account API, no soportada)
+    # /api/v3/trade/place-order → endpoint correcto para Unified Account
     #
     # Campos requeridos:
-    #   symbol       → "BTCUSDT" (sin /)
-    #   productType  → "usdt-futures" (minúsculas)
-    #   marginMode   → "crossed" | "isolated"
-    #   marginCoin   → "USDT"
-    #   size         → cantidad en contratos (string)
-    #   side         → "buy" | "sell"
-    #   tradeSide    → "open" | "close"
-    #   orderType    → "market"
+    #   symbol      → "BTCUSDT" (sin /)
+    #   category    → "USDT-FUTURES" (mayúsculas, campo v3)
+    #   marginMode  → "crossed" | "isolated"
+    #   marginCoin  → "USDT"
+    #   size        → cantidad en contratos (string)
+    #   side        → "buy" | "sell"
+    #   tradeSide   → "open" | "close"
+    #   orderType   → "market"
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -177,35 +177,35 @@ class FuturesTrader:
     async def _place_order(self, side: str, trade_side: str, qty: float,
                            reduce_only: bool = False) -> dict:
         """
-        Coloca orden de mercado via /api/v2/mix/order/place-order.
+        Coloca orden de mercado via /api/v3/trade/place-order (Unified Account API).
         side       : 'buy' | 'sell'
         trade_side : 'open' | 'close'
         qty        : cantidad en contratos
         """
         sym = self._bitget_symbol(self.symbol)
-        # CORRECTO: /api/v2/mix/order/place-order (no /unified/order/)
-        path = "/api/v2/mix/order/place-order"
+        # Unified Account usa /api/v3/trade/place-order con campo 'category'
+        path = "/api/v3/trade/place-order"
         payload = {
-            "symbol":      sym,
-            "productType": "usdt-futures",   # minúsculas requeridas por /mix/
-            "marginMode":  self.margin_mode,
-            "marginCoin":  "USDT",
-            "size":        str(qty),
-            "side":        side,
-            "tradeSide":   trade_side,
-            "orderType":   "market",
+            "symbol":     sym,
+            "category":   "USDT-FUTURES",  # campo v3, mayusculas
+            "marginMode": self.margin_mode,
+            "marginCoin": "USDT",
+            "size":       str(qty),
+            "side":       side,
+            "tradeSide":  trade_side,
+            "orderType":  "market",
         }
         if reduce_only:
             payload["reduceOnly"] = "YES"
 
-        logger.info(f"[{self.symbol}] 📤 Mix order payload: {payload}")
+        logger.info(f"[{self.symbol}] 📤 v3 order payload: {payload}")
         resp = await self._http_post(path, payload)
-        logger.info(f"[{self.symbol}] 📥 Mix order response: {resp}")
+        logger.info(f"[{self.symbol}] 📥 v3 order response: {resp}")
 
         if resp.get("code") == "00000":
             order_id = (resp.get("data") or {}).get("orderId", "?")
             logger.info(
-                f"[{self.symbol}] ✅ Orden {side}/{trade_side} qty={qty} | orderId={order_id}"
+                f"[{self.symbol}] ✅ Orden v3 {side}/{trade_side} qty={qty} | orderId={order_id}"
             )
             return resp
 
@@ -214,15 +214,15 @@ class FuturesTrader:
         )
 
     # ─────────────────────────────────────────────────────────────
-    # POSICIONES — /api/v2/mix/position/single-position
+    # POSICIONES — /api/v3/position/single-position
     # ─────────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list:
         sym = self._bitget_symbol(self.symbol)
 
-        # Intento 1 — Mix positions v2
+        # Intento 1 — Unified v3 positions
         try:
-            path = f"/api/v2/mix/position/single-position?symbol={sym}&productType=usdt-futures&marginCoin=USDT"
+            path = f"/api/v3/position/single-position?symbol={sym}&category=USDT-FUTURES&marginCoin=USDT"
             r = await self._http_get(path)
             if r.get("code") == "00000":
                 data = r.get("data") or []
@@ -232,7 +232,7 @@ class FuturesTrader:
                 if result:
                     return result
         except Exception as e:
-            logger.warning(f"[{self.symbol}] get_positions mix/v2: {e}")
+            logger.warning(f"[{self.symbol}] get_positions v3: {e}")
 
         # Intento 2 — ccxt fetch_positions
         try:
