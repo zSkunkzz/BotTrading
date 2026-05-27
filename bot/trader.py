@@ -21,7 +21,6 @@ TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 BITGET_BASE = "https://api.bitget.com"
 
 # Cache de marginMode por símbolo: {symbol: 'isolated' | 'crossed'}
-# Evita reintentos innecesarios una vez sabemos qué acepta cada par.
 _margin_mode_cache: dict = {}
 
 
@@ -129,7 +128,6 @@ class FuturesTrader:
         return 0.0
 
     async def _get_balance_direct(self) -> float:
-        # Intento 1 — Unified Account v3 assets
         for path in ["/api/v3/account/assets", "/api/v3/account/assets?coin=USDT"]:
             try:
                 r = await self._http_get(path)
@@ -141,7 +139,6 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning(f"[{self.symbol}] balance {path}: {e}")
 
-        # Intento 2 — Unified Account v2 assets
         try:
             r = await self._http_get("/api/v2/unified/account/assets?coin=USDT")
             if r.get("code") == "00000":
@@ -156,12 +153,14 @@ class FuturesTrader:
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
-    # ÓRDENES — Unified Account: /api/v3/trade/place-order
+    # ÓRDENES
     #
-    # Error 25236 "Incorrect position open type":
-    #   Algunos pares solo aceptan marginMode=crossed, no isolated.
-    #   Solución: si falla con 25236, reintentar con crossed y cachear
-    #   el modo correcto para ese símbolo.
+    # Error 25236 — dos causas posibles:
+    #   A) marginMode incorrecto para el par → reintentar con crossed
+    #   B) cuenta en hedge mode → necesita tradeSide='open'/'close'
+    #
+    # Estrategia: incluimos siempre tradeSide en el payload.
+    # En one-way mode Bitget lo ignora; en hedge mode es obligatorio.
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -170,19 +169,27 @@ class FuturesTrader:
         return ccxt_symbol.split("/")[0] + ccxt_symbol.split("/")[1].split(":")[0]
 
     def _effective_margin_mode(self) -> str:
-        """Devuelve el marginMode conocido para este símbolo, o el configurado por defecto."""
         return _margin_mode_cache.get(self.symbol, self.margin_mode)
 
     async def _place_order(self, side: str, trade_side: str, qty: float,
                            reduce_only: bool = False) -> dict:
         """
         Coloca orden de mercado via /api/v3/trade/place-order.
-        Si recibe error 25236 con isolated, reintenta con crossed y lo cachea.
+
+        tradeSide siempre incluido:
+          - trade_side='open'  → tradeSide='open'
+          - trade_side='close' → tradeSide='close'
+        Esto resuelve el error 25236 en cuentas con hedge mode activo.
+        En cuentas one-way Bitget lo acepta igual (campo ignorado).
+
+        Si aún recibe 25236, reintenta con marginMode=crossed.
         """
         sym = self._bitget_symbol(self.symbol)
         path = "/api/v3/trade/place-order"
-
         margin_mode = self._effective_margin_mode()
+
+        # tradeSide: 'open' para entrar, 'close' para salir/reducir
+        trade_side_val = "open" if trade_side == "open" else "close"
 
         payload = {
             "symbol":     sym,
@@ -191,6 +198,7 @@ class FuturesTrader:
             "marginCoin": "USDT",
             "qty":        str(qty),
             "side":       side,
+            "tradeSide":  trade_side_val,
             "orderType":  "market",
         }
         if reduce_only or trade_side == "close":
@@ -200,11 +208,11 @@ class FuturesTrader:
         resp = await self._http_post(path, payload)
         logger.info(f"[{self.symbol}] 📥 v3 order response: {resp}")
 
-        # Error 25236: marginMode incorrecto para este par → reintentar con crossed
+        # 25236 aún: probar con marginMode crossed
         if resp.get("code") == "25236" and margin_mode != "crossed":
             logger.warning(
                 f"[{self.symbol}] ⚠️ 25236 con marginMode={margin_mode} → "
-                f"reintentando con crossed (solo este par)"
+                f"reintentando con crossed"
             )
             _margin_mode_cache[self.symbol] = "crossed"
             payload["marginMode"] = "crossed"
@@ -213,10 +221,10 @@ class FuturesTrader:
             logger.info(f"[{self.symbol}] 📥 v3 retry response: {resp}")
 
         if resp.get("code") == "00000":
-            order_id = (resp.get("data") or {}).get("orderId", "?")
+            order_id  = (resp.get("data") or {}).get("orderId", "?")
             effective = payload["marginMode"]
             logger.info(
-                f"[{self.symbol}] ✅ Orden v3 {side}/{trade_side} qty={qty} "
+                f"[{self.symbol}] ✅ Orden v3 {side}/{trade_side_val} qty={qty} "
                 f"marginMode={effective} | orderId={order_id}"
             )
             return resp
@@ -232,7 +240,6 @@ class FuturesTrader:
     async def _get_positions(self) -> list:
         sym = self._bitget_symbol(self.symbol)
 
-        # Intento 1 — Unified v3 positions
         try:
             path = f"/api/v3/position/single-position?symbol={sym}&category=USDT-FUTURES&marginCoin=USDT"
             r = await self._http_get(path)
@@ -246,7 +253,6 @@ class FuturesTrader:
         except Exception as e:
             logger.warning(f"[{self.symbol}] get_positions v3: {e}")
 
-        # Intento 2 — ccxt fetch_positions
         try:
             positions = await self.exchange.fetch_positions([self.symbol])
             return [p for p in positions if float(p.get("contracts") or 0) > 0]
