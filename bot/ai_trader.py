@@ -146,9 +146,13 @@ async def _call_gemini(context):
 
 async def ai_decide(symbol, bars, position, entry_price, leverage):
     context = build_market_context(symbol, bars, position, entry_price, leverage)
-    result = await _call_groq(context)
+
+    # 1. Gemini primero
+    result = await _call_gemini(context)
+    # 2. Groq como fallback
     if not result:
-        result = await _call_gemini(context)
+        result = await _call_groq(context)
+    # 3. Fallback técnico
     if not result:
         logger.warning(f"[{symbol}] Sin IA — fallback técnico")
         ind = context["indicators"]
