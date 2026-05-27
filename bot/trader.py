@@ -154,7 +154,9 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
     # ÓRDENES — Unified Account: /api/v3/trade/place-order
     #
-    # Bitget v3 Unified Account usa "qty" (no "size") para la cantidad.
+    # La cuenta está en modo ONE-WAY (unilateral).
+    # En one-way mode NO se envía tradeSide — causa error 25236.
+    # Para cerrar se usa reduceOnly=YES en lugar de tradeSide=close.
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -166,23 +168,27 @@ class FuturesTrader:
                            reduce_only: bool = False) -> dict:
         """
         Coloca orden de mercado via /api/v3/trade/place-order (Unified Account API).
-        side       : 'buy' | 'sell'
-        trade_side : 'open' | 'close'
-        qty        : cantidad en contratos
+        side        : 'buy' | 'sell'
+        trade_side  : 'open' | 'close'  — solo se usa para logging; en one-way mode
+                      NO se envía a la API (error 25236).
+        qty         : cantidad en contratos
+        reduce_only : True para cerrar posición (one-way mode)
         """
         sym = self._bitget_symbol(self.symbol)
         path = "/api/v3/trade/place-order"
+
+        # One-way mode: NO incluir tradeSide en el payload
         payload = {
             "symbol":     sym,
             "category":   "USDT-FUTURES",
             "marginMode": self.margin_mode,
             "marginCoin": "USDT",
-            "qty":        str(qty),        # v3 usa "qty", no "size"
+            "qty":        str(qty),
             "side":       side,
-            "tradeSide":  trade_side,
             "orderType":  "market",
         }
-        if reduce_only:
+        # Para cerrar en one-way mode se usa reduceOnly en lugar de tradeSide
+        if reduce_only or trade_side == "close":
             payload["reduceOnly"] = "YES"
 
         logger.info(f"[{self.symbol}] 📤 v3 order payload: {payload}")
@@ -297,7 +303,8 @@ class FuturesTrader:
                     partial_qty  = round(size * ratio, 4)
                     pos_side     = str(p.get("holdSide") or p.get("side") or "").lower()
                     close_side   = "sell" if pos_side in ("long", "buy") else "buy"
-                    await self._place_order(close_side, "close", partial_qty)
+                    # one-way mode: usar reduceOnly en lugar de tradeSide=close
+                    await self._place_order(close_side, "close", partial_qty, reduce_only=True)
                     logger.info(f"[{self.symbol}] TP parcial {ratio*100:.0f}% ({partial_qty} contratos)")
                     break
         except Exception as e:
@@ -433,7 +440,8 @@ class FuturesTrader:
                     pos_side = str(p.get("holdSide") or p.get("side") or "").lower()
                     if size > 0:
                         close_side = "sell" if pos_side in ("long", "buy") else "buy"
-                        await self._place_order(close_side, "close", size)
+                        # one-way mode: reduceOnly=YES cierra la posición
+                        await self._place_order(close_side, "close", size, reduce_only=True)
                         break
             except Exception as e:
                 logger.error(f"[{self.symbol}] Close error: {e}")
