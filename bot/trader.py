@@ -1,13 +1,10 @@
 import asyncio
 import logging
 import os
-import time
 import ccxt.async_support as ccxt
 from bot.strategy import decide
 from bot.ai_trader import ai_decide
-from bot.telegram_bot import (
-    notify_open, notify_close, notify_ai_decision, notify_risk_block
-)
+from bot.telegram_bot import notify_open, notify_close
 from bot.state import (
     save_position, load_position, clear_position, mark_tp2_hit
 )
@@ -16,28 +13,6 @@ logger = logging.getLogger("Trader")
 
 # Fracción del contrato que se cierra en TP2 (50% por defecto)
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
-
-# Cooldown mínimo en segundos entre notificaciones del mismo tipo para el mismo par.
-# Evita spam cuando la señal se repite ciclo a ciclo sin que cambie nada.
-_NOTIFY_COOLDOWN = int(os.getenv("NOTIFY_COOLDOWN", "300"))   # 5 min por defecto
-_last_notify: dict[str, float] = {}   # clave: "symbol:action"
-
-
-def _can_notify(symbol: str, action: str) -> bool:
-    """Devuelve True si ha pasado el cooldown desde la última notificación igual."""
-    key = f"{symbol}:{action}"
-    now = time.monotonic()
-    last = _last_notify.get(key, 0.0)
-    if now - last >= _NOTIFY_COOLDOWN:
-        _last_notify[key] = now
-        return True
-    return False
-
-
-def _reset_notify(symbol: str):
-    """Limpia el cooldown de un símbolo (p.ej. al abrir/cerrar posición real)."""
-    for action in ("BUY", "SELL", "CLOSE", "RISK_BLOCK"):
-        _last_notify.pop(f"{symbol}:{action}", None)
 
 
 class FuturesTrader:
@@ -64,7 +39,6 @@ class FuturesTrader:
             "password": passphrase,
             "options":  {"defaultType": "swap"},
         })
-        # Referencia directa para que el webhook pueda llamar métodos
         self._trader_ref = self
 
     # ─────────────────────────────────────────────────────────────
@@ -165,8 +139,7 @@ class FuturesTrader:
 
     async def _sync_closed_from_exchange(self, fill_price: float, reason: str):
         """
-        Llamado por el webhook cuando Bitget confirma un cierre externo
-        (liquidación, SL en exchange, cierre manual desde app Bitget).
+        Llamado por el webhook cuando Bitget confirma un cierre externo.
         Limpia el estado interno sin enviar nueva orden al exchange.
         """
         if not self.position:
@@ -199,7 +172,6 @@ class FuturesTrader:
         self.tp3         = None
         self.tp2_hit     = False
         clear_position(self.symbol)
-        _reset_notify(self.symbol)
 
     # ─────────────────────────────────────────────────────────────
     # ABRIR POSICIÓN
@@ -221,7 +193,6 @@ class FuturesTrader:
         logger.warning(f"📈 [{self.symbol}] LONG @ {self.entry_price} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}")
         await notify_open(self.symbol, "long", self.entry_price,
                           self.leverage, usdt_amount, self.dry_run)
-        _reset_notify(self.symbol)
 
     async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None):
         await self._open_order("sell", usdt_amount)
@@ -239,7 +210,6 @@ class FuturesTrader:
         logger.warning(f"📉 [{self.symbol}] SHORT @ {self.entry_price} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}")
         await notify_open(self.symbol, "short", self.entry_price,
                           self.leverage, usdt_amount, self.dry_run)
-        _reset_notify(self.symbol)
 
     # ─────────────────────────────────────────────────────────────
     # SL / TP CHECK — incluye TP2 parcial y TP3 completo
@@ -365,7 +335,6 @@ class FuturesTrader:
         self.tp3         = None
         self.tp2_hit     = False
         clear_position(self.symbol)
-        _reset_notify(self.symbol)
         return result
 
     # ─────────────────────────────────────────────────────────────
@@ -406,20 +375,14 @@ class FuturesTrader:
                     current_pnl       = None,
                 )
 
-                action       = decision["action"]
-                sig          = decision["signal"]
-                reason       = decision["reason"]
-                signal_block = decision["signal_block"]
-
-                # ── Notificar decisión IA solo si pasa el cooldown ──
-                if action != "HOLD" and _can_notify(self.symbol, action):
-                    await notify_ai_decision(
-                        self.symbol, action,
-                        sig.score if sig else 0,
-                        f"{reason}\n{signal_block}"
-                    )
+                action = decision["action"]
+                sig    = decision["signal"]
+                reason = decision["reason"]
 
                 # ── 3. Ejecutar acción ───────────────────────────
+                # Las notificaciones SOLO se envían dentro de open_long/open_short
+                # y close_position. El loop no envía nada por sí mismo.
+
                 if action == "CLOSE" and self.position:
                     result = await self.close_position(reason[:60])
                     risk.on_trade_close(result.get("pnl_pct", 0))
@@ -450,9 +413,6 @@ class FuturesTrader:
                         else:
                             block_reason = r1 if not can_l else r2
                             logger.info(f"[{self.symbol}] ⛔ {block_reason}")
-                            # Notificar bloqueo de riesgo máximo una sola vez por cooldown
-                            if _can_notify(self.symbol, "RISK_BLOCK"):
-                                await notify_risk_block(self.symbol, block_reason)
 
                 elif action == "SELL":
                     if self.position == "long":
@@ -478,9 +438,6 @@ class FuturesTrader:
                         else:
                             block_reason = r1 if not can_l else r2
                             logger.info(f"[{self.symbol}] ⛔ {block_reason}")
-                            # Notificar bloqueo de riesgo máximo una sola vez por cooldown
-                            if _can_notify(self.symbol, "RISK_BLOCK"):
-                                await notify_risk_block(self.symbol, block_reason)
 
             except ccxt.NetworkError as e:
                 logger.error(f"[{self.symbol}] Red: {e}")
