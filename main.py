@@ -117,6 +117,7 @@ async def main():
     )
 
     logger.info("🔍 Escaneando mercado inicial...")
+    # scan() ya devuelve símbolos en formato BASE/USDT:USDT (ccxt estándar)
     initial_pairs = await scanner.scan()
 
     scored_data = []
@@ -135,7 +136,14 @@ async def main():
     logger.info("🤖 Filtrando con IA...")
     ai_ranked = await ai_rank_pairs(scored_data)
     top_n = int(os.getenv("TOP_PAIRS", "15"))
-    final_pairs = ai_ranked[:top_n]
+    # ai_rank_pairs puede devolver símbolos en formato comprimido (BTCUSDT);
+    # normalizarlos al formato estándar antes de lanzar los traders.
+    final_pairs = [
+        scanner.normalize(sym) for sym in ai_ranked[:top_n]
+    ]
+    # Deduplicar por si acaso ai_rank_pairs devolvió duplicados
+    seen = set()
+    final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
 
     logger.info(f"✅ Pares finales ({len(final_pairs)}): {', '.join(final_pairs)}")
 

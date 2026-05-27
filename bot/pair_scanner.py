@@ -21,12 +21,33 @@ NON_CRYPTO_BASES = {
 }
 
 
+def _normalize_symbol(symbol: str, markets: dict) -> str:
+    """
+    Garantiza que el símbolo sea siempre en formato ccxt estándar BASE/USDT:USDT.
+    Si viene como 'FFUSDT' o 'BTCUSDT', lo convierte al formato correcto
+    buscando en los mercados cargados. Si ya está en formato estándar, lo
+    devuelve sin cambios.
+    """
+    if symbol in markets:
+        return symbol
+    # Intentar construir el formato estándar a partir del símbolo comprimido
+    # Ej: FFUSDT -> base=FF, FF/USDT:USDT
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]  # quitar 'USDT' del final
+        candidate = f"{base}/USDT:USDT"
+        if candidate in markets:
+            return candidate
+    return symbol
+
+
 class PairScanner:
     """
     Escanea en tiempo real todos los pares USDT de futuros perpetuos en Bitget.
     Filtra por volumen, volatilidad y tendencia para elegir los mejores.
     Solo opera pares crypto puros — excluye acciones tokenizadas y commodities.
     Se refresca cada X minutos para detectar pares nuevos automáticamente.
+    IMPORTANTE: todos los símbolos devueltos están en formato ccxt estándar
+    (BASE/USDT:USDT) para evitar traders duplicados.
     """
 
     def __init__(self, api_key, api_secret, passphrase,
@@ -45,6 +66,7 @@ class PairScanner:
         self.top_n = top_n
         self.refresh_interval = refresh_interval_min * 60
         self.active_pairs: list = []
+        self._markets: dict = {}  # cache de mercados para normalización
         # Blacklist adicional configurable via .env
         # Ej: SYMBOL_BLACKLIST=ZEC,BSB,MU
         extra = os.getenv("SYMBOL_BLACKLIST", "")
@@ -55,19 +77,15 @@ class PairScanner:
     def _is_crypto_pair(self, symbol: str, market: dict) -> bool:
         """Devuelve True solo si el par es crypto pura, no accion/commodity"""
         base = market.get("base", "").upper()
-        # Excluir si el base está en la lista negra
         if base in self.blacklist:
             return False
-        # Los pares de acciones tokenizadas suelen tener / seguido de USDT:USDT
-        # pero el base tiene solo 2-5 letras que coinciden con tickers de bolsa.
-        # Heurística adicional: si el base tiene menos de 2 o más de 10 chars
-        # y no es crypto conocida, excluir.
         if len(base) < 2 or len(base) > 10:
             return False
         return True
 
     async def get_all_usdt_perp_pairs(self) -> list:
         markets = await self.exchange.load_markets(reload=True)
+        self._markets = markets  # guardar para normalización posterior
         pairs = [
             s for s, m in markets.items()
             if m.get("quote") == "USDT"
@@ -93,7 +111,7 @@ class PairScanner:
                 return None
             score = (volume_usdt / 1_000_000) * 0.6 + change_pct * 0.4
             return {
-                "symbol": symbol,
+                "symbol": symbol,  # ya en formato estándar (viene de get_all_usdt_perp_pairs)
                 "volume_usdt": round(volume_usdt / 1_000_000, 2),
                 "change_pct": round(change_pct, 2),
                 "last_price": last,
@@ -119,7 +137,12 @@ class PairScanner:
                 f"  {p['symbol']:<20} Vol: ${p['volume_usdt']}M | "
                 f"Cambio: {p['change_pct']}% | Score: {p['score']}"
             )
+        # Los símbolos ya vienen en formato BASE/USDT:USDT desde get_all_usdt_perp_pairs
         return [p["symbol"] for p in top]
+
+    def normalize(self, symbol: str) -> str:
+        """Normaliza un símbolo externo al formato ccxt estándar usando el cache de mercados."""
+        return _normalize_symbol(symbol, self._markets)
 
     async def run_scanner_loop(self, on_update_callback):
         while True:
