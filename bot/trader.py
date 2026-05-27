@@ -18,12 +18,7 @@ from bot.state import (
 logger = logging.getLogger("Trader")
 
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
-
-# Params comunes para todas las órdenes en Unified Account
-_ORDER_PARAMS_BASE = {
-    "productType": "USDT-FUTURES",
-    "marginCoin":  "USDT",
-}
+BITGET_BASE = "https://api.bitget.com"
 
 
 class FuturesTrader:
@@ -47,190 +42,171 @@ class FuturesTrader:
         self._api_key     = api_key
         self._api_secret  = api_secret
         self._passphrase  = passphrase
-        # ── ccxt: Unified Account requiere unified=True ──────────────────
+        # ccxt solo se usa para fetch_ticker y fetch_ohlcv (endpoints públicos/no-Unified)
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
             "secret":   api_secret,
             "password": passphrase,
-            "options":  {
-                "defaultType": "swap",
-                "unified":     True,   # ← CRÍTICO para Unified Account
-            },
+            "options":  {"defaultType": "swap"},
         })
 
     # ─────────────────────────────────────────────────────────────
-    # FIRMA
+    # FIRMA HTTP DIRECTA (Base64 — requerido por Bitget v2 Unified)
     # ─────────────────────────────────────────────────────────────
 
-    def _make_sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
+    def _sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
         msg = ts + method.upper() + path_with_qs + body
-        raw = hmac.new(
-            self._api_secret.encode(),
-            msg.encode(),
-            hashlib.sha256,
-        ).digest()
-        return base64.b64encode(raw).decode()
+        return base64.b64encode(
+            hmac.new(self._api_secret.encode(), msg.encode(), hashlib.sha256).digest()
+        ).decode()
 
-    def _auth_headers(self, method: str, path_with_qs: str, body: str = "") -> dict:
+    def _headers(self, method: str, path_with_qs: str, body: str = "") -> dict:
         ts = str(int(time.time() * 1000))
         return {
             "ACCESS-KEY":        self._api_key,
-            "ACCESS-SIGN":       self._make_sign(ts, method, path_with_qs, body),
+            "ACCESS-SIGN":       self._sign(ts, method, path_with_qs, body),
             "ACCESS-TIMESTAMP":  ts,
             "ACCESS-PASSPHRASE": self._passphrase,
             "Content-Type":      "application/json",
             "locale":            "en-US",
         }
 
+    async def _http_get(self, path_with_qs: str) -> dict:
+        url = BITGET_BASE + path_with_qs
+        headers = self._headers("GET", path_with_qs)
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                return _json.loads(await r.text())
+
+    async def _http_post(self, path: str, payload: dict) -> dict:
+        body = _json.dumps(payload)
+        headers = self._headers("POST", path, body)
+        async with aiohttp.ClientSession() as s:
+            async with s.post(BITGET_BASE + path, headers=headers, data=body,
+                              timeout=aiohttp.ClientTimeout(total=10)) as r:
+                return _json.loads(await r.text())
+
     # ─────────────────────────────────────────────────────────────
-    # BALANCE — API v3 Unified Account
+    # BALANCE
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _extract_usdt_available(data) -> float:
-        """
-        Extrae el campo 'available' de USDT de la respuesta v3.
-
-        La API v3 de Bitget devuelve DOS formatos posibles:
-          Formato A (lista plana):  data = [{'coin':'USDT','available':'304.06',...}, ...]
-          Formato B (dict anidado): data = [{'accountEquity':'...','assets':[{'coin':'USDT','available':'304.06'},...]}]
-
-        Este método maneja ambos.
-        """
         if not data:
             return 0.0
-
-        # Normalizar a lista
         if isinstance(data, dict):
             data = [data]
-
         for item in data:
-            # Formato A — el item tiene directamente 'coin'
             coin = str(item.get("coin") or "").upper()
             if coin == "USDT":
                 return float(
-                    item.get("available") or
-                    item.get("availableAmount") or
-                    item.get("crossMaxAvailable") or
-                    0
+                    item.get("available") or item.get("availableAmount") or
+                    item.get("crossMaxAvailable") or 0
                 )
-
-            # Formato B — el item tiene 'assets' anidado
-            nested = item.get("assets") or []
-            if isinstance(nested, dict):
-                nested = [nested]
-            for asset in nested:
-                acoin = str(asset.get("coin") or "").upper()
-                if acoin == "USDT":
+            for asset in (item.get("assets") or []):
+                if str(asset.get("coin") or "").upper() == "USDT":
                     return float(
-                        asset.get("available") or
-                        asset.get("availableAmount") or
-                        asset.get("crossMaxAvailable") or
-                        0
+                        asset.get("available") or asset.get("availableAmount") or
+                        asset.get("crossMaxAvailable") or 0
                     )
-
         return 0.0
 
     async def _get_balance_direct(self) -> float:
-        """
-        Bitget Unified Account — usa API v3 exclusivamente.
-        Maneja tanto el formato plano como el formato anidado con 'assets'.
-        """
-        # ── Intento 1: GET /api/v3/account/assets ────────────────────────
-        path_v3 = "/api/v3/account/assets"
+        for path in ["/api/v3/account/assets", "/api/v3/account/assets?coin=USDT"]:
+            try:
+                r = await self._http_get(path)
+                if r.get("code") == "00000":
+                    free = self._extract_usdt_available(r.get("data"))
+                    if free > 0:
+                        logger.info(f"[{self.symbol}] ✅ Balance USDT (v3/assets): {free}")
+                        return free
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] balance {path}: {e}")
+        # fallback mix
         try:
-            headers = self._auth_headers("GET", path_v3)
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://api.bitget.com" + path_v3,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    body = await resp.text()
-                    if resp.status == 200:
-                        jdata = _json.loads(body)
-                        if jdata.get("code") == "00000":
-                            free = self._extract_usdt_available(jdata.get("data"))
-                            if free > 0:
-                                logger.info(
-                                    f"[{self.symbol}] ✅ Balance USDT (v3/assets): {free}"
-                                )
-                                return free
-                            logger.warning(
-                                f"[{self.symbol}] v3/assets: USDT=0 o no encontrado."
-                            )
-                        else:
-                            logger.warning(
-                                f"[{self.symbol}] v3/assets code={jdata.get('code')} msg={jdata.get('msg')}"
-                            )
-                    else:
-                        logger.warning(
-                            f"[{self.symbol}] v3/assets HTTP {resp.status}: {body[:200]}"
-                        )
+            r = await self._http_get("/api/v2/mix/account/accounts?productType=USDT-FUTURES")
+            if r.get("code") == "00000":
+                for acc in (r.get("data") or []):
+                    coin = str(acc.get("marginCoin") or acc.get("coin") or "").upper()
+                    if coin == "USDT":
+                        free = float(acc.get("available") or acc.get("crossMaxAvailable") or 0)
+                        if free > 0:
+                            logger.info(f"[{self.symbol}] ✅ Balance USDT (mix/accounts): {free}")
+                            return free
         except Exception as e:
-            logger.warning(f"[{self.symbol}] v3/assets error: {e}")
-
-        # ── Intento 2: GET /api/v3/account/assets?coin=USDT ──────────────
-        path_v3_coin = "/api/v3/account/assets?coin=USDT"
-        try:
-            headers = self._auth_headers("GET", path_v3_coin)
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://api.bitget.com" + path_v3_coin,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    body = await resp.text()
-                    if resp.status == 200:
-                        jdata = _json.loads(body)
-                        if jdata.get("code") == "00000":
-                            free = self._extract_usdt_available(jdata.get("data"))
-                            if free > 0:
-                                logger.info(
-                                    f"[{self.symbol}] ✅ Balance USDT (v3/assets?coin): {free}"
-                                )
-                                return free
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] v3/assets?coin error: {e}")
-
-        # ── Intento 3: GET /api/v2/mix/account/accounts ──────────────────
-        path_mix = "/api/v2/mix/account/accounts?productType=USDT-FUTURES"
-        try:
-            headers = self._auth_headers("GET", path_mix)
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://api.bitget.com" + path_mix,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    body = await resp.text()
-                    if resp.status == 200:
-                        jdata = _json.loads(body)
-                        if jdata.get("code") == "00000":
-                            accounts = jdata.get("data") or []
-                            if isinstance(accounts, dict):
-                                accounts = [accounts]
-                            for acc in accounts:
-                                coin = str(acc.get("marginCoin") or acc.get("coin") or "").upper()
-                                if coin == "USDT":
-                                    free = float(
-                                        acc.get("available") or
-                                        acc.get("crossMaxAvailable") or
-                                        acc.get("availableAmount") or
-                                        0
-                                    )
-                                    if free > 0:
-                                        logger.info(
-                                            f"[{self.symbol}] ✅ Balance USDT (mix/accounts): {free}"
-                                        )
-                                        return free
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] mix/accounts error: {e}")
-
-        logger.warning(
-            f"[{self.symbol}] ⚠️ Balance = 0 — todos los endpoints fallaron."
-        )
+            logger.warning(f"[{self.symbol}] balance mix: {e}")
+        logger.warning(f"[{self.symbol}] ⚠️ Balance = 0 — todos los endpoints fallaron.")
         return 0.0
+
+    # ─────────────────────────────────────────────────────────────
+    # ÓRDENES — HTTP directo (Bitget v2 Unified Account)
+    #
+    # Endpoint: POST /api/v2/mix/order/place-order
+    # Documentación: https://www.bitget.com/api-doc/contract/trade/Place-Order
+    #
+    # Campos obligatorios en Unified Account:
+    #   symbol       — formato Bitget: "BTCUSDT" (sin slash ni :USDT)
+    #   productType  — "USDT-FUTURES"
+    #   marginMode   — "crossed" | "isolated"
+    #   marginCoin   — "USDT"
+    #   size         — cantidad en contratos (string)
+    #   side         — "buy" | "sell"
+    #   tradeSide    — "open" | "close"
+    #   orderType    — "market"
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _bitget_symbol(ccxt_symbol: str) -> str:
+        """Convierte 'BTC/USDT:USDT' → 'BTCUSDT'"""
+        return ccxt_symbol.split("/")[0] + ccxt_symbol.split("/")[1].split(":")[0]
+
+    async def _place_order(self, side: str, trade_side: str, qty: float,
+                           reduce_only: bool = False) -> dict:
+        """
+        Coloca una orden de mercado via HTTP directo.
+        side       : 'buy' | 'sell'
+        trade_side : 'open' | 'close'
+        qty        : cantidad en contratos
+        """
+        path = "/api/v2/mix/order/place-order"
+        payload = {
+            "symbol":      self._bitget_symbol(self.symbol),
+            "productType": "USDT-FUTURES",
+            "marginMode":  self.margin_mode,
+            "marginCoin":  "USDT",
+            "size":        str(qty),
+            "side":        side,
+            "tradeSide":   trade_side,
+            "orderType":   "market",
+        }
+        resp = await self._http_post(path, payload)
+        if resp.get("code") != "00000":
+            raise Exception(f"place-order error {resp.get('code')}: {resp.get('msg')}")
+        logger.info(f"[{self.symbol}] 📤 Orden {side}/{trade_side} qty={qty} | orderId={resp.get('data',{}).get('orderId')}")
+        return resp
+
+    # ─────────────────────────────────────────────────────────────
+    # POSICIONES — HTTP directo
+    # ─────────────────────────────────────────────────────────────
+
+    async def _get_positions(self) -> list:
+        """
+        Retorna lista de posiciones abiertas para self.symbol.
+        Endpoint: GET /api/v2/mix/position/single-position
+        """
+        sym   = self._bitget_symbol(self.symbol)
+        path  = f"/api/v2/mix/position/single-position?symbol={sym}&productType=USDT-FUTURES&marginCoin=USDT"
+        try:
+            r = await self._http_get(path)
+            if r.get("code") == "00000":
+                data = r.get("data") or []
+                if isinstance(data, dict):
+                    data = [data]
+                return [p for p in data if float(p.get("total") or p.get("size", 0)) > 0]
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] get_positions: {e}")
+        return []
 
     # ─────────────────────────────────────────────────────────────
     # INIT
@@ -238,7 +214,6 @@ class FuturesTrader:
 
     async def _init(self, usdt_amount: float):
         await self.exchange.load_markets()
-
         saved = load_position(self.symbol)
         if saved:
             self.position    = saved["position"]
@@ -256,12 +231,11 @@ class FuturesTrader:
             )
         else:
             self.usdt_amount = usdt_amount
-
         mode = "🧪 DRY" if self.dry_run else "💰 REAL"
         logger.info(f"✅ [{self.symbol}] Listo | x{self.leverage} | {mode}")
 
     # ─────────────────────────────────────────────────────────────
-    # EXCHANGE HELPERS
+    # HELPERS PRECIO / OHLCV
     # ─────────────────────────────────────────────────────────────
 
     async def get_balance(self):
@@ -276,44 +250,32 @@ class FuturesTrader:
     async def fetch_ohlcv(self, timeframe="15m", limit=100):
         return await self.exchange.fetch_ohlcv(self.symbol, timeframe, limit=limit)
 
-    async def _open_order(self, side, usdt_amount):
+    # ─────────────────────────────────────────────────────────────
+    # OPEN / CLOSE
+    # ─────────────────────────────────────────────────────────────
+
+    async def _open_order(self, side: str, usdt_amount: float):
         price = await self.get_price()
         qty   = round((usdt_amount * self.leverage) / price, 4)
         if self.dry_run:
             logger.warning(f"[DRY][{self.symbol}] {side.upper()} {qty} @ {price}")
-            return {"id": f"DRY_{side}", "price": price}
-        return await self.exchange.create_order(
-            self.symbol, "market", side, qty,
-            params={
-                **_ORDER_PARAMS_BASE,
-                "reduceOnly": False,
-                "marginMode": self.margin_mode,
-                "tradeSide":  "open",
-            }
-        )
+            return {"price": price}
+        await self._place_order(side, "open", qty)
+        return {"price": price}
 
-    async def _partial_close_order(self, side, ratio: float):
+    async def _partial_close_order(self, side: str, ratio: float):
         if self.dry_run:
             logger.warning(f"[DRY][{self.symbol}] PARTIAL CLOSE {ratio*100:.0f}% {side.upper()}")
             return
         try:
-            positions = await self.exchange.fetch_positions(
-                [self.symbol],
-                params={**_ORDER_PARAMS_BASE}
-            )
+            positions = await self._get_positions()
             for p in positions:
-                contracts = float(p.get("contracts") or p.get("size", 0))
-                if contracts > 0:
-                    partial_qty = round(contracts * ratio, 4)
-                    close_side  = "sell" if p["side"] == "long" else "buy"
-                    await self.exchange.create_order(
-                        self.symbol, "market", close_side, partial_qty,
-                        params={
-                            **_ORDER_PARAMS_BASE,
-                            "reduceOnly": True,
-                            "tradeSide":  "close",
-                        }
-                    )
+                size = float(p.get("total") or p.get("size", 0))
+                if size > 0:
+                    partial_qty  = round(size * ratio, 4)
+                    pos_side     = str(p.get("holdSide") or p.get("side") or "").lower()
+                    close_side   = "sell" if pos_side == "long" else "buy"
+                    await self._place_order(close_side, "close", partial_qty)
                     logger.info(f"[{self.symbol}] TP parcial {ratio*100:.0f}% ({partial_qty} contratos)")
                     break
         except Exception as e:
@@ -327,21 +289,17 @@ class FuturesTrader:
         if not self.position:
             return
         entry = self.entry_price or fill_price
+        pnl   = 0.0
         if fill_price and entry:
-            if self.position == "long":
-                pnl = (fill_price - entry) / entry * 100 * self.leverage
-            else:
-                pnl = (entry - fill_price) / entry * 100 * self.leverage
-        else:
-            pnl = 0.0
+            pnl = ((fill_price - entry) / entry * 100 * self.leverage
+                   if self.position == "long" else
+                   (entry - fill_price) / entry * 100 * self.leverage)
         self.total_pnl += pnl
         if pnl > 0:
             self.win_count += 1
         logger.warning(f"[Webhook][{self.symbol}] Cerrado | {reason} | PnL: {pnl:+.2f}%")
         await notify_close(self.symbol, self.position, entry, fill_price, pnl, reason, self.dry_run)
-        self.position = None
-        self.entry_price = None
-        self.sl = self.tp1 = self.tp2 = self.tp3 = None
+        self.position = self.entry_price = self.sl = self.tp1 = self.tp2 = self.tp3 = None
         self.tp2_hit = False
         clear_position(self.symbol)
 
@@ -447,21 +405,13 @@ class FuturesTrader:
         price = await self.get_price()
         if not self.dry_run:
             try:
-                positions = await self.exchange.fetch_positions(
-                    [self.symbol], params={**_ORDER_PARAMS_BASE}
-                )
+                positions = await self._get_positions()
                 for p in positions:
-                    contracts = float(p.get("contracts") or p.get("size", 0))
-                    if contracts > 0:
-                        side = "sell" if p["side"] == "long" else "buy"
-                        await self.exchange.create_order(
-                            self.symbol, "market", side, contracts,
-                            params={
-                                **_ORDER_PARAMS_BASE,
-                                "reduceOnly": True,
-                                "tradeSide":  "close",
-                            }
-                        )
+                    size     = float(p.get("total") or p.get("size", 0))
+                    pos_side = str(p.get("holdSide") or p.get("side") or "").lower()
+                    if size > 0:
+                        close_side = "sell" if pos_side == "long" else "buy"
+                        await self._place_order(close_side, "close", size)
                         break
             except Exception as e:
                 logger.error(f"[{self.symbol}] Close error: {e}")
@@ -476,9 +426,7 @@ class FuturesTrader:
         await notify_close(self.symbol, self.position, self.entry_price, price, pnl, reason, self.dry_run)
         result = {"side": self.position, "entry": self.entry_price, "exit": price,
                   "pnl_pct": round(pnl, 2), "reason": reason}
-        self.position = None
-        self.entry_price = None
-        self.sl = self.tp1 = self.tp2 = self.tp3 = None
+        self.position = self.entry_price = self.sl = self.tp1 = self.tp2 = self.tp3 = None
         self.tp2_hit = False
         clear_position(self.symbol)
         return result
@@ -578,7 +526,6 @@ class FuturesTrader:
             await asyncio.sleep(interval)
 
     async def close(self):
-        """Cierra limpiamente la sesión ccxt al parar el trader."""
         try:
             await self.exchange.close()
         except Exception:
