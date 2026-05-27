@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import json
+import time
 import asyncio
 import aiohttp
 from bot.indicators import ema, rsi, macd, supertrend, atr
@@ -12,8 +13,15 @@ logger = logging.getLogger("AITrader")
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
-# NOTA: gemini-2.5-flash-preview-05-20 fue deprecado. Usar gemini-2.5-flash (GA).
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# Caché de decisiones IA: {cache_key: (result_dict, timestamp)}
+# Evita llamar a Gemini si el símbolo + score no cambiaron en los últimos CACHE_TTL segundos
+_ai_cache: dict = {}
+CACHE_TTL = int(os.getenv("AI_CACHE_TTL", "300"))  # 5 minutos por defecto
+
+# Score mínimo para consultar la IA (scores bajos → HOLD directo sin llamada)
+AI_MIN_SCORE = int(os.getenv("AI_MIN_SCORE", "7"))
 
 SYSTEM_PROMPT = """You are a crypto futures trading expert. Reply ONLY with a JSON object, nothing else.
 Rules: CLOSE if pnl>+3% or pnl<-1.5% | No BUY if rsi>70 | No SELL if rsi<30 | vol_ratio>1.5 confirms, <0.7 weakens | If unsure -> HOLD
@@ -32,7 +40,6 @@ def _parse_ai_json(raw: str) -> dict:
     start = raw.find("{")
     end   = raw.rfind("}")
     if start == -1 or end == -1 or end < start:
-        # Intentar recuperar JSON truncado: extraer action y confidence con regex
         action_m = re.search(r'"action"\s*:\s*"(BUY|SELL|HOLD|CLOSE)"', raw)
         conf_m   = re.search(r'"confidence"\s*:\s*(\d+)', raw)
         if action_m:
@@ -255,13 +262,39 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         context = context_override
         tech_signal = context_override.get("signal", "NEUTRAL")
         fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
-        logger.info(f"[{symbol}] IA consultada (score={context.get('score')}/10)")
+        score = context_override.get("score", 0)
+
+        # FILTRO SCORE: si el score es bajo, no consultar IA → HOLD directo
+        if score < AI_MIN_SCORE:
+            logger.info(f"[{symbol}] ⏭️ Score {score}/10 < {AI_MIN_SCORE} → HOLD sin IA (ahorro Gemini)")
+            return {"action": "HOLD", "confidence": 4, "reasoning": f"Score {score}/10 insuficiente", "key_factors": []}
+
+        # CACHÉ: si ya tenemos decisión reciente para este símbolo+score, reutilizarla
+        cache_key = f"{symbol}:{score}:{tech_signal}"
+        now = time.monotonic()
+        if cache_key in _ai_cache:
+            cached_result, cached_ts = _ai_cache[cache_key]
+            if now - cached_ts < CACHE_TTL:
+                logger.info(f"[{symbol}] 🔄 IA cached ({int(now - cached_ts)}s ago): {cached_result.get('action')} → ahorro Gemini")
+                return cached_result
+
+        logger.info(f"[{symbol}] IA consultada (score={score}/10)")
     else:
         tech = _technical_signal(bars)
         if tech["signal"] == "HOLD":
             return {"action": "HOLD", "confidence": tech["confidence"], "reasoning": "Sin señal técnica", "key_factors": []}
         context = build_market_context(symbol, bars, position, entry_price, leverage)
         fallback_action = tech["signal"]
+        cache_key = f"{symbol}:tech:{tech['signal']}"
+        now = time.monotonic()
+
+        # CACHÉ para señales técnicas también
+        if cache_key in _ai_cache:
+            cached_result, cached_ts = _ai_cache[cache_key]
+            if now - cached_ts < CACHE_TTL:
+                logger.info(f"[{symbol}] 🔄 IA cached técnico ({int(now - cached_ts)}s ago): {cached_result.get('action')}")
+                return cached_result
+
         logger.info(f"[{symbol}] Técnico {tech['signal']} → IA")
 
     result = await _call_gemini(context)
@@ -275,6 +308,13 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
     min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "6"))
     if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
         result["action"] = "HOLD"
+
+    # Guardar en caché solo si la respuesta es válida
+    _ai_cache[cache_key] = (result, now)
+    # Limpiar caché antigua para no acumular memoria
+    if len(_ai_cache) > 200:
+        oldest_key = min(_ai_cache, key=lambda k: _ai_cache[k][1])
+        del _ai_cache[oldest_key]
 
     logger.info(f"🤖 [{symbol}] {result['action']} ({confidence}/10) | {result.get('reasoning', result.get('reason', ''))}")
     return result
