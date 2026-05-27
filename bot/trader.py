@@ -50,99 +50,131 @@ class FuturesTrader:
         })
 
     # ─────────────────────────────────────────────────────────────
-    # BALANCE
+    # BALANCE — Unified Account v2
+    # Docs: GET /api/v2/account/assets?coin=USDT
     # ─────────────────────────────────────────────────────────────
 
+    def _make_sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
+        """Bitget v2: ACCESS-SIGN = Base64(HMAC-SHA256(ts+method+path+body))"""
+        msg = ts + method.upper() + path_with_qs + body
+        raw = hmac.new(
+            self._api_secret.encode(),
+            msg.encode(),
+            hashlib.sha256,
+        ).digest()
+        return base64.b64encode(raw).decode()
+
+    def _auth_headers(self, method: str, path_with_qs: str) -> dict:
+        ts = str(int(time.time() * 1000))
+        return {
+            "ACCESS-KEY":        self._api_key,
+            "ACCESS-SIGN":       self._make_sign(ts, method, path_with_qs),
+            "ACCESS-TIMESTAMP":  ts,
+            "ACCESS-PASSPHRASE": self._passphrase,
+            "Content-Type":      "application/json",
+            "locale":            "en-US",
+        }
+
     async def _get_balance_direct(self) -> float:
-        # ---- Intento 1: ccxt fetch_balance accountType=unified ----
+        """
+        Bitget Unified Account v2.
+        Endpoint correcto: GET /api/v2/account/assets?coin=USDT
+        (NO /unified/account/assets — ese es 404 en Unified mode)
+        (NO /mix/account/accounts — ese devuelve 40085 en Unified mode)
+        """
+        # Intento 1: ccxt con type=spot para forzar ruta v2/account (unified)
+        # ccxt no tiene soporte directo para unified account assets,
+        # pero fetch_balance con type=spot usa /api/v2/account/assets internamente
         try:
-            data = await self.exchange.fetch_balance({"accountType": "unified"})
+            data = await self.exchange.fetch_balance({"type": "spot"})
             usdt = data.get("USDT") or {}
             free = float(usdt.get("free") or 0)
             total = float(usdt.get("total") or 0)
-            logger.warning(f"[{self.symbol}] 📊 Balance unified/ccxt: free={free} total={total} USDT")
+            logger.warning(f"[{self.symbol}] 📊 Balance ccxt/spot: free={free} total={total} USDT")
             if free > 0:
                 return free
-            # Puede ser cuenta sin posiciones: total=0 pero existe la cuenta
-            if total >= 0 and data.get("info"):
-                # Intentar leer desde info raw de Bitget
-                info = data.get("info", {})
-                raw_list = info.get("data") or []
-                if isinstance(raw_list, dict):
-                    raw_list = [raw_list]
-                for item in raw_list:
-                    coin = str(item.get("coin") or item.get("coinName") or "").upper()
-                    if coin == "USDT":
-                        av = float(item.get("available") or item.get("availableAmount") or 0)
-                        logger.warning(f"[{self.symbol}] 📊 Balance unified/info raw: available={av} USDT")
-                        return av
         except Exception as e:
-            logger.warning(f"[{self.symbol}] ❌ fetch_balance unified error: {e}")
+            logger.warning(f"[{self.symbol}] ❌ fetch_balance spot error: {e}")
 
-        # ---- Intento 2: ccxt fetch_balance USDT-FUTURES ----
+        # Intento 2: HTTP directo al endpoint correcto para Unified Account
+        # GET /api/v2/account/assets?coin=USDT
+        path = "/api/v2/account/assets?coin=USDT"
         try:
-            data2 = await self.exchange.fetch_balance({"productType": "USDT-FUTURES"})
-            usdt2 = data2.get("USDT") or {}
-            free2 = float(usdt2.get("free") or 0)
-            logger.warning(f"[{self.symbol}] 📊 Balance futures/ccxt: free={free2} USDT")
-            if free2 > 0:
-                return free2
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] ❌ fetch_balance futures error: {e}")
-
-        # ---- Intento 3: HTTP directo firma Base64 ----
-        for path in [
-            "/api/v2/unified/account/assets",
-            "/api/v2/mix/account/accounts?productType=USDT-FUTURES",
-        ]:
-            try:
-                ts = str(int(time.time() * 1000))
-                msg = ts + "GET" + path
-                raw_sig = hmac.new(
-                    self._api_secret.encode(),
-                    msg.encode(),
-                    hashlib.sha256,
-                ).digest()
-                sign = base64.b64encode(raw_sig).decode()
-                headers = {
-                    "ACCESS-KEY":        self._api_key,
-                    "ACCESS-SIGN":       sign,
-                    "ACCESS-TIMESTAMP":  ts,
-                    "ACCESS-PASSPHRASE": self._passphrase,
-                    "Content-Type":      "application/json",
-                    "locale":            "en-US",
-                }
-                async with aiohttp.ClientSession() as s:
-                    async with s.get(
-                        "https://api.bitget.com" + path,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as resp:
-                        body = await resp.text()
-                        logger.warning(f"[{self.symbol}] 🌐 HTTP {path} → status={resp.status} body={body[:300]}")
-                        if "json" not in resp.headers.get("Content-Type", ""):
-                            continue
+            headers = self._auth_headers("GET", path)
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    "https://api.bitget.com" + path,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    body = await resp.text()
+                    logger.warning(
+                        f"[{self.symbol}] 🌐 HTTP {path} → "
+                        f"status={resp.status} body={body[:300]}"
+                    )
+                    if resp.status == 200 and "00000" in body:
                         import json as _json
                         jdata = _json.loads(body)
-                        if str(jdata.get("code")) != "00000":
-                            continue
                         assets = jdata.get("data") or []
                         if isinstance(assets, dict):
                             assets = [assets]
                         for asset in assets:
-                            coin = str(asset.get("coin") or asset.get("marginCoin") or asset.get("coinName") or "").upper()
+                            coin = str(
+                                asset.get("coin") or
+                                asset.get("coinName") or ""
+                            ).upper()
                             if coin == "USDT":
                                 free = float(
-                                    asset.get("available")
-                                    or asset.get("availableAmount")
-                                    or 0
+                                    asset.get("available") or
+                                    asset.get("availableAmount") or
+                                    asset.get("frozen") and 0 or  # avoid frozen
+                                    0
                                 )
-                                logger.warning(f"[{self.symbol}] ✅ Balance HTTP {path}: {free} USDT")
+                                logger.warning(
+                                    f"[{self.symbol}] ✅ Balance HTTP unified: {free} USDT "
+                                    f"(raw={asset})"
+                                )
                                 return free
-            except Exception as e:
-                logger.warning(f"[{self.symbol}] ❌ HTTP {path} error: {e}")
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] ❌ HTTP {path} error: {e}")
 
-        logger.warning(f"[{self.symbol}] Balance = 0 — los 3 endpoints fallaron.")
+        # Intento 3: GET /api/v2/account/all-account-balance (otro endpoint unified)
+        path2 = "/api/v2/account/all-account-balance"
+        try:
+            headers2 = self._auth_headers("GET", path2)
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    "https://api.bitget.com" + path2,
+                    headers=headers2,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp2:
+                    body2 = await resp2.text()
+                    logger.warning(
+                        f"[{self.symbol}] 🌐 HTTP {path2} → "
+                        f"status={resp2.status} body={body2[:400]}"
+                    )
+                    if resp2.status == 200 and "00000" in body2:
+                        import json as _json
+                        jdata2 = _json.loads(body2)
+                        # data puede ser dict con campo usdtBalance o similar
+                        d = jdata2.get("data") or {}
+                        usdt_bal = float(
+                            d.get("usdtBalance") or
+                            d.get("availableAmount") or
+                            d.get("available") or 0
+                        )
+                        if usdt_bal > 0:
+                            logger.warning(
+                                f"[{self.symbol}] ✅ Balance all-account: {usdt_bal} USDT"
+                            )
+                            return usdt_bal
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] ❌ HTTP {path2} error: {e}")
+
+        logger.warning(
+            f"[{self.symbol}] Balance = 0 — todos los endpoints fallaron. "
+            "Verifica permisos API Key (Read Account + Trade)."
+        )
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
