@@ -56,7 +56,8 @@ class FuturesTrader:
         t = await self.exchange.fetch_ticker(self.symbol)
         return float(t["last"])
 
-    async def fetch_ohlcv(self, timeframe="15m", limit=200):
+    async def fetch_ohlcv(self, timeframe="15m", limit=100):
+        # limit reducido de 200 a 100 — suficiente para todos los indicadores
         return await self.exchange.fetch_ohlcv(self.symbol, timeframe, limit=limit)
 
     async def _open_order(self, side, usdt_amount):
@@ -133,27 +134,35 @@ class FuturesTrader:
         tf = os.getenv("TIMEFRAME", "15m")
         while True:
             try:
-                bars = await self.fetch_ohlcv(tf, limit=200)
+                bars = await self.fetch_ohlcv(tf, limit=100)
+
+                # ai_decide aplica la nueva lógica:
+                # - Sin posición + HOLD técnico → 0 llamadas IA
+                # - Con posición abierta → 0 llamadas IA (solo revisa PnL)
+                # - Sin posición + señal clara → 1 llamada IA de confirmación
                 decision = await ai_decide(
                     self.symbol, bars,
                     self.position, self.entry_price,
                     self.leverage
                 )
-                action = decision["action"]
+                action     = decision["action"]
                 confidence = decision.get("confidence", 5)
-                reasoning = decision.get("reasoning", "")
+                reasoning  = decision.get("reasoning", "")
 
-                await notify_ai_decision(self.symbol, action, confidence, reasoning)
+                # Solo notificar por Telegram si hay acción real (no HOLD)
+                # Evita spam de notificaciones en cada ciclo
+                if action != "HOLD":
+                    await notify_ai_decision(self.symbol, action, confidence, reasoning)
 
                 if action == "CLOSE" and self.position:
-                    result = await self.close_position(f"IA: {reasoning[:50]}")
+                    result = await self.close_position(f"{reasoning[:50]}")
                     risk.on_trade_close(result.get("pnl_pct", 0))
                     if global_risk:
                         await global_risk.register_close(result.get("pnl_pct", 0))
 
                 elif action == "BUY":
                     if self.position == "short":
-                        result = await self.close_position("IA reversi\u00f3n \u2192 LONG")
+                        result = await self.close_position("Reversión → LONG")
                         risk.on_trade_close(result.get("pnl_pct", 0))
                         if global_risk:
                             await global_risk.register_close(result.get("pnl_pct", 0))
@@ -168,12 +177,12 @@ class FuturesTrader:
                                 await global_risk.register_open()
                         else:
                             reason = r1 if not can_l else r2
-                            logger.info(f"[{self.symbol}] \u26d4 {reason}")
+                            logger.info(f"[{self.symbol}] ⛔ {reason}")
                             await notify_risk_block(self.symbol, reason)
 
                 elif action == "SELL":
                     if self.position == "long":
-                        result = await self.close_position("IA reversi\u00f3n \u2192 SHORT")
+                        result = await self.close_position("Reversión → SHORT")
                         risk.on_trade_close(result.get("pnl_pct", 0))
                         if global_risk:
                             await global_risk.register_close(result.get("pnl_pct", 0))
@@ -188,7 +197,7 @@ class FuturesTrader:
                                 await global_risk.register_open()
                         else:
                             reason = r1 if not can_l else r2
-                            logger.info(f"[{self.symbol}] \u26d4 {reason}")
+                            logger.info(f"[{self.symbol}] ⛔ {reason}")
                             await notify_risk_block(self.symbol, reason)
 
             except ccxt.NetworkError as e:
