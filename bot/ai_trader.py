@@ -11,7 +11,7 @@ logger = logging.getLogger("AITrader")
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-05-20")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # ──────────────────────────────────────────────────────────────────────────────────
 # FLUJO (sin context_override):
@@ -226,13 +226,11 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
 
     # ── 2. Sin posición ────────────────────────────────────────────────────
     if context_override:
-        # signal_engine ya hizo el análisis multi-TF — usar directamente
         context = context_override
         tech_signal = context_override.get("signal", "NEUTRAL")
         fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
         logger.info(f"[{symbol}] Context override (score={context.get('score')}/10) → consultando IA")
     else:
-        # Ruta legacy: análisis básico 1TF
         tech = _technical_signal(bars)
         if tech["signal"] == "HOLD":
             logger.debug(f"[{symbol}] Técnico HOLD → sin IA")
