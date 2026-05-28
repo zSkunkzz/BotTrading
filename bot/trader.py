@@ -104,6 +104,96 @@ class FuturesTrader:
                     return {"code": "ERR", "msg": text[:200]}
 
     # ─────────────────────────────────────────────────────────────
+    # DETECCIÓN TIPO DE CUENTA (UA vs Classic) — se llama en _init
+    # ─────────────────────────────────────────────────────────────
+
+    async def _detect_account_type(self):
+        """
+        Detecta si la cuenta es Unified Account (UA) o Classic.
+        Si es UA, fija self._api_version = "ua" inmediatamente
+        para evitar que _place_order intente v3/v2 (que devuelven 40085/25236).
+        También detecta el pos_mode del par (hedge vs one_way).
+        """
+        if self._api_version is not None:
+            return  # ya detectado
+
+        try:
+            # Endpoint exclusivo de Unified Account
+            r = await self._http_get("/api/v3/account/account-type")
+            if r.get("code") == "00000":
+                data = r.get("data") or {}
+                acc_type = str(data.get("accountType") or "").lower()
+                if "unified" in acc_type or "ua" in acc_type:
+                    self._api_version = "ua"
+                    logger.info(
+                        f"[{self.symbol}] 🔎 Cuenta detectada: Unified Account → "
+                        f"modo UA activado"
+                    )
+                    await self._detect_ua_pos_mode()
+                    return
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] detect_account_type /v3/account-type: {e}")
+
+        # Prueba alternativa: si el endpoint de assets UA responde OK → es UA
+        try:
+            r2 = await self._http_get("/api/v2/unified/account/assets?coin=USDT")
+            if r2.get("code") == "00000" and r2.get("data"):
+                self._api_version = "ua"
+                logger.info(
+                    f"[{self.symbol}] 🔎 Cuenta detectada: Unified Account "
+                    f"(via unified/assets) → modo UA activado"
+                )
+                await self._detect_ua_pos_mode()
+                return
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] detect_account_type unified/assets: {e}")
+
+        logger.info(f"[{self.symbol}] 🔎 Cuenta detectada: Classic (v3/v2)")
+
+    async def _detect_ua_pos_mode(self):
+        """
+        Detecta el modo de posición (hedge vs one_way) del par en Unified Account.
+        Prueba con una orden ficticia de qty=0 — Bitget rechaza qty=0 con un código
+        específico que revela si el modo es correcto o no; o bien consulta la
+        configuración de posición directamente.
+        """
+        if self._ua_pos_mode is not None:
+            return
+
+        sym = self._bitget_symbol(self.symbol)
+        try:
+            # Intentar leer el pos_mode desde la configuración del contrato
+            path = (
+                f"/api/v3/position/single-position"
+                f"?symbol={sym}&category=USDT-FUTURES&marginCoin=USDT"
+            )
+            r = await self._http_get(path)
+            if r.get("code") == "00000":
+                data = r.get("data") or []
+                if isinstance(data, dict):
+                    data = [data]
+                if data:
+                    # Si tiene posición abierta, el holdSide/posSide nos dice el modo
+                    p = data[0]
+                    if p.get("holdSide") or p.get("posSide"):
+                        self._ua_pos_mode = "hedge"
+                    else:
+                        self._ua_pos_mode = "one_way"
+                    logger.info(
+                        f"[{self.symbol}] 📌 UA pos_mode detectado desde posición: "
+                        f"{self._ua_pos_mode}"
+                    )
+                    return
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] detect_ua_pos_mode: {e}")
+
+        # Sin posición abierta — asumir hedge (default Bitget UA)
+        self._ua_pos_mode = "hedge"
+        logger.info(
+            f"[{self.symbol}] 📌 UA pos_mode asumido: hedge (sin posición previa)"
+        )
+
+    # ─────────────────────────────────────────────────────────────
     # BALANCE
     # ─────────────────────────────────────────────────────────────
 
@@ -309,6 +399,19 @@ class FuturesTrader:
                 f"place-order v2 {resp_v2.get('code')}: {resp_v2.get('msg')}"
             )
 
+        # 40085 directamente en v3 = UA
+        if resp_v3.get("code") == "40085":
+            logger.warning(
+                f"[{self.symbol}] ⚠️ v3→40085 — Unified Account, probando UA"
+            )
+            resp_ua = await self._place_order_ua(sym, side, trade_side, qty, hold_side)
+            if resp_ua.get("code") == "00000":
+                self._api_version = "ua"
+                logger.info(
+                    f"[{self.symbol}] 📌 API version fijada: UA (modo={self._ua_pos_mode})"
+                )
+            return resp_ua
+
         # Cualquier otro error de v3
         raise Exception(
             f"place-order v3 {resp_v3.get('code')}: {resp_v3.get('msg')}"
@@ -328,6 +431,14 @@ class FuturesTrader:
                 f"qty={qty} orderId={order_id} [v3]"
             )
             return resp
+        # Si falla con 25236/40085 en modo fijado → resetear y reintentar
+        if resp.get("code") in ("25236", "40085"):
+            logger.warning(
+                f"[{self.symbol}] ⚠️ v3 fijado devuelve {resp.get('code')} — "
+                f"reseteando api_version para re-autodetección"
+            )
+            self._api_version = None
+            return await self._place_order(side, trade_side, qty, hold_side)
         raise Exception(f"place-order v3 {resp.get('code')}: {resp.get('msg')}")
 
     async def _place_order_ua(self, sym: str, side: str, trade_side: str,
@@ -352,6 +463,27 @@ class FuturesTrader:
                     f"qty={qty} orderId={order_id} [ua-hedge]"
                 )
                 return resp
+            # 25236 con ua-hedge fijado → el contrato es one_way, cambiar
+            if resp.get("code") == "25236":
+                logger.warning(
+                    f"[{self.symbol}] ⚠️ ua-hedge fijado devuelve 25236 — "
+                    f"cambiando a one_way"
+                )
+                self._ua_pos_mode = "one_way"
+                payload_ow = self._build_payload_ua_oneway(sym, side, trade_side, qty)
+                logger.info(f"[{self.symbol}] 📤 order [ua-oneway]: {payload_ow}")
+                resp_ow = await self._http_post(path, payload_ow)
+                logger.info(f"[{self.symbol}] 📥 response [ua-oneway]: {resp_ow}")
+                if resp_ow.get("code") == "00000":
+                    order_id = (resp_ow.get("data") or {}).get("orderId", "?")
+                    logger.info(
+                        f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} "
+                        f"orderId={order_id} [ua-oneway]"
+                    )
+                    return resp_ow
+                raise Exception(
+                    f"place-order ua-oneway {resp_ow.get('code')}: {resp_ow.get('msg')}"
+                )
             raise Exception(
                 f"place-order ua-hedge {resp.get('code')}: {resp.get('msg')}"
             )
@@ -368,6 +500,29 @@ class FuturesTrader:
                     f"orderId={order_id} [ua-oneway]"
                 )
                 return resp
+            # 25236 con ua-oneway fijado → el contrato es hedge, cambiar
+            if resp.get("code") == "25236" and hold_side:
+                logger.warning(
+                    f"[{self.symbol}] ⚠️ ua-oneway fijado devuelve 25236 — "
+                    f"cambiando a hedge"
+                )
+                self._ua_pos_mode = "hedge"
+                payload_h = self._build_payload_ua_hedge(
+                    sym, side, trade_side, qty, hold_side
+                )
+                logger.info(f"[{self.symbol}] 📤 order [ua-hedge]: {payload_h}")
+                resp_h = await self._http_post(path, payload_h)
+                logger.info(f"[{self.symbol}] 📥 response [ua-hedge]: {resp_h}")
+                if resp_h.get("code") == "00000":
+                    order_id = (resp_h.get("data") or {}).get("orderId", "?")
+                    logger.info(
+                        f"[{self.symbol}] ✅ {side}/{trade_side} posSide={hold_side} "
+                        f"qty={qty} orderId={order_id} [ua-hedge]"
+                    )
+                    return resp_h
+                raise Exception(
+                    f"place-order ua-hedge {resp_h.get('code')}: {resp_h.get('msg')}"
+                )
             raise Exception(
                 f"place-order ua-oneway {resp.get('code')}: {resp.get('msg')}"
             )
@@ -436,6 +591,17 @@ class FuturesTrader:
                 f"qty={qty} orderId={order_id} [v2]"
             )
             return resp
+        # Si falla con 25236/40085 en modo fijado → resetear y reintentar
+        if resp.get("code") in ("25236", "40085"):
+            logger.warning(
+                f"[{self.symbol}] ⚠️ v2 fijado devuelve {resp.get('code')} — "
+                f"escalando a UA"
+            )
+            self._api_version = None
+            resp_ua = await self._place_order_ua(sym, side, trade_side, qty, hold_side)
+            if resp_ua.get("code") == "00000":
+                self._api_version = "ua"
+            return resp_ua
         raise Exception(f"place-order v2 {resp.get('code')}: {resp.get('msg')}")
 
     # ─────────────────────────────────────────────────────────────
@@ -496,15 +662,19 @@ class FuturesTrader:
 
     async def _init(self, usdt_amount: float):
         await self.exchange.load_markets()
+
+        # ── DETECTAR TIPO DE CUENTA ANTES DE OPERAR ──
+        await self._detect_account_type()
+
         saved = load_position(self.symbol)
         if saved:
             # Restaurar api_version y ua_pos_mode si fueron guardados
-            if saved.get("api_version"):
+            if saved.get("api_version") and self._api_version is None:
                 self._api_version = saved["api_version"]
                 logger.info(
                     f"[{self.symbol}] 📌 API version restaurada: {self._api_version}"
                 )
-            if saved.get("ua_pos_mode"):
+            if saved.get("ua_pos_mode") and self._ua_pos_mode is None:
                 self._ua_pos_mode = saved["ua_pos_mode"]
 
             # ── Validar contra el exchange que la posición realmente existe ──
