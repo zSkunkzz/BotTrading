@@ -330,36 +330,44 @@ class FuturesTrader:
 
     # ─────────────────────────────────────────────────────────────
     # SET LEVERAGE DINÁMICO — aplica el leverage del signal en Bitget
+    # FIX: añadido holdSide en v3 (necesario en modo hedge),
+    #      warning detallado cuando falla, retorna leverage efectivo.
     # ─────────────────────────────────────────────────────────────
 
-    async def _set_leverage_on_exchange(self, leverage: int) -> bool:
+    async def _set_leverage_on_exchange(self, leverage: int) -> int:
         """
         Fija el leverage para el par en Bitget antes de abrir una posición.
         Actualiza self.leverage si tiene éxito.
-        Retorna True si OK, False si falla (no bloquea la orden).
+        Retorna el leverage efectivo (el solicitado si OK, self.leverage si falla).
         """
         if self.dry_run:
             self.leverage = leverage
-            return True
+            return leverage
 
         sym = self._bitget_symbol(self.symbol)
         lev_str = str(leverage)
+        r_v3 = None
+        r_v2 = None
 
-        # Intentar v3 primero (Unified Account)
+        # Intentar v3 primero (Unified Account) — con holdSide para modo hedge
         try:
             payload_v3 = {
                 "symbol":     sym,
                 "category":   "USDT-FUTURES",
                 "marginCoin": "USDT",
                 "leverage":   lev_str,
+                "holdSide":   "long",
             }
-            r = await self._http_post("/api/v3/account/set-leverage", payload_v3)
-            if r.get("code") == "00000":
+            r_v3 = await self._http_post("/api/v3/account/set-leverage", payload_v3)
+            if r_v3.get("code") == "00000":
+                # En modo hedge también fijar para short
+                payload_v3_s = {**payload_v3, "holdSide": "short"}
+                await self._http_post("/api/v3/account/set-leverage", payload_v3_s)
                 self.leverage = leverage
                 logger.info(
                     f"[{self.symbol}] ⚙️ Leverage fijado a x{leverage} (v3)"
                 )
-                return True
+                return leverage
         except Exception as e:
             logger.debug(f"[{self.symbol}] set-leverage v3 error: {e}")
 
@@ -372,8 +380,8 @@ class FuturesTrader:
                 "leverage":    lev_str,
                 "holdSide":    "long",
             }
-            r2 = await self._http_post("/api/v2/mix/account/set-leverage", payload_v2)
-            if r2.get("code") == "00000":
+            r_v2 = await self._http_post("/api/v2/mix/account/set-leverage", payload_v2)
+            if r_v2.get("code") == "00000":
                 # hedge mode: también fijar para short
                 payload_v2_s = {**payload_v2, "holdSide": "short"}
                 await self._http_post("/api/v2/mix/account/set-leverage", payload_v2_s)
@@ -381,15 +389,19 @@ class FuturesTrader:
                 logger.info(
                     f"[{self.symbol}] ⚙️ Leverage fijado a x{leverage} (v2)"
                 )
-                return True
+                return leverage
         except Exception as e:
             logger.debug(f"[{self.symbol}] set-leverage v2 error: {e}")
 
+        # Ambos fallaron — loguear códigos exactos para diagnóstico
+        code_v3 = r_v3.get("code") if r_v3 else "N/A"
+        code_v2 = r_v2.get("code") if r_v2 else "N/A"
         logger.warning(
-            f"[{self.symbol}] ⚠️ No se pudo fijar leverage x{leverage} en Bitget — "
-            f"se usará el leverage actual de la cuenta"
+            f"[{self.symbol}] ⚠️ set-leverage x{leverage} falló "
+            f"(v3={code_v3} v2={code_v2}) — "
+            f"qty se calculará con self.leverage={self.leverage}x (cuenta)"
         )
-        return False
+        return self.leverage  # retorna el leverage actual, no el solicitado
 
     # ─────────────────────────────────────────────────────────────
     # ÓRDENES — con fallback automático v3 → v2 Mix → UA
@@ -1062,11 +1074,18 @@ class FuturesTrader:
 
     # ─────────────────────────────────────────────────────────────
     # OPEN / CLOSE helpers
+    # FIX: _open_order ahora acepta leverage explícito para calcular
+    #      qty con el apalancamiento dinámico correcto, no self.leverage.
     # ─────────────────────────────────────────────────────────────
 
-    async def _open_order(self, side: str, usdt_amount: float):
+    async def _open_order(self, side: str, usdt_amount: float, leverage: int = None):
         price = await self.get_price()
-        qty   = round((usdt_amount * self.leverage) / price, 4)
+        effective_lev = leverage if leverage is not None else self.leverage
+        qty   = round((usdt_amount * effective_lev) / price, 4)
+        logger.info(
+            f"[{self.symbol}] 📐 qty={qty} "
+            f"(usdt={usdt_amount} × lev={effective_lev}x ÷ price={price})"
+        )
         if self.dry_run:
             logger.warning(f"[DRY][{self.symbol}] OPEN {side.upper()} {qty} @ {price}")
             return
@@ -1142,14 +1161,19 @@ class FuturesTrader:
 
     # ─────────────────────────────────────────────────────────────
     # ABRIR POSICIÓN
+    # FIX: se pasa leverage explícito a _open_order para que la qty
+    #      se calcule con el apalancamiento dinámico correcto.
     # ─────────────────────────────────────────────────────────────
 
     async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None,
                         leverage: int = None):
         # Aplicar leverage dinámico si se especifica
+        effective_lev = self.leverage
         if leverage and leverage != self.leverage:
-            await self._set_leverage_on_exchange(leverage)
-        await self._open_order("buy", usdt_amount)
+            effective_lev = await self._set_leverage_on_exchange(leverage)
+        elif leverage:
+            effective_lev = leverage
+        await self._open_order("buy", usdt_amount, leverage=effective_lev)
         self.position    = "long"
         self.entry_price = await self.get_price()
         self.sl = sl; self.tp1 = tp1; self.tp2 = tp2; self.tp3 = tp3
@@ -1174,9 +1198,12 @@ class FuturesTrader:
     async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None,
                          leverage: int = None):
         # Aplicar leverage dinámico si se especifica
+        effective_lev = self.leverage
         if leverage and leverage != self.leverage:
-            await self._set_leverage_on_exchange(leverage)
-        await self._open_order("sell", usdt_amount)
+            effective_lev = await self._set_leverage_on_exchange(leverage)
+        elif leverage:
+            effective_lev = leverage
+        await self._open_order("sell", usdt_amount, leverage=effective_lev)
         self.position    = "short"
         self.entry_price = await self.get_price()
         self.sl = sl; self.tp1 = tp1; self.tp2 = tp2; self.tp3 = tp3
