@@ -895,13 +895,22 @@ class FuturesTrader:
                                   (self.position == "short" and price <= self.tp3)
                         if hit_sl:
                             await self.close_position(reason="SL")
+                            risk.on_trade_close(pnl_pct=-risk.sl_pct)
                         elif hit_tp3:
                             await self.close_position(reason="TP3")
+                            risk.on_trade_close(pnl_pct=risk.tp_pct)
 
                     await asyncio.sleep(2)
                     continue
 
-                # ── Sin posición: buscar señal ───────────────────────────────
+                # ── Sin posición: verificar risk antes de buscar señal ───────
+                # FIX: pasar balance real a can_open_trade para que evalúe correctamente
+                can_trade, reason = risk.can_open_trade(balance)
+                if not can_trade:
+                    logger.debug(f"[{self.symbol}] RiskManager bloqueó trade: {reason}")
+                    await asyncio.sleep(2)
+                    continue
+
                 if global_risk and not global_risk.can_open_trade():
                     await asyncio.sleep(2)
                     continue
@@ -925,8 +934,11 @@ class FuturesTrader:
                 )
 
                 if decision.get("action") in ("LONG", "SHORT", "BUY", "SELL"):
-                    action      = decision["action"]
-                    usdt_amount = min(usdt_per_trade, balance * 0.95)
+                    action = decision["action"]
+                    # FIX: proteger contra balance None antes de calcular usdt_amount
+                    safe_balance = balance if (balance is not None and balance > 0) else usdt_per_trade
+                    usdt_amount  = min(usdt_per_trade, safe_balance * 0.95)
+
                     lev  = decision.get("leverage", self.leverage)
                     sl   = decision.get("sl")
                     tp1  = decision.get("tp1")
@@ -938,14 +950,19 @@ class FuturesTrader:
 
                     if action in ("LONG", "BUY"):
                         await self.open_long(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
+                        if self.position:
+                            risk.on_trade_open(self.entry_price, "long")
                     else:
                         await self.open_short(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
+                        if self.position:
+                            risk.on_trade_open(self.entry_price, "short")
 
                     if global_risk:
                         global_risk.register_close_trade()
 
                 elif decision.get("action") == "CLOSE" and self.position:
                     await self.close_position(reason=decision.get("reasoning", "IA-CLOSE"))
+                    risk.on_trade_close(pnl_pct=0.0)
 
             except asyncio.CancelledError:
                 logger.info(f"[{self.symbol}] Trader cancelado.")
