@@ -34,7 +34,7 @@ _MIN_QTY_FALLBACK = {
     "NEARUSDT":  0.1,
     "XLMUSDT":   1.0,
     "XAUUSDT":   0.01,
-    "XAUTUSDT":  0.001,   # FIX: min qty para XAU Token (≠ XAUUSDT perpetuo)
+    "XAUTUSDT":  0.001,
     "XAGUSDT":   0.1,
     "HYPEUSDT":  0.1,
     "FILOUSDT":  0.1,
@@ -44,7 +44,6 @@ _MIN_QTY_FALLBACK = {
     "WLDUSDT":   0.1,
     "BEATUSDT":  1.0,
     "BZUSDT":    1.0,
-    "XRPUSDT":   1.0,
 }
 
 # Cache de min_qty leídos desde API (sym → float)
@@ -74,8 +73,12 @@ class FuturesTrader:
         self._passphrase  = passphrase
         # None = autodetectar, "v3" | "v2" | "ua" = fijado tras primer éxito
         self._api_version = None
-        # None = no detectado, "hedge" | "one_way" = modo detectado en UA
+        # Modo de posición para Unified Account (v3): "hedge" | "one_way"
         self._ua_pos_mode = None
+        # Modo de posición para cuenta Clásica (v2): "hedge" | "one_way"
+        # Se mantiene SEPARADO de _ua_pos_mode para que el fallback 25236
+        # en v2 no contamine el estado de UA ni viceversa.
+        self._v2_pos_mode = None
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
             "secret":   api_secret,
@@ -135,7 +138,7 @@ class FuturesTrader:
     async def _detect_account_type(self):
         """
         Detecta si la cuenta es Unified (UA / v3) o Clásica (v2).
-        Fija self._api_version y, si es UA, detecta el pos_mode.
+        Fija self._api_version y detecta el pos_mode adecuado.
         """
         try:
             r = await self._http_get("/api/v3/account/assets", {"coin": "USDT"})
@@ -148,15 +151,17 @@ class FuturesTrader:
             logger.debug(f"[{self.symbol}] v3/assets error: {e}")
 
         try:
+            sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
             r = await self._http_get(
                 "/api/v2/mix/account/account",
-                {"symbol": self.symbol.replace("/", "").replace(":USDT", ""),
+                {"symbol": sym_clean,
                  "productType": "USDT-FUTURES",
                  "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
                 self._api_version = "v2"
                 logger.info(f"[{self.symbol}] 🔎 Cuenta Clásica detectada (v2)")
+                await self._detect_v2_pos_mode()
                 return
         except Exception as e:
             logger.debug(f"[{self.symbol}] v2/account error: {e}")
@@ -165,7 +170,8 @@ class FuturesTrader:
             f"[{self.symbol}] ⚠️ account-mode error 40404: "
             "Request URL NOT FOUND — asumiendo hedge"
         )
-        self._ua_pos_mode = "hedge"  # default seguro para UA
+        self._ua_pos_mode = "hedge"
+        self._v2_pos_mode = "hedge"
 
     async def _detect_ua_pos_mode(self):
         """
@@ -186,7 +192,7 @@ class FuturesTrader:
                     hs = str(data[0].get("holdSide") or "").lower()
                     self._ua_pos_mode = "hedge" if hs in ("long", "short") else "one_way"
                 else:
-                    self._ua_pos_mode = "hedge"  # sin posición → hedge por defecto
+                    self._ua_pos_mode = "hedge"
                 logger.info(
                     f"[{self.symbol}] 📌 UA pos_mode detectado: {self._ua_pos_mode}"
                 )
@@ -194,6 +200,34 @@ class FuturesTrader:
         except Exception as e:
             logger.debug(f"[{self.symbol}] _detect_ua_pos_mode error: {e}")
         self._ua_pos_mode = "hedge"
+
+    async def _detect_v2_pos_mode(self):
+        """
+        Para cuentas Clásicas v2: detecta si el par está en hedge o one_way.
+        Consulta posiciones abiertas; si no hay, asume hedge (default de Bitget).
+        """
+        try:
+            sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+            r = await self._http_get(
+                "/api/v2/mix/position/single-position",
+                {"symbol": sym_clean,
+                 "productType": "USDT-FUTURES",
+                 "marginCoin": "USDT"}
+            )
+            if r.get("code") == "00000":
+                data = r.get("data") or []
+                if data:
+                    hs = str(data[0].get("holdSide") or "").lower()
+                    self._v2_pos_mode = "hedge" if hs in ("long", "short") else "one_way"
+                else:
+                    self._v2_pos_mode = "hedge"
+                logger.info(
+                    f"[{self.symbol}] 📌 v2 pos_mode detectado: {self._v2_pos_mode}"
+                )
+                return
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] _detect_v2_pos_mode error: {e}")
+        self._v2_pos_mode = "hedge"
 
     # ─────────────────────────────────────────────────────────────
     # PRECIO Y BALANCE
@@ -205,7 +239,6 @@ class FuturesTrader:
 
     async def get_balance(self) -> float:
         """Retorna el balance USDT disponible."""
-        # Intenta primero v3 (UA)
         try:
             r = await self._http_get("/api/v3/account/assets", {"coin": "USDT"})
             if r.get("code") == "00000":
@@ -218,7 +251,6 @@ class FuturesTrader:
         except Exception:
             pass
 
-        # Fallback v2
         try:
             sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
             r = await self._http_get(
@@ -271,11 +303,6 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
 
     async def _set_leverage_on_exchange(self, leverage: int) -> int:
-        """
-        Fija el leverage para el par en Bitget antes de abrir una posición.
-        Actualiza self.leverage si tiene éxito.
-        Retorna el leverage efectivo.
-        """
         max_lev = int(os.getenv("MAX_LEVERAGE", "15"))
         leverage = min(leverage, max_lev)
         if self.dry_run:
@@ -285,7 +312,6 @@ class FuturesTrader:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         lev_str = str(leverage)
 
-        # Intentar v3 (UA)
         try:
             payload_v3 = {
                 "symbol":      sym_clean,
@@ -299,14 +325,11 @@ class FuturesTrader:
                     payload_v3_s = {**payload_v3, "holdSide": hold}
                     await self._http_post("/api/v3/account/set-leverage", payload_v3_s)
                 self.leverage = leverage
-                logger.info(
-                    f"[{self.symbol}] ⚙️ Leverage fijado a x{leverage} (v3)"
-                )
+                logger.info(f"[{self.symbol}] ⚙️ Leverage fijado a x{leverage} (v3)")
                 return leverage
         except Exception as e:
             logger.debug(f"[{self.symbol}] set-leverage v3 error: {e}")
 
-        # Fallback v2
         try:
             payload_v2 = {
                 "symbol":      sym_clean,
@@ -320,37 +343,25 @@ class FuturesTrader:
                     payload_v2_s = {**payload_v2, "holdSide": hold}
                     await self._http_post("/api/v2/mix/account/set-leverage", payload_v2_s)
                 self.leverage = leverage
-                logger.info(
-                    f"[{self.symbol}] ⚙️ Leverage fijado a x{leverage} (v2)"
-                )
+                logger.info(f"[{self.symbol}] ⚙️ Leverage fijado a x{leverage} (v2)")
                 return leverage
         except Exception as e:
             logger.debug(f"[{self.symbol}] set-leverage v2 error: {e}")
 
         logger.warning(
-            f"[{self.symbol}] ⚠️ set-leverage x{leverage} falló "
-            f"en v3 y v2. "
+            f"[{self.symbol}] ⚠️ set-leverage x{leverage} falló en v3 y v2. "
             f"qty se calculará con self.leverage={self.leverage}x (cuenta)"
         )
         return self.leverage
 
     # ─────────────────────────────────────────────────────────────
     # POSICIONES ABIERTAS EN BITGET
-    # FIX: nunca usa ccxt (que lanza 40085 en Unified Account).
-    #      Solo HTTP directo v3 → v2. Si ambos fallan con excepción,
-    #      retorna None para distinguir "error" de "sin posición".
     # ─────────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list | None:
-        """
-        Retorna la lista de posiciones abiertas para self.symbol.
-        Retorna None si no se pudo consultar (error de red/API).
-        Retorna [] si la consulta fue exitosa pero no hay posición abierta.
-        """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         last_error = None
 
-        # ── v3 Unified Account ──
         if self._api_version in ("ua", None):
             try:
                 r = await self._http_get(
@@ -366,13 +377,12 @@ class FuturesTrader:
                         if float(p.get("total") or p.get("contracts") or
                                  p.get("size", 0)) > 0
                     ]
-                    return open_pos  # lista vacía = sin posición (confirmado)
+                    return open_pos
                 last_error = r.get("msg", "unknown v3 error")
             except Exception as e:
                 last_error = str(e)
                 logger.debug(f"[{self.symbol}] v3 positions error: {e}")
 
-        # ── v2 Classic Account ──
         try:
             r = await self._http_get(
                 "/api/v2/mix/position/single-position",
@@ -392,7 +402,6 @@ class FuturesTrader:
             last_error = str(e)
             logger.debug(f"[{self.symbol}] v2 positions error: {e}")
 
-        # Ambos endpoints fallaron → no podemos confirmar ni desmentir
         logger.warning(
             f"[{self.symbol}] ⚠️ _get_positions: ambos endpoints fallaron "
             f"({last_error}) — retornando None (estado local preservado)"
@@ -401,65 +410,26 @@ class FuturesTrader:
 
     # ─────────────────────────────────────────────────────────────
     # COLOCAR / CERRAR ÓRDENES
-    # FIX 25236: payload one_way NO debe incluir tradeSide/posSide.
-    #            payload hedge DEBE incluir posSide (v3) o tradeSide (v2).
-    #            Fallback de 25236 construye payload desde cero para
-    #            evitar campos residuales del modo anterior.
+    #
+    # FIX 25236 (definitivo):
+    #   - UA  usa _ua_pos_mode  (independiente)
+    #   - v2  usa _v2_pos_mode  (independiente)
+    #   El fallback 25236 en cada bloque SOLO alterna su propio modo,
+    #   sin contaminar el del otro bloque.
+    #   Payload one_way NO lleva tradeSide/posSide.
+    #   Payload hedge SÍ lleva posSide (UA) o tradeSide (v2).
     # ─────────────────────────────────────────────────────────────
 
     async def _place_order(self, side: str, trade_side: str, qty: float):
-        """
-        Coloca una orden de futuros en Bitget.
-        Detecta automáticamente v3 UA (hedge/one_way) vs v2 clásica.
-        """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
 
         # ── UA (v3) ──
         if self._api_version in ("ua", None):
             try:
-                # Payload base sin campos de modo
-                payload = {
-                    "symbol":     sym_clean,
-                    "category":   "USDT-FUTURES",
-                    "marginMode": self.margin_mode,
-                    "marginCoin": "USDT",
-                    "qty":        str(qty),
-                    "side":       side,       # buy / sell
-                    "orderType":  "market",
-                }
-                # Solo añadir posSide si el modo es hedge
-                if self._ua_pos_mode == "hedge":
-                    pos_side = "long" if side == "buy" else "short"
-                    if trade_side == "close":
-                        pos_side = "short" if side == "buy" else "long"
-                    payload["posSide"] = pos_side
+                ua_mode = self._ua_pos_mode or "hedge"
 
-                logger.info(
-                    f"[{self.symbol}] 📤 order [ua-{self._ua_pos_mode or 'auto'}]: "
-                    f"{payload}"
-                )
-                r = await self._http_post("/api/v3/mix/order/place-order", payload)
-                logger.info(f"[{self.symbol}] 📥 response ua: {r}")
-                if r.get("code") == "00000":
-                    order_id = r.get("data", {}).get("orderId", "?")
-                    logger.info(
-                        f"[{self.symbol}] {side}/{trade_side} "
-                        f"posSide={payload.get('posSide','n/a')} "
-                        f"qty={qty} orderId={order_id} ua-{self._ua_pos_mode or 'auto'}"
-                    )
-                    if self._api_version is None:
-                        self._api_version = "ua"
-                    return
-                # 25236: alternar modo y reconstruir payload desde cero
-                if r.get("code") == "25236":
-                    alt_mode = "one_way" if self._ua_pos_mode != "one_way" else "hedge"
-                    logger.warning(
-                        f"[{self.symbol}] ⚠️ 25236 con mode={self._ua_pos_mode} "
-                        f"→ cambiando a {alt_mode} y reintentando"
-                    )
-                    self._ua_pos_mode = alt_mode
-                    # Reconstruir payload limpio para el modo alternativo
-                    retry = {
+                def _build_ua_payload(mode: str) -> dict:
+                    p = {
                         "symbol":     sym_clean,
                         "category":   "USDT-FUTURES",
                         "marginMode": self.margin_mode,
@@ -468,84 +438,66 @@ class FuturesTrader:
                         "side":       side,
                         "orderType":  "market",
                     }
-                    if alt_mode == "hedge":
+                    if mode == "hedge":
                         pos_side = "long" if side == "buy" else "short"
                         if trade_side == "close":
                             pos_side = "short" if side == "buy" else "long"
-                        retry["posSide"] = pos_side
+                        p["posSide"] = pos_side
+                    return p
+
+                payload = _build_ua_payload(ua_mode)
+                logger.info(f"[{self.symbol}] 📤 order [ua-{ua_mode}]: {payload}")
+                r = await self._http_post("/api/v3/mix/order/place-order", payload)
+                logger.info(f"[{self.symbol}] 📥 response ua: {r}")
+
+                if r.get("code") == "00000":
+                    order_id = r.get("data", {}).get("orderId", "?")
                     logger.info(
-                        f"[{self.symbol}] 📤 retry [{alt_mode}]: {retry}"
+                        f"[{self.symbol}] {side}/{trade_side} "
+                        f"posSide={payload.get('posSide','n/a')} "
+                        f"qty={qty} orderId={order_id} ua-{ua_mode}"
                     )
+                    if self._api_version is None:
+                        self._api_version = "ua"
+                    return
+
+                if r.get("code") == "25236":
+                    alt_ua = "one_way" if ua_mode == "hedge" else "hedge"
+                    logger.warning(
+                        f"[{self.symbol}] ⚠️ 25236 ua mode={ua_mode} "
+                        f"→ cambiando a {alt_ua} y reintentando"
+                    )
+                    self._ua_pos_mode = alt_ua
+                    retry = _build_ua_payload(alt_ua)
+                    logger.info(f"[{self.symbol}] 📤 retry [ua-{alt_ua}]: {retry}")
                     r2 = await self._http_post("/api/v3/mix/order/place-order", retry)
-                    logger.info(f"[{self.symbol}] 📥 retry response: {r2}")
+                    logger.info(f"[{self.symbol}] 📥 retry response ua: {r2}")
                     if r2.get("code") == "00000":
-                        order_id = r2.get("data", {}).get("orderId", "?")
-                        logger.info(
-                            f"[{self.symbol}] {side}/{trade_side} "
-                            f"posSide={retry.get('posSide','n/a')} "
-                            f"qty={qty} orderId={order_id} ua-{alt_mode}"
-                        )
                         if self._api_version is None:
                             self._api_version = "ua"
                         return
-                    raise Exception(
-                        f"place-order {r2.get('code')}: {r2.get('msg')}"
-                    )
+                    raise Exception(f"place-order {r2.get('code')}: {r2.get('msg')}")
+
                 if r.get("code") not in ("00000",):
                     raise Exception(f"place-order {r.get('code')}: {r.get('msg')}")
+
             except Exception as e:
                 if self._api_version == "ua":
                     raise
                 logger.debug(f"[{self.symbol}] ua order error: {e}")
 
         # ── v2 Classic ──
-        # FIX 25236: construir payload específico para cada modo.
-        # one_way: NO incluye tradeSide (Bitget lo rechaza con 25236).
-        # hedge:   SÍ incluye tradeSide=open/close.
+        # USA _v2_pos_mode, completamente independiente de _ua_pos_mode.
+        # Así el fallback 25236 en v2 no afecta al estado UA.
         try:
-            is_hedge = (self._ua_pos_mode or "hedge") == "hedge"
+            # Inicializar _v2_pos_mode si aún es None
+            if self._v2_pos_mode is None:
+                self._v2_pos_mode = "hedge"  # default seguro
 
-            # Payload base común
-            payload_v2 = {
-                "symbol":      sym_clean,
-                "productType": "USDT-FUTURES",
-                "marginMode":  self.margin_mode,
-                "marginCoin":  "USDT",
-                "qty":         str(qty),
-                "side":        side,
-                "orderType":   "market",
-            }
-            # Solo hedge añade tradeSide
-            if is_hedge:
-                payload_v2["tradeSide"] = "open" if trade_side == "open" else "close"
+            v2_mode = self._v2_pos_mode
 
-            mode_label = "hedge" if is_hedge else "one_way"
-            logger.info(f"[{self.symbol}] 📤 order [{mode_label}]: {payload_v2}")
-            r_v2 = await self._http_post(
-                "/api/v2/mix/order/place-order", payload_v2
-            )
-            logger.info(f"[{self.symbol}] 📥 response: {r_v2}")
-
-            if r_v2.get("code") == "00000":
-                order_id = r_v2.get("data", {}).get("orderId", "?")
-                logger.info(
-                    f"[{self.symbol}] {side}/{trade_side} "
-                    f"qty={qty} orderId={order_id} v2-{mode_label}"
-                )
-                if self._api_version is None:
-                    self._api_version = "v2"
-                return
-
-            # 25236: alternar modo y reconstruir payload v2 desde cero
-            if r_v2.get("code") == "25236":
-                alt = "one_way" if is_hedge else "hedge"
-                logger.warning(
-                    f"[{self.symbol}] ⚠️ 25236 con mode={mode_label} "
-                    f"→ cambiando a {alt} y reintentando"
-                )
-                self._ua_pos_mode = alt
-                # Payload limpio para el modo alternativo
-                retry_v2 = {
+            def _build_v2_payload(mode: str) -> dict:
+                p = {
                     "symbol":      sym_clean,
                     "productType": "USDT-FUTURES",
                     "marginMode":  self.margin_mode,
@@ -554,20 +506,44 @@ class FuturesTrader:
                     "side":        side,
                     "orderType":   "market",
                 }
-                if alt == "hedge":
-                    retry_v2["tradeSide"] = "open" if trade_side == "open" else "close"
-                # one_way no lleva tradeSide
-                logger.info(f"[{self.symbol}] 📤 retry [{alt}]: {retry_v2}")
-                r3 = await self._http_post(
-                    "/api/v2/mix/order/place-order", retry_v2
+                if mode == "hedge":
+                    p["tradeSide"] = "open" if trade_side == "open" else "close"
+                # one_way: no lleva tradeSide
+                return p
+
+            payload_v2 = _build_v2_payload(v2_mode)
+            logger.info(f"[{self.symbol}] 📤 order [v2-{v2_mode}]: {payload_v2}")
+            r_v2 = await self._http_post("/api/v2/mix/order/place-order", payload_v2)
+            logger.info(f"[{self.symbol}] 📥 response v2: {r_v2}")
+
+            if r_v2.get("code") == "00000":
+                order_id = r_v2.get("data", {}).get("orderId", "?")
+                logger.info(
+                    f"[{self.symbol}] {side}/{trade_side} "
+                    f"qty={qty} orderId={order_id} v2-{v2_mode}"
                 )
-                logger.info(f"[{self.symbol}] 📥 retry response: {r3}")
+                if self._api_version is None:
+                    self._api_version = "v2"
+                return
+
+            if r_v2.get("code") == "25236":
+                alt_v2 = "one_way" if v2_mode == "hedge" else "hedge"
+                logger.warning(
+                    f"[{self.symbol}] ⚠️ 25236 v2 mode={v2_mode} "
+                    f"→ cambiando a {alt_v2} y reintentando"
+                )
+                self._v2_pos_mode = alt_v2
+                retry_v2 = _build_v2_payload(alt_v2)
+                logger.info(f"[{self.symbol}] 📤 retry [v2-{alt_v2}]: {retry_v2}")
+                r3 = await self._http_post("/api/v2/mix/order/place-order", retry_v2)
+                logger.info(f"[{self.symbol}] 📥 retry response v2: {r3}")
                 if r3.get("code") == "00000":
                     self._api_version = "v2"
                     return
                 raise Exception(f"place-order {r3.get('code')}: {r3.get('msg')}")
 
             raise Exception(f"place-order {r_v2.get('code')}: {r_v2.get('msg')}")
+
         except Exception as e:
             raise
 
@@ -578,10 +554,8 @@ class FuturesTrader:
     async def _init(self, usdt_amount: float):
         await self.exchange.load_markets()
 
-        # ── DETECTAR TIPO DE CUENTA ANTES DE OPERAR ──
         await self._detect_account_type()
 
-        # Si la detección no fue concluyente pero el balance v3/assets funciona → es UA
         if self._api_version is None:
             try:
                 r_check = await self._http_get("/api/v3/account/assets?coin=USDT")
@@ -597,7 +571,6 @@ class FuturesTrader:
 
         saved = load_position(self.symbol)
         if saved:
-            # Restaurar api_version y ua_pos_mode si fueron guardados
             if saved.get("api_version") and self._api_version is None:
                 self._api_version = saved["api_version"]
                 logger.info(
@@ -605,15 +578,12 @@ class FuturesTrader:
                 )
             if saved.get("ua_pos_mode") and self._ua_pos_mode is None:
                 self._ua_pos_mode = saved["ua_pos_mode"]
+            if saved.get("v2_pos_mode") and self._v2_pos_mode is None:
+                self._v2_pos_mode = saved["v2_pos_mode"]
 
-            # ── Validar contra el exchange que la posición realmente existe ──
-            # FIX: _get_positions ahora retorna None si falló la consulta.
-            #      Solo limpiamos el estado si la respuesta es [] confirmada.
-            #      Si es None (error), conservamos el estado local para seguridad.
             real_positions = await self._get_positions()
 
             if real_positions is None:
-                # No se pudo verificar — conservar estado local por seguridad
                 logger.warning(
                     f"[{self.symbol}] ⚠️ No se pudo verificar posición en exchange "
                     f"— conservando estado local ({saved.get('position')} "
@@ -630,7 +600,6 @@ class FuturesTrader:
                 if saved.get("leverage"):
                     self.leverage = saved["leverage"]
             elif not real_positions:
-                # Lista vacía confirmada → estado stale, limpiar
                 logger.warning(
                     f"[{self.symbol}] 🧹 Estado guardado ({saved.get('position')} "
                     f"@ {saved.get('entry_price')}) pero Bitget confirma sin posición "
@@ -639,7 +608,6 @@ class FuturesTrader:
                 clear_position(self.symbol)
                 self.usdt_amount = usdt_amount
             else:
-                # Posición confirmada en Bitget → restaurar
                 self.position    = saved["position"]
                 self.entry_price = saved["entry_price"]
                 self.sl          = saved.get("sl")
@@ -672,7 +640,6 @@ class FuturesTrader:
         qty           = round((usdt_amount * effective_lev) / price, 4)
         min_qty       = await self._get_min_qty()
         if qty < min_qty:
-            # FIX: si qty < min_qty incluso con el leverage máximo, skip el trade
             max_lev = int(os.getenv("MAX_LEVERAGE", "15"))
             qty_max = round((usdt_amount * max_lev) / price, 4)
             if qty_max < min_qty:
@@ -692,7 +659,6 @@ class FuturesTrader:
         await self._place_order(side, "close", qty)
 
     async def _partial_close_order(self, pos_side: str, ratio: float):
-        """Cierra un porcentaje de la posición abierta."""
         positions = await self._get_positions()
         if positions is None or not positions:
             logger.warning(
@@ -726,7 +692,6 @@ class FuturesTrader:
                 return
 
     async def _sync_closed_from_exchange(self, fill_price: float, reason: str):
-        """Sincroniza el cierre cuando la posición ya fue cerrada en exchange."""
         if not self.position:
             return {}
         pnl = (
@@ -784,6 +749,7 @@ class FuturesTrader:
             sl, tp1, tp2, tp3, usdt_amount, self.leverage,
             api_version=self._api_version,
             ua_pos_mode=self._ua_pos_mode,
+            v2_pos_mode=self._v2_pos_mode,
         )
         logger.warning(
             f"📈 [{self.symbol}] LONG @ {self.entry_price} | "
@@ -811,6 +777,7 @@ class FuturesTrader:
             sl, tp1, tp2, tp3, usdt_amount, self.leverage,
             api_version=self._api_version,
             ua_pos_mode=self._ua_pos_mode,
+            v2_pos_mode=self._v2_pos_mode,
         )
         logger.warning(
             f"📉 [{self.symbol}] SHORT @ {self.entry_price} | "
@@ -899,8 +866,6 @@ class FuturesTrader:
 
     # ─────────────────────────────────────────────────────────────
     # CERRAR POSICIÓN
-    # FIX: no limpiar estado si la orden falla.
-    #      _get_positions retorna None si hubo error → no considera stale.
     # ─────────────────────────────────────────────────────────────
 
     async def close_position(self, reason=""):
