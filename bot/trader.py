@@ -20,16 +20,12 @@ logger = logging.getLogger("Trader")
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 BITGET_BASE = "https://api.bitget.com"
 
-# Cache de marginMode por símbolo: {symbol: 'isolated' | 'crossed'}
-_margin_mode_cache: dict = {}
-
 
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
                  leverage, margin_mode, dry_run):
         self.symbol       = symbol
         self.leverage     = leverage
-        self.margin_mode  = margin_mode or "crossed"
         self.dry_run      = dry_run
         self.position     = None
         self.entry_price  = None
@@ -45,6 +41,8 @@ class FuturesTrader:
         self._api_key     = api_key
         self._api_secret  = api_secret
         self._passphrase  = passphrase
+        # Hedge mode: siempre crossed (isolated no está soportado en hedge)
+        self.margin_mode  = "crossed"
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
             "secret":   api_secret,
@@ -56,7 +54,7 @@ class FuturesTrader:
         })
 
     # ─────────────────────────────────────────────────────────────
-    # FIRMA HTTP DIRECTA (Base64 — requerido por Bitget v2/v3)
+    # FIRMA HTTP DIRECTA
     # ─────────────────────────────────────────────────────────────
 
     def _sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
@@ -138,7 +136,6 @@ class FuturesTrader:
                         return free
             except Exception as e:
                 logger.warning(f"[{self.symbol}] balance {path}: {e}")
-
         try:
             r = await self._http_get("/api/v2/unified/account/assets?coin=USDT")
             if r.get("code") == "00000":
@@ -148,98 +145,62 @@ class FuturesTrader:
                     return free
         except Exception as e:
             logger.warning(f"[{self.symbol}] balance unified/assets: {e}")
-
         logger.warning(f"[{self.symbol}] ⚠️ Balance = 0 — todos los endpoints fallaron.")
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
-    # ÓRDENES
+    # ÓRDENES — Hedge Mode
     #
-    # Error 25236 — dos causas posibles:
-    #   A) marginMode incorrecto para el par → reintentar con crossed
-    #   B) cuenta en hedge mode → necesita tradeSide='open'/'close'
-    #
-    # Estrategia: incluimos siempre tradeSide en el payload.
-    # En one-way mode Bitget lo ignora; en hedge mode es obligatorio.
+    # Bitget hedge mode: side + tradeSide obligatorios
+    #   Abrir long : side="buy",  tradeSide="open"
+    #   Abrir short: side="sell", tradeSide="open"
+    #   Cerrar long: side="sell", tradeSide="close"
+    #   Cerrar short:side="buy",  tradeSide="close"
+    # reduceOnly NO se envía en hedge mode (campo ignorado/conflicto)
+    # marginMode: siempre "crossed" (isolated incompatible con hedge)
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _bitget_symbol(ccxt_symbol: str) -> str:
-        """Convierte 'BTC/USDT:USDT' → 'BTCUSDT'"""
         return ccxt_symbol.split("/")[0] + ccxt_symbol.split("/")[1].split(":")[0]
 
-    def _effective_margin_mode(self) -> str:
-        return _margin_mode_cache.get(self.symbol, self.margin_mode)
-
-    async def _place_order(self, side: str, trade_side: str, qty: float,
-                           reduce_only: bool = False) -> dict:
+    async def _place_order(self, side: str, trade_side: str, qty: float) -> dict:
         """
-        Coloca orden de mercado via /api/v3/trade/place-order.
-
-        tradeSide siempre incluido:
-          - trade_side='open'  → tradeSide='open'
-          - trade_side='close' → tradeSide='close'
-        Esto resuelve el error 25236 en cuentas con hedge mode activo.
-        En cuentas one-way Bitget lo acepta igual (campo ignorado).
-
-        Si aún recibe 25236, reintenta con marginMode=crossed.
+        side       : "buy" | "sell"
+        trade_side : "open" | "close"
+        qty        : cantidad en contratos
         """
-        sym = self._bitget_symbol(self.symbol)
+        sym  = self._bitget_symbol(self.symbol)
         path = "/api/v3/trade/place-order"
-        margin_mode = self._effective_margin_mode()
-
-        # tradeSide: 'open' para entrar, 'close' para salir/reducir
-        trade_side_val = "open" if trade_side == "open" else "close"
 
         payload = {
             "symbol":     sym,
             "category":   "USDT-FUTURES",
-            "marginMode": margin_mode,
+            "marginMode": "crossed",
             "marginCoin": "USDT",
             "qty":        str(qty),
             "side":       side,
-            "tradeSide":  trade_side_val,
+            "tradeSide":  trade_side,
             "orderType":  "market",
         }
-        if reduce_only or trade_side == "close":
-            payload["reduceOnly"] = "YES"
 
-        logger.info(f"[{self.symbol}] 📤 v3 order payload: {payload}")
+        logger.info(f"[{self.symbol}] 📤 order: {payload}")
         resp = await self._http_post(path, payload)
-        logger.info(f"[{self.symbol}] 📥 v3 order response: {resp}")
-
-        # 25236 aún: probar con marginMode crossed
-        if resp.get("code") == "25236" and margin_mode != "crossed":
-            logger.warning(
-                f"[{self.symbol}] ⚠️ 25236 con marginMode={margin_mode} → "
-                f"reintentando con crossed"
-            )
-            _margin_mode_cache[self.symbol] = "crossed"
-            payload["marginMode"] = "crossed"
-            logger.info(f"[{self.symbol}] 📤 v3 retry payload: {payload}")
-            resp = await self._http_post(path, payload)
-            logger.info(f"[{self.symbol}] 📥 v3 retry response: {resp}")
+        logger.info(f"[{self.symbol}] 📥 response: {resp}")
 
         if resp.get("code") == "00000":
-            order_id  = (resp.get("data") or {}).get("orderId", "?")
-            effective = payload["marginMode"]
-            logger.info(
-                f"[{self.symbol}] ✅ Orden v3 {side}/{trade_side_val} qty={qty} "
-                f"marginMode={effective} | orderId={order_id}"
-            )
+            order_id = (resp.get("data") or {}).get("orderId", "?")
+            logger.info(f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} orderId={order_id}")
             return resp
 
-        raise Exception(
-            f"place-order error {resp.get('code')}: {resp.get('msg')}"
-        )
+        raise Exception(f"place-order {resp.get('code')}: {resp.get('msg')}")
 
     # ─────────────────────────────────────────────────────────────
-    # POSICIONES — /api/v3/position/single-position
+    # POSICIONES
     # ─────────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list:
         sym = self._bitget_symbol(self.symbol)
-
         try:
             path = f"/api/v3/position/single-position?symbol={sym}&category=USDT-FUTURES&marginCoin=USDT"
             r = await self._http_get(path)
@@ -252,13 +213,11 @@ class FuturesTrader:
                     return result
         except Exception as e:
             logger.warning(f"[{self.symbol}] get_positions v3: {e}")
-
         try:
             positions = await self.exchange.fetch_positions([self.symbol])
             return [p for p in positions if float(p.get("contracts") or 0) > 0]
         except Exception as e2:
             logger.warning(f"[{self.symbol}] get_positions ccxt: {e2}")
-
         return []
 
     # ─────────────────────────────────────────────────────────────
@@ -288,7 +247,7 @@ class FuturesTrader:
         logger.info(f"✅ [{self.symbol}] Listo | x{self.leverage} | {mode}")
 
     # ─────────────────────────────────────────────────────────────
-    # HELPERS PRECIO / OHLCV
+    # HELPERS
     # ─────────────────────────────────────────────────────────────
 
     async def get_balance(self):
@@ -308,27 +267,36 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
 
     async def _open_order(self, side: str, usdt_amount: float):
+        """side: 'buy' (long) | 'sell' (short)"""
         price = await self.get_price()
         qty   = round((usdt_amount * self.leverage) / price, 4)
         if self.dry_run:
             logger.warning(f"[DRY][{self.symbol}] {side.upper()} {qty} @ {price}")
-            return {"price": price}
+            return
         await self._place_order(side, "open", qty)
-        return {"price": price}
 
-    async def _partial_close_order(self, side: str, ratio: float):
+    async def _close_order(self, pos_side: str, qty: float):
+        """Cierra la posición indicada por pos_side: 'long'|'short'"""
         if self.dry_run:
-            logger.warning(f"[DRY][{self.symbol}] PARTIAL CLOSE {ratio*100:.0f}% {side.upper()}")
+            logger.warning(f"[DRY][{self.symbol}] CLOSE {pos_side.upper()} {qty}")
+            return
+        # En hedge mode, para cerrar un long se envía side=sell+tradeSide=close
+        close_side = "sell" if pos_side == "long" else "buy"
+        await self._place_order(close_side, "close", qty)
+
+    async def _partial_close_order(self, pos_side: str, ratio: float):
+        if self.dry_run:
+            logger.warning(f"[DRY][{self.symbol}] PARTIAL CLOSE {ratio*100:.0f}% {pos_side.upper()}")
             return
         try:
             positions = await self._get_positions()
             for p in positions:
                 size = float(p.get("total") or p.get("contracts") or p.get("size", 0))
                 if size > 0:
-                    partial_qty  = round(size * ratio, 4)
-                    pos_side     = str(p.get("holdSide") or p.get("side") or "").lower()
-                    close_side   = "sell" if pos_side in ("long", "buy") else "buy"
-                    await self._place_order(close_side, "close", partial_qty, reduce_only=True)
+                    partial_qty = round(size * ratio, 4)
+                    hold_side   = str(p.get("holdSide") or p.get("side") or "").lower()
+                    ps          = "long" if hold_side in ("long", "buy") else "short"
+                    await self._close_order(ps, partial_qty)
                     logger.info(f"[{self.symbol}] TP parcial {ratio*100:.0f}% ({partial_qty} contratos)")
                     break
         except Exception as e:
@@ -407,7 +375,7 @@ class FuturesTrader:
             tp2_hit = (price >= self.tp2) if is_long else (price <= self.tp2)
             if tp2_hit:
                 logger.warning(f"[{self.symbol}] ✂️  TP2 parcial @ {price:.4f}")
-                await self._partial_close_order("sell" if is_long else "buy", TP2_PARTIAL_RATIO)
+                await self._partial_close_order(self.position, TP2_PARTIAL_RATIO)
                 self.tp2_hit = True
                 mark_tp2_hit(self.symbol)
                 self.sl = self.entry_price
@@ -461,10 +429,10 @@ class FuturesTrader:
                 positions = await self._get_positions()
                 for p in positions:
                     size     = float(p.get("total") or p.get("contracts") or p.get("size", 0))
-                    pos_side = str(p.get("holdSide") or p.get("side") or "").lower()
+                    hold_side = str(p.get("holdSide") or p.get("side") or "").lower()
                     if size > 0:
-                        close_side = "sell" if pos_side in ("long", "buy") else "buy"
-                        await self._place_order(close_side, "close", size, reduce_only=True)
+                        ps = "long" if hold_side in ("long", "buy") else "short"
+                        await self._close_order(ps, size)
                         break
             except Exception as e:
                 logger.error(f"[{self.symbol}] Close error: {e}")
