@@ -43,8 +43,10 @@ class FuturesTrader:
         self._api_secret  = api_secret
         self._passphrase  = passphrase
         # "v3" | "v2" | "ua" — se autodetecta al primer intento de orden
-        # "ua" = Unified Account: v3 sin holdSide + reduceOnly para cerrar
+        # "ua" = Unified Account: v3 con posSide (hedge) o sin posSide (one-way)
         self._api_version = None
+        # None = no detectado, "hedge" | "one_way" = modo detectado en UA
+        self._ua_pos_mode = None
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
             "secret":   api_secret,
@@ -151,13 +153,14 @@ class FuturesTrader:
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
-    # ÓRDENES — con fallback automático v3 → v2 Mix → UA (one-way)
+    # ÓRDENES — con fallback automático v3 → v2 Mix → UA
     #
     # Flujo de autodetección (solo en el primer trade por par):
-    #   1. Intentar v3 con holdSide (hedge mode).
+    #   1. Intentar v3 con holdSide (hedge mode estándar).
     #   2. Si 25236 → intentar v2 Mix con tradeSide (classic hedge).
     #   3. Si 40085 → cuenta en Unified Account:
-    #      usar v3 SIN holdSide (one-way). Fijar self._api_version = "ua".
+    #      3a. Intentar v3 con posSide (UA hedge mode). ← FIX PRINCIPAL
+    #      3b. Si 25236 → intentar v3 sin posSide ni holdSide (UA one-way).
     #   4. Una vez detectado, usar siempre esa versión directamente.
     # ─────────────────────────────────────────────────────────────
 
@@ -182,15 +185,42 @@ class FuturesTrader:
             payload["reduceOnly"] = "YES"
         return payload
 
-    def _build_payload_ua(self, sym: str, side: str, trade_side: str,
-                          qty: float) -> dict:
+    def _build_payload_ua_hedge(self, sym: str, side: str, trade_side: str,
+                                qty: float, hold_side: str) -> dict:
         """
-        Payload para Unified Account: v3 SIN holdSide (one-way).
-        Para cerrar se usa reduceOnly=YES en lugar de tradeSide.
-        - Abrir long:  side=buy
-        - Abrir short: side=sell
-        - Cerrar long: side=sell + reduceOnly=YES
-        - Cerrar short: side=buy + reduceOnly=YES
+        Payload para Unified Account en modo HEDGE.
+        Usa posSide (long/short) en lugar de holdSide.
+        - Abrir long:   side=buy,  posSide=long
+        - Abrir short:  side=sell, posSide=short
+        - Cerrar long:  side=sell, posSide=long  + reduceOnly=YES
+        - Cerrar short: side=buy,  posSide=short + reduceOnly=YES
+        """
+        # posSide indica qué lado de la posición afecta la orden
+        if trade_side == "open":
+            pos_side = hold_side  # "long" o "short"
+        else:
+            # Al cerrar: la posición que se cierra es el hold_side
+            pos_side = hold_side
+
+        payload = {
+            "symbol":     sym,
+            "category":   "USDT-FUTURES",
+            "marginMode": self.margin_mode,
+            "marginCoin": "USDT",
+            "qty":        str(qty),
+            "side":       side,
+            "orderType":  "market",
+            "posSide":    pos_side,
+        }
+        if trade_side == "close":
+            payload["reduceOnly"] = "YES"
+        return payload
+
+    def _build_payload_ua_oneway(self, sym: str, side: str, trade_side: str,
+                                 qty: float) -> dict:
+        """
+        Payload para Unified Account en modo ONE-WAY.
+        Sin holdSide ni posSide. Cierre con reduceOnly=YES.
         """
         payload = {
             "symbol":     sym,
@@ -225,12 +255,14 @@ class FuturesTrader:
     async def _place_order(self, side: str, trade_side: str, qty: float,
                            hold_side: str = None) -> dict:
         """
-        Coloca una orden con fallback automático v3 → v2 Mix → UA.
+        Coloca una orden con fallback automático v3 → v2 Mix → UA hedge → UA one-way.
 
         Versiones:
-        - v3  : holdSide (hedge) — la mayoría de contratos
-        - v2  : tradeSide (classic mix API) — algunos contratos legacy
-        - ua  : Unified Account, v3 sin holdSide, reduceOnly para cerrar
+        - v3        : holdSide (hedge) — la mayoría de contratos
+        - v2        : tradeSide (classic mix API) — algunos contratos legacy
+        - ua        : Unified Account
+                      · ua_hedge  = v3 con posSide (contratos en hedge)
+                      · ua_oneway = v3 sin holdSide/posSide (contratos en one-way)
 
         - side       : "buy" | "sell"
         - trade_side : "open" | "close"
@@ -245,7 +277,7 @@ class FuturesTrader:
         if self._api_version == "v2":
             return await self._place_order_v2(sym, side, trade_side, qty, hold_side)
         if self._api_version == "ua":
-            return await self._place_order_ua(sym, side, trade_side, qty)
+            return await self._place_order_ua(sym, side, trade_side, qty, hold_side)
 
         # ── Autodetección: intentar v3 primero ──────────────────
         path_v3    = "/api/v3/trade/place-order"
@@ -287,15 +319,16 @@ class FuturesTrader:
                 return resp_v2
 
             if resp_v2.get("code") == "40085":
-                # Unified Account — v2 Mix no soportado → usar v3 one-way sin holdSide
+                # Unified Account detectado — v2 Mix no soportado
+                # Intentar UA hedge (con posSide) primero
                 logger.warning(
                     f"[{self.symbol}] ⚠️ 40085 Unified Account detectado — "
-                    f"usando v3 one-way (sin holdSide)"
+                    f"intentando UA hedge (posSide)"
                 )
-                resp_ua = await self._place_order_ua(sym, side, trade_side, qty)
+                resp_ua = await self._place_order_ua(sym, side, trade_side, qty, hold_side)
                 if resp_ua.get("code") == "00000":
                     self._api_version = "ua"
-                    logger.info(f"[{self.symbol}] 📌 API version fijada: UA (one-way)")
+                    logger.info(f"[{self.symbol}] 📌 API version fijada: UA (modo={self._ua_pos_mode})")
                 return resp_ua
 
             raise Exception(f"place-order {resp_v2.get('code')}: {resp_v2.get('msg')}")
@@ -320,21 +353,72 @@ class FuturesTrader:
         raise Exception(f"place-order {resp.get('code')}: {resp.get('msg')}")
 
     async def _place_order_ua(self, sym: str, side: str, trade_side: str,
-                               qty: float) -> dict:
-        """Unified Account: v3 sin holdSide, one-way mode."""
+                               qty: float, hold_side: str = None) -> dict:
+        """
+        Unified Account: intenta primero con posSide (hedge mode).
+        Si devuelve 25236, reintenta sin posSide (one-way mode).
+        Persiste el modo detectado en self._ua_pos_mode.
+        """
         path = "/api/v3/trade/place-order"
-        payload = self._build_payload_ua(sym, side, trade_side, qty)
-        logger.info(f"[{self.symbol}] 📤 order [ua]: {payload}")
-        resp = await self._http_post(path, payload)
-        logger.info(f"[{self.symbol}] 📥 response [ua]: {resp}")
-        if resp.get("code") == "00000":
-            order_id = (resp.get("data") or {}).get("orderId", "?")
-            logger.info(
-                f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} "
-                f"orderId={order_id} [ua]"
+
+        # Si ya sabemos el modo UA de este par, ir directo
+        if self._ua_pos_mode == "hedge" and hold_side:
+            payload = self._build_payload_ua_hedge(sym, side, trade_side, qty, hold_side)
+            logger.info(f"[{self.symbol}] 📤 order [ua-hedge]: {payload}")
+            resp = await self._http_post(path, payload)
+            logger.info(f"[{self.symbol}] 📥 response [ua-hedge]: {resp}")
+            if resp.get("code") == "00000":
+                order_id = (resp.get("data") or {}).get("orderId", "?")
+                logger.info(f"[{self.symbol}] ✅ {side}/{trade_side} posSide={hold_side} qty={qty} orderId={order_id} [ua-hedge]")
+                return resp
+            raise Exception(f"place-order UA-hedge {resp.get('code')}: {resp.get('msg')}")
+
+        if self._ua_pos_mode == "one_way":
+            payload = self._build_payload_ua_oneway(sym, side, trade_side, qty)
+            logger.info(f"[{self.symbol}] 📤 order [ua-oneway]: {payload}")
+            resp = await self._http_post(path, payload)
+            logger.info(f"[{self.symbol}] 📥 response [ua-oneway]: {resp}")
+            if resp.get("code") == "00000":
+                order_id = (resp.get("data") or {}).get("orderId", "?")
+                logger.info(f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} orderId={order_id} [ua-oneway]")
+                return resp
+            raise Exception(f"place-order UA-oneway {resp.get('code')}: {resp.get('msg')}")
+
+        # ── Autodetección UA: probar hedge primero ───────────────
+        if hold_side:
+            payload_hedge = self._build_payload_ua_hedge(sym, side, trade_side, qty, hold_side)
+            logger.info(f"[{self.symbol}] 📤 order [ua-hedge]: {payload_hedge}")
+            resp_hedge = await self._http_post(path, payload_hedge)
+            logger.info(f"[{self.symbol}] 📥 response [ua-hedge]: {resp_hedge}")
+
+            if resp_hedge.get("code") == "00000":
+                self._ua_pos_mode = "hedge"
+                logger.info(f"[{self.symbol}] 📌 UA pos mode: hedge (posSide)")
+                order_id = (resp_hedge.get("data") or {}).get("orderId", "?")
+                logger.info(f"[{self.symbol}] ✅ {side}/{trade_side} posSide={hold_side} qty={qty} orderId={order_id} [ua-hedge]")
+                return resp_hedge
+
+            if resp_hedge.get("code") != "25236":
+                raise Exception(f"place-order UA-hedge {resp_hedge.get('code')}: {resp_hedge.get('msg')}")
+
+            logger.warning(
+                f"[{self.symbol}] ⚠️ UA hedge 25236 — contrato en one-way, intentando sin posSide"
             )
-            return resp
-        raise Exception(f"place-order UA {resp.get('code')}: {resp.get('msg')}")
+
+        # Fallback UA one-way (sin posSide)
+        payload_ow = self._build_payload_ua_oneway(sym, side, trade_side, qty)
+        logger.info(f"[{self.symbol}] 📤 order [ua-oneway]: {payload_ow}")
+        resp_ow = await self._http_post(path, payload_ow)
+        logger.info(f"[{self.symbol}] 📥 response [ua-oneway]: {resp_ow}")
+
+        if resp_ow.get("code") == "00000":
+            self._ua_pos_mode = "one_way"
+            logger.info(f"[{self.symbol}] 📌 UA pos mode: one_way (sin posSide)")
+            order_id = (resp_ow.get("data") or {}).get("orderId", "?")
+            logger.info(f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} orderId={order_id} [ua-oneway]")
+            return resp_ow
+
+        raise Exception(f"place-order UA {resp_ow.get('code')}: {resp_ow.get('msg')}")
 
     async def _place_order_v2(self, sym: str, side: str, trade_side: str,
                                qty: float, hold_side: str) -> dict:
