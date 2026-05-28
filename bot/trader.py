@@ -929,28 +929,15 @@ class FuturesTrader:
                         self.tp1 = self.tp2 = self.tp3 = None
                         clear_position(self.symbol)
 
-                # ── Obtener datos OHLCV ──
-                try:
-                    ohlcv = await self.exchange.fetch_ohlcv(
-                        self.symbol, tf, limit=200
-                    )
-                except Exception as e:
-                    logger.warning(f"[{self.symbol}] OHLCV error: {e}")
-                    await asyncio.sleep(interval)
-                    continue
-
-                if len(ohlcv) < 50:
-                    await asyncio.sleep(interval)
-                    continue
-
-                # ── Decisión IA ──
+                # ── Decisión de estrategia ──
+                # FIX: decide() en strategy.py NO acepta ohlcv ni price.
+                # Solo necesita exch, symbol, ai_decide_fn y flags de estado.
                 def _ai_fn(candles, sym, sig):
                     return ai_decide(candles, sym, sig)
 
                 decision = await decide(
-                    ohlcv=ohlcv,
-                    price=price,
-                    exch=self.exchange, symbol=self.symbol,
+                    exch=self.exchange,
+                    symbol=self.symbol,
                     ai_decide_fn=_ai_fn,
                     has_open_position=self.position is not None,
                     current_pnl=None,
