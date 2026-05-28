@@ -42,8 +42,7 @@ class FuturesTrader:
         self._api_key     = api_key
         self._api_secret  = api_secret
         self._passphrase  = passphrase
-        # "v3" | "v2" | "ua" — se autodetecta al primer intento de orden
-        # "ua" = Unified Account: v3 con posSide (hedge) o sin posSide (one-way)
+        # None = autodetectar, "v3" | "v2" | "ua" = fijado tras primer éxito
         self._api_version = None
         # None = no detectado, "hedge" | "one_way" = modo detectado en UA
         self._ua_pos_mode = None
@@ -156,11 +155,11 @@ class FuturesTrader:
     # ÓRDENES — con fallback automático v3 → v2 Mix → UA
     #
     # Flujo de autodetección (solo en el primer trade por par):
-    #   1. Intentar v3 con holdSide (hedge mode estándar).
-    #   2. Si 25236 → intentar v2 Mix con tradeSide (classic hedge).
-    #   3. Si 40085 o 25236 en v2 → cuenta en Unified Account:
+    #   1. Intentar v3 con holdSide (hedge mode — la mayoría de contratos).
+    #   2. Si 25236 → intentar v2 Mix con tradeSide (API mix legacy).
+    #   3. Si v2 falla con 40085 o 25236 → Unified Account:
     #      3a. Intentar v3 con posSide (UA hedge mode).
-    #      3b. Si 25236 → intentar v3 sin posSide ni holdSide (UA one-way).
+    #      3b. Si 25236 → intentar v3 sin holdSide/posSide (UA one-way).
     #   4. Una vez detectado, usar siempre esa versión directamente.
     # ─────────────────────────────────────────────────────────────
 
@@ -170,7 +169,7 @@ class FuturesTrader:
 
     def _build_payload_v3(self, sym: str, side: str, trade_side: str,
                           qty: float, hold_side: str) -> dict:
-        """Payload para /api/v3/trade/place-order (holdSide obligatorio — hedge)."""
+        """Payload para /api/v3/trade/place-order (holdSide — hedge mode)."""
         payload = {
             "symbol":     sym,
             "category":   "USDT-FUTURES",
@@ -190,12 +189,7 @@ class FuturesTrader:
         """
         Payload para Unified Account en modo HEDGE.
         Usa posSide (long/short) en lugar de holdSide.
-        - Abrir long:   side=buy,  posSide=long
-        - Abrir short:  side=sell, posSide=short
-        - Cerrar long:  side=sell, posSide=long  + reduceOnly=YES
-        - Cerrar short: side=buy,  posSide=short + reduceOnly=YES
         """
-        pos_side = hold_side  # "long" o "short"
         payload = {
             "symbol":     sym,
             "category":   "USDT-FUTURES",
@@ -204,7 +198,7 @@ class FuturesTrader:
             "qty":        str(qty),
             "side":       side,
             "orderType":  "market",
-            "posSide":    pos_side,
+            "posSide":    hold_side,  # "long" o "short"
         }
         if trade_side == "close":
             payload["reduceOnly"] = "YES"
@@ -251,13 +245,6 @@ class FuturesTrader:
         """
         Coloca una orden con fallback automático v3 → v2 Mix → UA hedge → UA one-way.
 
-        Versiones:
-        - v3        : holdSide (hedge) — la mayoría de contratos
-        - v2        : tradeSide (classic mix API) — algunos contratos legacy
-        - ua        : Unified Account
-                      · ua_hedge  = v3 con posSide (contratos en hedge)
-                      · ua_oneway = v3 sin holdSide/posSide (contratos en one-way)
-
         - side       : "buy" | "sell"
         - trade_side : "open" | "close"
         - qty        : cantidad en contratos
@@ -265,7 +252,7 @@ class FuturesTrader:
         """
         sym = self._bitget_symbol(self.symbol)
 
-        # Si ya sabemos qué versión usa este par, ir directamente
+        # Si ya detectamos versión API para este par → ir directo
         if self._api_version == "v3":
             return await self._place_order_v3(sym, side, trade_side, qty, hold_side)
         if self._api_version == "v2":
@@ -273,7 +260,7 @@ class FuturesTrader:
         if self._api_version == "ua":
             return await self._place_order_ua(sym, side, trade_side, qty, hold_side)
 
-        # ── Autodetección: intentar v3 primero ──────────────────
+        # ── Autodetección: intentar v3 (hedge con holdSide) primero ──
         path_v3    = "/api/v3/trade/place-order"
         payload_v3 = self._build_payload_v3(sym, side, trade_side, qty, hold_side)
         logger.info(f"[{self.symbol}] 📤 order [v3]: {payload_v3}")
@@ -282,7 +269,7 @@ class FuturesTrader:
 
         if resp_v3.get("code") == "00000":
             self._api_version = "v3"
-            logger.info(f"[{self.symbol}] 📌 API version fijada: v3")
+            logger.info(f"[{self.symbol}] 📌 API version fijada: v3 (holdSide/hedge)")
             order_id = (resp_v3.get("data") or {}).get("orderId", "?")
             logger.info(
                 f"[{self.symbol}] ✅ {side}/{trade_side} holdSide={hold_side} "
@@ -291,10 +278,9 @@ class FuturesTrader:
             return resp_v3
 
         if resp_v3.get("code") == "25236":
-            # Contrato no soporta holdSide → probar v2 Mix
+            # holdSide rechazado → probar v2 Mix (tradeSide)
             logger.warning(
-                f"[{self.symbol}] ⚠️ v3 devolvió 25236 — "
-                f"contrato no soporta holdSide, intentando v2 Mix"
+                f"[{self.symbol}] ⚠️ v3 holdSide→25236 — probando v2 Mix (tradeSide)"
             )
             path_v2    = "/api/v2/mix/order/place-order"
             payload_v2 = self._build_payload_v2(sym, side, trade_side, qty, hold_side)
@@ -312,23 +298,29 @@ class FuturesTrader:
                 )
                 return resp_v2
 
-            # 40085 = Unified Account explícito, 25236 = UA que no acepta tradeSide
-            # En ambos casos intentar UA
+            # 40085 = Unified Account; 25236 en v2 = UA que no acepta tradeSide
             if resp_v2.get("code") in ("40085", "25236"):
                 logger.warning(
-                    f"[{self.symbol}] ⚠️ v2 devolvió {resp_v2.get('code')} — "
-                    f"Unified Account detectado, intentando UA hedge (posSide)"
+                    f"[{self.symbol}] ⚠️ v2→{resp_v2.get('code')} — "
+                    f"Unified Account detectado, probando UA hedge/oneway"
                 )
                 resp_ua = await self._place_order_ua(sym, side, trade_side, qty, hold_side)
                 if resp_ua.get("code") == "00000":
                     self._api_version = "ua"
-                    logger.info(f"[{self.symbol}] 📌 API version fijada: UA (modo={self._ua_pos_mode})")
+                    logger.info(
+                        f"[{self.symbol}] 📌 API version fijada: UA "
+                        f"(modo={self._ua_pos_mode})"
+                    )
                 return resp_ua
 
-            raise Exception(f"place-order {resp_v2.get('code')}: {resp_v2.get('msg')}")
+            raise Exception(
+                f"place-order v2 {resp_v2.get('code')}: {resp_v2.get('msg')}"
+            )
 
         # Cualquier otro error de v3
-        raise Exception(f"place-order {resp_v3.get('code')}: {resp_v3.get('msg')}")
+        raise Exception(
+            f"place-order v3 {resp_v3.get('code')}: {resp_v3.get('msg')}"
+        )
 
     async def _place_order_v3(self, sym: str, side: str, trade_side: str,
                                qty: float, hold_side: str) -> dict:
@@ -344,18 +336,18 @@ class FuturesTrader:
                 f"qty={qty} orderId={order_id} [v3]"
             )
             return resp
-        raise Exception(f"place-order {resp.get('code')}: {resp.get('msg')}")
+        raise Exception(f"place-order v3 {resp.get('code')}: {resp.get('msg')}")
 
     async def _place_order_ua(self, sym: str, side: str, trade_side: str,
                                qty: float, hold_side: str = None) -> dict:
         """
-        Unified Account: intenta primero con posSide (hedge mode).
-        Si devuelve 25236, reintenta sin posSide (one-way mode).
+        Unified Account: intenta hedge (posSide) primero.
+        Si devuelve 25236, reintenta one-way (sin posSide).
         Persiste el modo detectado en self._ua_pos_mode.
         """
         path = "/api/v3/trade/place-order"
 
-        # Si ya sabemos el modo UA de este par, ir directo
+        # Si ya conocemos el modo UA de este par → ir directo
         if self._ua_pos_mode == "hedge" and hold_side:
             payload = self._build_payload_ua_hedge(sym, side, trade_side, qty, hold_side)
             logger.info(f"[{self.symbol}] 📤 order [ua-hedge]: {payload}")
@@ -363,9 +355,14 @@ class FuturesTrader:
             logger.info(f"[{self.symbol}] 📥 response [ua-hedge]: {resp}")
             if resp.get("code") == "00000":
                 order_id = (resp.get("data") or {}).get("orderId", "?")
-                logger.info(f"[{self.symbol}] ✅ {side}/{trade_side} posSide={hold_side} qty={qty} orderId={order_id} [ua-hedge]")
+                logger.info(
+                    f"[{self.symbol}] ✅ {side}/{trade_side} posSide={hold_side} "
+                    f"qty={qty} orderId={order_id} [ua-hedge]"
+                )
                 return resp
-            raise Exception(f"place-order UA-hedge {resp.get('code')}: {resp.get('msg')}")
+            raise Exception(
+                f"place-order ua-hedge {resp.get('code')}: {resp.get('msg')}"
+            )
 
         if self._ua_pos_mode == "one_way":
             payload = self._build_payload_ua_oneway(sym, side, trade_side, qty)
@@ -374,13 +371,20 @@ class FuturesTrader:
             logger.info(f"[{self.symbol}] 📥 response [ua-oneway]: {resp}")
             if resp.get("code") == "00000":
                 order_id = (resp.get("data") or {}).get("orderId", "?")
-                logger.info(f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} orderId={order_id} [ua-oneway]")
+                logger.info(
+                    f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} "
+                    f"orderId={order_id} [ua-oneway]"
+                )
                 return resp
-            raise Exception(f"place-order UA-oneway {resp.get('code')}: {resp.get('msg')}")
+            raise Exception(
+                f"place-order ua-oneway {resp.get('code')}: {resp.get('msg')}"
+            )
 
-        # ── Autodetección UA: probar hedge primero ───────────────
+        # ── Autodetección UA: probar hedge primero ────────────────
         if hold_side:
-            payload_hedge = self._build_payload_ua_hedge(sym, side, trade_side, qty, hold_side)
+            payload_hedge = self._build_payload_ua_hedge(
+                sym, side, trade_side, qty, hold_side
+            )
             logger.info(f"[{self.symbol}] 📤 order [ua-hedge]: {payload_hedge}")
             resp_hedge = await self._http_post(path, payload_hedge)
             logger.info(f"[{self.symbol}] 📥 response [ua-hedge]: {resp_hedge}")
@@ -389,14 +393,21 @@ class FuturesTrader:
                 self._ua_pos_mode = "hedge"
                 logger.info(f"[{self.symbol}] 📌 UA pos mode: hedge (posSide)")
                 order_id = (resp_hedge.get("data") or {}).get("orderId", "?")
-                logger.info(f"[{self.symbol}] ✅ {side}/{trade_side} posSide={hold_side} qty={qty} orderId={order_id} [ua-hedge]")
+                logger.info(
+                    f"[{self.symbol}] ✅ {side}/{trade_side} posSide={hold_side} "
+                    f"qty={qty} orderId={order_id} [ua-hedge]"
+                )
                 return resp_hedge
 
             if resp_hedge.get("code") != "25236":
-                raise Exception(f"place-order UA-hedge {resp_hedge.get('code')}: {resp_hedge.get('msg')}")
+                raise Exception(
+                    f"place-order ua-hedge {resp_hedge.get('code')}: "
+                    f"{resp_hedge.get('msg')}"
+                )
 
             logger.warning(
-                f"[{self.symbol}] ⚠️ UA hedge 25236 — contrato en one-way, intentando sin posSide"
+                f"[{self.symbol}] ⚠️ UA hedge→25236 — contrato en one-way, "
+                f"intentando sin posSide"
             )
 
         # Fallback UA one-way (sin posSide)
@@ -409,10 +420,15 @@ class FuturesTrader:
             self._ua_pos_mode = "one_way"
             logger.info(f"[{self.symbol}] 📌 UA pos mode: one_way (sin posSide)")
             order_id = (resp_ow.get("data") or {}).get("orderId", "?")
-            logger.info(f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} orderId={order_id} [ua-oneway]")
+            logger.info(
+                f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} "
+                f"orderId={order_id} [ua-oneway]"
+            )
             return resp_ow
 
-        raise Exception(f"place-order UA {resp_ow.get('code')}: {resp_ow.get('msg')}")
+        raise Exception(
+            f"place-order ua-oneway {resp_ow.get('code')}: {resp_ow.get('msg')}"
+        )
 
     async def _place_order_v2(self, sym: str, side: str, trade_side: str,
                                qty: float, hold_side: str) -> dict:
@@ -428,7 +444,7 @@ class FuturesTrader:
                 f"qty={qty} orderId={order_id} [v2]"
             )
             return resp
-        raise Exception(f"place-order {resp.get('code')}: {resp.get('msg')}")
+        raise Exception(f"place-order v2 {resp.get('code')}: {resp.get('msg')}")
 
     # ─────────────────────────────────────────────────────────────
     # POSICIONES
@@ -437,31 +453,44 @@ class FuturesTrader:
     async def _get_positions(self) -> list:
         sym = self._bitget_symbol(self.symbol)
         try:
-            path = f"/api/v3/position/single-position?symbol={sym}&category=USDT-FUTURES&marginCoin=USDT"
+            path = (
+                f"/api/v3/position/single-position"
+                f"?symbol={sym}&category=USDT-FUTURES&marginCoin=USDT"
+            )
             r = await self._http_get(path)
             if r.get("code") == "00000":
                 data = r.get("data") or []
                 if isinstance(data, dict):
                     data = [data]
-                result = [p for p in data if float(p.get("total") or p.get("size", 0)) > 0]
+                result = [
+                    p for p in data
+                    if float(p.get("total") or p.get("size", 0)) > 0
+                ]
                 if result:
                     return result
         except Exception as e:
             logger.warning(f"[{self.symbol}] get_positions v3: {e}")
         # Fallback v2
         try:
-            sym_v2 = sym + "_UMCBL"
-            path_v2 = f"/api/v2/mix/position/single-position?symbol={sym_v2}&productType=USDT-FUTURES&marginCoin=USDT"
+            sym_v2   = sym + "_UMCBL"
+            path_v2  = (
+                f"/api/v2/mix/position/single-position"
+                f"?symbol={sym_v2}&productType=USDT-FUTURES&marginCoin=USDT"
+            )
             r2 = await self._http_get(path_v2)
             if r2.get("code") == "00000":
                 data2 = r2.get("data") or []
                 if isinstance(data2, dict):
                     data2 = [data2]
-                result2 = [p for p in data2 if float(p.get("total") or p.get("size", 0)) > 0]
+                result2 = [
+                    p for p in data2
+                    if float(p.get("total") or p.get("size", 0)) > 0
+                ]
                 if result2:
                     return result2
         except Exception as e2:
             logger.warning(f"[{self.symbol}] get_positions v2: {e2}")
+        # Fallback ccxt
         try:
             positions = await self.exchange.fetch_positions([self.symbol])
             return [p for p in positions if float(p.get("contracts") or 0) > 0]
@@ -493,7 +522,8 @@ class FuturesTrader:
         else:
             self.usdt_amount = usdt_amount
         mode = "🧪 DRY" if self.dry_run else "💰 REAL"
-        logger.info(f"✅ [{self.symbol}] Listo | x{self.leverage} | {self.margin_mode.upper()} | {mode}")
+        logger.info(f"✅ [{self.symbol}] Listo | x{self.leverage} | "
+                    f"{self.margin_mode.upper()} | {mode}")
 
     # ─────────────────────────────────────────────────────────────
     # HELPERS
@@ -533,18 +563,30 @@ class FuturesTrader:
 
     async def _partial_close_order(self, pos_side: str, ratio: float):
         if self.dry_run:
-            logger.warning(f"[DRY][{self.symbol}] PARTIAL CLOSE {ratio*100:.0f}% {pos_side.upper()}")
+            logger.warning(
+                f"[DRY][{self.symbol}] PARTIAL CLOSE "
+                f"{ratio*100:.0f}% {pos_side.upper()}"
+            )
             return
         try:
             positions = await self._get_positions()
             for p in positions:
-                size = float(p.get("total") or p.get("contracts") or p.get("size", 0))
+                size = float(
+                    p.get("total") or p.get("contracts") or p.get("size", 0)
+                )
                 if size > 0:
                     partial_qty = round(size * ratio, 4)
-                    hold_side   = str(p.get("holdSide") or p.get("side") or "").lower()
-                    ps          = "long" if hold_side in ("long", "buy") else "short"
+                    # Soportar holdSide, positionSide y side (UA)
+                    hs = (
+                        str(p.get("holdSide") or p.get("positionSide")
+                            or p.get("side") or "").lower()
+                    )
+                    ps = "long" if hs in ("long", "buy") else "short"
                     await self._close_order(ps, partial_qty)
-                    logger.info(f"[{self.symbol}] TP parcial {ratio*100:.0f}% ({partial_qty} contratos)")
+                    logger.info(
+                        f"[{self.symbol}] TP parcial "
+                        f"{ratio*100:.0f}% ({partial_qty} contratos)"
+                    )
                     break
         except Exception as e:
             logger.error(f"[{self.symbol}] Partial close error: {e}")
@@ -559,15 +601,23 @@ class FuturesTrader:
         entry = self.entry_price or fill_price
         pnl   = 0.0
         if fill_price and entry:
-            pnl = ((fill_price - entry) / entry * 100 * self.leverage
-                   if self.position == "long" else
-                   (entry - fill_price) / entry * 100 * self.leverage)
+            pnl = (
+                (fill_price - entry) / entry * 100 * self.leverage
+                if self.position == "long" else
+                (entry - fill_price) / entry * 100 * self.leverage
+            )
         self.total_pnl += pnl
         if pnl > 0:
             self.win_count += 1
-        logger.warning(f"[Webhook][{self.symbol}] Cerrado | {reason} | PnL: {pnl:+.2f}%")
-        await notify_close(self.symbol, self.position, entry, fill_price, pnl, reason, self.dry_run)
-        self.position = self.entry_price = self.sl = self.tp1 = self.tp2 = self.tp3 = None
+        logger.warning(
+            f"[Webhook][{self.symbol}] Cerrado | {reason} | PnL: {pnl:+.2f}%"
+        )
+        await notify_close(
+            self.symbol, self.position, entry, fill_price, pnl, reason,
+            self.dry_run
+        )
+        self.position = self.entry_price = self.sl = None
+        self.tp1 = self.tp2 = self.tp3 = None
         self.tp2_hit = False
         clear_position(self.symbol)
 
@@ -583,10 +633,18 @@ class FuturesTrader:
         self.tp2_hit = False
         self.usdt_amount = usdt_amount
         self.trade_count += 1
-        save_position(self.symbol, self.position, self.entry_price,
-                      sl, tp1, tp2, tp3, usdt_amount, self.leverage)
-        logger.warning(f"📈 [{self.symbol}] LONG @ {self.entry_price} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}")
-        await notify_open(self.symbol, "long", self.entry_price, self.leverage, usdt_amount, self.dry_run)
+        save_position(
+            self.symbol, self.position, self.entry_price,
+            sl, tp1, tp2, tp3, usdt_amount, self.leverage
+        )
+        logger.warning(
+            f"📈 [{self.symbol}] LONG @ {self.entry_price} | "
+            f"SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}"
+        )
+        await notify_open(
+            self.symbol, "long", self.entry_price, self.leverage,
+            usdt_amount, self.dry_run
+        )
 
     async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None):
         await self._open_order("sell", usdt_amount)
@@ -596,16 +654,26 @@ class FuturesTrader:
         self.tp2_hit = False
         self.usdt_amount = usdt_amount
         self.trade_count += 1
-        save_position(self.symbol, self.position, self.entry_price,
-                      sl, tp1, tp2, tp3, usdt_amount, self.leverage)
-        logger.warning(f"📉 [{self.symbol}] SHORT @ {self.entry_price} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}")
-        await notify_open(self.symbol, "short", self.entry_price, self.leverage, usdt_amount, self.dry_run)
+        save_position(
+            self.symbol, self.position, self.entry_price,
+            sl, tp1, tp2, tp3, usdt_amount, self.leverage
+        )
+        logger.warning(
+            f"📉 [{self.symbol}] SHORT @ {self.entry_price} | "
+            f"SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}"
+        )
+        await notify_open(
+            self.symbol, "short", self.entry_price, self.leverage,
+            usdt_amount, self.dry_run
+        )
 
     # ─────────────────────────────────────────────────────────────
     # SL / TP CHECK
     # ─────────────────────────────────────────────────────────────
 
-    async def _check_and_handle_sl_tp(self, price: float, risk, global_risk) -> bool:
+    async def _check_and_handle_sl_tp(
+        self, price: float, risk, global_risk
+    ) -> bool:
         if not self.position or not self.entry_price:
             return False
         is_long = self.position == "long"
@@ -615,51 +683,70 @@ class FuturesTrader:
             if sl_hit:
                 result = await self.close_position(f"SL @ {price:.4f}")
                 risk.on_trade_close(result.get("pnl_pct", 0))
-                if global_risk: await global_risk.register_close(result.get("pnl_pct", 0))
+                if global_risk:
+                    await global_risk.register_close(result.get("pnl_pct", 0))
                 return True
 
         if self.tp2 and not self.tp2_hit:
-            tp2_hit = (price >= self.tp2) if is_long else (price <= self.tp2)
+            tp2_hit = (
+                (price >= self.tp2) if is_long else (price <= self.tp2)
+            )
             if tp2_hit:
-                logger.warning(f"[{self.symbol}] ✂️  TP2 parcial @ {price:.4f}")
+                logger.warning(
+                    f"[{self.symbol}] ✂️  TP2 parcial @ {price:.4f}"
+                )
                 await self._partial_close_order(self.position, TP2_PARTIAL_RATIO)
                 self.tp2_hit = True
                 mark_tp2_hit(self.symbol)
                 self.sl = self.entry_price
                 try:
                     from bot.telegram_bot import notify_tp_partial
-                    await notify_tp_partial(self.symbol, self.position, price, 2, TP2_PARTIAL_RATIO)
+                    await notify_tp_partial(
+                        self.symbol, self.position, price, 2, TP2_PARTIAL_RATIO
+                    )
                 except Exception:
                     pass
                 return False
 
         if self.tp3:
-            tp3_hit = (price >= self.tp3) if is_long else (price <= self.tp3)
+            tp3_hit = (
+                (price >= self.tp3) if is_long else (price <= self.tp3)
+            )
             if tp3_hit:
                 result = await self.close_position(f"TP3 @ {price:.4f}")
                 risk.on_trade_close(result.get("pnl_pct", 0))
-                if global_risk: await global_risk.register_close(result.get("pnl_pct", 0))
+                if global_risk:
+                    await global_risk.register_close(result.get("pnl_pct", 0))
                 return True
 
         if self.tp1 and not self.tp2:
-            tp1_hit = (price >= self.tp1) if is_long else (price <= self.tp1)
+            tp1_hit = (
+                (price >= self.tp1) if is_long else (price <= self.tp1)
+            )
             if tp1_hit:
                 result = await self.close_position(f"TP1 @ {price:.4f}")
                 risk.on_trade_close(result.get("pnl_pct", 0))
-                if global_risk: await global_risk.register_close(result.get("pnl_pct", 0))
+                if global_risk:
+                    await global_risk.register_close(result.get("pnl_pct", 0))
                 return True
 
         if not self.sl and not self.tp1:
-            pnl = ((price - self.entry_price) / self.entry_price * 100 * self.leverage
-                   if is_long else
-                   (self.entry_price - price) / self.entry_price * 100 * self.leverage)
+            pnl = (
+                (price - self.entry_price) / self.entry_price * 100 * self.leverage
+                if is_long else
+                (self.entry_price - price) / self.entry_price * 100 * self.leverage
+            )
             tp_pct = float(os.getenv("AI_TP_PCT",  "3.0"))
             sl_pct = float(os.getenv("AI_SL_PCT", "-1.5"))
             if pnl >= tp_pct or pnl <= sl_pct:
-                tag = f"TP +{pnl:.2f}%" if pnl >= tp_pct else f"SL {pnl:.2f}%"
+                tag = (
+                    f"TP +{pnl:.2f}%" if pnl >= tp_pct
+                    else f"SL {pnl:.2f}%"
+                )
                 result = await self.close_position(tag)
                 risk.on_trade_close(result.get("pnl_pct", 0))
-                if global_risk: await global_risk.register_close(result.get("pnl_pct", 0))
+                if global_risk:
+                    await global_risk.register_close(result.get("pnl_pct", 0))
                 return True
         return False
 
@@ -675,26 +762,51 @@ class FuturesTrader:
             try:
                 positions = await self._get_positions()
                 for p in positions:
-                    size      = float(p.get("total") or p.get("contracts") or p.get("size", 0))
-                    hold_side = str(p.get("holdSide") or p.get("side") or "").lower()
+                    size = float(
+                        p.get("total") or p.get("contracts") or
+                        p.get("size", 0)
+                    )
+                    # Soportar holdSide, positionSide y side (UA)
+                    hs = (
+                        str(p.get("holdSide") or p.get("positionSide")
+                            or p.get("side") or "").lower()
+                    )
                     if size > 0:
-                        ps = "long" if hold_side in ("long", "buy") else "short"
+                        ps = "long" if hs in ("long", "buy") else "short"
                         await self._close_order(ps, size)
                         break
             except Exception as e:
                 logger.error(f"[{self.symbol}] Close error: {e}")
 
-        pnl = ((price - self.entry_price) / self.entry_price * 100 * self.leverage
-               if self.position == "long" else
-               (self.entry_price - price) / self.entry_price * 100 * self.leverage)
+        pnl = (
+            (price - self.entry_price) / self.entry_price * 100 * self.leverage
+            if self.position == "long" else
+            (self.entry_price - price) / self.entry_price * 100 * self.leverage
+        )
         self.total_pnl += pnl
-        if pnl > 0: self.win_count += 1
-        wr = self.win_count / self.trade_count * 100 if self.trade_count else 0
-        logger.warning(f"🔒 [{self.symbol}] {self.position.upper()} cerrado | {reason} | PnL: {pnl:+.2f}% | WR: {wr:.1f}%")
-        await notify_close(self.symbol, self.position, self.entry_price, price, pnl, reason, self.dry_run)
-        result = {"side": self.position, "entry": self.entry_price, "exit": price,
-                  "pnl_pct": round(pnl, 2), "reason": reason}
-        self.position = self.entry_price = self.sl = self.tp1 = self.tp2 = self.tp3 = None
+        if pnl > 0:
+            self.win_count += 1
+        wr = (
+            self.win_count / self.trade_count * 100
+            if self.trade_count else 0
+        )
+        logger.warning(
+            f"🔒 [{self.symbol}] {self.position.upper()} cerrado | "
+            f"{reason} | PnL: {pnl:+.2f}% | WR: {wr:.1f}%"
+        )
+        await notify_close(
+            self.symbol, self.position, self.entry_price,
+            price, pnl, reason, self.dry_run
+        )
+        result = {
+            "side":    self.position,
+            "entry":   self.entry_price,
+            "exit":    price,
+            "pnl_pct": round(pnl, 2),
+            "reason":  reason,
+        }
+        self.position = self.entry_price = self.sl = None
+        self.tp1 = self.tp2 = self.tp3 = None
         self.tp2_hit = False
         clear_position(self.symbol)
         return result
@@ -714,7 +826,9 @@ class FuturesTrader:
                 price = await self.get_price()
 
                 if self.position:
-                    closed = await self._check_and_handle_sl_tp(price, risk, global_risk)
+                    closed = await self._check_and_handle_sl_tp(
+                        price, risk, global_risk
+                    )
                     if closed:
                         await asyncio.sleep(interval)
                         continue
@@ -722,8 +836,8 @@ class FuturesTrader:
                 async def _ai_fn(sym, ctx):
                     bars = await self.fetch_ohlcv(tf, limit=100)
                     return (await ai_decide(
-                        sym, bars, self.position, self.entry_price, self.leverage,
-                        context_override=ctx,
+                        sym, bars, self.position, self.entry_price,
+                        self.leverage, context_override=ctx,
                     ))["action"]
 
                 decision = await decide(
@@ -740,43 +854,72 @@ class FuturesTrader:
                 if action == "CLOSE" and self.position:
                     result = await self.close_position(reason[:60])
                     risk.on_trade_close(result.get("pnl_pct", 0))
-                    if global_risk: await global_risk.register_close(result.get("pnl_pct", 0))
+                    if global_risk:
+                        await global_risk.register_close(result.get("pnl_pct", 0))
 
                 elif action == "BUY":
                     if self.position == "short":
                         result = await self.close_position("Regresión → LONG")
                         risk.on_trade_close(result.get("pnl_pct", 0))
-                        if global_risk: await global_risk.register_close(result.get("pnl_pct", 0))
+                        if global_risk:
+                            await global_risk.register_close(
+                                result.get("pnl_pct", 0)
+                            )
                     if self.position is None:
                         bal = await self.get_balance()
                         can_l, r1 = risk.can_open_trade(bal)
-                        can_g, r2 = (True, "OK") if not global_risk else await global_risk.can_open()
+                        can_g, r2 = (
+                            (True, "OK") if not global_risk
+                            else await global_risk.can_open()
+                        )
                         if can_l and can_g:
-                            await self.open_long(usdt,
-                                sl=sig.sl if sig else None, tp1=sig.tp1 if sig else None,
-                                tp2=sig.tp2 if sig else None, tp3=sig.tp3 if sig else None)
+                            await self.open_long(
+                                usdt,
+                                sl=sig.sl   if sig else None,
+                                tp1=sig.tp1 if sig else None,
+                                tp2=sig.tp2 if sig else None,
+                                tp3=sig.tp3 if sig else None,
+                            )
                             risk.on_trade_open(self.entry_price, "long")
-                            if global_risk: await global_risk.register_open()
+                            if global_risk:
+                                await global_risk.register_open()
                         else:
-                            logger.info(f"[{self.symbol}] ⛔ {r1 if not can_l else r2}")
+                            logger.info(
+                                f"[{self.symbol}] ⛔ "
+                                f"{r1 if not can_l else r2}"
+                            )
 
                 elif action == "SELL":
                     if self.position == "long":
                         result = await self.close_position("Regresión → SHORT")
                         risk.on_trade_close(result.get("pnl_pct", 0))
-                        if global_risk: await global_risk.register_close(result.get("pnl_pct", 0))
+                        if global_risk:
+                            await global_risk.register_close(
+                                result.get("pnl_pct", 0)
+                            )
                     if self.position is None:
                         bal = await self.get_balance()
                         can_l, r1 = risk.can_open_trade(bal)
-                        can_g, r2 = (True, "OK") if not global_risk else await global_risk.can_open()
+                        can_g, r2 = (
+                            (True, "OK") if not global_risk
+                            else await global_risk.can_open()
+                        )
                         if can_l and can_g:
-                            await self.open_short(usdt,
-                                sl=sig.sl if sig else None, tp1=sig.tp1 if sig else None,
-                                tp2=sig.tp2 if sig else None, tp3=sig.tp3 if sig else None)
+                            await self.open_short(
+                                usdt,
+                                sl=sig.sl   if sig else None,
+                                tp1=sig.tp1 if sig else None,
+                                tp2=sig.tp2 if sig else None,
+                                tp3=sig.tp3 if sig else None,
+                            )
                             risk.on_trade_open(self.entry_price, "short")
-                            if global_risk: await global_risk.register_open()
+                            if global_risk:
+                                await global_risk.register_open()
                         else:
-                            logger.info(f"[{self.symbol}] ⛔ {r1 if not can_l else r2}")
+                            logger.info(
+                                f"[{self.symbol}] ⛔ "
+                                f"{r1 if not can_l else r2}"
+                            )
 
             except ccxt.NetworkError as e:
                 logger.error(f"[{self.symbol}] Red: {e}")

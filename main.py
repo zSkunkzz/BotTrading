@@ -100,7 +100,9 @@ async def main():
 
     global_risk = GlobalRisk(
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
-        max_global_daily_loss_pct=float(os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")),
+        max_global_daily_loss_pct=float(
+            os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")
+        ),
     )
 
     # Arrancar webhook server en paralelo
@@ -117,7 +119,6 @@ async def main():
     )
 
     logger.info("🔍 Escaneando mercado inicial...")
-    # scan() ya devuelve símbolos en formato BASE/USDT:USDT (ccxt estándar)
     initial_pairs = await scanner.scan()
 
     scored_data = []
@@ -125,9 +126,11 @@ async def main():
         try:
             ticker = await scanner.exchange.fetch_ticker(sym)
             scored_data.append({
-                "symbol": sym,
+                "symbol":     sym,
                 "volume_usdt": round(float(ticker.get("quoteVolume") or 0) / 1e6, 2),
-                "change_pct": round(abs(float(ticker.get("percentage") or 0)), 2),
+                "change_pct":  round(
+                    abs(float(ticker.get("percentage") or 0)), 2
+                ),
                 "score": 0,
             })
         except Exception:
@@ -136,14 +139,23 @@ async def main():
     logger.info("🤖 Filtrando con IA...")
     ai_ranked = await ai_rank_pairs(scored_data)
     top_n = int(os.getenv("TOP_PAIRS", "15"))
-    # ai_rank_pairs puede devolver símbolos en formato comprimido (BTCUSDT);
-    # normalizarlos al formato estándar antes de lanzar los traders.
+
+    # Normalizar al formato estándar ccxt (BASE/USDT:USDT)
     final_pairs = [
         scanner.normalize(sym) for sym in ai_ranked[:top_n]
     ]
-    # Deduplicar por si acaso ai_rank_pairs devolvió duplicados
+
+    # Deduplicar preservando orden
     seen = set()
     final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
+
+    # Fallback: si IA devolvió lista vacía usar el scan inicial directamente
+    if not final_pairs:
+        logger.warning(
+            "⚠️ ai_rank_pairs devolvió lista vacía — "
+            "usando pares del scanner directamente"
+        )
+        final_pairs = initial_pairs[:top_n]
 
     logger.info(f"✅ Pares finales ({len(final_pairs)}): {', '.join(final_pairs)}")
 
