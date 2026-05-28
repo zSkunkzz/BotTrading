@@ -20,6 +20,11 @@ logger = logging.getLogger("Trader")
 
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 
+# Timeframe usado para los indicadores técnicos / IA
+OHLCV_TF        = os.getenv("OHLCV_TF", "15m")
+OHLCV_LIMIT     = int(os.getenv("OHLCV_LIMIT", "200"))
+OHLCV_MIN_BARS  = int(os.getenv("OHLCV_MIN_BARS", "55"))
+
 _MIN_QTY_FALLBACK = {
     "BTCUSDT":   0.001,
     "ETHUSDT":   0.01,
@@ -88,23 +93,11 @@ def _extract_usdt_balance(item: dict) -> float | None:
         if v is not None and v > 0:
             logger.debug(f"[BalanceCache] campo={field} val={v}")
             return v
-    # Aunque sea 0, si existe 'available' lo retornamos
     v = _to_float(item.get("available"))
     return v if v is not None else 0.0
 
 
 async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
-    """
-    Intenta obtener balance USDT disponible.
-
-    Orden de intentos:
-      1. /api/v3/account/assets?coin=USDT          (UA, data puede ser list o dict)
-      2. /api/v3/account/assets-detail?coin=USDT   (UA alternativo, siempre dict)
-      3. /api/v2/mix/account/account               (Classic / fallback UA)
-      4. /api/v2/mix/account/accounts              (Classic multi)
-
-    Retorna float (puede ser 0.0 si cuenta vacía) o None si todo falla.
-    """
     global _balance_cache_value, _balance_cache_ts
 
     def _sign(ts, method, path_with_qs, body=""):
@@ -131,7 +124,7 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
         logger.info(f"[BalanceCache] ✅ Balance USDT ({source}): {val:.2f}")
         return val
 
-    # ── ENDPOINT 1: v3/account/assets (UA) ───────────────────────────────────
+    # ENDPOINT 1: v3/account/assets
     try:
         path = "/api/v3/account/assets"
         qs   = "?coin=USDT"
@@ -141,10 +134,6 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
                 data = await _safe_json(r)
         raw_data = data.get("data")
-        logger.debug(
-            f"[BalanceCache] v3/assets raw: code={data.get('code')} "
-            f"data_type={type(raw_data).__name__}"
-        )
         if data.get("code") == "00000":
             if isinstance(raw_data, dict):
                 items = [raw_data]
@@ -152,7 +141,6 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
                 items = raw_data
             else:
                 items = []
-
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -161,11 +149,6 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
                     bal = _extract_usdt_balance(item)
                     if bal is not None:
                         return _cache_and_return(bal, "v3/assets")
-
-            logger.warning(
-                f"[BalanceCache] ⚠️ v3/assets OK pero sin ítem USDT "
-                f"(data type={type(raw_data).__name__}, items={len(items)})"
-            )
         else:
             logger.warning(f"[BalanceCache] ⚠️ v3/assets code={data.get('code')} msg={data.get('msg')}")
     except ValueError as e:
@@ -173,7 +156,7 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
     except Exception as e:
         logger.warning(f"[BalanceCache] ❌ v3/assets excepción: {e}")
 
-    # ── ENDPOINT 2: v3/account/assets-detail (UA alternativo) ──────────────────
+    # ENDPOINT 2: v3/account/assets-detail
     try:
         path = "/api/v3/account/assets-detail"
         qs   = "?coin=USDT"
@@ -183,10 +166,6 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
                 data = await _safe_json(r)
         raw_data = data.get("data")
-        logger.debug(
-            f"[BalanceCache] v3/assets-detail raw: code={data.get('code')} "
-            f"data_type={type(raw_data).__name__}"
-        )
         if data.get("code") == "00000":
             if isinstance(raw_data, dict):
                 items = [raw_data]
@@ -211,7 +190,7 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
     except Exception as e:
         logger.warning(f"[BalanceCache] ❌ v3/assets-detail excepción: {e}")
 
-    # ── ENDPOINT 3: v2/mix/account/account (single) ────────────────────────────
+    # ENDPOINT 3: v2/mix/account/account
     try:
         path = "/api/v2/mix/account/account"
         qs   = "?symbol=USDTUSDT&productType=USDT-FUTURES&marginCoin=USDT"
@@ -228,16 +207,14 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
                     return _cache_and_return(bal, "v2-single")
         else:
             code = data.get("code")
-            if code == "40085":
-                logger.debug("[BalanceCache] v2-single: 40085 (UA mode, esperado)")
-            else:
+            if code != "40085":
                 logger.warning(f"[BalanceCache] ⚠️ v2-single code={code} msg={data.get('msg')}")
     except ValueError as e:
         logger.warning(f"[BalanceCache] ⚠️ v2-single respuesta inesperada: {e}")
     except Exception as e:
         logger.warning(f"[BalanceCache] ❌ v2-single excepción: {e}")
 
-    # ── ENDPOINT 4: v2/mix/account/accounts (plural) ───────────────────────────
+    # ENDPOINT 4: v2/mix/account/accounts
     try:
         path = "/api/v2/mix/account/accounts"
         qs   = "?productType=USDT-FUTURES"
@@ -254,9 +231,7 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
                     return _cache_and_return(bal, "v2-multi")
         else:
             code = data.get("code")
-            if code == "40085":
-                logger.debug("[BalanceCache] v2-multi: 40085 (UA mode, esperado)")
-            else:
+            if code != "40085":
                 logger.warning(f"[BalanceCache] ⚠️ v2-multi code={code} msg={data.get('msg')}")
     except ValueError as e:
         logger.warning(f"[BalanceCache] ⚠️ v2-multi respuesta inesperada: {e}")
@@ -310,7 +285,7 @@ class FuturesTrader:
         self.win_count    = 0
         self.total_pnl    = 0.0
         self.exchange     = None
-        self._api_version = None   # "ua" | "v2"
+        self._api_version = None
         self._ua_pos_mode = None
         self._v2_pos_mode = None
 
@@ -380,11 +355,6 @@ class FuturesTrader:
         await self._detect_account_type()
 
     async def _detect_account_type(self):
-        """
-        Detecta si la cuenta es Unified Account (UA) o Classic.
-        UA: /api/v3/position/all-position responde con code=00000
-        Classic: /api/v2/mix/account/account responde con code=00000
-        """
         # Probe UA
         try:
             r = await self._http_get(
@@ -437,13 +407,12 @@ class FuturesTrader:
         self._api_version = "ua"
         self._ua_pos_mode = "hedge"
 
-    # ── PRECIO Y BALANCE ─────────────────────────────────────────────────────────────
+    # ── PRECIO, OHLCV Y BALANCE ────────────────────────────────────────────────────────
 
     async def get_price(self) -> float:
         """
-        Retorna el precio actual.
-        Primero intenta el WS feed (tiempo real, sin coste de API).
-        Si el precio WS no está disponible o tiene más de 10s, cae a REST.
+        Precio actual. WS feed primero (sin coste de API),
+        fallback REST si el precio WS tiene >10s o no está disponible.
         """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
         try:
@@ -454,9 +423,48 @@ class FuturesTrader:
                     return price
         except Exception:
             pass
-        # Fallback REST
         ticker = await self.exchange.fetch_ticker(self.symbol)
         return float(ticker["last"])
+
+    async def get_ohlcv(self, tf: str = OHLCV_TF) -> list:
+        """
+        Retorna candles OHLCV como lista de listas [ts, o, h, l, c, v],
+        compatible con ai_decide(bars=...).
+
+        Orden de prioridad:
+          1. WS feed (caché en memoria, cero coste) si hay >= OHLCV_MIN_BARS velas.
+          2. REST ccxt fetch_ohlcv como fallback (consume rate limit).
+        """
+        sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
+        try:
+            from bot.ws_feed import ws_feed
+            if ws_feed.has_data(sym_clean, tf=tf, min_candles=OHLCV_MIN_BARS):
+                df = ws_feed.get_ohlcv(sym_clean, tf)
+                if not df.empty and len(df) >= OHLCV_MIN_BARS:
+                    # Convertir DataFrame a lista [[ts_ms, o, h, l, c, v], ...]
+                    df_reset = df.reset_index()
+                    bars = [
+                        [
+                            int(row["ts"].timestamp() * 1000),
+                            float(row["open"]),
+                            float(row["high"]),
+                            float(row["low"]),
+                            float(row["close"]),
+                            float(row["volume"]),
+                        ]
+                        for _, row in df_reset.iterrows()
+                    ]
+                    logger.debug(f"[{self.symbol}] OHLCV desde WS ({len(bars)} velas)")
+                    return bars
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] get_ohlcv WS error: {e}")
+
+        # Fallback REST
+        # Mapeo tf → formato ccxt
+        tf_ccxt = {"15m": "15m", "1h": "1h", "4h": "4h"}.get(tf, tf)
+        logger.debug(f"[{self.symbol}] OHLCV fallback REST ({tf_ccxt})")
+        bars = await self.exchange.fetch_ohlcv(self.symbol, tf_ccxt, limit=OHLCV_LIMIT)
+        return bars
 
     async def get_balance(self) -> float | None:
         return await get_cached_balance(self._api_key, self._api_secret, self._passphrase)
@@ -630,10 +638,6 @@ class FuturesTrader:
         qty = max(min_qty, round(raw_qty / min_qty) * min_qty)
         decimals = len(str(min_qty).rstrip("0").split(".")[-1]) if "." in str(min_qty) else 0
         qty = round(qty, decimals)
-        logger.debug(
-            f"[{self.symbol}] calc_qty: usdt={usdt_amount} x lev={effective_lev} / price={price} "
-            f"= raw {raw_qty:.6f} → qty={qty} (min={min_qty})"
-        )
         return qty
 
     # ── ABRIR POSICIONES ─────────────────────────────────────────────────────────────
@@ -795,7 +799,7 @@ class FuturesTrader:
 
         while True:
             try:
-                price = await self.get_price()
+                price   = await self.get_price()
                 balance = await self.get_balance()
 
                 if balance is None or balance <= 0:
@@ -805,13 +809,11 @@ class FuturesTrader:
 
                 # ── Gestión de posición abierta ───────────────────────────────────
                 if self.position:
-                    # Cierre parcial en TP2
                     if not self.tp2_hit and self.tp2:
                         if (self.position == "long"  and price >= self.tp2) or \
                            (self.position == "short" and price <= self.tp2):
                             await self.partial_close(ratio=TP2_PARTIAL_RATIO)
 
-                    # Verificar SL / TP3
                     if self.sl and self.tp3:
                         hit_sl  = (self.position == "long"  and price <= self.sl) or \
                                   (self.position == "short" and price >= self.sl)
@@ -830,18 +832,27 @@ class FuturesTrader:
                     await asyncio.sleep(2)
                     continue
 
+                # Obtener candles WS o REST
+                bars = await self.get_ohlcv()
+
+                if not bars or len(bars) < OHLCV_MIN_BARS:
+                    logger.debug(
+                        f"[{self.symbol}] Esperando candles WS ({len(bars) if bars else 0}/{OHLCV_MIN_BARS})"
+                    )
+                    await asyncio.sleep(2)
+                    continue
+
                 decision = await ai_decide(
-                    exchange=self.exchange,
                     symbol=self.symbol,
-                    price=price,
-                    balance=balance,
+                    bars=bars,
+                    position=self.position,
+                    entry_price=self.entry_price,
+                    leverage=self.leverage,
                 )
 
-                if decision.get("action") in ("LONG", "SHORT"):
-                    usdt_amount = min(
-                        usdt_per_trade,
-                        balance * 0.95
-                    )
+                if decision.get("action") in ("LONG", "SHORT", "BUY", "SELL"):
+                    action = decision["action"]
+                    usdt_amount = min(usdt_per_trade, balance * 0.95)
                     lev  = decision.get("leverage", self.leverage)
                     sl   = decision.get("sl")
                     tp1  = decision.get("tp1")
@@ -851,13 +862,16 @@ class FuturesTrader:
                     if global_risk:
                         global_risk.register_open_trade()
 
-                    if decision["action"] == "LONG":
+                    if action in ("LONG", "BUY"):
                         await self.open_long(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
                     else:
                         await self.open_short(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
 
                     if global_risk:
                         global_risk.register_close_trade()
+
+                elif decision.get("action") == "CLOSE" and self.position:
+                    await self.close_position(reason=decision.get("reasoning", "IA-CLOSE"))
 
             except asyncio.CancelledError:
                 logger.info(f"[{self.symbol}] Trader cancelado.")
