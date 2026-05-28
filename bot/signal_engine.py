@@ -85,10 +85,29 @@ class SignalResult:
 
 
 async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataFrame:
+    """
+    Intenta obtener OHLCV desde el WS feed (caché en memoria).
+    Si no hay datos suficientes cae al REST de ccxt.
+    """
+    # ── 1. Intentar WS feed ──────────────────────────────────────────
+    try:
+        from bot.ws_feed import ws_feed
+        # El símbolo en el feed va sin '/' ni ':USDT' (ej: BTCUSDT)
+        sym_clean = symbol.replace("/", "").replace(":USDT", "")
+        df = ws_feed.get_ohlcv(sym_clean, tf)
+        if not df.empty and len(df) >= 55:
+            log.debug(f"[OHLCV] {symbol} {tf} ← WS ({len(df)} velas)")
+            return df
+        log.debug(f"[OHLCV] {symbol} {tf} WS insuficiente ({len(df)} velas), usando REST")
+    except Exception as e:
+        log.debug(f"[OHLCV] {symbol} {tf} WS error: {e}, usando REST")
+
+    # ── 2. Fallback REST ccxt ──────────────────────────────────────────
     try:
         raw = await exch.fetch_ohlcv(symbol, tf, limit=limit)
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        log.debug(f"[OHLCV] {symbol} {tf} ← REST ({len(df)} velas)")
         return df.set_index("ts").astype(float)
     except Exception as e:
         log.warning(f"[OHLCV] {symbol} {tf}: {e}")
