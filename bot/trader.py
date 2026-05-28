@@ -329,6 +329,69 @@ class FuturesTrader:
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
+    # SET LEVERAGE DINÁMICO — aplica el leverage del signal en Bitget
+    # ─────────────────────────────────────────────────────────────
+
+    async def _set_leverage_on_exchange(self, leverage: int) -> bool:
+        """
+        Fija el leverage para el par en Bitget antes de abrir una posición.
+        Actualiza self.leverage si tiene éxito.
+        Retorna True si OK, False si falla (no bloquea la orden).
+        """
+        if self.dry_run:
+            self.leverage = leverage
+            return True
+
+        sym = self._bitget_symbol(self.symbol)
+        lev_str = str(leverage)
+
+        # Intentar v3 primero (Unified Account)
+        try:
+            payload_v3 = {
+                "symbol":     sym,
+                "category":   "USDT-FUTURES",
+                "marginCoin": "USDT",
+                "leverage":   lev_str,
+            }
+            r = await self._http_post("/api/v3/account/set-leverage", payload_v3)
+            if r.get("code") == "00000":
+                self.leverage = leverage
+                logger.info(
+                    f"[{self.symbol}] ⚙️ Leverage fijado a x{leverage} (v3)"
+                )
+                return True
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] set-leverage v3 error: {e}")
+
+        # Fallback v2 Mix
+        try:
+            payload_v2 = {
+                "symbol":      sym,
+                "productType": "USDT-FUTURES",
+                "marginCoin":  "USDT",
+                "leverage":    lev_str,
+                "holdSide":    "long",
+            }
+            r2 = await self._http_post("/api/v2/mix/account/set-leverage", payload_v2)
+            if r2.get("code") == "00000":
+                # hedge mode: también fijar para short
+                payload_v2_s = {**payload_v2, "holdSide": "short"}
+                await self._http_post("/api/v2/mix/account/set-leverage", payload_v2_s)
+                self.leverage = leverage
+                logger.info(
+                    f"[{self.symbol}] ⚙️ Leverage fijado a x{leverage} (v2)"
+                )
+                return True
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] set-leverage v2 error: {e}")
+
+        logger.warning(
+            f"[{self.symbol}] ⚠️ No se pudo fijar leverage x{leverage} en Bitget — "
+            f"se usará el leverage actual de la cuenta"
+        )
+        return False
+
+    # ─────────────────────────────────────────────────────────────
     # ÓRDENES — con fallback automático v3 → v2 Mix → UA
     # ─────────────────────────────────────────────────────────────
 
@@ -966,6 +1029,9 @@ class FuturesTrader:
                 self.tp3         = saved.get("tp3")
                 self.tp2_hit     = saved.get("tp2_hit", False)
                 self.usdt_amount = saved.get("usdt_amount", usdt_amount)
+                # Restaurar leverage guardado si existe
+                if saved.get("leverage"):
+                    self.leverage = saved["leverage"]
                 logger.warning(
                     f"[{self.symbol}] ♻️  Estado recuperado (confirmado en exchange): "
                     f"{self.position} @ {self.entry_price} | "
@@ -1078,7 +1144,11 @@ class FuturesTrader:
     # ABRIR POSICIÓN
     # ─────────────────────────────────────────────────────────────
 
-    async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None):
+    async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None,
+                        leverage: int = None):
+        # Aplicar leverage dinámico si se especifica
+        if leverage and leverage != self.leverage:
+            await self._set_leverage_on_exchange(leverage)
         await self._open_order("buy", usdt_amount)
         self.position    = "long"
         self.entry_price = await self.get_price()
@@ -1094,14 +1164,18 @@ class FuturesTrader:
         )
         logger.warning(
             f"📈 [{self.symbol}] LONG @ {self.entry_price} | "
-            f"SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}"
+            f"x{self.leverage} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}"
         )
         await notify_open(
             self.symbol, "long", self.entry_price, self.leverage,
             sl, tp1, tp2, tp3, self.dry_run
         )
 
-    async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None):
+    async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None,
+                         leverage: int = None):
+        # Aplicar leverage dinámico si se especifica
+        if leverage and leverage != self.leverage:
+            await self._set_leverage_on_exchange(leverage)
         await self._open_order("sell", usdt_amount)
         self.position    = "short"
         self.entry_price = await self.get_price()
@@ -1117,7 +1191,7 @@ class FuturesTrader:
         )
         logger.warning(
             f"📉 [{self.symbol}] SHORT @ {self.entry_price} | "
-            f"SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}"
+            f"x{self.leverage} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}"
         )
         await notify_open(
             self.symbol, "short", self.entry_price, self.leverage,
@@ -1358,12 +1432,14 @@ class FuturesTrader:
                             else await global_risk.can_open()
                         )
                         if can_l and can_g:
+                            dyn_lev = sig.suggested_lev if sig and sig.suggested_lev else None
                             await self.open_long(
                                 usdt,
                                 sl=sig.sl   if sig else None,
                                 tp1=sig.tp1 if sig else None,
                                 tp2=sig.tp2 if sig else None,
                                 tp3=sig.tp3 if sig else None,
+                                leverage=dyn_lev,
                             )
                             risk.on_trade_open(self.entry_price, "long")
                             if global_risk:
@@ -1390,12 +1466,14 @@ class FuturesTrader:
                             else await global_risk.can_open()
                         )
                         if can_l and can_g:
+                            dyn_lev = sig.suggested_lev if sig and sig.suggested_lev else None
                             await self.open_short(
                                 usdt,
                                 sl=sig.sl   if sig else None,
                                 tp1=sig.tp1 if sig else None,
                                 tp2=sig.tp2 if sig else None,
                                 tp3=sig.tp3 if sig else None,
+                                leverage=dyn_lev,
                             )
                             risk.on_trade_open(self.entry_price, "short")
                             if global_risk:
