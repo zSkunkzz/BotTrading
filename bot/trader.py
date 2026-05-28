@@ -153,14 +153,6 @@ class FuturesTrader:
 
     # ─────────────────────────────────────────────────────────────
     # ÓRDENES — con fallback automático v3 → v2 Mix → UA
-    #
-    # Flujo de autodetección (solo en el primer trade por par):
-    #   1. Intentar v3 con holdSide (hedge mode — la mayoría de contratos).
-    #   2. Si 25236 → intentar v2 Mix con tradeSide (API mix legacy).
-    #   3. Si v2 falla con 40085 o 25236 → Unified Account:
-    #      3a. Intentar v3 con posSide (UA hedge mode).
-    #      3b. Si 25236 → intentar v3 sin holdSide/posSide (UA one-way).
-    #   4. Una vez detectado, usar siempre esa versión directamente.
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -785,7 +777,7 @@ class FuturesTrader:
         return False
 
     # ─────────────────────────────────────────────────────────────
-    # CERRAR POSICIÓN
+    # CERRAR POSICIÓN — FIX: no limpiar estado si la orden falla
     # ─────────────────────────────────────────────────────────────
 
     async def close_position(self, reason=""):
@@ -793,14 +785,25 @@ class FuturesTrader:
             return {}
         price = await self.get_price()
         if not self.dry_run:
+            order_executed = False
             try:
                 positions = await self._get_positions()
+                if not positions:
+                    # No hay posición real en Bitget — estado stale, limpiar
+                    logger.warning(
+                        f"[{self.symbol}] ⚠️ close_position: no hay posición "
+                        f"real en Bitget — limpiando estado stale ({reason})"
+                    )
+                    self.position = self.entry_price = self.sl = None
+                    self.tp1 = self.tp2 = self.tp3 = None
+                    self.tp2_hit = False
+                    clear_position(self.symbol)
+                    return {}
                 for p in positions:
                     size = float(
                         p.get("total") or p.get("contracts") or
                         p.get("size", 0)
                     )
-                    # Soportar holdSide, positionSide y side (UA)
                     hs = (
                         str(p.get("holdSide") or p.get("positionSide")
                             or p.get("side") or "").lower()
@@ -808,9 +811,32 @@ class FuturesTrader:
                     if size > 0:
                         ps = "long" if hs in ("long", "buy") else "short"
                         await self._close_order(ps, size)
+                        order_executed = True
                         break
             except Exception as e:
-                logger.error(f"[{self.symbol}] Close error: {e}")
+                logger.error(
+                    f"[{self.symbol}] ❌ CIERRE FALLIDO en Bitget: {e} | "
+                    f"Razón: {reason} — posición SIGUE ABIERTA"
+                )
+                # Notificar urgente por Telegram sin limpiar estado
+                try:
+                    from bot.telegram_bot import notify_close_failed
+                    await notify_close_failed(self.symbol, reason, str(e))
+                except Exception:
+                    pass
+                # Re-lanzar para que el loop principal lo capture
+                raise
+
+            if not order_executed:
+                logger.warning(
+                    f"[{self.symbol}] ⚠️ close_position: ninguna posición "
+                    f"ejecutada — posiciones vacías tras consulta ({reason})"
+                )
+                self.position = self.entry_price = self.sl = None
+                self.tp1 = self.tp2 = self.tp3 = None
+                self.tp2_hit = False
+                clear_position(self.symbol)
+                return {}
 
         pnl = (
             (price - self.entry_price) / self.entry_price * 100 * self.leverage
