@@ -77,12 +77,32 @@ def _to_float(val) -> float | None:
         return None
 
 
+def _extract_usdt_balance(item: dict) -> float | None:
+    """Extrae balance USDT disponible de un dict de cuenta/asset."""
+    if not isinstance(item, dict):
+        return None
+    for field in ("available", "crossMaxAvailable", "usdtEquity",
+                  "isolatedMaxAvailable", "equity", "availableBalance",
+                  "availableMargin", "accountEquity"):
+        v = _to_float(item.get(field))
+        if v is not None and v > 0:
+            logger.debug(f"[BalanceCache] campo={field} val={v}")
+            return v
+    # Aunque sea 0, si existe 'available' lo retornamos
+    v = _to_float(item.get("available"))
+    return v if v is not None else 0.0
+
+
 async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
     """
-    Intenta obtener balance USDT disponible en Unified Account.
-    Endpoint principal: /api/v3/account/assets (UA)
-    Fallback 1: /api/v2/mix/account/account (single, puede dar 40085 en UA)
-    Fallback 2: /api/v2/mix/account/accounts (plural)
+    Intenta obtener balance USDT disponible.
+
+    Orden de intentos:
+      1. /api/v3/account/assets?coin=USDT          (UA, data puede ser list o dict)
+      2. /api/v3/account/assets-detail?coin=USDT   (UA alternativo, siempre dict)
+      3. /api/v2/mix/account/account               (Classic / fallback UA)
+      4. /api/v2/mix/account/accounts              (Classic multi)
+
     Retorna float (puede ser 0.0 si cuenta vacía) o None si todo falla.
     """
     global _balance_cache_value, _balance_cache_ts
@@ -104,8 +124,15 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
             "locale":            "en-US",
         }
 
-    # ── ENDPOINT 1: v3/account/assets (Unified Account) ────────────────
-    # FIX: data["data"] puede ser un string en UA → validar que sea lista
+    def _cache_and_return(val: float, source: str) -> float:
+        global _balance_cache_value, _balance_cache_ts
+        _balance_cache_value = val
+        _balance_cache_ts    = time.monotonic()
+        logger.info(f"[BalanceCache] ✅ Balance USDT ({source}): {val:.2f}")
+        return val
+
+    # ── ENDPOINT 1: v3/account/assets (UA) ─────────────────────────────
+    # FIX: data["data"] puede ser dict (un solo asset) o list en UA
     try:
         path = "/api/v3/account/assets"
         qs   = "?coin=USDT"
@@ -114,42 +141,80 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
             async with s.get(url, headers=_headers("GET", path + qs),
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
                 data = await _safe_json(r)
-        logger.debug(f"[BalanceCache] v3 raw: code={data.get('code')} data_type={type(data.get('data')).__name__}")
+        raw_data = data.get("data")
+        logger.debug(
+            f"[BalanceCache] v3/assets raw: code={data.get('code')} "
+            f"data_type={type(raw_data).__name__}"
+        )
         if data.get("code") == "00000":
-            raw_data = data.get("data")
-            # UA puede devolver data como string o dict, no siempre lista
-            items = raw_data if isinstance(raw_data, list) else []
+            # Normalizar a lista independientemente de si es dict o list
+            if isinstance(raw_data, dict):
+                items = [raw_data]
+            elif isinstance(raw_data, list):
+                items = raw_data
+            else:
+                items = []
+
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                if item.get("coin") == "USDT":
-                    bal = None
-                    for field in ("available", "crossMaxAvailable", "usdtEquity",
-                                  "isolatedMaxAvailable", "equity"):
-                        v = _to_float(item.get(field))
-                        if v is not None and v > 0:
-                            bal = v
-                            logger.debug(f"[BalanceCache] v3 campo={field} val={v}")
-                            break
-                    if bal is None:
-                        bal = _to_float(item.get("available")) or 0.0
-                    _balance_cache_value = bal
-                    _balance_cache_ts    = time.monotonic()
-                    logger.info(f"[BalanceCache] ✅ Balance USDT (v3): {bal:.2f}")
-                    return bal
-            # data OK pero sin ítem USDT en lista → intentar endpoint 2
+                coin = item.get("coin") or item.get("currency") or ""
+                if coin.upper() == "USDT" or not items:  # si solo hay un item, asumirlo
+                    bal = _extract_usdt_balance(item)
+                    if bal is not None:
+                        return _cache_and_return(bal, "v3/assets")
+
+            # data OK pero sin ítem USDT identificable
             logger.warning(
-                f"[BalanceCache] ⚠️ v3 OK pero sin ítem USDT "
-                f"(data type={type(raw_data).__name__}, len={len(items)})"
+                f"[BalanceCache] ⚠️ v3/assets OK pero sin ítem USDT "
+                f"(data type={type(raw_data).__name__}, items={len(items)})"
             )
         else:
-            logger.warning(f"[BalanceCache] ⚠️ v3 code={data.get('code')} msg={data.get('msg')}")
+            logger.warning(f"[BalanceCache] ⚠️ v3/assets code={data.get('code')} msg={data.get('msg')}")
     except ValueError as e:
-        logger.warning(f"[BalanceCache] ⚠️ v3 respuesta inesperada: {e}")
+        logger.warning(f"[BalanceCache] ⚠️ v3/assets respuesta inesperada: {e}")
     except Exception as e:
-        logger.warning(f"[BalanceCache] ❌ v3 excepción: {e}")
+        logger.warning(f"[BalanceCache] ❌ v3/assets excepción: {e}")
 
-    # ── ENDPOINT 2: v2/mix/account/account (single) ─────────────────────
+    # ── ENDPOINT 2: v3/account/assets-detail (UA alternativo) ──────────
+    try:
+        path = "/api/v3/account/assets-detail"
+        qs   = "?coin=USDT"
+        url  = "https://api.bitget.com" + path + qs
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=_headers("GET", path + qs),
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await _safe_json(r)
+        raw_data = data.get("data")
+        logger.debug(
+            f"[BalanceCache] v3/assets-detail raw: code={data.get('code')} "
+            f"data_type={type(raw_data).__name__}"
+        )
+        if data.get("code") == "00000":
+            if isinstance(raw_data, dict):
+                items = [raw_data]
+            elif isinstance(raw_data, list):
+                items = raw_data
+            else:
+                items = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                coin = item.get("coin") or item.get("currency") or ""
+                if coin.upper() == "USDT" or len(items) == 1:
+                    bal = _extract_usdt_balance(item)
+                    if bal is not None:
+                        return _cache_and_return(bal, "v3/assets-detail")
+        else:
+            code = data.get("code")
+            if code not in ("40085", "40001"):
+                logger.warning(f"[BalanceCache] ⚠️ v3/assets-detail code={code} msg={data.get('msg')}")
+    except ValueError as e:
+        logger.warning(f"[BalanceCache] ⚠️ v3/assets-detail respuesta inesperada: {e}")
+    except Exception as e:
+        logger.warning(f"[BalanceCache] ❌ v3/assets-detail excepción: {e}")
+
+    # ── ENDPOINT 3: v2/mix/account/account (single) ─────────────────────
     try:
         path = "/api/v2/mix/account/account"
         qs   = "?symbol=USDTUSDT&productType=USDT-FUTURES&marginCoin=USDT"
@@ -161,18 +226,9 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
         if data.get("code") == "00000":
             d = data.get("data") or {}
             if isinstance(d, dict):
-                for field in ("available", "crossMaxAvailable", "usdtEquity", "equity"):
-                    v = _to_float(d.get(field))
-                    if v is not None and v > 0:
-                        _balance_cache_value = v
-                        _balance_cache_ts    = time.monotonic()
-                        logger.info(f"[BalanceCache] ✅ Balance USDT (v2-single/{field}): {v:.2f}")
-                        return v
-                bal = _to_float(d.get("available")) or 0.0
-                _balance_cache_value = bal
-                _balance_cache_ts    = time.monotonic()
-                logger.info(f"[BalanceCache] ✅ Balance USDT (v2-single vacía): {bal:.2f}")
-                return bal
+                bal = _extract_usdt_balance(d)
+                if bal is not None:
+                    return _cache_and_return(bal, "v2-single")
         else:
             code = data.get("code")
             if code == "40085":
@@ -184,7 +240,7 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
     except Exception as e:
         logger.warning(f"[BalanceCache] ❌ v2-single excepción: {e}")
 
-    # ── ENDPOINT 3: v2/mix/account/accounts (plural) ─────────────────────
+    # ── ENDPOINT 4: v2/mix/account/accounts (plural) ─────────────────────
     try:
         path = "/api/v2/mix/account/accounts"
         qs   = "?productType=USDT-FUTURES"
@@ -196,19 +252,9 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
         if data.get("code") == "00000":
             items = data.get("data") or []
             if isinstance(items, list) and items:
-                d = items[0]
-                for field in ("available", "crossMaxAvailable", "usdtEquity"):
-                    v = _to_float(d.get(field))
-                    if v is not None and v > 0:
-                        _balance_cache_value = v
-                        _balance_cache_ts    = time.monotonic()
-                        logger.info(f"[BalanceCache] ✅ Balance USDT (v2-multi/{field}): {v:.2f}")
-                        return v
-                bal = _to_float(d.get("available")) or 0.0
-                _balance_cache_value = bal
-                _balance_cache_ts    = time.monotonic()
-                logger.info(f"[BalanceCache] ✅ Balance USDT (v2-multi vacía): {bal:.2f}")
-                return bal
+                bal = _extract_usdt_balance(items[0])
+                if bal is not None:
+                    return _cache_and_return(bal, "v2-multi")
         else:
             code = data.get("code")
             if code == "40085":
@@ -221,7 +267,7 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
         logger.warning(f"[BalanceCache] ❌ v2-multi excepción: {e}")
 
     logger.error(
-        f"[BalanceCache] 🚨 Los 3 endpoints fallaron — balance NO actualizado. "
+        f"[BalanceCache] 🚨 Los 4 endpoints fallaron — balance NO actualizado. "
         f"Caché actual: {_balance_cache_value}. Se reintentará en el próximo ciclo."
     )
     return None
