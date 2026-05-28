@@ -39,7 +39,8 @@ def save_position(symbol: str, position: str, entry_price: float,
                   tp2: float | None, tp3: float | None,
                   usdt_amount: float, leverage: int,
                   api_version: str | None = None,
-                  ua_pos_mode: str | None = None):
+                  ua_pos_mode: str | None = None,
+                  v2_pos_mode: str | None = None):
     """Persiste una posición abierta."""
     data = _load_raw()
     entry = {
@@ -57,6 +58,8 @@ def save_position(symbol: str, position: str, entry_price: float,
         entry["api_version"] = api_version
     if ua_pos_mode:
         entry["ua_pos_mode"] = ua_pos_mode
+    if v2_pos_mode:
+        entry["v2_pos_mode"] = v2_pos_mode
     data[symbol] = entry
     _save_raw(data)
     logger.info(f"[State] Guardado {symbol} {position} @ {entry_price}")
