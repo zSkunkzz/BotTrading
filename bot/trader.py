@@ -158,8 +158,8 @@ class FuturesTrader:
     # Flujo de autodetección (solo en el primer trade por par):
     #   1. Intentar v3 con holdSide (hedge mode estándar).
     #   2. Si 25236 → intentar v2 Mix con tradeSide (classic hedge).
-    #   3. Si 40085 → cuenta en Unified Account:
-    #      3a. Intentar v3 con posSide (UA hedge mode). ← FIX PRINCIPAL
+    #   3. Si 40085 o 25236 en v2 → cuenta en Unified Account:
+    #      3a. Intentar v3 con posSide (UA hedge mode).
     #      3b. Si 25236 → intentar v3 sin posSide ni holdSide (UA one-way).
     #   4. Una vez detectado, usar siempre esa versión directamente.
     # ─────────────────────────────────────────────────────────────
@@ -195,13 +195,7 @@ class FuturesTrader:
         - Cerrar long:  side=sell, posSide=long  + reduceOnly=YES
         - Cerrar short: side=buy,  posSide=short + reduceOnly=YES
         """
-        # posSide indica qué lado de la posición afecta la orden
-        if trade_side == "open":
-            pos_side = hold_side  # "long" o "short"
-        else:
-            # Al cerrar: la posición que se cierra es el hold_side
-            pos_side = hold_side
-
+        pos_side = hold_side  # "long" o "short"
         payload = {
             "symbol":     sym,
             "category":   "USDT-FUTURES",
@@ -318,12 +312,12 @@ class FuturesTrader:
                 )
                 return resp_v2
 
-            if resp_v2.get("code") == "40085":
-                # Unified Account detectado — v2 Mix no soportado
-                # Intentar UA hedge (con posSide) primero
+            # 40085 = Unified Account explícito, 25236 = UA que no acepta tradeSide
+            # En ambos casos intentar UA
+            if resp_v2.get("code") in ("40085", "25236"):
                 logger.warning(
-                    f"[{self.symbol}] ⚠️ 40085 Unified Account detectado — "
-                    f"intentando UA hedge (posSide)"
+                    f"[{self.symbol}] ⚠️ v2 devolvió {resp_v2.get('code')} — "
+                    f"Unified Account detectado, intentando UA hedge (posSide)"
                 )
                 resp_ua = await self._place_order_ua(sym, side, trade_side, qty, hold_side)
                 if resp_ua.get("code") == "00000":
