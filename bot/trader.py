@@ -134,7 +134,22 @@ class FuturesTrader:
         except Exception as e:
             logger.debug(f"[{self.symbol}] detect_account_type /v3/account-type: {e}")
 
-        # Prueba alternativa: si el endpoint de assets UA responde OK → es UA
+        # Prueba alternativa A: si /api/v3/account/assets responde OK → es UA
+        # (Los logs muestran que este endpoint funciona en esta cuenta)
+        try:
+            r1b = await self._http_get("/api/v3/account/assets?coin=USDT")
+            if r1b.get("code") == "00000" and r1b.get("data"):
+                self._api_version = "ua"
+                logger.info(
+                    f"[{self.symbol}] 🔎 Cuenta detectada: Unified Account "
+                    f"(via v3/account/assets) → modo UA activado"
+                )
+                await self._detect_ua_pos_mode()
+                return
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] detect_account_type v3/account/assets: {e}")
+
+        # Prueba alternativa B: endpoint unified/assets
         try:
             r2 = await self._http_get("/api/v2/unified/account/assets?coin=USDT")
             if r2.get("code") == "00000" and r2.get("data"):
@@ -147,6 +162,21 @@ class FuturesTrader:
                 return
         except Exception as e:
             logger.debug(f"[{self.symbol}] detect_account_type unified/assets: {e}")
+
+        # Prueba alternativa C: si el balance v3/assets da resultado → es UA
+        # (Fallback final: si podemos leer balance en v3 → tratar como UA)
+        try:
+            r3 = await self._http_get("/api/v3/account/assets")
+            if r3.get("code") == "00000":
+                self._api_version = "ua"
+                logger.info(
+                    f"[{self.symbol}] 🔎 Cuenta detectada: Unified Account "
+                    f"(via v3/assets fallback) → modo UA activado"
+                )
+                await self._detect_ua_pos_mode()
+                return
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] detect_account_type v3/assets-fallback: {e}")
 
         logger.info(f"[{self.symbol}] 🔎 Cuenta detectada: Classic (v3/v2)")
 
@@ -187,7 +217,32 @@ class FuturesTrader:
         except Exception as e:
             logger.debug(f"[{self.symbol}] detect_ua_pos_mode: {e}")
 
-        # Sin posición abierta — asumir hedge (default Bitget UA)
+        # Sin posición abierta — intentar leer posMode de la configuración de cuenta
+        sym = self._bitget_symbol(self.symbol)
+        try:
+            path_mode = (
+                f"/api/v3/position/position-mode"
+                f"?symbol={sym}&category=USDT-FUTURES"
+            )
+            r_mode = await self._http_get(path_mode)
+            if r_mode.get("code") == "00000":
+                data_mode = r_mode.get("data") or {}
+                pos_mode_val = str(
+                    data_mode.get("posMode") or data_mode.get("positionMode") or ""
+                ).lower()
+                if "hedge" in pos_mode_val:
+                    self._ua_pos_mode = "hedge"
+                elif "oneway" in pos_mode_val or "one_way" in pos_mode_val or "single" in pos_mode_val:
+                    self._ua_pos_mode = "one_way"
+                if self._ua_pos_mode:
+                    logger.info(
+                        f"[{self.symbol}] 📌 UA pos_mode leído de API: {self._ua_pos_mode}"
+                    )
+                    return
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] detect_ua_pos_mode position-mode: {e}")
+
+        # Sin posición y sin config → asumir hedge (default Bitget UA)
         self._ua_pos_mode = "hedge"
         logger.info(
             f"[{self.symbol}] 📌 UA pos_mode asumido: hedge (sin posición previa)"
@@ -431,22 +486,24 @@ class FuturesTrader:
                 f"qty={qty} orderId={order_id} [v3]"
             )
             return resp
-        # Si falla con 25236/40085 en modo fijado → resetear y reintentar
         if resp.get("code") in ("25236", "40085"):
             logger.warning(
                 f"[{self.symbol}] ⚠️ v3 fijado devuelve {resp.get('code')} — "
-                f"reseteando api_version para re-autodetección"
+                f"escalando a UA"
             )
             self._api_version = None
-            return await self._place_order(side, trade_side, qty, hold_side)
+            resp_ua = await self._place_order_ua(sym, side, trade_side, qty, hold_side)
+            if resp_ua.get("code") == "00000":
+                self._api_version = "ua"
+            return resp_ua
         raise Exception(f"place-order v3 {resp.get('code')}: {resp.get('msg')}")
 
     async def _place_order_ua(self, sym: str, side: str, trade_side: str,
-                               qty: float, hold_side: str = None) -> dict:
+                               qty: float, hold_side: str) -> dict:
         """
-        Unified Account: intenta hedge (posSide) primero.
-        Si devuelve 25236, reintenta one-way (sin posSide).
-        Persiste el modo detectado en self._ua_pos_mode.
+        Coloca orden en Unified Account.
+        Intenta hedge (posSide) primero, luego one-way (sin posSide).
+        Si ambos fallan con 25236, intenta forzar el modo via switch-position-mode.
         """
         path = "/api/v3/trade/place-order"
 
@@ -573,6 +630,87 @@ class FuturesTrader:
             )
             return resp_ow
 
+        # Ambos ua-hedge y ua-oneway fallan con 25236 → intentar forzar modo hedge via API
+        if resp_ow.get("code") == "25236":
+            logger.warning(
+                f"[{self.symbol}] ⚠️ Ambos ua-hedge y ua-oneway devuelven 25236 — "
+                f"intentando forzar posMode=hedge via switch-position-mode"
+            )
+            try:
+                sym_local = self._bitget_symbol(self.symbol)
+                switch_payload = {
+                    "symbol":   sym_local,
+                    "category": "USDT-FUTURES",
+                    "posMode":  "hedge",
+                }
+                r_switch = await self._http_post(
+                    "/api/v3/position/switch-position-mode", switch_payload
+                )
+                logger.info(
+                    f"[{self.symbol}] 🔄 switch-position-mode hedge: {r_switch}"
+                )
+                if r_switch.get("code") == "00000":
+                    self._ua_pos_mode = "hedge"
+                    # Reintentar con hedge tras cambio de modo
+                    if hold_side:
+                        payload_retry = self._build_payload_ua_hedge(
+                            sym, side, trade_side, qty, hold_side
+                        )
+                        resp_retry = await self._http_post(path, payload_retry)
+                        logger.info(
+                            f"[{self.symbol}] 📥 response [ua-hedge-after-switch]: "
+                            f"{resp_retry}"
+                        )
+                        if resp_retry.get("code") == "00000":
+                            order_id = (resp_retry.get("data") or {}).get("orderId", "?")
+                            logger.info(
+                                f"[{self.symbol}] ✅ {side}/{trade_side} "
+                                f"posSide={hold_side} qty={qty} "
+                                f"orderId={order_id} [ua-hedge-after-switch]"
+                            )
+                            return resp_retry
+            except Exception as e_sw:
+                logger.warning(
+                    f"[{self.symbol}] switch-position-mode falló: {e_sw}"
+                )
+            # Intentar también forzar one_way
+            try:
+                sym_local = self._bitget_symbol(self.symbol)
+                switch_payload_ow = {
+                    "symbol":   sym_local,
+                    "category": "USDT-FUTURES",
+                    "posMode":  "oneway",
+                }
+                r_switch_ow = await self._http_post(
+                    "/api/v3/position/switch-position-mode", switch_payload_ow
+                )
+                logger.info(
+                    f"[{self.symbol}] 🔄 switch-position-mode oneway: {r_switch_ow}"
+                )
+                if r_switch_ow.get("code") == "00000":
+                    self._ua_pos_mode = "one_way"
+                    payload_retry_ow = self._build_payload_ua_oneway(
+                        sym, side, trade_side, qty
+                    )
+                    resp_retry_ow = await self._http_post(path, payload_retry_ow)
+                    logger.info(
+                        f"[{self.symbol}] 📥 response [ua-oneway-after-switch]: "
+                        f"{resp_retry_ow}"
+                    )
+                    if resp_retry_ow.get("code") == "00000":
+                        order_id = (
+                            resp_retry_ow.get("data") or {}
+                        ).get("orderId", "?")
+                        logger.info(
+                            f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} "
+                            f"orderId={order_id} [ua-oneway-after-switch]"
+                        )
+                        return resp_retry_ow
+            except Exception as e_sw2:
+                logger.warning(
+                    f"[{self.symbol}] switch-position-mode oneway falló: {e_sw2}"
+                )
+
         raise Exception(
             f"place-order ua-oneway {resp_ow.get('code')}: {resp_ow.get('msg')}"
         )
@@ -665,6 +803,20 @@ class FuturesTrader:
 
         # ── DETECTAR TIPO DE CUENTA ANTES DE OPERAR ──
         await self._detect_account_type()
+
+        # Si la detección no fue concluyente pero el balance v3/assets funciona → es UA
+        if self._api_version is None:
+            try:
+                r_check = await self._http_get("/api/v3/account/assets?coin=USDT")
+                if r_check.get("code") == "00000":
+                    self._api_version = "ua"
+                    logger.info(
+                        f"[{self.symbol}] 🔎 Forzando UA: /v3/account/assets OK "
+                        f"(fallback en _init)"
+                    )
+                    await self._detect_ua_pos_mode()
+            except Exception:
+                pass
 
         saved = load_position(self.symbol)
         if saved:
@@ -837,7 +989,7 @@ class FuturesTrader:
         )
         await notify_open(
             self.symbol, "long", self.entry_price, self.leverage,
-            usdt_amount, self.dry_run
+            sl, tp1, tp2, tp3, self.dry_run
         )
 
     async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None):
@@ -860,18 +1012,17 @@ class FuturesTrader:
         )
         await notify_open(
             self.symbol, "short", self.entry_price, self.leverage,
-            usdt_amount, self.dry_run
+            sl, tp1, tp2, tp3, self.dry_run
         )
 
     # ─────────────────────────────────────────────────────────────
-    # SL / TP CHECK
+    # SL/TP CHECK
     # ─────────────────────────────────────────────────────────────
 
-    async def _check_and_handle_sl_tp(
-        self, price: float, risk, global_risk
-    ) -> bool:
+    async def _check_and_handle_sl_tp(self, price, risk, global_risk=None):
         if not self.position or not self.entry_price:
             return False
+
         is_long = self.position == "long"
 
         if self.sl:
@@ -884,18 +1035,12 @@ class FuturesTrader:
                 return True
 
         if self.tp2 and not self.tp2_hit:
-            tp2_hit = (
-                (price >= self.tp2) if is_long else (price <= self.tp2)
-            )
+            tp2_hit = (price >= self.tp2) if is_long else (price <= self.tp2)
             if tp2_hit:
-                logger.warning(
-                    f"[{self.symbol}] ✂️  TP2 parcial @ {price:.4f}"
-                )
-                await self._partial_close_order(self.position, TP2_PARTIAL_RATIO)
                 self.tp2_hit = True
                 mark_tp2_hit(self.symbol)
-                self.sl = self.entry_price
                 try:
+                    await self._partial_close_order(self.position, TP2_PARTIAL_RATIO)
                     from bot.telegram_bot import notify_tp_partial
                     await notify_tp_partial(
                         self.symbol, self.position, price, 2, TP2_PARTIAL_RATIO
@@ -1151,23 +1296,7 @@ class FuturesTrader:
                                 f"{r1 if not can_l else r2}"
                             )
 
-            except ccxt.NetworkError as e:
-                logger.error(f"[{self.symbol}] Red: {e}")
-                await asyncio.sleep(60)
-                continue
-            except ccxt.ExchangeError as e:
-                logger.error(f"[{self.symbol}] Exchange: {e}")
-                await asyncio.sleep(30)
-                continue
             except Exception as e:
-                logger.exception(f"[{self.symbol}] Error: {e}")
-                await asyncio.sleep(30)
-                continue
+                logger.error(f"[{self.symbol}] Loop error: {e}", exc_info=True)
 
             await asyncio.sleep(interval)
-
-    async def close(self):
-        try:
-            await self.exchange.close()
-        except Exception:
-            pass
