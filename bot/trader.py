@@ -239,37 +239,20 @@ class FuturesTrader:
 
     async def get_balance(self) -> float:
         """Retorna el balance USDT disponible."""
-        # ── Intento 1: UA (v3/account/assets) ──
-        # El endpoint devuelve data como dict (cuenta UA con coin=USDT)
-        # O como lista de objetos. Manejamos ambos casos.
+        # Intenta primero v3 (UA)
         try:
             r = await self._http_get("/api/v3/account/assets", {"coin": "USDT"})
             if r.get("code") == "00000":
-                data = r.get("data")
-                # Caso A: data es un dict directamente (respuesta UA single-coin)
-                if isinstance(data, dict):
-                    bal = float(
-                        data.get("available") or
-                        data.get("crossMaxAvailable") or
-                        data.get("availableBalance") or 0
-                    )
-                    logger.info(f"[{self.symbol}] ✅ Balance USDT (v3/assets dict): {bal}")
-                    return bal
-                # Caso B: data es una lista
-                if isinstance(data, list):
-                    for item in data:
-                        if item.get("coin") == "USDT":
-                            bal = float(
-                                item.get("available") or
-                                item.get("crossMaxAvailable") or
-                                item.get("availableBalance") or 0
-                            )
-                            logger.info(f"[{self.symbol}] ✅ Balance USDT (v3/assets list): {bal}")
-                            return bal
+                data = r.get("data") or []
+                for item in data:
+                    if item.get("coin") == "USDT":
+                        bal = float(item.get("available", 0) or item.get("crossMaxAvailable", 0))
+                        logger.info(f"[{self.symbol}] ✅ Balance USDT (v3/assets): {bal}")
+                        return bal
         except Exception:
             pass
 
-        # ── Intento 2: Clásica (v2/mix/account/account) ──
+        # Fallback v2
         try:
             sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
             r = await self._http_get(
@@ -280,7 +263,7 @@ class FuturesTrader:
             )
             if r.get("code") == "00000":
                 d = r.get("data", {})
-                bal = float(d.get("available") or d.get("availableBalance") or 0)
+                bal = float(d.get("available", 0))
                 logger.info(f"[{self.symbol}] ✅ Balance USDT (v2): {bal}")
                 return bal
         except Exception:
