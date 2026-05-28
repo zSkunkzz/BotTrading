@@ -6,6 +6,10 @@ Modos de entrada (se exporta entry_mode en SignalResult):
   EARLY   score 5-6, 4h neutral/débil, 1h+15m alineados → lev 5-8x
   NORMAL  score 6-7, todos los TF alineados               → lev 8-14x
   STRONG  score 8+, confluencia máxima                    → lev 14-15x
+
+Señales adicionales (microestructura, hasta +2 pts al score):
+  ob_imbalance  → OB L2 bid/ask imbalance del WS feed (+1 si confirma)
+  funding_bias  → Funding rate extremo filtra o penaliza señales contra-tendencia (+1)
 """
 
 from __future__ import annotations
@@ -38,9 +42,16 @@ LEV_EARLY_MAX   = 8
 LEV_NORMAL_MIN  = 8
 LEV_NORMAL_MAX  = 14
 LEV_STRONG_MIN  = 14
-LEV_STRONG_MAX  = 15   # techo bajado de 20x a 15x
+LEV_STRONG_MAX  = 15
 
 EARLY_SIZE_RATIO = 0.5
+
+# Umbral de imbalance OB para considerar presión significativa (|imbalance| > esto)
+OB_IMBALANCE_THRESHOLD = 0.15
+
+# Funding extremo: por encima/debajo de este valor el funding es una señal relevante
+# Ej: 0.0005 = 0.05% por funding period (bastante elevado)
+FUNDING_EXTREME_THRESHOLD = 0.0005
 
 
 @dataclass
@@ -48,7 +59,7 @@ class SignalResult:
     symbol: str
     signal: str      = "NEUTRAL"
     score: int       = 0
-    max_score: int   = 10
+    max_score: int   = 12   # +2 por microestructura
     entry_mode: str  = "NONE"
     entry: float     = 0.0
     sl: float        = 0.0
@@ -61,6 +72,8 @@ class SignalResult:
     size_ratio: float   = 1.0
     pct_tp3: float      = 0.0
     indicators: dict    = field(default_factory=dict)
+    ob_imbalance: Optional[float]  = None   # [-1..+1]
+    funding_rate: Optional[float]  = None   # float o None
     error: Optional[str] = None
 
     @property
@@ -74,13 +87,19 @@ class SignalResult:
 
     def summary(self) -> str:
         if not self.is_valid:
-            return f"{self.symbol} · NEUTRAL · Score {self.score}/10"
+            return f"{self.symbol} · NEUTRAL · Score {self.score}/12"
         em   = f"[{self.entry_mode}]"
         icon = "🟢" if self.signal == "LONG" else "🔴"
+        extras = []
+        if self.ob_imbalance is not None:
+            extras.append(f"OB {self.ob_imbalance:+.2f}")
+        if self.funding_rate is not None:
+            extras.append(f"FR {self.funding_rate*100:+.4f}%")
+        extra_str = " · " + " · ".join(extras) if extras else ""
         return (
-            f"{icon} {self.symbol} · {self.signal} {em} · Score {self.score}/10 · "
+            f"{icon} {self.symbol} · {self.signal} {em} · Score {self.score}/12 · "
             f"R/R {self.rr:.1f} · Lev {self.suggested_lev}x · "
-            f"Entry {self.entry:.4f} · SL {self.sl:.4f} · TP1 {self.tp1:.4f}"
+            f"Entry {self.entry:.4f} · SL {self.sl:.4f} · TP1 {self.tp1:.4f}{extra_str}"
         )
 
 
@@ -89,10 +108,8 @@ async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataF
     Intenta obtener OHLCV desde el WS feed (caché en memoria).
     Si no hay datos suficientes cae al REST de ccxt.
     """
-    # ── 1. Intentar WS feed ──────────────────────────────────────────
     try:
         from bot.ws_feed import ws_feed
-        # El símbolo en el feed va sin '/' ni ':USDT' (ej: BTCUSDT)
         sym_clean = symbol.replace("/", "").replace(":USDT", "")
         df = ws_feed.get_ohlcv(sym_clean, tf)
         if not df.empty and len(df) >= 55:
@@ -102,7 +119,6 @@ async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataF
     except Exception as e:
         log.debug(f"[OHLCV] {symbol} {tf} WS error: {e}, usando REST")
 
-    # ── 2. Fallback REST ccxt ──────────────────────────────────────────
     try:
         raw = await exch.fetch_ohlcv(symbol, tf, limit=limit)
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -266,6 +282,74 @@ def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, int, str]:
     return score, min(sl, 10), direction
 
 
+def _apply_microstructure(
+    score: int,
+    direction: str,
+    ob_metrics: Optional[dict],
+    funding_rate: Optional[float],
+) -> tuple[int, Optional[float], Optional[float]]:
+    """
+    Aplica hasta +2 puntos adicionales al score base usando microestructura:
+
+    +1 OB imbalance confirma dirección:
+       LONG  + imbalance > +OB_IMBALANCE_THRESHOLD → presión compradora
+       SHORT + imbalance < -OB_IMBALANCE_THRESHOLD → presión vendedora
+
+    +1 Funding rate confirma o filtra:
+       LONG  + funding muy positivo  → -1 (mercado sobrecargado, penalización)
+       LONG  + funding muy negativo  → +1 (shorts pagando, favorece longs)
+       SHORT + funding muy negativo  → -1 (mercado sobrecargado short)
+       SHORT + funding muy positivo  → +1 (longs pagando, favorece shorts)
+
+    Retorna (score_ajustado, ob_imbalance, funding_rate)
+    """
+    ob_imbalance_val = None
+    fr_val           = None
+    bonus            = 0
+
+    # ── Order Book imbalance ──────────────────────────────────────────
+    if ob_metrics and isinstance(ob_metrics, dict):
+        imbalance = ob_metrics.get("imbalance", 0.0)
+        ob_imbalance_val = imbalance
+        if direction == "LONG"  and imbalance >  OB_IMBALANCE_THRESHOLD:
+            bonus += 1
+            log.debug(f"[micro] OB +1 LONG confirma imbalance={imbalance:+.3f}")
+        elif direction == "SHORT" and imbalance < -OB_IMBALANCE_THRESHOLD:
+            bonus += 1
+            log.debug(f"[micro] OB +1 SHORT confirma imbalance={imbalance:+.3f}")
+        elif direction == "LONG"  and imbalance < -OB_IMBALANCE_THRESHOLD:
+            bonus -= 1
+            log.debug(f"[micro] OB -1 LONG contra imbalance={imbalance:+.3f}")
+        elif direction == "SHORT" and imbalance >  OB_IMBALANCE_THRESHOLD:
+            bonus -= 1
+            log.debug(f"[micro] OB -1 SHORT contra imbalance={imbalance:+.3f}")
+
+    # ── Funding Rate bias ─────────────────────────────────────────────
+    if funding_rate is not None:
+        fr_val = funding_rate
+        if direction == "LONG":
+            if funding_rate > FUNDING_EXTREME_THRESHOLD:
+                # Mercado sobrecargado de longs, penalizar
+                bonus -= 1
+                log.debug(f"[micro] FR -1 LONG, funding muy positivo={funding_rate:.6f}")
+            elif funding_rate < -FUNDING_EXTREME_THRESHOLD:
+                # Shorts pagando, favorece longs
+                bonus += 1
+                log.debug(f"[micro] FR +1 LONG, funding negativo={funding_rate:.6f}")
+        else:  # SHORT
+            if funding_rate < -FUNDING_EXTREME_THRESHOLD:
+                # Mercado sobrecargado de shorts, penalizar
+                bonus -= 1
+                log.debug(f"[micro] FR -1 SHORT, funding muy negativo={funding_rate:.6f}")
+            elif funding_rate > FUNDING_EXTREME_THRESHOLD:
+                # Longs pagando, favorece shorts
+                bonus += 1
+                log.debug(f"[micro] FR +1 SHORT, funding positivo={funding_rate:.6f}")
+
+    adjusted = max(0, score + bonus)
+    return adjusted, ob_imbalance_val, fr_val
+
+
 def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction: str) -> tuple[str, int, float]:
     sign = 1 if direction == "LONG" else -1
 
@@ -314,8 +398,26 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         s4h = _analyze_tf(df4h) if not df4h.empty else {}
         result.indicators = {"15m": s15, "1h": s1h, "4h": s4h}
 
-        score, _, direction = _compute_score(s4h, s1h, s15)
-        result.score = score
+        score_base, _, direction = _compute_score(s4h, s1h, s15)
+
+        # ── Microestructura: OB L2 + Funding Rate ────────────────────────
+        ob_metrics   = None
+        funding_rate = None
+        try:
+            from bot.ws_feed import ws_feed
+            sym_clean    = symbol.replace("/", "").replace(":USDT", "")
+            ob_metrics   = ws_feed.get_orderbook_metrics(sym_clean)
+            funding_rate = ws_feed.get_funding_rate(sym_clean)
+        except Exception as e:
+            log.debug(f"[signal_engine] microestructura no disponible: {e}")
+
+        score, ob_imbalance_val, fr_val = _apply_microstructure(
+            score_base, direction, ob_metrics, funding_rate
+        )
+        result.score        = score
+        result.ob_imbalance = ob_imbalance_val
+        result.funding_rate = fr_val
+        # ────────────────────────────────────────────────────────────
 
         mode, lev, size_ratio = _classify_entry_mode(score, s4h, s1h, s15, direction)
 
@@ -382,7 +484,7 @@ def _mode_emoji(mode: str) -> str:
 
 def format_signal_block(r: SignalResult) -> str:
     if not r.is_valid:
-        return f"📊 Score técnico: `{r.score}/10` — sin señal clara"
+        return f"📊 Score técnico: `{r.score}/12` — sin señal clara"
 
     i15 = r.indicators.get("15m", {})
     i1h = r.indicators.get("1h",  {})
@@ -392,9 +494,20 @@ def format_signal_block(r: SignalResult) -> str:
 
     size_txt = f" · Size `{int(r.size_ratio*100)}%`" if r.size_ratio < 1.0 else ""
 
+    ob_txt = ""
+    if r.ob_imbalance is not None:
+        arrow = "↑" if r.ob_imbalance > 0.05 else ("↓" if r.ob_imbalance < -0.05 else "→")
+        ob_txt = f"\n  OB {arrow} `{r.ob_imbalance:+.3f}`"
+
+    fr_txt = ""
+    if r.funding_rate is not None:
+        fr_pct = r.funding_rate * 100
+        emoji  = "🔥" if abs(fr_pct) > 0.05 else "⚪"
+        fr_txt = f"\n  Funding {emoji} `{fr_pct:+.4f}%`"
+
     lines = [
-        f"📊 *Análisis técnico* · Score `{r.score}/10` · R/R `{r.rr}:1`",
-        f"{'🟢 LONG' if d == 'LONG' else '🔴 SHORT'} · Modo {me}`{r.entry_mode}` · Lev `{r.suggested_lev}x`{size_txt}",
+        f"📊 *Análisis técnico* · Score `{r.score}/12` · R/R `{r.rr}:1`",
+        f"{'\U0001f7e2 LONG' if d == 'LONG' else '\U0001f534 SHORT'} · Modo {me}`{r.entry_mode}` · Lev `{r.suggested_lev}x`{size_txt}",
         f"",
         f"  Entry `{r.entry}` · SL `{r.sl}` · TP1 `{r.tp1}`",
         f"",
@@ -405,4 +518,4 @@ def format_signal_block(r: SignalResult) -> str:
         f"  ST    {_ei(i4h.get('supertrend',0))}·{_ei(i1h.get('supertrend',0))}·{_ei(i15.get('supertrend',0))}",
         f"  Vol   {_ei(i15.get('volume',0))} ×{i15.get('vol_ratio',1.0)}",
     ]
-    return "\n".join(lines)
+    return "\n".join(lines) + ob_txt + fr_txt
