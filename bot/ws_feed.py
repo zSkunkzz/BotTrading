@@ -1,20 +1,23 @@
 """
-ws_feed.py — WebSocket feed de Bitget para precio y OHLCV en tiempo real.
+ws_feed.py — WebSocket feed de Bitget para precio, OHLCV, Order Book L2 y Funding Rate.
 
 Suscripciones por símbolo activo:
   • ticker         → precio last en tiempo real
   • candle15m      → candles 15m (últimas 200 velas en caché)
   • candle1H       → candles 1h
   • candle4H       → candles 4h
+  • books1         → mejor bid/ask + imbalance L2 en tiempo real
+  • funding-rate   → funding rate actual del perp
 
 Uso desde signal_engine.py:
     from bot.ws_feed import ws_feed
-    price  = ws_feed.get_price("BTCUSDT")
-    df15   = ws_feed.get_ohlcv("BTCUSDT", "15m")
-
-Uso desde trader.py (get_price):
-    from bot.ws_feed import ws_feed
-    price = ws_feed.get_price(sym_clean)  # fallback a REST si no disponible
+    price   = ws_feed.get_price("BTCUSDT")
+    df15    = ws_feed.get_ohlcv("BTCUSDT", "15m")
+    ob      = ws_feed.get_orderbook_metrics("BTCUSDT")
+    # ob → {"bid": float, "ask": float, "spread_pct": float, "imbalance": float}
+    # imbalance: +1.0 = presión compradora total, -1.0 = vendedora total
+    funding = ws_feed.get_funding_rate("BTCUSDT")
+    # funding → float (ej: 0.0001) o None si no disponible
 
 El módulo arranca con ws_feed.start(symbols) y se detiene con ws_feed.stop().
 Se reconecta automáticamente con backoff exponencial.
@@ -36,10 +39,10 @@ log = logging.getLogger("WSFeed")
 
 # ── Constantes Bitget WS ──────────────────────────────────────────────────────
 WS_URL        = "wss://ws.bitget.com/v2/ws/public"
-PING_INTERVAL = 25        # segundos entre ping
-OHLCV_LIMIT   = 200       # velas en caché por tf
-RECONNECT_BASE = 2.0      # segundos base para backoff
-RECONNECT_MAX  = 60.0     # techo backoff
+PING_INTERVAL = 25
+OHLCV_LIMIT   = 200
+RECONNECT_BASE = 2.0
+RECONNECT_MAX  = 60.0
 
 TF_MAP = {
     "15m": "candle15m",
@@ -47,30 +50,98 @@ TF_MAP = {
     "4h":  "candle4H",
 }
 
+# Número de niveles de profundidad a cachear por side (bid/ask)
+OB_DEPTH = 20
 
-# ── Caché en memoria ──────────────────────────────────────────────────────────
 
-class _SymbolCache:
-    """Caché de precio y candles para un símbolo."""
+# ── Caché de Order Book ───────────────────────────────────────────────────────
+
+class _OrderBookCache:
+    """
+    Caché del order book L2 para un símbolo.
+    Guarda los mejores OB_DEPTH niveles de bids y asks.
+    """
+    __slots__ = ("bids", "asks", "ts")
 
     def __init__(self):
-        self.price:     Optional[float] = None
-        self.price_ts:  float = 0.0
-        # tf → deque de [ts_ms, open, high, low, close, volume]
-        self.candles:   Dict[str, deque] = {tf: deque(maxlen=OHLCV_LIMIT) for tf in TF_MAP}
-        self.candle_ts: Dict[str, float] = {tf: 0.0 for tf in TF_MAP}
+        # lista de [precio, tamaño] ordenada: bids desc, asks asc
+        self.bids: list = []
+        self.asks: list = []
+        self.ts:   float = 0.0
+
+    def apply_snapshot(self, bids: list, asks: list):
+        self.bids = sorted([[float(p), float(s)] for p, s in bids if float(s) > 0],
+                           key=lambda x: -x[0])[:OB_DEPTH]
+        self.asks = sorted([[float(p), float(s)] for p, s in asks if float(s) > 0],
+                           key=lambda x:  x[0])[:OB_DEPTH]
+        self.ts = time.monotonic()
+
+    def apply_delta(self, bids: list, asks: list):
+        """Aplica delta incremental al order book en memoria."""
+        def _merge(levels: list, updates: list, descending: bool) -> list:
+            d = {p: s for p, s in levels}
+            for p_str, s_str in updates:
+                p, s = float(p_str), float(s_str)
+                if s == 0:
+                    d.pop(p, None)
+                else:
+                    d[p] = s
+            return sorted([[p, s] for p, s in d.items()],
+                          key=lambda x: -x[0] if descending else x[0])[:OB_DEPTH]
+
+        if bids:
+            self.bids = _merge(self.bids, bids, descending=True)
+        if asks:
+            self.asks = _merge(self.asks, asks, descending=False)
+        self.ts = time.monotonic()
+
+    def metrics(self) -> Optional[dict]:
+        """Retorna métricas de microestructura o None si no hay datos."""
+        if not self.bids or not self.asks:
+            return None
+        best_bid = self.bids[0][0]
+        best_ask = self.asks[0][0]
+        mid      = (best_bid + best_ask) / 2.0
+        spread_pct = (best_ask - best_bid) / mid * 100 if mid > 0 else 0.0
+
+        # Imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
+        # Rango: -1 (presión vendedora) a +1 (presión compradora)
+        bid_vol = sum(s for _, s in self.bids[:5])
+        ask_vol = sum(s for _, s in self.asks[:5])
+        total   = bid_vol + ask_vol
+        imbalance = (bid_vol - ask_vol) / total if total > 0 else 0.0
+
+        return {
+            "bid":        best_bid,
+            "ask":        best_ask,
+            "mid":        mid,
+            "spread_pct": round(spread_pct, 4),
+            "imbalance":  round(imbalance, 4),
+            "bid_vol":    round(bid_vol, 4),
+            "ask_vol":    round(ask_vol, 4),
+            "age":        round(time.monotonic() - self.ts, 2),
+        }
+
+
+# ── Caché por símbolo ─────────────────────────────────────────────────────────
+
+class _SymbolCache:
+    """Caché completa de un símbolo: precio, candles, OB y funding."""
+
+    def __init__(self):
+        self.price:        Optional[float] = None
+        self.price_ts:     float = 0.0
+        self.candles:      Dict[str, deque] = {tf: deque(maxlen=OHLCV_LIMIT) for tf in TF_MAP}
+        self.candle_ts:    Dict[str, float] = {tf: 0.0 for tf in TF_MAP}
+        self.ob:           _OrderBookCache  = _OrderBookCache()
+        self.funding_rate: Optional[float]  = None
+        self.funding_ts:   float = 0.0
 
     def update_price(self, last: float):
         self.price    = last
         self.price_ts = time.monotonic()
 
     def update_candle(self, tf: str, candle: list):
-        """
-        candle: [ts_ms_str, open, high, low, close, volume, ...]
-        Bitget envía la vela actual (puede estar incompleta) con el campo
-        'confirm' = 0 (en curso) o 1 (cerrada).
-        Reemplazamos la última vela si tiene el mismo ts, o añadimos si es nueva.
-        """
         if tf not in self.candles:
             return
         try:
@@ -79,14 +150,16 @@ class _SymbolCache:
                    float(candle[3]), float(candle[4]), float(candle[5])]
         except (IndexError, ValueError):
             return
-
         dq = self.candles[tf]
         if dq and dq[-1][0] == ts:
-            dq[-1] = row          # actualizar vela actual en curso
+            dq[-1] = row
         else:
-            dq.append(row)        # vela nueva
-
+            dq.append(row)
         self.candle_ts[tf] = time.monotonic()
+
+    def update_funding(self, rate: float):
+        self.funding_rate = rate
+        self.funding_ts   = time.monotonic()
 
     def get_ohlcv_df(self, tf: str) -> pd.DataFrame:
         dq = self.candles.get(tf)
@@ -109,39 +182,63 @@ class WSFeed:
     # ── API pública ───────────────────────────────────────────────────────────
 
     def get_price(self, symbol: str) -> Optional[float]:
-        """Retorna el último precio recibido por WS, o None si no disponible."""
         c = self._cache.get(symbol)
         return c.price if c else None
 
     def get_ohlcv(self, symbol: str, tf: str) -> pd.DataFrame:
-        """
-        Retorna DataFrame OHLCV desde caché WS.
-        Mismo formato que ccxt.fetch_ohlcv → compatible con signal_engine._analyze_tf().
-        Retorna DataFrame vacío si no hay datos suficientes.
-        """
         c = self._cache.get(symbol)
         if not c:
             return pd.DataFrame()
         return c.get_ohlcv_df(tf)
 
+    def get_orderbook_metrics(self, symbol: str) -> Optional[dict]:
+        """
+        Retorna métricas de microestructura del order book L2:
+          bid, ask, mid, spread_pct, imbalance [-1..+1], bid_vol, ask_vol, age
+        Retorna None si no hay datos de OB disponibles.
+        """
+        c = self._cache.get(symbol)
+        if not c:
+            return None
+        return c.ob.metrics()
+
+    def get_funding_rate(self, symbol: str) -> Optional[float]:
+        """
+        Retorna el funding rate actual del perp (ej: 0.0001 = 0.01%),
+        o None si no hay datos WS disponibles aún.
+        Positivo → longs pagan → mercado sobrecargado de longs.
+        Negativo → shorts pagan → mercado sobrecargado de shorts.
+        """
+        c = self._cache.get(symbol)
+        if not c or c.funding_rate is None:
+            return None
+        # Caducar funding si tiene más de 10 minutos (se actualiza cada ~8h)
+        if time.monotonic() - c.funding_ts > 600:
+            return None
+        return c.funding_rate
+
     def has_data(self, symbol: str, tf: str = "15m", min_candles: int = 55) -> bool:
-        """True si hay suficientes candles para el signal engine."""
         c = self._cache.get(symbol)
         if not c:
             return False
         return len(c.candles.get(tf, [])) >= min_candles
 
     def is_price_fresh(self, symbol: str, max_age: float = 10.0) -> bool:
-        """True si el precio fue actualizado hace menos de max_age segundos."""
         c = self._cache.get(symbol)
         if not c or c.price is None:
             return False
         return (time.monotonic() - c.price_ts) < max_age
 
+    def has_orderbook(self, symbol: str, max_age: float = 5.0) -> bool:
+        """True si el OB tiene datos recientes."""
+        c = self._cache.get(symbol)
+        if not c or not c.ob.bids:
+            return False
+        return (time.monotonic() - c.ob.ts) < max_age
+
     # ── Control del feed ─────────────────────────────────────────────────────
 
     def start(self, symbols: List[str]):
-        """Arranca el feed WS para la lista de símbolos (formato Bitget: BTCUSDT)."""
         self._symbols = list(symbols)
         for sym in self._symbols:
             if sym not in self._cache:
@@ -151,7 +248,6 @@ class WSFeed:
         log.info(f"[WSFeed] Iniciado para {len(self._symbols)} símbolos")
 
     def update_symbols(self, symbols: List[str]):
-        """Añade nuevos símbolos al feed (los existentes siguen activos)."""
         new = [s for s in symbols if s not in self._cache]
         if new:
             for sym in new:
@@ -211,32 +307,27 @@ class WSFeed:
                     ping_task.cancel()
 
     async def _subscribe(self, ws):
-        """Envía las suscripciones de ticker y candles para todos los símbolos."""
+        """Envía las suscripciones de ticker, candles, OB y funding para todos los símbolos."""
         args = []
         for sym in self._symbols:
             # Ticker
-            args.append({
-                "instType": "USDT-FUTURES",
-                "channel":  "ticker",
-                "instId":   sym,
-            })
-            # Candles 15m / 1h / 4h
+            args.append({"instType": "USDT-FUTURES", "channel": "ticker",       "instId": sym})
+            # Candles
             for tf_key in TF_MAP.values():
-                args.append({
-                    "instType": "USDT-FUTURES",
-                    "channel":  tf_key,
-                    "instId":   sym,
-                })
+                args.append({"instType": "USDT-FUTURES", "channel": tf_key,     "instId": sym})
+            # Order Book L2 (books1 = top-of-book actualizado tick a tick)
+            args.append({"instType": "USDT-FUTURES", "channel": "books",        "instId": sym})
+            # Funding Rate
+            args.append({"instType": "USDT-FUTURES", "channel": "funding-rate", "instId": sym})
 
-        # Bitget acepta hasta 100 args por mensaje de suscripción
+        # Bitget acepta hasta 100 args por batch
         for i in range(0, len(args), 100):
-            batch = args[i:i + 100]
+            batch   = args[i:i + 100]
             payload = json.dumps({"op": "subscribe", "args": batch})
             await ws.send_str(payload)
             log.debug(f"[WSFeed] Suscrito batch {i//100 + 1} ({len(batch)} canales)")
 
     async def _ping_loop(self, ws):
-        """Mantiene la conexión viva enviando 'ping' cada PING_INTERVAL s."""
         while self._running:
             await asyncio.sleep(PING_INTERVAL)
             try:
@@ -254,13 +345,12 @@ class WSFeed:
         except json.JSONDecodeError:
             return
 
-        # Confirmación de suscripción
         if msg.get("event") in ("subscribe", "error"):
             if msg.get("event") == "error":
                 log.warning(f"[WSFeed] Suscripción error: {msg}")
             return
 
-        action  = msg.get("action")           # "snapshot" o "update"
+        action  = msg.get("action")
         arg     = msg.get("arg", {})
         channel = arg.get("channel", "")
         inst_id = arg.get("instId", "")
@@ -275,17 +365,16 @@ class WSFeed:
             self._handle_ticker(cache, data)
 
         elif channel in TF_MAP.values():
-            # Invertir TF_MAP: "candle15m" → "15m"
             tf = next((k for k, v in TF_MAP.items() if v == channel), None)
             if tf:
-                if action == "snapshot":
-                    # Snapshot: lista de velas históricas (más antiguas primero)
-                    for candle in data:
-                        cache.update_candle(tf, candle)
-                else:
-                    # Update: vela actual (puede ser incompleta)
-                    for candle in data:
-                        cache.update_candle(tf, candle)
+                for candle in data:
+                    cache.update_candle(tf, candle)
+
+        elif channel == "books":
+            self._handle_orderbook(cache, action, data)
+
+        elif channel == "funding-rate":
+            self._handle_funding(cache, data)
 
     def _handle_ticker(self, cache: _SymbolCache, data: list):
         try:
@@ -295,6 +384,40 @@ class WSFeed:
                 cache.update_price(last)
         except (IndexError, KeyError, ValueError, TypeError):
             pass
+
+    def _handle_orderbook(self, cache: _SymbolCache, action: str, data: list):
+        """
+        Procesa snapshot y deltas del canal books.
+        Formato Bitget:
+          data[0] = {"asks": [[precio, size], ...], "bids": [[precio, size], ...], "ts": ...}
+        """
+        try:
+            item = data[0] if isinstance(data, list) else data
+            bids = item.get("bids", [])
+            asks = item.get("asks", [])
+            if action == "snapshot":
+                cache.ob.apply_snapshot(bids, asks)
+            else:
+                cache.ob.apply_delta(bids, asks)
+        except (IndexError, KeyError, ValueError, TypeError) as e:
+            log.debug(f"[WSFeed] OB parse error: {e}")
+
+    def _handle_funding(self, cache: _SymbolCache, data: list):
+        """
+        Procesa funding rate del canal funding-rate.
+        Formato Bitget: data[0] = {"fundingRate": "0.0001", "nextFundingTime": ...}
+        """
+        try:
+            item = data[0] if isinstance(data, list) else data
+            rate = float(
+                item.get("fundingRate") or
+                item.get("fundingrate") or
+                item.get("currentFundingRate") or 0
+            )
+            cache.update_funding(rate)
+            log.debug(f"[WSFeed] Funding update: {rate:.6f}")
+        except (IndexError, KeyError, ValueError, TypeError) as e:
+            log.debug(f"[WSFeed] Funding parse error: {e}")
 
 
 # ── Instancia global ──────────────────────────────────────────────────────────
