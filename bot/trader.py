@@ -58,9 +58,9 @@ _min_qty_cache: dict = {}
 # Si falla, se reintenta en el próximo ciclo sin bloquear.
 # ─────────────────────────────────────────────────────────────
 _BALANCE_CACHE_TTL  = int(os.getenv("BALANCE_CACHE_TTL", "30"))   # segundos
-_balance_cache_value: float = 0.0
-_balance_cache_ts:    float = 0.0   # solo se actualiza en éxito
-_balance_fetch_lock:  asyncio.Lock = None  # lazy-init
+_balance_cache_value: float | None = None   # None = nunca obtenido con éxito
+_balance_cache_ts:    float = 0.0           # solo se actualiza en éxito
+_balance_fetch_lock:  asyncio.Lock = None   # lazy-init
 
 
 def _get_balance_lock() -> asyncio.Lock:
@@ -84,12 +84,16 @@ async def _safe_json(response) -> dict:
     return data
 
 
-async def _fetch_balance_once(api_key, api_secret, passphrase) -> float:
+async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
     """
     Llama a la API de Bitget y devuelve el balance USDT disponible.
     Actualiza el caché global SOLO si la llamada tiene éxito.
-    Si falla, deja _balance_cache_ts intacto (= 0 la primera vez)
-    para que el próximo ciclo vuelva a intentarlo.
+
+    Retorna:
+      - float  : balance real obtenido de la API
+      - None   : ambas APIs fallaron — el caller debe tratar como 'desconocido'
+
+    NUNCA devuelve 0.0 para indicar fallo (0.0 significa cuenta vacía real).
     """
     global _balance_cache_value, _balance_cache_ts
 
@@ -169,31 +173,48 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float:
     # NO actualizamos _balance_cache_ts → el próximo ciclo reintentará
     logger.error(
         "[BalanceCache] 🚨 Ambos endpoints fallaron — balance NO actualizado. "
-        f"Valor en caché: {_balance_cache_value:.2f} USDT. "
+        f"Valor en caché: {_balance_cache_value}. "
         "Se reintentará en el próximo ciclo."
     )
-    return _balance_cache_value  # devuelve último conocido (0 si nunca se obtuvo)
+    # Retornar None para indicar fallo, NO 0.0 (que significaría cuenta vacía real)
+    return None
 
 
-async def get_cached_balance(api_key, api_secret, passphrase) -> float:
+async def get_cached_balance(api_key, api_secret, passphrase) -> float | None:
     """
     Devuelve el balance USDT desde caché global.
     Solo llama a la API si han pasado más de BALANCE_CACHE_TTL segundos
-    desde la ÚLTIMA LLAMADA EXITOSA. Si la última llamada falló,
-    _balance_cache_ts no se actualizó → siempre reintenta hasta obtener éxito.
+    desde la ÚLTIMA LLAMADA EXITOSA.
+
+    Retorna:
+      - float  : balance conocido (puede ser 0.0 si cuenta vacía)
+      - None   : API nunca respondió con éxito o caché expiró y fallo nuevo
+
+    El caller (trader.py) debe tratar None como 'balance desconocido',
+    NO como 'balance = 0'.
     """
     global _balance_cache_value, _balance_cache_ts
     lock = _get_balance_lock()
     now  = time.monotonic()
 
-    if now - _balance_cache_ts < _BALANCE_CACHE_TTL:
+    if _balance_cache_value is not None and now - _balance_cache_ts < _BALANCE_CACHE_TTL:
         return _balance_cache_value
 
     async with lock:
         now = time.monotonic()
-        if now - _balance_cache_ts < _BALANCE_CACHE_TTL:
+        if _balance_cache_value is not None and now - _balance_cache_ts < _BALANCE_CACHE_TTL:
             return _balance_cache_value
-        return await _fetch_balance_once(api_key, api_secret, passphrase)
+        result = await _fetch_balance_once(api_key, api_secret, passphrase)
+        if result is None:
+            # API falló — devolver caché anterior si existe, o None si nunca hubo éxito
+            if _balance_cache_value is not None:
+                logger.warning(
+                    f"[BalanceCache] ⚠️ API falló, usando caché anterior: "
+                    f"{_balance_cache_value:.2f} USDT"
+                )
+                return _balance_cache_value
+            return None
+        return result
 
 
 class FuturesTrader:
@@ -368,8 +389,12 @@ class FuturesTrader:
         ticker = await self.exchange.fetch_ticker(self.symbol)
         return float(ticker["last"])
 
-    async def get_balance(self) -> float:
-        """Retorna el balance USDT desde caché global (máx 1 llamada HTTP cada 30s)."""
+    async def get_balance(self) -> float | None:
+        """
+        Retorna el balance USDT desde caché global.
+        Puede retornar None si la API nunca respondió con éxito.
+        El caller debe tratar None como 'balance desconocido', no como 0.
+        """
         return await get_cached_balance(self._api_key, self._api_secret, self._passphrase)
 
     async def fetch_ohlcv(self, timeframe="15m", limit=100):
@@ -1226,8 +1251,8 @@ class FuturesTrader:
                         if global_risk:
                             await global_risk.register_open()
                     else:
-                        logger.info(
-                            f"[{self.symbol}] ⛔ "
+                        logger.warning(
+                            f"[{self.symbol}] ⛔ Trade bloqueado: "
                             f"{r1 if not can_l else r2}"
                         )
 
@@ -1252,8 +1277,8 @@ class FuturesTrader:
                         if global_risk:
                             await global_risk.register_open()
                     else:
-                        logger.info(
-                            f"[{self.symbol}] ⛔ "
+                        logger.warning(
+                            f"[{self.symbol}] ⛔ Trade bloqueado: "
                             f"{r1 if not can_l else r2}"
                         )
 

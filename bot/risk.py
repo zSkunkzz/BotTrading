@@ -1,4 +1,5 @@
 import logging
+import os
 
 logger = logging.getLogger("Risk")
 
@@ -22,16 +23,38 @@ class RiskManager:
         self.peak_pnl                = 0.0
 
     def can_open_trade(self, balance):
+        """
+        balance puede ser:
+          - float > 0  : balance real conocido
+          - 0.0        : balance real cero (cuenta vacía)
+          - None       : API falló, balance desconocido
+
+        Si es None, operamos con usdt_per_trade como estimación conservadora
+        (el trade podría fallar al ejecutarse, pero no bloqueamos preventivamente).
+        """
         if self.open_trades >= self.max_open_trades:
             return False, f"Max trades ({self.max_open_trades}) alcanzado"
-        # Comparar daily_pnl contra umbral negativo correcto
+
         if self.daily_pnl <= -self.max_daily_loss_pct:
             return False, (
                 f"Daily loss limit -{self.max_daily_loss_pct}% alcanzado "
                 f"(actual: {self.daily_pnl:.2f}%)"
             )
+
+        if balance is None:
+            # API de balance no disponible — permitir con warning
+            logger.warning(
+                "[Risk] ⚠️ Balance desconocido (API falló) — "
+                f"asumiendo ≥ {self.usdt_per_trade:.2f} USDT para continuar"
+            )
+            return True, "OK (balance desconocido)"
+
         if balance < self.usdt_per_trade:
-            return False, f"Balance insuficiente: {balance:.2f} USDT"
+            return False, (
+                f"Balance insuficiente: {balance:.2f} USDT "
+                f"(necesario: {self.usdt_per_trade:.2f} USDT)"
+            )
+
         return True, "OK"
 
     def on_trade_open(self, entry_price, side):
