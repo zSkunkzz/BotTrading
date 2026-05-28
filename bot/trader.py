@@ -499,28 +499,58 @@ class FuturesTrader:
         return []
 
     # ─────────────────────────────────────────────────────────────
-    # INIT
+    # INIT — con validación de estado vs exchange real
     # ─────────────────────────────────────────────────────────────
 
     async def _init(self, usdt_amount: float):
         await self.exchange.load_markets()
         saved = load_position(self.symbol)
         if saved:
-            self.position    = saved["position"]
-            self.entry_price = saved["entry_price"]
-            self.sl          = saved.get("sl")
-            self.tp1         = saved.get("tp1")
-            self.tp2         = saved.get("tp2")
-            self.tp3         = saved.get("tp3")
-            self.tp2_hit     = saved.get("tp2_hit", False)
-            self.usdt_amount = saved.get("usdt_amount", usdt_amount)
-            logger.warning(
-                f"[{self.symbol}] ♻️  Estado recuperado: "
-                f"{self.position} @ {self.entry_price} | "
-                f"SL={self.sl} TP1={self.tp1} TP2={self.tp2} TP3={self.tp3}"
-            )
+            # Restaurar api_version y ua_pos_mode si fueron guardados
+            if saved.get("api_version"):
+                self._api_version = saved["api_version"]
+                logger.info(
+                    f"[{self.symbol}] 📌 API version restaurada: {self._api_version}"
+                )
+            if saved.get("ua_pos_mode"):
+                self._ua_pos_mode = saved["ua_pos_mode"]
+
+            # ── Validar contra el exchange que la posición realmente existe ──
+            real_positions = []
+            try:
+                real_positions = await self._get_positions()
+            except Exception as e:
+                logger.warning(
+                    f"[{self.symbol}] No se pudo verificar posición real: {e}"
+                )
+
+            if not real_positions:
+                # Estado guardado pero Bitget no muestra posición abierta → stale
+                logger.warning(
+                    f"[{self.symbol}] 🧹 Estado guardado ({saved.get('position')} "
+                    f"@ {saved.get('entry_price')}) pero Bitget no tiene posición "
+                    f"abierta → limpiando estado stale"
+                )
+                clear_position(self.symbol)
+                self.usdt_amount = usdt_amount
+            else:
+                # Posición confirmada en Bitget → restaurar
+                self.position    = saved["position"]
+                self.entry_price = saved["entry_price"]
+                self.sl          = saved.get("sl")
+                self.tp1         = saved.get("tp1")
+                self.tp2         = saved.get("tp2")
+                self.tp3         = saved.get("tp3")
+                self.tp2_hit     = saved.get("tp2_hit", False)
+                self.usdt_amount = saved.get("usdt_amount", usdt_amount)
+                logger.warning(
+                    f"[{self.symbol}] ♻️  Estado recuperado (confirmado en exchange): "
+                    f"{self.position} @ {self.entry_price} | "
+                    f"SL={self.sl} TP1={self.tp1} TP2={self.tp2} TP3={self.tp3}"
+                )
         else:
             self.usdt_amount = usdt_amount
+
         mode = "🧪 DRY" if self.dry_run else "💰 REAL"
         logger.info(f"✅ [{self.symbol}] Listo | x{self.leverage} | "
                     f"{self.margin_mode.upper()} | {mode}")
@@ -635,7 +665,9 @@ class FuturesTrader:
         self.trade_count += 1
         save_position(
             self.symbol, self.position, self.entry_price,
-            sl, tp1, tp2, tp3, usdt_amount, self.leverage
+            sl, tp1, tp2, tp3, usdt_amount, self.leverage,
+            api_version=self._api_version,
+            ua_pos_mode=self._ua_pos_mode,
         )
         logger.warning(
             f"📈 [{self.symbol}] LONG @ {self.entry_price} | "
@@ -656,7 +688,9 @@ class FuturesTrader:
         self.trade_count += 1
         save_position(
             self.symbol, self.position, self.entry_price,
-            sl, tp1, tp2, tp3, usdt_amount, self.leverage
+            sl, tp1, tp2, tp3, usdt_amount, self.leverage,
+            api_version=self._api_version,
+            ua_pos_mode=self._ua_pos_mode,
         )
         logger.warning(
             f"📉 [{self.symbol}] SHORT @ {self.entry_price} | "
