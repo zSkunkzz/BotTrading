@@ -49,6 +49,112 @@ _MIN_QTY_FALLBACK = {
 # Cache de min_qty leídos desde API (sym → float)
 _min_qty_cache: dict = {}
 
+# ─────────────────────────────────────────────────────────────
+# CACHÉ GLOBAL DE BALANCE (compartido por todos los traders)
+# Evita N llamadas HTTP simultáneas a Bitget — una sola cada 30s
+# ─────────────────────────────────────────────────────────────
+_BALANCE_CACHE_TTL = int(os.getenv("BALANCE_CACHE_TTL", "30"))  # segundos
+_balance_cache_value: float = 0.0
+_balance_cache_ts: float = 0.0
+_balance_cache_lock: asyncio.Lock = None  # se inicializa en el primer uso
+
+
+def _get_balance_lock() -> asyncio.Lock:
+    """Lazy-init del lock para ser compatible con el event loop de asyncio."""
+    global _balance_cache_lock
+    if _balance_cache_lock is None:
+        _balance_cache_lock = asyncio.Lock()
+    return _balance_cache_lock
+
+
+async def _fetch_balance_once(api_key, api_secret, passphrase) -> float:
+    """Hace la llamada real a Bitget y actualiza el caché global."""
+    global _balance_cache_value, _balance_cache_ts
+
+    def _sign(ts, method, path_with_qs, body=""):
+        msg = ts + method.upper() + path_with_qs + body
+        return base64.b64encode(
+            hmac.new(api_secret.encode(), msg.encode(), hashlib.sha256).digest()
+        ).decode()
+
+    def _headers(method, path_with_qs, body=""):
+        ts = str(int(time.time() * 1000))
+        return {
+            "ACCESS-KEY":        api_key,
+            "ACCESS-SIGN":       _sign(ts, method, path_with_qs, body),
+            "ACCESS-TIMESTAMP":  ts,
+            "ACCESS-PASSPHRASE": passphrase,
+            "Content-Type":      "application/json",
+            "locale":            "en-US",
+        }
+
+    # Intentar v3 (Unified Account)
+    try:
+        path = "/api/v3/account/assets"
+        qs = "?coin=USDT"
+        headers = _headers("GET", path + qs)
+        url = "https://api.bitget.com" + path + qs
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+        if data.get("code") == "00000":
+            for item in (data.get("data") or []):
+                if item.get("coin") == "USDT":
+                    bal = float(item.get("available", 0) or item.get("crossMaxAvailable", 0))
+                    _balance_cache_value = bal
+                    _balance_cache_ts = time.monotonic()
+                    logger.info(f"[BalanceCache] ✅ Balance USDT (v3): {bal:.2f}")
+                    return bal
+    except Exception as e:
+        logger.debug(f"[BalanceCache] v3 error: {e}")
+
+    # Fallback v2
+    try:
+        path = "/api/v2/mix/account/accounts"
+        qs = "?productType=USDT-FUTURES"
+        headers = _headers("GET", path + qs)
+        url = "https://api.bitget.com" + path + qs
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+        if data.get("code") == "00000":
+            items = data.get("data") or []
+            if items:
+                bal = float(items[0].get("available", 0))
+                _balance_cache_value = bal
+                _balance_cache_ts = time.monotonic()
+                logger.info(f"[BalanceCache] ✅ Balance USDT (v2): {bal:.2f}")
+                return bal
+    except Exception as e:
+        logger.debug(f"[BalanceCache] v2 error: {e}")
+
+    logger.warning("[BalanceCache] ⚠️ No se pudo obtener balance — manteniendo caché anterior")
+    # Devolver el último valor conocido (no sobreescribir con 0)
+    return _balance_cache_value
+
+
+async def get_cached_balance(api_key, api_secret, passphrase) -> float:
+    """
+    Devuelve el balance USDT disponible desde caché global.
+    Solo llama a la API si han pasado más de BALANCE_CACHE_TTL segundos
+    desde la última lectura exitosa. Todos los traders comparten este valor.
+    """
+    global _balance_cache_value, _balance_cache_ts
+    lock = _get_balance_lock()
+    now = time.monotonic()
+
+    if now - _balance_cache_ts < _BALANCE_CACHE_TTL:
+        return _balance_cache_value
+
+    async with lock:
+        # Double-check dentro del lock para evitar llamadas concurrentes
+        now = time.monotonic()
+        if now - _balance_cache_ts < _BALANCE_CACHE_TTL:
+            return _balance_cache_value
+        return await _fetch_balance_once(api_key, api_secret, passphrase)
+
 
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
@@ -221,37 +327,8 @@ class FuturesTrader:
         return float(ticker["last"])
 
     async def get_balance(self) -> float:
-        """Retorna el balance USDT disponible."""
-        try:
-            r = await self._http_get("/api/v3/account/assets", {"coin": "USDT"})
-            if r.get("code") == "00000":
-                data = r.get("data") or []
-                for item in data:
-                    if item.get("coin") == "USDT":
-                        bal = float(item.get("available", 0) or item.get("crossMaxAvailable", 0))
-                        logger.info(f"[{self.symbol}] ✅ Balance USDT (v3/assets): {bal}")
-                        return bal
-        except Exception:
-            pass
-
-        try:
-            sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
-            r = await self._http_get(
-                "/api/v2/mix/account/account",
-                {"symbol": sym_clean,
-                 "productType": "USDT-FUTURES",
-                 "marginCoin": "USDT"}
-            )
-            if r.get("code") == "00000":
-                d = r.get("data", {})
-                bal = float(d.get("available", 0))
-                logger.info(f"[{self.symbol}] ✅ Balance USDT (v2): {bal}")
-                return bal
-        except Exception:
-            pass
-
-        logger.warning(f"[{self.symbol}] ⚠️ No se pudo obtener balance, retornando 0")
-        return 0.0
+        """Retorna el balance USDT desde caché global (máx 1 llamada HTTP cada 30s)."""
+        return await get_cached_balance(self._api_key, self._api_secret, self._passphrase)
 
     async def fetch_ohlcv(self, timeframe="15m", limit=100):
         return await self.exchange.fetch_ohlcv(self.symbol, timeframe, limit=limit)
