@@ -1029,10 +1029,10 @@ class FuturesTrader:
                 )
                 if size > 0:
                     partial_qty = round(size * ratio, 4)
-                    # Soportar holdSide, positionSide y side (UA)
+                    # FIX: incluir posSide para Unified Account (UA)
                     hs = (
-                        str(p.get("holdSide") or p.get("positionSide")
-                            or p.get("side") or "").lower()
+                        str(p.get("holdSide") or p.get("posSide")
+                            or p.get("positionSide") or p.get("side") or "").lower()
                     )
                     ps = "long" if hs in ("long", "buy") else "short"
                     await self._close_order(ps, partial_qty)
@@ -1228,9 +1228,10 @@ class FuturesTrader:
                         p.get("total") or p.get("contracts") or
                         p.get("size", 0)
                     )
+                    # FIX: incluir posSide para Unified Account (UA)
                     hs = (
-                        str(p.get("holdSide") or p.get("positionSide")
-                            or p.get("side") or "").lower()
+                        str(p.get("holdSide") or p.get("posSide")
+                            or p.get("positionSide") or p.get("side") or "").lower()
                     )
                     if size > 0:
                         ps = "long" if hs in ("long", "buy") else "short"
