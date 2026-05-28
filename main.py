@@ -41,7 +41,7 @@ def make_risk():
 async def _start_single_pair(symbol: str):
     if symbol in active_traders:
         return
-    logger.info(f"🚀 Iniciando trader: {symbol}")
+    logger.info(f"\U0001f680 Iniciando trader: {symbol}")
     trader = FuturesTrader(
         api_key=os.getenv("BITGET_API_KEY"),
         api_secret=os.getenv("BITGET_API_SECRET"),
@@ -72,7 +72,7 @@ async def stop_pair(symbol: str):
     _trader_instances.pop(symbol, None)
     register_traders(_trader_instances)
     task.cancel()
-    logger.info(f"⏹ Trader detenido: {symbol}")
+    logger.info(f"\u23f9 Trader detenido: {symbol}")
 
 
 async def on_pairs_updated(new_pairs: list):
@@ -88,18 +88,21 @@ async def on_pairs_updated(new_pairs: list):
         await stop_pair(sym)
 
     await notify_scanner_update(added, removed, len(active_traders))
-    logger.info(f"📊 Traders activos: {len(active_traders)}")
+    logger.info(f"\U0001f4ca Traders activos: {len(active_traders)}")
 
 
 async def main():
     global global_risk
 
     logger.info("=" * 60)
-    logger.info("  BitgetProBot v5.3 — IA + Scanner + Telegram + Webhook")
+    logger.info("  BitgetProBot v5.3 \u2014 IA + Scanner + Telegram + Webhook")
     logger.info("=" * 60)
 
+    # FIX: MAX_CONCURRENT_TRADES default subido a 5 (antes 3).
+    # Con 15 pares activos y señales fuertes simultáneas, 3 bloqueaba
+    # trades válidos de score 8-9/10. Ajusta vía env var si necesitas más.
     global_risk = GlobalRisk(
-        max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "3")),
+        max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "5")),
         max_global_daily_loss_pct=float(
             os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")
         ),
@@ -118,7 +121,7 @@ async def main():
         refresh_interval_min=int(os.getenv("SCANNER_REFRESH_MIN", "30")),
     )
 
-    logger.info("🔍 Escaneando mercado inicial...")
+    logger.info("\U0001f50d Escaneando mercado inicial...")
     initial_pairs = await scanner.scan()
 
     scored_data = []
@@ -136,7 +139,7 @@ async def main():
         except Exception:
             pass
 
-    logger.info("🤖 Filtrando con IA...")
+    logger.info("\U0001f916 Filtrando con IA...")
     ai_ranked = await ai_rank_pairs(scored_data)
     top_n = int(os.getenv("TOP_PAIRS", "15"))
 
@@ -152,12 +155,12 @@ async def main():
     # Fallback: si IA devolvió lista vacía usar el scan inicial directamente
     if not final_pairs:
         logger.warning(
-            "⚠️ ai_rank_pairs devolvió lista vacía — "
+            "\u26a0\ufe0f ai_rank_pairs devolvió lista vacía — "
             "usando pares del scanner directamente"
         )
         final_pairs = initial_pairs[:top_n]
 
-    logger.info(f"✅ Pares finales ({len(final_pairs)}): {', '.join(final_pairs)}")
+    logger.info(f"\u2705 Pares finales ({len(final_pairs)}): {', '.join(final_pairs)}")
 
     await start_traders_staggered(final_pairs, _start_single_pair, delay=2.0)
 

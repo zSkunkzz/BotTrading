@@ -34,6 +34,7 @@ _MIN_QTY_FALLBACK = {
     "NEARUSDT":  0.1,
     "XLMUSDT":   1.0,
     "XAUUSDT":   0.01,
+    "XAUTUSDT":  0.001,   # FIX: min qty para XAU Token (≠ XAUUSDT perpetuo)
     "XAGUSDT":   0.1,
     "HYPEUSDT":  0.1,
     "FILOUSDT":  0.1,
@@ -43,6 +44,7 @@ _MIN_QTY_FALLBACK = {
     "WLDUSDT":   0.1,
     "BEATUSDT":  1.0,
     "BZUSDT":    1.0,
+    "XRPUSDT":   1.0,
 }
 
 # Cache de min_qty leídos desde API (sym → float)
@@ -265,18 +267,15 @@ class FuturesTrader:
         return fb
 
     # ─────────────────────────────────────────────────────────────
-    # SET LEVERAGE DINÁMICO — aplica el leverage del signal en Bitget
-    # FIX: hard-cap con MAX_LEVERAGE (default 15x),
-    #      warning detallado cuando falla, retorna leverage efectivo.
+    # SET LEVERAGE DINÁMICO
     # ─────────────────────────────────────────────────────────────
 
     async def _set_leverage_on_exchange(self, leverage: int) -> int:
         """
         Fija el leverage para el par en Bitget antes de abrir una posición.
         Actualiza self.leverage si tiene éxito.
-        Retorna el leverage efectivo (el solicitado si OK, self.leverage si falla).
+        Retorna el leverage efectivo.
         """
-        # Hard-cap: nunca superar MAX_LEVERAGE (default 15x)
         max_lev = int(os.getenv("MAX_LEVERAGE", "15"))
         leverage = min(leverage, max_lev)
         if self.dry_run:
@@ -296,7 +295,6 @@ class FuturesTrader:
             }
             r_v3 = await self._http_post("/api/v3/account/set-leverage", payload_v3)
             if r_v3.get("code") == "00000":
-                # Algunas cuentas UA requieren fijar long/short por separado
                 for hold in ("long", "short"):
                     payload_v3_s = {**payload_v3, "holdSide": hold}
                     await self._http_post("/api/v3/account/set-leverage", payload_v3_s)
@@ -334,18 +332,23 @@ class FuturesTrader:
             f"en v3 y v2. "
             f"qty se calculará con self.leverage={self.leverage}x (cuenta)"
         )
-        return self.leverage  # retorna el leverage actual, no el solicitado
+        return self.leverage
 
     # ─────────────────────────────────────────────────────────────
     # POSICIONES ABIERTAS EN BITGET
+    # FIX: nunca usa ccxt (que lanza 40085 en Unified Account).
+    #      Solo HTTP directo v3 → v2. Si ambos fallan con excepción,
+    #      retorna None para distinguir "error" de "sin posición".
     # ─────────────────────────────────────────────────────────────
 
-    async def _get_positions(self) -> list:
+    async def _get_positions(self) -> list | None:
         """
         Retorna la lista de posiciones abiertas para self.symbol.
-        Intenta v3 (UA) primero, luego v2 clásica.
+        Retorna None si no se pudo consultar (error de red/API).
+        Retorna [] si la consulta fue exitosa pero no hay posición abierta.
         """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        last_error = None
 
         # ── v3 Unified Account ──
         if self._api_version in ("ua", None):
@@ -363,9 +366,10 @@ class FuturesTrader:
                         if float(p.get("total") or p.get("contracts") or
                                  p.get("size", 0)) > 0
                     ]
-                    if open_pos or self._api_version == "ua":
-                        return open_pos
+                    return open_pos  # lista vacía = sin posición (confirmado)
+                last_error = r.get("msg", "unknown v3 error")
             except Exception as e:
+                last_error = str(e)
                 logger.debug(f"[{self.symbol}] v3 positions error: {e}")
 
         # ── v2 Classic Account ──
@@ -383,10 +387,17 @@ class FuturesTrader:
                     if float(p.get("total") or p.get("contracts") or
                              p.get("size", 0)) > 0
                 ]
+            last_error = r.get("msg", "unknown v2 error")
         except Exception as e:
+            last_error = str(e)
             logger.debug(f"[{self.symbol}] v2 positions error: {e}")
 
-        return []
+        # Ambos endpoints fallaron → no podemos confirmar ni desmentir
+        logger.warning(
+            f"[{self.symbol}] ⚠️ _get_positions: ambos endpoints fallaron "
+            f"({last_error}) — retornando None (estado local preservado)"
+        )
+        return None
 
     # ─────────────────────────────────────────────────────────────
     # COLOCAR / CERRAR ÓRDENES
@@ -566,19 +577,33 @@ class FuturesTrader:
                 self._ua_pos_mode = saved["ua_pos_mode"]
 
             # ── Validar contra el exchange que la posición realmente existe ──
-            real_positions = []
-            try:
-                real_positions = await self._get_positions()
-            except Exception as e:
-                logger.warning(
-                    f"[{self.symbol}] No se pudo verificar posición real: {e}"
-                )
+            # FIX: _get_positions ahora retorna None si falló la consulta.
+            #      Solo limpiamos el estado si la respuesta es [] confirmada.
+            #      Si es None (error), conservamos el estado local para seguridad.
+            real_positions = await self._get_positions()
 
-            if not real_positions:
-                # Estado guardado pero Bitget no muestra posición abierta → stale
+            if real_positions is None:
+                # No se pudo verificar — conservar estado local por seguridad
+                logger.warning(
+                    f"[{self.symbol}] ⚠️ No se pudo verificar posición en exchange "
+                    f"— conservando estado local ({saved.get('position')} "
+                    f"@ {saved.get('entry_price')})"
+                )
+                self.position    = saved["position"]
+                self.entry_price = saved["entry_price"]
+                self.sl          = saved.get("sl")
+                self.tp1         = saved.get("tp1")
+                self.tp2         = saved.get("tp2")
+                self.tp3         = saved.get("tp3")
+                self.tp2_hit     = saved.get("tp2_hit", False)
+                self.usdt_amount = saved.get("usdt_amount", usdt_amount)
+                if saved.get("leverage"):
+                    self.leverage = saved["leverage"]
+            elif not real_positions:
+                # Lista vacía confirmada → estado stale, limpiar
                 logger.warning(
                     f"[{self.symbol}] 🧹 Estado guardado ({saved.get('position')} "
-                    f"@ {saved.get('entry_price')}) pero Bitget no tiene posición "
+                    f"@ {saved.get('entry_price')}) pero Bitget confirma sin posición "
                     f"abierta → limpiando estado stale"
                 )
                 clear_position(self.symbol)
@@ -593,7 +618,6 @@ class FuturesTrader:
                 self.tp3         = saved.get("tp3")
                 self.tp2_hit     = saved.get("tp2_hit", False)
                 self.usdt_amount = saved.get("usdt_amount", usdt_amount)
-                # Restaurar leverage guardado si existe
                 if saved.get("leverage"):
                     self.leverage = saved["leverage"]
                 logger.warning(
@@ -613,13 +637,19 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
 
     async def _open_order(self, side: str, usdt_amount: float, leverage: int = None):
-        # FIX: _open_order ahora acepta leverage explícito para calcular
-        #      qty con el apalancamiento dinámico correcto, no self.leverage.
         price        = await self.get_price()
         effective_lev = leverage if leverage is not None else self.leverage
         qty           = round((usdt_amount * effective_lev) / price, 4)
         min_qty       = await self._get_min_qty()
         if qty < min_qty:
+            # FIX: si qty < min_qty incluso con el leverage máximo, skip el trade
+            max_lev = int(os.getenv("MAX_LEVERAGE", "15"))
+            qty_max = round((usdt_amount * max_lev) / price, 4)
+            if qty_max < min_qty:
+                raise Exception(
+                    f"qty {qty} (max con x{max_lev}: {qty_max}) "
+                    f"< min_qty {min_qty} — trade no viable con USDT_PER_TRADE actual"
+                )
             qty = min_qty
         logger.info(
             f"[{self.symbol}] qty={qty} "
@@ -634,9 +664,9 @@ class FuturesTrader:
     async def _partial_close_order(self, pos_side: str, ratio: float):
         """Cierra un porcentaje de la posición abierta."""
         positions = await self._get_positions()
-        if not positions:
+        if positions is None or not positions:
             logger.warning(
-                f"[{self.symbol}] _partial_close_order: sin posición abierta"
+                f"[{self.symbol}] _partial_close_order: sin posición abierta o error"
             )
             return
         for p in positions:
@@ -705,13 +735,10 @@ class FuturesTrader:
 
     # ─────────────────────────────────────────────────────────────
     # ABRIR POSICIONES
-    # FIX: leverage dinámico SIEMPRE llama _set_leverage_on_exchange
-    #      notify_open recibe los 6 args correctos (no sl/tp)
     # ─────────────────────────────────────────────────────────────
 
     async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None,
                         leverage: int = None):
-        # Aplicar leverage dinámico — siempre fijar en exchange si se especifica
         effective_lev = self.leverage
         if leverage:
             effective_lev = await self._set_leverage_on_exchange(leverage)
@@ -739,7 +766,6 @@ class FuturesTrader:
 
     async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None,
                          leverage: int = None):
-        # Aplicar leverage dinámico — siempre fijar en exchange si se especifica
         effective_lev = self.leverage
         if leverage:
             effective_lev = await self._set_leverage_on_exchange(leverage)
@@ -842,7 +868,9 @@ class FuturesTrader:
         return False
 
     # ─────────────────────────────────────────────────────────────
-    # CERRAR POSICIÓN — FIX: no limpiar estado si la orden falla
+    # CERRAR POSICIÓN
+    # FIX: no limpiar estado si la orden falla.
+    #      _get_positions retorna None si hubo error → no considera stale.
     # ─────────────────────────────────────────────────────────────
 
     async def close_position(self, reason=""):
@@ -853,8 +881,30 @@ class FuturesTrader:
             order_executed = False
             try:
                 positions = await self._get_positions()
-                if not positions:
-                    # No hay posición real en Bitget — estado stale, limpiar
+                if positions is None:
+                    # Error consultando — asumir posición sigue abierta, intentar cerrar igualmente
+                    logger.warning(
+                        f"[{self.symbol}] ⚠️ close_position: no se pudo consultar posición "
+                        f"en exchange — intentando cierre directo ({reason})"
+                    )
+                    # Intentar cerrar con el lado conocido localmente
+                    try:
+                        ps = self.position  # "long" o "short"
+                        # Estimar qty desde usdt_amount y precio actual
+                        estimated_qty = round(
+                            (self.usdt_amount or 5.0) * self.leverage / price, 4
+                        ) if self.usdt_amount else 1.0
+                        min_qty = await self._get_min_qty()
+                        close_qty = max(estimated_qty, min_qty)
+                        await self._close_order(ps, close_qty)
+                        order_executed = True
+                    except Exception as ce:
+                        logger.error(
+                            f"[{self.symbol}] ❌ Cierre directo también falló: {ce}"
+                        )
+                        raise ce
+                elif not positions:
+                    # Lista vacía confirmada → estado stale
                     logger.warning(
                         f"[{self.symbol}] ⚠️ close_position: no hay posición "
                         f"real en Bitget — limpiando estado stale ({reason})"
@@ -864,33 +914,31 @@ class FuturesTrader:
                     self.tp2_hit = False
                     clear_position(self.symbol)
                     return {}
-                for p in positions:
-                    size = float(
-                        p.get("total") or p.get("contracts") or
-                        p.get("size", 0)
-                    )
-                    # FIX: incluir posSide para Unified Account (UA)
-                    hs = (
-                        str(p.get("holdSide") or p.get("posSide")
-                            or p.get("positionSide") or p.get("side") or "").lower()
-                    )
-                    if size > 0:
-                        ps = "long" if hs in ("long", "buy") else "short"
-                        await self._close_order(ps, size)
-                        order_executed = True
-                        break
+                else:
+                    for p in positions:
+                        size = float(
+                            p.get("total") or p.get("contracts") or
+                            p.get("size", 0)
+                        )
+                        hs = (
+                            str(p.get("holdSide") or p.get("posSide")
+                                or p.get("positionSide") or p.get("side") or "").lower()
+                        )
+                        if size > 0:
+                            ps = "long" if hs in ("long", "buy") else "short"
+                            await self._close_order(ps, size)
+                            order_executed = True
+                            break
             except Exception as e:
                 logger.error(
                     f"[{self.symbol}] ❌ CIERRE FALLIDO en Bitget: {e} | "
                     f"Razón: {reason} — posición SIGUE ABIERTA"
                 )
-                # Notificar urgente por Telegram sin limpiar estado
                 try:
                     from bot.telegram_bot import notify_close_failed
                     await notify_close_failed(self.symbol, reason, str(e))
                 except Exception:
                     pass
-                # Re-lanzar para que el loop principal lo capture
                 raise
 
             if not order_executed:
@@ -1039,7 +1087,6 @@ class FuturesTrader:
                         )
 
                 elif action in ("BUY", "SELL") and self.position:
-                    # Señal en dirección contraria — cerrar y reabrir
                     opp = "long" if action == "SELL" else "short"
                     if self.position == opp:
                         result = await self.close_position(f"Regresión → {action}")
