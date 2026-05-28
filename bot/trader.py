@@ -123,14 +123,14 @@ def _extract_usdt_balance(item: dict) -> float | None:
 
 async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
     """
-    Intenta obtener el balance USDT usando 4 endpoints en orden.
+    Intenta obtener el balance USDT usando 5 endpoints en orden.
 
-    FIX: Endpoints v3/* eliminados — no existen en Bitget Unified Account.
-    Orden correcto para UA:
-      1. v2/account/all-account-balance  → balance unificado UA (principal)
-      2. v2/mix/account/accounts         → cuentas de futuros (lista)
-      3. v2/mix/account/account          → cuenta futuros de un símbolo concreto
-      4. v2/spot/account/assets          → activos spot (fallback)
+    Orden correcto para Unified Account (UA) de Bitget:
+      0. v2/unified/account/assets      → endpoint UA nativo (fix 40085)
+      1. v2/account/all-account-balance → balance unificado UA (fallback)
+      2. v2/mix/account/accounts        → cuentas de futuros (lista)
+      3. v2/mix/account/account         → cuenta futuros de un símbolo concreto
+      4. v2/spot/account/assets         → activos spot (último recurso)
     """
     global _balance_cache_value, _balance_cache_ts
 
@@ -157,6 +157,42 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
         _balance_cache_ts    = time.monotonic()
         logger.info(f"[BalanceCache] ✅ Balance USDT ({source}): {val:.2f}")
         return val
+
+    # ENDPOINT 0: v2/unified/account/assets (UA nativo — fix error 40085)
+    try:
+        path = "/api/v2/unified/account/assets"
+        qs   = "?coin=USDT"
+        url  = "https://api.bitget.com" + path + qs
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=_headers("GET", path + qs),
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await _safe_json(r)
+        if data.get("code") == "00000":
+            raw_data = data.get("data")
+            if isinstance(raw_data, dict):
+                items = [raw_data]
+            elif isinstance(raw_data, list):
+                items = raw_data
+            else:
+                items = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                coin = item.get("coin") or item.get("currency") or ""
+                if coin.upper() == "USDT" or not coin:
+                    bal = _extract_usdt_balance(item)
+                    if bal is not None:
+                        return _cache_and_return(bal, "v2/unified-assets")
+        else:
+            code = data.get("code")
+            if code not in ("40085", "40001"):
+                logger.warning(
+                    f"[BalanceCache] ⚠️ v2/unified-assets code={code} msg={data.get('msg')}"
+                )
+    except ValueError as e:
+        logger.warning(f"[BalanceCache] ⚠️ v2/unified-assets respuesta inesperada: {e}")
+    except Exception as e:
+        logger.warning(f"[BalanceCache] ❌ v2/unified-assets excepción: {e}")
 
     # ENDPOINT 1: v2/account/all-account-balance (UA — balance unificado)
     try:
@@ -245,7 +281,7 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
     except Exception as e:
         logger.warning(f"[BalanceCache] ❌ v2/mix-account excepción: {e}")
 
-    # ENDPOINT 4: v2/spot/account/assets (activos spot — fallback)
+    # ENDPOINT 4: v2/spot/account/assets (activos spot — último recurso)
     try:
         path = "/api/v2/spot/account/assets"
         qs   = "?coin=USDT"
@@ -282,7 +318,7 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
         logger.warning(f"[BalanceCache] ❌ v2/spot-assets excepción: {e}")
 
     logger.error(
-        f"[BalanceCache] 🚨 Los 4 endpoints fallaron — balance NO actualizado. "
+        f"[BalanceCache] 🚨 Los 5 endpoints fallaron — balance NO actualizado. "
         f"Caché actual: {_balance_cache_value}. Se reintentará en el próximo ciclo."
     )
     return None
@@ -436,15 +472,14 @@ class FuturesTrader:
         await self._detect_account_type()
 
     async def _detect_account_type(self):
-        # Probe UA usando v2/account/all-account-balance (endpoint que sí existe)
+        # Probe UA primero con endpoint nativo v2/unified/account/assets
         try:
             r = await self._http_get(
-                "/api/v2/account/all-account-balance",
+                "/api/v2/unified/account/assets",
                 {"coin": "USDT"}
             )
             if r.get("code") == "00000":
                 self._api_version = "ua"
-                # Intentar detectar pos_mode desde posiciones abiertas UA
                 try:
                     rp = await self._http_get(
                         "/api/v2/mix/position/all-position",
@@ -461,11 +496,41 @@ class FuturesTrader:
                 except Exception:
                     self._ua_pos_mode = "hedge"
                 logger.info(
-                    f"[{self.symbol}] ✅ Unified Account (UA). pos_mode={self._ua_pos_mode}"
+                    f"[{self.symbol}] ✅ Unified Account (UA) via unified/assets. pos_mode={self._ua_pos_mode}"
                 )
                 return
         except Exception as e:
-            logger.debug(f"[{self.symbol}] UA probe error: {e}")
+            logger.debug(f"[{self.symbol}] UA unified/assets probe error: {e}")
+
+        # Probe UA con all-account-balance (fallback)
+        try:
+            r = await self._http_get(
+                "/api/v2/account/all-account-balance",
+                {"coin": "USDT"}
+            )
+            if r.get("code") == "00000":
+                self._api_version = "ua"
+                try:
+                    rp = await self._http_get(
+                        "/api/v2/mix/position/all-position",
+                        {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
+                    )
+                    if rp.get("code") == "00000":
+                        items = rp.get("data") or []
+                        if items and isinstance(items, list):
+                            self._ua_pos_mode = items[0].get("holdMode", "hedge")
+                        else:
+                            self._ua_pos_mode = "hedge"
+                    else:
+                        self._ua_pos_mode = "hedge"
+                except Exception:
+                    self._ua_pos_mode = "hedge"
+                logger.info(
+                    f"[{self.symbol}] ✅ Unified Account (UA) via all-account-balance. pos_mode={self._ua_pos_mode}"
+                )
+                return
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] UA all-account-balance probe error: {e}")
 
         # Probe Classic v2
         try:
@@ -904,7 +969,6 @@ class FuturesTrader:
                     continue
 
                 # ── Sin posición: verificar risk antes de buscar señal ───────
-                # FIX: pasar balance real a can_open_trade para que evalúe correctamente
                 can_trade, reason = risk.can_open_trade(balance)
                 if not can_trade:
                     logger.debug(f"[{self.symbol}] RiskManager bloqueó trade: {reason}")
@@ -935,7 +999,6 @@ class FuturesTrader:
 
                 if decision.get("action") in ("LONG", "SHORT", "BUY", "SELL"):
                     action = decision["action"]
-                    # FIX: proteger contra balance None antes de calcular usdt_amount
                     safe_balance = balance if (balance is not None and balance > 0) else usdt_per_trade
                     usdt_amount  = min(usdt_per_trade, safe_balance * 0.95)
 
