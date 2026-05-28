@@ -26,6 +26,7 @@ class FuturesTrader:
                  leverage, margin_mode, dry_run):
         self.symbol       = symbol
         self.leverage     = leverage
+        self.margin_mode  = margin_mode or "isolated"   # respeta config del usuario
         self.dry_run      = dry_run
         self.position     = None
         self.entry_price  = None
@@ -41,8 +42,6 @@ class FuturesTrader:
         self._api_key     = api_key
         self._api_secret  = api_secret
         self._passphrase  = passphrase
-        # Hedge mode: siempre crossed (isolated no está soportado en hedge)
-        self.margin_mode  = "crossed"
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
             "secret":   api_secret,
@@ -149,15 +148,18 @@ class FuturesTrader:
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
-    # ÓRDENES — Hedge Mode
+    # ÓRDENES — Hedge Mode + Isolated Margin
     #
     # Bitget hedge mode: side + tradeSide obligatorios
     #   Abrir long : side="buy",  tradeSide="open"
     #   Abrir short: side="sell", tradeSide="open"
     #   Cerrar long: side="sell", tradeSide="close"
     #   Cerrar short:side="buy",  tradeSide="close"
-    # reduceOnly NO se envía en hedge mode (campo ignorado/conflicto)
-    # marginMode: siempre "crossed" (isolated incompatible con hedge)
+    #
+    # IMPORTANTE: reduceOnly NO se envía en hedge mode.
+    # En hedge mode el campo tradeSide ya identifica la dirección;
+    # añadir reduceOnly=YES provoca error 25236.
+    # Isolated margin sí es compatible con hedge mode en USDT-Futures.
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -169,6 +171,8 @@ class FuturesTrader:
         side       : "buy" | "sell"
         trade_side : "open" | "close"
         qty        : cantidad en contratos
+
+        NO incluye reduceOnly — incompatible con hedge mode.
         """
         sym  = self._bitget_symbol(self.symbol)
         path = "/api/v3/trade/place-order"
@@ -176,7 +180,7 @@ class FuturesTrader:
         payload = {
             "symbol":     sym,
             "category":   "USDT-FUTURES",
-            "marginMode": "crossed",
+            "marginMode": self.margin_mode,   # "isolated" por defecto
             "marginCoin": "USDT",
             "qty":        str(qty),
             "side":       side,
@@ -190,7 +194,7 @@ class FuturesTrader:
 
         if resp.get("code") == "00000":
             order_id = (resp.get("data") or {}).get("orderId", "?")
-            logger.info(f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} orderId={order_id}")
+            logger.info(f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} marginMode={self.margin_mode} orderId={order_id}")
             return resp
 
         raise Exception(f"place-order {resp.get('code')}: {resp.get('msg')}")
@@ -244,7 +248,7 @@ class FuturesTrader:
         else:
             self.usdt_amount = usdt_amount
         mode = "🧪 DRY" if self.dry_run else "💰 REAL"
-        logger.info(f"✅ [{self.symbol}] Listo | x{self.leverage} | {mode}")
+        logger.info(f"✅ [{self.symbol}] Listo | x{self.leverage} | {self.margin_mode.upper()} | {mode}")
 
     # ─────────────────────────────────────────────────────────────
     # HELPERS
@@ -263,7 +267,7 @@ class FuturesTrader:
         return await self.exchange.fetch_ohlcv(self.symbol, timeframe, limit=limit)
 
     # ─────────────────────────────────────────────────────────────
-    # OPEN / CLOSE
+    # OPEN / CLOSE helpers
     # ─────────────────────────────────────────────────────────────
 
     async def _open_order(self, side: str, usdt_amount: float):
@@ -271,16 +275,17 @@ class FuturesTrader:
         price = await self.get_price()
         qty   = round((usdt_amount * self.leverage) / price, 4)
         if self.dry_run:
-            logger.warning(f"[DRY][{self.symbol}] {side.upper()} {qty} @ {price}")
+            logger.warning(f"[DRY][{self.symbol}] OPEN {side.upper()} {qty} @ {price}")
             return
         await self._place_order(side, "open", qty)
 
     async def _close_order(self, pos_side: str, qty: float):
-        """Cierra la posición indicada por pos_side: 'long'|'short'"""
+        """Cierra la posición indicada. pos_side: 'long' | 'short'"""
         if self.dry_run:
             logger.warning(f"[DRY][{self.symbol}] CLOSE {pos_side.upper()} {qty}")
             return
-        # En hedge mode, para cerrar un long se envía side=sell+tradeSide=close
+        # En hedge mode: cerrar long → side=sell+tradeSide=close
+        #                cerrar short → side=buy+tradeSide=close
         close_side = "sell" if pos_side == "long" else "buy"
         await self._place_order(close_side, "close", qty)
 
@@ -428,7 +433,7 @@ class FuturesTrader:
             try:
                 positions = await self._get_positions()
                 for p in positions:
-                    size     = float(p.get("total") or p.get("contracts") or p.get("size", 0))
+                    size      = float(p.get("total") or p.get("contracts") or p.get("size", 0))
                     hold_side = str(p.get("holdSide") or p.get("side") or "").lower()
                     if size > 0:
                         ps = "long" if hold_side in ("long", "buy") else "short"
