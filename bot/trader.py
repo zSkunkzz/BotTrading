@@ -42,6 +42,8 @@ class FuturesTrader:
         self._api_key     = api_key
         self._api_secret  = api_secret
         self._passphrase  = passphrase
+        # "v3" | "v2" — se autodetecta al primer intento de orden
+        self._api_version = None
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
             "secret":   api_secret,
@@ -148,36 +150,27 @@ class FuturesTrader:
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
-    # ÓRDENES — API v3 Bitget con holdSide
+    # ÓRDENES — con fallback automático v3 → v2 Mix
     #
-    # La API v3 de Bitget usa holdSide ('long'|'short') para identificar
-    # la dirección de la posición. Este campo es obligatorio y es el que
-    # reemplaza a tradeSide de la v2. Sin él se recibe error 25236.
+    # Algunos contratos (ej: BEAT, SOXL) no están disponibles en
+    # la API v3 de Bitget y devuelven 25236 incluso con holdSide
+    # correcto. Para ellos usamos la API v2 Mix con tradeSide.
     #
-    # Apertura:  side=buy  + holdSide=long  | side=sell + holdSide=short
-    # Cierre:    side=sell + holdSide=long  | side=buy  + holdSide=short
-    #            + reduceOnly=YES
+    # Flujo:
+    #   1. Si self._api_version ya está fijado, usarlo directamente.
+    #   2. Si no, intentar v3 primero.
+    #   3. Si v3 devuelve 25236, cambiar a v2 y reintentar.
+    #   4. Guardar la versión que funcionó para futuras órdenes.
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _bitget_symbol(ccxt_symbol: str) -> str:
         return ccxt_symbol.split("/")[0] + ccxt_symbol.split("/")[1].split(":")[0]
 
-    async def _place_order(self, side: str, trade_side: str, qty: float,
-                           hold_side: str = None) -> dict:
-        """
-        side       : "buy" | "sell"
-        trade_side : "open" | "close"
-        qty        : cantidad en contratos
-        hold_side  : "long" | "short" — dirección de la posición (requerido en v3)
-
-        La API v3 de Bitget requiere holdSide para identificar la posición.
-        Sin holdSide → error 25236 en ambos modos (hedge y one_way).
-        """
-        sym  = self._bitget_symbol(self.symbol)
-        path = "/api/v3/trade/place-order"
-        is_close = (trade_side == "close")
-
+    def _build_payload_v3(self, sym: str, side: str, trade_side: str,
+                          qty: float, hold_side: str) -> dict:
+        """Payload para /api/v3/trade/place-order (holdSide obligatorio)."""
+        is_close = trade_side == "close"
         payload = {
             "symbol":     sym,
             "category":   "USDT-FUTURES",
@@ -186,28 +179,95 @@ class FuturesTrader:
             "qty":        str(qty),
             "side":       side,
             "orderType":  "market",
+            "holdSide":   hold_side,
         }
-
-        # holdSide es obligatorio en v3 para USDT perp
-        if hold_side:
-            payload["holdSide"] = hold_side
-
-        # En cierre siempre añadir reduceOnly
         if is_close:
             payload["reduceOnly"] = "YES"
+        return payload
 
-        logger.info(f"[{self.symbol}] 📤 order: {payload}")
+    def _build_payload_v2(self, sym: str, side: str, trade_side: str,
+                          qty: float, hold_side: str) -> dict:
+        """Payload para /api/v2/mix/order/place-order (tradeSide)."""
+        is_close = trade_side == "close"
+        payload = {
+            "symbol":     sym,
+            "productType": "USDT-FUTURES",
+            "marginMode": self.margin_mode,
+            "marginCoin": "USDT",
+            "size":       str(qty),
+            "side":       side,
+            "orderType":  "market",
+            "tradeSide":  trade_side,
+        }
+        if is_close:
+            payload["reduceOnly"] = "YES"
+        return payload
+
+    async def _place_order(self, side: str, trade_side: str, qty: float,
+                           hold_side: str = None) -> dict:
+        """
+        Coloca una orden con fallback automático v3 → v2 Mix.
+        - side       : "buy" | "sell"
+        - trade_side : "open" | "close"
+        - qty        : cantidad en contratos
+        - hold_side  : "long" | "short"
+        """
+        sym = self._bitget_symbol(self.symbol)
+
+        # Si ya sabemos qué versión usa este par, ir directamente
+        if self._api_version == "v3":
+            return await self._place_order_v3(sym, side, trade_side, qty, hold_side)
+        if self._api_version == "v2":
+            return await self._place_order_v2(sym, side, trade_side, qty, hold_side)
+
+        # Autodetección: intentar v3 primero
+        try:
+            result = await self._place_order_v3(sym, side, trade_side, qty, hold_side)
+            self._api_version = "v3"
+            logger.info(f"[{self.symbol}] 📌 API version fijada: v3")
+            return result
+        except Exception as e:
+            if "25236" in str(e):
+                logger.warning(
+                    f"[{self.symbol}] ⚠️ v3 devolvió 25236 — "
+                    f"este contrato no soporta v3, usando v2 Mix"
+                )
+                result = await self._place_order_v2(sym, side, trade_side, qty, hold_side)
+                self._api_version = "v2"
+                logger.info(f"[{self.symbol}] 📌 API version fijada: v2 Mix")
+                return result
+            raise
+
+    async def _place_order_v3(self, sym: str, side: str, trade_side: str,
+                               qty: float, hold_side: str) -> dict:
+        path = "/api/v3/trade/place-order"
+        payload = self._build_payload_v3(sym, side, trade_side, qty, hold_side)
+        logger.info(f"[{self.symbol}] 📤 order [v3]: {payload}")
         resp = await self._http_post(path, payload)
-        logger.info(f"[{self.symbol}] 📥 response: {resp}")
-
+        logger.info(f"[{self.symbol}] 📥 response [v3]: {resp}")
         if resp.get("code") == "00000":
             order_id = (resp.get("data") or {}).get("orderId", "?")
             logger.info(
                 f"[{self.symbol}] ✅ {side}/{trade_side} holdSide={hold_side} "
-                f"qty={qty} marginMode={self.margin_mode} orderId={order_id}"
+                f"qty={qty} orderId={order_id} [v3]"
             )
             return resp
+        raise Exception(f"place-order {resp.get('code')}: {resp.get('msg')}")
 
+    async def _place_order_v2(self, sym: str, side: str, trade_side: str,
+                               qty: float, hold_side: str) -> dict:
+        path = "/api/v2/mix/order/place-order"
+        payload = self._build_payload_v2(sym, side, trade_side, qty, hold_side)
+        logger.info(f"[{self.symbol}] 📤 order [v2]: {payload}")
+        resp = await self._http_post(path, payload)
+        logger.info(f"[{self.symbol}] 📥 response [v2]: {resp}")
+        if resp.get("code") == "00000":
+            order_id = (resp.get("data") or {}).get("orderId", "?")
+            logger.info(
+                f"[{self.symbol}] ✅ {side}/{trade_side} tradeSide={trade_side} "
+                f"qty={qty} orderId={order_id} [v2]"
+            )
+            return resp
         raise Exception(f"place-order {resp.get('code')}: {resp.get('msg')}")
 
     # ─────────────────────────────────────────────────────────────
@@ -228,11 +288,25 @@ class FuturesTrader:
                     return result
         except Exception as e:
             logger.warning(f"[{self.symbol}] get_positions v3: {e}")
+        # Fallback v2
+        try:
+            sym_v2 = sym + "_UMCBL"
+            path_v2 = f"/api/v2/mix/position/single-position?symbol={sym_v2}&productType=USDT-FUTURES&marginCoin=USDT"
+            r2 = await self._http_get(path_v2)
+            if r2.get("code") == "00000":
+                data2 = r2.get("data") or []
+                if isinstance(data2, dict):
+                    data2 = [data2]
+                result2 = [p for p in data2 if float(p.get("total") or p.get("size", 0)) > 0]
+                if result2:
+                    return result2
+        except Exception as e2:
+            logger.warning(f"[{self.symbol}] get_positions v2: {e2}")
         try:
             positions = await self.exchange.fetch_positions([self.symbol])
             return [p for p in positions if float(p.get("contracts") or 0) > 0]
-        except Exception as e2:
-            logger.warning(f"[{self.symbol}] get_positions ccxt: {e2}")
+        except Exception as e3:
+            logger.warning(f"[{self.symbol}] get_positions ccxt: {e3}")
         return []
 
     # ─────────────────────────────────────────────────────────────
@@ -282,10 +356,6 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
 
     async def _open_order(self, side: str, usdt_amount: float):
-        """
-        side: "buy" (long) | "sell" (short)
-        holdSide se deriva del side: buy → long, sell → short
-        """
         price = await self.get_price()
         qty   = round((usdt_amount * self.leverage) / price, 4)
         if self.dry_run:
@@ -295,10 +365,6 @@ class FuturesTrader:
         await self._place_order(side, "open", qty, hold_side=hold_side)
 
     async def _close_order(self, pos_side: str, qty: float):
-        """
-        pos_side: "long" | "short" (dirección de la posición a cerrar)
-        El cierre usa el side opuesto con holdSide de la posición + reduceOnly
-        """
         if self.dry_run:
             logger.warning(f"[DRY][{self.symbol}] CLOSE {pos_side.upper()} {qty}")
             return
