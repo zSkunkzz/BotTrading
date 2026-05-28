@@ -20,10 +20,13 @@ logger = logging.getLogger("Trader")
 
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 
-# Timeframe usado para los indicadores técnicos / IA
 OHLCV_TF        = os.getenv("OHLCV_TF", "15m")
 OHLCV_LIMIT     = int(os.getenv("OHLCV_LIMIT", "200"))
 OHLCV_MIN_BARS  = int(os.getenv("OHLCV_MIN_BARS", "55"))
+
+# Máx reintentos de balance antes de saltarse el ciclo
+_BALANCE_MAX_RETRIES = int(os.getenv("BALANCE_MAX_RETRIES", "5"))
+_BALANCE_RETRY_SLEEP = float(os.getenv("BALANCE_RETRY_SLEEP", "3"))
 
 _MIN_QTY_FALLBACK = {
     "BTCUSDT":   0.001,
@@ -83,18 +86,44 @@ def _to_float(val) -> float | None:
 
 
 def _extract_usdt_balance(item: dict) -> float | None:
-    """Extrae balance USDT disponible de un dict de cuenta/asset."""
+    """
+    Extrae balance USDT disponible de un dict de cuenta/asset.
+
+    BUG FIX: la versión anterior retornaba 0.0 si el campo 'available'
+    existía pero valía 0 (cuenta sin fondos en ese sub-wallet), cortando
+    la búsqueda antes de probar crossMaxAvailable / usdtEquity / equity.
+    Ahora se itera todos los campos antes de rendir, y solo retorna 0.0
+    como fallback explícito si ninguno fue positivo.
+    """
     if not isinstance(item, dict):
         return None
-    for field in ("available", "crossMaxAvailable", "usdtEquity",
-                  "isolatedMaxAvailable", "equity", "availableBalance",
-                  "availableMargin", "accountEquity"):
+
+    candidates = [
+        "available",
+        "crossMaxAvailable",
+        "usdtEquity",
+        "isolatedMaxAvailable",
+        "equity",
+        "availableBalance",
+        "availableMargin",
+        "accountEquity",
+    ]
+
+    # Primera pasada: buscar cualquier valor > 0
+    for field in candidates:
         v = _to_float(item.get(field))
         if v is not None and v > 0:
             logger.debug(f"[BalanceCache] campo={field} val={v}")
             return v
-    v = _to_float(item.get("available"))
-    return v if v is not None else 0.0
+
+    # Segunda pasada: si todos son 0, retornar el primero que exista (puede ser 0.0 real)
+    for field in candidates:
+        v = _to_float(item.get(field))
+        if v is not None:
+            logger.debug(f"[BalanceCache] campo={field} val={v} (fallback-0)")
+            return v
+
+    return None
 
 
 async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
@@ -266,6 +295,49 @@ async def get_cached_balance(api_key, api_secret, passphrase) -> float | None:
         return result
 
 
+async def _wait_for_balance(
+    api_key: str,
+    api_secret: str,
+    passphrase: str,
+    symbol: str,
+    max_retries: int = _BALANCE_MAX_RETRIES,
+    sleep_s: float   = _BALANCE_RETRY_SLEEP,
+) -> float | None:
+    """
+    Reintenta obtener el balance hasta max_retries veces con backoff lineal.
+    Invalida la caché en cada intento para forzar un fetch real.
+    Retorna el balance en cuanto sea > 0, o None si se agotan los reintentos.
+
+    Esto resuelve el bug principal: en Railway el DNS o el token JWT de Bitget
+    puede tardar unos segundos en propagarse, y el primer ciclo siempre
+    obtenía balance=0 porque la caché guardaba el 0 y lo reutilizaba.
+    """
+    global _balance_cache_value, _balance_cache_ts
+
+    for attempt in range(1, max_retries + 1):
+        # Forzar fetch real invalidando caché
+        _balance_cache_value = None
+        _balance_cache_ts    = 0.0
+
+        bal = await get_cached_balance(api_key, api_secret, passphrase)
+        if bal is not None and bal > 0:
+            logger.info(f"[{symbol}] Balance OK en intento {attempt}: {bal:.2f} USDT")
+            return bal
+
+        wait = sleep_s * attempt  # backoff lineal: 3s, 6s, 9s, 12s, 15s
+        logger.warning(
+            f"[{symbol}] ⚠️ Balance={bal} (intento {attempt}/{max_retries}), "
+            f"reintentando en {wait:.0f}s..."
+        )
+        await asyncio.sleep(wait)
+
+    logger.error(
+        f"[{symbol}] 🚨 Balance sigue siendo 0 o None tras {max_retries} intentos. "
+        f"Saltando ciclo de trading hasta próxima vuelta."
+    )
+    return None
+
+
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
                  leverage, margin_mode, dry_run):
@@ -288,8 +360,9 @@ class FuturesTrader:
         self._api_version = None
         self._ua_pos_mode = None
         self._v2_pos_mode = None
+        self._balance_ok  = False   # True tras primera confirmación exitosa
 
-    # ── HTTP HELPERS ─────────────────────────────────────────────────────────────────
+    # ── HTTP HELPERS ────────────────────────────────────────────────────────────
 
     def _sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
         msg = ts + method.upper() + path_with_qs + body
@@ -333,7 +406,7 @@ class FuturesTrader:
             ) as r:
                 return await _safe_json(r)
 
-    # ── INICIALIZACIÓN ─────────────────────────────────────────────────────────────
+    # ── INICIALIZACIÓN ────────────────────────────────────────────────────────
 
     async def _init(self, usdt_per_trade: float):
         self.exchange = ccxt.bitget({
@@ -407,13 +480,9 @@ class FuturesTrader:
         self._api_version = "ua"
         self._ua_pos_mode = "hedge"
 
-    # ── PRECIO, OHLCV Y BALANCE ────────────────────────────────────────────────────────
+    # ── PRECIO, OHLCV Y BALANCE ────────────────────────────────────────────────
 
     async def get_price(self) -> float:
-        """
-        Precio actual. WS feed primero (sin coste de API),
-        fallback REST si el precio WS tiene >10s o no está disponible.
-        """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
         try:
             from bot.ws_feed import ws_feed
@@ -427,21 +496,12 @@ class FuturesTrader:
         return float(ticker["last"])
 
     async def get_ohlcv(self, tf: str = OHLCV_TF) -> list:
-        """
-        Retorna candles OHLCV como lista de listas [ts, o, h, l, c, v],
-        compatible con ai_decide(bars=...).
-
-        Orden de prioridad:
-          1. WS feed (caché en memoria, cero coste) si hay >= OHLCV_MIN_BARS velas.
-          2. REST ccxt fetch_ohlcv como fallback (consume rate limit).
-        """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
         try:
             from bot.ws_feed import ws_feed
             if ws_feed.has_data(sym_clean, tf=tf, min_candles=OHLCV_MIN_BARS):
                 df = ws_feed.get_ohlcv(sym_clean, tf)
                 if not df.empty and len(df) >= OHLCV_MIN_BARS:
-                    # Convertir DataFrame a lista [[ts_ms, o, h, l, c, v], ...]
                     df_reset = df.reset_index()
                     bars = [
                         [
@@ -459,8 +519,6 @@ class FuturesTrader:
         except Exception as e:
             logger.debug(f"[{self.symbol}] get_ohlcv WS error: {e}")
 
-        # Fallback REST
-        # Mapeo tf → formato ccxt
         tf_ccxt = {"15m": "15m", "1h": "1h", "4h": "4h"}.get(tf, tf)
         logger.debug(f"[{self.symbol}] OHLCV fallback REST ({tf_ccxt})")
         bars = await self.exchange.fetch_ohlcv(self.symbol, tf_ccxt, limit=OHLCV_LIMIT)
@@ -469,7 +527,7 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await get_cached_balance(self._api_key, self._api_secret, self._passphrase)
 
-    # ── LEVERAGE ──────────────────────────────────────────────────────────────────────
+    # ── LEVERAGE ─────────────────────────────────────────────────────────────
 
     async def set_leverage(self, leverage: int, side: str | None = None):
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
@@ -503,7 +561,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning(f"[{self.symbol}] set_leverage error: {e}")
 
-    # ── MÍNIMOS DE QTY ───────────────────────────────────────────────────────────────
+    # ── MÍNIMOS DE QTY ─────────────────────────────────────────────────────────
 
     async def _get_min_qty(self) -> float:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
@@ -530,7 +588,7 @@ class FuturesTrader:
         _min_qty_cache[sym_clean] = fallback
         return fallback
 
-    # ── POSICIONES ABIERTAS ──────────────────────────────────────────────────────────
+    # ── POSICIONES ABIERTAS ────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list | None:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
@@ -581,7 +639,7 @@ class FuturesTrader:
         )
         return None
 
-    # ── COLOCAR / CERRAR ÓRDENES ────────────────────────────────────────────────────
+    # ── COLOCAR / CERRAR ÓRDENES ──────────────────────────────────────────────────
 
     async def _place_order(self, side: str, trade_side: str, qty: float):
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
@@ -640,7 +698,7 @@ class FuturesTrader:
         qty = round(qty, decimals)
         return qty
 
-    # ── ABRIR POSICIONES ─────────────────────────────────────────────────────────────
+    # ── ABRIR POSICIONES ────────────────────────────────────────────────────────
 
     async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None,
                         leverage=None):
@@ -697,7 +755,7 @@ class FuturesTrader:
     async def close_position(self, reason: str = ""):
         if not self.position:
             return
-        side      = "sell" if self.position == "long" else "buy"
+        side       = "sell" if self.position == "long" else "buy"
         trade_side = "close"
         qty = None
         try:
@@ -790,7 +848,7 @@ class FuturesTrader:
                 f"[{self.symbol}] partial_close FAILED: code={r.get('code')} msg={r.get('msg')}"
             )
 
-    # ── LOOP PRINCIPAL ────────────────────────────────────────────────────────────────
+    # ── LOOP PRINCIPAL ──────────────────────────────────────────────────────────
 
     async def run(self, risk: "RiskManager", global_risk: "GlobalRisk" = None):
         from bot.risk import RiskManager
@@ -799,15 +857,33 @@ class FuturesTrader:
 
         while True:
             try:
-                price   = await self.get_price()
+                price = await self.get_price()
+
+                # ── Balance con retry ───────────────────────────────────────────
+                # Solo usamos el retry pesado la primera vez (bot recién arrancado)
+                # o si la caché expiró y el fetch devolvió 0/None de nuevo.
                 balance = await self.get_balance()
+                if (balance is None or balance <= 0) and not self._balance_ok:
+                    balance = await _wait_for_balance(
+                        self._api_key, self._api_secret, self._passphrase,
+                        symbol=self.symbol,
+                    )
 
                 if balance is None or balance <= 0:
-                    logger.warning(f"[{self.symbol}] Balance insuficiente {balance or 0:.2f} USDT")
-                    await asyncio.sleep(2)
+                    logger.warning(
+                        f"[{self.symbol}] ⚠️ Balance {balance or 0:.2f} USDT — "
+                        f"esperando {_BALANCE_RETRY_SLEEP * 2:.0f}s"
+                    )
+                    await asyncio.sleep(_BALANCE_RETRY_SLEEP * 2)
                     continue
 
-                # ── Gestión de posición abierta ───────────────────────────────────
+                # Primera vez que confirmamos balance OK
+                if not self._balance_ok:
+                    self._balance_ok = True
+                    logger.info(f"[{self.symbol}] ✅ Balance confirmado: {balance:.2f} USDT")
+                # ──────────────────────────────────────────────────────────────────────
+
+                # ── Gestión de posición abierta ──────────────────────────────
                 if self.position:
                     if not self.tp2_hit and self.tp2:
                         if (self.position == "long"  and price >= self.tp2) or \
@@ -827,17 +903,17 @@ class FuturesTrader:
                     await asyncio.sleep(2)
                     continue
 
-                # ── Sin posición: buscar señal ──────────────────────────────────────
+                # ── Sin posición: buscar señal ───────────────────────────────
                 if global_risk and not global_risk.can_open_trade():
                     await asyncio.sleep(2)
                     continue
 
-                # Obtener candles WS o REST
                 bars = await self.get_ohlcv()
 
                 if not bars or len(bars) < OHLCV_MIN_BARS:
                     logger.debug(
-                        f"[{self.symbol}] Esperando candles WS ({len(bars) if bars else 0}/{OHLCV_MIN_BARS})"
+                        f"[{self.symbol}] Esperando candles WS "
+                        f"({len(bars) if bars else 0}/{OHLCV_MIN_BARS})"
                     )
                     await asyncio.sleep(2)
                     continue
@@ -851,7 +927,7 @@ class FuturesTrader:
                 )
 
                 if decision.get("action") in ("LONG", "SHORT", "BUY", "SELL"):
-                    action = decision["action"]
+                    action      = decision["action"]
                     usdt_amount = min(usdt_per_trade, balance * 0.95)
                     lev  = decision.get("leverage", self.leverage)
                     sl   = decision.get("sl")
