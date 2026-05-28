@@ -70,6 +70,20 @@ def _get_balance_lock() -> asyncio.Lock:
     return _balance_fetch_lock
 
 
+async def _safe_json(response) -> dict:
+    """
+    Parsea r.json() de forma segura.
+    - Fuerza content_type=None para evitar error cuando Bitget devuelve
+      text/html o text/plain en errores HTTP.
+    - Si el resultado es un str (respuesta de texto plano), lanza ValueError
+      con el contenido para que el caller lo logee correctamente.
+    """
+    data = await response.json(content_type=None)
+    if not isinstance(data, dict):
+        raise ValueError(f"Respuesta no-JSON: {str(data)[:300]}")
+    return data
+
+
 async def _fetch_balance_once(api_key, api_secret, passphrase) -> float:
     """
     Llama a la API de Bitget y devuelve el balance USDT disponible.
@@ -104,7 +118,7 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, headers=_headers("GET", path + qs),
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json()
+                data = await _safe_json(r)
         logger.debug(f"[BalanceCache] v3 raw response: {data}")
         if data.get("code") == "00000":
             for item in (data.get("data") or []):
@@ -117,6 +131,8 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float:
                     _balance_cache_ts    = time.monotonic()
                     logger.info(f"[BalanceCache] ✅ Balance USDT (v3): {bal:.2f}")
                     return bal
+            # code 00000 pero sin item USDT — cuenta vacía o sin futuros aún
+            logger.warning("[BalanceCache] ⚠️ v3 OK pero sin ítem USDT en data")
         else:
             logger.warning(
                 f"[BalanceCache] ⚠️ v3 code={data.get('code')} msg={data.get('msg')}"
@@ -132,7 +148,7 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, headers=_headers("GET", path + qs),
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json()
+                data = await _safe_json(r)
         logger.debug(f"[BalanceCache] v2 raw response: {data}")
         if data.get("code") == "00000":
             items = data.get("data") or []
@@ -245,7 +261,8 @@ class FuturesTrader:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, headers=headers,
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
-                return await r.json()
+                data = await _safe_json(r)
+                return data
 
     async def _http_post(self, path: str, body: dict) -> dict:
         body_str = _json.dumps(body)
@@ -254,7 +271,8 @@ class FuturesTrader:
         async with aiohttp.ClientSession() as s:
             async with s.post(url, headers=headers, data=body_str,
                               timeout=aiohttp.ClientTimeout(total=10)) as r:
-                return await r.json()
+                data = await _safe_json(r)
+                return data
 
     # ─────────────────────────────────────────────────────────────
     # DETECCIÓN DE TIPO DE CUENTA
