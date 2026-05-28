@@ -163,7 +163,7 @@ class FuturesTrader:
 
         logger.warning(
             f"[{self.symbol}] ⚠️ account-mode error 40404: "
-            "Request URL NOT FOUND — asumiendo one_way"
+            "Request URL NOT FOUND — asumiendo hedge"
         )
         self._ua_pos_mode = "hedge"  # default seguro para UA
 
@@ -401,6 +401,10 @@ class FuturesTrader:
 
     # ─────────────────────────────────────────────────────────────
     # COLOCAR / CERRAR ÓRDENES
+    # FIX 25236: payload one_way NO debe incluir tradeSide/posSide.
+    #            payload hedge DEBE incluir posSide (v3) o tradeSide (v2).
+    #            Fallback de 25236 construye payload desde cero para
+    #            evitar campos residuales del modo anterior.
     # ─────────────────────────────────────────────────────────────
 
     async def _place_order(self, side: str, trade_side: str, qty: float):
@@ -413,6 +417,7 @@ class FuturesTrader:
         # ── UA (v3) ──
         if self._api_version in ("ua", None):
             try:
+                # Payload base sin campos de modo
                 payload = {
                     "symbol":     sym_clean,
                     "category":   "USDT-FUTURES",
@@ -422,6 +427,7 @@ class FuturesTrader:
                     "side":       side,       # buy / sell
                     "orderType":  "market",
                 }
+                # Solo añadir posSide si el modo es hedge
                 if self._ua_pos_mode == "hedge":
                     pos_side = "long" if side == "buy" else "short"
                     if trade_side == "close":
@@ -444,7 +450,7 @@ class FuturesTrader:
                     if self._api_version is None:
                         self._api_version = "ua"
                     return
-                # Si falla con error de tipo de posición, intentar alternar pos_mode
+                # 25236: alternar modo y reconstruir payload desde cero
                 if r.get("code") == "25236":
                     alt_mode = "one_way" if self._ua_pos_mode != "one_way" else "hedge"
                     logger.warning(
@@ -452,8 +458,16 @@ class FuturesTrader:
                         f"→ cambiando a {alt_mode} y reintentando"
                     )
                     self._ua_pos_mode = alt_mode
-                    retry = dict(payload)
-                    retry.pop("posSide", None)
+                    # Reconstruir payload limpio para el modo alternativo
+                    retry = {
+                        "symbol":     sym_clean,
+                        "category":   "USDT-FUTURES",
+                        "marginMode": self.margin_mode,
+                        "marginCoin": "USDT",
+                        "qty":        str(qty),
+                        "side":       side,
+                        "orderType":  "market",
+                    }
                     if alt_mode == "hedge":
                         pos_side = "long" if side == "buy" else "short"
                         if trade_side == "close":
@@ -485,24 +499,28 @@ class FuturesTrader:
                 logger.debug(f"[{self.symbol}] ua order error: {e}")
 
         # ── v2 Classic ──
+        # FIX 25236: construir payload específico para cada modo.
+        # one_way: NO incluye tradeSide (Bitget lo rechaza con 25236).
+        # hedge:   SÍ incluye tradeSide=open/close.
         try:
-            one_way = (self._ua_pos_mode or "one_way") == "one_way"
+            is_hedge = (self._ua_pos_mode or "hedge") == "hedge"
+
+            # Payload base común
             payload_v2 = {
                 "symbol":      sym_clean,
-                "category":    "USDT-FUTURES",
+                "productType": "USDT-FUTURES",
                 "marginMode":  self.margin_mode,
                 "marginCoin":  "USDT",
                 "qty":         str(qty),
                 "side":        side,
                 "orderType":   "market",
             }
-            if not one_way:
-                pos_side = "long" if side == "buy" else "short"
-                if trade_side == "close":
-                    pos_side = "short" if side == "buy" else "long"
+            # Solo hedge añade tradeSide
+            if is_hedge:
                 payload_v2["tradeSide"] = "open" if trade_side == "open" else "close"
 
-            logger.info(f"[{self.symbol}] 📤 order [one_way]: {payload_v2}")
+            mode_label = "hedge" if is_hedge else "one_way"
+            logger.info(f"[{self.symbol}] 📤 order [{mode_label}]: {payload_v2}")
             r_v2 = await self._http_post(
                 "/api/v2/mix/order/place-order", payload_v2
             )
@@ -512,21 +530,33 @@ class FuturesTrader:
                 order_id = r_v2.get("data", {}).get("orderId", "?")
                 logger.info(
                     f"[{self.symbol}] {side}/{trade_side} "
-                    f"qty={qty} orderId={order_id} v2"
+                    f"qty={qty} orderId={order_id} v2-{mode_label}"
                 )
                 if self._api_version is None:
                     self._api_version = "v2"
                 return
 
+            # 25236: alternar modo y reconstruir payload v2 desde cero
             if r_v2.get("code") == "25236":
-                alt = "hedge"
+                alt = "one_way" if is_hedge else "hedge"
                 logger.warning(
-                    f"[{self.symbol}] ⚠️ 25236 con mode=one_way "
+                    f"[{self.symbol}] ⚠️ 25236 con mode={mode_label} "
                     f"→ cambiando a {alt} y reintentando"
                 )
                 self._ua_pos_mode = alt
-                retry_v2 = dict(payload_v2)
-                retry_v2["tradeSide"] = "open" if trade_side == "open" else "close"
+                # Payload limpio para el modo alternativo
+                retry_v2 = {
+                    "symbol":      sym_clean,
+                    "productType": "USDT-FUTURES",
+                    "marginMode":  self.margin_mode,
+                    "marginCoin":  "USDT",
+                    "qty":         str(qty),
+                    "side":        side,
+                    "orderType":   "market",
+                }
+                if alt == "hedge":
+                    retry_v2["tradeSide"] = "open" if trade_side == "open" else "close"
+                # one_way no lleva tradeSide
                 logger.info(f"[{self.symbol}] 📤 retry [{alt}]: {retry_v2}")
                 r3 = await self._http_post(
                     "/api/v2/mix/order/place-order", retry_v2
