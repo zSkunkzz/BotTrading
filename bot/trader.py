@@ -20,6 +20,33 @@ logger = logging.getLogger("Trader")
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 BITGET_BASE = "https://api.bitget.com"
 
+# ─────────────────────────────────────────────────────────────
+# Tamaños mínimos de contrato por par (fallback hardcoded).
+# Se actualiza dinámicamente desde la API en _get_min_qty().
+# Unidades: contratos (no USDT). Fuente: Bitget market info.
+# ─────────────────────────────────────────────────────────────
+_MIN_QTY_HARDCODED = {
+    "XAUTUSDT":  0.01,   # XAUT/USDT — oro tokenizado (~$3000/u)
+    "XAGUSDT":   0.1,    # XAG/USDT — plata tokenizada
+    "BTCUSDT":   0.001,  # BTC
+    "ETHUSDT":   0.01,   # ETH
+    "SOLUSDT":   0.1,    # SOL
+    "XRPUSDT":   1.0,    # XRP
+    "XLMUSDT":   1.0,    # XLM
+    "SUIUSDT":   0.1,    # SUI
+    "NEARUSDT":  0.1,    # NEAR
+    "HYPERUSDT": 0.1,    # HYPE
+    "FILUSDT":   0.1,    # FIL
+    "ZECUSDT":   0.01,   # ZEC
+    "WLDUSDT":   0.1,    # WLD
+    "SOXLUSDT":  0.1,    # SOXL
+    "BEATUSDT":  1.0,    # BEAT
+    "BZUSDT":    1.0,    # BZ
+}
+
+# Cache de min_qty leídos desde API (sym → float)
+_min_qty_cache: dict = {}
+
 
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
@@ -87,8 +114,10 @@ class FuturesTrader:
                 try:
                     return _json.loads(text)
                 except Exception:
-                    logger.warning(f"_http_get non-JSON ({r.status}): {text[:200]}")
-                    return {"code": "ERR", "msg": text[:200]}
+                    # Solo loguear si no es un 404 esperado (detección de cuenta)
+                    if r.status != 404:
+                        logger.warning(f"_http_get non-JSON ({r.status}): {text[:200]}")
+                    return {"code": str(r.status), "msg": text[:200]}
 
     async def _http_post(self, path: str, payload: dict) -> dict:
         body = _json.dumps(payload)
@@ -104,95 +133,100 @@ class FuturesTrader:
                     return {"code": "ERR", "msg": text[:200]}
 
     # ─────────────────────────────────────────────────────────────
-    # DETECCIÓN TIPO DE CUENTA (UA vs Classic) — se llama en _init
+    # MIN QTY — validación antes de enviar órdenes (fix error 45111)
+    # ─────────────────────────────────────────────────────────────
+
+    async def _get_min_qty(self, sym: str) -> float:
+        """
+        Devuelve el tamaño mínimo de contrato para el par.
+        Prioridad: cache > API > hardcoded > 0.001 fallback.
+        """
+        global _min_qty_cache
+        if sym in _min_qty_cache:
+            return _min_qty_cache[sym]
+
+        # Intentar leer desde la API de contratos
+        try:
+            path = f"/api/v2/mix/market/contracts?productType=USDT-FUTURES&symbol={sym}"
+            r = await self._http_get(path)
+            if r.get("code") == "00000":
+                data = r.get("data") or []
+                if isinstance(data, dict):
+                    data = [data]
+                for contract in data:
+                    if str(contract.get("symbol") or "").upper() == sym.upper():
+                        min_size = float(
+                            contract.get("minTradeNum") or
+                            contract.get("minOrderNum") or
+                            contract.get("lotSz") or
+                            0
+                        )
+                        if min_size > 0:
+                            _min_qty_cache[sym] = min_size
+                            logger.debug(
+                                f"[{self.symbol}] 📏 min_qty {sym}={min_size} (API)"
+                            )
+                            return min_size
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] _get_min_qty API error: {e}")
+
+        # Fallback hardcoded
+        hardcoded = _MIN_QTY_HARDCODED.get(sym, 0.001)
+        _min_qty_cache[sym] = hardcoded
+        logger.debug(f"[{self.symbol}] 📏 min_qty {sym}={hardcoded} (hardcoded)")
+        return hardcoded
+
+    # ─────────────────────────────────────────────────────────────
+    # DETECCIÓN TIPO DE CUENTA (UA vs Classic)
     # ─────────────────────────────────────────────────────────────
 
     async def _detect_account_type(self):
         """
         Detecta si la cuenta es Unified Account (UA) o Classic.
-        Si es UA, fija self._api_version = "ua" inmediatamente
-        para evitar que _place_order intente v3/v2 (que devuelven 40085/25236).
-        También detecta el pos_mode del par (hedge vs one_way).
+        Elimina la llamada a /v3/account/account-type que siempre devuelve 404.
+        Usa endpoints que realmente funcionan en esta cuenta.
         """
         if self._api_version is not None:
             return  # ya detectado
 
+        # Prueba A: /api/v3/account/assets — responde OK en UA, falla en Classic
         try:
-            # Endpoint exclusivo de Unified Account
-            r = await self._http_get("/api/v3/account/account-type")
-            if r.get("code") == "00000":
-                data = r.get("data") or {}
-                acc_type = str(data.get("accountType") or "").lower()
-                if "unified" in acc_type or "ua" in acc_type:
-                    self._api_version = "ua"
-                    logger.info(
-                        f"[{self.symbol}] 🔎 Cuenta detectada: Unified Account → "
-                        f"modo UA activado"
-                    )
-                    await self._detect_ua_pos_mode()
-                    return
-        except Exception as e:
-            logger.debug(f"[{self.symbol}] detect_account_type /v3/account-type: {e}")
-
-        # Prueba alternativa A: si /api/v3/account/assets responde OK → es UA
-        # (Los logs muestran que este endpoint funciona en esta cuenta)
-        try:
-            r1b = await self._http_get("/api/v3/account/assets?coin=USDT")
-            if r1b.get("code") == "00000" and r1b.get("data"):
+            r1 = await self._http_get("/api/v3/account/assets?coin=USDT")
+            if r1.get("code") == "00000" and r1.get("data"):
                 self._api_version = "ua"
                 logger.info(
-                    f"[{self.symbol}] 🔎 Cuenta detectada: Unified Account "
-                    f"(via v3/account/assets) → modo UA activado"
+                    f"[{self.symbol}] 🔎 Cuenta detectada: Unified Account (v3/assets)"
                 )
                 await self._detect_ua_pos_mode()
                 return
         except Exception as e:
-            logger.debug(f"[{self.symbol}] detect_account_type v3/account/assets: {e}")
+            logger.debug(f"[{self.symbol}] detect_account_type v3/assets: {e}")
 
-        # Prueba alternativa B: endpoint unified/assets
+        # Prueba B: /api/v2/unified/account/assets
         try:
             r2 = await self._http_get("/api/v2/unified/account/assets?coin=USDT")
             if r2.get("code") == "00000" and r2.get("data"):
                 self._api_version = "ua"
                 logger.info(
-                    f"[{self.symbol}] 🔎 Cuenta detectada: Unified Account "
-                    f"(via unified/assets) → modo UA activado"
+                    f"[{self.symbol}] 🔎 Cuenta detectada: Unified Account (unified/assets)"
                 )
                 await self._detect_ua_pos_mode()
                 return
         except Exception as e:
             logger.debug(f"[{self.symbol}] detect_account_type unified/assets: {e}")
 
-        # Prueba alternativa C: si el balance v3/assets da resultado → es UA
-        # (Fallback final: si podemos leer balance en v3 → tratar como UA)
-        try:
-            r3 = await self._http_get("/api/v3/account/assets")
-            if r3.get("code") == "00000":
-                self._api_version = "ua"
-                logger.info(
-                    f"[{self.symbol}] 🔎 Cuenta detectada: Unified Account "
-                    f"(via v3/assets fallback) → modo UA activado"
-                )
-                await self._detect_ua_pos_mode()
-                return
-        except Exception as e:
-            logger.debug(f"[{self.symbol}] detect_account_type v3/assets-fallback: {e}")
-
         logger.info(f"[{self.symbol}] 🔎 Cuenta detectada: Classic (v3/v2)")
 
     async def _detect_ua_pos_mode(self):
         """
         Detecta el modo de posición (hedge vs one_way) del par en Unified Account.
-        Prueba con una orden ficticia de qty=0 — Bitget rechaza qty=0 con un código
-        específico que revela si el modo es correcto o no; o bien consulta la
-        configuración de posición directamente.
         """
         if self._ua_pos_mode is not None:
             return
 
         sym = self._bitget_symbol(self.symbol)
+        # Intentar leer pos_mode desde posición abierta
         try:
-            # Intentar leer el pos_mode desde la configuración del contrato
             path = (
                 f"/api/v3/position/single-position"
                 f"?symbol={sym}&category=USDT-FUTURES&marginCoin=USDT"
@@ -203,7 +237,6 @@ class FuturesTrader:
                 if isinstance(data, dict):
                     data = [data]
                 if data:
-                    # Si tiene posición abierta, el holdSide/posSide nos dice el modo
                     p = data[0]
                     if p.get("holdSide") or p.get("posSide"):
                         self._ua_pos_mode = "hedge"
@@ -217,8 +250,7 @@ class FuturesTrader:
         except Exception as e:
             logger.debug(f"[{self.symbol}] detect_ua_pos_mode: {e}")
 
-        # Sin posición abierta — intentar leer posMode de la configuración de cuenta
-        sym = self._bitget_symbol(self.symbol)
+        # Leer posMode desde la configuración de cuenta
         try:
             path_mode = (
                 f"/api/v3/position/position-mode"
@@ -381,6 +413,7 @@ class FuturesTrader:
                            hold_side: str = None) -> dict:
         """
         Coloca una orden con fallback automático v3 → v2 Mix → UA hedge → UA one-way.
+        INCLUYE validación de min_qty antes de enviar (fix error 45111).
 
         - side       : "buy" | "sell"
         - trade_side : "open" | "close"
@@ -388,6 +421,15 @@ class FuturesTrader:
         - hold_side  : "long" | "short"
         """
         sym = self._bitget_symbol(self.symbol)
+
+        # ── Validación min_qty (fix error 45111) ──────────────────
+        if trade_side == "open":
+            min_qty = await self._get_min_qty(sym)
+            if qty < min_qty:
+                raise Exception(
+                    f"qty_too_small: {qty} < min_qty {min_qty} para {sym}. "
+                    f"Aumenta el balance o reduce el apalancamiento."
+                )
 
         # Si ya detectamos versión API para este par → ir directo
         if self._api_version == "v3":
@@ -504,6 +546,8 @@ class FuturesTrader:
         Coloca orden en Unified Account.
         Intenta hedge (posSide) primero, luego one-way (sin posSide).
         Si ambos fallan con 25236, intenta forzar el modo via switch-position-mode.
+        FIX: cuando switch-position-mode también falla, marca el contrato como
+        incompatible y evita loops infinitos.
         """
         path = "/api/v3/trade/place-order"
 
@@ -520,6 +564,12 @@ class FuturesTrader:
                     f"qty={qty} orderId={order_id} [ua-hedge]"
                 )
                 return resp
+            # 45111 = cantidad menor al mínimo — no reintentar, propagar
+            if resp.get("code") == "45111":
+                raise Exception(
+                    f"place-order ua-hedge 45111: {resp.get('msg')} "
+                    f"(qty={qty} posiblemente menor al mínimo del contrato)"
+                )
             # 25236 con ua-hedge fijado → el contrato es one_way, cambiar
             if resp.get("code") == "25236":
                 logger.warning(
@@ -538,6 +588,11 @@ class FuturesTrader:
                         f"orderId={order_id} [ua-oneway]"
                     )
                     return resp_ow
+                if resp_ow.get("code") == "45111":
+                    raise Exception(
+                        f"place-order ua-oneway 45111: {resp_ow.get('msg')} "
+                        f"(qty={qty} posiblemente menor al mínimo del contrato)"
+                    )
                 raise Exception(
                     f"place-order ua-oneway {resp_ow.get('code')}: {resp_ow.get('msg')}"
                 )
@@ -557,6 +612,11 @@ class FuturesTrader:
                     f"orderId={order_id} [ua-oneway]"
                 )
                 return resp
+            if resp.get("code") == "45111":
+                raise Exception(
+                    f"place-order ua-oneway 45111: {resp.get('msg')} "
+                    f"(qty={qty} posiblemente menor al mínimo del contrato)"
+                )
             # 25236 con ua-oneway fijado → el contrato es hedge, cambiar
             if resp.get("code") == "25236" and hold_side:
                 logger.warning(
@@ -577,6 +637,11 @@ class FuturesTrader:
                         f"qty={qty} orderId={order_id} [ua-hedge]"
                     )
                     return resp_h
+                if resp_h.get("code") == "45111":
+                    raise Exception(
+                        f"place-order ua-hedge 45111: {resp_h.get('msg')} "
+                        f"(qty={qty} posiblemente menor al mínimo del contrato)"
+                    )
                 raise Exception(
                     f"place-order ua-hedge {resp_h.get('code')}: {resp_h.get('msg')}"
                 )
@@ -602,6 +667,12 @@ class FuturesTrader:
                     f"qty={qty} orderId={order_id} [ua-hedge]"
                 )
                 return resp_hedge
+
+            if resp_hedge.get("code") == "45111":
+                raise Exception(
+                    f"place-order ua-hedge 45111: {resp_hedge.get('msg')} "
+                    f"(qty={qty} posiblemente menor al mínimo del contrato)"
+                )
 
             if resp_hedge.get("code") != "25236":
                 raise Exception(
@@ -630,12 +701,21 @@ class FuturesTrader:
             )
             return resp_ow
 
-        # Ambos ua-hedge y ua-oneway fallan con 25236 → intentar forzar modo hedge via API
+        if resp_ow.get("code") == "45111":
+            raise Exception(
+                f"place-order ua-oneway 45111: {resp_ow.get('msg')} "
+                f"(qty={qty} posiblemente menor al mínimo del contrato)"
+            )
+
+        # Ambos ua-hedge y ua-oneway fallan con 25236 → intentar switch-position-mode
         if resp_ow.get("code") == "25236":
             logger.warning(
                 f"[{self.symbol}] ⚠️ Ambos ua-hedge y ua-oneway devuelven 25236 — "
                 f"intentando forzar posMode=hedge via switch-position-mode"
             )
+            switched = False
+
+            # Intentar switch a hedge
             try:
                 sym_local = self._bitget_symbol(self.symbol)
                 switch_payload = {
@@ -651,7 +731,7 @@ class FuturesTrader:
                 )
                 if r_switch.get("code") == "00000":
                     self._ua_pos_mode = "hedge"
-                    # Reintentar con hedge tras cambio de modo
+                    switched = True
                     if hold_side:
                         payload_retry = self._build_payload_ua_hedge(
                             sym, side, trade_side, qty, hold_side
@@ -669,47 +749,76 @@ class FuturesTrader:
                                 f"orderId={order_id} [ua-hedge-after-switch]"
                             )
                             return resp_retry
+                        if resp_retry.get("code") == "45111":
+                            raise Exception(
+                                f"place-order 45111 after switch: {resp_retry.get('msg')} "
+                                f"(qty={qty})"
+                            )
             except Exception as e_sw:
+                # Solo relanzar si es 45111, los demás son errores de switch esperados
+                if "45111" in str(e_sw):
+                    raise
                 logger.warning(
-                    f"[{self.symbol}] switch-position-mode falló: {e_sw}"
+                    f"[{self.symbol}] switch-position-mode hedge falló: {e_sw}"
                 )
-            # Intentar también forzar one_way
-            try:
-                sym_local = self._bitget_symbol(self.symbol)
-                switch_payload_ow = {
-                    "symbol":   sym_local,
-                    "category": "USDT-FUTURES",
-                    "posMode":  "oneway",
-                }
-                r_switch_ow = await self._http_post(
-                    "/api/v3/position/switch-position-mode", switch_payload_ow
-                )
-                logger.info(
-                    f"[{self.symbol}] 🔄 switch-position-mode oneway: {r_switch_ow}"
-                )
-                if r_switch_ow.get("code") == "00000":
-                    self._ua_pos_mode = "one_way"
-                    payload_retry_ow = self._build_payload_ua_oneway(
-                        sym, side, trade_side, qty
+
+            # Si switch a hedge falla, intentar switch a oneway
+            if not switched:
+                try:
+                    sym_local = self._bitget_symbol(self.symbol)
+                    switch_payload_ow = {
+                        "symbol":   sym_local,
+                        "category": "USDT-FUTURES",
+                        "posMode":  "oneway",
+                    }
+                    r_switch_ow = await self._http_post(
+                        "/api/v3/position/switch-position-mode", switch_payload_ow
                     )
-                    resp_retry_ow = await self._http_post(path, payload_retry_ow)
                     logger.info(
-                        f"[{self.symbol}] 📥 response [ua-oneway-after-switch]: "
-                        f"{resp_retry_ow}"
+                        f"[{self.symbol}] 🔄 switch-position-mode oneway: {r_switch_ow}"
                     )
-                    if resp_retry_ow.get("code") == "00000":
-                        order_id = (
-                            resp_retry_ow.get("data") or {}
-                        ).get("orderId", "?")
-                        logger.info(
-                            f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} "
-                            f"orderId={order_id} [ua-oneway-after-switch]"
+                    if r_switch_ow.get("code") == "00000":
+                        self._ua_pos_mode = "one_way"
+                        payload_retry_ow = self._build_payload_ua_oneway(
+                            sym, side, trade_side, qty
                         )
-                        return resp_retry_ow
-            except Exception as e_sw2:
-                logger.warning(
-                    f"[{self.symbol}] switch-position-mode oneway falló: {e_sw2}"
-                )
+                        resp_retry_ow = await self._http_post(path, payload_retry_ow)
+                        logger.info(
+                            f"[{self.symbol}] 📥 response [ua-oneway-after-switch]: "
+                            f"{resp_retry_ow}"
+                        )
+                        if resp_retry_ow.get("code") == "00000":
+                            order_id = (
+                                resp_retry_ow.get("data") or {}
+                            ).get("orderId", "?")
+                            logger.info(
+                                f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} "
+                                f"orderId={order_id} [ua-oneway-after-switch]"
+                            )
+                            return resp_retry_ow
+                        if resp_retry_ow.get("code") == "45111":
+                            raise Exception(
+                                f"place-order 45111 after switch-oneway: "
+                                f"{resp_retry_ow.get('msg')} (qty={qty})"
+                            )
+                except Exception as e_sw2:
+                    if "45111" in str(e_sw2):
+                        raise
+                    logger.warning(
+                        f"[{self.symbol}] switch-position-mode oneway falló: {e_sw2}"
+                    )
+
+            # Si llegamos aquí, el contrato no acepta ningún modo vía API.
+            # Registrar como incompatible para no reintentar en este ciclo.
+            logger.error(
+                f"[{self.symbol}] ❌ Contrato {sym} no acepta ningún modo de posición "
+                f"(25236 persistente). El par puede no soportar futuros perpetuos "
+                f"en esta cuenta. Omitiendo."
+            )
+            raise Exception(
+                f"place-order 25236 persistente: {sym} no acepta hedge ni one_way. "
+                f"Verificar en Bitget UI si el par está disponible para esta cuenta."
+            )
 
         raise Exception(
             f"place-order ua-oneway {resp_ow.get('code')}: {resp_ow.get('msg')}"
