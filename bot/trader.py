@@ -152,13 +152,15 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
     # ÓRDENES — con fallback automático v3 → v2 Mix
     #
-    # Algunos contratos (ej: BEAT, SOXL) no están disponibles en
-    # la API v3 de Bitget y devuelven 25236 incluso con holdSide
+    # Algunos contratos (ej: BEAT, XLM, SOXL) no están disponibles
+    # en la API v3 de Bitget y devuelven 25236 incluso con holdSide
     # correcto. Para ellos usamos la API v2 Mix con tradeSide.
     #
     # Flujo:
     #   1. Si self._api_version ya está fijado, usarlo directamente.
-    #   2. Si no, intentar v3 primero.
+    #   2. Si no, intentar v3 primero (sin capturar excepciones — se
+    #      comprueba el código de respuesta directamente para no
+    #      depender del raise de _place_order_v3).
     #   3. Si v3 devuelve 25236, cambiar a v2 y reintentar.
     #   4. Guardar la versión que funcionó para futuras órdenes.
     # ─────────────────────────────────────────────────────────────
@@ -187,17 +189,17 @@ class FuturesTrader:
 
     def _build_payload_v2(self, sym: str, side: str, trade_side: str,
                           qty: float, hold_side: str) -> dict:
-        """Payload para /api/v2/mix/order/place-order (tradeSide)."""
+        """Payload para /api/v2/mix/order/place-order (tradeSide, sin holdSide)."""
         is_close = trade_side == "close"
         payload = {
-            "symbol":     sym,
+            "symbol":      sym,
             "productType": "USDT-FUTURES",
-            "marginMode": self.margin_mode,
-            "marginCoin": "USDT",
-            "size":       str(qty),
-            "side":       side,
-            "orderType":  "market",
-            "tradeSide":  trade_side,
+            "marginMode":  self.margin_mode,
+            "marginCoin":  "USDT",
+            "size":        str(qty),
+            "side":        side,
+            "orderType":   "market",
+            "tradeSide":   trade_side,
         }
         if is_close:
             payload["reduceOnly"] = "YES"
@@ -207,6 +209,13 @@ class FuturesTrader:
                            hold_side: str = None) -> dict:
         """
         Coloca una orden con fallback automático v3 → v2 Mix.
+
+        El error 25236 ocurre cuando un contrato específico no admite
+        holdSide (modo hedge) aunque la cuenta global esté en hedge.
+        Algunos pares (BEAT, XLM, SOXL...) sólo aceptan la API v2 Mix
+        con tradeSide. Este método detecta eso automáticamente y memoriza
+        la versión correcta por par para evitar dobles intentos.
+
         - side       : "buy" | "sell"
         - trade_side : "open" | "close"
         - qty        : cantidad en contratos
@@ -220,23 +229,52 @@ class FuturesTrader:
         if self._api_version == "v2":
             return await self._place_order_v2(sym, side, trade_side, qty, hold_side)
 
-        # Autodetección: intentar v3 primero
-        try:
-            result = await self._place_order_v3(sym, side, trade_side, qty, hold_side)
+        # ── Autodetección: intentar v3 primero ──────────────────
+        # Usamos _http_post directamente para capturar el código 25236
+        # ANTES de que _place_order_v3 lance la excepción, evitando
+        # que el bloque except necesite parsear el mensaje de error.
+        path_v3  = "/api/v3/trade/place-order"
+        payload_v3 = self._build_payload_v3(sym, side, trade_side, qty, hold_side)
+        logger.info(f"[{self.symbol}] 📤 order [v3]: {payload_v3}")
+        resp_v3 = await self._http_post(path_v3, payload_v3)
+        logger.info(f"[{self.symbol}] 📥 response [v3]: {resp_v3}")
+
+        if resp_v3.get("code") == "00000":
             self._api_version = "v3"
             logger.info(f"[{self.symbol}] 📌 API version fijada: v3")
-            return result
-        except Exception as e:
-            if "25236" in str(e):
-                logger.warning(
-                    f"[{self.symbol}] ⚠️ v3 devolvió 25236 — "
-                    f"este contrato no soporta v3, usando v2 Mix"
-                )
-                result = await self._place_order_v2(sym, side, trade_side, qty, hold_side)
+            order_id = (resp_v3.get("data") or {}).get("orderId", "?")
+            logger.info(
+                f"[{self.symbol}] ✅ {side}/{trade_side} holdSide={hold_side} "
+                f"qty={qty} orderId={order_id} [v3]"
+            )
+            return resp_v3
+
+        if resp_v3.get("code") == "25236":
+            # Este contrato no soporta v3/holdSide → probar v2 Mix
+            logger.warning(
+                f"[{self.symbol}] ⚠️ v3 devolvió 25236 — "
+                f"contrato no soporta holdSide, usando v2 Mix"
+            )
+            path_v2    = "/api/v2/mix/order/place-order"
+            payload_v2 = self._build_payload_v2(sym, side, trade_side, qty, hold_side)
+            logger.info(f"[{self.symbol}] 📤 retry [v2]: {payload_v2}")
+            resp_v2 = await self._http_post(path_v2, payload_v2)
+            logger.info(f"[{self.symbol}] 📥 response [v2]: {resp_v2}")
+
+            if resp_v2.get("code") == "00000":
                 self._api_version = "v2"
                 logger.info(f"[{self.symbol}] 📌 API version fijada: v2 Mix")
-                return result
-            raise
+                order_id = (resp_v2.get("data") or {}).get("orderId", "?")
+                logger.info(
+                    f"[{self.symbol}] ✅ {side}/{trade_side} tradeSide={trade_side} "
+                    f"qty={qty} orderId={order_id} [v2]"
+                )
+                return resp_v2
+
+            raise Exception(f"place-order {resp_v2.get('code')}: {resp_v2.get('msg')}")
+
+        # Cualquier otro error de v3
+        raise Exception(f"place-order {resp_v3.get('code')}: {resp_v3.get('msg')}")
 
     async def _place_order_v3(self, sym: str, side: str, trade_side: str,
                                qty: float, hold_side: str) -> dict:
