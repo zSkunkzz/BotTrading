@@ -71,13 +71,8 @@ class FuturesTrader:
         self._api_key     = api_key
         self._api_secret  = api_secret
         self._passphrase  = passphrase
-        # None = autodetectar, "v3" | "v2" | "ua" = fijado tras primer éxito
         self._api_version = None
-        # Modo de posición para Unified Account (v3): "hedge" | "one_way"
         self._ua_pos_mode = None
-        # Modo de posición para cuenta Clásica (v2): "hedge" | "one_way"
-        # Se mantiene SEPARADO de _ua_pos_mode para que el fallback 25236
-        # en v2 no contamine el estado de UA ni viceversa.
         self._v2_pos_mode = None
         self.exchange = ccxt.bitget({
             "apiKey":   api_key,
@@ -136,10 +131,6 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
 
     async def _detect_account_type(self):
-        """
-        Detecta si la cuenta es Unified (UA / v3) o Clásica (v2).
-        Fija self._api_version y detecta el pos_mode adecuado.
-        """
         try:
             r = await self._http_get("/api/v3/account/assets", {"coin": "USDT"})
             if r.get("code") == "00000":
@@ -174,10 +165,6 @@ class FuturesTrader:
         self._v2_pos_mode = "hedge"
 
     async def _detect_ua_pos_mode(self):
-        """
-        Para cuentas UA: detecta si el par está en hedge o one_way.
-        Consulta posiciones abiertas; si no hay, asume hedge (default de Bitget UA).
-        """
         try:
             sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
             r = await self._http_get(
@@ -202,10 +189,6 @@ class FuturesTrader:
         self._ua_pos_mode = "hedge"
 
     async def _detect_v2_pos_mode(self):
-        """
-        Para cuentas Clásicas v2: detecta si el par está en hedge o one_way.
-        Consulta posiciones abiertas; si no hay, asume hedge (default de Bitget).
-        """
         try:
             sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
             r = await self._http_get(
@@ -239,7 +222,6 @@ class FuturesTrader:
 
     async def get_balance(self) -> float:
         """Retorna el balance USDT disponible."""
-        # Intenta primero v3 (UA)
         try:
             r = await self._http_get("/api/v3/account/assets", {"coin": "USDT"})
             if r.get("code") == "00000":
@@ -252,7 +234,6 @@ class FuturesTrader:
         except Exception:
             pass
 
-        # Fallback v2
         try:
             sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
             r = await self._http_get(
@@ -412,14 +393,6 @@ class FuturesTrader:
 
     # ─────────────────────────────────────────────────────────────
     # COLOCAR / CERRAR ÓRDENES
-    #
-    # FIX 25236 (definitivo):
-    #   - UA  usa _ua_pos_mode  (independiente)
-    #   - v2  usa _v2_pos_mode  (independiente)
-    #   El fallback 25236 en cada bloque SOLO alterna su propio modo,
-    #   sin contaminar el del otro bloque.
-    #   Payload one_way NO lleva tradeSide/posSide.
-    #   Payload hedge SÍ lleva posSide (UA) o tradeSide (v2).
     # ─────────────────────────────────────────────────────────────
 
     async def _place_order(self, side: str, trade_side: str, qty: float):
@@ -489,12 +462,9 @@ class FuturesTrader:
                 logger.debug(f"[{self.symbol}] ua order error: {e}")
 
         # ── v2 Classic ──
-        # USA _v2_pos_mode, completamente independiente de _ua_pos_mode.
-        # Así el fallback 25236 en v2 no afecta al estado UA.
         try:
-            # Inicializar _v2_pos_mode si aún es None
             if self._v2_pos_mode is None:
-                self._v2_pos_mode = "hedge"  # default seguro
+                self._v2_pos_mode = "hedge"
 
             v2_mode = self._v2_pos_mode
 
@@ -510,7 +480,6 @@ class FuturesTrader:
                 }
                 if mode == "hedge":
                     p["tradeSide"] = "open" if trade_side == "open" else "close"
-                # one_way: no lleva tradeSide
                 return p
 
             payload_v2 = _build_v2_payload(v2_mode)
@@ -548,6 +517,89 @@ class FuturesTrader:
 
         except Exception as e:
             raise
+
+    # ─────────────────────────────────────────────────────────────
+    # COLOCAR SL NATIVO EN BITGET (orden real en el exchange)
+    # ─────────────────────────────────────────────────────────────
+
+    async def _place_sl_order(self, pos_side: str, sl_price: float, qty: float):
+        """
+        Coloca una Stop-Loss order nativa en Bitget.
+        pos_side: 'long' o 'short'
+        sl_price: precio de trigger del SL
+        qty:      contratos de la posición abierta
+        """
+        if self.dry_run:
+            logger.info(f"[{self.symbol}] 🧪 DRY — SL nativo simulado @ {sl_price}")
+            return
+
+        sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        close_side = "sell" if pos_side == "long" else "buy"
+
+        # Intentar v3 (UA) primero
+        if self._api_version in ("ua", None):
+            try:
+                payload = {
+                    "symbol":        sym_clean,
+                    "productType":   "USDT-FUTURES",
+                    "marginCoin":    "USDT",
+                    "planType":      "loss_plan",
+                    "triggerPrice":  str(round(sl_price, 6)),
+                    "triggerType":   "mark_price",
+                    "executePrice":  "0",        # market al trigger
+                    "holdSide":      pos_side,
+                    "size":          str(qty),
+                    "side":          close_side,
+                    "orderType":     "market",
+                    "marginMode":    self.margin_mode,
+                }
+                r = await self._http_post("/api/v3/mix/order/place-tpsl-order", payload)
+                logger.info(f"[{self.symbol}] 📥 SL nativo (v3): {r}")
+                if r.get("code") == "00000":
+                    logger.warning(
+                        f"[{self.symbol}] 🛡️ SL nativo colocado @ {sl_price} (v3)"
+                    )
+                    return
+                logger.warning(
+                    f"[{self.symbol}] ⚠️ SL v3 falló: {r.get('code')} {r.get('msg')}"
+                )
+            except Exception as e:
+                logger.debug(f"[{self.symbol}] _place_sl_order v3 error: {e}")
+
+        # Fallback v2
+        try:
+            ua_mode = self._ua_pos_mode or self._v2_pos_mode or "hedge"
+            payload_v2 = {
+                "symbol":        sym_clean,
+                "productType":   "USDT-FUTURES",
+                "marginCoin":    "USDT",
+                "planType":      "loss_plan",
+                "triggerPrice":  str(round(sl_price, 6)),
+                "triggerType":   "mark_price",
+                "executePrice":  "0",
+                "holdSide":      pos_side,
+                "size":          str(qty),
+                "side":          close_side,
+                "orderType":     "market",
+                "marginMode":    self.margin_mode,
+            }
+            if ua_mode == "hedge":
+                payload_v2["tradeSide"] = "close"
+            r2 = await self._http_post("/api/v2/mix/order/place-tpsl-order", payload_v2)
+            logger.info(f"[{self.symbol}] 📥 SL nativo (v2): {r2}")
+            if r2.get("code") == "00000":
+                logger.warning(
+                    f"[{self.symbol}] 🛡️ SL nativo colocado @ {sl_price} (v2)"
+                )
+                return
+            logger.warning(
+                f"[{self.symbol}] ⚠️ SL v2 falló: {r2.get('code')} {r2.get('msg')} "
+                f"— SL solo por software"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{self.symbol}] ⚠️ _place_sl_order v2 error: {e} — SL solo por software"
+            )
 
     # ─────────────────────────────────────────────────────────────
     # INIT
@@ -655,6 +707,7 @@ class FuturesTrader:
             f"(usdt={usdt_amount} × lev={effective_lev}x ÷ price={price})"
         )
         await self._place_order(side, "open", qty)
+        return qty  # devolvemos qty para usarla en el SL nativo
 
     async def _close_order(self, pos_side: str, qty: float):
         side = "sell" if pos_side == "long" else "buy"
@@ -739,7 +792,7 @@ class FuturesTrader:
         effective_lev = self.leverage
         if leverage:
             effective_lev = await self._set_leverage_on_exchange(leverage)
-        await self._open_order("buy", usdt_amount, leverage=effective_lev)
+        qty = await self._open_order("buy", usdt_amount, leverage=effective_lev)
         self.position    = "long"
         self.entry_price = await self.get_price()
         self.sl = sl; self.tp1 = tp1; self.tp2 = tp2; self.tp3 = tp3
@@ -757,6 +810,14 @@ class FuturesTrader:
             f"📈 [{self.symbol}] LONG @ {self.entry_price} | "
             f"x{self.leverage} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}"
         )
+        # Colocar SL nativo en Bitget para proteger si el bot se cae
+        if sl is not None:
+            try:
+                await self._place_sl_order("long", sl, qty)
+            except Exception as e:
+                logger.warning(
+                    f"[{self.symbol}] ⚠️ SL nativo LONG no colocado: {e} — SL solo por software"
+                )
         await notify_open(
             self.symbol, "long", self.entry_price, self.leverage,
             usdt_amount, self.dry_run
@@ -767,7 +828,7 @@ class FuturesTrader:
         effective_lev = self.leverage
         if leverage:
             effective_lev = await self._set_leverage_on_exchange(leverage)
-        await self._open_order("sell", usdt_amount, leverage=effective_lev)
+        qty = await self._open_order("sell", usdt_amount, leverage=effective_lev)
         self.position    = "short"
         self.entry_price = await self.get_price()
         self.sl = sl; self.tp1 = tp1; self.tp2 = tp2; self.tp3 = tp3
@@ -785,6 +846,14 @@ class FuturesTrader:
             f"📉 [{self.symbol}] SHORT @ {self.entry_price} | "
             f"x{self.leverage} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}"
         )
+        # Colocar SL nativo en Bitget para proteger si el bot se cae
+        if sl is not None:
+            try:
+                await self._place_sl_order("short", sl, qty)
+            except Exception as e:
+                logger.warning(
+                    f"[{self.symbol}] ⚠️ SL nativo SHORT no colocado: {e} — SL solo por software"
+                )
         await notify_open(
             self.symbol, "short", self.entry_price, self.leverage,
             usdt_amount, self.dry_run
