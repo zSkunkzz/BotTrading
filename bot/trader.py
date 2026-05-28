@@ -44,6 +44,9 @@ _MIN_QTY_FALLBACK = {
     "WLDUSDT":   0.1,
     "BEATUSDT":  1.0,
     "BZUSDT":    1.0,
+    "TAOUSDT":   0.001,
+    "ADAUSDT":   1.0,
+    "DOGEUSDTUSDT": 1.0,
 }
 
 # Cache de min_qty leídos desde API (sym → float)
@@ -51,24 +54,29 @@ _min_qty_cache: dict = {}
 
 # ─────────────────────────────────────────────────────────────
 # CACHÉ GLOBAL DE BALANCE (compartido por todos los traders)
-# Evita N llamadas HTTP simultáneas a Bitget — una sola cada 30s
+# TTL solo se actualiza cuando la llamada HTTP TIENE ÉXITO.
+# Si falla, se reintenta en el próximo ciclo sin bloquear.
 # ─────────────────────────────────────────────────────────────
-_BALANCE_CACHE_TTL = int(os.getenv("BALANCE_CACHE_TTL", "30"))  # segundos
+_BALANCE_CACHE_TTL  = int(os.getenv("BALANCE_CACHE_TTL", "30"))   # segundos
 _balance_cache_value: float = 0.0
-_balance_cache_ts: float = 0.0
-_balance_cache_lock: asyncio.Lock = None  # se inicializa en el primer uso
+_balance_cache_ts:    float = 0.0   # solo se actualiza en éxito
+_balance_fetch_lock:  asyncio.Lock = None  # lazy-init
 
 
 def _get_balance_lock() -> asyncio.Lock:
-    """Lazy-init del lock para ser compatible con el event loop de asyncio."""
-    global _balance_cache_lock
-    if _balance_cache_lock is None:
-        _balance_cache_lock = asyncio.Lock()
-    return _balance_cache_lock
+    global _balance_fetch_lock
+    if _balance_fetch_lock is None:
+        _balance_fetch_lock = asyncio.Lock()
+    return _balance_fetch_lock
 
 
 async def _fetch_balance_once(api_key, api_secret, passphrase) -> float:
-    """Hace la llamada real a Bitget y actualiza el caché global."""
+    """
+    Llama a la API de Bitget y devuelve el balance USDT disponible.
+    Actualiza el caché global SOLO si la llamada tiene éxito.
+    Si falla, deja _balance_cache_ts intacto (= 0 la primera vez)
+    para que el próximo ciclo vuelva a intentarlo.
+    """
     global _balance_cache_value, _balance_cache_ts
 
     def _sign(ts, method, path_with_qs, body=""):
@@ -88,68 +96,84 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float:
             "locale":            "en-US",
         }
 
-    # Intentar v3 (Unified Account)
+    # ── Intentar v3 (Unified Account) ──
     try:
         path = "/api/v3/account/assets"
-        qs = "?coin=USDT"
-        headers = _headers("GET", path + qs)
-        url = "https://api.bitget.com" + path + qs
+        qs   = "?coin=USDT"
+        url  = "https://api.bitget.com" + path + qs
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers=headers,
+            async with s.get(url, headers=_headers("GET", path + qs),
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
                 data = await r.json()
+        logger.debug(f"[BalanceCache] v3 raw response: {data}")
         if data.get("code") == "00000":
             for item in (data.get("data") or []):
                 if item.get("coin") == "USDT":
-                    bal = float(item.get("available", 0) or item.get("crossMaxAvailable", 0))
+                    bal = float(
+                        item.get("available") or
+                        item.get("crossMaxAvailable") or 0
+                    )
                     _balance_cache_value = bal
-                    _balance_cache_ts = time.monotonic()
+                    _balance_cache_ts    = time.monotonic()
                     logger.info(f"[BalanceCache] ✅ Balance USDT (v3): {bal:.2f}")
                     return bal
+        else:
+            logger.warning(
+                f"[BalanceCache] ⚠️ v3 code={data.get('code')} msg={data.get('msg')}"
+            )
     except Exception as e:
-        logger.debug(f"[BalanceCache] v3 error: {e}")
+        logger.warning(f"[BalanceCache] ❌ v3 excepción: {e}")
 
-    # Fallback v2
+    # ── Fallback v2 ──
     try:
         path = "/api/v2/mix/account/accounts"
-        qs = "?productType=USDT-FUTURES"
-        headers = _headers("GET", path + qs)
-        url = "https://api.bitget.com" + path + qs
+        qs   = "?productType=USDT-FUTURES"
+        url  = "https://api.bitget.com" + path + qs
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers=headers,
+            async with s.get(url, headers=_headers("GET", path + qs),
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
                 data = await r.json()
+        logger.debug(f"[BalanceCache] v2 raw response: {data}")
         if data.get("code") == "00000":
             items = data.get("data") or []
             if items:
-                bal = float(items[0].get("available", 0))
+                bal = float(items[0].get("available") or 0)
                 _balance_cache_value = bal
-                _balance_cache_ts = time.monotonic()
+                _balance_cache_ts    = time.monotonic()
                 logger.info(f"[BalanceCache] ✅ Balance USDT (v2): {bal:.2f}")
                 return bal
+        else:
+            logger.warning(
+                f"[BalanceCache] ⚠️ v2 code={data.get('code')} msg={data.get('msg')}"
+            )
     except Exception as e:
-        logger.debug(f"[BalanceCache] v2 error: {e}")
+        logger.warning(f"[BalanceCache] ❌ v2 excepción: {e}")
 
-    logger.warning("[BalanceCache] ⚠️ No se pudo obtener balance — manteniendo caché anterior")
-    # Devolver el último valor conocido (no sobreescribir con 0)
-    return _balance_cache_value
+    # ── Ambos endpoints fallaron ──
+    # NO actualizamos _balance_cache_ts → el próximo ciclo reintentará
+    logger.error(
+        "[BalanceCache] 🚨 Ambos endpoints fallaron — balance NO actualizado. "
+        f"Valor en caché: {_balance_cache_value:.2f} USDT. "
+        "Se reintentará en el próximo ciclo."
+    )
+    return _balance_cache_value  # devuelve último conocido (0 si nunca se obtuvo)
 
 
 async def get_cached_balance(api_key, api_secret, passphrase) -> float:
     """
-    Devuelve el balance USDT disponible desde caché global.
+    Devuelve el balance USDT desde caché global.
     Solo llama a la API si han pasado más de BALANCE_CACHE_TTL segundos
-    desde la última lectura exitosa. Todos los traders comparten este valor.
+    desde la ÚLTIMA LLAMADA EXITOSA. Si la última llamada falló,
+    _balance_cache_ts no se actualizó → siempre reintenta hasta obtener éxito.
     """
     global _balance_cache_value, _balance_cache_ts
     lock = _get_balance_lock()
-    now = time.monotonic()
+    now  = time.monotonic()
 
     if now - _balance_cache_ts < _BALANCE_CACHE_TTL:
         return _balance_cache_value
 
     async with lock:
-        # Double-check dentro del lock para evitar llamadas concurrentes
         now = time.monotonic()
         if now - _balance_cache_ts < _BALANCE_CACHE_TTL:
             return _balance_cache_value
@@ -600,12 +624,6 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
 
     async def _place_sl_order(self, pos_side: str, sl_price: float, qty: float):
-        """
-        Coloca una Stop-Loss order nativa en Bitget.
-        pos_side: 'long' o 'short'
-        sl_price: precio de trigger del SL
-        qty:      contratos de la posición abierta
-        """
         if self.dry_run:
             logger.info(f"[{self.symbol}] 🧪 DRY — SL nativo simulado @ {sl_price}")
             return
@@ -613,7 +631,6 @@ class FuturesTrader:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         close_side = "sell" if pos_side == "long" else "buy"
 
-        # Intentar v3 (UA) primero
         if self._api_version in ("ua", None):
             try:
                 payload = {
@@ -623,7 +640,7 @@ class FuturesTrader:
                     "planType":      "loss_plan",
                     "triggerPrice":  str(round(sl_price, 6)),
                     "triggerType":   "mark_price",
-                    "executePrice":  "0",        # market al trigger
+                    "executePrice":  "0",
                     "holdSide":      pos_side,
                     "size":          str(qty),
                     "side":          close_side,
@@ -643,7 +660,6 @@ class FuturesTrader:
             except Exception as e:
                 logger.debug(f"[{self.symbol}] _place_sl_order v3 error: {e}")
 
-        # Fallback v2
         try:
             ua_mode = self._ua_pos_mode or self._v2_pos_mode or "hedge"
             payload_v2 = {
@@ -784,7 +800,7 @@ class FuturesTrader:
             f"(usdt={usdt_amount} × lev={effective_lev}x ÷ price={price})"
         )
         await self._place_order(side, "open", qty)
-        return qty  # devolvemos qty para usarla en el SL nativo
+        return qty
 
     async def _close_order(self, pos_side: str, qty: float):
         side = "sell" if pos_side == "long" else "buy"
@@ -887,7 +903,6 @@ class FuturesTrader:
             f"📈 [{self.symbol}] LONG @ {self.entry_price} | "
             f"x{self.leverage} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}"
         )
-        # Colocar SL nativo en Bitget para proteger si el bot se cae
         if sl is not None:
             try:
                 await self._place_sl_order("long", sl, qty)
@@ -923,7 +938,6 @@ class FuturesTrader:
             f"📉 [{self.symbol}] SHORT @ {self.entry_price} | "
             f"x{self.leverage} | SL={sl} TP1={tp1} TP2={tp2} TP3={tp3}"
         )
-        # Colocar SL nativo en Bitget para proteger si el bot se cae
         if sl is not None:
             try:
                 await self._place_sl_order("short", sl, qty)
