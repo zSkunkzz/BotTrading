@@ -549,13 +549,14 @@ class FuturesTrader:
 
                 def _build_ua_payload(mode: str) -> dict:
                     p = {
-                        "symbol":     sym_clean,
-                        "category":   "USDT-FUTURES",
-                        "marginMode": self.margin_mode,
-                        "marginCoin": "USDT",
-                        "qty":        str(qty),
-                        "side":       side,
-                        "orderType":  "market",
+                        "symbol":      sym_clean,
+                        # FIX: productType en lugar de category
+                        "productType": "USDT-FUTURES",
+                        "marginMode":  self.margin_mode,
+                        "marginCoin":  "USDT",
+                        "qty":         str(qty),
+                        "side":        side,
+                        "orderType":   "market",
                     }
                     if mode == "hedge":
                         pos_side = "long" if side == "buy" else "short"
@@ -746,9 +747,12 @@ class FuturesTrader:
 
         await self._detect_account_type()
 
+        # FIX: usar params dict en _http_get, no query string embebido en el path
         if self._api_version is None:
             try:
-                r_check = await self._http_get("/api/v3/account/assets?coin=USDT")
+                r_check = await self._http_get(
+                    "/api/v3/account/assets", {"coin": "USDT"}
+                )
                 if r_check.get("code") == "00000":
                     self._api_version = "ua"
                     logger.info(
