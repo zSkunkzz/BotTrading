@@ -20,13 +20,6 @@ logger = logging.getLogger("Trader")
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 BITGET_BASE = "https://api.bitget.com"
 
-# Cache de posMode por symbol: 'hedge' | 'one_way'
-# Se detecta automáticamente al primer intento fallido.
-_pos_mode_cache: dict = {}
-
-# Cache del posMode real de la cuenta (se consulta una vez al arranque)
-_account_pos_mode: str | None = None
-
 
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
@@ -155,111 +148,63 @@ class FuturesTrader:
         return 0.0
 
     # ─────────────────────────────────────────────────────────────
-    # DETECTAR POSMODE REAL DE LA CUENTA
-    # ─────────────────────────────────────────────────────────────
-
-    async def _fetch_account_pos_mode(self) -> str:
-        """
-        Consulta el posMode real configurado en la cuenta de Bitget.
-        Retorna 'hedge' o 'one_way'.
-        La API devuelve: 'hedge_mode' | 'one_way_mode'
-        """
-        global _account_pos_mode
-        if _account_pos_mode is not None:
-            return _account_pos_mode
-        try:
-            r = await self._http_get("/api/v3/position/account-mode?productType=USDT-FUTURES")
-            code = r.get("code")
-            if code == "00000":
-                raw = str((r.get("data") or {}).get("posMode") or "").lower()
-                # Bitget devuelve: "hedge_mode" | "one_way_mode"
-                mode = "hedge" if "hedge" in raw else "one_way"
-                logger.info(f"[{self.symbol}] 🔍 posMode cuenta: {raw} → usando '{mode}'")
-                _account_pos_mode = mode
-                # Precarga el cache para este símbolo
-                _pos_mode_cache[self.symbol] = mode
-                return mode
-            else:
-                logger.warning(f"[{self.symbol}] ⚠️ account-mode error {code}: {r.get('msg')} — asumiendo one_way")
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] ⚠️ account-mode excepción: {e} — asumiendo one_way")
-        _account_pos_mode = "one_way"
-        _pos_mode_cache[self.symbol] = "one_way"
-        return "one_way"
-
-    # ─────────────────────────────────────────────────────────────
-    # ÓRDENES — Usa posMode real de la cuenta
+    # ÓRDENES — API v3 Bitget con holdSide
+    #
+    # La API v3 de Bitget usa holdSide ('long'|'short') para identificar
+    # la dirección de la posición. Este campo es obligatorio y es el que
+    # reemplaza a tradeSide de la v2. Sin él se recibe error 25236.
+    #
+    # Apertura:  side=buy  + holdSide=long  | side=sell + holdSide=short
+    # Cierre:    side=sell + holdSide=long  | side=buy  + holdSide=short
+    #            + reduceOnly=YES
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _bitget_symbol(ccxt_symbol: str) -> str:
         return ccxt_symbol.split("/")[0] + ccxt_symbol.split("/")[1].split(":")[0]
 
-    def _pos_mode(self) -> str:
-        """Devuelve 'hedge' o 'one_way' según caché (default: one_way)."""
-        return _pos_mode_cache.get(self.symbol, "one_way")
-
-    async def _place_order(self, side: str, trade_side: str, qty: float) -> dict:
+    async def _place_order(self, side: str, trade_side: str, qty: float,
+                           hold_side: str = None) -> dict:
         """
         side       : "buy" | "sell"
         trade_side : "open" | "close"
         qty        : cantidad en contratos
+        hold_side  : "long" | "short" — dirección de la posición (requerido en v3)
 
-        Detecta posMode real de la cuenta en el primer intento.
-        Si aun así recibe 25236 hace un único fallback al modo contrario.
+        La API v3 de Bitget requiere holdSide para identificar la posición.
+        Sin holdSide → error 25236 en ambos modos (hedge y one_way).
         """
-        # Asegurar que tenemos el posMode real antes del primer order
-        await self._fetch_account_pos_mode()
-
         sym  = self._bitget_symbol(self.symbol)
         path = "/api/v3/trade/place-order"
-        mode = self._pos_mode()
         is_close = (trade_side == "close")
 
-        def build_payload(hedge: bool) -> dict:
-            p = {
-                "symbol":     sym,
-                "category":   "USDT-FUTURES",
-                "marginMode": self.margin_mode,
-                "marginCoin": "USDT",
-                "qty":        str(qty),
-                "side":       side,
-                "orderType":  "market",
-            }
-            if hedge:
-                p["tradeSide"] = trade_side        # "open" | "close"
-            else:
-                if is_close:
-                    p["reduceOnly"] = "YES"        # one-way cierre
-            return p
+        payload = {
+            "symbol":     sym,
+            "category":   "USDT-FUTURES",
+            "marginMode": self.margin_mode,
+            "marginCoin": "USDT",
+            "qty":        str(qty),
+            "side":       side,
+            "orderType":  "market",
+        }
 
-        # Intento 1: según modo real de la cuenta
-        payload = build_payload(hedge=(mode == "hedge"))
-        logger.info(f"[{self.symbol}] 📤 order [{mode}]: {payload}")
+        # holdSide es obligatorio en v3 para USDT perp
+        if hold_side:
+            payload["holdSide"] = hold_side
+
+        # En cierre siempre añadir reduceOnly
+        if is_close:
+            payload["reduceOnly"] = "YES"
+
+        logger.info(f"[{self.symbol}] 📤 order: {payload}")
         resp = await self._http_post(path, payload)
         logger.info(f"[{self.symbol}] 📥 response: {resp}")
 
-        # 25236 → modo incorrecto, cambiar y reintentar una vez
-        if resp.get("code") == "25236":
-            new_mode = "one_way" if mode == "hedge" else "hedge"
-            logger.warning(
-                f"[{self.symbol}] ⚠️ 25236 con mode={mode} → "
-                f"cambiando a {new_mode} y reintentando"
-            )
-            _pos_mode_cache[self.symbol] = new_mode
-            global _account_pos_mode
-            _account_pos_mode = new_mode  # actualizar también el global
-            payload = build_payload(hedge=(new_mode == "hedge"))
-            logger.info(f"[{self.symbol}] 📤 retry [{new_mode}]: {payload}")
-            resp = await self._http_post(path, payload)
-            logger.info(f"[{self.symbol}] 📥 retry response: {resp}")
-
         if resp.get("code") == "00000":
             order_id = (resp.get("data") or {}).get("orderId", "?")
-            effective_mode = _pos_mode_cache.get(self.symbol, "one_way")
             logger.info(
-                f"[{self.symbol}] ✅ {side}/{trade_side} qty={qty} "
-                f"mode={effective_mode} marginMode={self.margin_mode} orderId={order_id}"
+                f"[{self.symbol}] ✅ {side}/{trade_side} holdSide={hold_side} "
+                f"qty={qty} marginMode={self.margin_mode} orderId={order_id}"
             )
             return resp
 
@@ -296,8 +241,6 @@ class FuturesTrader:
 
     async def _init(self, usdt_amount: float):
         await self.exchange.load_markets()
-        # Detectar posMode real de la cuenta al arranque
-        await self._fetch_account_pos_mode()
         saved = load_position(self.symbol)
         if saved:
             self.position    = saved["position"]
@@ -339,21 +282,28 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────
 
     async def _open_order(self, side: str, usdt_amount: float):
+        """
+        side: "buy" (long) | "sell" (short)
+        holdSide se deriva del side: buy → long, sell → short
+        """
         price = await self.get_price()
         qty   = round((usdt_amount * self.leverage) / price, 4)
         if self.dry_run:
             logger.warning(f"[DRY][{self.symbol}] OPEN {side.upper()} {qty} @ {price}")
             return
-        await self._place_order(side, "open", qty)
+        hold_side = "long" if side == "buy" else "short"
+        await self._place_order(side, "open", qty, hold_side=hold_side)
 
     async def _close_order(self, pos_side: str, qty: float):
+        """
+        pos_side: "long" | "short" (dirección de la posición a cerrar)
+        El cierre usa el side opuesto con holdSide de la posición + reduceOnly
+        """
         if self.dry_run:
             logger.warning(f"[DRY][{self.symbol}] CLOSE {pos_side.upper()} {qty}")
             return
-        # hedge : side opuesto + tradeSide=close
-        # one_way: side opuesto + reduceOnly=YES (gestionado en _place_order)
         close_side = "sell" if pos_side == "long" else "buy"
-        await self._place_order(close_side, "close", qty)
+        await self._place_order(close_side, "close", qty, hold_side=pos_side)
 
     async def _partial_close_order(self, pos_side: str, ratio: float):
         if self.dry_run:
