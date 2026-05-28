@@ -1,13 +1,15 @@
 """
-ws_feed.py — WebSocket feed de Bitget para precio, OHLCV, Order Book L2 y Funding Rate.
+ws_feed.py — WebSocket feed de Bitget para precio, OHLCV y Order Book L2.
 
 Suscripciones por símbolo activo:
   • ticker         → precio last en tiempo real
   • candle15m      → candles 15m (últimas 200 velas en caché)
   • candle1H       → candles 1h
   • candle4H       → candles 4h
-  • books1         → mejor bid/ask + imbalance L2 en tiempo real
-  • funding-rate   → funding rate actual del perp
+  • books          → mejor bid/ask + imbalance L2 en tiempo real
+
+NOTA: funding-rate eliminado del WS (Bitget devuelve code 30016 con instId
+sin sufijo _UMCBL). El funding rate se consulta por REST cuando se necesita.
 
 Uso desde signal_engine.py:
     from bot.ws_feed import ws_feed
@@ -16,8 +18,6 @@ Uso desde signal_engine.py:
     ob      = ws_feed.get_orderbook_metrics("BTCUSDT")
     # ob → {"bid": float, "ask": float, "spread_pct": float, "imbalance": float}
     # imbalance: +1.0 = presión compradora total, -1.0 = vendedora total
-    funding = ws_feed.get_funding_rate("BTCUSDT")
-    # funding → float (ej: 0.0001) o None si no disponible
 
 El módulo arranca con ws_feed.start(symbols) y se detiene con ws_feed.stop().
 Se reconecta automáticamente con backoff exponencial.
@@ -64,7 +64,6 @@ class _OrderBookCache:
     __slots__ = ("bids", "asks", "ts")
 
     def __init__(self):
-        # lista de [precio, tamaño] ordenada: bids desc, asks asc
         self.bids: list = []
         self.asks: list = []
         self.ts:   float = 0.0
@@ -104,8 +103,6 @@ class _OrderBookCache:
         mid      = (best_bid + best_ask) / 2.0
         spread_pct = (best_ask - best_bid) / mid * 100 if mid > 0 else 0.0
 
-        # Imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-        # Rango: -1 (presión vendedora) a +1 (presión compradora)
         bid_vol = sum(s for _, s in self.bids[:5])
         ask_vol = sum(s for _, s in self.asks[:5])
         total   = bid_vol + ask_vol
@@ -126,7 +123,7 @@ class _OrderBookCache:
 # ── Caché por símbolo ─────────────────────────────────────────────────────────
 
 class _SymbolCache:
-    """Caché completa de un símbolo: precio, candles, OB y funding."""
+    """Caché completa de un símbolo: precio, candles y OB."""
 
     def __init__(self):
         self.price:        Optional[float] = None
@@ -134,8 +131,6 @@ class _SymbolCache:
         self.candles:      Dict[str, deque] = {tf: deque(maxlen=OHLCV_LIMIT) for tf in TF_MAP}
         self.candle_ts:    Dict[str, float] = {tf: 0.0 for tf in TF_MAP}
         self.ob:           _OrderBookCache  = _OrderBookCache()
-        self.funding_rate: Optional[float]  = None
-        self.funding_ts:   float = 0.0
 
     def update_price(self, last: float):
         self.price    = last
@@ -156,10 +151,6 @@ class _SymbolCache:
         else:
             dq.append(row)
         self.candle_ts[tf] = time.monotonic()
-
-    def update_funding(self, rate: float):
-        self.funding_rate = rate
-        self.funding_ts   = time.monotonic()
 
     def get_ohlcv_df(self, tf: str) -> pd.DataFrame:
         dq = self.candles.get(tf)
@@ -204,18 +195,10 @@ class WSFeed:
 
     def get_funding_rate(self, symbol: str) -> Optional[float]:
         """
-        Retorna el funding rate actual del perp (ej: 0.0001 = 0.01%),
-        o None si no hay datos WS disponibles aún.
-        Positivo → longs pagan → mercado sobrecargado de longs.
-        Negativo → shorts pagan → mercado sobrecargado de shorts.
+        Funding rate eliminado del WS (Bitget error 30016).
+        Retorna siempre None — consultar por REST si se necesita.
         """
-        c = self._cache.get(symbol)
-        if not c or c.funding_rate is None:
-            return None
-        # Caducar funding si tiene más de 10 minutos (se actualiza cada ~8h)
-        if time.monotonic() - c.funding_ts > 600:
-            return None
-        return c.funding_rate
+        return None
 
     def has_data(self, symbol: str, tf: str = "15m", min_candles: int = 55) -> bool:
         c = self._cache.get(symbol)
@@ -307,18 +290,22 @@ class WSFeed:
                     ping_task.cancel()
 
     async def _subscribe(self, ws):
-        """Envía las suscripciones de ticker, candles, OB y funding para todos los símbolos."""
+        """Envía las suscripciones de ticker, candles y OB para todos los símbolos.
+        
+        FIX: funding-rate eliminado — Bitget devuelve error 30016 (Param error)
+        con el formato instId=BTCUSDT. Requeriría BTCUSDT_UMCBL y no está
+        disponible en el WS público v2. Se consulta por REST cuando se necesita.
+        """
         args = []
         for sym in self._symbols:
-            # Ticker
-            args.append({"instType": "USDT-FUTURES", "channel": "ticker",       "instId": sym})
-            # Candles
+            # Ticker — precio en tiempo real
+            args.append({"instType": "USDT-FUTURES", "channel": "ticker", "instId": sym})
+            # Candles — todas las timeframes
             for tf_key in TF_MAP.values():
-                args.append({"instType": "USDT-FUTURES", "channel": tf_key,     "instId": sym})
-            # Order Book L2 (books1 = top-of-book actualizado tick a tick)
-            args.append({"instType": "USDT-FUTURES", "channel": "books",        "instId": sym})
-            # Funding Rate
-            args.append({"instType": "USDT-FUTURES", "channel": "funding-rate", "instId": sym})
+                args.append({"instType": "USDT-FUTURES", "channel": tf_key, "instId": sym})
+            # Order Book L2
+            args.append({"instType": "USDT-FUTURES", "channel": "books", "instId": sym})
+            # ELIMINADO: funding-rate (error 30016 en WS público Bitget v2)
 
         # Bitget acepta hasta 100 args por batch
         for i in range(0, len(args), 100):
@@ -373,9 +360,6 @@ class WSFeed:
         elif channel == "books":
             self._handle_orderbook(cache, action, data)
 
-        elif channel == "funding-rate":
-            self._handle_funding(cache, data)
-
     def _handle_ticker(self, cache: _SymbolCache, data: list):
         try:
             item = data[0] if isinstance(data, list) else data
@@ -401,23 +385,6 @@ class WSFeed:
                 cache.ob.apply_delta(bids, asks)
         except (IndexError, KeyError, ValueError, TypeError) as e:
             log.debug(f"[WSFeed] OB parse error: {e}")
-
-    def _handle_funding(self, cache: _SymbolCache, data: list):
-        """
-        Procesa funding rate del canal funding-rate.
-        Formato Bitget: data[0] = {"fundingRate": "0.0001", "nextFundingTime": ...}
-        """
-        try:
-            item = data[0] if isinstance(data, list) else data
-            rate = float(
-                item.get("fundingRate") or
-                item.get("fundingrate") or
-                item.get("currentFundingRate") or 0
-            )
-            cache.update_funding(rate)
-            log.debug(f"[WSFeed] Funding update: {rate:.6f}")
-        except (IndexError, KeyError, ValueError, TypeError) as e:
-            log.debug(f"[WSFeed] Funding parse error: {e}")
 
 
 # ── Instancia global ──────────────────────────────────────────────────────────
