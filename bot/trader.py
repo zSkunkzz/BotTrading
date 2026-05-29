@@ -169,6 +169,12 @@ class FuturesTrader:
             s = s[:-4]
         return s
 
+    # ── Circuit breaker — helper público ─────────────────────────────────────
+
+    def is_cb_paused(self) -> bool:
+        """True si el circuit breaker 40085 está activo ahora mismo."""
+        return self._cb_40085_paused_until > time.time()
+
     # ── Inicialización ────────────────────────────────────────────────────────
 
     async def _init(self, usdt_per_trade: float):
@@ -802,6 +808,15 @@ class FuturesTrader:
                 if kill_switch.is_halted(self.symbol):
                     logger.debug(f"[{self.symbol}] KS L{kill_switch.level()} — sin nuevas entradas")
                     await asyncio.sleep(5)
+                    continue
+
+                # ── Circuit breaker 40085: saltar todo el ciclo IA + PreTrade ──
+                if self.is_cb_paused():
+                    remaining = int(self._cb_40085_paused_until - time.time())
+                    logger.debug(
+                        f"[{self.symbol}] ⏸ CB-40085 activo — esperando {remaining}s"
+                    )
+                    await asyncio.sleep(min(remaining, 30))
                     continue
 
                 can_trade, reason = risk.can_open_trade(balance)
