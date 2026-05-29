@@ -5,14 +5,16 @@ import ccxt.async_support as ccxt
 
 logger = logging.getLogger("PairScanner")
 
-# Activos NO-crypto: acciones tokenizadas, ETFs, commodities, índices
-# Bitget los lista como swaps pero su comportamiento es distinto
+# Activos NO-crypto: acciones tokenizadas, ETFs, commodities, índices, metales preciosos
+# Bitget los lista como swaps pero su comportamiento es distinto al de criptomonedas
 NON_CRYPTO_BASES = {
     # Acciones tech
     "AAPL", "TSLA", "NVDA", "AMZN", "GOOGL", "META", "MSFT", "NFLX",
     "AMD", "INTC", "MU", "SNDK", "QCOM", "AVGO", "CRM", "ORCL",
     # Commodities
     "CL", "GC", "SI", "NG", "HG", "ZC", "ZW", "ZS",
+    # Metales preciosos (futuros de oro/plata — comportamiento distinto)
+    "XAU", "XAG", "XAUT",
     # Índices
     "SPX", "NDX", "DJI", "VIX",
     # Acciones variadas
@@ -44,7 +46,8 @@ class PairScanner:
     """
     Escanea en tiempo real todos los pares USDT de futuros perpetuos en Bitget.
     Filtra por volumen, volatilidad y tendencia para elegir los mejores.
-    Solo opera pares crypto puros — excluye acciones tokenizadas y commodities.
+    Solo opera pares crypto puros — excluye acciones tokenizadas, commodities
+    y metales preciosos (XAU, XAG, XAUT).
     Se refresca cada X minutos para detectar pares nuevos automáticamente.
     IMPORTANTE: todos los símbolos devueltos están en formato ccxt estándar
     (BASE/USDT:USDT) para evitar traders duplicados.
@@ -75,7 +78,7 @@ class PairScanner:
         }
 
     def _is_crypto_pair(self, symbol: str, market: dict) -> bool:
-        """Devuelve True solo si el par es crypto pura, no accion/commodity"""
+        """Devuelve True solo si el par es crypto pura, no accion/commodity/metal"""
         base = market.get("base", "").upper()
         if base in self.blacklist:
             return False

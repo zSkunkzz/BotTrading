@@ -13,6 +13,7 @@ from bot.ai_filter import ai_rank_pairs
 from bot.logger import setup_logger
 from bot.telegram_bot import notify_startup, notify_scanner_update
 from bot.ws_feed import ws_feed
+from bot.balance_service import balance_svc
 from ai_rate_limiter import start_traders_staggered, telegram_ai_status
 from webhook import start_webhook_server, register_traders
 
@@ -105,6 +106,15 @@ async def main():
     logger.info("=" * 60)
     logger.info("  BitgetProBot v5.3 — IA + Scanner + Telegram + Webhook")
     logger.info("=" * 60)
+
+    # ── Inicializar balance singleton ANTES de arrancar traders ───────────────
+    # Esto garantiza que los 15 traders comparten un único fetch de balance
+    # y evita los 429 por peticiones simultáneas.
+    balance_svc.init(
+        os.getenv("BITGET_API_KEY"),
+        os.getenv("BITGET_API_SECRET"),
+        os.getenv("BITGET_PASSPHRASE"),
+    )
 
     global_risk = GlobalRisk(
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "5")),
