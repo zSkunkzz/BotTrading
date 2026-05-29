@@ -18,7 +18,8 @@ Uso:
   from bot.execution_engine import execution_engine
   result = await execution_engine.execute(
       trader=self, side="buy", qty=0.01,
-      arrival_price=67000.0, ask=67002.0, bid=66998.0
+      arrival_price=67000.0, ask=67002.0, bid=66998.0,
+      trade_side="open",
   )
   # result: dict con code, fill_price, slippage_bps, ...
 """
@@ -53,7 +54,7 @@ class TradeRecord:
     fill_latency_ms:   float       = 0.0
     partial_fill_ratio: float      = 1.0
     order_type_used:   str         = "market"  # "limit" o "market"
-    cancel_reason:     str         = ""        # por qué se canceló el limit (si aplica)
+    cancel_reason:     str         = ""        # por qué se cancелó el limit (si aplica)
     success:           bool        = False
 
 
@@ -72,7 +73,7 @@ class ExecutionEngine:
         # Telemetría: {symbol: [TradeRecord]}
         self._records: dict[str, list[TradeRecord]] = defaultdict(list)
 
-    # ── API pública ───────────────────────────────────────────────────────────
+    # ── API pública ─────────────────────────────────────────────────────────
 
     async def execute(
         self,
@@ -82,10 +83,14 @@ class ExecutionEngine:
         arrival_price: float,
         ask:           float | None = None,
         bid:           float | None = None,
+        trade_side:    str = "open",
     ) -> dict:
         """
         Intenta primero con limit agresiva; si no llena en timeout, usa market.
         Devuelve el resultado de la orden (dict con 'code' al mínimo).
+
+        trade_side: "open" para abrir posición, "close" para cerrarla.
+        Se propaga a _place_order_raw en todas las rutas.
         """
         sym = trader.symbol
         rec = TradeRecord(
@@ -106,7 +111,7 @@ class ExecutionEngine:
         if use_limit:
             limit_price = self._calc_limit_price(side, arrival_price, ask, bid)
             result, filled = await self._try_limit(
-                trader, side, qty, limit_price, rec
+                trader, side, qty, limit_price, rec, trade_side=trade_side
             )
             if filled:
                 rec.order_type_used = "limit"
@@ -117,7 +122,7 @@ class ExecutionEngine:
                 logger.info(
                     f"[{sym}] ⚡ Limit sin fill en {self.limit_timeout_s}s → fallback market"
                 )
-                result = await trader._place_order_raw(side, qty)
+                result = await trader._place_order_raw(side, qty, trade_side=trade_side)
                 rec.order_type_used = "market"
                 rec.fill_price      = arrival_price  # estimación conservadora
         else:
@@ -128,12 +133,12 @@ class ExecutionEngine:
                 else "sin datos de orderbook"
             )
             logger.debug(f"[{sym}] Market directo ({reason})")
-            result = await trader._place_order_raw(side, qty)
+            result = await trader._place_order_raw(side, qty, trade_side=trade_side)
             rec.order_type_used = "market"
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
 
-        # ── Telemetría ────────────────────────────────────────────────────────
+        # ── Telemetría ──────────────────────────────────────────────────────────
         rec.fill_latency_ms = (time.monotonic() - t0) * 1000
         rec.success         = result.get("code") == "00000"
 
@@ -147,7 +152,7 @@ class ExecutionEngine:
 
         log_msg = (
             f"[{sym}] 📊 Exec: type={rec.order_type_used} side={side} qty={qty} "
-            f"arrival={arrival_price:.4f} fill={rec.fill_price:.4f} "
+            f"tradeSide={trade_side} arrival={arrival_price:.4f} fill={rec.fill_price:.4f} "
             f"slippage={rec.slippage_bps:+.1f}bps latency={rec.fill_latency_ms:.0f}ms"
         )
         if rec.slippage_bps > self.max_slippage_alert_bps:
@@ -201,7 +206,7 @@ class ExecutionEngine:
         """Estadísticas de todos los símbolos."""
         return [self.get_stats(sym) for sym in self._records]
 
-    # ── Internos ──────────────────────────────────────────────────────────────
+    # ── Internos ────────────────────────────────────────────────────────────
 
     def _calc_spread_bps(
         self, ask: float | None, bid: float | None, price: float
@@ -232,6 +237,7 @@ class ExecutionEngine:
         qty:    float,
         price:  float,
         rec:    TradeRecord,
+        trade_side: str = "open",
     ) -> tuple[dict, bool]:
         """
         Coloca limit y espera hasta limit_timeout_s.
@@ -239,7 +245,9 @@ class ExecutionEngine:
         Si no llena, cancela la orden y devuelve filled=False.
         """
         sym = trader.symbol
-        result = await trader._place_order_raw(side, qty, order_type="limit", price=price)
+        result = await trader._place_order_raw(
+            side, qty, order_type="limit", price=price, trade_side=trade_side
+        )
         if result.get("code") != "00000":
             # La limit no se aceptó → reportar como no filled
             rec.cancel_reason = f"limit_rejected: {result.get('msg', '')}"
