@@ -502,16 +502,20 @@ class FuturesTrader:
                     await asyncio.sleep(2)
                     continue
 
-                # Sin posición: verificar riesgo
+                # Sin posición: verificar riesgo local
                 can_trade, reason = risk.can_open_trade(balance)
                 if not can_trade:
                     logger.debug(f"[{self.symbol}] Risk bloquea: {reason}")
                     await asyncio.sleep(2)
                     continue
 
-                if global_risk and not global_risk.can_open_trade():
-                    await asyncio.sleep(2)
-                    continue
+                # Verificar riesgo global (métodos correctos: can_open + register_open/close)
+                if global_risk:
+                    gr_ok, gr_reason = await global_risk.can_open()
+                    if not gr_ok:
+                        logger.debug(f"[{self.symbol}] GlobalRisk bloquea: {gr_reason}")
+                        await asyncio.sleep(2)
+                        continue
 
                 bars = await self.get_ohlcv()
                 if not bars or len(bars) < OHLCV_MIN_BARS:
@@ -536,7 +540,7 @@ class FuturesTrader:
                     tp3 = decision.get("tp3")
 
                     if global_risk:
-                        global_risk.register_open_trade()
+                        await global_risk.register_open()
 
                     if action in ("LONG", "BUY"):
                         await self.open_long(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
@@ -547,10 +551,9 @@ class FuturesTrader:
                         if self.position:
                             risk.on_trade_open(self.entry_price, "short")
 
-                    if global_risk:
-                        global_risk.register_close_trade()
-
                 elif action == "CLOSE" and self.position:
+                    if global_risk:
+                        await global_risk.register_close(pnl_pct=0.0)
                     await self.close_position(reason=decision.get("reasoning", "IA-CLOSE"))
                     risk.on_trade_close(pnl_pct=0.0)
 
