@@ -15,6 +15,7 @@ from bot.state import (
     save_position, load_position, clear_position, mark_tp2_hit
 )
 from bot.telegram_bot import notify_tp_partial
+from bot.balance_service import balance_svc  # <-- NUEVO: servicio centralizado
 
 logger = logging.getLogger("Trader")
 
@@ -23,9 +24,6 @@ TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 OHLCV_TF        = os.getenv("OHLCV_TF", "15m")
 OHLCV_LIMIT     = int(os.getenv("OHLCV_LIMIT", "200"))
 OHLCV_MIN_BARS  = int(os.getenv("OHLCV_MIN_BARS", "55"))
-
-_BALANCE_RETRY_SLEEP = float(os.getenv("BALANCE_RETRY_SLEEP", "6"))
-_BALANCE_CACHE_TTL   = float(os.getenv("BALANCE_CACHE_TTL", "30"))
 
 _MIN_QTY_FALLBACK = {
     "BTCUSDT":   0.001,
@@ -57,29 +55,6 @@ _MIN_QTY_FALLBACK = {
 _min_qty_cache: dict = {}
 
 
-async def _safe_json(response) -> dict:
-    text = await response.text()
-    stripped = text.strip()
-    if not stripped.startswith("{") and not stripped.startswith("["):
-        raise ValueError(f"Respuesta no-JSON: {stripped[:200]}")
-    try:
-        data = _json.loads(stripped)
-    except _json.JSONDecodeError as e:
-        raise ValueError(f"JSON inválido: {e} — contenido: {stripped[:200]}")
-    if not isinstance(data, dict):
-        raise ValueError(f"Respuesta inesperada (tipo {type(data).__name__}): {str(data)[:300]}")
-    return data
-
-
-def _to_float(val) -> float | None:
-    if val is None:
-        return None
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return None
-
-
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
                  leverage, margin_mode, dry_run):
@@ -103,8 +78,8 @@ class FuturesTrader:
         self._ua_pos_mode = None
         self._v2_pos_mode = None
         self._balance_ok  = False
-        self._cached_balance: float | None = None
-        self._balance_ts: float = 0.0
+
+    # ── HTTP HELPERS ──────────────────────────────────────────────────────────
 
     def _sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
         msg = ts + method.upper() + path_with_qs + body
@@ -134,7 +109,7 @@ class FuturesTrader:
                 headers=self._headers("GET", path + qs),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
-                return await _safe_json(r)
+                return await self._safe_json(r)
 
     async def _http_post(self, path: str, payload: dict) -> dict:
         body = _json.dumps(payload)
@@ -146,138 +121,25 @@ class FuturesTrader:
                 data=body,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
-                return await _safe_json(r)
+                return await self._safe_json(r)
 
-    # ------------------------------------------------------------------ balance
+    @staticmethod
+    async def _safe_json(response) -> dict:
+        text = await response.text()
+        stripped = text.strip()
+        if not stripped.startswith("{") and not stripped.startswith("["):
+            raise ValueError(f"Respuesta no-JSON: {stripped[:200]}")
+        try:
+            data = _json.loads(stripped)
+        except _json.JSONDecodeError as e:
+            raise ValueError(f"JSON inválido: {e} — contenido: {stripped[:200]}")
+        if not isinstance(data, dict):
+            raise ValueError(f"Respuesta inesperada (tipo {type(data).__name__}): {str(data)[:300]}")
+        return data
 
-    async def _extract_usdt_balance(self, data) -> float | None:
-        """
-        Extrae el balance USDT disponible de la respuesta de la API de Bitget.
+    # ── INICIALIZACIÓN ────────────────────────────────────────────────────────
 
-        Formatos soportados:
-        1. Lista de assets directos: [{coin: USDT, available: X}, ...]
-        2. Lista de cuentas UA con 'list' anidado: [{accountType: ..., list: [{coin: USDT, ...}]}]
-        3. Diccionario directo con campos de balance
-        4. Diccionario con 'list' anidado
-        """
-        balance_keys = (
-            "available", "availableBalance", "crossMaxAvailable",
-            "equity", "usdtEquity", "isolatedMaxAvailable",
-            "crossedMaxAvailable", "walletBalance", "balance", "free",
-        )
-
-        def _extract_from_dict(d: dict) -> float | None:
-            coin = d.get("marginCoin") or d.get("coin") or d.get("asset") or ""
-            if coin.upper() == "USDT":
-                for key in balance_keys:
-                    v = _to_float(d.get(key))
-                    if v is not None and v >= 0:
-                        return v
-            return None
-
-        def _scan_list(lst: list) -> float | None:
-            best = None
-            for item in lst:
-                if not isinstance(item, dict):
-                    continue
-                # Formato directo: {coin: USDT, available: X}
-                v = _extract_from_dict(item)
-                if v is not None:
-                    if best is None or v > best:
-                        best = v
-                    continue
-                # Formato UA anidado: {accountType: ..., list: [{coin: USDT, ...}]}
-                nested = item.get("list") or item.get("assets") or []
-                if isinstance(nested, list):
-                    for sub in nested:
-                        if isinstance(sub, dict):
-                            v2 = _extract_from_dict(sub)
-                            if v2 is not None:
-                                if best is None or v2 > best:
-                                    best = v2
-            return best
-
-        if isinstance(data, list):
-            val = _scan_list(data)
-            if val is not None:
-                return val
-
-        if isinstance(data, dict):
-            # Directo
-            for key in balance_keys:
-                v = _to_float(data.get(key))
-                if v is not None and v >= 0:
-                    return v
-            # 'list' anidado dentro del dict raíz
-            nested = data.get("list") or data.get("assets") or []
-            if isinstance(nested, list):
-                val = _scan_list(nested)
-                if val is not None:
-                    return val
-
-        return None
-
-    async def _fetch_balance_once(self) -> float | None:
-        sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
-        endpoints = [
-            ("/api/v2/mix/account/accounts",        {"productType": "USDT-FUTURES"}),
-            ("/api/v2/account/all-account-balance", {"coin": "USDT"}),
-            ("/api/v2/mix/account/account",         {"symbol": sym_clean, "productType": "USDT-FUTURES", "marginCoin": "USDT"}),
-            ("/api/v2/spot/account/assets",         {"coin": "USDT"}),
-            ("/api/v2/account/info",                None),
-        ]
-        for path, params in endpoints:
-            try:
-                r = await self._http_get(path, params)
-                code = r.get("code")
-                if code == "00000":
-                    raw_data = r.get("data")
-                    val = await self._extract_usdt_balance(raw_data)
-                    if val is not None:
-                        logger.info(f"[{self.symbol}] 💰 Balance USDT: {val:.2f} (vía {path})")
-                        return val
-                    else:
-                        logger.info(
-                            f"[{self.symbol}] ⚠️ {path} → code=00000 pero sin USDT extraíble. "
-                            f"data={str(raw_data)[:300]}"
-                        )
-                else:
-                    logger.info(
-                        f"[{self.symbol}] ⚠️ {path} → code={code} msg={r.get('msg')} "
-                        f"data={str(r.get('data', ''))[:200]}"
-                    )
-            except Exception as e:
-                logger.info(f"[{self.symbol}] ⚠️ {path} excepción: {e}")
-        return None
-
-    async def get_cached_balance(self) -> float | None:
-        now = time.time()
-        if self._cached_balance is not None and (now - self._balance_ts) < _BALANCE_CACHE_TTL:
-            return self._cached_balance
-        val = await self._fetch_balance_once()
-        if val is not None:
-            self._cached_balance = val
-            self._balance_ts = now
-        return val
-
-    async def _wait_for_balance(self, timeout: float = 60.0) -> float | None:
-        deadline = time.time() + timeout
-        attempt = 0
-        while time.time() < deadline:
-            attempt += 1
-            val = await self._fetch_balance_once()
-            if val is not None:
-                self._cached_balance = val
-                self._balance_ts = time.time()
-                self._balance_ok = True
-                return val
-            logger.warning(f"[{self.symbol}] ⏳ Balance no disponible (intento {attempt}), reintentando en {_BALANCE_RETRY_SLEEP}s…")
-            await asyncio.sleep(_BALANCE_RETRY_SLEEP)
-        logger.error(f"[{self.symbol}] ❌ No se pudo obtener balance tras {timeout}s.")
-        return None
-
-    # ------------------------------------------------------------------ init
-    async def _init(self):
+    async def _init(self, usdt_per_trade: float):
         self.exchange = ccxt.bitget({
             "apiKey":     self._api_key,
             "secret":     self._api_secret,
@@ -294,17 +156,31 @@ class FuturesTrader:
             self.tp3         = saved.get("tp3")
             self.tp2_hit     = saved.get("tp2_hit", False)
             logger.info(f"[{self.symbol}] 🔄 Posición restaurada: {self.position} @ {self.entry_price}")
+
+        # Inicializar balance_svc con las credenciales (solo una vez)
+        balance_svc.init(self._api_key, self._api_secret, self._passphrase)
+
+        # Detectar tipo de cuenta: ahora usamos variable de entorno para forzar UA
         await self._detect_account_type()
 
     async def _detect_account_type(self):
-        # Probe 1: UA via mix/accounts (más fiable en Unified Account)
+        """
+        Detecta si la cuenta es Unified Account (UA) o Classic.
+        Si la variable de entorno BITGET_ACCOUNT_TYPE está en 'ua', se fuerza UA.
+        """
+        force_ua = os.getenv("BITGET_ACCOUNT_TYPE", "").lower() == "ua"
+        if force_ua:
+            self._api_version = "ua"
+            self._ua_pos_mode = "single_hold"   # por defecto one-way
+            logger.info(f"[{self.symbol}] ✅ Cuenta forzada a UA (single_hold)")
+            return
+
+        # Si no se fuerza, probar un endpoint UA que debería devolver 00000
         try:
-            r = await self._http_get(
-                "/api/v2/mix/account/accounts",
-                {"productType": "USDT-FUTURES"}
-            )
+            r = await self._http_get("/api/v2/unified/account/assets", {"coin": "USDT"})
             if r.get("code") == "00000":
                 self._api_version = "ua"
+                # Obtener holdMode desde posiciones (por defecto single_hold)
                 try:
                     rp = await self._http_get(
                         "/api/v2/mix/position/all-position",
@@ -312,74 +188,25 @@ class FuturesTrader:
                     )
                     if rp.get("code") == "00000":
                         items = rp.get("data") or []
-                        self._ua_pos_mode = items[0].get("holdMode", "single_hold") if items else "single_hold"
+                        if items and isinstance(items, list):
+                            self._ua_pos_mode = items[0].get("holdMode", "single_hold")
+                        else:
+                            self._ua_pos_mode = "single_hold"
                     else:
                         self._ua_pos_mode = "single_hold"
                 except Exception:
                     self._ua_pos_mode = "single_hold"
-                logger.info(
-                    f"[{self.symbol}] ✅ Unified Account (UA) via mix/accounts. pos_mode={self._ua_pos_mode}"
-                )
+                logger.info(f"[{self.symbol}] ✅ Unified Account detectada. pos_mode={self._ua_pos_mode}")
                 return
-            else:
-                logger.info(f"[{self.symbol}] mix/accounts → code={r.get('code')} msg={r.get('msg')}")
         except Exception as e:
-            logger.info(f"[{self.symbol}] mix/accounts probe error: {e}")
+            logger.debug(f"[{self.symbol}] Probe UA falló: {e}")
 
-        # Probe 2: UA via all-account-balance
-        try:
-            r = await self._http_get(
-                "/api/v2/account/all-account-balance",
-                {"coin": "USDT"}
-            )
-            if r.get("code") == "00000":
-                self._api_version = "ua"
-                self._ua_pos_mode = "single_hold"
-                logger.info(f"[{self.symbol}] ✅ Unified Account (UA) via all-account-balance. pos_mode=single_hold")
-                return
-            else:
-                logger.info(f"[{self.symbol}] all-account-balance → code={r.get('code')} msg={r.get('msg')}")
-        except Exception as e:
-            logger.info(f"[{self.symbol}] UA all-account-balance probe error: {e}")
+        # Fallback: asumir Classic (aunque hoy en día casi todas son UA)
+        logger.warning(f"[{self.symbol}] ⚠️ No se detectó UA, asumiendo Classic (v2).")
+        self._api_version = "v2"
+        self._v2_pos_mode = "hedge"
 
-        # Probe 3: spot assets
-        try:
-            r = await self._http_get(
-                "/api/v2/spot/account/assets",
-                {"coin": "USDT"}
-            )
-            if r.get("code") == "00000":
-                self._api_version = "ua"
-                self._ua_pos_mode = "single_hold"
-                logger.info(f"[{self.symbol}] ✅ Cuenta detectada via spot/assets.")
-                return
-            else:
-                logger.info(f"[{self.symbol}] spot/assets → code={r.get('code')} msg={r.get('msg')}")
-        except Exception as e:
-            logger.info(f"[{self.symbol}] spot probe error: {e}")
-
-        # Probe 4: Classic Account v2
-        try:
-            sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
-            r = await self._http_get(
-                "/api/v2/mix/account/account",
-                {"symbol": sym_clean, "productType": "USDT-FUTURES", "marginCoin": "USDT"}
-            )
-            if r.get("code") == "00000":
-                self._api_version = "v2"
-                d = r.get("data") or {}
-                d = d if isinstance(d, dict) else {}
-                self._v2_pos_mode = d.get("holdMode", "hedge")
-                logger.info(f"[{self.symbol}] ✅ Classic Account (v2). pos_mode={self._v2_pos_mode}")
-                return
-            else:
-                logger.info(f"[{self.symbol}] mix/account/account → code={r.get('code')} msg={r.get('msg')}")
-        except Exception as e:
-            logger.info(f"[{self.symbol}] v2 probe error: {e}")
-
-        logger.warning(f"[{self.symbol}] ⚠️ Tipo de cuenta no detectado, asumiendo UA single_hold.")
-        self._api_version = "ua"
-        self._ua_pos_mode = "single_hold"
+    # ── PRECIO, OHLCV Y BALANCE (usando balance_svc) ─────────────────────────
 
     async def get_price(self) -> float:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
@@ -413,355 +240,438 @@ class FuturesTrader:
                         ]
                         for _, row in df_reset.iterrows()
                     ]
-                    return bars[-OHLCV_LIMIT:]
-        except Exception:
-            pass
-        return await self.exchange.fetch_ohlcv(self.symbol, tf, limit=OHLCV_LIMIT)
+                    return bars
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] get_ohlcv WS error: {e}")
 
-    async def get_min_qty(self) -> float:
-        sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
+        tf_ccxt = {"15m": "15m", "1h": "1h", "4h": "4h"}.get(tf, tf)
+        bars = await self.exchange.fetch_ohlcv(self.symbol, tf_ccxt, limit=OHLCV_LIMIT)
+        return bars
+
+    async def get_balance(self) -> float | None:
+        """Obtiene balance usando el servicio centralizado."""
+        return await balance_svc.get()
+
+    # ── LEVERAGE (Unified Account) ───────────────────────────────────────────
+
+    async def set_leverage(self, leverage: int, side: str | None = None):
+        sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        endpoint = "/api/v2/mix/account/set-leverage"
+
+        if self._api_version == "ua":
+            # Para UA, usar holdSide = "all" (one-way) o "long"/"short" según
+            hold_side = "all"   # one-way mode
+            payload = {
+                "symbol": sym_clean,
+                "productType": "USDT-FUTURES",
+                "marginCoin": "USDT",
+                "leverage": str(leverage),
+                "holdSide": hold_side,
+            }
+            try:
+                r = await self._http_post(endpoint, payload)
+                if r.get("code") == "00000":
+                    logger.debug(f"[{self.symbol}] Leverage {leverage}x (UA) OK")
+                else:
+                    logger.warning(f"[{self.symbol}] set_leverage UA error: code={r.get('code')} msg={r.get('msg')}")
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] set_leverage UA exception: {e}")
+        else:
+            # Lógica Classic (v2)
+            pos_mode = self._v2_pos_mode or "hedge"
+            sides = ["long", "short"] if pos_mode == "hedge" else [side or "long"]
+            for hold_side in sides:
+                try:
+                    payload = {
+                        "symbol": sym_clean,
+                        "productType": "USDT-FUTURES",
+                        "marginCoin": "USDT",
+                        "leverage": str(leverage),
+                        "holdSide": hold_side,
+                    }
+                    r = await self._http_post(endpoint, payload)
+                    if r.get("code") == "00000":
+                        logger.debug(f"[{self.symbol}] Leverage {leverage}x ({hold_side}) OK")
+                    else:
+                        logger.warning(f"[{self.symbol}] set_leverage {hold_side} error: {r}")
+                except Exception as e:
+                    logger.warning(f"[{self.symbol}] set_leverage {hold_side} exception: {e}")
+
+    # ── MÍNIMOS DE QTY ────────────────────────────────────────────────────────
+
+    async def _get_min_qty(self) -> float:
+        sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         if sym_clean in _min_qty_cache:
             return _min_qty_cache[sym_clean]
         try:
             r = await self._http_get(
                 "/api/v2/mix/market/contracts",
-                {"productType": "USDT-FUTURES", "symbol": sym_clean},
+                {"symbol": sym_clean, "productType": "USDT-FUTURES"}
             )
             if r.get("code") == "00000":
                 items = r.get("data") or []
-                for item in (items if isinstance(items, list) else [items]):
-                    v = _to_float(item.get("minTradeNum") or item.get("minQty"))
-                    if v is not None and v > 0:
-                        _min_qty_cache[sym_clean] = v
-                        return v
+                items = items if isinstance(items, list) else []
+                if items:
+                    min_qty = float(
+                        items[0].get("minTradeNum") or
+                        items[0].get("minOrderSize") or 0.001
+                    )
+                    _min_qty_cache[sym_clean] = min_qty
+                    return min_qty
         except Exception as e:
-            logger.debug(f"[{self.symbol}] get_min_qty error: {e}")
-        fallback = _MIN_QTY_FALLBACK.get(sym_clean, 0.01)
+            logger.debug(f"[{self.symbol}] _get_min_qty error: {e}")
+        fallback = _MIN_QTY_FALLBACK.get(sym_clean, 0.001)
         _min_qty_cache[sym_clean] = fallback
         return fallback
 
-    async def set_leverage(self, leverage: int, side: str | None = None):
-        sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
-        if self._api_version == "ua":
-            sides = ["all"]
-        else:
-            sides = ["long", "short"] if self._v2_pos_mode == "hedge" else ["long"]
-        for s in sides:
-            payload = {
-                "symbol":      sym_clean,
-                "productType": "USDT-FUTURES",
-                "marginCoin":  "USDT",
-                "leverageVal": str(leverage),
-                "holdSide":    s,
-            }
-            try:
-                r = await self._http_post("/api/v2/mix/account/set-leverage", payload)
-                if r.get("code") not in ("00000", "40919"):
-                    logger.warning(f"[{self.symbol}] set_leverage {s}: {r.get('msg')}")
-            except Exception as e:
-                logger.warning(f"[{self.symbol}] set_leverage exception ({s}): {e}")
+    # ── POSICIONES ABIERTAS ───────────────────────────────────────────────────
 
-    async def set_margin_mode(self):
-        sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
-        payload = {
-            "symbol":      sym_clean,
-            "productType": "USDT-FUTURES",
-            "marginCoin":  "USDT",
-            "marginMode":  self.margin_mode,
-        }
+    async def _get_positions(self) -> list | None:
+        sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+
         try:
-            r = await self._http_post("/api/v2/mix/account/set-margin-mode", payload)
-            if r.get("code") not in ("00000", "40919"):
-                logger.warning(f"[{self.symbol}] set_margin_mode: {r.get('msg')}")
-        except Exception as e:
-            logger.warning(f"[{self.symbol}] set_margin_mode exception: {e}")
-
-    async def _place_order(self, side: str, trade_side: str, qty: float) -> dict:
-        sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
-        if self.dry_run:
-            logger.info(f"[{self.symbol}] 🧪 DRY RUN: {side}/{trade_side} qty={qty}")
-            return {"code": "00000", "data": {"orderId": "DRY"}}
-
-        if self._api_version == "ua":
-            if self._ua_pos_mode == "single_hold":
-                payload = {
-                    "symbol":      sym_clean,
-                    "productType": "USDT-FUTURES",
-                    "marginMode":  self.margin_mode,
-                    "marginCoin":  "USDT",
-                    "size":        str(qty),
-                    "orderType":   "market",
-                    "side":        side,
-                    "holdMode":    "single_hold",
-                }
+            r = await self._http_get(
+                "/api/v2/mix/position/single-position",
+                {"symbol": sym_clean, "productType": "USDT-FUTURES", "marginCoin": "USDT"}
+            )
+            if r.get("code") == "00000":
+                data = r.get("data") or []
+                data = data if isinstance(data, list) else []
+                return [
+                    p for p in data
+                    if isinstance(p, dict)
+                    and float(p.get("total") or p.get("contracts") or
+                              p.get("size", 0)) > 0
+                ]
             else:
-                payload = {
-                    "symbol":      sym_clean,
-                    "productType": "USDT-FUTURES",
-                    "marginMode":  self.margin_mode,
-                    "marginCoin":  "USDT",
-                    "size":        str(qty),
-                    "orderType":   "market",
-                    "side":        side,
-                    "tradeSide":   trade_side,
-                }
-        else:
-            payload = {
-                "symbol":      sym_clean,
-                "productType": "USDT-FUTURES",
-                "marginMode":  self.margin_mode,
-                "marginCoin":  "USDT",
-                "size":        str(qty),
-                "orderType":   "market",
-                "side":        side,
-                "tradeSide":   trade_side,
-            }
+                logger.debug(f"[{self.symbol}] positions: code={r.get('code')} msg={r.get('msg')}")
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] positions error: {e}")
 
-        r = await self._http_post("/api/v2/mix/order/place-order", payload)
-        if r.get("code") != "00000":
-            raise RuntimeError(f"place_order error: {r.get('msg')} | payload={payload}")
-        self._cached_balance = None
-        return r
-
-    async def open_long(self, qty: float) -> dict:
-        return await self._place_order("buy", "open", qty)
-
-    async def open_short(self, qty: float) -> dict:
-        return await self._place_order("sell", "open", qty)
-
-    async def close_long(self, qty: float) -> dict:
-        return await self._place_order("sell", "close", qty)
-
-    async def close_short(self, qty: float) -> dict:
-        return await self._place_order("buy", "close", qty)
-
-    async def get_open_position(self) -> dict | None:
-        sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
+        # Fallback: all-position
         try:
             r = await self._http_get(
                 "/api/v2/mix/position/all-position",
-                {"productType": "USDT-FUTURES", "marginCoin": "USDT"},
+                {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
-                for pos in (r.get("data") or []):
-                    if pos.get("symbol", "").upper() == sym_clean.upper():
-                        total = _to_float(pos.get("total"))
-                        if total and total > 0:
-                            return pos
+                data = r.get("data") or []
+                data = data if isinstance(data, list) else []
+                return [
+                    p for p in data
+                    if isinstance(p, dict)
+                    and p.get("symbol") == sym_clean
+                    and float(p.get("total") or p.get("contracts") or
+                              p.get("size", 0)) > 0
+                ]
         except Exception as e:
-            logger.debug(f"[{self.symbol}] get_open_position error: {e}")
+            logger.debug(f"[{self.symbol}] all-positions error: {e}")
+
+        logger.warning(f"[{self.symbol}] ⚠️ _get_positions falló — estado local preservado")
         return None
 
-    async def _handle_tp2_partial(self, price: float, pos_side: str):
-        if self.tp2_hit:
-            return
-        if self.tp2 is None:
-            return
-        hit = (pos_side == "long" and price >= self.tp2) or \
-              (pos_side == "short" and price <= self.tp2)
-        if not hit:
-            return
-        pos = await self.get_open_position()
-        if not pos:
-            return
-        total_qty = _to_float(pos.get("total"))
-        if not total_qty or total_qty <= 0:
-            return
-        partial_qty = round(total_qty * TP2_PARTIAL_RATIO, 6)
-        min_qty = await self.get_min_qty()
-        if partial_qty < min_qty:
-            logger.warning(f"[{self.symbol}] TP2 partial qty {partial_qty} < min {min_qty}, skip.")
-            return
-        try:
-            if pos_side == "long":
-                await self.close_long(partial_qty)
-            else:
-                await self.close_short(partial_qty)
-            self.tp2_hit = True
-            mark_tp2_hit(self.symbol)
-            logger.info(f"[{self.symbol}] 🎯 TP2 parcial ejecutado: {partial_qty} @ {price}")
-            await notify_tp_partial(self.symbol, pos_side, price, partial_qty)
-        except Exception as e:
-            logger.error(f"[{self.symbol}] TP2 partial error: {e}")
+    # ── COLOCAR / CERRAR ÓRDENES (Unified Account) ────────────────────────────
 
-    async def run(self, risk_manager=None, global_risk=None, interval: int = 60):
-        """Bucle principal del trader.
-
-        Args:
-            risk_manager: instancia de RiskManager (o float usdt_per_trade por
-                          compatibilidad con llamadas antiguas).
-            global_risk:  instancia de GlobalRisk compartida entre traders.
-            interval:     segundos entre ciclos.
-        """
-        # Compatibilidad: si se pasa un float directamente usará ese valor
-        if isinstance(risk_manager, (int, float)):
-            usdt_per_trade = float(risk_manager)
-            sl_pct_default  = float(os.getenv("SL_PCT",  "0.015"))
-            tp1_pct_default = float(os.getenv("TP1_PCT", "0.01"))
-            tp2_pct_default = float(os.getenv("TP2_PCT", "0.025"))
-            tp3_pct_default = float(os.getenv("TP3_PCT", "0.04"))
+    async def _place_order(self, side: str, qty: float):
+        sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        endpoint = "/api/v2/mix/order/place-order"
+        payload = {
+            "symbol": sym_clean,
+            "productType": "USDT-FUTURES",
+            "marginMode": self.margin_mode,
+            "marginCoin": "USDT",
+            "qty": str(qty),
+            "orderType": "market",
+            "side": side,
+        }
+        if self._api_version == "ua":
+            # UA usa holdMode en lugar de tradeSide
+            payload["holdMode"] = self._ua_pos_mode or "single_hold"
+            # No incluir "tradeSide"
         else:
-            rm = risk_manager
-            usdt_per_trade  = getattr(rm, "usdt_per_trade",  float(os.getenv("USDT_PER_TRADE", "10")))
-            sl_pct_default  = getattr(rm, "sl_pct",   float(os.getenv("SL_PCT",  "0.015")))
-            tp1_pct_default = getattr(rm, "tp_pct",   float(os.getenv("TP1_PCT", "0.01")))  # tp1 ~ tp_pct/4
-            tp2_pct_default = getattr(rm, "tp_pct",   float(os.getenv("TP2_PCT", "0.025"))) / 100 * float(os.getenv("TP2_MULT", "250")) / 100
-            tp3_pct_default = getattr(rm, "tp_pct",   float(os.getenv("TP3_PCT", "0.04")))  / 100
-            # Normalizar sl_pct a decimal si viene como porcentaje (e.g. 2.0 → 0.02)
-            if sl_pct_default > 1:
-                sl_pct_default /= 100
-            if tp1_pct_default > 1:
-                tp1_pct_default /= 100
-            if tp2_pct_default > 1:
-                tp2_pct_default /= 100
-            if tp3_pct_default > 1:
-                tp3_pct_default /= 100
+            # Classic necesita tradeSide = "open"/"close"
+            trade_side = "open" if not self.position else "close"
+            payload["tradeSide"] = trade_side
 
-        await self._init()
-        await self.set_margin_mode()
-        await self.set_leverage(self.leverage)
+        if self.dry_run:
+            logger.info(f"[{self.symbol}] 🟡 DRY RUN: {side} qty={qty} (mode={self._api_version})")
+            return {"code": "00000", "data": {"orderId": "dry"}}
 
-        balance = await self._wait_for_balance(timeout=120.0)
-        if balance is None:
-            logger.error(f"[{self.symbol}] ❌ No se pudo obtener balance. Abortando.")
+        try:
+            r = await self._http_post(endpoint, payload)
+            if r.get("code") == "00000":
+                # Invalidar caché de balance tras ejecutar una orden
+                balance_svc.invalidate()
+                return r
+            # Si falla con código de hedge/one-way, reintentar con el otro modo (solo classic)
+            if self._api_version != "ua" and r.get("code") in ("40786", "40787", "40788"):
+                logger.warning(f"[{self.symbol}] Order failed ({r.get('code')}), retrying one-way")
+                payload["tradeSide"] = "open" if not self.position else "close"
+                r2 = await self._http_post(endpoint, payload)
+                if r2.get("code") == "00000":
+                    balance_svc.invalidate()
+                    return r2
+            logger.error(f"[{self.symbol}] Order failed: code={r.get('code')} msg={r.get('msg')}")
+            return r
+        except Exception as e:
+            logger.error(f"[{self.symbol}] _place_order exception: {e}")
+            return {"code": "ERROR", "msg": str(e)}
+
+    async def _calc_qty(self, usdt_amount: float, price: float, leverage: int) -> float:
+        effective_lev = leverage or self.leverage
+        raw_qty = (usdt_amount * effective_lev) / price
+        min_qty = await self._get_min_qty()
+        qty = max(min_qty, round(raw_qty / min_qty) * min_qty)
+        decimals = len(str(min_qty).rstrip("0").split(".")[-1]) if "." in str(min_qty) else 0
+        qty = round(qty, decimals)
+        return qty
+
+    # ── ABRIR POSICIONES ──────────────────────────────────────────────────────
+
+    async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None,
+                        leverage=None):
+        price = await self.get_price()
+        lev   = leverage or self.leverage
+        qty   = await self._calc_qty(usdt_amount, price, lev)
+        await self.set_leverage(lev, side="long")
+        r = await self._place_order("buy", qty)
+        if r.get("code") == "00000":
+            self.position    = "long"
+            self.entry_price = price
+            self.sl = sl; self.tp1 = tp1; self.tp2 = tp2; self.tp3 = tp3
+            self.tp2_hit = False
+            save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
+            logger.warning(
+                f"🟢 [{self.symbol}] LONG abierto @ {price:.4f} | "
+                f"lev={lev}x | sl={sl} tp1={tp1} tp2={tp2} tp3={tp3}"
+            )
+            await notify_open(
+                self.symbol, "long", price, lev,
+                sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run
+            )
+        else:
+            logger.error(f"[{self.symbol}] open_long FAILED: {r}")
+
+    async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None,
+                         leverage=None):
+        price = await self.get_price()
+        lev   = leverage or self.leverage
+        qty   = await self._calc_qty(usdt_amount, price, lev)
+        await self.set_leverage(lev, side="short")
+        r = await self._place_order("sell", qty)
+        if r.get("code") == "00000":
+            self.position    = "short"
+            self.entry_price = price
+            self.sl = sl; self.tp1 = tp1; self.tp2 = tp2; self.tp3 = tp3
+            self.tp2_hit = False
+            save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
+            logger.warning(
+                f"🔴 [{self.symbol}] SHORT abierto @ {price:.4f} | "
+                f"lev={lev}x | sl={sl} tp1={tp1} tp2={tp2} tp3={tp3}"
+            )
+            await notify_open(
+                self.symbol, "short", price, lev,
+                sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run
+            )
+        else:
+            logger.error(f"[{self.symbol}] open_short FAILED: {r}")
+
+    async def close_position(self, reason: str = ""):
+        if not self.position:
             return
-        logger.info(f"[{self.symbol}] 💰 Balance inicial: {balance:.2f} USDT")
+        side = "sell" if self.position == "long" else "buy"
+        qty = None
+        try:
+            positions = await self._get_positions()
+            if positions:
+                qty = float(
+                    positions[0].get("total") or
+                    positions[0].get("contracts") or
+                    positions[0].get("size") or 0
+                )
+        except Exception:
+            pass
+
+        if not qty or qty <= 0:
+            logger.warning(f"[{self.symbol}] close_position: qty no disponible, usando 0")
+            qty = 0
+
+        exit_price = await self.get_price()
+        pnl = 0.0
+        if self.entry_price and exit_price:
+            if self.position == "long":
+                pnl = (exit_price - self.entry_price) / self.entry_price * 100
+            else:
+                pnl = (self.entry_price - exit_price) / self.entry_price * 100
+
+        if qty > 0:
+            r = await self._place_order(side, qty)
+            if r.get("code") != "00000":
+                logger.error(f"[{self.symbol}] close_position FAILED: {r}")
+                return
+
+        old_pos = self.position
+        self.position    = None
+        self.entry_price = None
+        self.sl = self.tp1 = self.tp2 = self.tp3 = None
+        self.tp2_hit = False
+        clear_position(self.symbol)
+
+        if pnl >= 0:
+            self.win_count += 1
+        self.trade_count += 1
+        self.total_pnl   += pnl
+
+        logger.warning(
+            f"[{self.symbol}] 🟡 {old_pos.upper()} cerrado | razón={reason} | "
+            f"pnl={pnl:+.2f}% | trades={self.trade_count} wins={self.win_count}"
+        )
+        await notify_close(
+            self.symbol, old_pos, exit_price, pnl,
+            reason=reason, dry_run=self.dry_run
+        )
+
+    async def partial_close(self, ratio: float = 0.5):
+        if not self.position:
+            return
+        side = "sell" if self.position == "long" else "buy"
+        qty = None
+        try:
+            positions = await self._get_positions()
+            if positions:
+                total = float(
+                    positions[0].get("total") or
+                    positions[0].get("contracts") or
+                    positions[0].get("size") or 0
+                )
+                min_qty = await self._get_min_qty()
+                qty = max(min_qty, round((total * ratio) / min_qty) * min_qty)
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] partial_close: {e}")
+            return
+
+        if not qty or qty <= 0:
+            return
+
+        r = await self._place_order(side, qty)
+        if r.get("code") == "00000":
+            mark_tp2_hit(self.symbol)
+            self.tp2_hit = True
+            exit_price = await self.get_price()
+            await notify_tp_partial(
+                self.symbol, self.position, exit_price,
+                ratio=ratio, dry_run=self.dry_run
+            )
+            logger.info(f"[{self.symbol}] ✂️ Cierre parcial {int(ratio*100)}% ejecutado")
+        else:
+            logger.warning(f"[{self.symbol}] partial_close FAILED: {r}")
+
+    # ── LOOP PRINCIPAL ────────────────────────────────────────────────────────
+
+    async def run(self, risk: "RiskManager", global_risk: "GlobalRisk" = None):
+        from bot.risk import RiskManager
+        usdt_per_trade = risk.usdt_per_trade
+        await self._init(usdt_per_trade)
 
         while True:
             try:
-                # Respetar límite global de trades concurrentes
-                if global_risk is not None:
-                    can_open = getattr(global_risk, "can_open_trade", None)
-                    if callable(can_open) and not can_open():
-                        logger.debug(f"[{self.symbol}] GlobalRisk: límite alcanzado, esperando.")
-                        await asyncio.sleep(interval)
-                        continue
-
                 price = await self.get_price()
-                ohlcv = await self.get_ohlcv()
 
-                if len(ohlcv) < OHLCV_MIN_BARS:
-                    logger.warning(f"[{self.symbol}] ⚠️ OHLCV insuficiente ({len(ohlcv)} barras). Esperando…")
-                    await asyncio.sleep(interval)
+                # ── Balance usando servicio centralizado ───────────────────────────
+                balance = await self.get_balance()
+                if balance is None:
+                    logger.warning(f"[{self.symbol}] ⏳ Balance no disponible, esperando 5s...")
+                    await asyncio.sleep(5)
+                    continue
+                if balance <= 0:
+                    logger.warning(f"[{self.symbol}] ⚠️ Balance {balance:.2f} USDT — insuficiente")
+                    await asyncio.sleep(10)
                     continue
 
+                if not self._balance_ok:
+                    self._balance_ok = True
+                    logger.info(f"[{self.symbol}] ✅ Balance confirmado: {balance:.2f} USDT")
+
+                # ── Gestión de posición abierta ────────────────────────────────
                 if self.position:
-                    await self._handle_tp2_partial(price, self.position)
-                    pos = await self.get_open_position()
-                    if pos is None:
-                        logger.info(f"[{self.symbol}] 📭 Posición cerrada externamente.")
-                        if global_risk is not None:
-                            close_fn = getattr(global_risk, "close_trade", None)
-                            if callable(close_fn):
-                                close_fn(self.symbol)
-                        self.position = None
-                        clear_position(self.symbol)
-                    elif self.sl and (
-                        (self.position == "long"  and price <= self.sl) or
-                        (self.position == "short" and price >= self.sl)
-                    ):
-                        logger.info(f"[{self.symbol}] 🛑 SL alcanzado @ {price}")
-                        qty = _to_float(pos.get("total")) or 0
-                        if qty > 0:
-                            if self.position == "long":
-                                await self.close_long(qty)
-                            else:
-                                await self.close_short(qty)
-                        pnl = (price - self.entry_price) * qty if self.position == "long" \
-                              else (self.entry_price - price) * qty
-                        self.trade_count += 1
-                        self.total_pnl   += pnl
-                        if global_risk is not None:
-                            close_fn = getattr(global_risk, "close_trade", None)
-                            if callable(close_fn):
-                                close_fn(self.symbol)
-                        await notify_close(self.symbol, self.position, price,
-                                           self.entry_price, pnl,
-                                           self.trade_count, self.win_count, self.total_pnl)
-                        self.position = None
-                        clear_position(self.symbol)
-                    elif self.tp3 and (
-                        (self.position == "long"  and price >= self.tp3) or
-                        (self.position == "short" and price <= self.tp3)
-                    ):
-                        logger.info(f"[{self.symbol}] 🏆 TP3 alcanzado @ {price}")
-                        qty = _to_float(pos.get("total")) or 0
-                        if qty > 0:
-                            if self.position == "long":
-                                await self.close_long(qty)
-                            else:
-                                await self.close_short(qty)
-                        pnl = (price - self.entry_price) * qty if self.position == "long" \
-                              else (self.entry_price - price) * qty
-                        self.trade_count += 1
-                        self.win_count   += 1
-                        self.total_pnl   += pnl
-                        if global_risk is not None:
-                            close_fn = getattr(global_risk, "close_trade", None)
-                            if callable(close_fn):
-                                close_fn(self.symbol)
-                        await notify_close(self.symbol, self.position, price,
-                                           self.entry_price, pnl,
-                                           self.trade_count, self.win_count, self.total_pnl)
-                        self.position = None
-                        clear_position(self.symbol)
-                else:
-                    balance = await self.get_cached_balance()
-                    if balance is None:
-                        logger.warning(f"[{self.symbol}] ⚠️ Balance no disponible, skip ciclo.")
-                        await asyncio.sleep(interval)
-                        continue
+                    if not self.tp2_hit and self.tp2:
+                        if (self.position == "long"  and price >= self.tp2) or \
+                           (self.position == "short" and price <= self.tp2):
+                            await self.partial_close(ratio=TP2_PARTIAL_RATIO)
 
-                    signal = decide(ohlcv)
-                    if signal == "hold":
-                        signal = await ai_decide(ohlcv, self.symbol)
+                    if self.sl and self.tp3:
+                        hit_sl  = (self.position == "long"  and price <= self.sl) or \
+                                  (self.position == "short" and price >= self.sl)
+                        hit_tp3 = (self.position == "long"  and price >= self.tp3) or \
+                                  (self.position == "short" and price <= self.tp3)
+                        if hit_sl:
+                            await self.close_position(reason="SL")
+                            risk.on_trade_close(pnl_pct=-risk.sl_pct)
+                        elif hit_tp3:
+                            await self.close_position(reason="TP3")
+                            risk.on_trade_close(pnl_pct=risk.tp_pct)
 
-                    if signal in ("long", "short"):
-                        trade_usdt = min(usdt_per_trade, balance)
-                        if trade_usdt < 1.0:
-                            logger.warning(f"[{self.symbol}] ⚠️ Balance insuficiente ({balance:.2f} USDT).")
-                            await asyncio.sleep(interval)
-                            continue
+                    await asyncio.sleep(2)
+                    continue
 
-                        qty = trade_usdt * self.leverage / price
-                        min_qty = await self.get_min_qty()
-                        qty = max(round(qty, 6), min_qty)
+                # ── Sin posición: verificar risk antes de buscar señal ─────────
+                can_trade, reason = risk.can_open_trade(balance)
+                if not can_trade:
+                    logger.debug(f"[{self.symbol}] RiskManager bloqueó trade: {reason}")
+                    await asyncio.sleep(2)
+                    continue
 
-                        sl_pct  = sl_pct_default
-                        tp1_pct = tp1_pct_default
-                        tp2_pct = tp2_pct_default
-                        tp3_pct = tp3_pct_default
+                if global_risk and not global_risk.can_open_trade():
+                    await asyncio.sleep(2)
+                    continue
 
-                        if signal == "long":
-                            await self.open_long(qty)
-                            self.sl  = price * (1 - sl_pct)
-                            self.tp1 = price * (1 + tp1_pct)
-                            self.tp2 = price * (1 + tp2_pct)
-                            self.tp3 = price * (1 + tp3_pct)
-                        else:
-                            await self.open_short(qty)
-                            self.sl  = price * (1 + sl_pct)
-                            self.tp1 = price * (1 - tp1_pct)
-                            self.tp2 = price * (1 - tp2_pct)
-                            self.tp3 = price * (1 - tp3_pct)
+                bars = await self.get_ohlcv()
+                if not bars or len(bars) < OHLCV_MIN_BARS:
+                    await asyncio.sleep(2)
+                    continue
 
-                        self.position    = signal
-                        self.entry_price = price
-                        self.tp2_hit     = False
+                decision = await ai_decide(
+                    symbol=self.symbol,
+                    bars=bars,
+                    position=self.position,
+                    entry_price=self.entry_price,
+                    leverage=self.leverage,
+                )
 
-                        if global_risk is not None:
-                            open_fn = getattr(global_risk, "open_trade", None)
-                            if callable(open_fn):
-                                open_fn(self.symbol)
+                if decision.get("action") in ("LONG", "SHORT", "BUY", "SELL"):
+                    action = decision["action"]
+                    safe_balance = balance if (balance is not None and balance > 0) else usdt_per_trade
+                    usdt_amount  = min(usdt_per_trade, safe_balance * 0.95)
 
-                        save_position(self.symbol, signal, price,
-                                      sl=self.sl, tp1=self.tp1,
-                                      tp2=self.tp2, tp3=self.tp3)
-                        logger.info(f"[{self.symbol}] 🚀 {signal.upper()} abierto @ {price} | qty={qty} | SL={self.sl:.4f} TP3={self.tp3:.4f}")
-                        await notify_open(self.symbol, signal, price, qty,
-                                          self.sl, self.tp1, self.tp2, self.tp3)
+                    lev  = decision.get("leverage", self.leverage)
+                    sl   = decision.get("sl")
+                    tp1  = decision.get("tp1")
+                    tp2  = decision.get("tp2")
+                    tp3  = decision.get("tp3")
 
+                    if global_risk:
+                        global_risk.register_open_trade()
+
+                    if action in ("LONG", "BUY"):
+                        await self.open_long(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
+                        if self.position:
+                            risk.on_trade_open(self.entry_price, "long")
+                    else:
+                        await self.open_short(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
+                        if self.position:
+                            risk.on_trade_open(self.entry_price, "short")
+
+                    if global_risk:
+                        global_risk.register_close_trade()
+
+                elif decision.get("action") == "CLOSE" and self.position:
+                    await self.close_position(reason=decision.get("reasoning", "IA-CLOSE"))
+                    risk.on_trade_close(pnl_pct=0.0)
+
+            except asyncio.CancelledError:
+                logger.info(f"[{self.symbol}] Trader cancelado.")
+                break
             except Exception as e:
-                logger.error(f"[{self.symbol}] ❌ Error en ciclo: {e}", exc_info=True)
+                logger.error(f"[{self.symbol}] run() error: {e}")
 
-            await asyncio.sleep(interval)
+            await asyncio.sleep(2)
