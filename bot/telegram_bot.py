@@ -37,6 +37,11 @@ async def _send(text: str):
         logger.warning(f"[Telegram] {e}")
 
 
+async def send_message(text: str):
+    """Alias publico para enviar mensajes directos."""
+    await _send(text)
+
+
 async def notify_startup(pairs: list, dry_run: bool, top_n: int):
     mode = "\U0001f9ea DRY RUN" if dry_run else "\U0001f4b0 REAL MONEY"
     pairs_str = _esc(", ".join(pairs[:10])) + (" ..." if len(pairs) > 10 else "")
@@ -47,21 +52,40 @@ async def notify_startup(pairs: list, dry_run: bool, top_n: int):
     await _send(text)
 
 
-async def notify_open(symbol, side, price, leverage, usdt, dry_run):
+async def notify_open(
+    symbol,
+    side,
+    price,
+    leverage,
+    usdt=None,
+    sl=None,
+    tp1=None,
+    tp2=None,
+    tp3=None,
+    dry_run=False,
+):
     emoji = "\U0001f4c8" if side == "long" else "\U0001f4c9"
     mode  = " [DRY]" if dry_run else ""
-    await _send(
-        f"{emoji} <b>OPEN {_esc(side.upper())}</b>{mode} <code>{_esc(symbol)}</code>\n"
-        f"Entry: <code>{_esc(price)}</code> | Lev: <code>{_esc(leverage)}x</code> | Size: <code>{_esc(usdt)}$</code>"
-    )
+    lines = [
+        f"{emoji} <b>OPEN {_esc(side.upper())}</b>{mode} <code>{_esc(symbol)}</code>",
+        f"Entry: <code>{_esc(price)}</code> | Lev: <code>{_esc(leverage)}x</code>"
+        + (f" | Size: <code>{_esc(usdt)}$</code>" if usdt is not None else ""),
+    ]
+    if sl:
+        lines.append(f"SL: <code>{_esc(sl)}</code>")
+    tps = [tp for tp in (tp1, tp2, tp3) if tp is not None]
+    if tps:
+        lines.append("TP: " + " / ".join(f"<code>{_esc(t)}</code>" for t in tps))
+    await _send("\n".join(lines))
 
 
-async def notify_close(symbol, side, entry, exit_p, pnl, reason, dry_run):
+async def notify_close(symbol, side, exit_p, pnl, entry=None, reason="", dry_run=False):
     emoji = "\u2705" if pnl > 0 else "\u274c"
     mode  = " [DRY]" if dry_run else ""
+    entry_str = f"Entry: <code>{_esc(entry)}</code> \u2192 " if entry is not None else ""
     await _send(
         f"{emoji} <b>CLOSE {_esc(side.upper())}</b>{mode} <code>{_esc(symbol)}</code>\n"
-        f"Entry: <code>{_esc(entry)}</code> \u2192 Exit: <code>{_esc(exit_p)}</code>\n"
+        f"{entry_str}Exit: <code>{_esc(exit_p)}</code>\n"
         f"PnL: <code>{pnl:+.2f}%</code> | {_esc(reason)}"
     )
 
@@ -76,10 +100,11 @@ async def notify_close_failed(symbol, reason, error):
     )
 
 
-async def notify_tp_partial(symbol, side, price, tp_level: int, ratio: float):
+async def notify_tp_partial(symbol, side, price, tp_level: int = 2, ratio: float = 0.5, dry_run: bool = False):
     """Notifica un cierre parcial de TP."""
+    mode = " [DRY]" if dry_run else ""
     await _send(
-        f"\u2702\ufe0f <b>TP{tp_level} PARCIAL</b> <code>{_esc(symbol)}</code>\n"
+        f"\u2702\ufe0f <b>TP{tp_level} PARCIAL</b>{mode} <code>{_esc(symbol)}</code>\n"
         f"Cerrado <code>{ratio*100:.0f}%</code> de la posición {_esc(side.upper())} @ <code>{_esc(price)}</code>\n"
         f"SL movido a <b>break-even</b>"
     )
@@ -106,7 +131,7 @@ async def notify_scanner_update(added: set, removed: set, total: int):
 
 
 async def notify_kill_switch(level: int, trigger: str):
-    """Alerta de kill switch activado — Commit 3."""
+    """Alerta de kill switch activado."""
     level_labels = {
         1: "\u26a0\ufe0f L1 — Nuevas entradas pausadas",
         2: "\U0001f6d1 L2 — Símbolo/estrategia halted",
@@ -118,5 +143,5 @@ async def notify_kill_switch(level: int, trigger: str):
         f"\U0001f6d1 <b>KILL SWITCH ACTIVADO</b>\n"
         f"Nivel: <b>{label}</b>\n"
         f"Trigger: <code>{_esc(trigger[:300])}</code>\n"
-        f"{'\u26a0\ufe0f RE-ARM MANUAL requerido' if level >= 3 else '\u2705 Se puede resetear automáticamente'}"
+        f"{'\\u26a0\\ufe0f RE-ARM MANUAL requerido' if level >= 3 else '\\u2705 Se puede resetear automáticamente'}"
     )
