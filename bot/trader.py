@@ -81,11 +81,9 @@ class FuturesTrader:
         self._ua_pos_mode = None
         self._v2_pos_mode = None
         self._balance_ok  = False
-        # ── Commit 1: protective orders server-side ──────────────────────────────
         self.sl_order_id    = None
         self.tp_order_id    = None
         self._protection_ok = False
-        # ── Commit 2: notional abierto para pretrade_risk ─────────────────────
         self._open_notional = 0.0
 
     # ── HTTP helpers ──────────────────────────────────────────────────────────
@@ -220,12 +218,10 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage — Unified Account v3/contract ────────────────────────────────
+    # ── Leverage — POST /api/v2/mix/account/set-leverage ─────────────────────
 
     async def set_leverage(self, leverage: int, side: str | None = None):
-        """Ajusta el apalancamiento usando el endpoint v3 contract de Unified Account.
-        Endpoint: POST /api/v3/contract/account/set-leverage
-        """
+        """Ajusta el apalancamiento usando POST /api/v2/mix/account/set-leverage."""
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         if sym_clean.endswith("USDTUSDT"):
             sym_clean = sym_clean[:-4]
@@ -236,13 +232,13 @@ class FuturesTrader:
             "leverage":    str(leverage),
         }
         try:
-            r = await self._http_post("/api/v3/contract/account/set-leverage", payload)
+            r = await self._http_post("/api/v2/mix/account/set-leverage", payload)
             if r.get("code") == "00000":
-                logger.debug(f"[{self.symbol}] Leverage {leverage}x (v3 UA) OK")
+                logger.debug(f"[{self.symbol}] Leverage {leverage}x OK")
             else:
-                logger.warning(f"[{self.symbol}] set_leverage v3 error: {r}")
+                logger.warning(f"[{self.symbol}] set_leverage error: {r}")
         except Exception as e:
-            logger.warning(f"[{self.symbol}] set_leverage v3 exception: {e}")
+            logger.warning(f"[{self.symbol}] set_leverage exception: {e}")
 
     # ── Mínimos de qty ────────────────────────────────────────────────────────
 
@@ -252,25 +248,6 @@ class FuturesTrader:
             sym_clean = sym_clean[:-4]
         if sym_clean in _min_qty_cache:
             return _min_qty_cache[sym_clean]
-        try:
-            # v3 UA market contracts endpoint
-            r = await self._http_get(
-                "/api/v3/contract/public/contracts",
-                {"symbol": sym_clean, "productType": "USDT-FUTURES"}
-            )
-            if r.get("code") == "00000":
-                items = r.get("data") or []
-                items = items if isinstance(items, list) else []
-                if items:
-                    min_qty = float(
-                        items[0].get("minTradeNum") or
-                        items[0].get("minOrderSize") or 0.001
-                    )
-                    _min_qty_cache[sym_clean] = min_qty
-                    return min_qty
-        except Exception as e:
-            logger.debug(f"[{self.symbol}] _get_min_qty v3 error: {e}")
-        # fallback to v2 public market endpoint (no auth needed, no UA restriction)
         try:
             r = await self._http_get(
                 "/api/v2/mix/market/contracts",
@@ -287,12 +264,12 @@ class FuturesTrader:
                     _min_qty_cache[sym_clean] = min_qty
                     return min_qty
         except Exception as e:
-            logger.debug(f"[{self.symbol}] _get_min_qty v2 fallback error: {e}")
+            logger.debug(f"[{self.symbol}] _get_min_qty error: {e}")
         fallback = _MIN_QTY_FALLBACK.get(sym_clean, 0.001)
         _min_qty_cache[sym_clean] = fallback
         return fallback
 
-    # ── Posiciones abiertas — Unified Account v3/contract ─────────────────────
+    # ── Posiciones abiertas — /api/v2/mix/position/ ───────────────────────────
 
     async def _get_positions(self) -> list | None:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
@@ -300,7 +277,7 @@ class FuturesTrader:
             sym_clean = sym_clean[:-4]
         try:
             r = await self._http_get(
-                "/api/v3/contract/position/single-position",
+                "/api/v2/mix/position/single-position",
                 {"symbol": sym_clean, "productType": "USDT-FUTURES", "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
@@ -312,11 +289,11 @@ class FuturesTrader:
                     and float(p.get("total") or p.get("size", 0)) > 0
                 ]
         except Exception as e:
-            logger.debug(f"[{self.symbol}] positions v3 single error: {e}")
+            logger.debug(f"[{self.symbol}] positions single error: {e}")
 
         try:
             r = await self._http_get(
-                "/api/v3/contract/position/all-position",
+                "/api/v2/mix/position/all-position",
                 {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
@@ -329,12 +306,12 @@ class FuturesTrader:
                     and float(p.get("total") or p.get("size", 0)) > 0
                 ]
         except Exception as e:
-            logger.debug(f"[{self.symbol}] all-positions v3 error: {e}")
+            logger.debug(f"[{self.symbol}] all-positions error: {e}")
 
         logger.warning(f"[{self.symbol}] ⚠️ _get_positions falló")
         return None
 
-    # ── Protective orders server-side (COMMIT 1) ──────────────────────────────
+    # ── Protective orders server-side ─────────────────────────────────────────
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
         if not self.position:
@@ -368,7 +345,7 @@ class FuturesTrader:
             return {"code": "00000", "data": {"orderId": "dry-tpsl"}}
 
         try:
-            r = await self._http_post("/api/v3/contract/order/place-tpsl-order", payload)
+            r = await self._http_post("/api/v2/mix/order/place-tpsl-order", payload)
             if r.get("code") == "00000":
                 data = r.get("data") or {}
                 item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
@@ -407,7 +384,7 @@ class FuturesTrader:
             logger.error(f"[{self.symbol}] reconcile_position error: {e}")
             return False
 
-    # ── Colocar / cerrar órdenes — Unified Account v3/contract ───────────────
+    # ── Colocar / cerrar órdenes — /api/v2/mix/order/ ────────────────────────
 
     async def _place_order_raw(
         self, side: str, qty: float,
@@ -416,17 +393,13 @@ class FuturesTrader:
     ) -> dict:
         """
         Capa base de envío de órdenes al exchange.
-        Usada por ExecutionEngine y por _place_order().
-        No modifica estado interno: sólo envía y devuelve el resultado.
-        Usa el endpoint v3 contract de Unified Account.
-
+        Usa POST /api/v2/mix/order/place-order.
         trade_side: "open" para abrir posición, "close" para cerrarla.
         """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         if sym_clean.endswith("USDTUSDT"):
             sym_clean = sym_clean[:-4]
-        # v3 UA contract order endpoint
-        endpoint  = "/api/v3/contract/order/place-order"
+        endpoint  = "/api/v2/mix/order/place-order"
         payload: dict = {
             "symbol":      sym_clean,
             "productType": "USDT-FUTURES",
@@ -435,7 +408,7 @@ class FuturesTrader:
             "size":        str(qty),
             "orderType":   order_type,
             "side":        side,
-            "tradeSide":   trade_side,  # "open" o "close"
+            "tradeSide":   trade_side,
         }
         if order_type == "limit" and price is not None:
             payload["price"] = str(price)
@@ -451,13 +424,13 @@ class FuturesTrader:
             return {"code": "ERROR", "msg": str(e)}
 
     async def _get_order_status(self, order_id: str) -> dict:
-        """Consulta el estado de una orden por su ID (v3 UA contract)."""
+        """GET /api/v2/mix/order/detail"""
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         if sym_clean.endswith("USDTUSDT"):
             sym_clean = sym_clean[:-4]
         try:
             return await self._http_get(
-                "/api/v3/contract/order/detail",
+                "/api/v2/mix/order/detail",
                 {"symbol": sym_clean, "productType": "USDT-FUTURES", "orderId": order_id},
             )
         except Exception as e:
@@ -465,13 +438,13 @@ class FuturesTrader:
             return {}
 
     async def _cancel_order(self, order_id: str) -> dict:
-        """Cancela una orden por su ID (v3 UA contract)."""
+        """POST /api/v2/mix/order/cancel-order"""
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         if sym_clean.endswith("USDTUSDT"):
             sym_clean = sym_clean[:-4]
         try:
             return await self._http_post(
-                "/api/v3/contract/order/cancel-order",
+                "/api/v2/mix/order/cancel-order",
                 {"symbol": sym_clean, "productType": "USDT-FUTURES", "orderId": order_id},
             )
         except Exception as e:
@@ -481,18 +454,13 @@ class FuturesTrader:
     async def _place_order(self, side: str, qty: float, trade_side: str = "open") -> dict:
         """
         Punto de entrada principal para abrir/cerrar posiciones.
-        Delega en ExecutionEngine (limit→timeout→market) y mantiene
-        todos los hooks de kill_switch y balance_svc.
-
-        trade_side: "open" para abrir, "close" para cerrar.
+        Delega en ExecutionEngine (limit→timeout→market).
         """
-        # arrival price para el execution engine
         try:
             arrival_price = await self.get_price()
         except Exception:
             arrival_price = 0.0
 
-        # ask/bid desde orderbook metrics
         ask = bid = None
         try:
             sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
