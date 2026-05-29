@@ -1106,4 +1106,118 @@ class FuturesTrader:
 
         while True:
             try:
-                if kill_switch.is_hard_ki
+                if kill_switch.is_hard_killed():
+                    logger.critical("[%s] KillSwitch HARD -- bot detenido permanentemente", self.symbol)
+                    return
+
+                if kill_switch.is_halted(self.symbol):
+                    logger.warning("[%s] KillSwitch activo -- esperando %ss", self.symbol,
+                                   int(os.getenv("LOOP_SLEEP", "10")))
+                    await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
+                    continue
+
+                price = await self.get_price()
+                bars  = await self.get_ohlcv()
+
+                if len(bars) < OHLCV_MIN_BARS:
+                    logger.warning("[%s] Barras insuficientes (%s < %s)", self.symbol, len(bars), OHLCV_MIN_BARS)
+                    await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
+                    continue
+
+                # -- Gestion de posicion abierta --------------------------------
+                if self.position:
+                    sl  = self.sl
+                    tp1 = self.tp1
+                    tp2 = self.tp2
+                    tp3 = self.tp3
+
+                    # TP2 parcial
+                    if tp2 and not self.tp2_hit:
+                        if (self.position == "long"  and price >= tp2) or \
+                           (self.position == "short" and price <= tp2):
+                            logger.info("[%s] TP2 alcanzado -- cierre parcial %.0f%%",
+                                        self.symbol, TP2_PARTIAL_RATIO * 100)
+                            await self.partial_close(ratio=TP2_PARTIAL_RATIO)
+
+                    # Fallback SL/TP en loop (si no hay TPSL en exchange)
+                    if not self._protection_ok:
+                        close_reason = None
+                        if sl:
+                            if (self.position == "long"  and price <= sl) or \
+                               (self.position == "short" and price >= sl):
+                                close_reason = "SL"
+                        if tp3 and not close_reason:
+                            if (self.position == "long"  and price >= tp3) or \
+                               (self.position == "short" and price <= tp3):
+                                close_reason = "TP3"
+                        if close_reason:
+                            await self.close_position(reason=close_reason)
+                            await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
+                            continue
+
+                    # Senal de cierre por estrategia
+                    signal = decide(bars, self.position, self.entry_price, self.leverage)
+                    if signal in ("CLOSE_LONG", "CLOSE_SHORT"):
+                        await self.close_position(reason="strategy")
+                    elif signal == "AI_CLOSE":
+                        context = {
+                            "price": price,
+                            "position": self.position,
+                            "entry_price": self.entry_price,
+                            "sl": sl,
+                            "tp1": tp1, "tp2": tp2, "tp3": tp3,
+                        }
+                        ai_action = await _ai_decide_fn(self.symbol, context)
+                        if ai_action in ("CLOSE_LONG", "CLOSE_SHORT", "CLOSE"):
+                            await self.close_position(reason="ai_strategy")
+
+                # -- Sin posicion: buscar entrada --------------------------------
+                else:
+                    balance = await self.get_balance() or 0.0
+                    signal  = decide(bars, None, None, self.leverage)
+
+                    if signal == "AI":
+                        context = {"price": price, "balance": balance}
+                        signal  = await _ai_decide_fn(self.symbol, context)
+
+                    usdt = risk.usdt_per_trade
+                    lev  = self.leverage
+
+                    if signal == "LONG":
+                        atr = _calc_atr(bars)
+                        sl  = round(price - 1.5 * atr, 6) if atr else None
+                        tp1 = round(price + 1.0 * atr, 6) if atr else None
+                        tp2 = round(price + 2.0 * atr, 6) if atr else None
+                        tp3 = round(price + 3.0 * atr, 6) if atr else None
+                        await self.open_long(usdt, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
+
+                    elif signal == "SHORT":
+                        atr = _calc_atr(bars)
+                        sl  = round(price + 1.5 * atr, 6) if atr else None
+                        tp1 = round(price - 1.0 * atr, 6) if atr else None
+                        tp2 = round(price - 2.0 * atr, 6) if atr else None
+                        tp3 = round(price - 3.0 * atr, 6) if atr else None
+                        await self.open_short(usdt, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
+
+            except asyncio.CancelledError:
+                logger.info("[%s] Loop cancelado", self.symbol)
+                return
+            except Exception as e:
+                logger.error("[%s] Loop error: %s", self.symbol, e, exc_info=True)
+
+            await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
+
+
+# -- Helpers fuera de clase ----------------------------------------------------
+
+def _calc_atr(bars: list, period: int = 14) -> float | None:
+    if len(bars) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(bars)):
+        high  = bars[i][2]
+        low   = bars[i][3]
+        close_prev = bars[i - 1][4]
+        trs.append(max(high - low, abs(high - close_prev), abs(low - close_prev)))
+    atr = sum(trs[-period:]) / period
+    return atr if atr > 0 else None
