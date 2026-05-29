@@ -81,8 +81,6 @@ class FuturesTrader:
                  leverage, margin_mode, dry_run):
         self.symbol       = symbol
         self.leverage     = leverage
-        # isolated es el modo preferido del usuario; se puede sobreescribir con
-        # la variable de entorno MARGIN_MODE (isolated | crossed)
         self.margin_mode  = os.getenv("MARGIN_MODE", margin_mode or "isolated").lower()
         self.dry_run      = dry_run
         self._api_key     = api_key
@@ -408,7 +406,7 @@ class FuturesTrader:
         logger.warning("[%s] _get_positions fallo", self.symbol)
         return None
 
-    # -- TPSL server-side ------------------------------------------------------
+    # -- TPSL server-side (post-fill, via /api/v2/mix/order/place-tpsl-order) --
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
         if not self.position:
@@ -480,6 +478,8 @@ class FuturesTrader:
             return False
 
     # -- Ordenes Unified Account v3 -------------------------------------------
+    # IMPORTANTE: el endpoint /api/v3/trade/place-order NO acepta tpTriggerBy
+    # ni slTriggerBy. El SL/TP se coloca SIEMPRE post-fill via _place_pos_tpsl.
 
     async def _place_order_raw(
         self,
@@ -526,21 +526,15 @@ class FuturesTrader:
             if price is not None:
                 payload["price"] = str(price)
 
-        if effective_trade_side == "open":
-            if tp:
-                payload["takeProfit"]  = str(tp)
-                payload["tpTriggerBy"] = "mark_price"
-                payload["tpOrderType"] = "market"
-            if sl:
-                payload["stopLoss"]    = str(sl)
-                payload["slTriggerBy"] = "mark_price"
-                payload["slOrderType"] = "market"
+        # NO incluimos tpTriggerBy/slTriggerBy aqui: el endpoint v3
+        # /api/v3/trade/place-order rechaza esos parametros (error 40020).
+        # Los niveles SL/TP se aplican siempre post-fill via _place_pos_tpsl.
 
         if self.dry_run:
             logger.info(
-                "[%s] DRY RUN RAW: %s mode=%s marginMode=%s tradeSide=%s posSide=%s %s qty=%s price=%s tp=%s sl=%s",
+                "[%s] DRY RUN RAW: %s mode=%s marginMode=%s tradeSide=%s posSide=%s %s qty=%s price=%s",
                 self.symbol, side, self._ua_pos_mode, bg_margin_mode, effective_trade_side,
-                payload.get("posSide"), order_type, qty, price, tp, sl
+                payload.get("posSide"), order_type, qty, price
             )
             return {"code": "00000", "data": {"orderId": "dry"}}
 
@@ -653,6 +647,8 @@ class FuturesTrader:
 
         trade_side = "close" if reduce_only else "open"
 
+        # sl/tp se pasan al execution_engine pero NO se incluyen en el payload
+        # de place-order (ver _place_order_raw). Se aplicaran post-fill.
         r = await execution_engine.execute(
             trader=self,
             side=side,
@@ -748,7 +744,8 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="long")
-        r = await self._place_order("buy", qty, reduce_only=False, sl=sl, tp=tp3)
+        # Orden de entrada sin SL/TP inline (v3 no los acepta en place-order)
+        r = await self._place_order("buy", qty, reduce_only=False)
         if r.get("code") == "00000":
             self.position    = "long"
             self.entry_price = price
@@ -757,15 +754,16 @@ class FuturesTrader:
             self.tp2  = tp2
             self.tp3  = tp3
             self.tp2_hit       = False
-            self.sl_order_id   = r.get("data", {}).get("orderId") or "inline-tpsl"
-            self.tp_order_id   = r.get("data", {}).get("orderId") or "inline-tpsl"
-            self._protection_ok = bool(sl or tp3)
             self._open_notional = usdt_amount
             save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
             logger.warning("[%s] LONG @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            if not self._protection_ok:
-                await self._place_pos_tpsl(sl=sl, tp=tp3)
+            # Colocar TPSL post-fill via endpoint dedicado
+            tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
+            if tpsl_r.get("code") == "00000":
+                self._protection_ok = True
+            else:
+                self._protection_ok = False
             ok2 = await self.reconcile_position()
             if not ok2:
                 logger.error("[%s] Posicion abierta pero sin proteccion confirmada", self.symbol)
@@ -791,7 +789,8 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="short")
-        r = await self._place_order("sell", qty, reduce_only=False, sl=sl, tp=tp3)
+        # Orden de entrada sin SL/TP inline (v3 no los acepta en place-order)
+        r = await self._place_order("sell", qty, reduce_only=False)
         if r.get("code") == "00000":
             self.position    = "short"
             self.entry_price = price
@@ -800,15 +799,16 @@ class FuturesTrader:
             self.tp2  = tp2
             self.tp3  = tp3
             self.tp2_hit       = False
-            self.sl_order_id   = r.get("data", {}).get("orderId") or "inline-tpsl"
-            self.tp_order_id   = r.get("data", {}).get("orderId") or "inline-tpsl"
-            self._protection_ok = bool(sl or tp3)
             self._open_notional = usdt_amount
             save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
             logger.warning("[%s] SHORT @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            if not self._protection_ok:
-                await self._place_pos_tpsl(sl=sl, tp=tp3)
+            # Colocar TPSL post-fill via endpoint dedicado
+            tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
+            if tpsl_r.get("code") == "00000":
+                self._protection_ok = True
+            else:
+                self._protection_ok = False
             ok2 = await self.reconcile_position()
             if not ok2:
                 logger.error("[%s] Posicion abierta pero sin proteccion confirmada", self.symbol)
@@ -976,9 +976,7 @@ class FuturesTrader:
                         risk.reset()
                 else:
                     # -------------------------------------------------------
-                    # Llamada a strategy.decide() con la firma correcta:
-                    #   decide(exch, symbol, ai_decide_fn,
-                    #          has_open_position, current_pnl) -> dict
+                    # Llamada a strategy.decide() con la firma correcta
                     # -------------------------------------------------------
                     result = await decide(
                         exch=self.exchange,
