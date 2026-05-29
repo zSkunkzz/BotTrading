@@ -3,6 +3,12 @@ bot/balance_service.py - Servicio de balance para Unified Account de Bitget.
 
 Usa HTTP directo en lugar de ccxt.fetch_balance(), que llama al endpoint
 Classic Account y falla con code 40085 en cuentas UA.
+
+Endpoints probados (en orden):
+  1. /api/mix/v1/account/accounts?productType=umcbl   → futuros USDT-M (V1, UA-compatible)
+  2. /api/mix/v1/account/accounts?productType=dmcbl   → futuros COIN-M (V1, UA-compatible)
+  3. /api/spot/v1/account/assets                      → spot (V1, UA-compatible)
+  4. /api/spot/v1/account/assets-lite                 → spot lite (V1, UA-compatible)
 """
 
 import asyncio
@@ -48,7 +54,7 @@ class BalanceService:
         self._api_secret = api_secret
         self._passphrase = passphrase
         self._ready = True
-        logger.info("[BalanceSvc] ✅ Inicializado (HTTP directo, UA compatible)")
+        logger.info("[BalanceSvc] ✅ Inicializado (HTTP directo V1, UA compatible)")
 
     # ------------------------------------------------------------------
     def _sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
@@ -89,7 +95,7 @@ class BalanceService:
     def _extract_usdt(self, data) -> float | None:
         """
         Extrae el mayor balance USDT disponible de la respuesta.
-        Soporta lista plana, lista de cuentas UA con 'list' anidado y dict directo.
+        Soporta lista plana, lista de cuentas con 'list' anidado y dict directo.
         """
         keys = (
             "available", "availableBalance", "crossMaxAvailable",
@@ -114,9 +120,8 @@ class BalanceService:
                 v = _from_dict(item)
                 if v is not None:
                     best = v if best is None else max(best, v)
-                    continue
-                # UA anidado: {accountType: ..., list: [{coin: USDT, ...}]}
-                for nested_key in ("list", "assets"):
+                # UA anidado: {accountType: ..., list/assets/data: [{coin: USDT, ...}]}
+                for nested_key in ("list", "assets", "data"):
                     nested = item.get(nested_key)
                     if isinstance(nested, list):
                         for sub in nested:
@@ -136,7 +141,7 @@ class BalanceService:
                 v = _to_float(data.get(k))
                 if v is not None and v >= 0:
                     return v
-            for nested_key in ("list", "assets"):
+            for nested_key in ("list", "assets", "data"):
                 nested = data.get(nested_key)
                 if isinstance(nested, list):
                     val = _scan_list(nested)
@@ -146,14 +151,19 @@ class BalanceService:
 
     async def _fetch_balance(self) -> float | None:
         """
-        Prueba 5 endpoints en orden, del más específico (futuros UA) al más genérico.
-        Todos son compatibles con Unified Account (no usan /api/v1/ Classic).
+        Prueba endpoints V1 en orden, todos compatibles con Unified Account.
+        Los endpoints V2 de mix/account y spot/account/assets son Classic Account
+        y fallan con 40085 en cuentas UA.
         """
         endpoints = [
-            ("/api/v2/mix/account/accounts",        {"productType": "USDT-FUTURES"}),
-            ("/api/v2/account/all-account-balance", {"coin": "USDT"}),
-            ("/api/v2/spot/account/assets",         {"coin": "USDT"}),
-            ("/api/v2/account/info",                None),
+            # Futuros USDT-M (V1) — endpoint principal para cuentas con futuros
+            ("/api/mix/v1/account/accounts", {"productType": "umcbl"}),
+            # Futuros COIN-M (V1) — fallback por si el USDT está aquí
+            ("/api/mix/v1/account/accounts", {"productType": "dmcbl"}),
+            # Spot (V1) — balance en spot
+            ("/api/spot/v1/account/assets", None),
+            # Spot lite (V1) — versión reducida, más rápida
+            ("/api/spot/v1/account/assets-lite", None),
         ]
         for path, params in endpoints:
             try:
@@ -162,6 +172,7 @@ class BalanceService:
                 if code == "00000":
                     val = self._extract_usdt(r.get("data"))
                     if val is not None:
+                        logger.info(f"[BalanceSvc] ✅ Balance obtenido via {path}: {val:.2f} USDT")
                         return val
                     logger.info(
                         f"[BalanceSvc] ⚠️ {path} code=00000 pero sin USDT extraíble. "
