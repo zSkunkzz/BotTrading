@@ -69,6 +69,7 @@ _MIN_QTY_FALLBACK = {
     "IDUSDT":    1.0,
     "PEPEUSDT":  1000.0,
     "UBUSDT":    1.0,
+    "ONDOUSDT":  1.0,
 }
 
 _min_qty_cache = {}
@@ -521,11 +522,11 @@ class FuturesTrader:
     #   reduceOnly  : "yes"  (solo en one-way mode, en lugar de posSide)
     #   takeProfit  : precio trigger TP (string, omitir si no aplica)
     #   stopLoss    : precio trigger SL (string, omitir si no aplica)
-    #   tpTriggerBy : "mark" | "market"  (default market)
-    #   slTriggerBy : "mark" | "market"  (default market)
+    #   tpTriggerBy : "last_price" | "mark_price" | "index_price"
+    #   slTriggerBy : "last_price" | "mark_price" | "index_price"
     #
-    # NOTA: /api/v3/trade/place-tpsl-order y /api/v2/mix/order/place-tpsl-order
-    #       NO existen o dan error en UA v3. El endpoint correcto es place-strategy-order.
+    # NOTA: "market" NO es un valor valido para triggerBy en UA v3.
+    #       Usar "last_price" (equivalente al precio de mercado en tiempo real).
     # NOTA: Un solo request puede enviar SL + TP simultaneamente.
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
@@ -569,13 +570,15 @@ class FuturesTrader:
             # One-way mode: reduceOnly indica que cierra posicion existente
             payload["reduceOnly"] = "yes"
 
-        # Precios de activacion (market price trigger por defecto)
+        # Precios de activacion
+        # IMPORTANTE: triggerBy acepta "last_price", "mark_price" o "index_price"
+        # "market" no es un valor valido en UA v3 (causa error 40020)
         if sl:
             payload["stopLoss"]    = str(sl)
-            payload["slTriggerBy"] = "market"
+            payload["slTriggerBy"] = "last_price"
         if tp:
             payload["takeProfit"]  = str(tp)
-            payload["tpTriggerBy"] = "market"
+            payload["tpTriggerBy"] = "last_price"
 
         try:
             r = await self._http_post("/api/v3/trade/place-strategy-order", payload)
@@ -657,17 +660,23 @@ class FuturesTrader:
             "side":       side,
             "orderType":  order_type,
             "marginMode": bg_margin_mode,
-            "reduceOnly": "YES" if reduce_only else "NO",
         }
 
         if is_hedge:
+            # En hedge mode: posSide identifica la posicion; NO se usa reduceOnly
+            # Combinar posSide + reduceOnly causa error 25238 en Bitget UA v3
             if pos_side:
                 payload["posSide"] = pos_side
             else:
                 if not reduce_only:
                     payload["posSide"] = "long" if side == "buy" else "short"
                 else:
+                    # Cierre: el lado de la posicion es el opuesto al side de cierre
                     payload["posSide"] = "long" if side == "sell" else "short"
+            # No se envia reduceOnly en hedge mode (causa error 25238)
+        else:
+            # One-way mode: reduceOnly distingue apertura de cierre
+            payload["reduceOnly"] = "YES" if reduce_only else "NO"
 
         if order_type == "limit":
             payload["timeInForce"] = "gtc"
