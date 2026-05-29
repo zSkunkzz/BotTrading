@@ -220,11 +220,11 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage (V3 UA /mix) ─────────────────────────────────────────────────
+    # ── Leverage (V2 mix UA) ──────────────────────────────────────────────────
 
     async def set_leverage(self, leverage: int, side: str | None = None):
-        """Ajusta el apalancamiento usando el endpoint V3 mix de Unified Account.
-        Endpoint: POST /api/v3/mix/account/set-leverage
+        """Ajusta el apalancamiento usando el endpoint V2 mix de Unified Account.
+        Endpoint: POST /api/v2/mix/account/set-leverage
         """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         if sym_clean.endswith("USDTUSDT"):
@@ -236,13 +236,13 @@ class FuturesTrader:
             "leverage":    str(leverage),
         }
         try:
-            r = await self._http_post("/api/v3/mix/account/set-leverage", payload)
+            r = await self._http_post("/api/v2/mix/account/set-leverage", payload)
             if r.get("code") == "00000":
-                logger.debug(f"[{self.symbol}] Leverage {leverage}x (V3 mix) OK")
+                logger.debug(f"[{self.symbol}] Leverage {leverage}x (V2 mix) OK")
             else:
-                logger.warning(f"[{self.symbol}] set_leverage V3 error: {r}")
+                logger.warning(f"[{self.symbol}] set_leverage V2 error: {r}")
         except Exception as e:
-            logger.warning(f"[{self.symbol}] set_leverage V3 exception: {e}")
+            logger.warning(f"[{self.symbol}] set_leverage V2 exception: {e}")
 
     # ── Mínimos de qty ────────────────────────────────────────────────────────
 
@@ -273,7 +273,7 @@ class FuturesTrader:
         _min_qty_cache[sym_clean] = fallback
         return fallback
 
-    # ── Posiciones abiertas (V3 mix UA) ──────────────────────────────────────
+    # ── Posiciones abiertas (V2 mix UA) ──────────────────────────────────────
 
     async def _get_positions(self) -> list | None:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
@@ -281,7 +281,7 @@ class FuturesTrader:
             sym_clean = sym_clean[:-4]
         try:
             r = await self._http_get(
-                "/api/v3/mix/position/single-position",
+                "/api/v2/mix/position/single-position",
                 {"symbol": sym_clean, "productType": "USDT-FUTURES", "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
@@ -293,11 +293,11 @@ class FuturesTrader:
                     and float(p.get("total") or p.get("size", 0)) > 0
                 ]
         except Exception as e:
-            logger.debug(f"[{self.symbol}] positions V3 mix error: {e}")
+            logger.debug(f"[{self.symbol}] positions V2 mix error: {e}")
 
         try:
             r = await self._http_get(
-                "/api/v3/mix/position/all-position",
+                "/api/v2/mix/position/all-position",
                 {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
@@ -310,7 +310,7 @@ class FuturesTrader:
                     and float(p.get("total") or p.get("size", 0)) > 0
                 ]
         except Exception as e:
-            logger.debug(f"[{self.symbol}] all-positions V3 mix error: {e}")
+            logger.debug(f"[{self.symbol}] all-positions V2 mix error: {e}")
 
         logger.warning(f"[{self.symbol}] ⚠️ _get_positions falló")
         return None
@@ -349,7 +349,7 @@ class FuturesTrader:
             return {"code": "00000", "data": {"orderId": "dry-tpsl"}}
 
         try:
-            r = await self._http_post("/api/v3/mix/order/place-tpsl", payload)
+            r = await self._http_post("/api/v2/mix/order/place-tpsl", payload)
             if r.get("code") == "00000":
                 data = r.get("data") or {}
                 item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
@@ -388,7 +388,7 @@ class FuturesTrader:
             logger.error(f"[{self.symbol}] reconcile_position error: {e}")
             return False
 
-    # ── Colocar / cerrar órdenes (V3 mix UA) ─────────────────────────────────
+    # ── Colocar / cerrar órdenes (V2 mix UA) ─────────────────────────────────
 
     async def _place_order_raw(
         self, side: str, qty: float,
@@ -399,16 +399,16 @@ class FuturesTrader:
         Capa base de envío de órdenes al exchange.
         Usada por ExecutionEngine y por _place_order().
         No modifica estado interno: sólo envía y devuelve el resultado.
-        Usa el endpoint V3 mix de Unified Account.
+        Usa el endpoint V2 mix de Unified Account.
 
         trade_side: "open" para abrir posición, "close" para cerrarla.
-        En modo single_hold de UA v3 este campo distingue apertura de cierre.
+        En modo single_hold de UA v2 este campo distingue apertura de cierre.
         """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         if sym_clean.endswith("USDTUSDT"):
             sym_clean = sym_clean[:-4]
-        # V3 mix UA order endpoint
-        endpoint  = "/api/v3/mix/order/place-order"
+        # V2 mix UA order endpoint
+        endpoint  = "/api/v2/mix/order/place-order"
         payload: dict = {
             "symbol":      sym_clean,
             "productType": "USDT-FUTURES",
@@ -433,13 +433,13 @@ class FuturesTrader:
             return {"code": "ERROR", "msg": str(e)}
 
     async def _get_order_status(self, order_id: str) -> dict:
-        """Consulta el estado de una orden por su ID (V3 mix UA)."""
+        """Consulta el estado de una orden por su ID (V2 mix UA)."""
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         if sym_clean.endswith("USDTUSDT"):
             sym_clean = sym_clean[:-4]
         try:
             return await self._http_get(
-                "/api/v3/mix/order/detail",
+                "/api/v2/mix/order/detail",
                 {"symbol": sym_clean, "productType": "USDT-FUTURES", "orderId": order_id},
             )
         except Exception as e:
@@ -447,13 +447,13 @@ class FuturesTrader:
             return {}
 
     async def _cancel_order(self, order_id: str) -> dict:
-        """Cancela una orden por su ID (V3 mix UA)."""
+        """Cancela una orden por su ID (V2 mix UA)."""
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         if sym_clean.endswith("USDTUSDT"):
             sym_clean = sym_clean[:-4]
         try:
             return await self._http_post(
-                "/api/v3/mix/order/cancel-order",
+                "/api/v2/mix/order/cancel-order",
                 {"symbol": sym_clean, "productType": "USDT-FUTURES", "orderId": order_id},
             )
         except Exception as e:
