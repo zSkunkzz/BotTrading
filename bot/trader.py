@@ -168,7 +168,7 @@ class FuturesTrader:
             s = s[:-4]
         return s
 
-    # -- Circuit breaker — helper publico -------------------------------------
+    # -- Circuit breaker helper publico ----------------------------------------
 
     def is_cb_paused(self) -> bool:
         """True si el circuit breaker 40085 esta activo ahora mismo."""
@@ -201,7 +201,7 @@ class FuturesTrader:
 
         self._api_version = "ua"
         self._ua_pos_mode = "single_hold"
-        logger.info("[%s] Forzado modo Unified Account (single_hold)", self.symbol)
+        logger.info("[%s] Forzado modo Unified Account v3 (single_hold)", self.symbol)
 
     # -- Precio, OHLCV y balance ----------------------------------------------
 
@@ -249,7 +249,7 @@ class FuturesTrader:
         return await balance_svc.get()
 
     # -- Leverage --------------------------------------------------------------
-    # UA puede devolver 40085 en set-leverage desde la API; se ignora silenciosamente.
+    # UA v3 puede devolver 40085 en set-leverage; se ignora silenciosamente.
 
     async def set_leverage(self, leverage: int, side: str | None = None):
         sym = self._sym()
@@ -260,7 +260,7 @@ class FuturesTrader:
             "leverage":    str(leverage),
         }
         try:
-            r = await self._http_post("/api/v2/mix/account/set-leverage", payload)
+            r = await self._http_post("/api/v3/mix/account/set-leverage", payload)
             code = r.get("code", "")
             if code == "00000":
                 logger.debug("[%s] Leverage %sx OK", self.symbol, leverage)
@@ -279,7 +279,7 @@ class FuturesTrader:
             return _min_qty_cache[sym]
         try:
             r = await self._http_get(
-                "/api/v2/mix/market/contracts",
+                "/api/v3/mix/market/contracts",
                 {"symbol": sym, "productType": "USDT-FUTURES"}
             )
             if r.get("code") == "00000":
@@ -304,7 +304,7 @@ class FuturesTrader:
         sym = self._sym()
         try:
             r = await self._http_get(
-                "/api/v2/mix/position/single-position",
+                "/api/v3/mix/position/single-position",
                 {"symbol": sym, "productType": "USDT-FUTURES", "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
@@ -320,7 +320,7 @@ class FuturesTrader:
 
         try:
             r = await self._http_get(
-                "/api/v2/mix/position/all-position",
+                "/api/v3/mix/position/all-position",
                 {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
@@ -370,7 +370,7 @@ class FuturesTrader:
             return {"code": "00000", "data": {"orderId": "dry-tpsl"}}
 
         try:
-            r = await self._http_post("/api/v2/mix/order/place-tpsl-order", payload)
+            r = await self._http_post("/api/v3/mix/order/place-tpsl-order", payload)
             if r.get("code") == "00000":
                 data = r.get("data") or {}
                 item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
@@ -409,18 +409,14 @@ class FuturesTrader:
             logger.error("[%s] reconcile_position error: %s", self.symbol, e)
             return False
 
-    # -- Ordenes — Unified Account v2 single_hold ----------------------------
+    # -- Ordenes Unified Account v3 single_hold --------------------------------
     #
-    # En UA v2 single_hold la API v2 de Bitget acepta:
     #   side: "buy"  + tradeSide: "open"  -> abre long
     #   side: "sell" + tradeSide: "open"  -> abre short
     #   side: "sell" + tradeSide: "close" -> cierra long
     #   side: "buy"  + tradeSide: "close" -> cierra short
     #
     # marginMode debe ser "crossed" para USDT-FUTURES en UA.
-    # FIX 40085: En Unified Account NO se puede usar posMode "hedge" ni "oneway"
-    # como parametro; se omite el campo posMode del payload completamente.
-    # El campo "force" (reduceOnly) tampoco es valido en UA v2.
 
     async def _place_order_raw(
         self, side: str, qty: float,
@@ -428,7 +424,6 @@ class FuturesTrader:
         trade_side: str = "open",
     ) -> dict:
         sym = self._sym()
-        # FIX 40085: payload minimo para UA v2. NO incluir posMode ni reduceOnly.
         payload: dict = {
             "symbol":      sym,
             "productType": "USDT-FUTURES",
@@ -447,7 +442,7 @@ class FuturesTrader:
             return {"code": "00000", "data": {"orderId": "dry"}}
 
         try:
-            return await self._http_post("/api/v2/mix/order/place-order", payload)
+            return await self._http_post("/api/v3/mix/order/place-order", payload)
         except Exception as e:
             logger.error("[%s] _place_order_raw exception: %s", self.symbol, e)
             return {"code": "ERROR", "msg": str(e)}
@@ -456,7 +451,7 @@ class FuturesTrader:
         sym = self._sym()
         try:
             return await self._http_get(
-                "/api/v2/mix/order/detail",
+                "/api/v3/mix/order/detail",
                 {"symbol": sym, "productType": "USDT-FUTURES", "orderId": order_id},
             )
         except Exception as e:
@@ -467,7 +462,7 @@ class FuturesTrader:
         sym = self._sym()
         try:
             return await self._http_post(
-                "/api/v2/mix/order/cancel-order",
+                "/api/v3/mix/order/cancel-order",
                 {"symbol": sym, "productType": "USDT-FUTURES", "orderId": order_id},
             )
         except Exception as e:
@@ -524,7 +519,6 @@ class FuturesTrader:
             if self._cb_40085_count >= _CB_40085_THRESHOLD:
                 self._cb_40085_paused_until = time.time() + _CB_40085_PAUSE_S
                 self._cb_40085_count = 0
-                # FIX UnicodeEncodeError: usar % formatting sin emojis en logger.critical
                 logger.critical(
                     "[%s] Circuit breaker 40085 activado -- "
                     "simbolo pausado %ss. "
