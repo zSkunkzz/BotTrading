@@ -103,3 +103,20 @@ async def notify_scanner_update(added: set, removed: set, total: int):
     if added:   parts.append(f"\u2795 A\u00f1adidos: <code>{_esc(', '.join(added))}</code>")
     if removed: parts.append(f"\u2796 Retirados: <code>{_esc(', '.join(removed))}</code>")
     await _send("\n".join(parts))
+
+
+async def notify_kill_switch(level: int, trigger: str):
+    """Alerta de kill switch activado — Commit 3."""
+    level_labels = {
+        1: "\u26a0\ufe0f L1 — Nuevas entradas pausadas",
+        2: "\U0001f6d1 L2 — Símbolo/estrategia halted",
+        3: "\U0001f6a8 L3 — Órdenes bloqueadas (re-arm manual)",
+        4: "\U0001f480 L4 — HARD KILL (re-arm manual)",
+    }
+    label = level_labels.get(level, f"L{level}")
+    await _send(
+        f"\U0001f6d1 <b>KILL SWITCH ACTIVADO</b>\n"
+        f"Nivel: <b>{label}</b>\n"
+        f"Trigger: <code>{_esc(trigger[:300])}</code>\n"
+        f"{'\u26a0\ufe0f RE-ARM MANUAL requerido' if level >= 3 else '\u2705 Se puede resetear automáticamente'}"
+    )

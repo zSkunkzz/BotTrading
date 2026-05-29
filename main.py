@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BitgetProBot v5.3 — IA + Scanner + Telegram + Webhook + Balance Service"""
+"""BitgetProBot v5.4 — IA + Scanner + Telegram + Webhook + Balance Service + Kill Switch"""
 
 import asyncio
 import logging
@@ -14,6 +14,7 @@ from bot.logger import setup_logger
 from bot.telegram_bot import notify_startup, notify_scanner_update
 from bot.ws_feed import ws_feed
 from bot.balance_service import balance_svc
+from bot.kill_switch import kill_switch
 from ai_rate_limiter import start_traders_staggered, telegram_ai_status
 from webhook import start_webhook_server, register_traders
 
@@ -23,7 +24,7 @@ logger = setup_logger()
 active_traders: dict = {}
 global_risk: GlobalRisk = None
 
-# Mapa símbolo → instancia FuturesTrader (para el webhook)
+# Mapa símbolo → instancia FuturesTrader (para el webhook y el watchdog)
 _trader_instances: dict = {}
 
 
@@ -58,7 +59,7 @@ async def _start_single_pair(symbol: str):
         margin_mode=os.getenv("MARGIN_MODE", "isolated"),
         dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
     )
-    # Registrar instancia para el webhook
+    # Registrar instancia para el webhook y el watchdog
     _trader_instances[symbol] = trader
     register_traders(_trader_instances)
 
@@ -104,7 +105,7 @@ async def main():
     global global_risk
 
     logger.info("=" * 60)
-    logger.info("  BitgetProBot v5.3 — IA + Scanner + Telegram + Webhook")
+    logger.info("  BitgetProBot v5.4 — IA + Scanner + Telegram + Webhook + KS")
     logger.info("=" * 60)
 
     # ── Inicializar servicio de balance (singleton, una sola vez) ──────────
@@ -177,12 +178,19 @@ async def main():
 
     await start_traders_staggered(final_pairs, _start_single_pair, delay=2.0)
 
+    # ── Commit 3: arrancar watchdog del kill switch ─────────────────────
+    watchdog_task = asyncio.create_task(
+        kill_switch.run_watchdog(_trader_instances)
+    )
+    logger.info("🐕 Kill Switch Watchdog arrancado")
+
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     await notify_startup(final_pairs, dry_run, top_n)
 
     try:
         await scanner.run_scanner_loop(on_pairs_updated)
     finally:
+        watchdog_task.cancel()
         ws_feed.stop()
         await webhook_runner.cleanup()
 

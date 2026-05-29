@@ -17,6 +17,7 @@ from bot.state import (
 from bot.telegram_bot import notify_tp_partial
 from bot.balance_service import balance_svc
 from bot.pretrade_risk import pretrade_risk
+from bot.kill_switch import kill_switch
 
 logger = logging.getLogger("Trader")
 
@@ -362,6 +363,7 @@ class FuturesTrader:
 
             if not has_pos:
                 logger.error(f"[{self.symbol}] ❌ Reconcile: posición no encontrada en exchange")
+                await kill_switch.on_state_mismatch(self.symbol)
             elif not (sl_covered and tp_covered):
                 logger.error(
                     f"[{self.symbol}] ❌ Reconcile: faltan órdenes TPSL "
@@ -398,13 +400,16 @@ class FuturesTrader:
 
         try:
             r = await self._http_post(endpoint, payload)
-            if r.get("code") == "00000":
+            rejected = r.get("code") != "00000"
+            await kill_switch.on_order_result(rejected=rejected)
+            if not rejected:
                 balance_svc.invalidate()
                 return r
             logger.error(f"[{self.symbol}] Order failed: {r}")
             return r
         except Exception as e:
             logger.error(f"[{self.symbol}] _place_order exception: {e}")
+            await kill_switch.on_order_result(rejected=True)
             return {"code": "ERROR", "msg": str(e)}
 
     async def _calc_qty(self, usdt_amount: float, price: float, leverage: int) -> float:
@@ -419,6 +424,11 @@ class FuturesTrader:
     # ── Abrir posiciones ──────────────────────────────────────────────────────
 
     async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
+        # ── Commit 3: kill switch check ────────────────────────────────
+        if kill_switch.is_halted(self.symbol):
+            logger.warning(f"[{self.symbol}] 🛑 open_long bloqueado por KillSwitch L{kill_switch.level()}")
+            return
+
         price  = await self.get_price()
         lev    = leverage or self.leverage
         qty    = await self._calc_qty(usdt_amount, price, lev)
@@ -458,6 +468,11 @@ class FuturesTrader:
             logger.error(f"[{self.symbol}] open_long FAILED: {r}")
 
     async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
+        # ── Commit 3: kill switch check ────────────────────────────────
+        if kill_switch.is_halted(self.symbol):
+            logger.warning(f"[{self.symbol}] 🛑 open_short bloqueado por KillSwitch L{kill_switch.level()}")
+            return
+
         price  = await self.get_price()
         lev    = leverage or self.leverage
         qty    = await self._calc_qty(usdt_amount, price, lev)
@@ -544,6 +559,9 @@ class FuturesTrader:
         self.trade_count += 1
         self.total_pnl   += pnl
 
+        # ── Commit 3: registrar resultado en kill switch ──────────────────
+        await kill_switch.on_trade_result(pnl)
+
         logger.warning(f"[{self.symbol}] 🟡 {old_pos.upper()} cerrado | razón={reason} | pnl={pnl:+.2f}%")
         await notify_close(self.symbol, old_pos, exit_price, pnl, reason=reason, dry_run=self.dry_run)
 
@@ -589,6 +607,13 @@ class FuturesTrader:
 
         while True:
             try:
+                # ── Commit 3: L4 hard kill → cerrar posición y parar ─────────
+                if kill_switch.is_hard_killed():
+                    logger.critical(f"[{self.symbol}] 💀 L4 HARD KILL — cerrando posición si la hay")
+                    if self.position:
+                        await self.close_position(reason="KS-L4-HARD-KILL")
+                    break
+
                 price = await self.get_price()
 
                 balance = await self.get_balance()
@@ -650,6 +675,12 @@ class FuturesTrader:
                     continue
 
                 # ── Sin posición: verificar riesgo ────────────────────────────
+                # ── Commit 3: L1/L2/L3 → no abrir posiciones nuevas ──────────
+                if kill_switch.is_halted(self.symbol):
+                    logger.debug(f"[{self.symbol}] KS L{kill_switch.level()} — sin nuevas entradas")
+                    await asyncio.sleep(5)
+                    continue
+
                 can_trade, reason = risk.can_open_trade(balance)
                 if not can_trade:
                     logger.debug(f"[{self.symbol}] Risk bloquea: {reason}")
