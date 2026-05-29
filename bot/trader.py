@@ -218,7 +218,7 @@ class FuturesTrader:
         return None
 
     # ------------------------------------------------------------------ init
-    async def _init(self, usdt_per_trade: float):
+    async def _init(self):
         self.exchange = ccxt.bitget({
             "apiKey":     self._api_key,
             "secret":     self._api_secret,
@@ -513,8 +513,40 @@ class FuturesTrader:
         except Exception as e:
             logger.error(f"[{self.symbol}] TP2 partial error: {e}")
 
-    async def run(self, usdt_per_trade: float, interval: int = 60):
-        await self._init(usdt_per_trade)
+    async def run(self, risk_manager=None, global_risk=None, interval: int = 60):
+        """Bucle principal del trader.
+
+        Args:
+            risk_manager: instancia de RiskManager (o float usdt_per_trade por
+                          compatibilidad con llamadas antiguas).
+            global_risk:  instancia de GlobalRisk compartida entre traders.
+            interval:     segundos entre ciclos.
+        """
+        # Compatibilidad: si se pasa un float directamente usará ese valor
+        if isinstance(risk_manager, (int, float)):
+            usdt_per_trade = float(risk_manager)
+            sl_pct_default  = float(os.getenv("SL_PCT",  "0.015"))
+            tp1_pct_default = float(os.getenv("TP1_PCT", "0.01"))
+            tp2_pct_default = float(os.getenv("TP2_PCT", "0.025"))
+            tp3_pct_default = float(os.getenv("TP3_PCT", "0.04"))
+        else:
+            rm = risk_manager
+            usdt_per_trade  = getattr(rm, "usdt_per_trade",  float(os.getenv("USDT_PER_TRADE", "10")))
+            sl_pct_default  = getattr(rm, "sl_pct",   float(os.getenv("SL_PCT",  "0.015")))
+            tp1_pct_default = getattr(rm, "tp_pct",   float(os.getenv("TP1_PCT", "0.01")))  # tp1 ~ tp_pct/4
+            tp2_pct_default = getattr(rm, "tp_pct",   float(os.getenv("TP2_PCT", "0.025"))) / 100 * float(os.getenv("TP2_MULT", "250")) / 100
+            tp3_pct_default = getattr(rm, "tp_pct",   float(os.getenv("TP3_PCT", "0.04")))  / 100
+            # Normalizar sl_pct a decimal si viene como porcentaje (e.g. 2.0 → 0.02)
+            if sl_pct_default > 1:
+                sl_pct_default /= 100
+            if tp1_pct_default > 1:
+                tp1_pct_default /= 100
+            if tp2_pct_default > 1:
+                tp2_pct_default /= 100
+            if tp3_pct_default > 1:
+                tp3_pct_default /= 100
+
+        await self._init()
         await self.set_margin_mode()
         await self.set_leverage(self.leverage)
 
@@ -526,6 +558,14 @@ class FuturesTrader:
 
         while True:
             try:
+                # Respetar límite global de trades concurrentes
+                if global_risk is not None:
+                    can_open = getattr(global_risk, "can_open_trade", None)
+                    if callable(can_open) and not can_open():
+                        logger.debug(f"[{self.symbol}] GlobalRisk: límite alcanzado, esperando.")
+                        await asyncio.sleep(interval)
+                        continue
+
                 price = await self.get_price()
                 ohlcv = await self.get_ohlcv()
 
@@ -539,6 +579,10 @@ class FuturesTrader:
                     pos = await self.get_open_position()
                     if pos is None:
                         logger.info(f"[{self.symbol}] 📭 Posición cerrada externamente.")
+                        if global_risk is not None:
+                            close_fn = getattr(global_risk, "close_trade", None)
+                            if callable(close_fn):
+                                close_fn(self.symbol)
                         self.position = None
                         clear_position(self.symbol)
                     elif self.sl and (
@@ -556,6 +600,10 @@ class FuturesTrader:
                               else (self.entry_price - price) * qty
                         self.trade_count += 1
                         self.total_pnl   += pnl
+                        if global_risk is not None:
+                            close_fn = getattr(global_risk, "close_trade", None)
+                            if callable(close_fn):
+                                close_fn(self.symbol)
                         await notify_close(self.symbol, self.position, price,
                                            self.entry_price, pnl,
                                            self.trade_count, self.win_count, self.total_pnl)
@@ -577,6 +625,10 @@ class FuturesTrader:
                         self.trade_count += 1
                         self.win_count   += 1
                         self.total_pnl   += pnl
+                        if global_risk is not None:
+                            close_fn = getattr(global_risk, "close_trade", None)
+                            if callable(close_fn):
+                                close_fn(self.symbol)
                         await notify_close(self.symbol, self.position, price,
                                            self.entry_price, pnl,
                                            self.trade_count, self.win_count, self.total_pnl)
@@ -604,10 +656,10 @@ class FuturesTrader:
                         min_qty = await self.get_min_qty()
                         qty = max(round(qty, 6), min_qty)
 
-                        sl_pct  = float(os.getenv("SL_PCT",  "0.015"))
-                        tp1_pct = float(os.getenv("TP1_PCT", "0.01"))
-                        tp2_pct = float(os.getenv("TP2_PCT", "0.025"))
-                        tp3_pct = float(os.getenv("TP3_PCT", "0.04"))
+                        sl_pct  = sl_pct_default
+                        tp1_pct = tp1_pct_default
+                        tp2_pct = tp2_pct_default
+                        tp3_pct = tp3_pct_default
 
                         if signal == "long":
                             await self.open_long(qty)
@@ -625,6 +677,12 @@ class FuturesTrader:
                         self.position    = signal
                         self.entry_price = price
                         self.tp2_hit     = False
+
+                        if global_risk is not None:
+                            open_fn = getattr(global_risk, "open_trade", None)
+                            if callable(open_fn):
+                                open_fn(self.symbol)
+
                         save_position(self.symbol, signal, price,
                                       sl=self.sl, tp1=self.tp1,
                                       tp2=self.tp2, tp3=self.tp3)
