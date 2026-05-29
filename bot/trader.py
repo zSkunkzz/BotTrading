@@ -398,13 +398,17 @@ class FuturesTrader:
 
     async def _place_order_raw(
         self, side: str, qty: float,
-        order_type: str = "market", price: float | None = None
+        order_type: str = "market", price: float | None = None,
+        trade_side: str = "open",
     ) -> dict:
         """
         Capa base de envío de órdenes al exchange.
         Usada por ExecutionEngine y por _place_order().
         No modifica estado interno: sólo envía y devuelve el resultado.
         Usa el endpoint V3 de Unified Account.
+
+        trade_side: "open" para abrir posición, "close" para cerrarla.
+        En modo single_hold de UA v3 este campo distingue apertura de cierre.
         """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         if sym_clean.endswith("USDTUSDT"):
@@ -416,16 +420,16 @@ class FuturesTrader:
             "productType": "USDT-FUTURES",
             "marginMode":  self.margin_mode,
             "marginCoin":  "USDT",
-            "size":        str(qty),   # V3 usa 'size' en lugar de 'qty'
+            "size":        str(qty),
             "orderType":   order_type,
             "side":        side,
-            "tradeSide":   self._ua_pos_mode or "open",  # V3 UA: open/close
+            "tradeSide":   trade_side,  # "open" o "close" — nunca "single_hold"
         }
         if order_type == "limit" and price is not None:
             payload["price"] = str(price)
 
         if self.dry_run:
-            logger.info(f"[{self.symbol}] 🟡 DRY RUN RAW: {side} {order_type} qty={qty} price={price}")
+            logger.info(f"[{self.symbol}] 🟡 DRY RUN RAW: {side} {order_type} qty={qty} price={price} tradeSide={trade_side}")
             return {"code": "00000", "data": {"orderId": "dry"}}
 
         try:
@@ -462,11 +466,13 @@ class FuturesTrader:
             logger.debug(f"[{self.symbol}] _cancel_order error: {e}")
             return {}
 
-    async def _place_order(self, side: str, qty: float) -> dict:
+    async def _place_order(self, side: str, qty: float, trade_side: str = "open") -> dict:
         """
         Punto de entrada principal para abrir/cerrar posiciones.
         Delega en ExecutionEngine (limit→timeout→market) y mantiene
         todos los hooks de kill_switch y balance_svc.
+
+        trade_side: "open" para abrir, "close" para cerrar.
         """
         # arrival price para el execution engine
         try:
@@ -493,6 +499,7 @@ class FuturesTrader:
             arrival_price=arrival_price,
             ask=ask,
             bid=bid,
+            trade_side=trade_side,
         )
 
         rejected = r.get("code") != "00000"
@@ -533,7 +540,7 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="long")
-        r = await self._place_order("buy", qty)
+        r = await self._place_order("buy", qty, trade_side="open")
         if r.get("code") == "00000":
             self.position    = "long"
             self.entry_price = price
@@ -575,7 +582,7 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="short")
-        r = await self._place_order("sell", qty)
+        r = await self._place_order("sell", qty, trade_side="open")
         if r.get("code") == "00000":
             self.position    = "short"
             self.entry_price = price
@@ -622,7 +629,7 @@ class FuturesTrader:
                 pnl = (self.entry_price - exit_price) / self.entry_price * 100
 
         if qty > 0:
-            r = await self._place_order(side, qty)
+            r = await self._place_order(side, qty, trade_side="close")
             if r.get("code") != "00000":
                 logger.error(f"[{self.symbol}] close_position FAILED: {r}")
                 return
@@ -668,7 +675,7 @@ class FuturesTrader:
         if not qty or qty <= 0:
             return
 
-        r = await self._place_order(side, qty)
+        r = await self._place_order(side, qty, trade_side="close")
         if r.get("code") == "00000":
             freed = self._open_notional * ratio
             pretrade_risk.register_close(self.symbol, freed)
