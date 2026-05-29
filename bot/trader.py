@@ -127,7 +127,7 @@ class FuturesTrader:
     async def _safe_json(response) -> dict:
         text = await response.text()
         stripped = text.strip()
-        if not stripped.startswith(("{", "[")):
+        if not stripped.startswith(("{" , "[")):
             raise ValueError(f"Respuesta no-JSON: {stripped[:200]}")
         try:
             data = _json.loads(stripped)
@@ -157,8 +157,11 @@ class FuturesTrader:
             self.tp2_hit     = saved.get("tp2_hit", False)
             logger.info(f"[{self.symbol}] 🔄 Posición restaurada: {self.position} @ {self.entry_price}")
 
-        # Inicializar balance_svc (solo una vez, idempotente)
-        balance_svc.init(self._api_key, self._api_secret, self._passphrase)
+        # FIX #4: balance_svc ya inicializado en main.py — no re-inicializar aquí.
+        # Solo loguear si aún no está listo.
+        if not balance_svc.is_ready():
+            logger.warning(f"[{self.symbol}] ⚠️ balance_svc no listo — init desde trader")
+            balance_svc.init(self._api_key, self._api_secret, self._passphrase)
 
         # Forzar modo Unified Account (UA) porque la API key es correcta para UA
         self._api_version = "ua"
@@ -215,7 +218,6 @@ class FuturesTrader:
     async def set_leverage(self, leverage: int, side: str | None = None):
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         endpoint = "/api/v2/mix/account/set-leverage"
-        # Para UA modo one-way
         payload = {
             "symbol": sym_clean,
             "productType": "USDT-FUTURES",
@@ -315,7 +317,6 @@ class FuturesTrader:
             "side": side,
             "holdMode": self._ua_pos_mode or "single_hold",
         }
-        # No se incluye "tradeSide" en UA
 
         if self.dry_run:
             logger.info(f"[{self.symbol}] 🟡 DRY RUN: {side} qty={qty}")
@@ -481,35 +482,53 @@ class FuturesTrader:
                     self._balance_ok = True
                     logger.info(f"[{self.symbol}] ✅ Balance confirmado: {balance:.2f} USDT")
 
-                # Gestión de posición abierta
+                # ── Gestión de posición abierta ───────────────────────────────
                 if self.position:
+                    # Cierre parcial en TP2
                     if not self.tp2_hit and self.tp2:
                         if (self.position == "long" and price >= self.tp2) or \
                            (self.position == "short" and price <= self.tp2):
                             await self.partial_close(ratio=TP2_PARTIAL_RATIO)
 
-                    if self.sl and self.tp3:
+                    # FIX #3: usar check_exit() de RiskManager para SL/TP3 + trailing SL
+                    should_exit, exit_reason = risk.check_exit(price)
+
+                    # También respetar los niveles fijos de SL/TP3 definidos en la señal
+                    if not should_exit and self.sl and self.tp3:
                         hit_sl = (self.position == "long" and price <= self.sl) or \
                                  (self.position == "short" and price >= self.sl)
                         hit_tp3 = (self.position == "long" and price >= self.tp3) or \
                                   (self.position == "short" and price <= self.tp3)
                         if hit_sl:
-                            await self.close_position(reason="SL")
-                            risk.on_trade_close(pnl_pct=-risk.sl_pct)
+                            should_exit = True
+                            exit_reason = f"SL fijo {price:.4f}"
                         elif hit_tp3:
-                            await self.close_position(reason="TP3")
-                            risk.on_trade_close(pnl_pct=risk.tp_pct)
+                            should_exit = True
+                            exit_reason = f"TP3 fijo {price:.4f}"
+
+                    if should_exit:
+                        pnl_pct = 0.0
+                        if self.entry_price:
+                            if self.position == "long":
+                                pnl_pct = (price - self.entry_price) / self.entry_price * 100
+                            else:
+                                pnl_pct = (self.entry_price - price) / self.entry_price * 100
+                        # FIX #1: siempre notificar al GlobalRisk al cerrar
+                        if global_risk:
+                            await global_risk.register_close(pnl_pct=pnl_pct)
+                        await self.close_position(reason=exit_reason)
+                        risk.on_trade_close(pnl_pct=pnl_pct)
+
                     await asyncio.sleep(2)
                     continue
 
-                # Sin posición: verificar riesgo local
+                # ── Sin posición: verificar riesgo ────────────────────────────
                 can_trade, reason = risk.can_open_trade(balance)
                 if not can_trade:
                     logger.debug(f"[{self.symbol}] Risk bloquea: {reason}")
                     await asyncio.sleep(2)
                     continue
 
-                # Verificar riesgo global (métodos correctos: can_open + register_open/close)
                 if global_risk:
                     gr_ok, gr_reason = await global_risk.can_open()
                     if not gr_ok:
@@ -539,23 +558,32 @@ class FuturesTrader:
                     tp2 = decision.get("tp2")
                     tp3 = decision.get("tp3")
 
-                    if global_risk:
-                        await global_risk.register_open()
-
+                    # FIX #2: abrir la orden ANTES de registrar en GlobalRisk
+                    # para que si falla, el contador no suba.
                     if action in ("LONG", "BUY"):
                         await self.open_long(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
-                        if self.position:
+                        if self.position:  # solo si la orden se ejecutó OK
+                            if global_risk:
+                                await global_risk.register_open()
                             risk.on_trade_open(self.entry_price, "long")
                     else:
                         await self.open_short(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
-                        if self.position:
+                        if self.position:  # solo si la orden se ejecutó OK
+                            if global_risk:
+                                await global_risk.register_open()
                             risk.on_trade_open(self.entry_price, "short")
 
                 elif action == "CLOSE" and self.position:
+                    pnl_pct = 0.0
+                    if self.entry_price:
+                        if self.position == "long":
+                            pnl_pct = (price - self.entry_price) / self.entry_price * 100
+                        else:
+                            pnl_pct = (self.entry_price - price) / self.entry_price * 100
                     if global_risk:
-                        await global_risk.register_close(pnl_pct=0.0)
+                        await global_risk.register_close(pnl_pct=pnl_pct)
                     await self.close_position(reason=decision.get("reasoning", "IA-CLOSE"))
-                    risk.on_trade_close(pnl_pct=0.0)
+                    risk.on_trade_close(pnl_pct=pnl_pct)
 
             except asyncio.CancelledError:
                 logger.info(f"[{self.symbol}] Trader cancelado.")
