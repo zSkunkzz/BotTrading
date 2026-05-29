@@ -478,8 +478,10 @@ class FuturesTrader:
             return False
 
     # -- Ordenes Unified Account v3 -------------------------------------------
-    # IMPORTANTE: el endpoint /api/v3/trade/place-order NO acepta tpTriggerBy
-    # ni slTriggerBy. El SL/TP se coloca SIEMPRE post-fill via _place_pos_tpsl.
+    # ENDPOINT: /api/v3/trade/place-order
+    # IMPORTANTE: Este endpoint NO acepta "tradeSide". El modo open/close se
+    # indica con el booleano "reduceOnly". En modo one_way no se envía "side"
+    # de posición (posSide). En hedge mode sí se incluye "posSide".
 
     async def _place_order_raw(
         self,
@@ -490,7 +492,7 @@ class FuturesTrader:
         reduce_only: bool = False,
         sl: float | None = None,
         tp: float | None = None,
-        trade_side: str = "open",
+        trade_side: str = "open",   # mantenido por compatibilidad con execution_engine, ignorado en payload
         pos_side: str | None = None,
     ) -> dict:
         sym = self._sym()
@@ -499,9 +501,17 @@ class FuturesTrader:
             self._ua_pos_mode = await self._detect_pos_mode()
 
         is_hedge = self._ua_pos_mode == "hedge"
-        effective_trade_side = "close" if reduce_only else trade_side
         bg_margin_mode = "isolated" if self.margin_mode == "isolated" else "crossed"
 
+        # /api/v3/trade/place-order acepta:
+        #   side: "buy" | "sell"
+        #   orderType: "market" | "limit"
+        #   reduceOnly: "YES" | "NO"  (string, no bool)
+        #   posSide: "long" | "short"  (solo en hedge mode)
+        #   marginMode: "isolated" | "crossed"
+        #   qty: string
+        #   price: string (solo en limit)
+        # NO acepta: tradeSide, timeInForce (usar gtc via campo aparte si es limit)
         payload: dict = {
             "category":   "USDT-FUTURES",
             "symbol":     sym,
@@ -509,16 +519,17 @@ class FuturesTrader:
             "side":       side,
             "orderType":  order_type,
             "marginMode": bg_margin_mode,
-            "tradeSide":  effective_trade_side,
+            "reduceOnly": "YES" if reduce_only else "NO",
         }
 
         if is_hedge:
             if pos_side:
                 payload["posSide"] = pos_side
             else:
-                if effective_trade_side == "open":
+                if not reduce_only:
                     payload["posSide"] = "long" if side == "buy" else "short"
                 else:
+                    # Para cerrar en hedge: la posicion opuesta al side de cierre
                     payload["posSide"] = "long" if side == "sell" else "short"
 
         if order_type == "limit":
@@ -526,14 +537,10 @@ class FuturesTrader:
             if price is not None:
                 payload["price"] = str(price)
 
-        # NO incluimos tpTriggerBy/slTriggerBy aqui: el endpoint v3
-        # /api/v3/trade/place-order rechaza esos parametros (error 40020).
-        # Los niveles SL/TP se aplican siempre post-fill via _place_pos_tpsl.
-
         if self.dry_run:
             logger.info(
-                "[%s] DRY RUN RAW: %s mode=%s marginMode=%s tradeSide=%s posSide=%s %s qty=%s price=%s",
-                self.symbol, side, self._ua_pos_mode, bg_margin_mode, effective_trade_side,
+                "[%s] DRY RUN RAW: %s mode=%s marginMode=%s reduceOnly=%s posSide=%s %s qty=%s price=%s",
+                self.symbol, side, self._ua_pos_mode, bg_margin_mode, reduce_only,
                 payload.get("posSide"), order_type, qty, price
             )
             return {"code": "00000", "data": {"orderId": "dry"}}
@@ -647,8 +654,6 @@ class FuturesTrader:
 
         trade_side = "close" if reduce_only else "open"
 
-        # sl/tp se pasan al execution_engine pero NO se incluyen en el payload
-        # de place-order (ver _place_order_raw). Se aplicaran post-fill.
         r = await execution_engine.execute(
             trader=self,
             side=side,
@@ -744,7 +749,6 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="long")
-        # Orden de entrada sin SL/TP inline (v3 no los acepta en place-order)
         r = await self._place_order("buy", qty, reduce_only=False)
         if r.get("code") == "00000":
             self.position    = "long"
@@ -758,7 +762,6 @@ class FuturesTrader:
             save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
             logger.warning("[%s] LONG @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            # Colocar TPSL post-fill via endpoint dedicado
             tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
             if tpsl_r.get("code") == "00000":
                 self._protection_ok = True
@@ -789,7 +792,6 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="short")
-        # Orden de entrada sin SL/TP inline (v3 no los acepta en place-order)
         r = await self._place_order("sell", qty, reduce_only=False)
         if r.get("code") == "00000":
             self.position    = "short"
@@ -803,7 +805,6 @@ class FuturesTrader:
             save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
             logger.warning("[%s] SHORT @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            # Colocar TPSL post-fill via endpoint dedicado
             tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
             if tpsl_r.get("code") == "00000":
                 self._protection_ok = True
@@ -906,8 +907,6 @@ class FuturesTrader:
         usdt_per_trade = risk.usdt_per_trade
         await self._init(usdt_per_trade)
 
-        # Wrapper ai_decide_fn compatible con la firma que espera strategy.decide():
-        #   ai_decide_fn(symbol: str, context: dict) -> str  ("BUY"|"SELL"|"HOLD")
         async def _ai_decide_fn(symbol: str, context: dict) -> str:
             result = await ai_decide(
                 symbol=symbol,
@@ -975,9 +974,6 @@ class FuturesTrader:
                         await self.close_position(reason=exit_reason)
                         risk.reset()
                 else:
-                    # -------------------------------------------------------
-                    # Llamada a strategy.decide() con la firma correcta
-                    # -------------------------------------------------------
                     result = await decide(
                         exch=self.exchange,
                         symbol=self.symbol,
@@ -1016,7 +1012,6 @@ class FuturesTrader:
                             sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
                             leverage=lev,
                         )
-                    # HOLD → no action
 
             except Exception as e:
                 logger.error("[%s] run() error: %s", self.symbol, e)
