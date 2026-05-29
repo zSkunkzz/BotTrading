@@ -1,14 +1,27 @@
 """
-bot/balance_service.py - Servicio de balance para Unified Account de Bitget.
+bot/balance_service.py - Servicio de balance para Unified Account (UA) de Bitget.
 
-Usa HTTP directo en lugar de ccxt.fetch_balance(), que llama al endpoint
-Classic Account y falla con code 40085 en cuentas UA.
+Usa la API V3, que es la API nativa diseñada específicamente para cuentas
+Unified Account. Los endpoints V1/V2 de mix/spot fallan con error 40085 en UA.
 
-Endpoints probados (en orden):
-  1. /api/mix/v1/account/accounts?productType=umcbl   → futuros USDT-M (V1, UA-compatible)
-  2. /api/mix/v1/account/accounts?productType=dmcbl   → futuros COIN-M (V1, UA-compatible)
-  3. /api/spot/v1/account/assets                      → spot (V1, UA-compatible)
-  4. /api/spot/v1/account/assets-lite                 → spot lite (V1, UA-compatible)
+Endpoint principal:
+  GET /api/v3/account/assets
+
+Respuesta (AccountAssetsV3):
+  {
+    "code": "00000",
+    "data": {
+      "usdtEquity": "123.45",       <- balance total en USDT (nivel raiz)
+      "accountEquity": "123.45",
+      "assets": [
+        { "coin": "USDT", "available": "100.00", "equity": "123.45", "balance": "123.45", ... },
+        ...
+      ]
+    }
+  }
+
+Fallback:
+  GET /api/v2/account/all-account-balance  (V2 UA, algunos usuarios)
 """
 
 import asyncio
@@ -31,7 +44,8 @@ def _to_float(val) -> float | None:
     if val is None:
         return None
     try:
-        return float(val)
+        v = float(val)
+        return v if v >= 0 else None
     except (ValueError, TypeError):
         return None
 
@@ -54,7 +68,7 @@ class BalanceService:
         self._api_secret = api_secret
         self._passphrase = passphrase
         self._ready = True
-        logger.info("[BalanceSvc] ✅ Inicializado (HTTP directo V1, UA compatible)")
+        logger.info("[BalanceSvc] ✅ Inicializado (API V3 Unified Account)")
 
     # ------------------------------------------------------------------
     def _sign(self, ts: str, method: str, path_with_qs: str, body: str = "") -> str:
@@ -78,11 +92,12 @@ class BalanceService:
         qs = ""
         if params:
             qs = "?" + "&".join(f"{k}={v}" for k, v in params.items())
-        url = "https://api.bitget.com" + path + qs
+        full_path = path + qs
+        url = "https://api.bitget.com" + full_path
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 url,
-                headers=self._headers("GET", path + qs),
+                headers=self._headers("GET", full_path),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
                 text = await r.text()
@@ -92,96 +107,105 @@ class BalanceService:
                 return _json.loads(stripped)
 
     # ------------------------------------------------------------------
-    def _extract_usdt(self, data) -> float | None:
+    def _extract_usdt_from_v3(self, data: dict) -> float | None:
         """
-        Extrae el mayor balance USDT disponible de la respuesta.
-        Soporta lista plana, lista de cuentas con 'list' anidado y dict directo.
-        """
-        keys = (
-            "available", "availableBalance", "crossMaxAvailable",
-            "equity", "usdtEquity", "isolatedMaxAvailable",
-            "crossedMaxAvailable", "walletBalance", "balance", "free",
-        )
+        Extrae USDT de la respuesta AccountAssetsV3.
 
-        def _from_dict(d: dict) -> float | None:
-            coin = (d.get("marginCoin") or d.get("coin") or d.get("asset") or "").upper()
-            if coin == "USDT":
-                for k in keys:
-                    v = _to_float(d.get(k))
-                    if v is not None and v >= 0:
-                        return v
+        La respuesta V3 tiene:
+          data.usdtEquity          <- string, balance total en USDT
+          data.assets[]            <- lista de AccountAssetV3
+            .coin == "USDT"
+            .available             <- disponible
+            .equity                <- equity total
+            .balance               <- balance bruto
+        """
+        if not isinstance(data, dict):
             return None
 
-        def _scan_list(lst: list) -> float | None:
-            best = None
-            for item in lst:
+        # 1. Campo de nivel raiz: usdtEquity (el mas directo)
+        v = _to_float(data.get("usdtEquity"))
+        if v is not None:
+            return v
+
+        # 2. Buscar en assets[] el coin USDT
+        assets = data.get("assets", [])
+        if isinstance(assets, list):
+            for asset in assets:
+                if not isinstance(asset, dict):
+                    continue
+                if (asset.get("coin") or "").upper() == "USDT":
+                    for field in ("available", "equity", "balance"):
+                        v = _to_float(asset.get(field))
+                        if v is not None:
+                            return v
+        return None
+
+    def _extract_usdt_from_v2_all_balance(self, data) -> float | None:
+        """
+        Extrae USDT de la respuesta de /api/v2/account/all-account-balance.
+        Devuelve una lista de {accountType, list: [{coin, available, ...}]}.
+        """
+        if not isinstance(data, list):
+            # A veces es un dict con 'list' dentro
+            if isinstance(data, dict):
+                data = data.get("list") or data.get("data") or []
+        best = None
+        for account in (data if isinstance(data, list) else []):
+            if not isinstance(account, dict):
+                continue
+            inner = account.get("list") or account.get("assets") or []
+            for item in (inner if isinstance(inner, list) else []):
                 if not isinstance(item, dict):
                     continue
-                v = _from_dict(item)
-                if v is not None:
-                    best = v if best is None else max(best, v)
-                # UA anidado: {accountType: ..., list/assets/data: [{coin: USDT, ...}]}
-                for nested_key in ("list", "assets", "data"):
-                    nested = item.get(nested_key)
-                    if isinstance(nested, list):
-                        for sub in nested:
-                            if isinstance(sub, dict):
-                                v2 = _from_dict(sub)
-                                if v2 is not None:
-                                    best = v2 if best is None else max(best, v2)
-            return best
-
-        if isinstance(data, list):
-            val = _scan_list(data)
-            if val is not None:
-                return val
-
-        if isinstance(data, dict):
-            for k in keys:
-                v = _to_float(data.get(k))
-                if v is not None and v >= 0:
-                    return v
-            for nested_key in ("list", "assets", "data"):
-                nested = data.get(nested_key)
-                if isinstance(nested, list):
-                    val = _scan_list(nested)
-                    if val is not None:
-                        return val
-        return None
+                if (item.get("coin") or "").upper() == "USDT":
+                    for field in ("available", "equity", "balance", "walletBalance"):
+                        v = _to_float(item.get(field))
+                        if v is not None:
+                            best = v if best is None else max(best, v)
+        return best
 
     async def _fetch_balance(self) -> float | None:
         """
-        Prueba endpoints V1 en orden, todos compatibles con Unified Account.
-        Los endpoints V2 de mix/account y spot/account/assets son Classic Account
-        y fallan con 40085 en cuentas UA.
+        Intenta obtener el balance USDT usando los endpoints UA en orden:
+          1. V3 /api/v3/account/assets          <- API nativa UA, la correcta
+          2. V2 /api/v2/account/all-account-balance  <- fallback UA V2
         """
-        endpoints = [
-            # Futuros USDT-M (V1) — endpoint principal para cuentas con futuros
-            ("/api/mix/v1/account/accounts", {"productType": "umcbl"}),
-            # Futuros COIN-M (V1) — fallback por si el USDT está aquí
-            ("/api/mix/v1/account/accounts", {"productType": "dmcbl"}),
-            # Spot (V1) — balance en spot
-            ("/api/spot/v1/account/assets", None),
-            # Spot lite (V1) — versión reducida, más rápida
-            ("/api/spot/v1/account/assets-lite", None),
-        ]
-        for path, params in endpoints:
-            try:
-                r = await self._http_get(path, params)
-                code = r.get("code")
-                if code == "00000":
-                    val = self._extract_usdt(r.get("data"))
-                    if val is not None:
-                        logger.info(f"[BalanceSvc] ✅ Balance obtenido via {path}: {val:.2f} USDT")
-                        return val
-                    logger.info(
-                        f"[BalanceSvc] ⚠️ {path} code=00000 pero sin USDT extraíble. "
-                        f"data={str(r.get('data', ''))[:300]}"
-                    )
-                else:
-                    logger.info(f"[BalanceSvc] ⚠️ {path} code={code} msg={r.get('msg')}")
-            except Exception as e:
-                logger.info(f"[BalanceSvc] ⚠️ {path} excepción: {e}")
+        # --- Intento 1: API V3 (UA nativa) ---
+        try:
+            r = await self._http_get("/api/v3/account/assets")
+            code = r.get("code")
+            if code == "00000":
+                val = self._extract_usdt_from_v3(r.get("data", {}))
+                if val is not None:
+                    logger.info(f"[BalanceSvc] ✅ V3 /account/assets: {val:.2f} USDT")
+                    return val
+                logger.warning(
+                    f"[BalanceSvc] ⚠️ V3 code=00000 pero sin USDT extraíble. "
+                    f"data={str(r.get('data',''))[:400]}"
+                )
+            else:
+                logger.warning(f"[BalanceSvc] ⚠️ V3 code={code} msg={r.get('msg')}")
+        except Exception as e:
+            logger.warning(f"[BalanceSvc] ⚠️ V3 excepción: {e}")
+
+        # --- Intento 2: API V2 all-account-balance (fallback) ---
+        try:
+            r = await self._http_get("/api/v2/account/all-account-balance")
+            code = r.get("code")
+            if code == "00000":
+                val = self._extract_usdt_from_v2_all_balance(r.get("data"))
+                if val is not None:
+                    logger.info(f"[BalanceSvc] ✅ V2 /all-account-balance: {val:.2f} USDT")
+                    return val
+                logger.warning(
+                    f"[BalanceSvc] ⚠️ V2 code=00000 pero sin USDT extraíble. "
+                    f"data={str(r.get('data',''))[:400]}"
+                )
+            else:
+                logger.warning(f"[BalanceSvc] ⚠️ V2 fallback code={code} msg={r.get('msg')}")
+        except Exception as e:
+            logger.warning(f"[BalanceSvc] ⚠️ V2 fallback excepción: {e}")
+
         return None
 
     # ------------------------------------------------------------------
@@ -201,9 +225,9 @@ class BalanceService:
                 self._ts = time.monotonic()
                 logger.info(f"[BalanceSvc] ✅ Balance actualizado: {fresh:.2f} USDT")
             elif self._value is not None:
-                logger.warning(f"[BalanceSvc] ⚠️ Usando caché: {self._value:.2f} USDT")
+                logger.warning(f"[BalanceSvc] ⚠️ Usando caché anterior: {self._value:.2f} USDT")
             else:
-                logger.error("[BalanceSvc] ❌ No se pudo obtener balance")
+                logger.error("[BalanceSvc] ❌ No se pudo obtener el balance")
             return self._value
 
     def invalidate(self):
