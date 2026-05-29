@@ -304,7 +304,7 @@ class FuturesTrader:
         sym = self._sym()
         try:
             r = await self._http_get(
-                "/api/v3/mix/position/single-position",
+                "/api/v2/mix/position/single-position",
                 {"symbol": sym, "productType": "USDT-FUTURES", "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
@@ -320,7 +320,7 @@ class FuturesTrader:
 
         try:
             r = await self._http_get(
-                "/api/v3/mix/position/all-position",
+                "/api/v2/mix/position/all-position",
                 {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
@@ -338,10 +338,10 @@ class FuturesTrader:
         logger.warning("[%s] _get_positions fallo", self.symbol)
         return None
 
-    # -- TPSL server-side (inline en place-order v3) ---------------------------
-    # En UTA v3 los campos takeProfit/stopLoss se pueden embeber directamente
-    # en place-order. Este metodo queda como fallback para actualizar TPSL
-    # sobre posiciones ya abiertas sin un endpoint de posicion-tpsl v3.
+    # -- TPSL server-side (fallback para posiciones ya abiertas) ---------------
+    # En UTA v3 los campos takeProfit/stopLoss se embeben en place-order.
+    # Este metodo se usa como fallback para actualizar TPSL sobre posiciones
+    # ya abiertas usando /api/v2/mix/order/place-tpsl-order.
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
         if not self.position:
@@ -373,7 +373,8 @@ class FuturesTrader:
             return {"code": "00000", "data": {"orderId": "dry-tpsl"}}
 
         try:
-            r = await self._http_post("/api/v3/mix/order/place-tpsl-order", payload)
+            # Fallback TPSL via v2 (endpoint estable para posiciones abiertas)
+            r = await self._http_post("/api/v2/mix/order/place-tpsl-order", payload)
             if r.get("code") == "00000":
                 data = r.get("data") or {}
                 item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
@@ -483,26 +484,79 @@ class FuturesTrader:
             return {"code": "ERROR", "msg": str(e)}
 
     async def _get_order_status(self, order_id: str) -> dict:
+        """
+        Consulta el estado de una orden via /api/v3/trade/order-detail (UTA v3).
+        Parametros: category, symbol, orderId.
+        """
         sym = self._sym()
         try:
             return await self._http_get(
-                "/api/v3/mix/order/detail",
-                {"symbol": sym, "productType": "USDT-FUTURES", "orderId": order_id},
+                "/api/v3/trade/order-detail",
+                {
+                    "category": "USDT-FUTURES",
+                    "symbol":   sym,
+                    "orderId":  order_id,
+                },
             )
         except Exception as e:
             logger.debug("[%s] _get_order_status error: %s", self.symbol, e)
             return {}
 
     async def _cancel_order(self, order_id: str) -> dict:
+        """
+        Cancela una orden via /api/v3/trade/cancel-order (UTA v3).
+        Parametros: category, symbol, orderId.
+        """
         sym = self._sym()
         try:
             return await self._http_post(
-                "/api/v3/mix/order/cancel-order",
-                {"symbol": sym, "productType": "USDT-FUTURES", "orderId": order_id},
+                "/api/v3/trade/cancel-order",
+                {
+                    "category": "USDT-FUTURES",
+                    "symbol":   sym,
+                    "orderId":  order_id,
+                },
             )
         except Exception as e:
             logger.debug("[%s] _cancel_order error: %s", self.symbol, e)
             return {}
+
+    async def _modify_order(
+        self,
+        order_id: str,
+        qty: float | None = None,
+        price: float | None = None,
+        auto_cancel: bool = False,
+    ) -> dict:
+        """
+        Modifica una orden pendiente via /api/v3/trade/modify-order (UTA v3).
+        Requiere orderId. Al menos qty o price deben indicarse.
+        auto_cancel=True cancela la orden original si la modificacion falla.
+        """
+        sym = self._sym()
+        payload: dict = {
+            "category":  "USDT-FUTURES",
+            "symbol":    sym,
+            "orderId":   order_id,
+            "autoCancel": "yes" if auto_cancel else "no",
+        }
+        if qty is not None:
+            payload["qty"] = str(qty)
+        if price is not None:
+            payload["price"] = str(price)
+
+        if self.dry_run:
+            logger.info(
+                "[%s] DRY RUN modify-order: orderId=%s qty=%s price=%s",
+                self.symbol, order_id, qty, price,
+            )
+            return {"code": "00000", "data": {"orderId": order_id}}
+
+        try:
+            return await self._http_post("/api/v3/trade/modify-order", payload)
+        except Exception as e:
+            logger.debug("[%s] _modify_order error: %s", self.symbol, e)
+            return {"code": "ERROR", "msg": str(e)}
 
     async def _place_order(
         self,
