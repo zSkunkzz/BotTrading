@@ -38,6 +38,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("ExecutionEngine")
 
+# Códigos de error que NO deben reintentarse con fallback market.
+# Son errores de configuración/permisos, no de ejecución transitoria.
+_FATAL_CODES = {"40085", "40001", "40006", "40009", "40037"}
+
 
 def _e(key: str, default: float) -> float:
     return float(os.getenv(key, str(default)))
@@ -54,7 +58,7 @@ class TradeRecord:
     fill_latency_ms:   float       = 0.0
     partial_fill_ratio: float      = 1.0
     order_type_used:   str         = "market"  # "limit" o "market"
-    cancel_reason:     str         = ""        # por qué se cancелó el limit (si aplica)
+    cancel_reason:     str         = ""        # por qué se canceló el limit (si aplica)
     success:           bool        = False
 
 
@@ -89,6 +93,9 @@ class ExecutionEngine:
         Intenta primero con limit agresiva; si no llena en timeout, usa market.
         Devuelve el resultado de la orden (dict con 'code' al mínimo).
 
+        Si la order recibe un código FATAL (ej. 40085 UA config error),
+        NO hace fallback a market — propaga el error directamente.
+
         trade_side: "open" para abrir posición, "close" para cerrarla.
         Se propaga a _place_order_raw en todas las rutas.
         """
@@ -117,14 +124,25 @@ class ExecutionEngine:
                 rec.order_type_used = "limit"
                 rec.fill_price      = limit_price
             else:
-                # Fallback a market
-                rec.cancel_reason = "timeout" if not filled else "unfilled"
-                logger.info(
-                    f"[{sym}] ⚡ Limit sin fill en {self.limit_timeout_s}s → fallback market"
-                )
-                result = await trader._place_order_raw(side, qty, trade_side=trade_side)
-                rec.order_type_used = "market"
-                rec.fill_price      = arrival_price  # estimación conservadora
+                # Si es un error fatal (ej. 40085), NO hacer fallback market.
+                error_code = result.get("code", "")
+                if error_code in _FATAL_CODES:
+                    logger.warning(
+                        f"[{sym}] ⛔ Error fatal {error_code} en limit — "
+                        f"abortando sin fallback market"
+                    )
+                    rec.order_type_used = "limit"
+                    rec.fill_price      = arrival_price
+                    rec.cancel_reason   = f"fatal:{error_code}"
+                else:
+                    # Fallback a market solo para errores transitorios
+                    rec.cancel_reason = "timeout" if not filled else "unfilled"
+                    logger.info(
+                        f"[{sym}] ⚡ Limit sin fill en {self.limit_timeout_s}s → fallback market"
+                    )
+                    result = await trader._place_order_raw(side, qty, trade_side=trade_side)
+                    rec.order_type_used = "market"
+                    rec.fill_price      = arrival_price  # estimación conservadora
         else:
             # Spread demasiado amplio o sin orderbook → directo market
             reason = (
@@ -243,14 +261,17 @@ class ExecutionEngine:
         Coloca limit y espera hasta limit_timeout_s.
         Devuelve (result_dict, filled_bool).
         Si no llena, cancela la orden y devuelve filled=False.
+        Si la orden devuelve un código fatal, devuelve inmediatamente filled=False
+        con el resultado de error para que el llamador no haga fallback.
         """
         sym = trader.symbol
         result = await trader._place_order_raw(
             side, qty, order_type="limit", price=price, trade_side=trade_side
         )
         if result.get("code") != "00000":
-            # La limit no se aceptó → reportar como no filled
-            rec.cancel_reason = f"limit_rejected: {result.get('msg', '')}"
+            error_code = result.get("code", "")
+            rec.cancel_reason = f"limit_rejected:{error_code} {result.get('msg', '')}"
+            # Devolver el resultado original para que el llamador decida si es fatal
             return result, False
 
         order_id = (result.get("data") or {}).get("orderId")

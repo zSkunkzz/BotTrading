@@ -28,6 +28,11 @@ OHLCV_TF        = os.getenv("OHLCV_TF", "15m")
 OHLCV_LIMIT     = int(os.getenv("OHLCV_LIMIT", "200"))
 OHLCV_MIN_BARS  = int(os.getenv("OHLCV_MIN_BARS", "55"))
 
+# Cuántos errores 40085 consecutivos pausan el símbolo
+_CB_40085_THRESHOLD = int(os.getenv("CB_40085_THRESHOLD", "3"))
+# Tiempo de pausa en segundos tras superar el umbral
+_CB_40085_PAUSE_S   = int(os.getenv("CB_40085_PAUSE_S", "300"))  # 5 min
+
 _MIN_QTY_FALLBACK = {
     "BTCUSDT":   0.001,
     "ETHUSDT":   0.01,
@@ -93,6 +98,9 @@ class FuturesTrader:
         self.tp_order_id    = None
         self._protection_ok = False
         self._open_notional = 0.0
+        # Circuit breaker para error 40085
+        self._cb_40085_count   = 0
+        self._cb_40085_paused_until = 0.0
 
     # ── Helpers HTTP ──────────────────────────────────────────────────────────
 
@@ -461,6 +469,16 @@ class FuturesTrader:
             return {}
 
     async def _place_order(self, side: str, qty: float, trade_side: str = "open") -> dict:
+        # ── Circuit breaker 40085 ─────────────────────────────────────────────
+        now = time.time()
+        if self._cb_40085_paused_until > now:
+            remaining = int(self._cb_40085_paused_until - now)
+            logger.warning(
+                f"[{self.symbol}] ⏸ Circuit breaker 40085 activo — "
+                f"pausado {remaining}s más"
+            )
+            return {"code": "40085", "msg": "circuit_breaker_paused"}
+
         try:
             arrival_price = await self.get_price()
         except Exception:
@@ -487,20 +505,43 @@ class FuturesTrader:
             trade_side=trade_side,
         )
 
-        rejected = r.get("code") != "00000"
-        # El error 40085 en place-order es un problema de configuración de cuenta,
-        # no un rechazo de orden normal. No debe acumularse en el KillSwitch.
-        if rejected and r.get("code") == "40085":
+        rejected  = r.get("code") != "00000"
+        err_code  = r.get("code", "")
+
+        if err_code == "40085":
+            self._cb_40085_count += 1
             logger.error(
-                f"[{self.symbol}] ❌ Error 40085 en place-order: la cuenta UA "
-                f"rechaza esta llamada. Verifica que la API key tenga permisos "
-                f"de trading en Unified Account."
+                f"[{self.symbol}] ❌ Error 40085 en place-order "
+                f"({self._cb_40085_count}/{_CB_40085_THRESHOLD}): "
+                f"API key sin permisos de Unified Account trading."
             )
-            # No llamamos on_order_result para no disparar KillSwitch innecesariamente
+            if self._cb_40085_count >= _CB_40085_THRESHOLD:
+                self._cb_40085_paused_until = time.time() + _CB_40085_PAUSE_S
+                self._cb_40085_count = 0
+                logger.critical(
+                    f"[{self.symbol}] 🚨 Circuit breaker 40085 activado — "
+                    f"símbolo pausado {_CB_40085_PAUSE_S}s. "
+                    f"Verifica que la API key tenga permisos de trading en Unified Account."
+                )
+                # Notificar por Telegram si está disponible
+                try:
+                    from bot.telegram_bot import send_message
+                    await send_message(
+                        f"🚨 <b>Circuit Breaker 40085</b>\n"
+                        f"Par: <code>{self.symbol}</code>\n"
+                        f"Bitget rechaza la API key para Unified Account trading.\n"
+                        f"El símbolo se pausa {_CB_40085_PAUSE_S//60} min.\n"
+                        f"<b>Acción requerida:</b> Crea una API key nueva desde "
+                        f"Unified Account → API Management en Bitget."
+                    )
+                except Exception:
+                    pass
+            # No acumular en KillSwitch — es un error de configuración, no de mercado
         else:
             await kill_switch.on_order_result(rejected=rejected)
             if not rejected:
                 balance_svc.invalidate()
+                self._cb_40085_count = 0  # reset contador en éxito
             else:
                 logger.error(f"[{self.symbol}] Order failed: {r}")
         return r
