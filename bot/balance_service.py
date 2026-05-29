@@ -1,10 +1,6 @@
 """
-bot/balance_service.py — Servicio singleton de balance USDT para Bitget
-Un único fetch cada BALANCE_TTL segundos compartido por TODOS los traders.
-Uso:
-    from bot.balance_service import balance_svc
-    balance_svc.init(api_key, api_secret, passphrase)
-    bal = await balance_svc.get()
+bot/balance_service.py - Servicio de balance para Unified Account
+Endpoint correcto: /api/v2/unified/account/assets?coin=USDT
 """
 
 import asyncio
@@ -19,7 +15,7 @@ import aiohttp
 
 logger = logging.getLogger("BalanceSvc")
 
-_TTL     = int(os.getenv("BALANCE_CACHE_TTL", "60"))
+_TTL = int(os.getenv("BALANCE_CACHE_TTL", "60"))
 _TIMEOUT = float(os.getenv("BALANCE_TIMEOUT", "10"))
 
 
@@ -40,11 +36,10 @@ class BalanceService:
         self._secret = api_secret
         self._passphrase = passphrase
         self._ready = True
-        logger.info("[BalanceSvc] ✅ Inicializado con credenciales OK")
+        logger.info("[BalanceSvc] ✅ Inicializado (Unified Account)")
 
     async def get(self):
         if not self._ready:
-            logger.error("[BalanceSvc] No inicializado")
             return None
         if self._value is not None and time.monotonic() - self._ts < _TTL:
             return self._value
@@ -57,11 +52,11 @@ class BalanceService:
             if fresh is not None:
                 self._value = fresh
                 self._ts = time.monotonic()
-                logger.info(f"[BalanceSvc] ✅ Balance actualizado: {fresh:.2f} USDT")
+                logger.info(f"[BalanceSvc] ✅ Balance: {fresh:.2f} USDT")
             elif self._value is not None:
-                logger.warning(f"[BalanceSvc] ⚠️ Fetch fallido, usando caché: {self._value:.2f} USDT")
+                logger.warning(f"[BalanceSvc] ⚠️ Usando caché: {self._value:.2f} USDT")
             else:
-                logger.error("[BalanceSvc] 🚨 Fetch fallido y sin caché")
+                logger.error("[BalanceSvc] ❌ No se pudo obtener balance")
             return self._value
 
     def invalidate(self):
@@ -94,18 +89,16 @@ class BalanceService:
                     timeout=aiohttp.ClientTimeout(total=_TIMEOUT),
                 ) as r:
                     if r.status == 429:
-                        retry_after = r.headers.get("Retry-After", "5")
-                        logger.warning(f"[BalanceSvc] 429, esperando {retry_after}s")
-                        await asyncio.sleep(float(retry_after))
+                        retry = r.headers.get("Retry-After", "5")
+                        await asyncio.sleep(float(retry))
                         return await self._get_json(path, qs)
                     text = await r.text()
-                    stripped = text.strip()
-                    if not stripped.startswith(("{", "[")):
-                        logger.debug(f"[BalanceSvc] Respuesta no JSON: {stripped[:120]}")
+                    if not text or not text.startswith(('{', '[')):
+                        logger.warning(f"[BalanceSvc] Respuesta no JSON: {text[:100]}")
                         return None
-                    return _json.loads(stripped)
+                    return _json.loads(text)
         except Exception as e:
-            logger.debug(f"[BalanceSvc] Excepción: {e}")
+            logger.warning(f"[BalanceSvc] Error en {path}: {e}")
             return None
 
     async def _fetch_with_retry(self, max_retries=3):
@@ -119,21 +112,42 @@ class BalanceService:
         return None
 
     async def _fetch(self):
-        # Endpoint más fiable para UA (también funciona en Classic)
-        path = "/api/v2/mix/account/accounts"
-        qs = "?productType=USDT-FUTURES"
+        # Endpoint correcto para Unified Account
+        path = "/api/v2/unified/account/assets"
+        qs = "?coin=USDT"
         data = await self._get_json(path, qs)
         if data and data.get("code") == "00000":
             items = data.get("data", [])
-            if isinstance(items, list) and items:
-                available = items[0].get("available")
-                if available is not None:
-                    return float(available)
-            logger.warning(f"[BalanceSvc] mix/accounts formato inesperado: {data}")
+            if isinstance(items, list):
+                for item in items:
+                    if item.get("coin") == "USDT":
+                        # El campo puede ser "available" o "free"
+                        available = item.get("available") or item.get("free")
+                        if available is not None:
+                            return float(available)
+            else:
+                logger.warning(f"[BalanceSvc] Formato inesperado: {data}")
         else:
             code = data.get("code") if data else "?"
             msg = data.get("msg") if data else "No response"
-            logger.warning(f"[BalanceSvc] mix/accounts code={code} msg={msg}")
+            logger.warning(f"[BalanceSvc] unified/assets code={code} msg={msg}")
+
+        # Fallback opcional (si el anterior no funciona)
+        path2 = "/api/v2/unified/account/balance"
+        data2 = await self._get_json(path2, qs)
+        if data2 and data2.get("code") == "00000":
+            items = data2.get("data", [])
+            if isinstance(items, list):
+                for item in items:
+                    if item.get("coin") == "USDT":
+                        available = item.get("available") or item.get("free")
+                        if available is not None:
+                            return float(available)
+        else:
+            code2 = data2.get("code") if data2 else "?"
+            logger.warning(f"[BalanceSvc] unified/balance code={code2}")
+
+        logger.error("[BalanceSvc] ❌ No se pudo obtener balance con endpoints UA")
         return None
 
 
