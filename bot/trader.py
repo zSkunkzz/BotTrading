@@ -506,23 +506,23 @@ class FuturesTrader:
         logger.warning("[%s] _get_positions fallo", self.symbol)
         return None
 
-    # -- TPSL server-side (v2 mix) ---------------------------------------------
-    # ENDPOINT: /api/v2/mix/order/place-tpsl-order
-    # Documentacion Bitget v2:
+    # -- TPSL server-side (Unified Account v3) ---------------------------------
+    # ENDPOINT: /api/v3/trade/place-tpsl-order
+    # Documentacion Bitget v3 (Unified Account):
     # https://www.bitget.com/api-doc/contract/plan/Place-Tpsl-Order
     #
-    # Campos clave:
-    #   symbol          : "HYPEUSDT" (sin slash)
-    #   productType     : "USDT-FUTURES"
-    #   marginCoin      : "USDT"
-    #   planType        : "pos_loss" (solo SL) | "pos_profit" (solo TP)
-    #   holdSide        : "long" | "short"  (requerido en hedge mode)
+    # Campos clave UA v3:
+    #   category        : "USDT-FUTURES"
+    #   symbol          : "INJUSDT" (sin slash)
+    #   tradeSide       : "buy" | "sell" (direccion de cierre)
+    #   planType        : "pos_loss" (SL) | "pos_profit" (TP)
     #   triggerPrice    : precio de activacion (string)
     #   triggerType     : "mark_price" | "last_price"
-    #   executePrice    : "0" para orden de mercado al activar
+    #   orderType       : "market" (executePrice=0) | "limit"
+    #   posSide         : "long" | "short" (solo en hedge mode)
     #
-    # NOTA: En one_way mode NO se debe enviar holdSide -- Bitget lo rechaza.
-    # NOTA: El endpoint /api/v3/trade/place-tpsl-order NO EXISTE -- da 40404.
+    # NOTA: /api/v2/mix/order/place-tpsl-order da error 40085 en UA v3.
+    # NOTA: En one_way mode NO se envia posSide.
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
         if not self.position:
@@ -531,12 +531,16 @@ class FuturesTrader:
             return {"code": "NO_TPSL", "msg": "Sin niveles de proteccion"}
 
         sym = self._sym()
-        hold_side = "long" if self.position == "long" else "short"
+        is_long = (self.position == "long")
+        # Al cerrar: long se cierra con sell, short con buy
+        close_trade_side = "sell" if is_long else "buy"
         is_hedge = (self._ua_pos_mode == "hedge")
 
         if self.dry_run:
-            logger.info("[%s] DRY RUN TPSL: sl=%s tp=%s holdSide=%s mode=%s",
-                        self.symbol, sl, tp, hold_side if is_hedge else "(omitido one_way)", self._ua_pos_mode)
+            logger.info("[%s] DRY RUN TPSL UA v3: sl=%s tp=%s posSide=%s mode=%s",
+                        self.symbol, sl, tp,
+                        self.position if is_hedge else "(omitido one_way)",
+                        self._ua_pos_mode)
             self.sl_order_id = "dry-sl"
             self.tp_order_id = "dry-tp"
             return {"code": "00000", "data": {"orderId": "dry-tpsl"}}
@@ -548,19 +552,19 @@ class FuturesTrader:
         # -- SL ----------------------------------------------------------------
         if sl:
             payload_sl: dict = {
+                "category":     "USDT-FUTURES",
                 "symbol":       sym,
-                "productType":  "USDT-FUTURES",
-                "marginCoin":   "USDT",
+                "tradeSide":    close_trade_side,
                 "planType":     "pos_loss",
                 "triggerPrice": str(sl),
                 "triggerType":  "mark_price",
-                "executePrice": "0",
+                "orderType":    "market",
             }
-            # holdSide solo en hedge mode
+            # posSide solo en hedge mode
             if is_hedge:
-                payload_sl["holdSide"] = hold_side
+                payload_sl["posSide"] = self.position  # "long" | "short"
             try:
-                r_sl = await self._http_post("/api/v2/mix/order/place-tpsl-order", payload_sl)
+                r_sl = await self._http_post("/api/v3/trade/place-tpsl-order", payload_sl)
                 results["sl"] = r_sl
                 if r_sl.get("code") == "00000":
                     data = r_sl.get("data") or {}
@@ -568,10 +572,10 @@ class FuturesTrader:
                         data.get("orderId") or data.get("clientOid") if isinstance(data, dict) else None
                     )
                     sl_placed = True
-                    logger.info("[%s] TPSL SL OK -- orderId=%s mode=%s",
+                    logger.info("[%s] TPSL SL OK (UA v3) -- orderId=%s mode=%s",
                                 self.symbol, self.sl_order_id, self._ua_pos_mode)
                 else:
-                    logger.error("[%s] TPSL SL FAILED mode=%s payload=%s resp=%s",
+                    logger.error("[%s] TPSL SL FAILED (UA v3) mode=%s payload=%s resp=%s",
                                  self.symbol, self._ua_pos_mode, payload_sl, r_sl)
             except Exception as e:
                 logger.error("[%s] _place_pos_tpsl SL exception: %s", self.symbol, e)
@@ -580,19 +584,19 @@ class FuturesTrader:
         # -- TP ----------------------------------------------------------------
         if tp:
             payload_tp: dict = {
+                "category":     "USDT-FUTURES",
                 "symbol":       sym,
-                "productType":  "USDT-FUTURES",
-                "marginCoin":   "USDT",
+                "tradeSide":    close_trade_side,
                 "planType":     "pos_profit",
                 "triggerPrice": str(tp),
                 "triggerType":  "mark_price",
-                "executePrice": "0",
+                "orderType":    "market",
             }
-            # holdSide solo en hedge mode
+            # posSide solo en hedge mode
             if is_hedge:
-                payload_tp["holdSide"] = hold_side
+                payload_tp["posSide"] = self.position  # "long" | "short"
             try:
-                r_tp = await self._http_post("/api/v2/mix/order/place-tpsl-order", payload_tp)
+                r_tp = await self._http_post("/api/v3/trade/place-tpsl-order", payload_tp)
                 results["tp"] = r_tp
                 if r_tp.get("code") == "00000":
                     data = r_tp.get("data") or {}
@@ -600,10 +604,10 @@ class FuturesTrader:
                         data.get("orderId") or data.get("clientOid") if isinstance(data, dict) else None
                     )
                     tp_placed = True
-                    logger.info("[%s] TPSL TP OK -- orderId=%s mode=%s",
+                    logger.info("[%s] TPSL TP OK (UA v3) -- orderId=%s mode=%s",
                                 self.symbol, self.tp_order_id, self._ua_pos_mode)
                 else:
-                    logger.error("[%s] TPSL TP FAILED mode=%s payload=%s resp=%s",
+                    logger.error("[%s] TPSL TP FAILED (UA v3) mode=%s payload=%s resp=%s",
                                  self.symbol, self._ua_pos_mode, payload_tp, r_tp)
             except Exception as e:
                 logger.error("[%s] _place_pos_tpsl TP exception: %s", self.symbol, e)
