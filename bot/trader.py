@@ -200,8 +200,8 @@ class FuturesTrader:
             balance_svc.init(self._api_key, self._api_secret, self._passphrase)
 
         self._api_version = "ua"
-        self._ua_pos_mode = "single_hold"
-        logger.info("[%s] Forzado modo Unified Account v3 (single_hold)", self.symbol)
+        self._ua_pos_mode = "one_way"  # UTA one-way mode (reduceOnly para cierres)
+        logger.info("[%s] Forzado modo Unified Account v3 (one_way)", self.symbol)
 
     # -- Precio, OHLCV y balance ----------------------------------------------
 
@@ -338,7 +338,10 @@ class FuturesTrader:
         logger.warning("[%s] _get_positions fallo", self.symbol)
         return None
 
-    # -- TPSL server-side ------------------------------------------------------
+    # -- TPSL server-side (inline en place-order v3) ---------------------------
+    # En UTA v3 los campos takeProfit/stopLoss se pueden embeber directamente
+    # en place-order. Este metodo queda como fallback para actualizar TPSL
+    # sobre posiciones ya abiertas sin un endpoint de posicion-tpsl v3.
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
         if not self.position:
@@ -409,40 +412,72 @@ class FuturesTrader:
             logger.error("[%s] reconcile_position error: %s", self.symbol, e)
             return False
 
-    # -- Ordenes Unified Account v3 single_hold --------------------------------
+    # -- Ordenes Unified Account v3 — /api/v3/trade/place-order ---------------
     #
-    #   side: "buy"  + tradeSide: "open"  -> abre long
-    #   side: "sell" + tradeSide: "open"  -> abre short
-    #   side: "sell" + tradeSide: "close" -> cierra long
-    #   side: "buy"  + tradeSide: "close" -> cierra short
+    # One-way mode (UTA por defecto):
+    #   Abrir long:   side=buy
+    #   Abrir short:  side=sell
+    #   Cerrar long:  side=sell  + reduceOnly="yes"
+    #   Cerrar short: side=buy   + reduceOnly="yes"
     #
-    # marginMode debe ser "crossed" para USDT-FUTURES en UA.
+    # Parametros del schema oficial v3:
+    #   category   -> "USDT-FUTURES"
+    #   symbol     -> e.g. "BTCUSDT"
+    #   qty        -> cantidad en base coin (string)
+    #   side       -> "buy" / "sell"
+    #   orderType  -> "market" / "limit"
+    #   reduceOnly -> "yes" / "no" (para cierres en one-way mode)
+    #   marginMode -> "crossed" / "isolated"
+    #   takeProfit / stopLoss -> preset TPSL inline (opcional)
 
     async def _place_order_raw(
-        self, side: str, qty: float,
-        order_type: str = "market", price: float | None = None,
-        trade_side: str = "open",
+        self,
+        side: str,
+        qty: float,
+        order_type: str = "market",
+        price: float | None = None,
+        reduce_only: bool = False,
+        sl: float | None = None,
+        tp: float | None = None,
     ) -> dict:
         sym = self._sym()
         payload: dict = {
-            "symbol":      sym,
-            "productType": "USDT-FUTURES",
-            "marginMode":  "crossed",
-            "marginCoin":  "USDT",
-            "size":        str(qty),
-            "orderType":   order_type,
-            "side":        side,
-            "tradeSide":   trade_side,
+            "category":  "USDT-FUTURES",
+            "symbol":    sym,
+            "qty":       str(qty),
+            "side":      side,
+            "orderType": order_type,
+            "marginMode": "crossed",
         }
-        if order_type == "limit" and price is not None:
-            payload["price"] = str(price)
+
+        if reduce_only:
+            payload["reduceOnly"] = "yes"
+
+        if order_type == "limit":
+            payload["timeInForce"] = "gtc"
+            if price is not None:
+                payload["price"] = str(price)
+
+        # Preset TP/SL inline (solo en ordenes de apertura)
+        if not reduce_only:
+            if tp:
+                payload["takeProfit"]  = str(tp)
+                payload["tpTriggerBy"] = "mark"
+                payload["tpOrderType"] = "market"
+            if sl:
+                payload["stopLoss"]    = str(sl)
+                payload["slTriggerBy"] = "mark"
+                payload["slOrderType"] = "market"
 
         if self.dry_run:
-            logger.info("[%s] DRY RUN RAW: %s/%s %s qty=%s price=%s", self.symbol, side, trade_side, order_type, qty, price)
+            logger.info(
+                "[%s] DRY RUN RAW: %s reduceOnly=%s %s qty=%s price=%s tp=%s sl=%s",
+                self.symbol, side, reduce_only, order_type, qty, price, tp, sl
+            )
             return {"code": "00000", "data": {"orderId": "dry"}}
 
         try:
-            return await self._http_post("/api/v3/mix/order/place-order", payload)
+            return await self._http_post("/api/v3/trade/place-order", payload)
         except Exception as e:
             logger.error("[%s] _place_order_raw exception: %s", self.symbol, e)
             return {"code": "ERROR", "msg": str(e)}
@@ -469,7 +504,14 @@ class FuturesTrader:
             logger.debug("[%s] _cancel_order error: %s", self.symbol, e)
             return {}
 
-    async def _place_order(self, side: str, qty: float, trade_side: str = "open") -> dict:
+    async def _place_order(
+        self,
+        side: str,
+        qty: float,
+        reduce_only: bool = False,
+        sl: float | None = None,
+        tp: float | None = None,
+    ) -> dict:
         # -- Circuit breaker 40085 --------------------------------------------
         now = time.time()
         if self._cb_40085_paused_until > now:
@@ -503,7 +545,9 @@ class FuturesTrader:
             arrival_price=arrival_price,
             ask=ask,
             bid=bid,
-            trade_side=trade_side,
+            reduce_only=reduce_only,
+            sl=sl,
+            tp=tp,
         )
 
         rejected  = r.get("code") != "00000"
@@ -576,7 +620,8 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="long")
-        r = await self._place_order("buy", qty, trade_side="open")
+        # side=buy, reduceOnly=False -> abre long. TP/SL inline en la orden.
+        r = await self._place_order("buy", qty, reduce_only=False, sl=sl, tp=tp3)
         if r.get("code") == "00000":
             self.position    = "long"
             self.entry_price = price
@@ -585,14 +630,16 @@ class FuturesTrader:
             self.tp2  = tp2
             self.tp3  = tp3
             self.tp2_hit       = False
-            self.sl_order_id   = None
-            self.tp_order_id   = None
-            self._protection_ok = False
+            self.sl_order_id   = r.get("data", {}).get("orderId") or "inline-tpsl"
+            self.tp_order_id   = r.get("data", {}).get("orderId") or "inline-tpsl"
+            self._protection_ok = bool(sl or tp3)
             self._open_notional = usdt_amount
             save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
             logger.warning("[%s] LONG @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            await self._place_pos_tpsl(sl=sl, tp=tp3)
+            if not self._protection_ok:
+                # fallback: intentar TPSL via endpoint separado
+                await self._place_pos_tpsl(sl=sl, tp=tp3)
             ok2 = await self.reconcile_position()
             if not ok2:
                 logger.error("[%s] Posicion abierta pero sin proteccion confirmada", self.symbol)
@@ -618,7 +665,8 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="short")
-        r = await self._place_order("sell", qty, trade_side="open")
+        # side=sell, reduceOnly=False -> abre short. TP/SL inline en la orden.
+        r = await self._place_order("sell", qty, reduce_only=False, sl=sl, tp=tp3)
         if r.get("code") == "00000":
             self.position    = "short"
             self.entry_price = price
@@ -627,14 +675,15 @@ class FuturesTrader:
             self.tp2  = tp2
             self.tp3  = tp3
             self.tp2_hit       = False
-            self.sl_order_id   = None
-            self.tp_order_id   = None
-            self._protection_ok = False
+            self.sl_order_id   = r.get("data", {}).get("orderId") or "inline-tpsl"
+            self.tp_order_id   = r.get("data", {}).get("orderId") or "inline-tpsl"
+            self._protection_ok = bool(sl or tp3)
             self._open_notional = usdt_amount
             save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
             logger.warning("[%s] SHORT @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            await self._place_pos_tpsl(sl=sl, tp=tp3)
+            if not self._protection_ok:
+                await self._place_pos_tpsl(sl=sl, tp=tp3)
             ok2 = await self.reconcile_position()
             if not ok2:
                 logger.error("[%s] Posicion abierta pero sin proteccion confirmada", self.symbol)
@@ -644,8 +693,8 @@ class FuturesTrader:
     async def close_position(self, reason: str = ""):
         if not self.position:
             return
-        side       = "sell" if self.position == "long" else "buy"
-        trade_side = "close"
+        # One-way mode: cierre con reduceOnly="yes"
+        side = "sell" if self.position == "long" else "buy"
         qty  = None
         try:
             positions = await self._get_positions()
@@ -666,7 +715,7 @@ class FuturesTrader:
                 pnl = (self.entry_price - exit_price) / self.entry_price * 100
 
         if qty > 0:
-            r = await self._place_order(side, qty, trade_side=trade_side)
+            r = await self._place_order(side, qty, reduce_only=True)
             if r.get("code") != "00000":
                 logger.error("[%s] close_position FAILED: %s", self.symbol, r)
                 return
@@ -697,8 +746,8 @@ class FuturesTrader:
     async def partial_close(self, ratio: float = 0.5):
         if not self.position:
             return
-        side       = "sell" if self.position == "long" else "buy"
-        trade_side = "close"
+        # One-way mode: cierre parcial con reduceOnly="yes"
+        side = "sell" if self.position == "long" else "buy"
         qty  = None
         try:
             positions = await self._get_positions()
@@ -713,7 +762,7 @@ class FuturesTrader:
         if not qty or qty <= 0:
             return
 
-        r = await self._place_order(side, qty, trade_side=trade_side)
+        r = await self._place_order(side, qty, reduce_only=True)
         if r.get("code") == "00000":
             freed = self._open_notional * ratio
             pretrade_risk.register_close(self.symbol, freed)
