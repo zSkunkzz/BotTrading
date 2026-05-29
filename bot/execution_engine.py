@@ -20,6 +20,7 @@ Uso:
       trader=self, side="buy", qty=0.01,
       arrival_price=67000.0, ask=67002.0, bid=66998.0,
       trade_side="open",
+      reduce_only=False, sl=66000.0, tp=68000.0,
   )
   # result: dict con code, fill_price, slippage_bps, ...
 """
@@ -88,6 +89,9 @@ class ExecutionEngine:
         ask:           float | None = None,
         bid:           float | None = None,
         trade_side:    str = "open",
+        reduce_only:   bool = False,
+        sl:            float | None = None,
+        tp:            float | None = None,
     ) -> dict:
         """
         Intenta primero con limit agresiva; si no llena en timeout, usa market.
@@ -97,7 +101,7 @@ class ExecutionEngine:
         NO hace fallback a market — propaga el error directamente.
 
         trade_side: "open" para abrir posición, "close" para cerrarla.
-        Se propaga a _place_order_raw en todas las rutas.
+        reduce_only / sl / tp: se propagan a _place_order_raw en todas las rutas.
         """
         sym = trader.symbol
         rec = TradeRecord(
@@ -118,7 +122,8 @@ class ExecutionEngine:
         if use_limit:
             limit_price = self._calc_limit_price(side, arrival_price, ask, bid)
             result, filled = await self._try_limit(
-                trader, side, qty, limit_price, rec, trade_side=trade_side
+                trader, side, qty, limit_price, rec,
+                trade_side=trade_side, reduce_only=reduce_only, sl=sl, tp=tp,
             )
             if filled:
                 rec.order_type_used = "limit"
@@ -140,7 +145,13 @@ class ExecutionEngine:
                     logger.info(
                         f"[{sym}] ⚡ Limit sin fill en {self.limit_timeout_s}s → fallback market"
                     )
-                    result = await trader._place_order_raw(side, qty, trade_side=trade_side)
+                    result = await trader._place_order_raw(
+                        side, qty,
+                        trade_side=trade_side,
+                        reduce_only=reduce_only,
+                        sl=sl,
+                        tp=tp,
+                    )
                     rec.order_type_used = "market"
                     rec.fill_price      = arrival_price  # estimación conservadora
         else:
@@ -151,7 +162,13 @@ class ExecutionEngine:
                 else "sin datos de orderbook"
             )
             logger.debug(f"[{sym}] Market directo ({reason})")
-            result = await trader._place_order_raw(side, qty, trade_side=trade_side)
+            result = await trader._place_order_raw(
+                side, qty,
+                trade_side=trade_side,
+                reduce_only=reduce_only,
+                sl=sl,
+                tp=tp,
+            )
             rec.order_type_used = "market"
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
@@ -255,7 +272,10 @@ class ExecutionEngine:
         qty:    float,
         price:  float,
         rec:    TradeRecord,
-        trade_side: str = "open",
+        trade_side:  str = "open",
+        reduce_only: bool = False,
+        sl:          float | None = None,
+        tp:          float | None = None,
     ) -> tuple[dict, bool]:
         """
         Coloca limit y espera hasta limit_timeout_s.
@@ -266,7 +286,13 @@ class ExecutionEngine:
         """
         sym = trader.symbol
         result = await trader._place_order_raw(
-            side, qty, order_type="limit", price=price, trade_side=trade_side
+            side, qty,
+            order_type="limit",
+            price=price,
+            trade_side=trade_side,
+            reduce_only=reduce_only,
+            sl=sl,
+            tp=tp,
         )
         if result.get("code") != "00000":
             error_code = result.get("code", "")
@@ -281,6 +307,7 @@ class ExecutionEngine:
         while time.monotonic() < deadline:
             await asyncio.sleep(0.5)
             status = await trader._get_order_status(order_id)
+            # API v3 usa 'orderStatus'; _get_order_status ya lo normaliza como 'state'
             state  = (status.get("data") or {}).get("state", "")
             if state in ("filled", "full_fill"):
                 filled = True

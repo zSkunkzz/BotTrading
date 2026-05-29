@@ -250,6 +250,8 @@ class FuturesTrader:
 
     # -- Leverage --------------------------------------------------------------
     # UA v3 puede devolver 40085 en set-leverage; se ignora silenciosamente.
+    # Endpoint oficial v3: POST /api/v2/mix/account/set-leverage
+    # (no existe /api/v3/trade/set-leverage en la doc oficial)
 
     async def set_leverage(self, leverage: int, side: str | None = None):
         sym = self._sym()
@@ -260,7 +262,7 @@ class FuturesTrader:
             "leverage":    str(leverage),
         }
         try:
-            r = await self._http_post("/api/v3/mix/account/set-leverage", payload)
+            r = await self._http_post("/api/v2/mix/account/set-leverage", payload)
             code = r.get("code", "")
             if code == "00000":
                 logger.debug("[%s] Leverage %sx OK", self.symbol, leverage)
@@ -272,6 +274,8 @@ class FuturesTrader:
             logger.debug("[%s] set_leverage exception (ignorado): %s", self.symbol, e)
 
     # -- Minimos de qty --------------------------------------------------------
+    # Endpoint oficial v2: GET /api/v2/mix/market/contracts
+    # (no existe /api/v3/mix/market/contracts)
 
     async def _get_min_qty(self) -> float:
         sym = self._sym()
@@ -279,7 +283,7 @@ class FuturesTrader:
             return _min_qty_cache[sym]
         try:
             r = await self._http_get(
-                "/api/v3/mix/market/contracts",
+                "/api/v2/mix/market/contracts",
                 {"symbol": sym, "productType": "USDT-FUTURES"}
             )
             if r.get("code") == "00000":
@@ -421,7 +425,7 @@ class FuturesTrader:
     #   Cerrar long:  side=sell  + reduceOnly="yes"
     #   Cerrar short: side=buy   + reduceOnly="yes"
     #
-    # Parametros del schema oficial v3:
+    # Parametros del schema oficial v3 (doc oficial):
     #   category   -> "USDT-FUTURES"
     #   symbol     -> e.g. "BTCUSDT"
     #   qty        -> cantidad en base coin (string)
@@ -430,6 +434,8 @@ class FuturesTrader:
     #   reduceOnly -> "yes" / "no" (para cierres en one-way mode)
     #   marginMode -> "crossed" / "isolated"
     #   takeProfit / stopLoss -> preset TPSL inline (opcional)
+    #   tpOrderType / slOrderType -> "market" / "limit"
+    #   tpTriggerBy / slTriggerBy -> "mark" / "market"
 
     async def _place_order_raw(
         self,
@@ -440,6 +446,7 @@ class FuturesTrader:
         reduce_only: bool = False,
         sl: float | None = None,
         tp: float | None = None,
+        trade_side: str = "open",
     ) -> dict:
         sym = self._sym()
         payload: dict = {
@@ -485,19 +492,28 @@ class FuturesTrader:
 
     async def _get_order_status(self, order_id: str) -> dict:
         """
-        Consulta el estado de una orden via /api/v3/trade/order-detail (UTA v3).
-        Parametros: category, symbol, orderId.
+        Consulta el estado de una orden via /api/v3/trade/order-info (UTA v3).
+        Response doc oficial: data.orderStatus (no data.state).
+        Valores: live | new | partially_filled | filled | cancelled
         """
         sym = self._sym()
         try:
-            return await self._http_get(
-                "/api/v3/trade/order-detail",
+            r = await self._http_get(
+                "/api/v3/trade/order-info",
                 {
                     "category": "USDT-FUTURES",
                     "symbol":   sym,
                     "orderId":  order_id,
                 },
             )
+            # Normalizar: exponer orderStatus como 'state' para compatibilidad
+            # con execution_engine que lee data.state
+            if r.get("code") == "00000":
+                data = r.get("data") or {}
+                if isinstance(data, dict) and "orderStatus" in data:
+                    data["state"] = data["orderStatus"]
+                    r["data"] = data
+            return r
         except Exception as e:
             logger.debug("[%s] _get_order_status error: %s", self.symbol, e)
             return {}
@@ -505,7 +521,7 @@ class FuturesTrader:
     async def _cancel_order(self, order_id: str) -> dict:
         """
         Cancela una orden via /api/v3/trade/cancel-order (UTA v3).
-        Parametros: category, symbol, orderId.
+        Parametros oficiales: category, symbol, orderId.
         """
         sym = self._sym()
         try:
@@ -592,6 +608,8 @@ class FuturesTrader:
         except Exception:
             pass
 
+        trade_side = "close" if reduce_only else "open"
+
         r = await execution_engine.execute(
             trader=self,
             side=side,
@@ -599,6 +617,7 @@ class FuturesTrader:
             arrival_price=arrival_price,
             ask=ask,
             bid=bid,
+            trade_side=trade_side,
             reduce_only=reduce_only,
             sl=sl,
             tp=tp,
@@ -674,7 +693,7 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="long")
-        # side=buy, reduceOnly=False -> abre long. TP/SL inline en la orden.
+        # side=buy, reduce_only=False -> abre long. TP/SL inline en la orden.
         r = await self._place_order("buy", qty, reduce_only=False, sl=sl, tp=tp3)
         if r.get("code") == "00000":
             self.position    = "long"
@@ -719,7 +738,7 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="short")
-        # side=sell, reduceOnly=False -> abre short. TP/SL inline en la orden.
+        # side=sell, reduce_only=False -> abre short. TP/SL inline en la orden.
         r = await self._place_order("sell", qty, reduce_only=False, sl=sl, tp=tp3)
         if r.get("code") == "00000":
             self.position    = "short"
