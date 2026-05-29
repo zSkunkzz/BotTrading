@@ -445,18 +445,21 @@ class FuturesTrader:
         Delega en ExecutionEngine (limit→timeout→market) y mantiene
         todos los hooks de kill_switch y balance_svc.
         """
-        # ── Commit 4: arrival price y orderbook best-effort ───────────────────
+        # arrival price para el execution engine
         try:
             arrival_price = await self.get_price()
         except Exception:
             arrival_price = 0.0
 
+        # ask/bid desde orderbook metrics (get_ask/get_bid no existen en ws_feed)
         ask = bid = None
         try:
             sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
             from bot.ws_feed import ws_feed
-            ask = ws_feed.get_ask(sym_clean)
-            bid = ws_feed.get_bid(sym_clean)
+            ob = ws_feed.get_orderbook_metrics(sym_clean)
+            if ob:
+                ask = ob.get("ask")
+                bid = ob.get("bid")
         except Exception:
             pass
 
@@ -674,7 +677,7 @@ class FuturesTrader:
             try:
                 # ── Commit 3: L4 hard kill → cerrar posición y parar ─────────
                 if kill_switch.is_hard_killed():
-                    logger.critical(f"[{self.symbol}] 💀 L4 HARD KILL — cerrando posición si la hay")
+                    logger.critical(f"[{self.symbol}] 💥 L4 HARD KILL — cerrando posición si la hay")
                     if self.position:
                         await self.close_position(reason="KS-L4-HARD-KILL")
                     break

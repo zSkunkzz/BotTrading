@@ -1,4 +1,11 @@
-"""Singleton de balance USDT para futuros Bitget (UA)."""
+"""Singleton de balance USDT para futuros Bitget (UA).
+
+Endpoints en orden de prioridad:
+  1. /api/v3/account/assets          V3 UA nativa  ← primer intento
+  2. /api/v2/account/all-account-balance  V2 UA    ← fallback
+
+El endpoint V2 mix/account/accounts está bloqueado en Unified Account.
+"""
 import asyncio
 import logging
 import time
@@ -10,13 +17,12 @@ import aiohttp
 
 logger = logging.getLogger("BalanceSvc")
 
-_CACHE_TTL   = 30   # segundos entre refreshes
-_ENDPOINTS   = [
-    ("/api/v2/account/balance",             {"accountType": "futures"}),
-    ("/api/v2/mix/account/accounts",        {"productType": "USDT-FUTURES"}),
-    ("/api/v2/mix/account/account",         {"productType": "USDT-FUTURES", "marginCoin": "USDT"}),
-    ("/api/v2/user/virtual-subaccount-list",{}),
-    ("/api/v2/account/info",                {}),
+_CACHE_TTL = 30   # segundos entre refreshes
+
+# (path, params, api_version)
+_ENDPOINTS = [
+    ("/api/v3/account/assets",              {},                          "v3"),
+    ("/api/v2/account/all-account-balance", {"accountType": "futures"}, "v2"),
 ]
 
 
@@ -30,13 +36,8 @@ class _BalanceService:
         self._lock       = asyncio.Lock()
         self._ready      = False
 
-    # ── Comprobación de estado ────────────────────────────────────────────────
-
     def is_ready(self) -> bool:
-        """True si ya se han cargado las credenciales."""
         return self._ready
-
-    # ── Init / invalidate ─────────────────────────────────────────────────────
 
     def init(self, key: str, secret: str, passphrase: str):
         """Idempotente: solo actualiza credenciales la primera vez."""
@@ -91,11 +92,43 @@ class _BalanceService:
 
     # ── Extracción de USDT ────────────────────────────────────────────────────
 
-    def _extract_usdt_balance(self, data: dict | list) -> float | None:
-        """Busca el balance USDT disponible en la respuesta de cualquier endpoint."""
+    def _extract_v3(self, data: dict) -> float | None:
+        """
+        Parsea respuesta de /api/v3/account/assets.
+        Estructura: data.usdtEquity  o  data.assets[].coin=="USDT"
+        """
+        inner = data.get("data")
+        if not isinstance(inner, dict):
+            return None
+
+        # Campo directo usdtEquity
+        ue = inner.get("usdtEquity")
+        if ue is not None:
+            try:
+                v = float(ue)
+                if v >= 0:
+                    return v
+            except (ValueError, TypeError):
+                pass
+
+        # Fallback: buscar en assets[]
+        assets = inner.get("assets") or []
+        for a in assets:
+            if isinstance(a, dict) and (a.get("coin") or "").upper() == "USDT":
+                for field in ("available", "equity"):
+                    v = a.get(field)
+                    if v is not None:
+                        try:
+                            return float(v)
+                        except (ValueError, TypeError):
+                            pass
+        return None
+
+    def _extract_v2(self, data: dict | list) -> float | None:
+        """Busca balance USDT en respuesta V2 (estructura variable)."""
         if isinstance(data, list):
             for item in data:
-                val = self._extract_usdt_balance(item)
+                val = self._extract_v2(item)
                 if val is not None:
                     return val
             return None
@@ -103,7 +136,6 @@ class _BalanceService:
         if not isinstance(data, dict):
             return None
 
-        # Nodo con campo 'coin' o 'marginCoin'
         coin = (data.get("coin") or data.get("marginCoin") or "").upper()
         if coin == "USDT":
             for field in ("available", "availableAmount", "crossMaxAvailable",
@@ -115,32 +147,35 @@ class _BalanceService:
                     except (ValueError, TypeError):
                         pass
 
-        # Recurrir en sub-listas
         for key in ("data", "list", "assets", "balances"):
             sub = data.get(key)
             if sub:
-                val = self._extract_usdt_balance(sub)
+                val = self._extract_v2(sub)
                 if val is not None:
                     return val
 
         return None
 
     async def _fetch_balance_once(self) -> float | None:
-        """Intenta obtener el balance probando todos los endpoints."""
-        for path, params in _ENDPOINTS:
+        """Intenta obtener balance probando endpoints en orden."""
+        for path, params, ver in _ENDPOINTS:
             r = await self._get(path, params)
             if not r or r.get("code") != "00000":
+                logger.debug(f"[BalanceSvc] {path} code={r.get('code') if r else 'no-resp'}")
                 continue
-            val = self._extract_usdt_balance(r)
+
+            val = self._extract_v3(r) if ver == "v3" else self._extract_v2(r)
             if val is not None:
                 logger.debug(f"[BalanceSvc] Balance={val:.2f} USDT via {path}")
                 return val
+
+        logger.warning("[BalanceSvc] ⚠️ Todos los endpoints fallaron")
         return None
 
     # ── API pública ───────────────────────────────────────────────────────────
 
     async def get(self) -> float | None:
-        """Devuelve el balance cacheado o lo refresca si ha caducado."""
+        """Devuelve balance cacheado o refresca si ha caducado."""
         if not self._ready:
             logger.warning("[BalanceSvc] get() llamado antes de init()")
             return None
@@ -152,9 +187,7 @@ class _BalanceService:
             if val is not None:
                 self._cache = val
                 self._ts    = time.time()
-            else:
-                logger.warning("[BalanceSvc] ⚠️ Todos los endpoints fallaron")
-            return self._cache  # puede ser None si nunca tuvo éxito
+            return self._cache
 
 
 balance_svc = _BalanceService()
