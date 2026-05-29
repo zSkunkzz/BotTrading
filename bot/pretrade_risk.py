@@ -48,8 +48,11 @@ class PreTradeRisk:
       PT_MAX_SPREAD_BPS           Spread máximo permitido en bps       (default 30)
       PT_MIN_SL_DISTANCE_BPS      Distancia mínima SL en bps           (default 20)
       PT_MAX_SLIPPAGE_BPS         Slippage esperado máximo aceptable   (default 50)
-      PT_MAX_ORDERS_PER_MIN       Órdenes máximas por minuto           (default 6)
+      PT_MAX_ORDERS_PER_MIN       Órdenes máximas por minuto POR SÍMBOLO (default 6)
       PT_BALANCE_USAGE_PCT        Máximo % del balance por trade       (default 0.40)
+
+    NOTA: el rate limit de órdenes se aplica POR SÍMBOLO, no globalmente.
+    Solo se cuentan las órdenes que el exchange acepta (code 00000).
     """
 
     def __init__(self) -> None:
@@ -65,8 +68,9 @@ class PreTradeRisk:
         # Estado interno
         # exposure: {symbol -> notional_usdt_abierto}
         self._symbol_exposure: dict[str, float] = {}
-        # ventana deslizante de timestamps de órdenes (últimos 60 s)
-        self._order_timestamps: deque[float] = deque()
+        # FIX: ventana deslizante de timestamps POR SÍMBOLO (no global)
+        # {sym -> deque[float]}
+        self._order_timestamps: dict[str, deque] = {}
 
     # ── API pública ───────────────────────────────────────────────────────────
 
@@ -92,7 +96,7 @@ class PreTradeRisk:
             self._check_balance_usage(notional, balance),
             self._check_symbol_exposure(sym, notional),
             self._check_total_exposure(notional),
-            self._check_order_rate(),
+            self._check_order_rate(sym),
             self._check_spread(ask, bid, price),
             self._check_sl_distance(price, sl, side),
         ]
@@ -105,13 +109,25 @@ class PreTradeRisk:
                 )
                 return False, reason
 
-        # Todos los checks pasaron: registrar la orden
-        self._register_order(sym, notional)
+        # Todos los checks pasaron: registrar intención (se confirma en confirm_order)
+        # NO se incrementa el rate counter aquí — solo cuando el exchange acepta la orden
+        self._register_exposure(sym, notional)
         logger.info(
             f"[PreTrade:{sym}] ✅ OK — side={side} notional={notional:.2f} "
             f"price={price:.4f} sl={sl}"
         )
         return True, "OK"
+
+    def confirm_order(self, symbol: str) -> None:
+        """
+        Llamar SOLO cuando el exchange confirma la orden (code 00000).
+        Registra el timestamp en el rate limiter por símbolo.
+        """
+        sym = symbol.replace("/", "").replace(":USDT", "")
+        if sym not in self._order_timestamps:
+            self._order_timestamps[sym] = deque()
+        self._order_timestamps[sym].append(time.monotonic())
+        logger.debug(f"[PreTrade:{sym}] 📌 Orden confirmada — rate count={len(self._order_timestamps[sym])}")
 
     def register_close(self, symbol: str, notional: float) -> None:
         """Llamar cuando una posición se cierra para liberar exposición."""
@@ -170,14 +186,18 @@ class PreTradeRisk:
             )
         return True, ""
 
-    def _check_order_rate(self) -> tuple[bool, str]:
+    def _check_order_rate(self, sym: str) -> tuple[bool, str]:
+        """Rate limit POR SÍMBOLO — no comparte cuota entre traders distintos."""
         now = time.monotonic()
+        if sym not in self._order_timestamps:
+            self._order_timestamps[sym] = deque()
+        ts = self._order_timestamps[sym]
         # Limpiar timestamps fuera de la ventana de 60 s
-        while self._order_timestamps and now - self._order_timestamps[0] > 60.0:
-            self._order_timestamps.popleft()
-        if len(self._order_timestamps) >= self.max_orders_per_min:
+        while ts and now - ts[0] > 60.0:
+            ts.popleft()
+        if len(ts) >= self.max_orders_per_min:
             return False, (
-                f"Rate de órdenes: {len(self._order_timestamps)} en 60 s "
+                f"Rate de órdenes: {len(ts)} en 60 s "
                 f"(límite {self.max_orders_per_min})"
             )
         return True, ""
@@ -216,8 +236,8 @@ class PreTradeRisk:
 
     # ── Registro interno ──────────────────────────────────────────────────────
 
-    def _register_order(self, sym: str, notional: float) -> None:
-        self._order_timestamps.append(time.monotonic())
+    def _register_exposure(self, sym: str, notional: float) -> None:
+        """Registra la exposición de capital (siempre, para controlar riesgo)."""
         self._symbol_exposure[sym] = self._symbol_exposure.get(sym, 0.0) + notional
 
 
