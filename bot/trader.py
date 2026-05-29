@@ -81,7 +81,9 @@ class FuturesTrader:
                  leverage, margin_mode, dry_run):
         self.symbol       = symbol
         self.leverage     = leverage
-        self.margin_mode  = margin_mode or "crossed"   # UA usa crossed por defecto
+        # isolated es el modo preferido del usuario; se puede sobreescribir con
+        # la variable de entorno MARGIN_MODE (isolated | crossed)
+        self.margin_mode  = os.getenv("MARGIN_MODE", margin_mode or "isolated").lower()
         self.dry_run      = dry_run
         self._api_key     = api_key
         self._api_secret  = api_secret
@@ -202,7 +204,7 @@ class FuturesTrader:
     # NUNCA mezclar: reduceOnly solo existe en v2 mix, NO en v3 trade.
     # NUNCA enviar posSide en one-way mode — causa 25236.
     #
-    # La deteccion se hace consultando /api/v3/mix/account/account
+    # La deteccion se hace consultando /api/v2/mix/account/account
     # (campo holdMode) o /api/v3/position/current-position si hay pos abiertas.
 
     async def _detect_pos_mode(self) -> str:
@@ -256,6 +258,31 @@ class FuturesTrader:
         _pos_mode_detected_at = now
         return "one_way"
 
+    # -- Set margin mode -------------------------------------------------------
+    # Configura isolated o crossed en Bitget v2 mix.
+    # Se llama una vez en _init; los errores se logean pero no bloquean el bot.
+
+    async def set_margin_mode(self):
+        """Aplica self.margin_mode (isolated | crossed) al contrato en Bitget v2."""
+        sym = self._sym()
+        # Bitget v2 acepta 'isolated' o 'crossed'
+        bg_mode = "isolated" if self.margin_mode == "isolated" else "crossed"
+        payload = {
+            "symbol":      sym,
+            "productType": "USDT-FUTURES",
+            "marginCoin":  "USDT",
+            "marginMode":  bg_mode,
+        }
+        try:
+            r = await self._http_post("/api/v2/mix/account/set-margin-mode", payload)
+            code = r.get("code", "")
+            if code == "00000":
+                logger.info("[%s] Margin mode configurado: %s", self.symbol, bg_mode)
+            else:
+                logger.warning("[%s] set_margin_mode respuesta inesperada: %s", self.symbol, r)
+        except Exception as e:
+            logger.warning("[%s] set_margin_mode exception (ignorado): %s", self.symbol, e)
+
     # -- Inicializacion --------------------------------------------------------
 
     async def _init(self, usdt_per_trade: float):
@@ -286,6 +313,9 @@ class FuturesTrader:
         detected_mode = await self._detect_pos_mode()
         self._ua_pos_mode = detected_mode
         logger.info("[%s] Modo cuenta Unified Account v3: %s", self.symbol, detected_mode)
+
+        # Aplicar margin mode preferido (isolated por defecto)
+        await self.set_margin_mode()
 
     # -- Precio, OHLCV y balance ----------------------------------------------
 
@@ -518,6 +548,9 @@ class FuturesTrader:
     #
     # reduceOnly es un campo de v2 mix, NO existe en v3 trade/place-order.
     # Enviar reduceOnly o un posSide incorrecto causa error 25236.
+    #
+    # marginMode: se toma de self.margin_mode (isolated por defecto).
+    # Se configura en Bitget via set_margin_mode() durante el init.
 
     async def _place_order_raw(
         self,
@@ -542,13 +575,16 @@ class FuturesTrader:
         # trade_side se determina por reduce_only si no se pasa explicitamente
         effective_trade_side = "close" if reduce_only else trade_side
 
+        # marginMode: 'isolated' o 'crossed' segun preferencia del usuario
+        bg_margin_mode = "isolated" if self.margin_mode == "isolated" else "crossed"
+
         payload: dict = {
             "category":   "USDT-FUTURES",
             "symbol":     sym,
             "qty":        str(qty),
             "side":       side,
             "orderType":  order_type,
-            "marginMode": "crossed",
+            "marginMode": bg_margin_mode,
             "tradeSide":  effective_trade_side,  # open | close — obligatorio en v3
         }
 
@@ -583,8 +619,8 @@ class FuturesTrader:
 
         if self.dry_run:
             logger.info(
-                "[%s] DRY RUN RAW: %s mode=%s tradeSide=%s posSide=%s %s qty=%s price=%s tp=%s sl=%s",
-                self.symbol, side, self._ua_pos_mode, effective_trade_side,
+                "[%s] DRY RUN RAW: %s mode=%s marginMode=%s tradeSide=%s posSide=%s %s qty=%s price=%s tp=%s sl=%s",
+                self.symbol, side, self._ua_pos_mode, bg_margin_mode, effective_trade_side,
                 payload.get("posSide"), order_type, qty, price, tp, sl
             )
             return {"code": "00000", "data": {"orderId": "dry"}}
