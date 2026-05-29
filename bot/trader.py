@@ -517,13 +517,14 @@ class FuturesTrader:
     #   marginCoin      : "USDT"
     #   planType        : "pos_loss" (solo SL) | "pos_profit" (solo TP)
     #                     | "pos_profit_loss" (SL+TP combinado)
-    #   holdSide        : "long" | "short"  (requerido en hedge mode)
+    #   holdSide        : "long" | "short"  (SOLO requerido en hedge mode)
     #   triggerPrice    : precio de activacion (string)
     #   triggerType     : "mark_price" | "last_price"
     #   executePrice    : "0" para orden de mercado al activar
     #
     # NOTA: El endpoint v2 /api/v2/mix/order/place-tpsl-order devuelve error
     # 40085 en cuentas Unified Account ("Classic Account API not supported").
+    # NOTA: En one_way mode NO se debe enviar holdSide -- Bitget lo rechaza.
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
         if not self.position:
@@ -533,27 +534,33 @@ class FuturesTrader:
 
         sym = self._sym()
         hold_side = "long" if self.position == "long" else "short"
+        is_hedge = (self._ua_pos_mode == "hedge")
 
         if self.dry_run:
-            logger.info("[%s] DRY RUN TPSL: sl=%s tp=%s", self.symbol, sl, tp)
+            logger.info("[%s] DRY RUN TPSL: sl=%s tp=%s holdSide=%s mode=%s",
+                        self.symbol, sl, tp, hold_side if is_hedge else "(omitido one_way)", self._ua_pos_mode)
             self.sl_order_id = "dry-sl"
             self.tp_order_id = "dry-tp"
             return {"code": "00000", "data": {"orderId": "dry-tpsl"}}
 
         results = {}
+        sl_placed = False
+        tp_placed = False
 
-        # Colocar SL independiente si se especifica
+        # -- SL ----------------------------------------------------------------
         if sl:
-            payload_sl = {
-                "category":    "USDT-FUTURES",
-                "symbol":      sym,
-                "marginCoin":  "USDT",
-                "planType":    "pos_loss",
-                "holdSide":    hold_side,
+            payload_sl: dict = {
+                "category":     "USDT-FUTURES",
+                "symbol":       sym,
+                "marginCoin":   "USDT",
+                "planType":     "pos_loss",
                 "triggerPrice": str(sl),
-                "triggerType": "mark_price",
+                "triggerType":  "mark_price",
                 "executePrice": "0",
             }
+            # holdSide solo en hedge mode
+            if is_hedge:
+                payload_sl["holdSide"] = hold_side
             try:
                 r_sl = await self._http_post("/api/v3/trade/place-tpsl-order", payload_sl)
                 results["sl"] = r_sl
@@ -562,25 +569,30 @@ class FuturesTrader:
                     self.sl_order_id = (
                         data.get("orderId") or data.get("clientOid") if isinstance(data, dict) else None
                     )
-                    logger.info("[%s] TPSL SL OK (v3) -- orderId=%s", self.symbol, self.sl_order_id)
+                    sl_placed = True
+                    logger.info("[%s] TPSL SL OK (v3) -- orderId=%s mode=%s",
+                                self.symbol, self.sl_order_id, self._ua_pos_mode)
                 else:
-                    logger.error("[%s] TPSL SL FAILED (v3): %s", self.symbol, r_sl)
+                    logger.error("[%s] TPSL SL FAILED (v3) mode=%s payload=%s resp=%s",
+                                 self.symbol, self._ua_pos_mode, payload_sl, r_sl)
             except Exception as e:
                 logger.error("[%s] _place_pos_tpsl SL exception: %s", self.symbol, e)
                 results["sl"] = {"code": "ERROR", "msg": str(e)}
 
-        # Colocar TP independiente si se especifica
+        # -- TP ----------------------------------------------------------------
         if tp:
-            payload_tp = {
-                "category":    "USDT-FUTURES",
-                "symbol":      sym,
-                "marginCoin":  "USDT",
-                "planType":    "pos_profit",
-                "holdSide":    hold_side,
+            payload_tp: dict = {
+                "category":     "USDT-FUTURES",
+                "symbol":       sym,
+                "marginCoin":   "USDT",
+                "planType":     "pos_profit",
                 "triggerPrice": str(tp),
-                "triggerType": "mark_price",
+                "triggerType":  "mark_price",
                 "executePrice": "0",
             }
+            # holdSide solo en hedge mode
+            if is_hedge:
+                payload_tp["holdSide"] = hold_side
             try:
                 r_tp = await self._http_post("/api/v3/trade/place-tpsl-order", payload_tp)
                 results["tp"] = r_tp
@@ -589,24 +601,38 @@ class FuturesTrader:
                     self.tp_order_id = (
                         data.get("orderId") or data.get("clientOid") if isinstance(data, dict) else None
                     )
-                    logger.info("[%s] TPSL TP OK (v3) -- orderId=%s", self.symbol, self.tp_order_id)
+                    tp_placed = True
+                    logger.info("[%s] TPSL TP OK (v3) -- orderId=%s mode=%s",
+                                self.symbol, self.tp_order_id, self._ua_pos_mode)
                 else:
-                    logger.error("[%s] TPSL TP FAILED (v3): %s", self.symbol, r_tp)
+                    logger.error("[%s] TPSL TP FAILED (v3) mode=%s payload=%s resp=%s",
+                                 self.symbol, self._ua_pos_mode, payload_tp, r_tp)
             except Exception as e:
                 logger.error("[%s] _place_pos_tpsl TP exception: %s", self.symbol, e)
                 results["tp"] = {"code": "ERROR", "msg": str(e)}
 
-        # Retornar exito si al menos SL fue colocado correctamente
-        sl_ok = results.get("sl", {}).get("code") == "00000" if sl else True
-        tp_ok = results.get("tp", {}).get("code") == "00000" if tp else True
-
-        if sl_ok and tp_ok:
-            return {"code": "00000", "data": results}
-        elif sl_ok:
-            return {"code": "00000", "data": results}  # SL es lo critico
+        # -- Resultado: exito solo si el SL fue colocado realmente -------------
+        # El SL es la proteccion critica. Si falla, devolvemos error aunque el
+        # TP haya ido bien, para que open_long/open_short no marquen
+        # _protection_ok = True con el bot desprotegido.
+        sl_requested = sl is not None and sl != 0
+        if sl_requested:
+            if sl_placed:
+                return {"code": "00000", "data": results}
+            else:
+                err = results.get("sl", {"code": "ERROR", "msg": "SL no colocado"})
+                logger.error(
+                    "[%s] _place_pos_tpsl: SL requerido pero NO colocado -- "
+                    "posicion SIN proteccion en exchange. resp=%s",
+                    self.symbol, err,
+                )
+                return err
         else:
-            # Devolver el error del SL como resultado principal
-            return results.get("sl", {"code": "ERROR", "msg": "TPSL failed"})
+            # Sin SL pedido: retornar exito si TP fue bien (o si no se pidio nada)
+            if tp_placed or not tp:
+                return {"code": "00000", "data": results}
+            else:
+                return results.get("tp", {"code": "ERROR", "msg": "TP no colocado"})
 
     async def reconcile_position(self) -> bool:
         try:
@@ -913,8 +939,14 @@ class FuturesTrader:
             tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
             if tpsl_r.get("code") == "00000":
                 self._protection_ok = True
+                logger.info("[%s] Proteccion TPSL confirmada (SL+TP en exchange)", self.symbol)
             else:
                 self._protection_ok = False
+                logger.error(
+                    "[%s] ADVERTENCIA: posicion abierta SIN TPSL en exchange. "
+                    "El bot usara el loop de precio como fallback (cada %ss). resp=%s",
+                    self.symbol, os.getenv("LOOP_SLEEP", "10"), tpsl_r,
+                )
             ok2 = await self.reconcile_position()
             if not ok2:
                 logger.error("[%s] Posicion abierta pero sin proteccion confirmada", self.symbol)
@@ -961,8 +993,14 @@ class FuturesTrader:
             tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
             if tpsl_r.get("code") == "00000":
                 self._protection_ok = True
+                logger.info("[%s] Proteccion TPSL confirmada (SL+TP en exchange)", self.symbol)
             else:
                 self._protection_ok = False
+                logger.error(
+                    "[%s] ADVERTENCIA: posicion abierta SIN TPSL en exchange. "
+                    "El bot usara el loop de precio como fallback (cada %ss). resp=%s",
+                    self.symbol, os.getenv("LOOP_SLEEP", "10"), tpsl_r,
+                )
             ok2 = await self.reconcile_position()
             if not ok2:
                 logger.error("[%s] Posicion abierta pero sin proteccion confirmada", self.symbol)
@@ -1170,4 +1208,4 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] run() error: %s", self.symbol, e)
 
-            await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "30")))
+            await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
