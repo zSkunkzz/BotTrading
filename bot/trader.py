@@ -18,6 +18,7 @@ from bot.telegram_bot import notify_tp_partial
 from bot.balance_service import balance_svc
 from bot.pretrade_risk import pretrade_risk
 from bot.kill_switch import kill_switch
+from bot.execution_engine import execution_engine
 
 logger = logging.getLogger("Trader")
 
@@ -380,37 +381,101 @@ class FuturesTrader:
 
     # ── Colocar / cerrar órdenes (UA) ─────────────────────────────────────────
 
-    async def _place_order(self, side: str, qty: float):
+    async def _place_order_raw(
+        self, side: str, qty: float,
+        order_type: str = "market", price: float | None = None
+    ) -> dict:
+        """
+        Capa base de envío de órdenes al exchange.
+        Usada por ExecutionEngine y por _place_order().
+        No modifica estado interno: sólo envía y devuelve el resultado.
+        """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
-        endpoint = "/api/v2/mix/order/place-order"
-        payload = {
+        endpoint  = "/api/v2/mix/order/place-order"
+        payload: dict = {
             "symbol":      sym_clean,
             "productType": "USDT-FUTURES",
             "marginMode":  self.margin_mode,
             "marginCoin":  "USDT",
             "qty":         str(qty),
-            "orderType":   "market",
+            "orderType":   order_type,
             "side":        side,
             "holdMode":    self._ua_pos_mode or "single_hold",
         }
+        if order_type == "limit" and price is not None:
+            payload["price"] = str(price)
 
         if self.dry_run:
-            logger.info(f"[{self.symbol}] 🟡 DRY RUN: {side} qty={qty}")
+            logger.info(f"[{self.symbol}] 🟡 DRY RUN RAW: {side} {order_type} qty={qty} price={price}")
             return {"code": "00000", "data": {"orderId": "dry"}}
 
         try:
-            r = await self._http_post(endpoint, payload)
-            rejected = r.get("code") != "00000"
-            await kill_switch.on_order_result(rejected=rejected)
-            if not rejected:
-                balance_svc.invalidate()
-                return r
-            logger.error(f"[{self.symbol}] Order failed: {r}")
-            return r
+            return await self._http_post(endpoint, payload)
         except Exception as e:
-            logger.error(f"[{self.symbol}] _place_order exception: {e}")
-            await kill_switch.on_order_result(rejected=True)
+            logger.error(f"[{self.symbol}] _place_order_raw exception: {e}")
             return {"code": "ERROR", "msg": str(e)}
+
+    async def _get_order_status(self, order_id: str) -> dict:
+        """Consulta el estado de una orden por su ID."""
+        sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        try:
+            return await self._http_get(
+                "/api/v2/mix/order/detail",
+                {"symbol": sym_clean, "productType": "USDT-FUTURES", "orderId": order_id},
+            )
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] _get_order_status error: {e}")
+            return {}
+
+    async def _cancel_order(self, order_id: str) -> dict:
+        """Cancela una orden por su ID."""
+        sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        try:
+            return await self._http_post(
+                "/api/v2/mix/order/cancel-order",
+                {"symbol": sym_clean, "productType": "USDT-FUTURES", "orderId": order_id},
+            )
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] _cancel_order error: {e}")
+            return {}
+
+    async def _place_order(self, side: str, qty: float) -> dict:
+        """
+        Punto de entrada principal para abrir/cerrar posiciones.
+        Delega en ExecutionEngine (limit→timeout→market) y mantiene
+        todos los hooks de kill_switch y balance_svc.
+        """
+        # ── Commit 4: arrival price y orderbook best-effort ───────────────────
+        try:
+            arrival_price = await self.get_price()
+        except Exception:
+            arrival_price = 0.0
+
+        ask = bid = None
+        try:
+            sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
+            from bot.ws_feed import ws_feed
+            ask = ws_feed.get_ask(sym_clean)
+            bid = ws_feed.get_bid(sym_clean)
+        except Exception:
+            pass
+
+        r = await execution_engine.execute(
+            trader=self,
+            side=side,
+            qty=qty,
+            arrival_price=arrival_price,
+            ask=ask,
+            bid=bid,
+        )
+
+        rejected = r.get("code") != "00000"
+        await kill_switch.on_order_result(rejected=rejected)
+        if not rejected:
+            balance_svc.invalidate()
+        else:
+            logger.error(f"[{self.symbol}] Order failed: {r}")
+        return r
 
     async def _calc_qty(self, usdt_amount: float, price: float, leverage: int) -> float:
         effective_lev = leverage or self.leverage
