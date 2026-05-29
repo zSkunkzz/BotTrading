@@ -235,11 +235,10 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage — Unified Account: POST /api/v2/mix/account/set-leverage ────
-    # El error 40085 aparece cuando se llama al endpoint de Classic Account.
-    # Para UA, el endpoint es el mismo /api/v2/mix/account/set-leverage PERO
-    # sin el campo "side" y con marginMode crossed (UA no tiene isolated leverage
-    # por side en single_hold). Si falla, ignoramos y continuamos.
+    # ── Leverage — Unified Account ────────────────────────────────────────────
+    # Para UA single_hold el set-leverage puede devolver 40085 en algunos pares
+    # porque UA gestiona el leverage globalmente desde la UI. Lo ignoramos
+    # silenciosamente y continuamos con el leverage configurado en la cuenta.
 
     async def set_leverage(self, leverage: int, side: str | None = None):
         sym = self._sym()
@@ -248,23 +247,20 @@ class FuturesTrader:
             "productType": "USDT-FUTURES",
             "marginCoin":  "USDT",
             "leverage":    str(leverage),
+            # No se envía "holdSide" en UA single_hold
         }
-        # En Unified Account single_hold NO se envía "holdSide"
-        # (causa el 40085 en cuentas UA cuando se manda como Classic API)
         try:
             r = await self._http_post("/api/v2/mix/account/set-leverage", payload)
-            if r.get("code") == "00000":
+            code = r.get("code", "")
+            if code == "00000":
                 logger.debug(f"[{self.symbol}] Leverage {leverage}x OK")
+            elif code == "40085":
+                # UA no permite set-leverage vía API clásica — silencioso, es esperado
+                logger.debug(f"[{self.symbol}] set_leverage UA-skip (40085) — lev gestionado por cuenta")
             else:
-                code = r.get("code", "")
-                if code == "40085":
-                    # UA no permite cambiar leverage vía esta ruta en algunos
-                    # pares; continuamos con el leverage por defecto de la cuenta.
-                    logger.debug(f"[{self.symbol}] set_leverage UA-skip (40085) — usando lev cuenta")
-                else:
-                    logger.warning(f"[{self.symbol}] set_leverage error: {r}")
+                logger.warning(f"[{self.symbol}] set_leverage error inesperado: {r}")
         except Exception as e:
-            logger.warning(f"[{self.symbol}] set_leverage exception: {e}")
+            logger.debug(f"[{self.symbol}] set_leverage exception (ignorado): {e}")
 
     # ── Mínimos de qty ────────────────────────────────────────────────────────
 
@@ -293,7 +289,7 @@ class FuturesTrader:
         _min_qty_cache[sym] = fallback
         return fallback
 
-    # ── Posiciones abiertas — Unified Account usa /api/v2/mix/position/ ───────
+    # ── Posiciones abiertas ───────────────────────────────────────────────────
 
     async def _get_positions(self) -> list | None:
         sym = self._sym()
@@ -342,6 +338,7 @@ class FuturesTrader:
             return {"code": "NO_TPSL", "msg": "Sin niveles de protección"}
 
         sym = self._sym()
+        # En UA single_hold, holdSide = "long"/"short" según la posición
         hold_side = "long" if self.position == "long" else "short"
         payload = {
             "symbol":      sym,
@@ -491,11 +488,21 @@ class FuturesTrader:
         )
 
         rejected = r.get("code") != "00000"
-        await kill_switch.on_order_result(rejected=rejected)
-        if not rejected:
-            balance_svc.invalidate()
+        # El error 40085 en place-order es un problema de configuración de cuenta,
+        # no un rechazo de orden normal. No debe acumularse en el KillSwitch.
+        if rejected and r.get("code") == "40085":
+            logger.error(
+                f"[{self.symbol}] ❌ Error 40085 en place-order: la cuenta UA "
+                f"rechaza esta llamada. Verifica que la API key tenga permisos "
+                f"de trading en Unified Account."
+            )
+            # No llamamos on_order_result para no disparar KillSwitch innecesariamente
         else:
-            logger.error(f"[{self.symbol}] Order failed: {r}")
+            await kill_switch.on_order_result(rejected=rejected)
+            if not rejected:
+                balance_svc.invalidate()
+            else:
+                logger.error(f"[{self.symbol}] Order failed: {r}")
         return r
 
     async def _calc_qty(self, usdt_amount: float, price: float, leverage: int) -> float:
