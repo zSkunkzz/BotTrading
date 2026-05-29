@@ -1155,48 +1155,47 @@ class FuturesTrader:
                             await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
                             continue
 
-                    # Senal de cierre por estrategia
-                    signal = decide(bars, self.position, self.entry_price, self.leverage)
-                    if signal in ("CLOSE_LONG", "CLOSE_SHORT"):
+                    # Senal de cierre por estrategia (nueva firma: exch, symbol, ai_fn, has_open)
+                    result = await decide(
+                        self.exchange,
+                        self.symbol,
+                        _ai_decide_fn,
+                        has_open_position=True,
+                    )
+                    action = result.get("action", "HOLD")
+                    if action in ("CLOSE_LONG", "CLOSE_SHORT"):
                         await self.close_position(reason="strategy")
-                    elif signal == "AI_CLOSE":
-                        context = {
-                            "price": price,
-                            "position": self.position,
-                            "entry_price": self.entry_price,
-                            "sl": sl,
-                            "tp1": tp1, "tp2": tp2, "tp3": tp3,
-                        }
-                        ai_action = await _ai_decide_fn(self.symbol, context)
-                        if ai_action in ("CLOSE_LONG", "CLOSE_SHORT", "CLOSE"):
-                            await self.close_position(reason="ai_strategy")
 
                 # -- Sin posicion: buscar entrada --------------------------------
                 else:
                     balance = await self.get_balance() or 0.0
-                    signal  = decide(bars, None, None, self.leverage)
 
-                    if signal == "AI":
-                        context = {"price": price, "balance": balance}
-                        signal  = await _ai_decide_fn(self.symbol, context)
+                    # Nueva firma de decide: exch, symbol, ai_fn, has_open_position
+                    result = await decide(
+                        self.exchange,
+                        self.symbol,
+                        _ai_decide_fn,
+                        has_open_position=False,
+                    )
+                    action = result.get("action", "HOLD")
+                    signal = result.get("signal")
 
                     usdt = risk.usdt_per_trade
                     lev  = self.leverage
 
-                    if signal == "LONG":
-                        atr = _calc_atr(bars)
-                        sl  = round(price - 1.5 * atr, 6) if atr else None
-                        tp1 = round(price + 1.0 * atr, 6) if atr else None
-                        tp2 = round(price + 2.0 * atr, 6) if atr else None
-                        tp3 = round(price + 3.0 * atr, 6) if atr else None
+                    if signal:
+                        sl  = signal.sl
+                        tp1 = signal.tp1
+                        tp2 = signal.tp2
+                        atr = signal.atr
+                        tp3 = round(signal.entry + 3.0 * atr, 6) if atr and signal.entry else None
+                    else:
+                        sl = tp1 = tp2 = tp3 = atr = None
+
+                    if action == "BUY":
                         await self.open_long(usdt, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
 
-                    elif signal == "SHORT":
-                        atr = _calc_atr(bars)
-                        sl  = round(price + 1.5 * atr, 6) if atr else None
-                        tp1 = round(price - 1.0 * atr, 6) if atr else None
-                        tp2 = round(price - 2.0 * atr, 6) if atr else None
-                        tp3 = round(price - 3.0 * atr, 6) if atr else None
+                    elif action == "SELL":
                         await self.open_short(usdt, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
 
             except asyncio.CancelledError:
