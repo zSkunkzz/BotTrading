@@ -107,6 +107,7 @@ class FuturesTrader:
         self.tp_order_id    = None
         self._protection_ok = False
         self._open_notional = 0.0
+        self._open_leverage = 1
         # Circuit breaker para error 40085
         self._cb_40085_count   = 0
         self._cb_40085_paused_until = 0.0
@@ -316,6 +317,8 @@ class FuturesTrader:
             self.tp2         = saved.get("tp2")
             self.tp3         = saved.get("tp3")
             self.tp2_hit     = saved.get("tp2_hit", False)
+            self._open_notional = saved.get("usdt_amount", 0.0)
+            self._open_leverage = saved.get("leverage", self.leverage)
             self._protection_ok = True
             logger.info("[%s] Posicion restaurada: %s @ %s", self.symbol, self.position, self.entry_price)
 
@@ -429,7 +432,44 @@ class FuturesTrader:
     # -- Posiciones abiertas ---------------------------------------------------
 
     async def _get_positions(self) -> list | None:
+        """
+        Devuelve lista de posiciones abiertas para este simbolo.
+
+        En UA v3 hedge mode los endpoints v2 devuelven lista vacia.
+        Se intenta primero /api/v3/position/current-position,
+        luego los fallbacks v2 para compatibilidad con cuentas clasicas.
+        """
         sym = self._sym()
+        is_hedge = (self._ua_pos_mode == "hedge")
+
+        # 1. UA v3: /api/v3/position/current-position (funciona en hedge mode)
+        try:
+            params: dict = {"category": "USDT-FUTURES", "symbol": sym}
+            if is_hedge and self.position:
+                params["holdSide"] = self.position  # "long" | "short"
+            r = await self._http_get("/api/v3/position/current-position", params)
+            if r.get("code") == "00000":
+                raw = r.get("data", {})
+                items = raw.get("list") if isinstance(raw, dict) else raw
+                if not isinstance(items, list):
+                    items = []
+                positions = [
+                    p for p in items
+                    if isinstance(p, dict)
+                    and float(p.get("size") or p.get("total", 0)) > 0
+                ]
+                if positions:
+                    logger.debug(
+                        "[%s] _get_positions v3: %d posicion(es) encontradas",
+                        self.symbol, len(positions),
+                    )
+                    return positions
+                # lista vacia con code 00000 = sin posicion abierta (OK)
+                return []
+        except Exception as e:
+            logger.debug("[%s] _get_positions v3 error: %s", self.symbol, e)
+
+        # 2. Classic v2 single-position
         try:
             r = await self._http_get(
                 "/api/v2/mix/position/single-position",
@@ -446,6 +486,7 @@ class FuturesTrader:
         except Exception as e:
             logger.debug("[%s] positions single error: %s", self.symbol, e)
 
+        # 3. Classic v2 all-position
         try:
             r = await self._http_get(
                 "/api/v2/mix/position/all-position",
@@ -817,9 +858,14 @@ class FuturesTrader:
             self.tp1  = tp1
             self.tp2  = tp2
             self.tp3  = tp3
-            self.tp2_hit       = False
+            self.tp2_hit        = False
             self._open_notional = usdt_amount
-            save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
+            self._open_leverage = lev
+            save_position(
+                self.symbol, "long", price,
+                sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+                usdt_amount=usdt_amount, leverage=lev,
+            )
             logger.warning("[%s] LONG @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
             tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
@@ -860,9 +906,14 @@ class FuturesTrader:
             self.tp1  = tp1
             self.tp2  = tp2
             self.tp3  = tp3
-            self.tp2_hit       = False
+            self.tp2_hit        = False
             self._open_notional = usdt_amount
-            save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
+            self._open_leverage = lev
+            save_position(
+                self.symbol, "short", price,
+                sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+                usdt_amount=usdt_amount, leverage=lev,
+            )
             logger.warning("[%s] SHORT @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
             tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
@@ -908,6 +959,7 @@ class FuturesTrader:
         old_pos = self.position
         pretrade_risk.register_close(self.symbol, self._open_notional)
         self._open_notional = 0.0
+        self._open_leverage = 1
 
         self.position    = None
         self.entry_price = None
