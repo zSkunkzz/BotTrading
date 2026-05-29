@@ -71,23 +71,6 @@ _MIN_QTY_FALLBACK = {
 _min_qty_cache = {}
 
 
-def _ua_side(side: str, trade_side: str) -> str:
-    """
-    Convierte side+trade_side del modo double_hold al valor correcto
-    para Unified Account v3 en modo single_hold.
-
-    En UA single_hold la API v2 acepta SOLO:
-      - "buy_single"  → abrir long O cerrar short
-      - "sell_single" → abrir short O cerrar long
-
-    El campo "tradeSide" y "side" con valores "buy"/"sell" + "open"/"close"
-    son para double_hold y generan error 40085 en UA single_hold.
-    """
-    if side in ("buy", "long"):
-        return "buy_single"
-    return "sell_single"
-
-
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
                  leverage, margin_mode, dry_run):
@@ -211,15 +194,15 @@ class FuturesTrader:
             self.tp3         = saved.get("tp3")
             self.tp2_hit     = saved.get("tp2_hit", False)
             self._protection_ok = True
-            logger.info(f"[{self.symbol}] 🔄 Posición restaurada: {self.position} @ {self.entry_price}")
+            logger.info(f"[{self.symbol}] \ud83d\udd04 Posición restaurada: {self.position} @ {self.entry_price}")
 
         if not balance_svc.is_ready():
-            logger.warning(f"[{self.symbol}] ⚠️ balance_svc no listo — init desde trader")
+            logger.warning(f"[{self.symbol}] \u26a0\ufe0f balance_svc no listo — init desde trader")
             balance_svc.init(self._api_key, self._api_secret, self._passphrase)
 
         self._api_version = "ua"
         self._ua_pos_mode = "single_hold"
-        logger.info(f"[{self.symbol}] ✅ Forzado modo Unified Account (single_hold)")
+        logger.info(f"[{self.symbol}] \u2705 Forzado modo Unified Account (single_hold)")
 
     # ── Precio, OHLCV y balance ───────────────────────────────────────────────
 
@@ -266,10 +249,8 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage — Unified Account ────────────────────────────────────────────
-    # Para UA single_hold el set-leverage puede devolver 40085 en algunos pares
-    # porque UA gestiona el leverage globalmente desde la UI. Lo ignoramos
-    # silenciosamente y continuamos con el leverage configurado en la cuenta.
+    # ── Leverage ──────────────────────────────────────────────────────────────
+    # UA puede devolver 40085 en set-leverage desde la API; se ignora silenciosamente.
 
     async def set_leverage(self, leverage: int, side: str | None = None):
         sym = self._sym()
@@ -278,7 +259,6 @@ class FuturesTrader:
             "productType": "USDT-FUTURES",
             "marginCoin":  "USDT",
             "leverage":    str(leverage),
-            # No se envía "holdSide" en UA single_hold
         }
         try:
             r = await self._http_post("/api/v2/mix/account/set-leverage", payload)
@@ -286,7 +266,6 @@ class FuturesTrader:
             if code == "00000":
                 logger.debug(f"[{self.symbol}] Leverage {leverage}x OK")
             elif code == "40085":
-                # UA no permite set-leverage vía API clásica — silencioso, es esperado
                 logger.debug(f"[{self.symbol}] set_leverage UA-skip (40085) — lev gestionado por cuenta")
             else:
                 logger.warning(f"[{self.symbol}] set_leverage error inesperado: {r}")
@@ -357,7 +336,7 @@ class FuturesTrader:
         except Exception as e:
             logger.debug(f"[{self.symbol}] all-positions error: {e}")
 
-        logger.warning(f"[{self.symbol}] ⚠️ _get_positions falló")
+        logger.warning(f"[{self.symbol}] \u26a0\ufe0f _get_positions falló")
         return None
 
     # ── TPSL server-side ──────────────────────────────────────────────────────
@@ -369,7 +348,6 @@ class FuturesTrader:
             return {"code": "NO_TPSL", "msg": "Sin niveles de protección"}
 
         sym = self._sym()
-        # En UA single_hold, holdSide = "long"/"short" según la posición
         hold_side = "long" if self.position == "long" else "short"
         payload = {
             "symbol":      sym,
@@ -387,7 +365,7 @@ class FuturesTrader:
             payload["stopLossExecutePrice"]    = "0"
 
         if self.dry_run:
-            logger.info(f"[{self.symbol}] 🟡 DRY RUN TPSL: sl={sl} tp={tp}")
+            logger.info(f"[{self.symbol}] \ud83d\udfe1 DRY RUN TPSL: sl={sl} tp={tp}")
             self.sl_order_id = "dry-sl"
             self.tp_order_id = "dry-tp"
             return {"code": "00000", "data": {"orderId": "dry-tpsl"}}
@@ -399,9 +377,9 @@ class FuturesTrader:
                 item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
                 self.sl_order_id = item.get("stopLossClientOid") or item.get("orderId")
                 self.tp_order_id = item.get("stopSurplusClientOid") or item.get("orderId")
-                logger.info(f"[{self.symbol}] 🛡️ TPSL server-side OK — SL={self.sl_order_id} TP={self.tp_order_id}")
+                logger.info(f"[{self.symbol}] \ud83d\udee1\ufe0f TPSL server-side OK — SL={self.sl_order_id} TP={self.tp_order_id}")
             else:
-                logger.error(f"[{self.symbol}] ❌ TPSL server-side FAILED: {r}")
+                logger.error(f"[{self.symbol}] \u274c TPSL server-side FAILED: {r}")
             return r
         except Exception as e:
             logger.error(f"[{self.symbol}] _place_pos_tpsl exception: {e}")
@@ -416,15 +394,15 @@ class FuturesTrader:
             self._protection_ok = has_pos and sl_covered and tp_covered
 
             if not has_pos:
-                logger.error(f"[{self.symbol}] ❌ Reconcile: posición no encontrada en exchange")
+                logger.error(f"[{self.symbol}] \u274c Reconcile: posición no encontrada en exchange")
                 await kill_switch.on_state_mismatch(self.symbol)
             elif not (sl_covered and tp_covered):
                 logger.error(
-                    f"[{self.symbol}] ❌ Reconcile: faltan órdenes TPSL "
+                    f"[{self.symbol}] \u274c Reconcile: faltan órdenes TPSL "
                     f"(sl_ok={sl_covered} tp_ok={tp_covered})"
                 )
             else:
-                logger.info(f"[{self.symbol}] ✅ Reconcile OK")
+                logger.info(f"[{self.symbol}] \u2705 Reconcile OK")
 
             return self._protection_ok
         except Exception as e:
@@ -434,37 +412,35 @@ class FuturesTrader:
 
     # ── Órdenes — Unified Account v3 single_hold ──────────────────────────────
     #
-    # En UA v3 single_hold el endpoint /api/v2/mix/order/place-order requiere:
-    #   side: "buy_single"  → abre long O cierra short
-    #         "sell_single" → abre short O cierra long
+    # En UA v3 single_hold la API v2 de Bitget acepta:
+    #   side: "buy"  + tradeSide: "open"  → abre long
+    #   side: "sell" + tradeSide: "open"  → abre short
+    #   side: "sell" + tradeSide: "close" → cierra long
+    #   side: "buy"  + tradeSide: "close" → cierra short
     #
-    # Los valores "buy"/"sell" con tradeSide="open"/"close" son para double_hold
-    # y devuelven error 40085 en Unified Account.
-    # NO se envía el campo "tradeSide" en single_hold.
+    # marginMode debe ser "crossed" para USDT-FUTURES en UA.
 
     async def _place_order_raw(
         self, side: str, qty: float,
         order_type: str = "market", price: float | None = None,
-        trade_side: str = "open",   # ignorado en UA single_hold, se conserva la firma
+        trade_side: str = "open",
     ) -> dict:
         sym = self._sym()
-        # Convertir al side correcto para UA single_hold
-        ua_side = _ua_side(side, trade_side)
         payload: dict = {
             "symbol":      sym,
             "productType": "USDT-FUTURES",
-            "marginMode":  "crossed",       # UA USDT-FUTURES sólo crossed
+            "marginMode":  "crossed",
             "marginCoin":  "USDT",
             "size":        str(qty),
             "orderType":   order_type,
-            "side":        ua_side,          # buy_single / sell_single
-            # NO se envía "tradeSide" — campo double_hold, causa 40085 en UA
+            "side":        side,
+            "tradeSide":   trade_side,
         }
         if order_type == "limit" and price is not None:
             payload["price"] = str(price)
 
         if self.dry_run:
-            logger.info(f"[{self.symbol}] 🟡 DRY RUN RAW: {ua_side} {order_type} qty={qty} price={price}")
+            logger.info(f"[{self.symbol}] \ud83d\udfe1 DRY RUN RAW: {side}/{trade_side} {order_type} qty={qty} price={price}")
             return {"code": "00000", "data": {"orderId": "dry"}}
 
         try:
@@ -501,7 +477,7 @@ class FuturesTrader:
         if self._cb_40085_paused_until > now:
             remaining = int(self._cb_40085_paused_until - now)
             logger.warning(
-                f"[{self.symbol}] ⏸ Circuit breaker 40085 activo — "
+                f"[{self.symbol}] \u23f8 Circuit breaker 40085 activo — "
                 f"pausado {remaining}s más"
             )
             return {"code": "40085", "msg": "circuit_breaker_paused"}
@@ -538,7 +514,7 @@ class FuturesTrader:
         if err_code == "40085":
             self._cb_40085_count += 1
             logger.error(
-                f"[{self.symbol}] ❌ Error 40085 en place-order "
+                f"[{self.symbol}] \u274c Error 40085 en place-order "
                 f"({self._cb_40085_count}/{_CB_40085_THRESHOLD}): "
                 f"UA single_hold side incorrecto o API key sin permisos UA."
             )
@@ -546,14 +522,14 @@ class FuturesTrader:
                 self._cb_40085_paused_until = time.time() + _CB_40085_PAUSE_S
                 self._cb_40085_count = 0
                 logger.critical(
-                    f"[{self.symbol}] 🚨 Circuit breaker 40085 activado — "
+                    f"[{self.symbol}] \ud83d\udea8 Circuit breaker 40085 activado — "
                     f"símbolo pausado {_CB_40085_PAUSE_S}s. "
                     f"Verifica que la API key tenga permisos de trading en Unified Account."
                 )
                 try:
                     from bot.telegram_bot import send_message
                     await send_message(
-                        f"🚨 <b>Circuit Breaker 40085</b>\n"
+                        f"\ud83d\udea8 <b>Circuit Breaker 40085</b>\n"
                         f"Par: <code>{self.symbol}</code>\n"
                         f"Bitget rechaza la orden en Unified Account.\n"
                         f"El símbolo se pausa {_CB_40085_PAUSE_S//60} min.\n"
@@ -566,7 +542,7 @@ class FuturesTrader:
             await kill_switch.on_order_result(rejected=rejected)
             if not rejected:
                 balance_svc.invalidate()
-                self._cb_40085_count = 0  # reset contador en éxito
+                self._cb_40085_count = 0
             else:
                 logger.error(f"[{self.symbol}] Order failed: {r}")
         return r
@@ -584,7 +560,7 @@ class FuturesTrader:
 
     async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
         if kill_switch.is_halted(self.symbol):
-            logger.warning(f"[{self.symbol}] 🛑 open_long bloqueado por KillSwitch L{kill_switch.level()}")
+            logger.warning(f"[{self.symbol}] \ud83d\uded1 open_long bloqueado por KillSwitch L{kill_switch.level()}")
             return
 
         price  = await self.get_price()
@@ -597,7 +573,7 @@ class FuturesTrader:
             price=price, balance=balance, sl=sl,
         )
         if not ok:
-            logger.warning(f"[{self.symbol}] 🚫 open_long bloqueado por PreTradeRisk: {reason}")
+            logger.warning(f"[{self.symbol}] \ud83d\udeab open_long bloqueado por PreTradeRisk: {reason}")
             return
 
         await self.set_leverage(lev, side="long")
@@ -615,18 +591,18 @@ class FuturesTrader:
             self._protection_ok = False
             self._open_notional = usdt_amount
             save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
-            logger.warning(f"🟢 [{self.symbol}] LONG @ {price:.4f} lev={lev}x")
+            logger.warning(f"\ud83d\udfe2 [{self.symbol}] LONG @ {price:.4f} lev={lev}x")
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
             await self._place_pos_tpsl(sl=sl, tp=tp3)
             ok2 = await self.reconcile_position()
             if not ok2:
-                logger.error(f"[{self.symbol}] ⚠️ Posición abierta pero sin protección confirmada")
+                logger.error(f"[{self.symbol}] \u26a0\ufe0f Posición abierta pero sin protección confirmada")
         else:
             logger.error(f"[{self.symbol}] open_long FAILED: {r}")
 
     async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
         if kill_switch.is_halted(self.symbol):
-            logger.warning(f"[{self.symbol}] 🛑 open_short bloqueado por KillSwitch L{kill_switch.level()}")
+            logger.warning(f"[{self.symbol}] \ud83d\uded1 open_short bloqueado por KillSwitch L{kill_switch.level()}")
             return
 
         price  = await self.get_price()
@@ -639,7 +615,7 @@ class FuturesTrader:
             price=price, balance=balance, sl=sl,
         )
         if not ok:
-            logger.warning(f"[{self.symbol}] 🚫 open_short bloqueado por PreTradeRisk: {reason}")
+            logger.warning(f"[{self.symbol}] \ud83d\udeab open_short bloqueado por PreTradeRisk: {reason}")
             return
 
         await self.set_leverage(lev, side="short")
@@ -657,19 +633,20 @@ class FuturesTrader:
             self._protection_ok = False
             self._open_notional = usdt_amount
             save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
-            logger.warning(f"🔴 [{self.symbol}] SHORT @ {price:.4f} lev={lev}x")
+            logger.warning(f"\ud83d\udd34 [{self.symbol}] SHORT @ {price:.4f} lev={lev}x")
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
             await self._place_pos_tpsl(sl=sl, tp=tp3)
             ok2 = await self.reconcile_position()
             if not ok2:
-                logger.error(f"[{self.symbol}] ⚠️ Posición abierta pero sin protección confirmada")
+                logger.error(f"[{self.symbol}] \u26a0\ufe0f Posición abierta pero sin protección confirmada")
         else:
             logger.error(f"[{self.symbol}] open_short FAILED: {r}")
 
     async def close_position(self, reason: str = ""):
         if not self.position:
             return
-        side = "sell" if self.position == "long" else "buy"
+        side       = "sell" if self.position == "long" else "buy"
+        trade_side = "close"
         qty  = None
         try:
             positions = await self._get_positions()
@@ -690,7 +667,7 @@ class FuturesTrader:
                 pnl = (self.entry_price - exit_price) / self.entry_price * 100
 
         if qty > 0:
-            r = await self._place_order(side, qty, trade_side="close")
+            r = await self._place_order(side, qty, trade_side=trade_side)
             if r.get("code") != "00000":
                 logger.error(f"[{self.symbol}] close_position FAILED: {r}")
                 return
@@ -715,13 +692,14 @@ class FuturesTrader:
 
         await kill_switch.on_trade_result(pnl)
 
-        logger.warning(f"[{self.symbol}] 🟡 {old_pos.upper()} cerrado | razón={reason} | pnl={pnl:+.2f}%")
+        logger.warning(f"[{self.symbol}] \ud83d\udfe1 {old_pos.upper()} cerrado | razón={reason} | pnl={pnl:+.2f}%")
         await notify_close(self.symbol, old_pos, exit_price, pnl, reason=reason, dry_run=self.dry_run)
 
     async def partial_close(self, ratio: float = 0.5):
         if not self.position:
             return
-        side = "sell" if self.position == "long" else "buy"
+        side       = "sell" if self.position == "long" else "buy"
+        trade_side = "close"
         qty  = None
         try:
             positions = await self._get_positions()
@@ -736,7 +714,7 @@ class FuturesTrader:
         if not qty or qty <= 0:
             return
 
-        r = await self._place_order(side, qty, trade_side="close")
+        r = await self._place_order(side, qty, trade_side=trade_side)
         if r.get("code") == "00000":
             freed = self._open_notional * ratio
             pretrade_risk.register_close(self.symbol, freed)
@@ -746,7 +724,7 @@ class FuturesTrader:
             self.tp2_hit = True
             exit_price   = await self.get_price()
             await notify_tp_partial(self.symbol, self.position, exit_price, ratio=ratio, dry_run=self.dry_run)
-            logger.info(f"[{self.symbol}] ✂️ Cierre parcial {int(ratio*100)}%")
+            logger.info(f"[{self.symbol}] \u2702\ufe0f Cierre parcial {int(ratio*100)}%")
         else:
             logger.warning(f"[{self.symbol}] partial_close FAILED: {r}")
 
@@ -760,7 +738,7 @@ class FuturesTrader:
         while True:
             try:
                 if kill_switch.is_hard_killed():
-                    logger.critical(f"[{self.symbol}] 💥 L4 HARD KILL — cerrando posición si la hay")
+                    logger.critical(f"[{self.symbol}] \ud83d\udca5 L4 HARD KILL — cerrando posición si la hay")
                     if self.position:
                         await self.close_position(reason="KS-L4-HARD-KILL")
                     break
@@ -769,22 +747,22 @@ class FuturesTrader:
 
                 balance = await self.get_balance()
                 if balance is None:
-                    logger.warning(f"[{self.symbol}] ⏳ Balance no disponible, esperando 5s...")
+                    logger.warning(f"[{self.symbol}] \u23f3 Balance no disponible, esperando 5s...")
                     await asyncio.sleep(5)
                     continue
                 if balance <= 0:
-                    logger.warning(f"[{self.symbol}] ⚠️ Balance {balance:.2f} USDT — insuficiente")
+                    logger.warning(f"[{self.symbol}] \u26a0\ufe0f Balance {balance:.2f} USDT — insuficiente")
                     await asyncio.sleep(10)
                     continue
 
                 if not self._balance_ok:
                     self._balance_ok = True
-                    logger.info(f"[{self.symbol}] ✅ Balance confirmado: {balance:.2f} USDT")
+                    logger.info(f"[{self.symbol}] \u2705 Balance confirmado: {balance:.2f} USDT")
 
                 if self.position:
                     if not self._protection_ok:
                         logger.warning(
-                            f"[{self.symbol}] ⚠️ Posición sin protección — reconciliando..."
+                            f"[{self.symbol}] \u26a0\ufe0f Posición sin protección — reconciliando..."
                         )
                         await self.reconcile_position()
                         await asyncio.sleep(5)
@@ -829,11 +807,11 @@ class FuturesTrader:
                     await asyncio.sleep(5)
                     continue
 
-                # ── Circuit breaker 40085: saltar todo el ciclo IA + PreTrade ──
+                # ── Circuit breaker 40085 ──
                 if self.is_cb_paused():
                     remaining = int(self._cb_40085_paused_until - time.time())
                     logger.debug(
-                        f"[{self.symbol}] ⏸ CB-40085 activo — esperando {remaining}s"
+                        f"[{self.symbol}] \u23f8 CB-40085 activo — esperando {remaining}s"
                     )
                     await asyncio.sleep(min(remaining, 30))
                     continue
