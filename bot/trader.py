@@ -70,9 +70,17 @@ def _get_balance_lock() -> asyncio.Lock:
 
 
 async def _safe_json(response) -> dict:
-    data = await response.json(content_type=None)
+    text = await response.text()
+    # Bitget a veces devuelve HTML en errores — detectar antes de parsear
+    stripped = text.strip()
+    if not stripped.startswith("{") and not stripped.startswith("["):
+        raise ValueError(f"Respuesta no-JSON: {stripped[:200]}")
+    try:
+        data = _json.loads(stripped)
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"JSON inválido: {e} — contenido: {stripped[:200]}")
     if not isinstance(data, dict):
-        raise ValueError(f"Respuesta no-JSON (tipo {type(data).__name__}): {str(data)[:300]}")
+        raise ValueError(f"Respuesta inesperada (tipo {type(data).__name__}): {str(data)[:300]}")
     return data
 
 
@@ -88,20 +96,23 @@ def _to_float(val) -> float | None:
 def _extract_usdt_balance(item: dict) -> float | None:
     """
     Extrae balance USDT disponible de un dict de cuenta/asset.
-    Itera todos los campos candidatos antes de rendirse.
+    Cubre campos de Bitget Unified Account (UA) y Classic.
     """
     if not isinstance(item, dict):
         return None
 
     candidates = [
         "available",
-        "crossMaxAvailable",
-        "usdtEquity",
-        "isolatedMaxAvailable",
-        "equity",
         "availableBalance",
+        "crossMaxAvailable",
+        "isolatedMaxAvailable",
+        "usdtEquity",
+        "equity",
         "availableMargin",
         "accountEquity",
+        "available_balance",
+        "walletBalance",
+        "locked",
     ]
 
     # Primera pasada: buscar cualquier valor > 0
@@ -111,7 +122,7 @@ def _extract_usdt_balance(item: dict) -> float | None:
             logger.debug(f"[BalanceCache] campo={field} val={v}")
             return v
 
-    # Segunda pasada: si todos son 0, retornar el primero que exista (puede ser 0.0 real)
+    # Segunda pasada: si todos son 0, retornar el primero que exista
     for field in candidates:
         v = _to_float(item.get(field))
         if v is not None:
@@ -123,13 +134,14 @@ def _extract_usdt_balance(item: dict) -> float | None:
 
 async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
     """
-    Intenta obtener el balance USDT usando 5 endpoints en orden.
+    Obtiene el balance USDT usando 5 endpoints en orden optimizado para
+    Bitget Unified Account (UA).
 
-    Orden correcto para Unified Account (UA) de Bitget:
-      0. v2/unified/account/assets      → endpoint UA nativo (fix 40085)
-      1. v2/account/all-account-balance → balance unificado UA (fallback)
-      2. v2/mix/account/accounts        → cuentas de futuros (lista)
-      3. v2/mix/account/account         → cuenta futuros de un símbolo concreto
+    ORDEN (UA-first):
+      0. v2/mix/account/accounts        → futuros USDT — más fiable en UA
+      1. v2/mix/account/account         → futuros símbolo concreto
+      2. v2/unified/account/assets      → endpoint UA nativo (a veces da HTML)
+      3. v2/account/all-account-balance → balance unificado (code 40085 en classic)
       4. v2/spot/account/assets         → activos spot (último recurso)
     """
     global _balance_cache_value, _balance_cache_ts
@@ -158,7 +170,63 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
         logger.info(f"[BalanceCache] ✅ Balance USDT ({source}): {val:.2f}")
         return val
 
-    # ENDPOINT 0: v2/unified/account/assets (UA nativo — fix error 40085)
+    # ENDPOINT 0: v2/mix/account/accounts — más fiable en Bitget UA
+    try:
+        path = "/api/v2/mix/account/accounts"
+        qs   = "?productType=USDT-FUTURES"
+        url  = "https://api.bitget.com" + path + qs
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=_headers("GET", path + qs),
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await _safe_json(r)
+        if data.get("code") == "00000":
+            items = data.get("data") or []
+            if isinstance(items, list) and items:
+                bal = _extract_usdt_balance(items[0])
+                if bal is not None:
+                    return _cache_and_return(bal, "v2/mix-accounts")
+            elif isinstance(items, dict):
+                bal = _extract_usdt_balance(items)
+                if bal is not None:
+                    return _cache_and_return(bal, "v2/mix-accounts")
+        else:
+            code = data.get("code")
+            if code not in ("40085", "40001"):
+                logger.warning(
+                    f"[BalanceCache] ⚠️ v2/mix-accounts code={code} msg={data.get('msg')}"
+                )
+    except ValueError as e:
+        logger.warning(f"[BalanceCache] ⚠️ v2/mix-accounts respuesta inesperada: {e}")
+    except Exception as e:
+        logger.warning(f"[BalanceCache] ❌ v2/mix-accounts excepción: {e}")
+
+    # ENDPOINT 1: v2/mix/account/account (cuenta futuros símbolo concreto)
+    try:
+        path = "/api/v2/mix/account/account"
+        qs   = "?symbol=BTCUSDT&productType=USDT-FUTURES&marginCoin=USDT"
+        url  = "https://api.bitget.com" + path + qs
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=_headers("GET", path + qs),
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await _safe_json(r)
+        if data.get("code") == "00000":
+            d = data.get("data") or {}
+            if isinstance(d, dict):
+                bal = _extract_usdt_balance(d)
+                if bal is not None:
+                    return _cache_and_return(bal, "v2/mix-account-btc")
+        else:
+            code = data.get("code")
+            if code not in ("40085", "40001"):
+                logger.warning(
+                    f"[BalanceCache] ⚠️ v2/mix-account code={code} msg={data.get('msg')}"
+                )
+    except ValueError as e:
+        logger.warning(f"[BalanceCache] ⚠️ v2/mix-account respuesta inesperada: {e}")
+    except Exception as e:
+        logger.warning(f"[BalanceCache] ❌ v2/mix-account excepción: {e}")
+
+    # ENDPOINT 2: v2/unified/account/assets (UA nativo)
     try:
         path = "/api/v2/unified/account/assets"
         qs   = "?coin=USDT"
@@ -194,7 +262,7 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
     except Exception as e:
         logger.warning(f"[BalanceCache] ❌ v2/unified-assets excepción: {e}")
 
-    # ENDPOINT 1: v2/account/all-account-balance (UA — balance unificado)
+    # ENDPOINT 3: v2/account/all-account-balance (UA — balance unificado)
     try:
         path = "/api/v2/account/all-account-balance"
         qs   = "?coin=USDT"
@@ -220,66 +288,16 @@ async def _fetch_balance_once(api_key, api_secret, passphrase) -> float | None:
                     if bal is not None:
                         return _cache_and_return(bal, "v2/all-account-balance")
         else:
-            logger.warning(
-                f"[BalanceCache] ⚠️ v2/all-account-balance code={data.get('code')} "
-                f"msg={data.get('msg')}"
-            )
+            code = data.get("code")
+            if code not in ("40085", "40001"):
+                logger.warning(
+                    f"[BalanceCache] ⚠️ v2/all-account-balance code={code} "
+                    f"msg={data.get('msg')}"
+                )
     except ValueError as e:
         logger.warning(f"[BalanceCache] ⚠️ v2/all-account-balance respuesta inesperada: {e}")
     except Exception as e:
         logger.warning(f"[BalanceCache] ❌ v2/all-account-balance excepción: {e}")
-
-    # ENDPOINT 2: v2/mix/account/accounts (lista de cuentas futuros USDT)
-    try:
-        path = "/api/v2/mix/account/accounts"
-        qs   = "?productType=USDT-FUTURES"
-        url  = "https://api.bitget.com" + path + qs
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers=_headers("GET", path + qs),
-                             timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await _safe_json(r)
-        if data.get("code") == "00000":
-            items = data.get("data") or []
-            if isinstance(items, list) and items:
-                bal = _extract_usdt_balance(items[0])
-                if bal is not None:
-                    return _cache_and_return(bal, "v2/mix-accounts")
-        else:
-            code = data.get("code")
-            if code not in ("40085", "40001"):
-                logger.warning(
-                    f"[BalanceCache] ⚠️ v2/mix-accounts code={code} msg={data.get('msg')}"
-                )
-    except ValueError as e:
-        logger.warning(f"[BalanceCache] ⚠️ v2/mix-accounts respuesta inesperada: {e}")
-    except Exception as e:
-        logger.warning(f"[BalanceCache] ❌ v2/mix-accounts excepción: {e}")
-
-    # ENDPOINT 3: v2/mix/account/account (cuenta futuros símbolo concreto)
-    try:
-        path = "/api/v2/mix/account/account"
-        qs   = "?symbol=BTCUSDT&productType=USDT-FUTURES&marginCoin=USDT"
-        url  = "https://api.bitget.com" + path + qs
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers=_headers("GET", path + qs),
-                             timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await _safe_json(r)
-        if data.get("code") == "00000":
-            d = data.get("data") or {}
-            if isinstance(d, dict):
-                bal = _extract_usdt_balance(d)
-                if bal is not None:
-                    return _cache_and_return(bal, "v2/mix-account-btc")
-        else:
-            code = data.get("code")
-            if code not in ("40085", "40001"):
-                logger.warning(
-                    f"[BalanceCache] ⚠️ v2/mix-account code={code} msg={data.get('msg')}"
-                )
-    except ValueError as e:
-        logger.warning(f"[BalanceCache] ⚠️ v2/mix-account respuesta inesperada: {e}")
-    except Exception as e:
-        logger.warning(f"[BalanceCache] ❌ v2/mix-account excepción: {e}")
 
     # ENDPOINT 4: v2/spot/account/assets (activos spot — último recurso)
     try:
@@ -354,8 +372,8 @@ async def _wait_for_balance(
     sleep_s: float   = _BALANCE_RETRY_SLEEP,
 ) -> float | None:
     """
-    Reintenta obtener el balance hasta max_retries veces con backoff lineal.
-    Invalida la caché en cada intento para forzar un fetch real.
+    Reintenta obtener el balance hasta max_retries veces con backoff exponencial.
+    El backoff exponencial evita saturar el rate limit de Bitget (429).
     """
     global _balance_cache_value, _balance_cache_ts
 
@@ -368,7 +386,8 @@ async def _wait_for_balance(
             logger.info(f"[{symbol}] Balance OK en intento {attempt}: {bal:.2f} USDT")
             return bal
 
-        wait = sleep_s * attempt
+        # Backoff exponencial: 3s, 6s, 12s, 24s, 48s — evita rate limit 429
+        wait = sleep_s * (2 ** (attempt - 1))
         logger.warning(
             f"[{symbol}] ⚠️ Balance={bal} (intento {attempt}/{max_retries}), "
             f"reintentando en {wait:.0f}s..."
@@ -472,7 +491,37 @@ class FuturesTrader:
         await self._detect_account_type()
 
     async def _detect_account_type(self):
-        # Probe UA primero con endpoint nativo v2/unified/account/assets
+        # Probe mix/accounts primero (más fiable en UA para futuros)
+        try:
+            r = await self._http_get(
+                "/api/v2/mix/account/accounts",
+                {"productType": "USDT-FUTURES"}
+            )
+            if r.get("code") == "00000":
+                self._api_version = "ua"
+                try:
+                    rp = await self._http_get(
+                        "/api/v2/mix/position/all-position",
+                        {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
+                    )
+                    if rp.get("code") == "00000":
+                        items = rp.get("data") or []
+                        if items and isinstance(items, list):
+                            self._ua_pos_mode = items[0].get("holdMode", "hedge")
+                        else:
+                            self._ua_pos_mode = "hedge"
+                    else:
+                        self._ua_pos_mode = "hedge"
+                except Exception:
+                    self._ua_pos_mode = "hedge"
+                logger.info(
+                    f"[{self.symbol}] ✅ Unified Account (UA) via mix/accounts. pos_mode={self._ua_pos_mode}"
+                )
+                return
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] UA mix/accounts probe error: {e}")
+
+        # Probe UA con unified/account/assets
         try:
             r = await self._http_get(
                 "/api/v2/unified/account/assets",
@@ -605,7 +654,6 @@ class FuturesTrader:
     async def set_leverage(self, leverage: int, side: str | None = None):
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
 
-        # UA siempre usa v2 para leverage (v3 endpoints eliminados)
         endpoint = "/api/v2/mix/account/set-leverage"
         pos_mode = self._ua_pos_mode or self._v2_pos_mode or "hedge"
 
@@ -663,7 +711,6 @@ class FuturesTrader:
     async def _get_positions(self) -> list | None:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
 
-        # UA y Classic v2 usan el mismo endpoint v2
         try:
             r = await self._http_get(
                 "/api/v2/mix/position/single-position",
@@ -714,7 +761,6 @@ class FuturesTrader:
     async def _place_order(self, side: str, trade_side: str, qty: float):
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
 
-        # UA y Classic v2 usan el mismo endpoint v2 para órdenes
         endpoint = "/api/v2/mix/order/place-order"
         pos_mode = self._ua_pos_mode or self._v2_pos_mode or "hedge"
 
