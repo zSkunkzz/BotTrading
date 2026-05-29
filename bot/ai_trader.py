@@ -18,7 +18,10 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 # Caché de decisiones IA: {cache_key: (result_dict, timestamp)}
 # La clave incluye símbolo + señal técnica + precio redondeado al 0.1%
 # para que el caché se invalide cuando el precio cambia significativamente.
-CACHE_TTL = int(os.getenv("AI_CACHE_TTL", "300"))  # 5 minutos
+# IMPORTANTE: los resultados HOLD para señales activas (BUY/SELL) NO se cachean,
+# así la IA se re-consulta en el siguiente tick en lugar de devolver HOLD indefinidamente.
+CACHE_TTL     = int(os.getenv("AI_CACHE_TTL",     "60"))   # 60s (antes 300s)
+CACHE_TTL_BUY = int(os.getenv("AI_CACHE_TTL_BUY", "60"))   # TTL para BUY/SELL confirmados
 _ai_cache: dict = {}
 
 # Score mínimo para consultar la IA (scores bajos → HOLD directo sin llamada)
@@ -264,7 +267,7 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
     if position:
         close_reason = _pnl_check(position, entry_price, current_price, leverage)
         if close_reason:
-            logger.info(f"\ud83d\udcca [{symbol}] CLOSE | {close_reason}")
+            logger.info(f"\U0001f4ca [{symbol}] CLOSE | {close_reason}")
             return {"action": "CLOSE", "confidence": 9, "reasoning": close_reason, "key_factors": ["pnl"]}
         return {"action": "HOLD", "confidence": 5, "reasoning": "PnL dentro de rango", "key_factors": []}
 
@@ -278,7 +281,7 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
 
         # FILTRO SCORE: si el score es bajo, no consultar IA → HOLD directo
         if score < AI_MIN_SCORE:
-            logger.info(f"[{symbol}] \u23ed\ufe0f Score {score}/10 < {AI_MIN_SCORE} → HOLD sin IA (ahorro Gemini)")
+            logger.info(f"[{symbol}] ⏭️ Score {score}/10 < {AI_MIN_SCORE} → HOLD sin IA (ahorro Gemini)")
             return {"action": "HOLD", "confidence": 4, "reasoning": f"Score {score}/10 insuficiente", "key_factors": []}
 
         # CACHÉ: clave incluye precio para invalidarse cuando el mercado se mueve
@@ -286,9 +289,15 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         now = time.monotonic()
         if cache_key in _ai_cache:
             cached_result, cached_ts = _ai_cache[cache_key]
-            if now - cached_ts < CACHE_TTL:
-                logger.info(f"[{symbol}] \ud83d\udd04 IA cached ({int(now - cached_ts)}s ago): {cached_result.get('action')} → ahorro Gemini")
+            age = int(now - cached_ts)
+            # Solo usar caché si la acción es BUY/SELL (confirmada).
+            # Un HOLD cacheado bloquearía nuevas entradas — se re-evalúa siempre.
+            if cached_result.get("action") in ("BUY", "SELL", "CLOSE") and age < CACHE_TTL:
+                logger.info(f"[{symbol}] 🔄 IA cached ({age}s ago): {cached_result.get('action')} → ahorro Gemini")
                 return cached_result
+            elif cached_result.get("action") == "HOLD" and age < CACHE_TTL:
+                # HOLD cacheado: log reducido para no saturar logs, pero SÍ se re-evalúa
+                pass  # cae al bloque de consulta IA abajo
 
         logger.info(f"[{symbol}] IA consultada (score={score}/10)")
     else:
@@ -298,15 +307,19 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         context = build_market_context(symbol, bars, position, entry_price, leverage)
         fallback_action = tech["signal"]
 
-        # CACHÉ: clave incluye señal técnica + precio para invalidarse con el mercado
+        # CACHÉ: clave incluye señal técnica + precio
         cache_key = f"{symbol}:tech:{tech['signal']}:{price_bucket}"
         now = time.monotonic()
 
         if cache_key in _ai_cache:
             cached_result, cached_ts = _ai_cache[cache_key]
-            if now - cached_ts < CACHE_TTL:
-                logger.info(f"[{symbol}] \ud83d\udd04 IA cached técnico ({int(now - cached_ts)}s ago): {cached_result.get('action')}")
+            age = int(now - cached_ts)
+            # Solo cachear BUY/SELL confirmados. Si la IA dijo HOLD a una señal BUY/SELL,
+            # no lo cacheamos para que el próximo tick lo re-evalúe.
+            if cached_result.get("action") in ("BUY", "SELL", "CLOSE") and age < CACHE_TTL_BUY:
+                logger.info(f"[{symbol}] 🔄 IA cached técnico ({age}s ago): {cached_result.get('action')}")
                 return cached_result
+            # HOLD sobre señal activa: no cachear, seguir hacia la llamada IA
 
         logger.info(f"[{symbol}] Técnico {tech['signal']} → IA")
 
@@ -322,12 +335,16 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
     if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
         result["action"] = "HOLD"
 
-    # Guardar en caché
-    _ai_cache[cache_key] = (result, now)
-    # Limpiar caché antigua
-    if len(_ai_cache) > 200:
-        oldest_key = min(_ai_cache, key=lambda k: _ai_cache[k][1])
-        del _ai_cache[oldest_key]
+    # Solo guardar en caché si la acción es BUY/SELL/CLOSE.
+    # Los HOLD no se cachean: la próxima vez que haya señal técnica activa
+    # se volverá a consultar la IA en lugar de servir un HOLD indefinido.
+    action = result.get("action")
+    if action in ("BUY", "SELL", "CLOSE"):
+        _ai_cache[cache_key] = (result, now)
+        # Limpiar caché antigua
+        if len(_ai_cache) > 200:
+            oldest_key = min(_ai_cache, key=lambda k: _ai_cache[k][1])
+            del _ai_cache[oldest_key]
 
-    logger.info(f"\ud83e\udd16 [{symbol}] {result['action']} ({confidence}/10) | {result.get('reasoning', result.get('reason', ''))}")
+    logger.info(f"\U0001f916 [{symbol}] {result['action']} ({confidence}/10) | {result.get('reasoning', result.get('reason', ''))}")
     return result
