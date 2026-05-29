@@ -185,21 +185,25 @@ class FuturesTrader:
     # Error 25236 = "Incorrect position open type"
     # Causa: el payload enviado no coincide con el modo configurado en la cuenta.
     #
+    # Unified Account v3 — /api/v3/trade/place-order
+    # -----------------------------------------------
     # One-way mode (onewaymode):
-    #   Abrir long:   side=buy           (sin posSide)
-    #   Abrir short:  side=sell          (sin posSide)
-    #   Cerrar long:  side=sell  + reduceOnly="yes"
-    #   Cerrar short: side=buy   + reduceOnly="yes"
+    #   Abrir long:   side=buy  tradeSide=open   (sin posSide, sin reduceOnly)
+    #   Abrir short:  side=sell tradeSide=open   (sin posSide, sin reduceOnly)
+    #   Cerrar long:  side=sell tradeSide=close  (sin posSide, sin reduceOnly)
+    #   Cerrar short: side=buy  tradeSide=close  (sin posSide, sin reduceOnly)
     #
     # Hedge mode (hedgemode):
-    #   Abrir long:   side=buy  + posSide=long
-    #   Abrir short:  side=sell + posSide=short
-    #   Cerrar long:  side=sell + posSide=long
-    #   Cerrar short: side=buy  + posSide=short
+    #   Abrir long:   side=buy  posSide=long  tradeSide=open
+    #   Abrir short:  side=sell posSide=short tradeSide=open
+    #   Cerrar long:  side=sell posSide=long  tradeSide=close
+    #   Cerrar short: side=buy  posSide=short tradeSide=close
     #
-    # La deteccion se hace consultando /api/v3/position/current-position
-    # y revisando el campo holdMode del primer registro. Si no hay posiciones,
-    # se intenta via /api/v2/mix/account/account.
+    # NUNCA mezclar: reduceOnly solo existe en v2 mix, NO en v3 trade.
+    # NUNCA enviar posSide en one-way mode — causa 25236.
+    #
+    # La deteccion se hace consultando /api/v3/mix/account/account
+    # (campo holdMode) o /api/v3/position/current-position si hay pos abiertas.
 
     async def _detect_pos_mode(self) -> str:
         """Retorna 'one_way' o 'hedge'. Cachea el resultado 5 minutos."""
@@ -210,7 +214,25 @@ class FuturesTrader:
 
         sym = self._sym()
 
-        # Intento 1: /api/v3/position/current-position (UTA v3)
+        # Intento 1: /api/v2/mix/account/account — campo holdMode (más fiable,
+        # funciona aunque no haya posiciones abiertas)
+        try:
+            r = await self._http_get(
+                "/api/v2/mix/account/account",
+                {"symbol": sym, "productType": "USDT-FUTURES", "marginCoin": "USDT"},
+            )
+            if r.get("code") == "00000":
+                hold_mode = (r.get("data") or {}).get("holdMode", "")
+                if hold_mode:
+                    mode = "hedge" if "hedge" in hold_mode.lower() else "one_way"
+                    _pos_mode_cache = mode
+                    _pos_mode_detected_at = now
+                    logger.info("[%s] Modo posicion detectado (v2 account holdMode): %s", self.symbol, mode)
+                    return mode
+        except Exception as e:
+            logger.debug("[%s] _detect_pos_mode v2 account error: %s", self.symbol, e)
+
+        # Intento 2: /api/v3/position/current-position (solo util si hay posiciones)
         try:
             r = await self._http_get(
                 "/api/v3/position/current-position",
@@ -226,24 +248,7 @@ class FuturesTrader:
                     logger.info("[%s] Modo posicion detectado (v3 position): %s", self.symbol, mode)
                     return mode
         except Exception as e:
-            logger.debug("[%s] _detect_pos_mode v3 error: %s", self.symbol, e)
-
-        # Intento 2: /api/v2/mix/account/account (campo holdMode)
-        try:
-            r = await self._http_get(
-                "/api/v2/mix/account/account",
-                {"symbol": sym, "productType": "USDT-FUTURES", "marginCoin": "USDT"},
-            )
-            if r.get("code") == "00000":
-                hold_mode = (r.get("data") or {}).get("holdMode", "")
-                if hold_mode:
-                    mode = "hedge" if "hedge" in hold_mode.lower() else "one_way"
-                    _pos_mode_cache = mode
-                    _pos_mode_detected_at = now
-                    logger.info("[%s] Modo posicion detectado (v2 account): %s", self.symbol, mode)
-                    return mode
-        except Exception as e:
-            logger.debug("[%s] _detect_pos_mode v2 error: %s", self.symbol, e)
+            logger.debug("[%s] _detect_pos_mode v3 position error: %s", self.symbol, e)
 
         # Fallback conservador: asumir one_way (modo por defecto en cuentas nuevas)
         logger.warning("[%s] No se pudo detectar holdMode -- asumiendo one_way", self.symbol)
@@ -495,20 +500,24 @@ class FuturesTrader:
 
     # -- Ordenes Unified Account v3 — /api/v3/trade/place-order ---------------
     #
-    # One-way mode (onewaymode) — parametros correctos segun doc oficial:
-    #   Abrir long:   side=buy                        (sin posSide, sin reduceOnly)
-    #   Abrir short:  side=sell                       (sin posSide, sin reduceOnly)
-    #   Cerrar long:  side=sell  + reduceOnly="yes"   (sin posSide)
-    #   Cerrar short: side=buy   + reduceOnly="yes"   (sin posSide)
+    # PARAMETROS CORRECTOS segun documentacion oficial Bitget UTA v3:
     #
-    # Hedge mode (hedgemode) — parametros correctos segun doc oficial:
-    #   Abrir long:   side=buy  + posSide="long"      (sin reduceOnly)
-    #   Abrir short:  side=sell + posSide="short"     (sin reduceOnly)
-    #   Cerrar long:  side=sell + posSide="long"      (sin reduceOnly)
-    #   Cerrar short: side=buy  + posSide="short"     (sin reduceOnly)
+    # One-way mode (onewaymode):
+    #   Abrir long:   side=buy  tradeSide=open
+    #   Abrir short:  side=sell tradeSide=open
+    #   Cerrar long:  side=sell tradeSide=close
+    #   Cerrar short: side=buy  tradeSide=close
+    #   → NUNCA incluir posSide ni reduceOnly en one-way
     #
-    # IMPORTANTE: mezclar parametros de ambos modos causa error 25236
-    # (ej: enviar posSide en one-way, o reduceOnly en hedge-mode)
+    # Hedge mode (hedgemode):
+    #   Abrir long:   side=buy  posSide=long  tradeSide=open
+    #   Abrir short:  side=sell posSide=short tradeSide=open
+    #   Cerrar long:  side=sell posSide=long  tradeSide=close
+    #   Cerrar short: side=buy  posSide=short tradeSide=close
+    #   → NUNCA incluir reduceOnly en hedge-mode
+    #
+    # reduceOnly es un campo de v2 mix, NO existe en v3 trade/place-order.
+    # Enviar reduceOnly o un posSide incorrecto causa error 25236.
 
     async def _place_order_raw(
         self,
@@ -530,6 +539,9 @@ class FuturesTrader:
 
         is_hedge = self._ua_pos_mode == "hedge"
 
+        # trade_side se determina por reduce_only si no se pasa explicitamente
+        effective_trade_side = "close" if reduce_only else trade_side
+
         payload: dict = {
             "category":   "USDT-FUTURES",
             "symbol":     sym,
@@ -537,24 +549,21 @@ class FuturesTrader:
             "side":       side,
             "orderType":  order_type,
             "marginMode": "crossed",
+            "tradeSide":  effective_trade_side,  # open | close — obligatorio en v3
         }
 
         if is_hedge:
             # Hedge mode: posSide obligatorio, NO usar reduceOnly
-            # Si pos_side no se pasa explicitamente, inferirlo de side y trade_side
             if pos_side:
                 payload["posSide"] = pos_side
             else:
                 # apertura: side=buy -> long, side=sell -> short
                 # cierre:   side=sell -> long (cierra long), side=buy -> short (cierra short)
-                if trade_side == "open":
+                if effective_trade_side == "open":
                     payload["posSide"] = "long" if side == "buy" else "short"
                 else:  # close
                     payload["posSide"] = "long" if side == "sell" else "short"
-        else:
-            # One-way mode: reduceOnly para cierres, NO usar posSide
-            if reduce_only:
-                payload["reduceOnly"] = "yes"
+        # En one-way mode NO se incluye posSide ni reduceOnly — solo tradeSide
 
         if order_type == "limit":
             payload["timeInForce"] = "gtc"
@@ -562,8 +571,7 @@ class FuturesTrader:
                 payload["price"] = str(price)
 
         # Preset TP/SL inline (solo en ordenes de apertura)
-        # tpTriggerBy / slTriggerBy: valores validos -> "mark_price" | "market"
-        if not reduce_only and trade_side == "open":
+        if effective_trade_side == "open":
             if tp:
                 payload["takeProfit"]  = str(tp)
                 payload["tpTriggerBy"] = "mark_price"
@@ -575,8 +583,8 @@ class FuturesTrader:
 
         if self.dry_run:
             logger.info(
-                "[%s] DRY RUN RAW: %s mode=%s reduceOnly=%s posSide=%s %s qty=%s price=%s tp=%s sl=%s",
-                self.symbol, side, self._ua_pos_mode, reduce_only,
+                "[%s] DRY RUN RAW: %s mode=%s tradeSide=%s posSide=%s %s qty=%s price=%s tp=%s sl=%s",
+                self.symbol, side, self._ua_pos_mode, effective_trade_side,
                 payload.get("posSide"), order_type, qty, price, tp, sl
             )
             return {"code": "00000", "data": {"orderId": "dry"}}
