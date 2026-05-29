@@ -183,29 +183,6 @@ class FuturesTrader:
         return self._cb_40085_paused_until > time.time()
 
     # -- Deteccion de modo de posicion (one-way vs hedge) ----------------------
-    #
-    # Error 25236 = "Incorrect position open type"
-    # Causa: el payload enviado no coincide con el modo configurado en la cuenta.
-    #
-    # Unified Account v3 — /api/v3/trade/place-order
-    # -----------------------------------------------
-    # One-way mode (onewaymode):
-    #   Abrir long:   side=buy  tradeSide=open   (sin posSide, sin reduceOnly)
-    #   Abrir short:  side=sell tradeSide=open   (sin posSide, sin reduceOnly)
-    #   Cerrar long:  side=sell tradeSide=close  (sin posSide, sin reduceOnly)
-    #   Cerrar short: side=buy  tradeSide=close  (sin posSide, sin reduceOnly)
-    #
-    # Hedge mode (hedgemode):
-    #   Abrir long:   side=buy  posSide=long  tradeSide=open
-    #   Abrir short:  side=sell posSide=short tradeSide=open
-    #   Cerrar long:  side=sell posSide=long  tradeSide=close
-    #   Cerrar short: side=buy  posSide=short tradeSide=close
-    #
-    # NUNCA mezclar: reduceOnly solo existe en v2 mix, NO en v3 trade.
-    # NUNCA enviar posSide en one-way mode — causa 25236.
-    #
-    # La deteccion se hace consultando /api/v2/mix/account/account
-    # (campo holdMode) o /api/v3/position/current-position si hay pos abiertas.
 
     async def _detect_pos_mode(self) -> str:
         """Retorna 'one_way' o 'hedge'. Cachea el resultado 5 minutos."""
@@ -216,8 +193,6 @@ class FuturesTrader:
 
         sym = self._sym()
 
-        # Intento 1: /api/v2/mix/account/account — campo holdMode (más fiable,
-        # funciona aunque no haya posiciones abiertas)
         try:
             r = await self._http_get(
                 "/api/v2/mix/account/account",
@@ -234,7 +209,6 @@ class FuturesTrader:
         except Exception as e:
             logger.debug("[%s] _detect_pos_mode v2 account error: %s", self.symbol, e)
 
-        # Intento 2: /api/v3/position/current-position (solo util si hay posiciones)
         try:
             r = await self._http_get(
                 "/api/v3/position/current-position",
@@ -252,26 +226,14 @@ class FuturesTrader:
         except Exception as e:
             logger.debug("[%s] _detect_pos_mode v3 position error: %s", self.symbol, e)
 
-        # Fallback conservador: asumir one_way (modo por defecto en cuentas nuevas)
         logger.warning("[%s] No se pudo detectar holdMode -- asumiendo one_way", self.symbol)
         _pos_mode_cache = "one_way"
         _pos_mode_detected_at = now
         return "one_way"
 
     # -- Set margin mode -------------------------------------------------------
-    # En Unified Account v3, el margin mode NO se configura via
-    # /api/v2/mix/account/set-margin-mode (Classic Account API — devuelve 40085).
-    # En UA v3, el margin mode se especifica por orden en el campo `marginMode`
-    # del payload de /api/v3/trade/place-order (ya implementado en _place_order_raw).
-    # Esta funcion se mantiene por compatibilidad pero es un no-op en UA v3.
 
     async def set_margin_mode(self):
-        """
-        En Unified Account v3, el margin mode se pasa directamente en cada
-        orden via el campo marginMode. El endpoint Classic Account
-        /api/v2/mix/account/set-margin-mode siempre devuelve 40085 para
-        cuentas UA v3 — se omite silenciosamente.
-        """
         logger.debug(
             "[%s] set_margin_mode: UA v3 -- margin mode '%s' se aplica "
             "por orden via campo marginMode en place-order (no requiere llamada separada)",
@@ -304,12 +266,10 @@ class FuturesTrader:
             balance_svc.init(self._api_key, self._api_secret, self._passphrase)
 
         self._api_version = "ua"
-        # Detectar modo de posicion real de la cuenta
         detected_mode = await self._detect_pos_mode()
         self._ua_pos_mode = detected_mode
         logger.info("[%s] Modo cuenta Unified Account v3: %s", self.symbol, detected_mode)
 
-        # En UA v3, set_margin_mode es un no-op (margin mode va por orden)
         await self.set_margin_mode()
 
     # -- Precio, OHLCV y balance ----------------------------------------------
@@ -358,8 +318,6 @@ class FuturesTrader:
         return await balance_svc.get()
 
     # -- Leverage --------------------------------------------------------------
-    # UA v3 puede devolver 40085 en set-leverage; se ignora silenciosamente.
-    # Endpoint estable v2: POST /api/v2/mix/account/set-leverage
 
     async def set_leverage(self, leverage: int, side: str | None = None):
         sym = self._sym()
@@ -369,7 +327,6 @@ class FuturesTrader:
             "marginCoin":  "USDT",
             "leverage":    str(leverage),
         }
-        # En hedge-mode hay que especificar holdSide
         if self._ua_pos_mode == "hedge" and side:
             payload["holdSide"] = side
         try:
@@ -385,7 +342,6 @@ class FuturesTrader:
             logger.debug("[%s] set_leverage exception (ignorado): %s", self.symbol, e)
 
     # -- Minimos de qty --------------------------------------------------------
-    # Endpoint estable v2: GET /api/v2/mix/market/contracts
 
     async def _get_min_qty(self) -> float:
         sym = self._sym()
@@ -452,7 +408,7 @@ class FuturesTrader:
         logger.warning("[%s] _get_positions fallo", self.symbol)
         return None
 
-    # -- TPSL server-side (fallback para posiciones ya abiertas) ---------------
+    # -- TPSL server-side ------------------------------------------------------
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
         if not self.position:
@@ -523,30 +479,7 @@ class FuturesTrader:
             logger.error("[%s] reconcile_position error: %s", self.symbol, e)
             return False
 
-    # -- Ordenes Unified Account v3 — /api/v3/trade/place-order ---------------
-    #
-    # PARAMETROS CORRECTOS segun documentacion oficial Bitget UTA v3:
-    #
-    # One-way mode (onewaymode):
-    #   Abrir long:   side=buy  tradeSide=open
-    #   Abrir short:  side=sell tradeSide=open
-    #   Cerrar long:  side=sell tradeSide=close
-    #   Cerrar short: side=buy  tradeSide=close
-    #   → NUNCA incluir posSide ni reduceOnly en one-way
-    #
-    # Hedge mode (hedgemode):
-    #   Abrir long:   side=buy  posSide=long  tradeSide=open
-    #   Abrir short:  side=sell posSide=short tradeSide=open
-    #   Cerrar long:  side=sell posSide=long  tradeSide=close
-    #   Cerrar short: side=buy  posSide=short tradeSide=close
-    #   → NUNCA incluir reduceOnly en hedge-mode
-    #
-    # reduceOnly es un campo de v2 mix, NO existe en v3 trade/place-order.
-    # Enviar reduceOnly o un posSide incorrecto causa error 25236.
-    #
-    # marginMode: se toma de self.margin_mode (isolated por defecto).
-    # Se pasa directamente en el payload de cada orden — no requiere
-    # llamada separada a set-margin-mode (que solo existe en Classic Account).
+    # -- Ordenes Unified Account v3 -------------------------------------------
 
     async def _place_order_raw(
         self,
@@ -558,20 +491,15 @@ class FuturesTrader:
         sl: float | None = None,
         tp: float | None = None,
         trade_side: str = "open",
-        pos_side: str | None = None,  # "long" | "short" | None (se calcula automaticamente)
+        pos_side: str | None = None,
     ) -> dict:
         sym = self._sym()
 
-        # Detectar modo si no se hizo aun (puede pasar en tests o llamadas directas)
         if self._ua_pos_mode is None:
             self._ua_pos_mode = await self._detect_pos_mode()
 
         is_hedge = self._ua_pos_mode == "hedge"
-
-        # trade_side se determina por reduce_only si no se pasa explicitamente
         effective_trade_side = "close" if reduce_only else trade_side
-
-        # marginMode: 'isolated' o 'crossed' segun preferencia del usuario
         bg_margin_mode = "isolated" if self.margin_mode == "isolated" else "crossed"
 
         payload: dict = {
@@ -581,28 +509,23 @@ class FuturesTrader:
             "side":       side,
             "orderType":  order_type,
             "marginMode": bg_margin_mode,
-            "tradeSide":  effective_trade_side,  # open | close — obligatorio en v3
+            "tradeSide":  effective_trade_side,
         }
 
         if is_hedge:
-            # Hedge mode: posSide obligatorio, NO usar reduceOnly
             if pos_side:
                 payload["posSide"] = pos_side
             else:
-                # apertura: side=buy -> long, side=sell -> short
-                # cierre:   side=sell -> long (cierra long), side=buy -> short (cierra short)
                 if effective_trade_side == "open":
                     payload["posSide"] = "long" if side == "buy" else "short"
-                else:  # close
+                else:
                     payload["posSide"] = "long" if side == "sell" else "short"
-        # En one-way mode NO se incluye posSide ni reduceOnly — solo tradeSide
 
         if order_type == "limit":
             payload["timeInForce"] = "gtc"
             if price is not None:
                 payload["price"] = str(price)
 
-        # Preset TP/SL inline (solo en ordenes de apertura)
         if effective_trade_side == "open":
             if tp:
                 payload["takeProfit"]  = str(tp)
@@ -628,11 +551,6 @@ class FuturesTrader:
             return {"code": "ERROR", "msg": str(e)}
 
     async def _get_order_status(self, order_id: str) -> dict:
-        """
-        Consulta el estado de una orden via /api/v3/trade/order-info (UTA v3).
-        Response doc oficial: data.orderStatus (no data.state).
-        Valores: live | new | partially_filled | filled | cancelled
-        """
         sym = self._sym()
         try:
             r = await self._http_get(
@@ -654,10 +572,6 @@ class FuturesTrader:
             return {}
 
     async def _cancel_order(self, order_id: str) -> dict:
-        """
-        Cancela una orden via /api/v3/trade/cancel-order (UTA v3).
-        Parametros oficiales: category, symbol, orderId.
-        """
         sym = self._sym()
         try:
             return await self._http_post(
@@ -679,9 +593,6 @@ class FuturesTrader:
         price: float | None = None,
         auto_cancel: bool = False,
     ) -> dict:
-        """
-        Modifica una orden pendiente via /api/v3/trade/modify-order (UTA v3).
-        """
         sym = self._sym()
         payload: dict = {
             "category":  "USDT-FUTURES",
@@ -715,7 +626,6 @@ class FuturesTrader:
         sl: float | None = None,
         tp: float | None = None,
     ) -> dict:
-        # -- Circuit breaker 40085 --------------------------------------------
         now = time.time()
         if self._cb_40085_paused_until > now:
             remaining = int(self._cb_40085_paused_until - now)
@@ -759,7 +669,6 @@ class FuturesTrader:
         rejected  = r.get("code") != "00000"
         err_code  = r.get("code", "")
 
-        # Si error 25236, invalidar cache de pos_mode para re-detectar en proxima orden
         if err_code == "25236":
             global _pos_mode_cache, _pos_mode_detected_at
             logger.error(
@@ -997,6 +906,19 @@ class FuturesTrader:
         usdt_per_trade = risk.usdt_per_trade
         await self._init(usdt_per_trade)
 
+        # Wrapper ai_decide_fn compatible con la firma que espera strategy.decide():
+        #   ai_decide_fn(symbol: str, context: dict) -> str  ("BUY"|"SELL"|"HOLD")
+        async def _ai_decide_fn(symbol: str, context: dict) -> str:
+            result = await ai_decide(
+                symbol=symbol,
+                bars=None,
+                position=self.position,
+                entry_price=self.entry_price,
+                leverage=self.leverage,
+                context_override=context,
+            )
+            return result.get("action", "HOLD")
+
         while True:
             try:
                 if kill_switch.is_hard_killed():
@@ -1050,37 +972,53 @@ class FuturesTrader:
                             exit_reason = f"TP3 fijo {price:.4f}"
 
                     if should_exit:
-                        pnl_pct = 0.0
-                        if self.entry_price:
-                            if self.position == "long":
-                                pnl_pct = (price - self.entry_price) / self.entry_price * 100
-                            else:
-                                pnl_pct = (self.entry_price - price) / self.entry_price * 100
                         await self.close_position(reason=exit_reason)
                         risk.reset()
                 else:
-                    bars = await self.get_ohlcv()
-                    if not bars or len(bars) < OHLCV_MIN_BARS:
-                        await asyncio.sleep(5)
-                        continue
+                    # -------------------------------------------------------
+                    # Llamada a strategy.decide() con la firma correcta:
+                    #   decide(exch, symbol, ai_decide_fn,
+                    #          has_open_position, current_pnl) -> dict
+                    # -------------------------------------------------------
+                    result = await decide(
+                        exch=self.exchange,
+                        symbol=self.symbol,
+                        ai_decide_fn=_ai_decide_fn,
+                        has_open_position=bool(self.position),
+                        current_pnl=None,
+                    )
 
-                    signal = decide(bars)
-                    if signal in ("long", "short"):
-                        ai_signal = await ai_decide(self.symbol, bars, signal)
-                        if ai_signal != signal:
-                            logger.info("[%s] AI overrule: %s -> %s", self.symbol, signal, ai_signal)
-                            signal = ai_signal
+                    action = result.get("action", "HOLD")
+                    signal = result.get("signal")
 
-                    if signal == "long":
-                        sl, tp1, tp2, tp3 = risk.calc_levels(price, "long")
+                    logger.debug(
+                        "[%s] strategy.decide → action=%s reason=%s",
+                        self.symbol, action, result.get("reason", "")
+                    )
+
+                    if action == "BUY":
+                        lev = (signal.suggested_lev if signal else None) or self.leverage
+                        sl  = signal.sl  if signal else None
+                        tp1 = signal.tp1 if signal else None
+                        tp2 = signal.tp2 if signal else None
+                        tp3 = signal.tp3 if signal else None
                         await self.open_long(
-                            usdt_amount=usdt_per_trade, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+                            usdt_amount=usdt_per_trade,
+                            sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+                            leverage=lev,
                         )
-                    elif signal == "short":
-                        sl, tp1, tp2, tp3 = risk.calc_levels(price, "short")
+                    elif action == "SELL":
+                        lev = (signal.suggested_lev if signal else None) or self.leverage
+                        sl  = signal.sl  if signal else None
+                        tp1 = signal.tp1 if signal else None
+                        tp2 = signal.tp2 if signal else None
+                        tp3 = signal.tp3 if signal else None
                         await self.open_short(
-                            usdt_amount=usdt_per_trade, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+                            usdt_amount=usdt_per_trade,
+                            sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+                            leverage=lev,
                         )
+                    # HOLD → no action
 
             except Exception as e:
                 logger.error("[%s] run() error: %s", self.symbol, e)
