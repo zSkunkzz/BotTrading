@@ -71,6 +71,23 @@ _MIN_QTY_FALLBACK = {
 _min_qty_cache = {}
 
 
+def _ua_side(side: str, trade_side: str) -> str:
+    """
+    Convierte side+trade_side del modo double_hold al valor correcto
+    para Unified Account v3 en modo single_hold.
+
+    En UA single_hold la API v2 acepta SOLO:
+      - "buy_single"  → abrir long O cerrar short
+      - "sell_single" → abrir short O cerrar long
+
+    El campo "tradeSide" y "side" con valores "buy"/"sell" + "open"/"close"
+    son para double_hold y generan error 40085 en UA single_hold.
+    """
+    if side in ("buy", "long"):
+        return "buy_single"
+    return "sell_single"
+
+
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
                  leverage, margin_mode, dry_run):
@@ -415,20 +432,24 @@ class FuturesTrader:
             logger.error(f"[{self.symbol}] reconcile_position error: {e}")
             return False
 
-    # ── Órdenes — Unified Account: /api/v2/mix/order/place-order ─────────────
-    # Para Unified Account en modo single_hold:
-    #   side: "buy" para abrir long / cerrar short
-    #         "sell" para abrir short / cerrar long
-    #   tradeSide: "open" o "close"
-    #   marginMode: "crossed" (UA sólo soporta crossed en USDT-FUTURES)
-    # NO se envía "holdSide" en place-order para single_hold.
+    # ── Órdenes — Unified Account v3 single_hold ──────────────────────────────
+    #
+    # En UA v3 single_hold el endpoint /api/v2/mix/order/place-order requiere:
+    #   side: "buy_single"  → abre long O cierra short
+    #         "sell_single" → abre short O cierra long
+    #
+    # Los valores "buy"/"sell" con tradeSide="open"/"close" son para double_hold
+    # y devuelven error 40085 en Unified Account.
+    # NO se envía el campo "tradeSide" en single_hold.
 
     async def _place_order_raw(
         self, side: str, qty: float,
         order_type: str = "market", price: float | None = None,
-        trade_side: str = "open",
+        trade_side: str = "open",   # ignorado en UA single_hold, se conserva la firma
     ) -> dict:
         sym = self._sym()
+        # Convertir al side correcto para UA single_hold
+        ua_side = _ua_side(side, trade_side)
         payload: dict = {
             "symbol":      sym,
             "productType": "USDT-FUTURES",
@@ -436,14 +457,14 @@ class FuturesTrader:
             "marginCoin":  "USDT",
             "size":        str(qty),
             "orderType":   order_type,
-            "side":        side,
-            "tradeSide":   trade_side,
+            "side":        ua_side,          # buy_single / sell_single
+            # NO se envía "tradeSide" — campo double_hold, causa 40085 en UA
         }
         if order_type == "limit" and price is not None:
             payload["price"] = str(price)
 
         if self.dry_run:
-            logger.info(f"[{self.symbol}] 🟡 DRY RUN RAW: {side} {order_type} qty={qty} price={price} tradeSide={trade_side}")
+            logger.info(f"[{self.symbol}] 🟡 DRY RUN RAW: {ua_side} {order_type} qty={qty} price={price}")
             return {"code": "00000", "data": {"orderId": "dry"}}
 
         try:
@@ -519,7 +540,7 @@ class FuturesTrader:
             logger.error(
                 f"[{self.symbol}] ❌ Error 40085 en place-order "
                 f"({self._cb_40085_count}/{_CB_40085_THRESHOLD}): "
-                f"API key sin permisos de Unified Account trading."
+                f"UA single_hold side incorrecto o API key sin permisos UA."
             )
             if self._cb_40085_count >= _CB_40085_THRESHOLD:
                 self._cb_40085_paused_until = time.time() + _CB_40085_PAUSE_S
@@ -529,20 +550,18 @@ class FuturesTrader:
                     f"símbolo pausado {_CB_40085_PAUSE_S}s. "
                     f"Verifica que la API key tenga permisos de trading en Unified Account."
                 )
-                # Notificar por Telegram si está disponible
                 try:
                     from bot.telegram_bot import send_message
                     await send_message(
                         f"🚨 <b>Circuit Breaker 40085</b>\n"
                         f"Par: <code>{self.symbol}</code>\n"
-                        f"Bitget rechaza la API key para Unified Account trading.\n"
+                        f"Bitget rechaza la orden en Unified Account.\n"
                         f"El símbolo se pausa {_CB_40085_PAUSE_S//60} min.\n"
-                        f"<b>Acción requerida:</b> Crea una API key nueva desde "
-                        f"Unified Account → API Management en Bitget."
+                        f"<b>Acción requerida:</b> Verifica que la API key tenga permisos "
+                        f"de Futures Trading en Unified Account."
                     )
                 except Exception:
                     pass
-            # No acumular en KillSwitch — es un error de configuración, no de mercado
         else:
             await kill_switch.on_order_result(rejected=rejected)
             if not rejected:
