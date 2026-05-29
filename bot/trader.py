@@ -220,34 +220,42 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage (UA) ─────────────────────────────────────────────────────────
+    # ── Leverage (V3 UA) ──────────────────────────────────────────────────────
 
     async def set_leverage(self, leverage: int, side: str | None = None):
+        """Ajusta el apalancamiento usando el endpoint V3 de Unified Account.
+        Endpoint: POST /api/v3/position/lever
+        """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
-        endpoint = "/api/v2/mix/account/set-leverage"
+        # sym_clean para V3 usa el símbolo sin sufijo USDT adicional, p.ej. INJUSDT
+        # pero si viene INJUSDTUSDT hay que normalizar a INJUSDT
+        if sym_clean.endswith("USDTUSDT"):
+            sym_clean = sym_clean[:-4]  # quita el segundo USDT
         payload = {
-            "symbol": sym_clean,
+            "symbol":     sym_clean,
             "productType": "USDT-FUTURES",
             "marginCoin": "USDT",
-            "leverage": str(leverage),
-            "holdSide": "all",
+            "leverage":   str(leverage),
         }
         try:
-            r = await self._http_post(endpoint, payload)
+            r = await self._http_post("/api/v3/position/lever", payload)
             if r.get("code") == "00000":
-                logger.debug(f"[{self.symbol}] Leverage {leverage}x (UA) OK")
+                logger.debug(f"[{self.symbol}] Leverage {leverage}x (V3 UA) OK")
             else:
-                logger.warning(f"[{self.symbol}] set_leverage UA error: {r}")
+                logger.warning(f"[{self.symbol}] set_leverage V3 error: {r}")
         except Exception as e:
-            logger.warning(f"[{self.symbol}] set_leverage UA exception: {e}")
+            logger.warning(f"[{self.symbol}] set_leverage V3 exception: {e}")
 
     # ── Mínimos de qty ────────────────────────────────────────────────────────
 
     async def _get_min_qty(self) -> float:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        if sym_clean.endswith("USDTUSDT"):
+            sym_clean = sym_clean[:-4]
         if sym_clean in _min_qty_cache:
             return _min_qty_cache[sym_clean]
         try:
+            # /api/v2/mix/market/contracts es un endpoint público (no de cuenta) → no afecta UA
             r = await self._http_get(
                 "/api/v2/mix/market/contracts",
                 {"symbol": sym_clean, "productType": "USDT-FUTURES"}
@@ -268,13 +276,16 @@ class FuturesTrader:
         _min_qty_cache[sym_clean] = fallback
         return fallback
 
-    # ── Posiciones abiertas ───────────────────────────────────────────────────
+    # ── Posiciones abiertas (V3 UA) ───────────────────────────────────────────
 
     async def _get_positions(self) -> list | None:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        if sym_clean.endswith("USDTUSDT"):
+            sym_clean = sym_clean[:-4]
         try:
+            # V3 single-position
             r = await self._http_get(
-                "/api/v2/mix/position/single-position",
+                "/api/v3/position/single-position",
                 {"symbol": sym_clean, "productType": "USDT-FUTURES", "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
@@ -283,14 +294,15 @@ class FuturesTrader:
                 return [
                     p for p in data
                     if isinstance(p, dict)
-                    and float(p.get("total") or p.get("contracts") or p.get("size", 0)) > 0
+                    and float(p.get("total") or p.get("size", 0)) > 0
                 ]
         except Exception as e:
-            logger.debug(f"[{self.symbol}] positions error: {e}")
+            logger.debug(f"[{self.symbol}] positions V3 error: {e}")
 
         try:
+            # V3 all-positions fallback
             r = await self._http_get(
-                "/api/v2/mix/position/all-position",
+                "/api/v3/position/all-position",
                 {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
             )
             if r.get("code") == "00000":
@@ -300,10 +312,10 @@ class FuturesTrader:
                     p for p in data
                     if isinstance(p, dict)
                     and p.get("symbol") == sym_clean
-                    and float(p.get("total") or p.get("contracts") or p.get("size", 0)) > 0
+                    and float(p.get("total") or p.get("size", 0)) > 0
                 ]
         except Exception as e:
-            logger.debug(f"[{self.symbol}] all-positions error: {e}")
+            logger.debug(f"[{self.symbol}] all-positions V3 error: {e}")
 
         logger.warning(f"[{self.symbol}] ⚠️ _get_positions falló")
         return None
@@ -317,6 +329,8 @@ class FuturesTrader:
             return {"code": "NO_TPSL", "msg": "Sin niveles de protección"}
 
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        if sym_clean.endswith("USDTUSDT"):
+            sym_clean = sym_clean[:-4]
         hold_side = "long" if self.position == "long" else "short"
         payload = {
             "symbol":      sym_clean,
@@ -340,7 +354,8 @@ class FuturesTrader:
             return {"code": "00000", "data": {"orderId": "dry-tpsl"}}
 
         try:
-            r = await self._http_post("/api/v2/mix/order/place-pos-tpsl", payload)
+            # V3 TPSL endpoint
+            r = await self._http_post("/api/v3/order/place-tpsl", payload)
             if r.get("code") == "00000":
                 data = r.get("data") or {}
                 item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
@@ -379,7 +394,7 @@ class FuturesTrader:
             logger.error(f"[{self.symbol}] reconcile_position error: {e}")
             return False
 
-    # ── Colocar / cerrar órdenes (UA) ─────────────────────────────────────────
+    # ── Colocar / cerrar órdenes (V3 UA) ──────────────────────────────────────
 
     async def _place_order_raw(
         self, side: str, qty: float,
@@ -389,18 +404,22 @@ class FuturesTrader:
         Capa base de envío de órdenes al exchange.
         Usada por ExecutionEngine y por _place_order().
         No modifica estado interno: sólo envía y devuelve el resultado.
+        Usa el endpoint V3 de Unified Account.
         """
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
-        endpoint  = "/api/v2/mix/order/place-order"
+        if sym_clean.endswith("USDTUSDT"):
+            sym_clean = sym_clean[:-4]
+        # V3 UA order endpoint
+        endpoint  = "/api/v3/order/place-order"
         payload: dict = {
             "symbol":      sym_clean,
             "productType": "USDT-FUTURES",
             "marginMode":  self.margin_mode,
             "marginCoin":  "USDT",
-            "qty":         str(qty),
+            "size":        str(qty),   # V3 usa 'size' en lugar de 'qty'
             "orderType":   order_type,
             "side":        side,
-            "holdMode":    self._ua_pos_mode or "single_hold",
+            "tradeSide":   self._ua_pos_mode or "open",  # V3 UA: open/close
         }
         if order_type == "limit" and price is not None:
             payload["price"] = str(price)
@@ -416,11 +435,13 @@ class FuturesTrader:
             return {"code": "ERROR", "msg": str(e)}
 
     async def _get_order_status(self, order_id: str) -> dict:
-        """Consulta el estado de una orden por su ID."""
+        """Consulta el estado de una orden por su ID (V3 UA)."""
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        if sym_clean.endswith("USDTUSDT"):
+            sym_clean = sym_clean[:-4]
         try:
             return await self._http_get(
-                "/api/v2/mix/order/detail",
+                "/api/v3/order/detail",
                 {"symbol": sym_clean, "productType": "USDT-FUTURES", "orderId": order_id},
             )
         except Exception as e:
@@ -428,11 +449,13 @@ class FuturesTrader:
             return {}
 
     async def _cancel_order(self, order_id: str) -> dict:
-        """Cancela una orden por su ID."""
+        """Cancela una orden por su ID (V3 UA)."""
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        if sym_clean.endswith("USDTUSDT"):
+            sym_clean = sym_clean[:-4]
         try:
             return await self._http_post(
-                "/api/v2/mix/order/cancel-order",
+                "/api/v3/order/cancel-order",
                 {"symbol": sym_clean, "productType": "USDT-FUTURES", "orderId": order_id},
             )
         except Exception as e:
@@ -451,7 +474,7 @@ class FuturesTrader:
         except Exception:
             arrival_price = 0.0
 
-        # ask/bid desde orderbook metrics (get_ask/get_bid no existen en ws_feed)
+        # ask/bid desde orderbook metrics
         ask = bid = None
         try:
             sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
@@ -492,7 +515,6 @@ class FuturesTrader:
     # ── Abrir posiciones ──────────────────────────────────────────────────────
 
     async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
-        # ── Commit 3: kill switch check ────────────────────────────────
         if kill_switch.is_halted(self.symbol):
             logger.warning(f"[{self.symbol}] 🛑 open_long bloqueado por KillSwitch L{kill_switch.level()}")
             return
@@ -502,7 +524,6 @@ class FuturesTrader:
         qty    = await self._calc_qty(usdt_amount, price, lev)
         balance = await self.get_balance() or 0.0
 
-        # ── Commit 2: pre-trade check ──────────────────────────────────
         ok, reason = await pretrade_risk.check(
             symbol=self.symbol, side="buy", notional=usdt_amount,
             price=price, balance=balance, sl=sl,
@@ -536,7 +557,6 @@ class FuturesTrader:
             logger.error(f"[{self.symbol}] open_long FAILED: {r}")
 
     async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
-        # ── Commit 3: kill switch check ────────────────────────────────
         if kill_switch.is_halted(self.symbol):
             logger.warning(f"[{self.symbol}] 🛑 open_short bloqueado por KillSwitch L{kill_switch.level()}")
             return
@@ -546,7 +566,6 @@ class FuturesTrader:
         qty    = await self._calc_qty(usdt_amount, price, lev)
         balance = await self.get_balance() or 0.0
 
-        # ── Commit 2: pre-trade check ──────────────────────────────────
         ok, reason = await pretrade_risk.check(
             symbol=self.symbol, side="sell", notional=usdt_amount,
             price=price, balance=balance, sl=sl,
@@ -587,7 +606,7 @@ class FuturesTrader:
         try:
             positions = await self._get_positions()
             if positions:
-                qty = float(positions[0].get("total") or positions[0].get("contracts") or positions[0].get("size", 0))
+                qty = float(positions[0].get("total") or positions[0].get("size", 0))
         except Exception:
             pass
 
@@ -609,7 +628,6 @@ class FuturesTrader:
                 return
 
         old_pos = self.position
-        # ── Liberar exposición en pretrade_risk ──────────────────────────
         pretrade_risk.register_close(self.symbol, self._open_notional)
         self._open_notional = 0.0
 
@@ -627,7 +645,6 @@ class FuturesTrader:
         self.trade_count += 1
         self.total_pnl   += pnl
 
-        # ── Commit 3: registrar resultado en kill switch ──────────────────
         await kill_switch.on_trade_result(pnl)
 
         logger.warning(f"[{self.symbol}] 🟡 {old_pos.upper()} cerrado | razón={reason} | pnl={pnl:+.2f}%")
@@ -641,7 +658,7 @@ class FuturesTrader:
         try:
             positions = await self._get_positions()
             if positions:
-                total   = float(positions[0].get("total") or positions[0].get("contracts") or positions[0].get("size", 0))
+                total   = float(positions[0].get("total") or positions[0].get("size", 0))
                 min_qty = await self._get_min_qty()
                 qty     = max(min_qty, round((total * ratio) / min_qty) * min_qty)
         except Exception as e:
@@ -653,7 +670,6 @@ class FuturesTrader:
 
         r = await self._place_order(side, qty)
         if r.get("code") == "00000":
-            # Reducir exposición proporcional en pretrade_risk
             freed = self._open_notional * ratio
             pretrade_risk.register_close(self.symbol, freed)
             self._open_notional = max(0.0, self._open_notional - freed)
@@ -675,7 +691,6 @@ class FuturesTrader:
 
         while True:
             try:
-                # ── Commit 3: L4 hard kill → cerrar posición y parar ─────────
                 if kill_switch.is_hard_killed():
                     logger.critical(f"[{self.symbol}] 💥 L4 HARD KILL — cerrando posición si la hay")
                     if self.position:
@@ -698,7 +713,6 @@ class FuturesTrader:
                     self._balance_ok = True
                     logger.info(f"[{self.symbol}] ✅ Balance confirmado: {balance:.2f} USDT")
 
-                # ── Gestión de posición abierta ───────────────────────────────
                 if self.position:
                     if not self._protection_ok:
                         logger.warning(
@@ -742,8 +756,6 @@ class FuturesTrader:
                     await asyncio.sleep(2)
                     continue
 
-                # ── Sin posición: verificar riesgo ────────────────────────────
-                # ── Commit 3: L1/L2/L3 → no abrir posiciones nuevas ──────────
                 if kill_switch.is_halted(self.symbol):
                     logger.debug(f"[{self.symbol}] KS L{kill_switch.level()} — sin nuevas entradas")
                     await asyncio.sleep(5)
