@@ -149,32 +149,79 @@ class FuturesTrader:
                 return await _safe_json(r)
 
     # ------------------------------------------------------------------ balance
+
     async def _extract_usdt_balance(self, data) -> float | None:
+        """
+        Extrae el balance USDT disponible de la respuesta de la API de Bitget.
+
+        Formatos soportados:
+        1. Lista de assets directos: [{coin: USDT, available: X}, ...]
+        2. Lista de cuentas UA con 'list' anidado: [{accountType: ..., list: [{coin: USDT, ...}]}]
+        3. Diccionario directo con campos de balance
+        4. Diccionario con 'list' anidado
+        """
+        balance_keys = (
+            "available", "availableBalance", "crossMaxAvailable",
+            "equity", "usdtEquity", "isolatedMaxAvailable",
+            "crossedMaxAvailable", "walletBalance", "balance", "free",
+        )
+
+        def _extract_from_dict(d: dict) -> float | None:
+            coin = d.get("marginCoin") or d.get("coin") or d.get("asset") or ""
+            if coin.upper() == "USDT":
+                for key in balance_keys:
+                    v = _to_float(d.get(key))
+                    if v is not None and v >= 0:
+                        return v
+            return None
+
+        def _scan_list(lst: list) -> float | None:
+            best = None
+            for item in lst:
+                if not isinstance(item, dict):
+                    continue
+                # Formato directo: {coin: USDT, available: X}
+                v = _extract_from_dict(item)
+                if v is not None:
+                    if best is None or v > best:
+                        best = v
+                    continue
+                # Formato UA anidado: {accountType: ..., list: [{coin: USDT, ...}]}
+                nested = item.get("list") or item.get("assets") or []
+                if isinstance(nested, list):
+                    for sub in nested:
+                        if isinstance(sub, dict):
+                            v2 = _extract_from_dict(sub)
+                            if v2 is not None:
+                                if best is None or v2 > best:
+                                    best = v2
+            return best
+
         if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict):
-                    coin = item.get("marginCoin") or item.get("coin") or item.get("asset") or ""
-                    if coin.upper() == "USDT":
-                        for key in ("available", "availableBalance", "crossMaxAvailable",
-                                    "equity", "usdtEquity", "isolatedMaxAvailable",
-                                    "crossedMaxAvailable", "walletBalance", "balance", "free"):
-                            v = _to_float(item.get(key))
-                            if v is not None and v >= 0:
-                                return v
+            val = _scan_list(data)
+            if val is not None:
+                return val
+
         if isinstance(data, dict):
-            for key in ("available", "availableBalance", "crossMaxAvailable",
-                        "equity", "usdtEquity", "isolatedMaxAvailable",
-                        "crossedMaxAvailable", "walletBalance", "balance", "free"):
+            # Directo
+            for key in balance_keys:
                 v = _to_float(data.get(key))
                 if v is not None and v >= 0:
                     return v
+            # 'list' anidado dentro del dict raíz
+            nested = data.get("list") or data.get("assets") or []
+            if isinstance(nested, list):
+                val = _scan_list(nested)
+                if val is not None:
+                    return val
+
         return None
 
     async def _fetch_balance_once(self) -> float | None:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
         endpoints = [
-            ("/api/v2/account/all-account-balance", {"coin": "USDT"}),
             ("/api/v2/mix/account/accounts",        {"productType": "USDT-FUTURES"}),
+            ("/api/v2/account/all-account-balance", {"coin": "USDT"}),
             ("/api/v2/mix/account/account",         {"symbol": sym_clean, "productType": "USDT-FUTURES", "marginCoin": "USDT"}),
             ("/api/v2/spot/account/assets",         {"coin": "USDT"}),
             ("/api/v2/account/info",                None),
@@ -182,13 +229,25 @@ class FuturesTrader:
         for path, params in endpoints:
             try:
                 r = await self._http_get(path, params)
-                if r.get("code") == "00000":
-                    val = await self._extract_usdt_balance(r.get("data"))
+                code = r.get("code")
+                if code == "00000":
+                    raw_data = r.get("data")
+                    val = await self._extract_usdt_balance(raw_data)
                     if val is not None:
-                        logger.info(f"[{self.symbol}] 💰 Balance USDT disponible: {val:.2f} (vía {path})")
+                        logger.info(f"[{self.symbol}] 💰 Balance USDT: {val:.2f} (vía {path})")
                         return val
+                    else:
+                        logger.info(
+                            f"[{self.symbol}] ⚠️ {path} → code=00000 pero sin USDT extraíble. "
+                            f"data={str(raw_data)[:300]}"
+                        )
+                else:
+                    logger.info(
+                        f"[{self.symbol}] ⚠️ {path} → code={code} msg={r.get('msg')} "
+                        f"data={str(r.get('data', ''))[:200]}"
+                    )
             except Exception as e:
-                logger.debug(f"[{self.symbol}] balance probe {path}: {e}")
+                logger.info(f"[{self.symbol}] ⚠️ {path} excepción: {e}")
         return None
 
     async def get_cached_balance(self) -> float | None:
@@ -238,19 +297,7 @@ class FuturesTrader:
         await self._detect_account_type()
 
     async def _detect_account_type(self):
-        try:
-            r = await self._http_get(
-                "/api/v2/account/all-account-balance",
-                {"coin": "USDT"}
-            )
-            if r.get("code") == "00000":
-                self._api_version = "ua"
-                self._ua_pos_mode = "single_hold"
-                logger.info(f"[{self.symbol}] ✅ Unified Account (UA) via all-account-balance. pos_mode=single_hold")
-                return
-        except Exception as e:
-            logger.debug(f"[{self.symbol}] UA all-account-balance probe error: {e}")
-
+        # Probe 1: UA via mix/accounts (más fiable en Unified Account)
         try:
             r = await self._http_get(
                 "/api/v2/mix/account/accounts",
@@ -265,18 +312,37 @@ class FuturesTrader:
                     )
                     if rp.get("code") == "00000":
                         items = rp.get("data") or []
-                        self._ua_pos_mode = items[0].get("holdMode", "hedge") if items else "hedge"
+                        self._ua_pos_mode = items[0].get("holdMode", "single_hold") if items else "single_hold"
                     else:
-                        self._ua_pos_mode = "hedge"
+                        self._ua_pos_mode = "single_hold"
                 except Exception:
-                    self._ua_pos_mode = "hedge"
+                    self._ua_pos_mode = "single_hold"
                 logger.info(
                     f"[{self.symbol}] ✅ Unified Account (UA) via mix/accounts. pos_mode={self._ua_pos_mode}"
                 )
                 return
+            else:
+                logger.info(f"[{self.symbol}] mix/accounts → code={r.get('code')} msg={r.get('msg')}")
         except Exception as e:
-            logger.debug(f"[{self.symbol}] UA mix/accounts probe error: {e}")
+            logger.info(f"[{self.symbol}] mix/accounts probe error: {e}")
 
+        # Probe 2: UA via all-account-balance
+        try:
+            r = await self._http_get(
+                "/api/v2/account/all-account-balance",
+                {"coin": "USDT"}
+            )
+            if r.get("code") == "00000":
+                self._api_version = "ua"
+                self._ua_pos_mode = "single_hold"
+                logger.info(f"[{self.symbol}] ✅ Unified Account (UA) via all-account-balance. pos_mode=single_hold")
+                return
+            else:
+                logger.info(f"[{self.symbol}] all-account-balance → code={r.get('code')} msg={r.get('msg')}")
+        except Exception as e:
+            logger.info(f"[{self.symbol}] UA all-account-balance probe error: {e}")
+
+        # Probe 3: spot assets
         try:
             r = await self._http_get(
                 "/api/v2/spot/account/assets",
@@ -284,12 +350,15 @@ class FuturesTrader:
             )
             if r.get("code") == "00000":
                 self._api_version = "ua"
-                self._ua_pos_mode = "hedge"
+                self._ua_pos_mode = "single_hold"
                 logger.info(f"[{self.symbol}] ✅ Cuenta detectada via spot/assets.")
                 return
+            else:
+                logger.info(f"[{self.symbol}] spot/assets → code={r.get('code')} msg={r.get('msg')}")
         except Exception as e:
-            logger.debug(f"[{self.symbol}] spot probe error: {e}")
+            logger.info(f"[{self.symbol}] spot probe error: {e}")
 
+        # Probe 4: Classic Account v2
         try:
             sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
             r = await self._http_get(
@@ -303,12 +372,14 @@ class FuturesTrader:
                 self._v2_pos_mode = d.get("holdMode", "hedge")
                 logger.info(f"[{self.symbol}] ✅ Classic Account (v2). pos_mode={self._v2_pos_mode}")
                 return
+            else:
+                logger.info(f"[{self.symbol}] mix/account/account → code={r.get('code')} msg={r.get('msg')}")
         except Exception as e:
-            logger.debug(f"[{self.symbol}] v2 probe error: {e}")
+            logger.info(f"[{self.symbol}] v2 probe error: {e}")
 
-        logger.warning(f"[{self.symbol}] ⚠️ Tipo de cuenta no detectado, asumiendo UA.")
+        logger.warning(f"[{self.symbol}] ⚠️ Tipo de cuenta no detectado, asumiendo UA single_hold.")
         self._api_version = "ua"
-        self._ua_pos_mode = "hedge"
+        self._ua_pos_mode = "single_hold"
 
     async def get_price(self) -> float:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
