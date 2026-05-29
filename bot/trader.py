@@ -250,8 +250,7 @@ class FuturesTrader:
 
     # -- Leverage --------------------------------------------------------------
     # UA v3 puede devolver 40085 en set-leverage; se ignora silenciosamente.
-    # Endpoint oficial v3: POST /api/v2/mix/account/set-leverage
-    # (no existe /api/v3/trade/set-leverage en la doc oficial)
+    # Endpoint estable v2: POST /api/v2/mix/account/set-leverage
 
     async def set_leverage(self, leverage: int, side: str | None = None):
         sym = self._sym()
@@ -274,8 +273,7 @@ class FuturesTrader:
             logger.debug("[%s] set_leverage exception (ignorado): %s", self.symbol, e)
 
     # -- Minimos de qty --------------------------------------------------------
-    # Endpoint oficial v2: GET /api/v2/mix/market/contracts
-    # (no existe /api/v3/mix/market/contracts)
+    # Endpoint estable v2: GET /api/v2/mix/market/contracts
 
     async def _get_min_qty(self) -> float:
         sym = self._sym()
@@ -435,7 +433,7 @@ class FuturesTrader:
     #   marginMode -> "crossed" / "isolated"
     #   takeProfit / stopLoss -> preset TPSL inline (opcional)
     #   tpOrderType / slOrderType -> "market" / "limit"
-    #   tpTriggerBy / slTriggerBy -> "mark" / "market"
+    #   tpTriggerBy / slTriggerBy -> "mark_price" / "market" (valores oficiales API v3)
 
     async def _place_order_raw(
         self,
@@ -467,14 +465,15 @@ class FuturesTrader:
                 payload["price"] = str(price)
 
         # Preset TP/SL inline (solo en ordenes de apertura)
+        # tpTriggerBy / slTriggerBy: valores validos -> "mark_price" | "market"
         if not reduce_only:
             if tp:
                 payload["takeProfit"]  = str(tp)
-                payload["tpTriggerBy"] = "mark"
+                payload["tpTriggerBy"] = "mark_price"
                 payload["tpOrderType"] = "market"
             if sl:
                 payload["stopLoss"]    = str(sl)
-                payload["slTriggerBy"] = "mark"
+                payload["slTriggerBy"] = "mark_price"
                 payload["slOrderType"] = "market"
 
         if self.dry_run:
