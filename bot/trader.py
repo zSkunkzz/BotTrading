@@ -69,6 +69,12 @@ _MIN_QTY_FALLBACK = {
 
 _min_qty_cache = {}
 
+# Cache global del modo de posicion detectado para evitar consultas repetidas
+# Valores: None (no detectado), "one_way", "hedge"
+_pos_mode_cache: str | None = None
+_pos_mode_detected_at: float = 0.0
+_POS_MODE_CACHE_TTL = 300.0  # 5 minutos
+
 
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
@@ -174,6 +180,77 @@ class FuturesTrader:
         """True si el circuit breaker 40085 esta activo ahora mismo."""
         return self._cb_40085_paused_until > time.time()
 
+    # -- Deteccion de modo de posicion (one-way vs hedge) ----------------------
+    #
+    # Error 25236 = "Incorrect position open type"
+    # Causa: el payload enviado no coincide con el modo configurado en la cuenta.
+    #
+    # One-way mode (onewaymode):
+    #   Abrir long:   side=buy           (sin posSide)
+    #   Abrir short:  side=sell          (sin posSide)
+    #   Cerrar long:  side=sell  + reduceOnly="yes"
+    #   Cerrar short: side=buy   + reduceOnly="yes"
+    #
+    # Hedge mode (hedgemode):
+    #   Abrir long:   side=buy  + posSide=long
+    #   Abrir short:  side=sell + posSide=short
+    #   Cerrar long:  side=sell + posSide=long
+    #   Cerrar short: side=buy  + posSide=short
+    #
+    # La deteccion se hace consultando /api/v3/position/current-position
+    # y revisando el campo holdMode del primer registro. Si no hay posiciones,
+    # se intenta via /api/v2/mix/account/account.
+
+    async def _detect_pos_mode(self) -> str:
+        """Retorna 'one_way' o 'hedge'. Cachea el resultado 5 minutos."""
+        global _pos_mode_cache, _pos_mode_detected_at
+        now = time.time()
+        if _pos_mode_cache is not None and (now - _pos_mode_detected_at) < _POS_MODE_CACHE_TTL:
+            return _pos_mode_cache
+
+        sym = self._sym()
+
+        # Intento 1: /api/v3/position/current-position (UTA v3)
+        try:
+            r = await self._http_get(
+                "/api/v3/position/current-position",
+                {"category": "USDT-FUTURES", "symbol": sym},
+            )
+            if r.get("code") == "00000":
+                items = r.get("data", {}).get("list") or r.get("data") or []
+                if isinstance(items, list) and items:
+                    hold_mode = items[0].get("holdMode", "")
+                    mode = "hedge" if "hedge" in hold_mode.lower() else "one_way"
+                    _pos_mode_cache = mode
+                    _pos_mode_detected_at = now
+                    logger.info("[%s] Modo posicion detectado (v3 position): %s", self.symbol, mode)
+                    return mode
+        except Exception as e:
+            logger.debug("[%s] _detect_pos_mode v3 error: %s", self.symbol, e)
+
+        # Intento 2: /api/v2/mix/account/account (campo holdMode)
+        try:
+            r = await self._http_get(
+                "/api/v2/mix/account/account",
+                {"symbol": sym, "productType": "USDT-FUTURES", "marginCoin": "USDT"},
+            )
+            if r.get("code") == "00000":
+                hold_mode = (r.get("data") or {}).get("holdMode", "")
+                if hold_mode:
+                    mode = "hedge" if "hedge" in hold_mode.lower() else "one_way"
+                    _pos_mode_cache = mode
+                    _pos_mode_detected_at = now
+                    logger.info("[%s] Modo posicion detectado (v2 account): %s", self.symbol, mode)
+                    return mode
+        except Exception as e:
+            logger.debug("[%s] _detect_pos_mode v2 error: %s", self.symbol, e)
+
+        # Fallback conservador: asumir one_way (modo por defecto en cuentas nuevas)
+        logger.warning("[%s] No se pudo detectar holdMode -- asumiendo one_way", self.symbol)
+        _pos_mode_cache = "one_way"
+        _pos_mode_detected_at = now
+        return "one_way"
+
     # -- Inicializacion --------------------------------------------------------
 
     async def _init(self, usdt_per_trade: float):
@@ -200,8 +277,10 @@ class FuturesTrader:
             balance_svc.init(self._api_key, self._api_secret, self._passphrase)
 
         self._api_version = "ua"
-        self._ua_pos_mode = "one_way"  # UTA one-way mode (reduceOnly para cierres)
-        logger.info("[%s] Forzado modo Unified Account v3 (one_way)", self.symbol)
+        # Detectar modo de posicion real de la cuenta
+        detected_mode = await self._detect_pos_mode()
+        self._ua_pos_mode = detected_mode
+        logger.info("[%s] Modo cuenta Unified Account v3: %s", self.symbol, detected_mode)
 
     # -- Precio, OHLCV y balance ----------------------------------------------
 
@@ -260,6 +339,9 @@ class FuturesTrader:
             "marginCoin":  "USDT",
             "leverage":    str(leverage),
         }
+        # En hedge-mode hay que especificar holdSide
+        if self._ua_pos_mode == "hedge" and side:
+            payload["holdSide"] = side
         try:
             r = await self._http_post("/api/v2/mix/account/set-leverage", payload)
             code = r.get("code", "")
@@ -341,9 +423,6 @@ class FuturesTrader:
         return None
 
     # -- TPSL server-side (fallback para posiciones ya abiertas) ---------------
-    # En UTA v3 los campos takeProfit/stopLoss se embeben en place-order.
-    # Este metodo se usa como fallback para actualizar TPSL sobre posiciones
-    # ya abiertas usando /api/v2/mix/order/place-tpsl-order.
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
         if not self.position:
@@ -375,7 +454,6 @@ class FuturesTrader:
             return {"code": "00000", "data": {"orderId": "dry-tpsl"}}
 
         try:
-            # Fallback TPSL via v2 (endpoint estable para posiciones abiertas)
             r = await self._http_post("/api/v2/mix/order/place-tpsl-order", payload)
             if r.get("code") == "00000":
                 data = r.get("data") or {}
@@ -417,23 +495,20 @@ class FuturesTrader:
 
     # -- Ordenes Unified Account v3 — /api/v3/trade/place-order ---------------
     #
-    # One-way mode (UTA por defecto):
-    #   Abrir long:   side=buy
-    #   Abrir short:  side=sell
-    #   Cerrar long:  side=sell  + reduceOnly="yes"
-    #   Cerrar short: side=buy   + reduceOnly="yes"
+    # One-way mode (onewaymode) — parametros correctos segun doc oficial:
+    #   Abrir long:   side=buy                        (sin posSide, sin reduceOnly)
+    #   Abrir short:  side=sell                       (sin posSide, sin reduceOnly)
+    #   Cerrar long:  side=sell  + reduceOnly="yes"   (sin posSide)
+    #   Cerrar short: side=buy   + reduceOnly="yes"   (sin posSide)
     #
-    # Parametros del schema oficial v3 (doc oficial):
-    #   category   -> "USDT-FUTURES"
-    #   symbol     -> e.g. "BTCUSDT"
-    #   qty        -> cantidad en base coin (string)
-    #   side       -> "buy" / "sell"
-    #   orderType  -> "market" / "limit"
-    #   reduceOnly -> "yes" / "no" (para cierres en one-way mode)
-    #   marginMode -> "crossed" / "isolated"
-    #   takeProfit / stopLoss -> preset TPSL inline (opcional)
-    #   tpOrderType / slOrderType -> "market" / "limit"
-    #   tpTriggerBy / slTriggerBy -> "mark_price" / "market" (valores oficiales API v3)
+    # Hedge mode (hedgemode) — parametros correctos segun doc oficial:
+    #   Abrir long:   side=buy  + posSide="long"      (sin reduceOnly)
+    #   Abrir short:  side=sell + posSide="short"     (sin reduceOnly)
+    #   Cerrar long:  side=sell + posSide="long"      (sin reduceOnly)
+    #   Cerrar short: side=buy  + posSide="short"     (sin reduceOnly)
+    #
+    # IMPORTANTE: mezclar parametros de ambos modos causa error 25236
+    # (ej: enviar posSide en one-way, o reduceOnly en hedge-mode)
 
     async def _place_order_raw(
         self,
@@ -445,19 +520,41 @@ class FuturesTrader:
         sl: float | None = None,
         tp: float | None = None,
         trade_side: str = "open",
+        pos_side: str | None = None,  # "long" | "short" | None (se calcula automaticamente)
     ) -> dict:
         sym = self._sym()
+
+        # Detectar modo si no se hizo aun (puede pasar en tests o llamadas directas)
+        if self._ua_pos_mode is None:
+            self._ua_pos_mode = await self._detect_pos_mode()
+
+        is_hedge = self._ua_pos_mode == "hedge"
+
         payload: dict = {
-            "category":  "USDT-FUTURES",
-            "symbol":    sym,
-            "qty":       str(qty),
-            "side":      side,
-            "orderType": order_type,
+            "category":   "USDT-FUTURES",
+            "symbol":     sym,
+            "qty":        str(qty),
+            "side":       side,
+            "orderType":  order_type,
             "marginMode": "crossed",
         }
 
-        if reduce_only:
-            payload["reduceOnly"] = "yes"
+        if is_hedge:
+            # Hedge mode: posSide obligatorio, NO usar reduceOnly
+            # Si pos_side no se pasa explicitamente, inferirlo de side y trade_side
+            if pos_side:
+                payload["posSide"] = pos_side
+            else:
+                # apertura: side=buy -> long, side=sell -> short
+                # cierre:   side=sell -> long (cierra long), side=buy -> short (cierra short)
+                if trade_side == "open":
+                    payload["posSide"] = "long" if side == "buy" else "short"
+                else:  # close
+                    payload["posSide"] = "long" if side == "sell" else "short"
+        else:
+            # One-way mode: reduceOnly para cierres, NO usar posSide
+            if reduce_only:
+                payload["reduceOnly"] = "yes"
 
         if order_type == "limit":
             payload["timeInForce"] = "gtc"
@@ -466,7 +563,7 @@ class FuturesTrader:
 
         # Preset TP/SL inline (solo en ordenes de apertura)
         # tpTriggerBy / slTriggerBy: valores validos -> "mark_price" | "market"
-        if not reduce_only:
+        if not reduce_only and trade_side == "open":
             if tp:
                 payload["takeProfit"]  = str(tp)
                 payload["tpTriggerBy"] = "mark_price"
@@ -478,8 +575,9 @@ class FuturesTrader:
 
         if self.dry_run:
             logger.info(
-                "[%s] DRY RUN RAW: %s reduceOnly=%s %s qty=%s price=%s tp=%s sl=%s",
-                self.symbol, side, reduce_only, order_type, qty, price, tp, sl
+                "[%s] DRY RUN RAW: %s mode=%s reduceOnly=%s posSide=%s %s qty=%s price=%s tp=%s sl=%s",
+                self.symbol, side, self._ua_pos_mode, reduce_only,
+                payload.get("posSide"), order_type, qty, price, tp, sl
             )
             return {"code": "00000", "data": {"orderId": "dry"}}
 
@@ -505,8 +603,6 @@ class FuturesTrader:
                     "orderId":  order_id,
                 },
             )
-            # Normalizar: exponer orderStatus como 'state' para compatibilidad
-            # con execution_engine que lee data.state
             if r.get("code") == "00000":
                 data = r.get("data") or {}
                 if isinstance(data, dict) and "orderStatus" in data:
@@ -545,8 +641,6 @@ class FuturesTrader:
     ) -> dict:
         """
         Modifica una orden pendiente via /api/v3/trade/modify-order (UTA v3).
-        Requiere orderId. Al menos qty o price deben indicarse.
-        auto_cancel=True cancela la orden original si la modificacion falla.
         """
         sym = self._sym()
         payload: dict = {
@@ -625,6 +719,19 @@ class FuturesTrader:
         rejected  = r.get("code") != "00000"
         err_code  = r.get("code", "")
 
+        # Si error 25236, invalidar cache de pos_mode para re-detectar en proxima orden
+        if err_code == "25236":
+            global _pos_mode_cache, _pos_mode_detected_at
+            logger.error(
+                "[%s] Error 25236 (Incorrect position open type) -- "
+                "invalidando cache pos_mode y re-detectando en proxima orden. "
+                "Verifica si la cuenta tiene hedge-mode o one-way mode en Bitget.",
+                self.symbol
+            )
+            _pos_mode_cache = None
+            _pos_mode_detected_at = 0.0
+            self._ua_pos_mode = None
+
         if err_code == "40085":
             self._cb_40085_count += 1
             logger.error(
@@ -692,7 +799,6 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="long")
-        # side=buy, reduce_only=False -> abre long. TP/SL inline en la orden.
         r = await self._place_order("buy", qty, reduce_only=False, sl=sl, tp=tp3)
         if r.get("code") == "00000":
             self.position    = "long"
@@ -710,7 +816,6 @@ class FuturesTrader:
             logger.warning("[%s] LONG @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
             if not self._protection_ok:
-                # fallback: intentar TPSL via endpoint separado
                 await self._place_pos_tpsl(sl=sl, tp=tp3)
             ok2 = await self.reconcile_position()
             if not ok2:
@@ -737,7 +842,6 @@ class FuturesTrader:
             return
 
         await self.set_leverage(lev, side="short")
-        # side=sell, reduce_only=False -> abre short. TP/SL inline en la orden.
         r = await self._place_order("sell", qty, reduce_only=False, sl=sl, tp=tp3)
         if r.get("code") == "00000":
             self.position    = "short"
@@ -765,7 +869,6 @@ class FuturesTrader:
     async def close_position(self, reason: str = ""):
         if not self.position:
             return
-        # One-way mode: cierre con reduceOnly="yes"
         side = "sell" if self.position == "long" else "buy"
         qty  = None
         try:
@@ -818,7 +921,6 @@ class FuturesTrader:
     async def partial_close(self, ratio: float = 0.5):
         if not self.position:
             return
-        # One-way mode: cierre parcial con reduceOnly="yes"
         side = "sell" if self.position == "long" else "buy"
         qty  = None
         try:
@@ -927,7 +1029,6 @@ class FuturesTrader:
                     await asyncio.sleep(5)
                     continue
 
-                # -- Circuit breaker 40085 --
                 if self.is_cb_paused():
                     remaining = int(self._cb_40085_paused_until - time.time())
                     logger.debug(
