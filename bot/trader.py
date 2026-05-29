@@ -78,6 +78,10 @@ class FuturesTrader:
         self._ua_pos_mode = None
         self._v2_pos_mode = None
         self._balance_ok  = False
+        # ── Commit 1: protective orders server-side ──────────────────────────
+        self.sl_order_id    = None
+        self.tp_order_id    = None
+        self._protection_ok = False   # True solo cuando posición + TPSL reconciliados
 
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
@@ -155,20 +159,19 @@ class FuturesTrader:
             self.tp2         = saved.get("tp2")
             self.tp3         = saved.get("tp3")
             self.tp2_hit     = saved.get("tp2_hit", False)
+            # Posición restaurada: asumimos protección existe en exchange
+            self._protection_ok = True
             logger.info(f"[{self.symbol}] 🔄 Posición restaurada: {self.position} @ {self.entry_price}")
 
-        # FIX #4: balance_svc ya inicializado en main.py — no re-inicializar aquí.
-        # Solo loguear si aún no está listo.
         if not balance_svc.is_ready():
             logger.warning(f"[{self.symbol}] ⚠️ balance_svc no listo — init desde trader")
             balance_svc.init(self._api_key, self._api_secret, self._passphrase)
 
-        # Forzar modo Unified Account (UA) porque la API key es correcta para UA
         self._api_version = "ua"
-        self._ua_pos_mode = "single_hold"   # modo one-way
+        self._ua_pos_mode = "single_hold"
         logger.info(f"[{self.symbol}] ✅ Forzado modo Unified Account (single_hold)")
 
-    # ── Precio, OHLCV y balance ──────────────────────────────────────────────
+    # ── Precio, OHLCV y balance ───────────────────────────────────────────────
 
     async def get_price(self) -> float:
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
@@ -213,7 +216,7 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage (UA) ────────────────────────────────────────────────────────
+    # ── Leverage (UA) ─────────────────────────────────────────────────────────
 
     async def set_leverage(self, leverage: int, side: str | None = None):
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
@@ -281,7 +284,6 @@ class FuturesTrader:
         except Exception as e:
             logger.debug(f"[{self.symbol}] positions error: {e}")
 
-        # Fallback: all-position
         try:
             r = await self._http_get(
                 "/api/v2/mix/position/all-position",
@@ -302,20 +304,99 @@ class FuturesTrader:
         logger.warning(f"[{self.symbol}] ⚠️ _get_positions falló")
         return None
 
-    # ── Colocar / cerrar órdenes (UA) ────────────────────────────────────────
+    # ── Protective orders server-side (COMMIT 1) ──────────────────────────────
+
+    async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
+        """Coloca TP y/o SL como órdenes de protección posicional en Bitget."""
+        if not self.position:
+            return {"code": "NO_POSITION", "msg": "No hay posición abierta"}
+        if not sl and not tp:
+            return {"code": "NO_TPSL", "msg": "Sin niveles de protección"}
+
+        sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
+        hold_side = "long" if self.position == "long" else "short"
+        payload = {
+            "symbol":      sym_clean,
+            "productType": "USDT-FUTURES",
+            "marginCoin":  "USDT",
+            "holdSide":    hold_side,
+        }
+        if tp:
+            payload["stopSurplusTriggerPrice"] = str(tp)
+            payload["stopSurplusTriggerType"]  = "mark_price"
+            payload["stopSurplusExecutePrice"] = "0"   # 0 = market
+        if sl:
+            payload["stopLossTriggerPrice"]    = str(sl)
+            payload["stopLossTriggerType"]     = "mark_price"
+            payload["stopLossExecutePrice"]    = "0"   # 0 = market
+
+        if self.dry_run:
+            logger.info(f"[{self.symbol}] 🟡 DRY RUN TPSL: sl={sl} tp={tp}")
+            self.sl_order_id = "dry-sl"
+            self.tp_order_id = "dry-tp"
+            return {"code": "00000", "data": {"orderId": "dry-tpsl"}}
+
+        try:
+            r = await self._http_post("/api/v2/mix/order/place-pos-tpsl", payload)
+            if r.get("code") == "00000":
+                # data puede ser dict o lista según la versión de API
+                data = r.get("data") or {}
+                item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+                self.sl_order_id = item.get("stopLossClientOid") or item.get("orderId")
+                self.tp_order_id = item.get("stopSurplusClientOid") or item.get("orderId")
+                logger.info(f"[{self.symbol}] 🛡️ TPSL server-side OK — SL_id={self.sl_order_id} TP_id={self.tp_order_id}")
+            else:
+                logger.error(f"[{self.symbol}] ❌ TPSL server-side FAILED: {r}")
+            return r
+        except Exception as e:
+            logger.error(f"[{self.symbol}] _place_pos_tpsl exception: {e}")
+            return {"code": "ERROR", "msg": str(e)}
+
+    async def reconcile_position(self) -> bool:
+        """
+        Verifica que la posición existe en el exchange y que las protecciones
+        TPSL quedaron registradas. Actualiza self._protection_ok.
+        """
+        try:
+            positions = await self._get_positions()
+            has_pos = bool(positions)
+
+            # Consideramos protección OK si tenemos IDs confirmados, o si no se
+            # pasaron niveles de SL/TP (señal sin protección explícita).
+            sl_covered = bool(self.sl_order_id) or (self.sl is None)
+            tp_covered = bool(self.tp_order_id) or (self.tp3 is None)
+            self._protection_ok = has_pos and sl_covered and tp_covered
+
+            if not has_pos:
+                logger.error(f"[{self.symbol}] ❌ Reconcile: posición no encontrada en exchange")
+            elif not (sl_covered and tp_covered):
+                logger.error(
+                    f"[{self.symbol}] ❌ Reconcile: faltan órdenes TPSL "
+                    f"(sl_ok={sl_covered} tp_ok={tp_covered})"
+                )
+            else:
+                logger.info(f"[{self.symbol}] ✅ Reconcile OK: posición + protecciones confirmadas")
+
+            return self._protection_ok
+        except Exception as e:
+            self._protection_ok = False
+            logger.error(f"[{self.symbol}] reconcile_position error: {e}")
+            return False
+
+    # ── Colocar / cerrar órdenes (UA) ─────────────────────────────────────────
 
     async def _place_order(self, side: str, qty: float):
         sym_clean = self.symbol.replace("/", "").replace(":USDT", "")
         endpoint = "/api/v2/mix/order/place-order"
         payload = {
-            "symbol": sym_clean,
+            "symbol":      sym_clean,
             "productType": "USDT-FUTURES",
-            "marginMode": self.margin_mode,
-            "marginCoin": "USDT",
-            "qty": str(qty),
-            "orderType": "market",
-            "side": side,
-            "holdMode": self._ua_pos_mode or "single_hold",
+            "marginMode":  self.margin_mode,
+            "marginCoin":  "USDT",
+            "qty":         str(qty),
+            "orderType":   "market",
+            "side":        side,
+            "holdMode":    self._ua_pos_mode or "single_hold",
         }
 
         if self.dry_run:
@@ -351,16 +432,24 @@ class FuturesTrader:
         await self.set_leverage(lev, side="long")
         r = await self._place_order("buy", qty)
         if r.get("code") == "00000":
-            self.position = "long"
+            self.position    = "long"
             self.entry_price = price
-            self.sl = sl
-            self.tp1 = tp1
-            self.tp2 = tp2
-            self.tp3 = tp3
+            self.sl   = sl
+            self.tp1  = tp1
+            self.tp2  = tp2
+            self.tp3  = tp3
             self.tp2_hit = False
+            self.sl_order_id = None
+            self.tp_order_id = None
+            self._protection_ok = False
             save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
             logger.warning(f"🟢 [{self.symbol}] LONG @ {price:.4f} lev={lev}x")
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
+            # Colocar TPSL server-side y reconciliar
+            await self._place_pos_tpsl(sl=sl, tp=tp3)
+            ok = await self.reconcile_position()
+            if not ok:
+                logger.error(f"[{self.symbol}] ⚠️ Posición abierta pero sin protección confirmada")
         else:
             logger.error(f"[{self.symbol}] open_long FAILED: {r}")
 
@@ -371,16 +460,24 @@ class FuturesTrader:
         await self.set_leverage(lev, side="short")
         r = await self._place_order("sell", qty)
         if r.get("code") == "00000":
-            self.position = "short"
+            self.position    = "short"
             self.entry_price = price
-            self.sl = sl
-            self.tp1 = tp1
-            self.tp2 = tp2
-            self.tp3 = tp3
+            self.sl   = sl
+            self.tp1  = tp1
+            self.tp2  = tp2
+            self.tp3  = tp3
             self.tp2_hit = False
+            self.sl_order_id = None
+            self.tp_order_id = None
+            self._protection_ok = False
             save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3)
             logger.warning(f"🔴 [{self.symbol}] SHORT @ {price:.4f} lev={lev}x")
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
+            # Colocar TPSL server-side y reconciliar
+            await self._place_pos_tpsl(sl=sl, tp=tp3)
+            ok = await self.reconcile_position()
+            if not ok:
+                logger.error(f"[{self.symbol}] ⚠️ Posición abierta pero sin protección confirmada")
         else:
             logger.error(f"[{self.symbol}] open_short FAILED: {r}")
 
@@ -414,16 +511,19 @@ class FuturesTrader:
                 return
 
         old_pos = self.position
-        self.position = None
+        self.position    = None
         self.entry_price = None
         self.sl = self.tp1 = self.tp2 = self.tp3 = None
-        self.tp2_hit = False
+        self.tp2_hit     = False
+        self.sl_order_id = None
+        self.tp_order_id = None
+        self._protection_ok = False
         clear_position(self.symbol)
 
         if pnl >= 0:
             self.win_count += 1
         self.trade_count += 1
-        self.total_pnl += pnl
+        self.total_pnl   += pnl
 
         logger.warning(f"[{self.symbol}] 🟡 {old_pos.upper()} cerrado | razón={reason} | pnl={pnl:+.2f}%")
         await notify_close(self.symbol, old_pos, exit_price, pnl, reason=reason, dry_run=self.dry_run)
@@ -436,9 +536,9 @@ class FuturesTrader:
         try:
             positions = await self._get_positions()
             if positions:
-                total = float(positions[0].get("total") or positions[0].get("contracts") or positions[0].get("size", 0))
+                total   = float(positions[0].get("total") or positions[0].get("contracts") or positions[0].get("size", 0))
                 min_qty = await self._get_min_qty()
-                qty = max(min_qty, round((total * ratio) / min_qty) * min_qty)
+                qty     = max(min_qty, round((total * ratio) / min_qty) * min_qty)
         except Exception as e:
             logger.warning(f"[{self.symbol}] partial_close: {e}")
             return
@@ -450,7 +550,7 @@ class FuturesTrader:
         if r.get("code") == "00000":
             mark_tp2_hit(self.symbol)
             self.tp2_hit = True
-            exit_price = await self.get_price()
+            exit_price   = await self.get_price()
             await notify_tp_partial(self.symbol, self.position, exit_price, ratio=ratio, dry_run=self.dry_run)
             logger.info(f"[{self.symbol}] ✂️ Cierre parcial {int(ratio*100)}%")
         else:
@@ -484,20 +584,29 @@ class FuturesTrader:
 
                 # ── Gestión de posición abierta ───────────────────────────────
                 if self.position:
+                    # Guard: posición sin protección — logear y no operar más
+                    if not self._protection_ok:
+                        logger.warning(
+                            f"[{self.symbol}] ⚠️ Posición abierta sin protección confirmada "
+                            f"— intentando reconciliar..."
+                        )
+                        await self.reconcile_position()
+                        await asyncio.sleep(5)
+                        continue
+
                     # Cierre parcial en TP2
                     if not self.tp2_hit and self.tp2:
                         if (self.position == "long" and price >= self.tp2) or \
                            (self.position == "short" and price <= self.tp2):
                             await self.partial_close(ratio=TP2_PARTIAL_RATIO)
 
-                    # FIX #3: usar check_exit() de RiskManager para SL/TP3 + trailing SL
+                    # Trailing SL + niveles fijos de SL/TP3
                     should_exit, exit_reason = risk.check_exit(price)
 
-                    # También respetar los niveles fijos de SL/TP3 definidos en la señal
                     if not should_exit and self.sl and self.tp3:
-                        hit_sl = (self.position == "long" and price <= self.sl) or \
-                                 (self.position == "short" and price >= self.sl)
-                        hit_tp3 = (self.position == "long" and price >= self.tp3) or \
+                        hit_sl  = (self.position == "long"  and price <= self.sl)  or \
+                                  (self.position == "short" and price >= self.sl)
+                        hit_tp3 = (self.position == "long"  and price >= self.tp3) or \
                                   (self.position == "short" and price <= self.tp3)
                         if hit_sl:
                             should_exit = True
@@ -513,7 +622,6 @@ class FuturesTrader:
                                 pnl_pct = (price - self.entry_price) / self.entry_price * 100
                             else:
                                 pnl_pct = (self.entry_price - price) / self.entry_price * 100
-                        # FIX #1: siempre notificar al GlobalRisk al cerrar
                         if global_risk:
                             await global_risk.register_close(pnl_pct=pnl_pct)
                         await self.close_position(reason=exit_reason)
@@ -552,23 +660,21 @@ class FuturesTrader:
                 action = decision.get("action")
                 if action in ("LONG", "SHORT", "BUY", "SELL"):
                     usdt_amount = min(usdt_per_trade, balance * 0.95)
-                    lev = decision.get("leverage", self.leverage)
-                    sl = decision.get("sl")
-                    tp1 = decision.get("tp1")
-                    tp2 = decision.get("tp2")
-                    tp3 = decision.get("tp3")
+                    lev  = decision.get("leverage", self.leverage)
+                    sl   = decision.get("sl")
+                    tp1  = decision.get("tp1")
+                    tp2  = decision.get("tp2")
+                    tp3  = decision.get("tp3")
 
-                    # FIX #2: abrir la orden ANTES de registrar en GlobalRisk
-                    # para que si falla, el contador no suba.
                     if action in ("LONG", "BUY"):
                         await self.open_long(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
-                        if self.position:  # solo si la orden se ejecutó OK
+                        if self.position:
                             if global_risk:
                                 await global_risk.register_open()
                             risk.on_trade_open(self.entry_price, "long")
                     else:
                         await self.open_short(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
-                        if self.position:  # solo si la orden se ejecutó OK
+                        if self.position:
                             if global_risk:
                                 await global_risk.register_open()
                             risk.on_trade_open(self.entry_price, "short")
