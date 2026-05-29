@@ -33,6 +33,10 @@ _CB_40085_THRESHOLD = int(os.getenv("CB_40085_THRESHOLD", "3"))
 # Tiempo de pausa en segundos tras superar el umbral
 _CB_40085_PAUSE_S   = int(os.getenv("CB_40085_PAUSE_S", "300"))  # 5 min
 
+# Permite sobreescribir la deteccion automatica de pos mode.
+# Valores validos: "hedge" | "one_way" | "" (auto-detect)
+_FORCE_POS_MODE = os.getenv("FORCE_POS_MODE", "").strip().lower()
+
 _MIN_QTY_FALLBACK = {
     "BTCUSDT":   0.001,
     "ETHUSDT":   0.01,
@@ -183,14 +187,55 @@ class FuturesTrader:
     # -- Deteccion de modo de posicion (one-way vs hedge) ----------------------
 
     async def _detect_pos_mode(self) -> str:
-        """Retorna 'one_way' o 'hedge'. Cachea el resultado 5 minutos."""
+        """
+        Retorna 'one_way' o 'hedge'. Cachea el resultado 5 minutos.
+
+        Orden de intentos:
+          1. Variable de entorno FORCE_POS_MODE (sobreescritura manual)
+          2. /api/v3/account/account-info  → campo posMode  (UA v3, siempre disponible)
+          3. /api/v2/mix/account/account   → campo holdMode (Classic, fallback)
+          4. /api/v3/position/current-position → holdMode (solo si hay posicion abierta)
+          5. Fallback hardcoded: hedge (configuracion conocida de esta cuenta)
+        """
         global _pos_mode_cache, _pos_mode_detected_at
         now = time.time()
+
+        # 1. Sobreescritura manual via env var
+        if _FORCE_POS_MODE in ("hedge", "one_way"):
+            if _pos_mode_cache != _FORCE_POS_MODE:
+                logger.info(
+                    "[%s] Modo posicion forzado por FORCE_POS_MODE: %s",
+                    self.symbol, _FORCE_POS_MODE,
+                )
+                _pos_mode_cache = _FORCE_POS_MODE
+                _pos_mode_detected_at = now
+            return _FORCE_POS_MODE
+
+        # Cache valido
         if _pos_mode_cache is not None and (now - _pos_mode_detected_at) < _POS_MODE_CACHE_TTL:
             return _pos_mode_cache
 
         sym = self._sym()
 
+        # 2. UA v3: /api/v3/account/account-info
+        # Devuelve posMode ("hedge" | "one_way") sin importar si hay posiciones.
+        try:
+            r = await self._http_get("/api/v3/account/account-info")
+            if r.get("code") == "00000":
+                pos_mode_raw = (r.get("data") or {}).get("posMode", "")
+                if pos_mode_raw:
+                    mode = "hedge" if "hedge" in pos_mode_raw.lower() else "one_way"
+                    _pos_mode_cache = mode
+                    _pos_mode_detected_at = now
+                    logger.info(
+                        "[%s] Modo posicion detectado (v3 account-info posMode='%s'): %s",
+                        self.symbol, pos_mode_raw, mode,
+                    )
+                    return mode
+        except Exception as e:
+            logger.debug("[%s] _detect_pos_mode v3 account-info error: %s", self.symbol, e)
+
+        # 3. Classic fallback: /api/v2/mix/account/account
         try:
             r = await self._http_get(
                 "/api/v2/mix/account/account",
@@ -202,11 +247,16 @@ class FuturesTrader:
                     mode = "hedge" if "hedge" in hold_mode.lower() else "one_way"
                     _pos_mode_cache = mode
                     _pos_mode_detected_at = now
-                    logger.info("[%s] Modo posicion detectado (v2 account holdMode): %s", self.symbol, mode)
+                    logger.info(
+                        "[%s] Modo posicion detectado (v2 account holdMode): %s",
+                        self.symbol, mode,
+                    )
                     return mode
         except Exception as e:
             logger.debug("[%s] _detect_pos_mode v2 account error: %s", self.symbol, e)
 
+        # 4. Posicion activa: /api/v3/position/current-position
+        # Solo util si hay una posicion abierta en este momento.
         try:
             r = await self._http_get(
                 "/api/v3/position/current-position",
@@ -216,18 +266,28 @@ class FuturesTrader:
                 items = r.get("data", {}).get("list") or r.get("data") or []
                 if isinstance(items, list) and items:
                     hold_mode = items[0].get("holdMode", "")
-                    mode = "hedge" if "hedge" in hold_mode.lower() else "one_way"
-                    _pos_mode_cache = mode
-                    _pos_mode_detected_at = now
-                    logger.info("[%s] Modo posicion detectado (v3 position): %s", self.symbol, mode)
-                    return mode
+                    if hold_mode:
+                        mode = "hedge" if "hedge" in hold_mode.lower() else "one_way"
+                        _pos_mode_cache = mode
+                        _pos_mode_detected_at = now
+                        logger.info(
+                            "[%s] Modo posicion detectado (v3 position holdMode): %s",
+                            self.symbol, mode,
+                        )
+                        return mode
         except Exception as e:
             logger.debug("[%s] _detect_pos_mode v3 position error: %s", self.symbol, e)
 
-        logger.warning("[%s] No se pudo detectar holdMode -- asumiendo one_way", self.symbol)
-        _pos_mode_cache = "one_way"
-        _pos_mode_detected_at = now
-        return "one_way"
+        # 5. Fallback hardcoded: hedge (configuracion conocida de esta cuenta).
+        # Se cachea con TTL reducido (60s) para reintentar la deteccion pronto.
+        logger.warning(
+            "[%s] No se pudo detectar holdMode via API -- usando hedge como fallback "
+            "(configuracion conocida). Puedes sobreescribir con FORCE_POS_MODE=hedge|one_way",
+            self.symbol,
+        )
+        _pos_mode_cache = "hedge"
+        _pos_mode_detected_at = now - (_POS_MODE_CACHE_TTL - 60)  # reintenta en 60s
+        return "hedge"
 
     # -- Set margin mode -------------------------------------------------------
 
