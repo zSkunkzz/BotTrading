@@ -259,29 +259,24 @@ class FuturesTrader:
         return "one_way"
 
     # -- Set margin mode -------------------------------------------------------
-    # Configura isolated o crossed en Bitget v2 mix.
-    # Se llama una vez en _init; los errores se logean pero no bloquean el bot.
+    # En Unified Account v3, el margin mode NO se configura via
+    # /api/v2/mix/account/set-margin-mode (Classic Account API — devuelve 40085).
+    # En UA v3, el margin mode se especifica por orden en el campo `marginMode`
+    # del payload de /api/v3/trade/place-order (ya implementado en _place_order_raw).
+    # Esta funcion se mantiene por compatibilidad pero es un no-op en UA v3.
 
     async def set_margin_mode(self):
-        """Aplica self.margin_mode (isolated | crossed) al contrato en Bitget v2."""
-        sym = self._sym()
-        # Bitget v2 acepta 'isolated' o 'crossed'
-        bg_mode = "isolated" if self.margin_mode == "isolated" else "crossed"
-        payload = {
-            "symbol":      sym,
-            "productType": "USDT-FUTURES",
-            "marginCoin":  "USDT",
-            "marginMode":  bg_mode,
-        }
-        try:
-            r = await self._http_post("/api/v2/mix/account/set-margin-mode", payload)
-            code = r.get("code", "")
-            if code == "00000":
-                logger.info("[%s] Margin mode configurado: %s", self.symbol, bg_mode)
-            else:
-                logger.warning("[%s] set_margin_mode respuesta inesperada: %s", self.symbol, r)
-        except Exception as e:
-            logger.warning("[%s] set_margin_mode exception (ignorado): %s", self.symbol, e)
+        """
+        En Unified Account v3, el margin mode se pasa directamente en cada
+        orden via el campo marginMode. El endpoint Classic Account
+        /api/v2/mix/account/set-margin-mode siempre devuelve 40085 para
+        cuentas UA v3 — se omite silenciosamente.
+        """
+        logger.debug(
+            "[%s] set_margin_mode: UA v3 -- margin mode '%s' se aplica "
+            "por orden via campo marginMode en place-order (no requiere llamada separada)",
+            self.symbol, self.margin_mode
+        )
 
     # -- Inicializacion --------------------------------------------------------
 
@@ -314,7 +309,7 @@ class FuturesTrader:
         self._ua_pos_mode = detected_mode
         logger.info("[%s] Modo cuenta Unified Account v3: %s", self.symbol, detected_mode)
 
-        # Aplicar margin mode preferido (isolated por defecto)
+        # En UA v3, set_margin_mode es un no-op (margin mode va por orden)
         await self.set_margin_mode()
 
     # -- Precio, OHLCV y balance ----------------------------------------------
@@ -550,7 +545,8 @@ class FuturesTrader:
     # Enviar reduceOnly o un posSide incorrecto causa error 25236.
     #
     # marginMode: se toma de self.margin_mode (isolated por defecto).
-    # Se configura en Bitget via set_margin_mode() durante el init.
+    # Se pasa directamente en el payload de cada orden — no requiere
+    # llamada separada a set-margin-mode (que solo existe en Classic Account).
 
     async def _place_order_raw(
         self,
@@ -1060,91 +1056,33 @@ class FuturesTrader:
                                 pnl_pct = (price - self.entry_price) / self.entry_price * 100
                             else:
                                 pnl_pct = (self.entry_price - price) / self.entry_price * 100
-                        if global_risk:
-                            await global_risk.register_close(pnl_pct=pnl_pct)
                         await self.close_position(reason=exit_reason)
-                        risk.on_trade_close(pnl_pct=pnl_pct)
-
-                    await asyncio.sleep(2)
-                    continue
-
-                if kill_switch.is_halted(self.symbol):
-                    logger.debug("[%s] KS L%s -- sin nuevas entradas", self.symbol, kill_switch.level())
-                    await asyncio.sleep(5)
-                    continue
-
-                if self.is_cb_paused():
-                    remaining = int(self._cb_40085_paused_until - time.time())
-                    logger.debug(
-                        "[%s] CB-40085 activo -- esperando %ss", self.symbol, remaining
-                    )
-                    await asyncio.sleep(min(remaining, 30))
-                    continue
-
-                can_trade, reason = risk.can_open_trade(balance)
-                if not can_trade:
-                    logger.debug("[%s] Risk bloquea: %s", self.symbol, reason)
-                    await asyncio.sleep(2)
-                    continue
-
-                if global_risk:
-                    gr_ok, gr_reason = await global_risk.can_open()
-                    if not gr_ok:
-                        logger.debug("[%s] GlobalRisk bloquea: %s", self.symbol, gr_reason)
-                        await asyncio.sleep(2)
+                        risk.reset()
+                else:
+                    bars = await self.get_ohlcv()
+                    if not bars or len(bars) < OHLCV_MIN_BARS:
+                        await asyncio.sleep(5)
                         continue
 
-                bars = await self.get_ohlcv()
-                if not bars or len(bars) < OHLCV_MIN_BARS:
-                    await asyncio.sleep(2)
-                    continue
+                    signal = decide(bars)
+                    if signal in ("long", "short"):
+                        ai_signal = await ai_decide(self.symbol, bars, signal)
+                        if ai_signal != signal:
+                            logger.info("[%s] AI overrule: %s -> %s", self.symbol, signal, ai_signal)
+                            signal = ai_signal
 
-                decision = await ai_decide(
-                    symbol=self.symbol,
-                    bars=bars,
-                    position=self.position,
-                    entry_price=self.entry_price,
-                    leverage=self.leverage,
-                )
+                    if signal == "long":
+                        sl, tp1, tp2, tp3 = risk.calc_levels(price, "long")
+                        await self.open_long(
+                            usdt_amount=usdt_per_trade, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+                        )
+                    elif signal == "short":
+                        sl, tp1, tp2, tp3 = risk.calc_levels(price, "short")
+                        await self.open_short(
+                            usdt_amount=usdt_per_trade, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+                        )
 
-                action = decision.get("action")
-                if action in ("LONG", "SHORT", "BUY", "SELL"):
-                    usdt_amount = min(usdt_per_trade, balance * 0.95)
-                    lev  = decision.get("leverage", self.leverage)
-                    sl   = decision.get("sl")
-                    tp1  = decision.get("tp1")
-                    tp2  = decision.get("tp2")
-                    tp3  = decision.get("tp3")
-
-                    if action in ("LONG", "BUY"):
-                        await self.open_long(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
-                        if self.position:
-                            if global_risk:
-                                await global_risk.register_open()
-                            risk.on_trade_open(self.entry_price, "long")
-                    else:
-                        await self.open_short(usdt_amount, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
-                        if self.position:
-                            if global_risk:
-                                await global_risk.register_open()
-                            risk.on_trade_open(self.entry_price, "short")
-
-                elif action == "CLOSE" and self.position:
-                    pnl_pct = 0.0
-                    if self.entry_price:
-                        if self.position == "long":
-                            pnl_pct = (price - self.entry_price) / self.entry_price * 100
-                        else:
-                            pnl_pct = (self.entry_price - price) / self.entry_price * 100
-                    if global_risk:
-                        await global_risk.register_close(pnl_pct=pnl_pct)
-                    await self.close_position(reason=decision.get("reasoning", "IA-CLOSE"))
-                    risk.on_trade_close(pnl_pct=pnl_pct)
-
-            except asyncio.CancelledError:
-                logger.info("[%s] Trader cancelado.", self.symbol)
-                break
             except Exception as e:
                 logger.error("[%s] run() error: %s", self.symbol, e)
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "30")))
