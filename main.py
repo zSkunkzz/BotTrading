@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BitgetProBot v5.3 — IA + Scanner + Telegram + RateLimiter + Webhook"""
+"""BitgetProBot v5.3 — IA + Scanner + Telegram + Webhook + Balance Service"""
 
 import asyncio
 import logging
@@ -85,7 +85,7 @@ async def stop_pair(symbol: str):
 async def on_pairs_updated(new_pairs: list):
     current = set(active_traders.keys())
     updated = set(new_pairs)
-    added   = updated - current
+    added = updated - current
     removed = current - updated
 
     if added:
@@ -107,20 +107,17 @@ async def main():
     logger.info("  BitgetProBot v5.3 — IA + Scanner + Telegram + Webhook")
     logger.info("=" * 60)
 
-    # ── Inicializar balance singleton ANTES de arrancar traders ───────────────
-    # Esto garantiza que los 15 traders comparten un único fetch de balance
-    # y evita los 429 por peticiones simultáneas.
+    # ── Inicializar servicio de balance (singleton, una sola vez) ──────────
     balance_svc.init(
         os.getenv("BITGET_API_KEY"),
         os.getenv("BITGET_API_SECRET"),
-        os.getenv("BITGET_PASSPHRASE"),
+        os.getenv("BITGET_PASSPHRASE")
     )
+    logger.info("✅ Balance service inicializado")
 
     global_risk = GlobalRisk(
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "5")),
-        max_global_daily_loss_pct=float(
-            os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")
-        ),
+        max_global_daily_loss_pct=float(os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")),
     )
 
     # Arrancar webhook server en paralelo
@@ -144,11 +141,9 @@ async def main():
         try:
             ticker = await scanner.exchange.fetch_ticker(sym)
             scored_data.append({
-                "symbol":     sym,
+                "symbol": sym,
                 "volume_usdt": round(float(ticker.get("quoteVolume") or 0) / 1e6, 2),
-                "change_pct":  round(
-                    abs(float(ticker.get("percentage") or 0)), 2
-                ),
+                "change_pct": round(abs(float(ticker.get("percentage") or 0)), 2),
                 "score": 0,
             })
         except Exception:
@@ -159,20 +154,15 @@ async def main():
     top_n = int(os.getenv("TOP_PAIRS", "15"))
 
     # Normalizar al formato estándar ccxt (BASE/USDT:USDT)
-    final_pairs = [
-        scanner.normalize(sym) for sym in ai_ranked[:top_n]
-    ]
+    final_pairs = [scanner.normalize(sym) for sym in ai_ranked[:top_n]]
 
     # Deduplicar preservando orden
     seen = set()
     final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
 
-    # Fallback: si IA devolvió lista vacía usar el scan inicial directamente
+    # Fallback: si IA devolvió lista vacía usar el scan inicial
     if not final_pairs:
-        logger.warning(
-            "⚠️ ai_rank_pairs devolvió lista vacía — "
-            "usando pares del scanner directamente"
-        )
+        logger.warning("⚠️ ai_rank_pairs vacío → usando scanner directamente")
         final_pairs = initial_pairs[:top_n]
 
     logger.info(f"✅ Pares finales ({len(final_pairs)}): {', '.join(final_pairs)}")
