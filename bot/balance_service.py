@@ -1,14 +1,12 @@
 """
 bot/balance_service.py
 
-Servicio singleton de balance USDT para Bitget.
-Un único fetch cada _TTL segundos compartido por TODOS los traders.
-Elimina el problema de 429 causado por 15 traders haciendo fetches simultáneos.
-
+Servicio singleton de balance USDT para Bitget (Unified Account).
+Un único fetch cada BALANCE_TTL segundos compartido por TODOS los traders.
 Uso:
     from bot.balance_service import balance_svc
     balance_svc.init(api_key, api_secret, passphrase)
-    bal = await balance_svc.get()   # todos los traders llaman esto
+    bal = await balance_svc.get()
 """
 
 import asyncio
@@ -25,14 +23,13 @@ import aiohttp
 logger = logging.getLogger("BalanceSvc")
 
 _TTL      = int(os.getenv("BALANCE_CACHE_TTL", "60"))   # segundos entre fetches reales
-_TIMEOUT  = float(os.getenv("BALANCE_TIMEOUT",  "10"))  # timeout HTTP por request
+_TIMEOUT  = float(os.getenv("BALANCE_TIMEOUT",  "10"))   # timeout HTTP por request
 
 
 class BalanceService:
     """
-    Singleton global de balance.
+    Singleton global de balance para Unified Account.
     - Un único asyncio.Lock garantiza que solo 1 coroutine hace el fetch a la vez.
-    - El resto espera y reutiliza el resultado cacheado.
     - TTL configurable via env BALANCE_CACHE_TTL (default 60s).
     """
 
@@ -44,7 +41,6 @@ class BalanceService:
         self._ts:         float = 0.0
         self._lock:       asyncio.Lock | None = None
         self._ready:      bool = False
-        self._warned_not_ready: bool = False
 
     # ── inicialización (llamar una vez al arrancar) ──────────────────────────
 
@@ -63,9 +59,7 @@ class BalanceService:
     async def get(self) -> float | None:
         """Devuelve el balance USDT. Cachea TTL segundos. Thread-safe."""
         if not self._ready:
-            if not self._warned_not_ready:
-                logger.error("[BalanceSvc] ¡No inicializado! Llama balance_svc.init() primero.")
-                self._warned_not_ready = True
+            logger.error("[BalanceSvc] ¡No inicializado! Llama balance_svc.init() primero.")
             return None
 
         # Fast-path sin lock si la caché es fresca
@@ -119,7 +113,7 @@ class BalanceService:
         }
 
     async def _get_json(self, path: str, qs: str = "") -> dict | None:
-        """GET a Bitget. Maneja 429 con Retry-After. Devuelve None si no es JSON válido."""
+        """GET a Bitget. Devuelve None si la respuesta no es JSON válida."""
         url = "https://api.bitget.com" + path + qs
         try:
             async with aiohttp.ClientSession() as s:
@@ -128,113 +122,85 @@ class BalanceService:
                     headers=self._headers("GET", path + qs),
                     timeout=aiohttp.ClientTimeout(total=_TIMEOUT),
                 ) as r:
+                    # Manejo de rate limit 429
                     if r.status == 429:
-                        retry_after = float(r.headers.get("Retry-After", "5"))
-                        logger.warning(
-                            f"[BalanceSvc] ⚠️ Rate limit 429 en {path} — "
-                            f"esperando {retry_after:.0f}s"
-                        )
-                        await asyncio.sleep(retry_after)
-                        async with s.get(
-                            url,
-                            headers=self._headers("GET", path + qs),
-                            timeout=aiohttp.ClientTimeout(total=_TIMEOUT),
-                        ) as r2:
-                            text = await r2.text()
-                    else:
-                        text = await r.text()
+                        retry_after = r.headers.get("Retry-After", "5")
+                        logger.warning(f"[BalanceSvc] 429, esperando {retry_after}s...")
+                        await asyncio.sleep(float(retry_after))
+                        return await self._get_json(path, qs)
+                    text = await r.text()
             stripped = text.strip()
             if not stripped.startswith("{") and not stripped.startswith("["):
                 logger.debug(f"[BalanceSvc] {path} → no-JSON: {stripped[:120]}")
                 return None
-            data = _json.loads(stripped)
-            if not isinstance(data, dict):
-                logger.debug(f"[BalanceSvc] {path} → tipo inesperado: {type(data).__name__}")
-                return None
-            # Log detallado cuando el código no es éxito
-            if data.get("code") != "00000":
-                logger.warning(
-                    f"[BalanceSvc] {path}{qs} → code={data.get('code')} msg={data.get('msg')} "
-                    f"data={str(data.get('data', ''))[:120]}"
-                )
-            return data
+            return _json.loads(stripped)
         except Exception as e:
             logger.debug(f"[BalanceSvc] {path} excepción: {e}")
             return None
 
     async def _fetch_with_retry(self, max_retries: int = 3) -> float | None:
-        """Llama a _fetch hasta max_retries veces con backoff exponencial."""
+        """Reintenta la obtención del balance con backoff exponencial."""
         for attempt in range(1, max_retries + 1):
             result = await self._fetch()
             if result is not None:
                 return result
-            wait = 2 ** attempt  # 2s, 4s, 8s
-            logger.warning(
-                f"[BalanceSvc] ⚠️ Intento {attempt}/{max_retries} fallido — "
-                f"reintentando en {wait}s"
-            )
+            wait = 2 ** attempt
+            logger.warning(f"[BalanceSvc] Intento {attempt}/{max_retries} falló, esperando {wait}s")
             await asyncio.sleep(wait)
         return None
 
     async def _fetch(self) -> float | None:
         """
-        Prueba endpoints en orden de fiabilidad para Bitget UA y Classic.
-
-        Orden:
-          1. /api/v2/account/all-account-balance  (Unified Account — campo 'available' en item coin=USDT)
-          2. /api/v2/mix/account/accounts         (Classic USDT-FUTURES — campo 'available' en items[0])
-          3. /api/v2/spot/account/assets          (último recurso — campo 'available' coin=USDT)
+        Obtiene el balance USDT desde Unified Account.
+        Endpoint oficial: GET /api/v2/unified/account/assets?coin=USDT
         """
-
-        # ── Endpoint 1: UA all-account-balance ──────────────────────────────
-        path = "/api/v2/account/all-account-balance"
-        qs   = "?coin=USDT"
+        # Endpoint para Unified Account
+        path = "/api/v2/unified/account/assets"
+        qs = "?coin=USDT"
         data = await self._get_json(path, qs)
         if data and data.get("code") == "00000":
-            items = data.get("data") or []
-            items = items if isinstance(items, list) else []
+            items = data.get("data", [])
+            # Puede ser una lista de assets o un dict directamente
+            if isinstance(items, dict):
+                items = [items]
             for item in items:
-                if isinstance(item, dict) and item.get("coin") == "USDT":
-                    try:
-                        bal = float(item.get("available") or 0)
-                        logger.debug(f"[BalanceSvc] ✔ all-account-balance(UA) → {bal:.2f}")
-                        return bal
-                    except (ValueError, TypeError):
-                        pass
+                if not isinstance(item, dict):
+                    continue
+                coin = item.get("coin") or item.get("currency") or ""
+                if coin.upper() == "USDT":
+                    # Probar diferentes nombres de campo
+                    available = item.get("available") or item.get("free") or item.get("availableBalance")
+                    if available is not None:
+                        return float(available)
+        else:
+            code = data.get("code") if data else "?"
+            msg = data.get("msg") if data else "No response"
+            logger.warning(f"[BalanceSvc] unified/assets code={code} msg={msg}")
 
-        # ── Endpoint 2: mix/account/accounts (Classic / fallback UA) ────────
-        path = "/api/v2/mix/account/accounts"
-        qs   = "?productType=USDT-FUTURES"
-        data = await self._get_json(path, qs)
-        if data and data.get("code") == "00000":
-            items = data.get("data") or []
-            items = items if isinstance(items, list) else []
-            if items:
-                try:
-                    bal = float(items[0].get("available") or 0)
-                    logger.debug(f"[BalanceSvc] ✔ mix/accounts → {bal:.2f}")
-                    return bal
-                except (ValueError, TypeError):
-                    pass
-
-        # ── Endpoint 3: spot/account/assets (último recurso) ─────────────────
-        path = "/api/v2/spot/account/assets"
-        qs   = "?coin=USDT"
-        data = await self._get_json(path, qs)
-        if data and data.get("code") == "00000":
-            items = data.get("data") or []
-            items = items if isinstance(items, list) else []
+        # Fallback: all-account-balance (a veces funciona en UA)
+        path2 = "/api/v2/account/all-account-balance"
+        qs2 = "?coin=USDT"
+        data2 = await self._get_json(path2, qs2)
+        if data2 and data2.get("code") == "00000":
+            items = data2.get("data", [])
+            if isinstance(items, dict):
+                items = [items]
             for item in items:
-                if isinstance(item, dict) and item.get("coin") == "USDT":
-                    try:
-                        bal = float(item.get("available") or 0)
-                        logger.debug(f"[BalanceSvc] ✔ spot/assets → {bal:.2f}")
-                        return bal
-                    except (ValueError, TypeError):
-                        pass
+                if not isinstance(item, dict):
+                    continue
+                coin = item.get("coin") or item.get("currency") or ""
+                if coin.upper() == "USDT":
+                    available = item.get("available") or item.get("free") or item.get("availableBalance")
+                    if available is not None:
+                        return float(available)
+        else:
+            code = data2.get("code") if data2 else "?"
+            msg = data2.get("msg") if data2 else "No response"
+            logger.warning(f"[BalanceSvc] all-account-balance code={code} msg={msg}")
 
-        logger.error("[BalanceSvc] 🚨 Todos los endpoints de balance fallaron")
+        logger.error("[BalanceSvc] 🚨 Todos los endpoints fallaron para obtener balance")
         return None
 
 
+# ── Singleton global ─────────────────────────────────────────────────────────
 balance_svc = BalanceService()
