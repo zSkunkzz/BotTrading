@@ -63,6 +63,8 @@ class KillSwitch:
         self._slippage_samples: list[float] = []
         self._halted_symbols: set[str] = set()
         self._hard_killed: bool = False
+        # Símbolos con TPSL retry activo — el watchdog los ignora para state_mismatch
+        self._tpsl_retrying: set[str] = set()
         self._load_state()
 
     # ── Estado ────────────────────────────────────────────────────────────────
@@ -80,6 +82,16 @@ class KillSwitch:
 
     def is_hard_killed(self) -> bool:
         return self._hard_killed
+
+    # ── TPSL retry tracking ───────────────────────────────────────────────────
+
+    def mark_tpsl_retrying(self, symbol: str):
+        """Llamar cuando empieza un retry de TPSL (code 31008). Inhibe state_mismatch."""
+        self._tpsl_retrying.add(symbol)
+
+    def clear_tpsl_retrying(self, symbol: str):
+        """Llamar cuando el TPSL se coloca OK o se agotan los reintentos."""
+        self._tpsl_retrying.discard(symbol)
 
     # ── Activación ────────────────────────────────────────────────────────────
 
@@ -148,6 +160,7 @@ class KillSwitch:
             self._state_mismatches = 0
             self._reject_count   = 0
             self._order_count    = 0
+            self._tpsl_retrying.clear()
             self._slippage_samples.clear()
             self._save_state()
             logger.info("✅ Kill switch re-armado manualmente")
@@ -204,6 +217,11 @@ class KillSwitch:
 
     async def on_state_mismatch(self, symbol: str):
         """Mismatch entre estado local y exchange."""
+        # Ignorar si el símbolo tiene TPSL retry activo (code 31008 lag de API)
+        if symbol in self._tpsl_retrying:
+            logger.debug(f"[{symbol}] KS: state_mismatch ignorado — TPSL retry activo")
+            return
+
         async with self._lock:
             self._state_mismatches += 1
             count = self._state_mismatches
@@ -249,8 +267,12 @@ class KillSwitch:
             self.reset_daily_pnl()
 
         # Comprobar posiciones sin protección (state mismatch)
+        # Excluir símbolos con TPSL retry activo — es lag de API Bitget, no un mismatch real
         for symbol, trader in list(traders.items()):
             try:
+                if symbol in self._tpsl_retrying:
+                    logger.debug(f"[{symbol}] KS watchdog: omitido (TPSL retry en curso)")
+                    continue
                 if trader.position and not trader._protection_ok:
                     await self.on_state_mismatch(symbol)
                     logger.warning(f"[{symbol}] ⚠️ Watchdog: posición sin protección detectada")
