@@ -49,8 +49,6 @@ _TPSL_RETRY_DELAY_S      = float(os.getenv("TPSL_RETRY_DELAY_S", "2.0"))
 _SL_SW_MARGIN = float(os.getenv("SL_SW_MARGIN", "0.001"))
 
 # ── Intervalo para verificar si la posición sigue abierta en Bitget ──────────
-# Cada N segundos comprobamos si Bitget todavía tiene la posición registrada.
-# Si no la tiene, significa que fue cerrada por TPSL/SL del servidor.
 _POS_CHECK_INTERVAL_S = int(os.getenv("POS_CHECK_INTERVAL_S", "30"))
 
 _MIN_QTY_FALLBACK = {
@@ -127,7 +125,7 @@ class FuturesTrader:
         self._cb_40085_count   = 0
         self._cb_40085_paused_until = 0.0
         self._last_tpsl_verify_at: float = 0.0
-        self._last_pos_check_at: float = 0.0  # FIX: para detectar cierre externo
+        self._last_pos_check_at: float = 0.0
 
     # -- Helpers HTTP ----------------------------------------------------------
 
@@ -447,7 +445,7 @@ class FuturesTrader:
         logger.warning("[%s] _get_positions fallo", self.symbol)
         return None
 
-    # -- FIX: Detectar cierre externo (TPSL/SL servidor) ----------------------
+    # -- Detectar cierre externo (TPSL/SL servidor) ----------------------
 
     async def _check_external_close(self) -> bool:
         """
@@ -517,6 +515,8 @@ class FuturesTrader:
             return False
 
     # -- TPSL server-side (Unified Account v3) ---------------------------------
+    # FIX: campos corregidos slTriggerType/tpTriggerType (antes slTriggerBy/tpTriggerBy)
+    # La API v3 de Bitget usa triggerType, no TriggerBy para strategy orders.
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
         if not self.position:
@@ -554,12 +554,15 @@ class FuturesTrader:
         else:
             payload["reduceOnly"] = "yes"
 
+        # FIX: usar slTriggerType / tpTriggerType (campos correctos para API v3)
+        # El campo anterior "slTriggerBy"/"tpTriggerBy" es ignorado por Bitget v3
+        # causando que el TPSL se registre sin trigger real y nunca se active.
         if sl:
-            payload["stopLoss"]    = str(sl)
-            payload["slTriggerBy"] = "last_price"
+            payload["stopLoss"]       = str(sl)
+            payload["slTriggerType"]  = "last_price"
         if tp:
-            payload["takeProfit"]  = str(tp)
-            payload["tpTriggerBy"] = "last_price"
+            payload["takeProfit"]     = str(tp)
+            payload["tpTriggerType"]  = "last_price"
 
         logger.info("[%s] TPSL payload: %s", self.symbol, payload)
 
@@ -1060,18 +1063,15 @@ class FuturesTrader:
             else:
                 pnl = (self.entry_price - exit_price) / self.entry_price * 100
 
-        closed_side = self.position  # FIX: guardar antes de limpiar
+        closed_side = self.position
 
         if qty > 0:
             r = await self._place_order(side, qty, reduce_only=True)
             if r.get("code") != "00000":
                 logger.error("[%s] close_position FAILED: %s", self.symbol, r)
-                # FIX: si la orden falla, verificar si la posición ya fue cerrada externamente
                 external = await self._check_external_close()
                 if not external:
-                    # Posición sigue abierta pero la orden de cierre falló — no limpiar estado
                     return
-                # Si fue cerrada externamente, _check_external_close ya limpió el estado
                 return
 
         pretrade_risk.register_close(self.symbol, self._open_notional)
@@ -1158,26 +1158,10 @@ class FuturesTrader:
                     continue
 
                 if self.position:
-                    # ── FIX: Detectar cierre externo (TPSL/SL servidor) ────────
-                    # Cada POS_CHECK_INTERVAL_S segundos verificamos si Bitget
-                    # todavía registra la posición. Si no, fue cerrada externamente.
-                    if (time.time() - self._last_pos_check_at) >= _POS_CHECK_INTERVAL_S:
-                        was_closed = await self._check_external_close()
-                        if was_closed:
-                            # Posición cerrada externamente — estado ya limpiado
-                            continue
-
-                    # ── Verificar TPSL periodicamente ──────────────────────────
-                    if self._protection_ok and (time.time() - self._last_tpsl_verify_at) >= _TPSL_VERIFY_INTERVAL_S:
-                        await self._verify_tpsl_alive()
-
-                    # ── Cierre parcial en TP2 ─────────────────────────────
-                    if self.tp2 and not self.tp2_hit:
-                        if (self.position == "long" and price >= self.tp2) or \
-                           (self.position == "short" and price <= self.tp2):
-                            await self.partial_close(ratio=TP2_PARTIAL_RATIO)
-
-                    # ── SL/TP3 software como red de seguridad ───────────────
+                    # ── FIX: SL software PRIMERO — antes de verificar cierre externo ──
+                    # El SL software actúa como red de seguridad urgente. Se ejecuta
+                    # antes de _check_external_close para no perder ticks críticos
+                    # donde el precio cruza el SL pero la posición aún existe en Bitget.
                     if self.sl:
                         sl_trigger_long  = self.sl * (1 - _SL_SW_MARGIN)
                         sl_trigger_short = self.sl * (1 + _SL_SW_MARGIN)
@@ -1199,6 +1183,22 @@ class FuturesTrader:
                             )
                             await self.close_position(reason="TP3_SOFTWARE")
                             continue
+
+                    # ── Detectar cierre externo (TPSL/SL servidor) ────────────
+                    if (time.time() - self._last_pos_check_at) >= _POS_CHECK_INTERVAL_S:
+                        was_closed = await self._check_external_close()
+                        if was_closed:
+                            continue
+
+                    # ── Verificar TPSL periodicamente ──────────────────────────
+                    if self._protection_ok and (time.time() - self._last_tpsl_verify_at) >= _TPSL_VERIFY_INTERVAL_S:
+                        await self._verify_tpsl_alive()
+
+                    # ── Cierre parcial en TP2 ─────────────────────────────
+                    if self.tp2 and not self.tp2_hit:
+                        if (self.position == "long" and price >= self.tp2) or \
+                           (self.position == "short" and price <= self.tp2):
+                            await self.partial_close(ratio=TP2_PARTIAL_RATIO)
 
                     result = await decide(self.exchange, self.symbol, _ai_decide_fn, has_open_position=True)
                     action = result.get("action", "HOLD")
