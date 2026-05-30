@@ -14,6 +14,9 @@ Cambios v2:
 
 Cambios v3:
   - ATR_MULT_SL, TP1_MULT, TP2_MULT, TP3_MULT y MIN_RR configurables por variables de entorno
+
+Cambios v4:
+  - MIN_SCORE y MIN_SCORE_FULL configurables por variables de entorno
 """
 
 from __future__ import annotations
@@ -33,8 +36,8 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-MIN_SCORE       = 5
-MIN_SCORE_FULL  = 6
+MIN_SCORE       = int(os.getenv("MIN_SCORE",      "5"))
+MIN_SCORE_FULL  = int(os.getenv("MIN_SCORE_FULL", "6"))
 MIN_RR          = float(os.getenv("MIN_RR",       "1.8"))
 ATR_MULT_SL     = float(os.getenv("ATR_MULT_SL",  "1.8"))
 TP1_MULT        = float(os.getenv("TP1_MULT",     "2.5"))
@@ -318,16 +321,6 @@ def _apply_microstructure(
 
 
 def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction: str) -> tuple[str, int, float]:
-    """
-    FIX v2: EARLY ahora cubre score==5 con cualquier combinación de TF
-    siempre que 1h Y 15m estén alineados con la dirección.
-
-    Antes: EARLY solo si tf4h_aligned <= 0  (4h en contra o neutral)
-           → score==5 con los 3 TF alineados caía en NONE silenciosamente
-
-    Ahora: EARLY si score==5 y (1h alineado AND 15m alineado)
-           El 4h puede estar alineado, neutral o en contra.
-    """
     sign = 1 if direction == "LONG" else -1
 
     tf1h_aligned = s1h.get("ema_trend", 0) * sign
@@ -342,24 +335,22 @@ def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction:
         lev   = round(LEV_STRONG_MIN + ratio * (LEV_STRONG_MAX - LEV_STRONG_MIN))
         return mode, lev, 1.0
 
-    if score >= MIN_SCORE_FULL:  # >= 6
+    if score >= MIN_SCORE_FULL:
         mode  = "NORMAL"
         ratio = min((score - MIN_SCORE_FULL) / 2.0, 1.0)
         lev   = round(LEV_NORMAL_MIN + ratio * (LEV_NORMAL_MAX - LEV_NORMAL_MIN))
         return mode, lev, 1.0
 
-    # score == 5 → EARLY si al menos 1h y 15m confirman
     if score == MIN_SCORE and tf1h_aligned > 0 and tf15_aligned > 0:
         quality = extra_1h + extra_15m
         ratio   = min(quality / 6.0, 1.0)
         lev     = round(LEV_EARLY_MIN + ratio * (LEV_EARLY_MAX - LEV_EARLY_MIN))
         log.debug(
-            f"[signal] EARLY activado — score=5, 1h={tf1h_aligned}, 15m={tf15_aligned}, "
+            f"[signal] EARLY activado — score={score}, 1h={tf1h_aligned}, 15m={tf15_aligned}, "
             f"quality={quality}, lev={lev}x"
         )
         return "EARLY", lev, EARLY_SIZE_RATIO
 
-    # Sin modo válido — log para diagnóstico
     log.debug(
         f"[signal] NONE — score={score}, 1h_aligned={tf1h_aligned}, "
         f"15m_aligned={tf15_aligned} (señal descartada)"
