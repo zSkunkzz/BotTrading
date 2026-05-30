@@ -37,6 +37,15 @@ _CB_40085_PAUSE_S   = int(os.getenv("CB_40085_PAUSE_S", "300"))  # 5 min
 # Valores validos: "hedge" | "one_way" | "" (auto-detect)
 _FORCE_POS_MODE = os.getenv("FORCE_POS_MODE", "").strip().lower()
 
+# FIX 1 — verificacion periodica de TPSL activo en exchange
+# Cada cuantos segundos se comprueba que las ordenes TPSL siguen vivas
+_TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))  # 2 minutos
+
+# FIX 2 — tiempo maximo de espera de fill tras orden de entrada (limit)
+# antes de colocar TPSL (evita race condition "no hay posicion abierta")
+_FILL_WAIT_MAX_S   = float(os.getenv("FILL_WAIT_MAX_S", "8.0"))
+_FILL_POLL_INTERVAL = float(os.getenv("FILL_POLL_INTERVAL", "0.5"))
+
 _MIN_QTY_FALLBACK = {
     "BTCUSDT":   0.001,
     "ETHUSDT":   0.01,
@@ -112,6 +121,8 @@ class FuturesTrader:
         # Circuit breaker para error 40085
         self._cb_40085_count   = 0
         self._cb_40085_paused_until = 0.0
+        # FIX 1 — timestamp de la ultima verificacion de TPSL en exchange
+        self._last_tpsl_verify_at: float = 0.0
 
     # -- Helpers HTTP ----------------------------------------------------------
 
@@ -321,6 +332,8 @@ class FuturesTrader:
             self._open_notional = saved.get("usdt_amount", 0.0)
             self._open_leverage = saved.get("leverage", self.leverage)
             self._protection_ok = True
+            # FIX 1 — al restaurar posicion, forzar verificacion inmediata de TPSL
+            self._last_tpsl_verify_at = 0.0
             logger.info("[%s] Posicion restaurada: %s @ %s", self.symbol, self.position, self.entry_price)
 
         if not balance_svc.is_ready():
@@ -605,26 +618,107 @@ class FuturesTrader:
             logger.error("[%s] _place_pos_tpsl exception: %s", self.symbol, e)
             return {"code": "ERROR", "msg": str(e)}
 
+    # -- FIX 1: verificar TPSL activo consultando ordenes strategy en exchange --
+
+    async def _verify_tpsl_alive(self) -> bool:
+        """
+        Consulta /api/v3/trade/current-plan-order para comprobar si existe
+        al menos una orden TPSL activa para este simbolo.
+        Actualiza _protection_ok y recoloca TPSL si no hay ninguna.
+        Retorna True si la proteccion esta confirmada.
+        """
+        if self.dry_run:
+            return True
+
+        sym = self._sym()
+        try:
+            r = await self._http_get(
+                "/api/v3/trade/current-plan-order",
+                {"category": "USDT-FUTURES", "symbol": sym, "orderType": "tpsl"},
+            )
+            if r.get("code") != "00000":
+                logger.warning("[%s] _verify_tpsl_alive: error al consultar plan orders: %s", self.symbol, r)
+                return self._protection_ok  # mantener estado anterior si falla la consulta
+
+            raw = r.get("data") or {}
+            orders = raw.get("entrustedList") or raw.get("list") or []
+            if not isinstance(orders, list):
+                orders = []
+
+            # Filtrar ordenes activas (live/new/triggered)
+            active = [
+                o for o in orders
+                if isinstance(o, dict)
+                and o.get("status", "").lower() in ("live", "new", "not_trigger", "")
+            ]
+
+            if active:
+                self._protection_ok = True
+                self._last_tpsl_verify_at = time.time()
+                logger.debug("[%s] TPSL verify OK — %d orden(es) activa(s)", self.symbol, len(active))
+                return True
+
+            # No hay ordenes TPSL activas — recolocar
+            logger.error(
+                "[%s] TPSL verify FALLO — no hay ordenes activas en exchange. "
+                "Recolocando SL=%s TP=%s ...",
+                self.symbol, self.sl, self.tp3,
+            )
+            tpsl_r = await self._place_pos_tpsl(sl=self.sl, tp=self.tp3)
+            if tpsl_r.get("code") == "00000":
+                self._protection_ok = True
+                self._last_tpsl_verify_at = time.time()
+                logger.info("[%s] TPSL recolocado con exito", self.symbol)
+                try:
+                    from bot.telegram_bot import send_message
+                    await send_message(
+                        f"⚠️ <b>TPSL recolocado</b> — <code>{self.symbol}</code>\n"
+                        f"Las ordenes TPSL habian desaparecido del exchange.\n"
+                        f"SL={self.sl} TP={self.tp3}"
+                    )
+                except Exception:
+                    pass
+            else:
+                self._protection_ok = False
+                logger.critical(
+                    "[%s] TPSL recolocado FALLO — posicion SIN proteccion. resp=%s",
+                    self.symbol, tpsl_r,
+                )
+            return self._protection_ok
+
+        except Exception as e:
+            logger.error("[%s] _verify_tpsl_alive exception: %s", self.symbol, e)
+            return self._protection_ok
+
+    # -- FIX 3: reconcile real consultando ordenes en exchange -----------------
+
     async def reconcile_position(self) -> bool:
+        """
+        FIX 3 — Verifica en el exchange si existe posicion Y si hay ordenes
+        TPSL activas, en lugar de solo confiar en sl_order_id local.
+        """
         try:
             positions = await self._get_positions()
             has_pos   = bool(positions)
-            sl_covered = bool(self.sl_order_id) or (self.sl is None)
-            tp_covered = bool(self.tp_order_id) or (self.tp3 is None)
-            self._protection_ok = has_pos and sl_covered and tp_covered
 
             if not has_pos:
                 logger.error("[%s] Reconcile: posicion no encontrada en exchange", self.symbol)
                 await kill_switch.on_state_mismatch(self.symbol)
-            elif not (sl_covered and tp_covered):
-                logger.error(
-                    "[%s] Reconcile: faltan ordenes TPSL (sl_ok=%s tp_ok=%s)",
-                    self.symbol, sl_covered, tp_covered
-                )
+                self._protection_ok = False
+                return False
+
+            # Consultar ordenes TPSL activas reales en el exchange
+            tpsl_ok = await self._verify_tpsl_alive()
+            self._protection_ok = tpsl_ok
+            self._last_tpsl_verify_at = time.time()
+
+            if tpsl_ok:
+                logger.info("[%s] Reconcile OK — posicion y TPSL confirmados en exchange", self.symbol)
             else:
-                logger.info("[%s] Reconcile OK", self.symbol)
+                logger.error("[%s] Reconcile: posicion existe pero TPSL sin confirmar", self.symbol)
 
             return self._protection_ok
+
         except Exception as e:
             self._protection_ok = False
             logger.error("[%s] reconcile_position error: %s", self.symbol, e)
@@ -764,6 +858,30 @@ class FuturesTrader:
         except Exception as e:
             logger.debug("[%s] _modify_order error: %s", self.symbol, e)
             return {"code": "ERROR", "msg": str(e)}
+
+    # -- FIX 2: esperar fill antes de colocar TPSL -----------------------------
+
+    async def _wait_for_position_open(self) -> bool:
+        """
+        Espera hasta _FILL_WAIT_MAX_S segundos a que la posicion aparezca
+        en el exchange (necesario cuando la orden de entrada es limit).
+        Retorna True si la posicion esta confirmada, False si expira.
+        """
+        deadline = time.monotonic() + _FILL_WAIT_MAX_S
+        while time.monotonic() < deadline:
+            try:
+                positions = await self._get_positions()
+                if positions:
+                    logger.debug("[%s] _wait_for_position_open: posicion confirmada", self.symbol)
+                    return True
+            except Exception as e:
+                logger.debug("[%s] _wait_for_position_open poll error: %s", self.symbol, e)
+            await asyncio.sleep(_FILL_POLL_INTERVAL)
+        logger.warning(
+            "[%s] _wait_for_position_open: timeout %.1fs -- colocando TPSL de todas formas",
+            self.symbol, _FILL_WAIT_MAX_S,
+        )
+        return False
 
     async def _place_order(
         self,
@@ -913,6 +1031,10 @@ class FuturesTrader:
             )
             logger.warning("[%s] LONG @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
+
+            # FIX 2 — esperar fill confirmado antes de colocar TPSL
+            await self._wait_for_position_open()
+
             tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
             if tpsl_r.get("code") == "00000":
                 self._protection_ok = True
@@ -967,6 +1089,10 @@ class FuturesTrader:
             )
             logger.warning("[%s] SHORT @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
+
+            # FIX 2 — esperar fill confirmado antes de colocar TPSL
+            await self._wait_for_position_open()
+
             tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
             if tpsl_r.get("code") == "00000":
                 self._protection_ok = True
@@ -1025,6 +1151,7 @@ class FuturesTrader:
         self.sl_order_id  = None
         self.tp_order_id  = None
         self._protection_ok = False
+        self._last_tpsl_verify_at = 0.0
         clear_position(self.symbol)
 
         if pnl >= 0:
@@ -1113,6 +1240,11 @@ class FuturesTrader:
                     tp1 = self.tp1
                     tp2 = self.tp2
                     tp3 = self.tp3
+
+                    # FIX 1 — verificacion periodica de TPSL activo en exchange
+                    now = time.time()
+                    if self._protection_ok and (now - self._last_tpsl_verify_at) >= _TPSL_VERIFY_INTERVAL_S:
+                        await self._verify_tpsl_alive()
 
                     # TP2 parcial
                     if tp2 and not self.tp2_hit:
