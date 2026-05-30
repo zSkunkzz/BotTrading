@@ -38,16 +38,15 @@ _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
 
 # ── FILL_WAIT: tiempo máximo esperando que la posición sea visible en UA v3 ──
 # UA v3 tiene mayor latencia de propagación que la cuenta clásica.
-# 8s era insuficiente — ahora 60s con polling cada 0.5s.
 _FILL_WAIT_MAX_S    = float(os.getenv("FILL_WAIT_MAX_S", "60.0"))
 _FILL_POLL_INTERVAL = float(os.getenv("FILL_POLL_INTERVAL", "0.5"))
 
-# ── TPSL retry config (fix code 31008) ────────────────────────────────────────
-_TPSL_MAX_RETRIES   = int(os.getenv("TPSL_MAX_RETRIES", "5"))
-_TPSL_RETRY_DELAY_S = float(os.getenv("TPSL_RETRY_DELAY_S", "0.5"))
+# ── TPSL retry config (fix code 31008) ────────────────────────────────────────────────
+TPSL_WAIT_BEFORE_RETRY_S = float(os.getenv("TPSL_WAIT_BEFORE_RETRY_S", "3.0"))  # espera fija antes del primer intento
+_TPSL_MAX_RETRIES        = int(os.getenv("TPSL_MAX_RETRIES",   "8"))             # subido de 5 a 8
+_TPSL_RETRY_DELAY_S      = float(os.getenv("TPSL_RETRY_DELAY_S", "1.0"))         # subido de 0.5 a 1.0
 
 # ── SL software margin: evita pisar el TPSL del servidor (0.1% por defecto) ──
-# El servidor actúa primero; el software solo dispara si el servidor falla.
 _SL_SW_MARGIN = float(os.getenv("SL_SW_MARGIN", "0.001"))
 
 _MIN_QTY_FALLBACK = {
@@ -393,13 +392,26 @@ class FuturesTrader:
 
     # -- Posiciones abiertas ---------------------------------------------------
 
-    async def _get_positions(self) -> list | None:
+    async def _get_positions(self, pos_side: str | None = None) -> list | None:
+        """
+        Retorna posiciones abiertas del símbolo.
+        pos_side: si se especifica, filtra por ese lado ('long'/'short') en modo hedge.
+                  Si no se especifica, usa self.position (comportamiento original).
+                  Pasar pos_side='' (cadena vacía) fuerza búsqueda SIN filtro de holdSide
+                  (util durante _wait_for_position_open justo tras el fill).
+        """
         sym = self._sym()
         is_hedge = (self._ua_pos_mode == "hedge")
+
+        # Determinar el holdSide a usar en la query
+        # Si pos_side se pasa explícitamente como string vacío -> no filtrar
+        # Si pos_side es None -> usar self.position
+        effective_side = pos_side if pos_side is not None else self.position
+
         try:
             params = {"category": "USDT-FUTURES", "symbol": sym}
-            if is_hedge and self.position:
-                params["holdSide"] = self.position
+            if is_hedge and effective_side:  # solo filtrar si hay un lado válido
+                params["holdSide"] = effective_side
             r = await self._http_get("/api/v3/position/current-position", params)
             if r.get("code") == "00000":
                 raw = r.get("data", {})
@@ -502,6 +514,15 @@ class FuturesTrader:
     # -- TPSL con retry ante code 31008 ----------------------------------------
 
     async def _place_pos_tpsl_with_retry(self, sl: float | None = None, tp: float | None = None) -> dict:
+        # FIX: espera fija antes del primer intento para dar tiempo a UA v3
+        # a propagar la posición internamente antes de colocar el TPSL.
+        if TPSL_WAIT_BEFORE_RETRY_S > 0:
+            logger.debug(
+                "[%s] _place_pos_tpsl_with_retry: esperando %.1fs antes del primer intento",
+                self.symbol, TPSL_WAIT_BEFORE_RETRY_S,
+            )
+            await asyncio.sleep(TPSL_WAIT_BEFORE_RETRY_S)
+
         last_r: dict = {}
         for attempt in range(1, _TPSL_MAX_RETRIES + 1):
             r = await self._place_pos_tpsl(sl=sl, tp=tp)
@@ -667,18 +688,27 @@ class FuturesTrader:
 
     # -- Esperar fill antes de TPSL -------------------------------------------
 
-    async def _wait_for_position_open(self) -> bool:
+    async def _wait_for_position_open(self, expected_side: str | None = None) -> bool:
+        """
+        Hace polling hasta que la posición sea visible en Bitget UA v3.
+        expected_side: 'long' o 'short'. Si se pasa, se usa para filtrar la búsqueda.
+        Durante el primer poll, buscamos SIN filtro de holdSide (pos_side='')
+        para evitar el race condition donde self.position está seteado pero
+        Bitget todavía no lo refleja en la query con holdSide.
+        """
         deadline = time.monotonic() + _FILL_WAIT_MAX_S
         attempt  = 0
         while time.monotonic() < deadline:
             attempt += 1
             try:
-                positions = await self._get_positions()
+                # FIX: usar pos_side='' (sin filtro holdSide) para los primeros polls
+                # Una vez encontrada la posición, el side no importa para verificar existencia
+                positions = await self._get_positions(pos_side="")
                 if positions:
                     elapsed = attempt * _FILL_POLL_INTERVAL
-                    logger.debug(
-                        "[%s] _wait_for_position_open: posicion confirmada tras ~%.1fs (%d polls)",
-                        self.symbol, elapsed, attempt,
+                    logger.info(
+                        "[%s] _wait_for_position_open: posicion confirmada tras ~%.1fs (%d polls) side=%s",
+                        self.symbol, elapsed, attempt, expected_side or self.position,
                     )
                     return True
             except Exception as e:
@@ -750,8 +780,8 @@ class FuturesTrader:
 
     # -- Helpers internos: colocar TPSL tras confirmar posicion ----------------
 
-    async def _confirm_and_place_tpsl(self, sl: float | None, tp: float | None) -> bool:
-        pos_confirmed = await self._wait_for_position_open()
+    async def _confirm_and_place_tpsl(self, sl: float | None, tp: float | None, expected_side: str | None = None) -> bool:
+        pos_confirmed = await self._wait_for_position_open(expected_side=expected_side)
         if not pos_confirmed:
             logger.critical(
                 "[%s] Posicion no confirmada en %.0fs (UA v3) -- intentando cierre de emergencia",
@@ -906,7 +936,7 @@ class FuturesTrader:
             save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, usdt_amount=usdt_amount, leverage=lev)
             logger.warning("[%s] LONG @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            tpsl_ok = await self._confirm_and_place_tpsl(sl=sl, tp=tp3)
+            tpsl_ok = await self._confirm_and_place_tpsl(sl=sl, tp=tp3, expected_side="long")
             self._protection_ok = tpsl_ok
             if tpsl_ok:
                 await self.reconcile_position()
@@ -939,7 +969,7 @@ class FuturesTrader:
             save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, usdt_amount=usdt_amount, leverage=lev)
             logger.warning("[%s] SHORT @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            tpsl_ok = await self._confirm_and_place_tpsl(sl=sl, tp=tp3)
+            tpsl_ok = await self._confirm_and_place_tpsl(sl=sl, tp=tp3, expected_side="short")
             self._protection_ok = tpsl_ok
             if tpsl_ok:
                 await self.reconcile_position()
@@ -1027,9 +1057,6 @@ class FuturesTrader:
         usdt_per_trade = risk.usdt_per_trade
         await self._init(usdt_per_trade)
 
-        # FIX: firma corregida — strategy.py llama con (symbol, bars, position,
-        # entry_price, leverage, context_override=...). Esta función acepta todos
-        # esos args y los mapea a ai_decide correctamente.
         async def _ai_decide_fn(symbol: str, bars, position, entry_price,
                                 leverage, context_override=None) -> dict:
             return await ai_decide(
@@ -1061,17 +1088,13 @@ class FuturesTrader:
                     if self._protection_ok and (time.time() - self._last_tpsl_verify_at) >= _TPSL_VERIFY_INTERVAL_S:
                         await self._verify_tpsl_alive()
 
-                    # ── Cierre parcial en TP2 ──────────────────────────────────
+                    # ── Cierre parcial en TP2 ─────────────────────────────
                     if self.tp2 and not self.tp2_hit:
                         if (self.position == "long" and price >= self.tp2) or \
                            (self.position == "short" and price <= self.tp2):
                             await self.partial_close(ratio=TP2_PARTIAL_RATIO)
 
-                    # ── FIX: SL/TP3 software activo SIEMPRE como red de seguridad ──
-                    # El margen _SL_SW_MARGIN (0.1%) evita dispararse antes que el
-                    # TPSL del servidor en condiciones normales. Si el TPSL del
-                    # servidor falla (latencia UA v3, error 31008, etc.), este bloque
-                    # cierra la posición sin esperar la siguiente verificación TPSL.
+                    # ── SL/TP3 software como red de seguridad ───────────────
                     if self.sl:
                         sl_trigger_long  = self.sl * (1 - _SL_SW_MARGIN)
                         sl_trigger_short = self.sl * (1 + _SL_SW_MARGIN)
@@ -1104,15 +1127,21 @@ class FuturesTrader:
                     action = result.get("action", "HOLD")
                     signal = result.get("signal")
                     usdt = risk.usdt_per_trade
-                    lev = self.leverage
+
                     if signal:
+                        # FIX: usar el leverage sugerido por la señal en vez del default
+                        lev = signal.suggested_lev if signal.suggested_lev else self.leverage
                         sl  = signal.sl
                         tp1 = signal.tp1
                         tp2 = signal.tp2
-                        atr = signal.atr
-                        tp3 = round(signal.entry + 3.0 * atr, 6) if atr and signal.entry else None
+                        atr_val = signal.atr
+                        tp3 = round(signal.entry + 3.0 * atr_val, 6) if atr_val and signal.entry else None
+                        if signal.signal == "SHORT" and signal.entry and atr_val:
+                            tp3 = round(signal.entry - 3.0 * atr_val, 6)
                     else:
+                        lev = self.leverage
                         sl = tp1 = tp2 = tp3 = None
+
                     if action == "BUY":
                         await self.open_long(usdt, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
                     elif action == "SELL":
