@@ -89,6 +89,12 @@ _pos_mode_cache: str | None = None
 _pos_mode_detected_at: float = 0.0
 _POS_MODE_CACHE_TTL = 300.0  # 5 minutos
 
+# Estados activos validos en planStatus (campo UA v3 para ordenes strategy/plan)
+# IMPORTANTE: NO incluir string vacio — una orden sin planStatus es desconocida,
+# no activa. Incluir "" causaba falsos positivos (ordenes ejecutadas/canceladas
+# sin campo planStatus contaban como activas).
+_TPSL_ACTIVE_STATUSES = frozenset({"live", "new", "not_trigger"})
+
 
 class FuturesTrader:
     def __init__(self, api_key, api_secret, passphrase, symbol,
@@ -624,6 +630,12 @@ class FuturesTrader:
         """
         Consulta /api/v3/trade/current-plan-order para comprobar si existe
         al menos una orden TPSL activa para este simbolo.
+
+        BUG CORREGIDO: el campo de estado en UA v3 para ordenes strategy/plan
+        es "planStatus", NO "status". Ademas se elimino string vacio del
+        filtro de estados activos (_TPSL_ACTIVE_STATUSES) para evitar contar
+        como activas ordenes ya ejecutadas o canceladas sin campo planStatus.
+
         Actualiza _protection_ok y recoloca TPSL si no hay ninguna.
         Retorna True si la proteccion esta confirmada.
         """
@@ -645,11 +657,13 @@ class FuturesTrader:
             if not isinstance(orders, list):
                 orders = []
 
-            # Filtrar ordenes activas (live/new/triggered)
+            # FIX: usar planStatus (campo correcto UA v3) en lugar de status.
+            # No incluir string vacio: una orden sin planStatus es desconocida,
+            # no activa. Ver _TPSL_ACTIVE_STATUSES definido al inicio del modulo.
             active = [
                 o for o in orders
                 if isinstance(o, dict)
-                and o.get("status", "").lower() in ("live", "new", "not_trigger", "")
+                and o.get("planStatus", "").lower() in _TPSL_ACTIVE_STATUSES
             ]
 
             if active:
