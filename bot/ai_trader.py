@@ -25,7 +25,8 @@ _ai_cache: dict = {}
 ENRICHED_CACHE_TTL = int(os.getenv("ENRICHED_CACHE_TTL", "120"))  # 2 min
 _enriched_cache: dict = {}
 
-# Score mínimo para consultar la IA
+# FIX: AI_MIN_SCORE — solo aplica en el path sin context_override (señal técnica directa)
+# En el path con context_override el filtro de score ya lo hace strategy.py
 AI_MIN_SCORE = int(os.getenv("AI_MIN_SCORE", "7"))
 
 SYSTEM_PROMPT = """You are a professional crypto futures trader. Reply ONLY with a JSON object, no extra text.
@@ -324,6 +325,9 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
         score           = context_override.get("score", 0)
 
+        # FIX: el filtro de score aquí solo aplica en el path directo (sin strategy.py).
+        # Cuando viene de strategy.py, el score ya fue validado con AI_CALL_MIN_SCORE=7.
+        # Mantenemos el guard pero con el mismo umbral para consistencia.
         if score < AI_MIN_SCORE:
             logger.info(f"[{symbol}] \u23ed\ufe0f Score {score}/10 < {AI_MIN_SCORE} \u2192 HOLD sin IA")
             return {"action": "HOLD", "confidence": 4,
@@ -378,8 +382,12 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
                   "reasoning": "Fallback técnico", "key_factors": []}
 
     confidence = result.get("confidence", 5)
-    min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "6"))
+    # FIX: bajado de 6 a 5 — la IA puede confirmar con confianza moderada.
+    # Un 5/10 es suficiente para no bloquear señales técnicas buenas.
+    # Si se quiere más conservador, subir AI_MIN_CONFIDENCE a 6 en .env
+    min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "5"))
     if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
+        logger.info(f"[{symbol}] IA confidence {confidence} < {min_conf} → HOLD")
         result["action"] = "HOLD"
 
     action = result.get("action")

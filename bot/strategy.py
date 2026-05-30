@@ -5,15 +5,15 @@ strategy.py — Lógica de decisión de BotTrading
 Flujo y coste IA:
   NONE   (score<5)   → HOLD directo, sin IA
   EARLY  (score 5-6) → HOLD directo, sin IA
-  NORMAL (score 7)   → HOLD directo, sin IA (score insuficiente)
-  NORMAL (score >=8) → confirma con IA (con contexto externo enriquecido)
+  NORMAL (score 7)   → confirma con IA (score suficiente desde AI_CALL_MIN_SCORE=7)
+  NORMAL (score >=8) → confirma con IA; si IA dice HOLD y score>=8 → override técnico
   STRONG (score >=8) → entra directo, sin IA (máxima confluencia)
 
 Variables de entorno:
   MIN_SIGNAL_SCORE   (default: 5)    — mínimo para activar cualquier modo
   MIN_RR_REQUIRED    (default: 1.8)
   SKIP_AI_ON_STRONG  (default: true) — omite IA cuando modo=STRONG
-  AI_CALL_MIN_SCORE  (default: 8)    — score mínimo para llamar a la IA
+  AI_CALL_MIN_SCORE  (default: 7)    — score mínimo para llamar a la IA (era 8)
 """
 
 import logging
@@ -33,7 +33,10 @@ log = logging.getLogger(__name__)
 MIN_SIGNAL_SCORE  = int(os.getenv("MIN_SIGNAL_SCORE",  str(MIN_SCORE)))
 MIN_RR_REQUIRED   = float(os.getenv("MIN_RR_REQUIRED", str(MIN_RR)))
 SKIP_AI_ON_STRONG = os.getenv("SKIP_AI_ON_STRONG", "true").lower() != "false"
-AI_CALL_MIN_SCORE = int(os.getenv("AI_CALL_MIN_SCORE", "8"))
+# FIX: bajado de 8 a 7 — score 7 ahora pasa a la IA en vez de ir a HOLD directo
+AI_CALL_MIN_SCORE = int(os.getenv("AI_CALL_MIN_SCORE", "7"))
+# FIX: score mínimo para override técnico si la IA dice HOLD
+AI_HOLD_OVERRIDE_SCORE = int(os.getenv("AI_HOLD_OVERRIDE_SCORE", "8"))
 
 
 async def decide(
@@ -163,6 +166,23 @@ async def decide(
 
     if action not in ("BUY", "SELL", "HOLD", "CLOSE"):
         action = "HOLD"
+
+    # FIX: si la IA dice HOLD pero el score técnico es muy alto (>=AI_HOLD_OVERRIDE_SCORE),
+    # la señal técnica es suficientemente fuerte para entrar sin confirmación IA.
+    # Esto evita que la IA bloquee setups STRONG/NORMAL de alta calidad.
+    if action == "HOLD" and signal.score >= AI_HOLD_OVERRIDE_SCORE:
+        override_action = "BUY" if signal.signal == "LONG" else "SELL"
+        log.info(
+            f"[strategy] {symbol} 🔁 IA→HOLD pero score={signal.score}>={AI_HOLD_OVERRIDE_SCORE} "
+            f"→ override técnico {override_action}"
+        )
+        return _result(
+            override_action, signal, True,
+            f"🔁 Override técnico (score={signal.score}/{AI_HOLD_OVERRIDE_SCORE}) · IA dudó pero señal fuerte · "
+            f"lev {signal.suggested_lev}x | {ai_reason}",
+            ai_confidence=confidence,
+            ai_reason=ai_reason,
+        )
 
     return _result(
         action, signal, True,
