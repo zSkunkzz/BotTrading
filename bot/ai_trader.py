@@ -6,6 +6,7 @@ import time
 import asyncio
 import aiohttp
 from bot.indicators import ema, rsi, macd, supertrend, atr
+from bot.data_enricher import fetch_enriched_context, format_context_for_prompt
 from ai_rate_limiter import budget, RateLimitExhausted
 
 logger = logging.getLogger("AITrader")
@@ -15,27 +16,47 @@ GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:
 GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Caché de decisiones IA: {cache_key: (result_dict, timestamp)}
-# La clave incluye símbolo + señal técnica + precio redondeado al 0.1%
-# para que el caché se invalide cuando el precio cambia significativamente.
-# IMPORTANTE: los resultados HOLD para señales activas (BUY/SELL) NO se cachean,
-# así la IA se re-consulta en el siguiente tick en lugar de devolver HOLD indefinidamente.
-CACHE_TTL     = int(os.getenv("AI_CACHE_TTL",     "60"))   # 60s (antes 300s)
-CACHE_TTL_BUY = int(os.getenv("AI_CACHE_TTL_BUY", "60"))   # TTL para BUY/SELL confirmados
+# Caché de decisiones IA
+CACHE_TTL     = int(os.getenv("AI_CACHE_TTL",     "60"))
+CACHE_TTL_BUY = int(os.getenv("AI_CACHE_TTL_BUY", "60"))
 _ai_cache: dict = {}
 
-# Score mínimo para consultar la IA (scores bajos → HOLD directo sin llamada)
+# Caché del EnrichedContext: {symbol: (EnrichedContext, timestamp)}
+# Se reutiliza durante ENRICHED_CACHE_TTL segundos para evitar llamadas
+# duplicadas cuando múltiples señales llegan en el mismo tick.
+ENRICHED_CACHE_TTL = int(os.getenv("ENRICHED_CACHE_TTL", "120"))  # 2 min
+_enriched_cache: dict = {}
+
+# Score mínimo para consultar la IA
 AI_MIN_SCORE = int(os.getenv("AI_MIN_SCORE", "7"))
 
-SYSTEM_PROMPT = """You are a crypto futures trading expert. Reply ONLY with a JSON object, nothing else.
-Rules: CLOSE if pnl>+3% or pnl<-1.5% | No BUY if rsi>70 | No SELL if rsi<30 | vol_ratio>1.5 confirms, <0.7 weakens | If unsure -> HOLD
-JSON format (no extra text, no markdown):
-{"action":"BUY","confidence":8,"reason":"short reason"}
+SYSTEM_PROMPT = """You are a professional crypto futures trader. Reply ONLY with a JSON object, no extra text.
+
+You receive:
+  1. Technical indicators across multiple timeframes (score 0-10)
+  2. External market context: Fear & Greed index, Open Interest delta, funding rate, recent news
+
+Decision rules:
+  - CLOSE if pnl > +3% or pnl < -1.5%
+  - No BUY if rsi > 70 | No SELL if rsi < 30
+  - vol_ratio > 1.5 confirms signal | vol_ratio < 0.7 weakens signal
+  - Fear & Greed < 20 + BUY signal → reduce confidence by 1 or HOLD
+  - Fear & Greed > 80 + BUY signal → euphoria risk, reduce confidence by 1
+  - Funding rate > +0.05% → crowded longs, favor SELL
+  - Funding rate < -0.05% → crowded shorts, favor BUY
+  - OI delta > +5% with price falling → bearish pressure, favor SELL
+  - OI delta > +5% with price rising → strong conviction, confirm signal
+  - Bearish news + BUY signal → reduce confidence by 1
+  - Bullish news + SELL signal → reduce confidence by 1
+  - If unsure → HOLD
+
+JSON format (strict, no markdown):
+{"action":"BUY","confidence":8,"reason":"short reason max 15 words"}
 action must be one of: BUY SELL HOLD CLOSE"""
 
 
 def _price_bucket(price: float) -> int:
-    """Redondea el precio a un cubo de ~0.1% para invalidar caché al moverse el mercado."""
+    """Rounds price to ~0.1% bucket to invalidate cache when market moves."""
     if not price or price <= 0:
         return 0
     import math
@@ -64,7 +85,25 @@ def _parse_ai_json(raw: str) -> dict:
     return json.loads(raw[start:end + 1])
 
 
-def build_market_context(symbol, bars, position, entry_price, leverage):
+async def _get_enriched_context(symbol: str):
+    """Returns cached EnrichedContext or fetches a fresh one."""
+    now = time.monotonic()
+    cached = _enriched_cache.get(symbol)
+    if cached:
+        ctx, ts = cached
+        if (now - ts) < ENRICHED_CACHE_TTL:
+            return ctx
+    ctx = await fetch_enriched_context(symbol)
+    _enriched_cache[symbol] = (ctx, now)
+    # Evitar crecimiento infinito
+    if len(_enriched_cache) > 50:
+        oldest = min(_enriched_cache, key=lambda k: _enriched_cache[k][1])
+        del _enriched_cache[oldest]
+    return ctx
+
+
+def build_market_context(symbol, bars, position, entry_price, leverage,
+                         enriched_str: str = ""):
     closes = [b[4] for b in bars]
     highs  = [b[2] for b in bars]
     lows   = [b[3] for b in bars]
@@ -103,6 +142,10 @@ def build_market_context(symbol, bars, position, entry_price, leverage):
         else:
             pnl = (entry_price - closes[-1]) / entry_price * 100 * leverage
         ctx["pnl"] = round(pnl, 2)
+
+    if enriched_str:
+        ctx["external"] = enriched_str
+
     return ctx
 
 
@@ -273,75 +316,68 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
 
     price_bucket = _price_bucket(current_price)
 
+    # Fetch enriched context (cached, no-throw)
+    enriched = await _get_enriched_context(symbol)
+    enriched_str = format_context_for_prompt(enriched)
+
     if context_override:
         context = context_override
         tech_signal = context_override.get("signal", "NEUTRAL")
         fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
         score = context_override.get("score", 0)
 
-        # FILTRO SCORE: si el score es bajo, no consultar IA → HOLD directo
         if score < AI_MIN_SCORE:
-            logger.info(f"[{symbol}] ⏭️ Score {score}/10 < {AI_MIN_SCORE} → HOLD sin IA (ahorro Gemini)")
+            logger.info(f"[{symbol}] \u23ed\ufe0f Score {score}/10 < {AI_MIN_SCORE} \u2192 HOLD sin IA")
             return {"action": "HOLD", "confidence": 4, "reasoning": f"Score {score}/10 insuficiente", "key_factors": []}
 
-        # CACHÉ: clave incluye precio para invalidarse cuando el mercado se mueve
         cache_key = f"{symbol}:{score}:{tech_signal}:{price_bucket}"
         now = time.monotonic()
         if cache_key in _ai_cache:
             cached_result, cached_ts = _ai_cache[cache_key]
             age = int(now - cached_ts)
-            # Solo usar caché si la acción es BUY/SELL (confirmada).
-            # Un HOLD cacheado bloquearía nuevas entradas — se re-evalúa siempre.
             if cached_result.get("action") in ("BUY", "SELL", "CLOSE") and age < CACHE_TTL:
-                logger.info(f"[{symbol}] 🔄 IA cached ({age}s ago): {cached_result.get('action')} → ahorro Gemini")
+                logger.info(f"[{symbol}] \U0001f504 IA cached ({age}s ago): {cached_result.get('action')}")
                 return cached_result
-            elif cached_result.get("action") == "HOLD" and age < CACHE_TTL:
-                # HOLD cacheado: log reducido para no saturar logs, pero SÍ se re-evalúa
-                pass  # cae al bloque de consulta IA abajo
 
-        logger.info(f"[{symbol}] IA consultada (score={score}/10)")
+        # Inject enriched context into the payload sent to the LLM
+        context = {**context_override, "external": enriched_str}
+        logger.info(f"[{symbol}] IA consultada (score={score}/10) + contexto externo")
+
     else:
         tech = _technical_signal(bars)
         if tech["signal"] == "HOLD":
-            return {"action": "HOLD", "confidence": tech["confidence"], "reasoning": "Sin señal técnica", "key_factors": []}
-        context = build_market_context(symbol, bars, position, entry_price, leverage)
+            return {"action": "HOLD", "confidence": tech["confidence"], "reasoning": "Sin se\u00f1al t\u00e9cnica", "key_factors": []}
+
+        context = build_market_context(symbol, bars, position, entry_price, leverage,
+                                       enriched_str=enriched_str)
         fallback_action = tech["signal"]
 
-        # CACHÉ: clave incluye señal técnica + precio
         cache_key = f"{symbol}:tech:{tech['signal']}:{price_bucket}"
         now = time.monotonic()
-
         if cache_key in _ai_cache:
             cached_result, cached_ts = _ai_cache[cache_key]
             age = int(now - cached_ts)
-            # Solo cachear BUY/SELL confirmados. Si la IA dijo HOLD a una señal BUY/SELL,
-            # no lo cacheamos para que el próximo tick lo re-evalúe.
             if cached_result.get("action") in ("BUY", "SELL", "CLOSE") and age < CACHE_TTL_BUY:
-                logger.info(f"[{symbol}] 🔄 IA cached técnico ({age}s ago): {cached_result.get('action')}")
+                logger.info(f"[{symbol}] \U0001f504 IA cached t\u00e9cnico ({age}s ago): {cached_result.get('action')}")
                 return cached_result
-            # HOLD sobre señal activa: no cachear, seguir hacia la llamada IA
 
-        logger.info(f"[{symbol}] Técnico {tech['signal']} → IA")
+        logger.info(f"[{symbol}] T\u00e9cnico {tech['signal']} \u2192 IA + contexto externo")
 
     result = await _call_gemini(context)
     if not result:
         result = await _call_groq(context)
     if not result:
-        logger.warning(f"[{symbol}] Sin IA → fallback técnico")
-        result = {"action": fallback_action, "confidence": 7, "reasoning": "Fallback técnico", "key_factors": []}
+        logger.warning(f"[{symbol}] Sin IA \u2192 fallback t\u00e9cnico")
+        result = {"action": fallback_action, "confidence": 7, "reasoning": "Fallback t\u00e9cnico", "key_factors": []}
 
     confidence = result.get("confidence", 5)
     min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "6"))
     if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
         result["action"] = "HOLD"
 
-    # Solo guardar en caché si la acción es BUY/SELL/CLOSE.
-    # Los HOLD no se cachean: la próxima vez que haya señal técnica activa
-    # se volverá a consultar la IA en lugar de servir un HOLD indefinido.
     action = result.get("action")
     if action in ("BUY", "SELL", "CLOSE"):
         _ai_cache[cache_key] = (result, now)
-        # Limpiar caché antigua
         if len(_ai_cache) > 200:
             oldest_key = min(_ai_cache, key=lambda k: _ai_cache[k][1])
             del _ai_cache[oldest_key]
