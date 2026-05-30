@@ -25,8 +25,9 @@ _ai_cache: dict = {}
 ENRICHED_CACHE_TTL = int(os.getenv("ENRICHED_CACHE_TTL", "120"))  # 2 min
 _enriched_cache: dict = {}
 
-# FIX: AI_MIN_SCORE — solo aplica en el path sin context_override (señal técnica directa)
-# En el path con context_override el filtro de score ya lo hace strategy.py
+# AI_MIN_SCORE: solo aplica en el path directo SIN context_override.
+# Cuando viene de strategy.py (context_override presente), el score
+# ya fue validado con AI_CALL_MIN_SCORE — no se aplica doble filtro.
 AI_MIN_SCORE = int(os.getenv("AI_MIN_SCORE", "7"))
 
 SYSTEM_PROMPT = """You are a professional crypto futures trader. Reply ONLY with a JSON object, no extra text.
@@ -325,13 +326,13 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
         score           = context_override.get("score", 0)
 
-        # FIX: el filtro de score aquí solo aplica en el path directo (sin strategy.py).
-        # Cuando viene de strategy.py, el score ya fue validado con AI_CALL_MIN_SCORE=7.
-        # Mantenemos el guard pero con el mismo umbral para consistencia.
-        if score < AI_MIN_SCORE:
-            logger.info(f"[{symbol}] \u23ed\ufe0f Score {score}/10 < {AI_MIN_SCORE} \u2192 HOLD sin IA")
-            return {"action": "HOLD", "confidence": 4,
-                    "reasoning": f"Score {score}/10 insuficiente", "key_factors": []}
+        # FIX: cuando viene de strategy.py con context_override, el score ya fue
+        # validado por AI_CALL_MIN_SCORE en strategy.py. NO aplicar doble filtro aquí.
+        # El guard AI_MIN_SCORE solo aplica en el path directo (sin strategy.py).
+        # Comentado para evitar el HOLD silencioso que bloqueaba todas las entradas.
+        # if score < AI_MIN_SCORE:
+        #     logger.info(f"[{symbol}] Score {score}/10 < {AI_MIN_SCORE} → HOLD sin IA")
+        #     return {"action": "HOLD", "confidence": 4, ...}
 
         cache_key = f"{symbol}:{score}:{tech_signal}:{price_bucket}"
         now       = time.monotonic()
@@ -347,7 +348,7 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         logger.info(f"[{symbol}] IA consultada (score={score}/10) + contexto externo")
 
     else:
-        # FIX: guard — si no hay bars suficientes no podemos calcular señal técnica
+        # Path directo sin strategy.py: aquí sí aplicamos AI_MIN_SCORE
         if not bars or len(bars) < 30:
             logger.warning(f"[{symbol}] ai_decide: bars insuficientes ({len(bars) if bars else 0}), HOLD")
             return {"action": "HOLD", "confidence": 3,
@@ -382,9 +383,6 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
                   "reasoning": "Fallback técnico", "key_factors": []}
 
     confidence = result.get("confidence", 5)
-    # FIX: bajado de 6 a 5 — la IA puede confirmar con confianza moderada.
-    # Un 5/10 es suficiente para no bloquear señales técnicas buenas.
-    # Si se quiere más conservador, subir AI_MIN_CONFIDENCE a 6 en .env
     min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "5"))
     if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
         logger.info(f"[{symbol}] IA confidence {confidence} < {min_conf} → HOLD")
