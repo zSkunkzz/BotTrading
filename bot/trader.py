@@ -38,6 +38,10 @@ _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
 _FILL_WAIT_MAX_S   = float(os.getenv("FILL_WAIT_MAX_S", "8.0"))
 _FILL_POLL_INTERVAL = float(os.getenv("FILL_POLL_INTERVAL", "0.5"))
 
+# ── TPSL retry config (fix code 31008) ────────────────────────────────────────
+_TPSL_MAX_RETRIES   = int(os.getenv("TPSL_MAX_RETRIES", "5"))
+_TPSL_RETRY_DELAY_S = float(os.getenv("TPSL_RETRY_DELAY_S", "0.5"))
+
 _MIN_QTY_FALLBACK = {
     "BTCUSDT":   0.001,
     "ETHUSDT":   0.01,
@@ -421,7 +425,7 @@ class FuturesTrader:
         logger.warning("[%s] _get_positions fallo", self.symbol)
         return None
 
-    # -- TPSL server-side (Unified Account v3) - CORREGIDO --------------------
+    # -- TPSL server-side (Unified Account v3) ---------------------------------
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
         if not self.position:
@@ -433,7 +437,6 @@ class FuturesTrader:
         is_long  = (self.position == "long")
         is_hedge = (self._ua_pos_mode == "hedge")
 
-        # ✅ CORRECCIÓN CRÍTICA: side debe ser "close_long" o "close_short"
         close_side = "close_long" if is_long else "close_short"
 
         if self.dry_run:
@@ -452,11 +455,11 @@ class FuturesTrader:
             "symbol":   sym,
             "type":     "tpsl",
             "tpslMode": "full",
-            "side":     close_side,      # ✅ aquí el cambio
+            "side":     close_side,
         }
 
         if is_hedge:
-            payload["posSide"] = self.position   # "long" o "short"
+            payload["posSide"] = self.position
         else:
             payload["reduceOnly"] = "yes"
 
@@ -467,7 +470,6 @@ class FuturesTrader:
             payload["takeProfit"]  = str(tp)
             payload["tpTriggerBy"] = "last_price"
 
-        # Log detallado para depuración
         logger.info("[%s] TPSL payload: %s", self.symbol, payload)
 
         try:
@@ -488,6 +490,38 @@ class FuturesTrader:
         except Exception as e:
             logger.error("[%s] _place_pos_tpsl exception: %s", self.symbol, e)
             return {"code": "ERROR", "msg": str(e)}
+
+    # -- TPSL con retry ante code 31008 (posicion aun no visible en Bitget) ----
+
+    async def _place_pos_tpsl_with_retry(self, sl: float | None = None, tp: float | None = None) -> dict:
+        """
+        Envuelve _place_pos_tpsl con reintentos exponenciales.
+        El error 31008 ('no position') ocurre cuando la orden de mercado fue
+        aceptada pero la posicion aun no es visible en el libro de Bitget.
+        Reintentamos hasta _TPSL_MAX_RETRIES veces con backoff antes de rendirnos.
+        """
+        last_r: dict = {}
+        for attempt in range(1, _TPSL_MAX_RETRIES + 1):
+            r = await self._place_pos_tpsl(sl=sl, tp=tp)
+            code = r.get("code", "")
+            if code == "00000":
+                return r
+            if code == "31008":
+                wait = _TPSL_RETRY_DELAY_S * (2 ** (attempt - 1))
+                logger.warning(
+                    "[%s] TPSL code 31008 (posicion aun no visible) -- reintento %d/%d en %.1fs",
+                    self.symbol, attempt, _TPSL_MAX_RETRIES, wait,
+                )
+                await asyncio.sleep(wait)
+                last_r = r
+                continue
+            # Cualquier otro error no es retriable
+            return r
+        logger.error(
+            "[%s] TPSL code 31008 persiste tras %d reintentos -- posicion sin proteccion",
+            self.symbol, _TPSL_MAX_RETRIES,
+        )
+        return last_r
 
     # -- Verificar TPSL activo -------------------------------------------------
 
@@ -510,7 +544,7 @@ class FuturesTrader:
                 logger.debug("[%s] TPSL verify OK — %d orden(es) activa(s)", self.symbol, len(active))
                 return True
             logger.error("[%s] TPSL verify FALLO — recolocando...", self.symbol)
-            tpsl_r = await self._place_pos_tpsl(sl=self.sl, tp=self.tp3)
+            tpsl_r = await self._place_pos_tpsl_with_retry(sl=self.sl, tp=self.tp3)
             if tpsl_r.get("code") == "00000":
                 self._protection_ok = True
                 self._last_tpsl_verify_at = time.time()
@@ -704,6 +738,43 @@ class FuturesTrader:
         qty = round(qty, decimals)
         return qty
 
+    # -- Helpers internos: colocar TPSL tras confirmar posicion ----------------
+
+    async def _confirm_and_place_tpsl(self, sl: float | None, tp: float | None) -> bool:
+        """
+        Espera a que la posicion sea visible en Bitget y luego coloca el TPSL
+        con reintentos ante code 31008. Devuelve True si el TPSL quedo activo.
+        Loggea y envia alerta Telegram si la posicion no se confirma a tiempo.
+        """
+        pos_confirmed = await self._wait_for_position_open()
+        if not pos_confirmed:
+            # La posicion no aparece tras FILL_WAIT_MAX_S segundos.
+            # No enviamos TPSL para evitar errores; reconcile_position lo detectara.
+            logger.error(
+                "[%s] Posicion no confirmada en %.0fs -- TPSL omitido. "
+                "reconcile_position intentara recuperar el estado.",
+                self.symbol, _FILL_WAIT_MAX_S,
+            )
+            try:
+                from bot.telegram_bot import send_message
+                await send_message(
+                    f"🚨 <b>TPSL omitido</b> — <code>{self.symbol}</code>\n"
+                    f"Posición no confirmada en {_FILL_WAIT_MAX_S:.0f}s.\n"
+                    f"SL={sl} TP={tp}\n"
+                    f"El watchdog intentará colocarlo en el próximo ciclo."
+                )
+            except Exception:
+                pass
+            return False
+
+        tpsl_r = await self._place_pos_tpsl_with_retry(sl=sl, tp=tp)
+        if tpsl_r.get("code") == "00000":
+            logger.info("[%s] TPSL confirmado", self.symbol)
+            return True
+        else:
+            logger.error("[%s] TPSL fallo tras reintentos: %s", self.symbol, tpsl_r)
+            return False
+
     # -- Abrir posiciones ------------------------------------------------------
 
     async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
@@ -732,14 +803,10 @@ class FuturesTrader:
             save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, usdt_amount=usdt_amount, leverage=lev)
             logger.warning("[%s] LONG @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            await self._wait_for_position_open()
-            tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
-            if tpsl_r.get("code") == "00000":
-                self._protection_ok = True
-                logger.info("[%s] TPSL confirmado", self.symbol)
-            else:
-                self._protection_ok = False
-                logger.error("[%s] TPSL fallo", self.symbol)
+            # ── FIX: esperar confirmacion de posicion ANTES del TPSL ──────────
+            tpsl_ok = await self._confirm_and_place_tpsl(sl=sl, tp=tp3)
+            self._protection_ok = tpsl_ok
+            # reconcile siempre, incluso si el TPSL fallo (watchdog lo reintentara)
             await self.reconcile_position()
         else:
             logger.error("[%s] open_long FAILED: %s", self.symbol, r)
@@ -770,14 +837,10 @@ class FuturesTrader:
             save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, usdt_amount=usdt_amount, leverage=lev)
             logger.warning("[%s] SHORT @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            await self._wait_for_position_open()
-            tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
-            if tpsl_r.get("code") == "00000":
-                self._protection_ok = True
-                logger.info("[%s] TPSL confirmado", self.symbol)
-            else:
-                self._protection_ok = False
-                logger.error("[%s] TPSL fallo", self.symbol)
+            # ── FIX: esperar confirmacion de posicion ANTES del TPSL ──────────
+            tpsl_ok = await self._confirm_and_place_tpsl(sl=sl, tp=tp3)
+            self._protection_ok = tpsl_ok
+            # reconcile siempre, incluso si el TPSL fallo (watchdog lo reintentara)
             await self.reconcile_position()
         else:
             logger.error("[%s] open_short FAILED: %s", self.symbol, r)
