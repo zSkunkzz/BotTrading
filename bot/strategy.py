@@ -3,17 +3,17 @@
 strategy.py — Lógica de decisión de BotTrading
 
 Flujo y coste IA:
-  NONE   (score<4)   → HOLD directo, sin IA
-  EARLY  (score 4-6) → consulta IA si score >= AI_CALL_MIN_SCORE (default 5)
+  NONE   (score<5)   → HOLD directo, sin IA
+  EARLY  (score 5-6) → consulta IA si score >= AI_CALL_MIN_SCORE (default 6)
   NORMAL (score 7)   → confirma con IA
-  NORMAL (score >=7) → confirma con IA; si IA dice HOLD y score>=7 → override técnico
-  STRONG (score >=8) → entra directo, sin IA (máxima confluencia)
+  NORMAL (score >=8) → confirma con IA; si IA dice HOLD y score>=8 → override técnico
+  STRONG (score >=9) → entra directo, sin IA (máxima confluencia)
 
 Variables de entorno:
-  MIN_SIGNAL_SCORE   (default: 4)    — mínimo para activar cualquier modo
-  MIN_RR_REQUIRED    (default: 1.5)
+  MIN_SIGNAL_SCORE   (default: 5)    — mínimo para activar cualquier modo
+  MIN_RR_REQUIRED    (default: 1.8)
   SKIP_AI_ON_STRONG  (default: true) — omite IA cuando modo=STRONG
-  AI_CALL_MIN_SCORE  (default: 5)    — score mínimo para llamar a la IA
+  AI_CALL_MIN_SCORE  (default: 6)    — score mínimo para llamar a la IA
 """
 
 import logging
@@ -30,11 +30,11 @@ from bot.signal_engine import (
 
 log = logging.getLogger(__name__)
 
-MIN_SIGNAL_SCORE  = int(os.getenv("MIN_SIGNAL_SCORE",  "4"))
-MIN_RR_REQUIRED   = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
+MIN_SIGNAL_SCORE  = int(os.getenv("MIN_SIGNAL_SCORE",  "5"))
+MIN_RR_REQUIRED   = float(os.getenv("MIN_RR_REQUIRED", "1.8"))
 SKIP_AI_ON_STRONG = os.getenv("SKIP_AI_ON_STRONG", "true").lower() != "false"
-AI_CALL_MIN_SCORE = int(os.getenv("AI_CALL_MIN_SCORE", "5"))
-AI_HOLD_OVERRIDE_SCORE = int(os.getenv("AI_HOLD_OVERRIDE_SCORE", "7"))
+AI_CALL_MIN_SCORE = int(os.getenv("AI_CALL_MIN_SCORE", "6"))
+AI_HOLD_OVERRIDE_SCORE = int(os.getenv("AI_HOLD_OVERRIDE_SCORE", "8"))
 
 
 async def decide(
