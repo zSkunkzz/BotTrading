@@ -8,6 +8,7 @@ import time
 import json as _json
 import aiohttp
 import ccxt.async_support as ccxt
+from ccxt.base.errors import RateLimitExceeded, DDoSProtection
 from bot.strategy import decide
 from bot.ai_trader import ai_decide
 from bot.telegram_bot import notify_open, notify_close
@@ -311,8 +312,23 @@ class FuturesTrader:
             logger.debug("[%s] get_ohlcv WS error: %s", self.symbol, e)
 
         tf_ccxt = {"15m": "15m", "1h": "1h", "4h": "4h"}.get(tf, tf)
-        bars = await self.exchange.fetch_ohlcv(self.symbol, tf_ccxt, limit=OHLCV_LIMIT)
-        return bars
+        # ── Fix: retry con backoff exponencial ante 429 ─────────────────
+        _max_retries = 4
+        _base_delay  = 2.0
+        for _attempt in range(_max_retries):
+            try:
+                bars = await self.exchange.fetch_ohlcv(self.symbol, tf_ccxt, limit=OHLCV_LIMIT)
+                return bars
+            except (RateLimitExceeded, DDoSProtection) as _e:
+                if _attempt == _max_retries - 1:
+                    raise
+                _wait = _base_delay * (2 ** _attempt)
+                logger.warning(
+                    "[%s] Rate limit 429 – reintento %d/%d en %.0fs: %s",
+                    self.symbol, _attempt + 1, _max_retries, _wait, _e,
+                )
+                await asyncio.sleep(_wait)
+        return []  # inalcanzable
 
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
@@ -912,7 +928,15 @@ class FuturesTrader:
                         await self.open_short(usdt, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
             except asyncio.CancelledError:
                 logger.info("[%s] Loop cancelado", self.symbol)
-                return
+                break
             except Exception as e:
                 logger.error("[%s] Loop error: %s", self.symbol, e, exc_info=True)
             await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
+        # ── Fix: cerrar sesión ccxt al salir del loop ─────────────────
+        if self.exchange:
+            try:
+                await self.exchange.close()
+            except Exception:
+                pass
+            self.exchange = None
+            logger.debug("[%s] exchange.close() OK", self.symbol)

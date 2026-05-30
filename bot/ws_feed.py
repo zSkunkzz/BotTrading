@@ -168,6 +168,7 @@ class WSFeed:
         self._cache:   Dict[str, _SymbolCache] = {}
         self._symbols: List[str] = []
         self._running  = False
+        self._last_pong_ts: float = 0.0
         self._task:    Optional[asyncio.Task] = None
 
     # ── API pública ───────────────────────────────────────────────────────────
@@ -315,17 +316,42 @@ class WSFeed:
             log.debug(f"[WSFeed] Suscrito batch {i//100 + 1} ({len(batch)} canales)")
 
     async def _ping_loop(self, ws):
+        """Envía ping cada PING_INTERVAL segundos.
+        Si Bitget no responde 'pong' en PONG_TIMEOUT segundos, cierra el WS
+        para forzar reconexión inmediata en _run_loop.
+        """
+        PONG_TIMEOUT = 15.0  # segundos máx esperando pong
         while self._running:
             await asyncio.sleep(PING_INTERVAL)
             try:
                 await ws.send_str("ping")
             except Exception:
                 break
+            # Esperar pong con timeout
+            deadline = asyncio.get_event_loop().time() + PONG_TIMEOUT
+            ponged = False
+            while asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.5)
+                # _pong_received se actualiza en _handle_message cuando llega 'pong'
+                if getattr(ws, '_pong_received', False) or getattr(self, '_last_pong_ts', 0) > (deadline - PONG_TIMEOUT):
+                    ponged = True
+                    break
+            if not ponged:
+                log.error(
+                    "[WSFeed] Sin PONG tras %.0fs – cerrando para reconectar",
+                    PONG_TIMEOUT,
+                )
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                break
 
     # ── Procesado de mensajes ─────────────────────────────────────────────────
 
     def _handle_message(self, raw: str):
         if raw == "pong":
+            self._last_pong_ts = asyncio.get_event_loop().time()
             return
         try:
             msg = json.loads(raw)
