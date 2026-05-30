@@ -4,8 +4,8 @@ strategy.py — Lógica de decisión de BotTrading
 
 Flujo y coste IA:
   NONE   (score<5)   → HOLD directo, sin IA
-  EARLY  (score 5-6) → HOLD directo, sin IA
-  NORMAL (score 7)   → confirma con IA (score suficiente desde AI_CALL_MIN_SCORE=7)
+  EARLY  (score 5-6) → consulta IA si score >= AI_CALL_MIN_SCORE (default 6)
+  NORMAL (score 7)   → confirma con IA
   NORMAL (score >=8) → confirma con IA; si IA dice HOLD y score>=8 → override técnico
   STRONG (score >=8) → entra directo, sin IA (máxima confluencia)
 
@@ -13,7 +13,7 @@ Variables de entorno:
   MIN_SIGNAL_SCORE   (default: 5)    — mínimo para activar cualquier modo
   MIN_RR_REQUIRED    (default: 1.8)
   SKIP_AI_ON_STRONG  (default: true) — omite IA cuando modo=STRONG
-  AI_CALL_MIN_SCORE  (default: 7)    — score mínimo para llamar a la IA (era 8)
+  AI_CALL_MIN_SCORE  (default: 6)    — score mínimo para llamar a la IA (bajado de 7 a 6)
 """
 
 import logging
@@ -33,8 +33,8 @@ log = logging.getLogger(__name__)
 MIN_SIGNAL_SCORE  = int(os.getenv("MIN_SIGNAL_SCORE",  str(MIN_SCORE)))
 MIN_RR_REQUIRED   = float(os.getenv("MIN_RR_REQUIRED", str(MIN_RR)))
 SKIP_AI_ON_STRONG = os.getenv("SKIP_AI_ON_STRONG", "true").lower() != "false"
-# FIX: bajado de 8 a 7 — score 7 ahora pasa a la IA en vez de ir a HOLD directo
-AI_CALL_MIN_SCORE = int(os.getenv("AI_CALL_MIN_SCORE", "7"))
+# FIX: bajado de 7 a 6 — score 6 ahora pasa a la IA en vez de ir a HOLD directo
+AI_CALL_MIN_SCORE = int(os.getenv("AI_CALL_MIN_SCORE", "6"))
 # FIX: score mínimo para override técnico si la IA dice HOLD
 AI_HOLD_OVERRIDE_SCORE = int(os.getenv("AI_HOLD_OVERRIDE_SCORE", "8"))
 
@@ -94,21 +94,14 @@ async def decide(
             f"💥 STRONG entry directo · score={signal.score}/10 · lev={signal.suggested_lev}x"
         )
 
-    # EARLY: score bajo (5-6), no justifica llamada a IA
-    if signal.entry_mode == "EARLY":
-        return _result(
-            "HOLD", signal, False,
-            f"⏭️ EARLY score={signal.score}/10 → HOLD sin IA"
-        )
-
-    # NORMAL con score bajo: sin IA
+    # EARLY o NORMAL con score bajo: sin suficiente confluencia para llamar a IA
     if signal.score < AI_CALL_MIN_SCORE:
         return _result(
             "HOLD", signal, False,
-            f"⏭️ NORMAL score={signal.score}/10 < {AI_CALL_MIN_SCORE} → HOLD sin IA"
+            f"⏭️ score={signal.score}/10 < {AI_CALL_MIN_SCORE} → HOLD sin IA"
         )
 
-    # NORMAL con score >= AI_CALL_MIN_SCORE: confirmar con IA
+    # EARLY/NORMAL con score >= AI_CALL_MIN_SCORE: confirmar con IA
     i15 = signal.indicators.get("15m", {})
     i1h = signal.indicators.get("1h",  {})
     i4h = signal.indicators.get("4h",  {})
@@ -139,7 +132,7 @@ async def decide(
         "rsi_15m":       i15.get("rsi_val", 50),
     }
 
-    log.info(f"[strategy] {symbol} 🤖 Consultando IA (score={signal.score}/10, mode=NORMAL)")
+    log.info(f"[strategy] {symbol} 🤖 Consultando IA (score={signal.score}/10, mode={signal.entry_mode})")
 
     try:
         # FIX: bars=[] es intencional aquí — ai_decide usa context_override y no accede a bars
@@ -169,7 +162,6 @@ async def decide(
 
     # FIX: si la IA dice HOLD pero el score técnico es muy alto (>=AI_HOLD_OVERRIDE_SCORE),
     # la señal técnica es suficientemente fuerte para entrar sin confirmación IA.
-    # Esto evita que la IA bloquee setups STRONG/NORMAL de alta calidad.
     if action == "HOLD" and signal.score >= AI_HOLD_OVERRIDE_SCORE:
         override_action = "BUY" if signal.signal == "LONG" else "SELL"
         log.info(
