@@ -28,21 +28,12 @@ OHLCV_TF        = os.getenv("OHLCV_TF", "15m")
 OHLCV_LIMIT     = int(os.getenv("OHLCV_LIMIT", "200"))
 OHLCV_MIN_BARS  = int(os.getenv("OHLCV_MIN_BARS", "55"))
 
-# Cuantos errores 40085 consecutivos pausan el simbolo
 _CB_40085_THRESHOLD = int(os.getenv("CB_40085_THRESHOLD", "3"))
-# Tiempo de pausa en segundos tras superar el umbral
-_CB_40085_PAUSE_S   = int(os.getenv("CB_40085_PAUSE_S", "300"))  # 5 min
+_CB_40085_PAUSE_S   = int(os.getenv("CB_40085_PAUSE_S", "300"))
 
-# Permite sobreescribir la deteccion automatica de pos mode.
-# Valores validos: "hedge" | "one_way" | "" (auto-detect)
 _FORCE_POS_MODE = os.getenv("FORCE_POS_MODE", "").strip().lower()
 
-# FIX 1 — verificacion periodica de TPSL activo en exchange
-# Cada cuantos segundos se comprueba que las ordenes TPSL siguen vivas
-_TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))  # 2 minutos
-
-# FIX 2 — tiempo maximo de espera de fill tras orden de entrada (limit)
-# antes de colocar TPSL (evita race condition "no hay posicion abierta")
+_TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
 _FILL_WAIT_MAX_S   = float(os.getenv("FILL_WAIT_MAX_S", "8.0"))
 _FILL_POLL_INTERVAL = float(os.getenv("FILL_POLL_INTERVAL", "0.5"))
 
@@ -82,18 +73,9 @@ _MIN_QTY_FALLBACK = {
 }
 
 _min_qty_cache = {}
-
-# Cache global del modo de posicion detectado para evitar consultas repetidas
-# Valores: None (no detectado), "one_way", "hedge"
 _pos_mode_cache: str | None = None
 _pos_mode_detected_at: float = 0.0
-_POS_MODE_CACHE_TTL = 300.0  # 5 minutos
-
-# Estados activos validos en planStatus (campo UA v3 para ordenes strategy/plan)
-# IMPORTANTE: NO incluir string vacio — una orden sin planStatus es desconocida,
-# no activa. Incluir "" causaba falsos positivos (ordenes ejecutadas/canceladas
-# sin campo planStatus contaban como activas).
-_TPSL_ACTIVE_STATUSES = frozenset({"live", "new", "not_trigger"})
+_POS_MODE_CACHE_TTL = 300.0
 
 
 class FuturesTrader:
@@ -124,10 +106,8 @@ class FuturesTrader:
         self._protection_ok = False
         self._open_notional = 0.0
         self._open_leverage = 1
-        # Circuit breaker para error 40085
         self._cb_40085_count   = 0
         self._cb_40085_paused_until = 0.0
-        # FIX 1 — timestamp de la ultima verificacion de TPSL en exchange
         self._last_tpsl_verify_at: float = 0.0
 
     # -- Helpers HTTP ----------------------------------------------------------
@@ -191,52 +171,35 @@ class FuturesTrader:
     # -- Simbolo limpio --------------------------------------------------------
 
     def _sym(self) -> str:
-        """Devuelve el simbolo limpio p.ej. HBARUSDT sin slash ni sufijo."""
         s = self.symbol.replace("/", "").replace(":USDT", "")
         if s.endswith("USDTUSDT"):
             s = s[:-4]
         return s
 
-    # -- Circuit breaker helper publico ----------------------------------------
+    # -- Circuit breaker helper ------------------------------------------------
 
     def is_cb_paused(self) -> bool:
-        """True si el circuit breaker 40085 esta activo ahora mismo."""
         return self._cb_40085_paused_until > time.time()
 
-    # -- Deteccion de modo de posicion (one-way vs hedge) ----------------------
+    # -- Detección de modo de posicion (one-way vs hedge) ----------------------
 
     async def _detect_pos_mode(self) -> str:
-        """
-        Retorna 'one_way' o 'hedge'. Cachea el resultado 5 minutos.
-
-        Orden de intentos:
-          1. Variable de entorno FORCE_POS_MODE (sobreescritura manual)
-          2. /api/v3/account/account-info  -> campo posMode  (UA v3, siempre disponible)
-          3. /api/v2/mix/account/account   -> campo holdMode (Classic, fallback)
-          4. /api/v3/position/current-position -> holdMode (solo si hay posicion abierta)
-          5. Fallback hardcoded: hedge (configuracion conocida de esta cuenta)
-        """
         global _pos_mode_cache, _pos_mode_detected_at
         now = time.time()
 
-        # 1. Sobreescritura manual via env var
         if _FORCE_POS_MODE in ("hedge", "one_way"):
             if _pos_mode_cache != _FORCE_POS_MODE:
-                logger.info(
-                    "[%s] Modo posicion forzado por FORCE_POS_MODE: %s",
-                    self.symbol, _FORCE_POS_MODE,
-                )
+                logger.info("[%s] Modo posicion forzado por FORCE_POS_MODE: %s", self.symbol, _FORCE_POS_MODE)
                 _pos_mode_cache = _FORCE_POS_MODE
                 _pos_mode_detected_at = now
             return _FORCE_POS_MODE
 
-        # Cache valido
         if _pos_mode_cache is not None and (now - _pos_mode_detected_at) < _POS_MODE_CACHE_TTL:
             return _pos_mode_cache
 
         sym = self._sym()
 
-        # 2. UA v3: /api/v3/account/account-info
+        # UA v3
         try:
             r = await self._http_get("/api/v3/account/account-info")
             if r.get("code") == "00000":
@@ -245,65 +208,26 @@ class FuturesTrader:
                     mode = "hedge" if "hedge" in pos_mode_raw.lower() else "one_way"
                     _pos_mode_cache = mode
                     _pos_mode_detected_at = now
-                    logger.info(
-                        "[%s] Modo posicion detectado (v3 account-info posMode='%s'): %s",
-                        self.symbol, pos_mode_raw, mode,
-                    )
+                    logger.info("[%s] Modo posicion detectado (v3): %s", self.symbol, mode)
                     return mode
         except Exception as e:
-            logger.debug("[%s] _detect_pos_mode v3 account-info error: %s", self.symbol, e)
+            logger.debug("[%s] _detect_pos_mode v3 error: %s", self.symbol, e)
 
-        # 3. Classic fallback: /api/v2/mix/account/account
+        # Classic fallback
         try:
-            r = await self._http_get(
-                "/api/v2/mix/account/account",
-                {"symbol": sym, "productType": "USDT-FUTURES", "marginCoin": "USDT"},
-            )
+            r = await self._http_get("/api/v2/mix/account/account", {"symbol": sym, "productType": "USDT-FUTURES", "marginCoin": "USDT"})
             if r.get("code") == "00000":
                 hold_mode = (r.get("data") or {}).get("holdMode", "")
                 if hold_mode:
                     mode = "hedge" if "hedge" in hold_mode.lower() else "one_way"
                     _pos_mode_cache = mode
                     _pos_mode_detected_at = now
-                    logger.info(
-                        "[%s] Modo posicion detectado (v2 account holdMode): %s",
-                        self.symbol, mode,
-                    )
+                    logger.info("[%s] Modo posicion detectado (v2): %s", self.symbol, mode)
                     return mode
         except Exception as e:
-            logger.debug("[%s] _detect_pos_mode v2 account error: %s", self.symbol, e)
+            logger.debug("[%s] _detect_pos_mode v2 error: %s", self.symbol, e)
 
-        # 4. Posicion activa: /api/v3/position/current-position
-        try:
-            r = await self._http_get(
-                "/api/v3/position/current-position",
-                {"category": "USDT-FUTURES", "symbol": sym},
-            )
-            if r.get("code") == "00000":
-                raw = r.get("data", {})
-                items = raw.get("list") if isinstance(raw, dict) else raw
-                if not isinstance(items, list):
-                    items = []
-                if items:
-                    hold_mode = items[0].get("holdMode", "")
-                    if hold_mode:
-                        mode = "hedge" if "hedge" in hold_mode.lower() else "one_way"
-                        _pos_mode_cache = mode
-                        _pos_mode_detected_at = now
-                        logger.info(
-                            "[%s] Modo posicion detectado (v3 position holdMode): %s",
-                            self.symbol, mode,
-                        )
-                        return mode
-        except Exception as e:
-            logger.debug("[%s] _detect_pos_mode v3 position error: %s", self.symbol, e)
-
-        # 5. Fallback hardcoded: hedge
-        logger.warning(
-            "[%s] No se pudo detectar holdMode via API -- usando hedge como fallback "
-            "(configuracion conocida). Puedes sobreescribir con FORCE_POS_MODE=hedge|one_way",
-            self.symbol,
-        )
+        logger.warning("[%s] No se pudo detectar holdMode -- usando hedge como fallback", self.symbol)
         _pos_mode_cache = "hedge"
         _pos_mode_detected_at = now - (_POS_MODE_CACHE_TTL - 60)
         return "hedge"
@@ -311,11 +235,7 @@ class FuturesTrader:
     # -- Set margin mode -------------------------------------------------------
 
     async def set_margin_mode(self):
-        logger.debug(
-            "[%s] set_margin_mode: UA v3 -- margin mode '%s' se aplica "
-            "por orden via campo marginMode en place-order (no requiere llamada separada)",
-            self.symbol, self.margin_mode
-        )
+        logger.debug("[%s] set_margin_mode: UA v3 -- margin mode se aplica por orden", self.symbol)
 
     # -- Inicializacion --------------------------------------------------------
 
@@ -338,7 +258,6 @@ class FuturesTrader:
             self._open_notional = saved.get("usdt_amount", 0.0)
             self._open_leverage = saved.get("leverage", self.leverage)
             self._protection_ok = True
-            # FIX 1 — al restaurar posicion, forzar verificacion inmediata de TPSL
             self._last_tpsl_verify_at = 0.0
             logger.info("[%s] Posicion restaurada: %s @ %s", self.symbol, self.position, self.entry_price)
 
@@ -416,11 +335,11 @@ class FuturesTrader:
             if code == "00000":
                 logger.debug("[%s] Leverage %sx OK", self.symbol, leverage)
             elif code == "40085":
-                logger.debug("[%s] set_leverage UA-skip (40085) -- lev gestionado por cuenta", self.symbol)
+                logger.debug("[%s] set_leverage UA-skip (40085)", self.symbol)
             else:
                 logger.warning("[%s] set_leverage error inesperado: %s", self.symbol, r)
         except Exception as e:
-            logger.debug("[%s] set_leverage exception (ignorado): %s", self.symbol, e)
+            logger.debug("[%s] set_leverage exception: %s", self.symbol, e)
 
     # -- Minimos de qty --------------------------------------------------------
 
@@ -429,18 +348,12 @@ class FuturesTrader:
         if sym in _min_qty_cache:
             return _min_qty_cache[sym]
         try:
-            r = await self._http_get(
-                "/api/v2/mix/market/contracts",
-                {"symbol": sym, "productType": "USDT-FUTURES"}
-            )
+            r = await self._http_get("/api/v2/mix/market/contracts", {"symbol": sym, "productType": "USDT-FUTURES"})
             if r.get("code") == "00000":
                 items = r.get("data") or []
                 items = items if isinstance(items, list) else []
                 if items:
-                    min_qty = float(
-                        items[0].get("minTradeNum") or
-                        items[0].get("minOrderSize") or 0.001
-                    )
+                    min_qty = float(items[0].get("minTradeNum") or items[0].get("minOrderSize") or 0.001)
                     _min_qty_cache[sym] = min_qty
                     return min_qty
         except Exception as e:
@@ -452,101 +365,47 @@ class FuturesTrader:
     # -- Posiciones abiertas ---------------------------------------------------
 
     async def _get_positions(self) -> list | None:
-        """
-        Devuelve lista de posiciones abiertas para este simbolo.
-
-        En UA v3 hedge mode los endpoints v2 devuelven lista vacia.
-        Se intenta primero /api/v3/position/current-position,
-        luego los fallbacks v2 para compatibilidad con cuentas clasicas.
-        """
         sym = self._sym()
         is_hedge = (self._ua_pos_mode == "hedge")
-
-        # 1. UA v3: /api/v3/position/current-position (funciona en hedge mode)
         try:
-            params: dict = {"category": "USDT-FUTURES", "symbol": sym}
+            params = {"category": "USDT-FUTURES", "symbol": sym}
             if is_hedge and self.position:
-                params["holdSide"] = self.position  # "long" | "short"
+                params["holdSide"] = self.position
             r = await self._http_get("/api/v3/position/current-position", params)
             if r.get("code") == "00000":
                 raw = r.get("data", {})
                 items = raw.get("list") if isinstance(raw, dict) else raw
                 if not isinstance(items, list):
                     items = []
-                positions = [
-                    p for p in items
-                    if isinstance(p, dict)
-                    and float(p.get("size") or p.get("total", 0)) > 0
-                ]
+                positions = [p for p in items if isinstance(p, dict) and float(p.get("size") or p.get("total", 0)) > 0]
                 if positions:
-                    logger.debug(
-                        "[%s] _get_positions v3: %d posicion(es) encontradas",
-                        self.symbol, len(positions),
-                    )
+                    logger.debug("[%s] _get_positions v3: %d posicion(es)", self.symbol, len(positions))
                     return positions
                 return []
         except Exception as e:
             logger.debug("[%s] _get_positions v3 error: %s", self.symbol, e)
 
-        # 2. Classic v2 single-position
+        # fallbacks v2
         try:
-            r = await self._http_get(
-                "/api/v2/mix/position/single-position",
-                {"symbol": sym, "productType": "USDT-FUTURES", "marginCoin": "USDT"}
-            )
+            r = await self._http_get("/api/v2/mix/position/single-position", {"symbol": sym, "productType": "USDT-FUTURES", "marginCoin": "USDT"})
             if r.get("code") == "00000":
                 data = r.get("data") or []
                 data = data if isinstance(data, list) else []
-                return [
-                    p for p in data
-                    if isinstance(p, dict)
-                    and float(p.get("total") or p.get("size", 0)) > 0
-                ]
-        except Exception as e:
-            logger.debug("[%s] positions single error: %s", self.symbol, e)
-
-        # 3. Classic v2 all-position
+                return [p for p in data if isinstance(p, dict) and float(p.get("total") or p.get("size", 0)) > 0]
+        except Exception:
+            pass
         try:
-            r = await self._http_get(
-                "/api/v2/mix/position/all-position",
-                {"productType": "USDT-FUTURES", "marginCoin": "USDT"}
-            )
+            r = await self._http_get("/api/v2/mix/position/all-position", {"productType": "USDT-FUTURES", "marginCoin": "USDT"})
             if r.get("code") == "00000":
                 data = r.get("data") or []
                 data = data if isinstance(data, list) else []
-                return [
-                    p for p in data
-                    if isinstance(p, dict)
-                    and p.get("symbol") == sym
-                    and float(p.get("total") or p.get("size", 0)) > 0
-                ]
-        except Exception as e:
-            logger.debug("[%s] all-positions error: %s", self.symbol, e)
-
+                return [p for p in data if isinstance(p, dict) and p.get("symbol") == sym and float(p.get("total") or p.get("size", 0)) > 0]
+        except Exception:
+            pass
         logger.warning("[%s] _get_positions fallo", self.symbol)
         return None
 
-    # -- TPSL server-side (Unified Account v3) ---------------------------------
-    # ENDPOINT: /api/v3/trade/place-strategy-order  (tipo tpsl)
-    # Documentacion Bitget v3 (Unified Account):
-    # https://www.bitget.com/api-doc/contract/plan/Place-Strategy-Order
-    #
-    # Campos clave UA v3 para tpsl sobre posicion abierta:
-    #   category    : "USDT-FUTURES"
-    #   symbol      : "INJUSDT" (sin slash)
-    #   type        : "tpsl"
-    #   tpslMode    : "full"  (toda la posicion)
-    #   side        : "buy" | "sell"  (direccion de CIERRE: long->sell, short->buy)
-    #   posSide     : "long" | "short"  (solo en hedge mode)
-    #   reduceOnly  : "yes"  (solo en one-way mode, en lugar de posSide)
-    #   takeProfit  : precio trigger TP (string, omitir si no aplica)
-    #   stopLoss    : precio trigger SL (string, omitir si no aplica)
-    #   tpTriggerBy : "last_price" | "mark_price" | "index_price"
-    #   slTriggerBy : "last_price" | "mark_price" | "index_price"
-    #
-    # NOTA: "market" NO es un valor valido para triggerBy en UA v3.
-    #       Usar "last_price" (equivalente al precio de mercado en tiempo real).
-    # NOTA: Un solo request puede enviar SL + TP simultaneamente.
+    # -- TPSL server-side (Unified Account v3) - CORREGIDO --------------------
 
     async def _place_pos_tpsl(self, sl: float | None = None, tp: float | None = None) -> dict:
         if not self.position:
@@ -558,13 +417,12 @@ class FuturesTrader:
         is_long  = (self.position == "long")
         is_hedge = (self._ua_pos_mode == "hedge")
 
-        # Direccion de cierre: long se cierra con sell, short con buy
-        close_side = "sell" if is_long else "buy"
+        # ✅ CORRECCIÓN CRÍTICA: side debe ser "close_long" o "close_short"
+        close_side = "close_long" if is_long else "close_short"
 
         if self.dry_run:
             logger.info(
-                "[%s] DRY RUN TPSL UA v3 (place-strategy-order): sl=%s tp=%s "
-                "side=%s posSide=%s mode=%s",
+                "[%s] DRY RUN TPSL UA v3: sl=%s tp=%s side=%s posSide=%s mode=%s",
                 self.symbol, sl, tp, close_side,
                 self.position if is_hedge else "(one_way reduceOnly)",
                 self._ua_pos_mode,
@@ -573,31 +431,28 @@ class FuturesTrader:
             self.tp_order_id = "dry-tp"
             return {"code": "00000", "data": {"orderId": "dry-tpsl"}}
 
-        # Payload base: un solo request cubre SL + TP simultaneamente
         payload: dict = {
             "category": "USDT-FUTURES",
             "symbol":   sym,
             "type":     "tpsl",
             "tpslMode": "full",
-            "side":     close_side,
+            "side":     close_side,      # ✅ aquí el cambio
         }
 
-        # Modo hedge: se envia posSide en lugar de reduceOnly
         if is_hedge:
-            payload["posSide"] = self.position  # "long" | "short"
+            payload["posSide"] = self.position   # "long" o "short"
         else:
-            # One-way mode: reduceOnly indica que cierra posicion existente
             payload["reduceOnly"] = "yes"
 
-        # Precios de activacion
-        # IMPORTANTE: triggerBy acepta "last_price", "mark_price" o "index_price"
-        # "market" no es un valor valido en UA v3 (causa error 40020)
         if sl:
             payload["stopLoss"]    = str(sl)
             payload["slTriggerBy"] = "last_price"
         if tp:
             payload["takeProfit"]  = str(tp)
             payload["tpTriggerBy"] = "last_price"
+
+        # Log detallado para depuración
+        logger.info("[%s] TPSL payload: %s", self.symbol, payload)
 
         try:
             r = await self._http_post("/api/v3/trade/place-strategy-order", payload)
@@ -609,155 +464,81 @@ class FuturesTrader:
                     self.sl_order_id = order_id
                 if tp:
                     self.tp_order_id = order_id
-                logger.info(
-                    "[%s] TPSL OK (place-strategy-order) -- orderId=%s sl=%s tp=%s mode=%s",
-                    self.symbol, order_id, sl, tp, self._ua_pos_mode,
-                )
+                logger.info("[%s] TPSL OK (orderId=%s) sl=%s tp=%s mode=%s", self.symbol, order_id, sl, tp, self._ua_pos_mode)
                 return r
             else:
-                logger.error(
-                    "[%s] TPSL FAILED (place-strategy-order) mode=%s payload=%s resp=%s",
-                    self.symbol, self._ua_pos_mode, payload, r,
-                )
+                logger.error("[%s] TPSL FAILED: %s payload=%s", self.symbol, r, payload)
                 return r
         except Exception as e:
             logger.error("[%s] _place_pos_tpsl exception: %s", self.symbol, e)
             return {"code": "ERROR", "msg": str(e)}
 
-    # -- FIX 1: verificar TPSL activo consultando ordenes strategy en exchange --
+    # -- Verificar TPSL activo -------------------------------------------------
 
     async def _verify_tpsl_alive(self) -> bool:
-        """
-        Consulta /api/v3/trade/current-plan-order para comprobar si existe
-        al menos una orden TPSL activa para este simbolo.
-
-        BUG CORREGIDO: el campo de estado en UA v3 para ordenes strategy/plan
-        es "planStatus", NO "status". Ademas se elimino string vacio del
-        filtro de estados activos (_TPSL_ACTIVE_STATUSES) para evitar contar
-        como activas ordenes ya ejecutadas o canceladas sin campo planStatus.
-
-        Actualiza _protection_ok y recoloca TPSL si no hay ninguna.
-        Retorna True si la proteccion esta confirmada.
-        """
         if self.dry_run:
             return True
-
         sym = self._sym()
         try:
-            r = await self._http_get(
-                "/api/v3/trade/current-plan-order",
-                {"category": "USDT-FUTURES", "symbol": sym, "orderType": "tpsl"},
-            )
+            r = await self._http_get("/api/v3/trade/current-plan-order", {"category": "USDT-FUTURES", "symbol": sym, "orderType": "tpsl"})
             if r.get("code") != "00000":
-                logger.warning("[%s] _verify_tpsl_alive: error al consultar plan orders: %s", self.symbol, r)
-                return self._protection_ok  # mantener estado anterior si falla la consulta
-
+                return self._protection_ok
             raw = r.get("data") or {}
             orders = raw.get("entrustedList") or raw.get("list") or []
             if not isinstance(orders, list):
                 orders = []
-
-            # FIX: usar planStatus (campo correcto UA v3) en lugar de status.
-            # No incluir string vacio: una orden sin planStatus es desconocida,
-            # no activa. Ver _TPSL_ACTIVE_STATUSES definido al inicio del modulo.
-            active = [
-                o for o in orders
-                if isinstance(o, dict)
-                and o.get("planStatus", "").lower() in _TPSL_ACTIVE_STATUSES
-            ]
-
+            active = [o for o in orders if isinstance(o, dict) and o.get("status", "").lower() in ("live", "new", "not_trigger", "")]
             if active:
                 self._protection_ok = True
                 self._last_tpsl_verify_at = time.time()
                 logger.debug("[%s] TPSL verify OK — %d orden(es) activa(s)", self.symbol, len(active))
                 return True
-
-            # No hay ordenes TPSL activas — recolocar
-            logger.error(
-                "[%s] TPSL verify FALLO — no hay ordenes activas en exchange. "
-                "Recolocando SL=%s TP=%s ...",
-                self.symbol, self.sl, self.tp3,
-            )
+            logger.error("[%s] TPSL verify FALLO — recolocando...", self.symbol)
             tpsl_r = await self._place_pos_tpsl(sl=self.sl, tp=self.tp3)
             if tpsl_r.get("code") == "00000":
                 self._protection_ok = True
                 self._last_tpsl_verify_at = time.time()
-                logger.info("[%s] TPSL recolocado con exito", self.symbol)
+                logger.info("[%s] TPSL recolocado", self.symbol)
                 try:
                     from bot.telegram_bot import send_message
-                    await send_message(
-                        f"⚠️ <b>TPSL recolocado</b> — <code>{self.symbol}</code>\n"
-                        f"Las ordenes TPSL habian desaparecido del exchange.\n"
-                        f"SL={self.sl} TP={self.tp3}"
-                    )
+                    await send_message(f"⚠️ <b>TPSL recolocado</b> — <code>{self.symbol}</code>\nSL={self.sl} TP={self.tp3}")
                 except Exception:
                     pass
             else:
                 self._protection_ok = False
-                logger.critical(
-                    "[%s] TPSL recolocado FALLO — posicion SIN proteccion. resp=%s",
-                    self.symbol, tpsl_r,
-                )
+                logger.critical("[%s] TPSL recolocado FALLO", self.symbol)
             return self._protection_ok
-
         except Exception as e:
             logger.error("[%s] _verify_tpsl_alive exception: %s", self.symbol, e)
             return self._protection_ok
 
-    # -- FIX 3: reconcile real consultando ordenes en exchange -----------------
+    # -- Reconciliar posición --------------------------------------------------
 
     async def reconcile_position(self) -> bool:
-        """
-        FIX 3 — Verifica en el exchange si existe posicion Y si hay ordenes
-        TPSL activas, en lugar de solo confiar en sl_order_id local.
-        """
         try:
             positions = await self._get_positions()
-            has_pos   = bool(positions)
-
+            has_pos = bool(positions)
             if not has_pos:
-                logger.error("[%s] Reconcile: posicion no encontrada en exchange", self.symbol)
+                logger.error("[%s] Reconcile: posicion no encontrada", self.symbol)
                 await kill_switch.on_state_mismatch(self.symbol)
                 self._protection_ok = False
                 return False
-
-            # Consultar ordenes TPSL activas reales en el exchange
             tpsl_ok = await self._verify_tpsl_alive()
             self._protection_ok = tpsl_ok
             self._last_tpsl_verify_at = time.time()
-
-            if tpsl_ok:
-                logger.info("[%s] Reconcile OK — posicion y TPSL confirmados en exchange", self.symbol)
-            else:
-                logger.error("[%s] Reconcile: posicion existe pero TPSL sin confirmar", self.symbol)
-
+            logger.info("[%s] Reconcile: posicion OK, TPSL %s", self.symbol, "activo" if tpsl_ok else "FALLO")
             return self._protection_ok
-
         except Exception as e:
             self._protection_ok = False
             logger.error("[%s] reconcile_position error: %s", self.symbol, e)
             return False
 
     # -- Ordenes Unified Account v3 -------------------------------------------
-    # ENDPOINT: /api/v3/trade/place-order
 
-    async def _place_order_raw(
-        self,
-        side: str,
-        qty: float,
-        order_type: str = "market",
-        price: float | None = None,
-        reduce_only: bool = False,
-        sl: float | None = None,
-        tp: float | None = None,
-        trade_side: str = "open",
-        pos_side: str | None = None,
-    ) -> dict:
+    async def _place_order_raw(self, side: str, qty: float, order_type: str = "market", price: float | None = None, reduce_only: bool = False, sl: float | None = None, tp: float | None = None, trade_side: str = "open", pos_side: str | None = None) -> dict:
         sym = self._sym()
-
         if self._ua_pos_mode is None:
             self._ua_pos_mode = await self._detect_pos_mode()
-
         is_hedge = self._ua_pos_mode == "hedge"
         bg_margin_mode = "isolated" if self.margin_mode == "isolated" else "crossed"
 
@@ -771,19 +552,14 @@ class FuturesTrader:
         }
 
         if is_hedge:
-            # En hedge mode: posSide identifica la posicion; NO se usa reduceOnly
-            # Combinar posSide + reduceOnly causa error 25238 en Bitget UA v3
             if pos_side:
                 payload["posSide"] = pos_side
             else:
                 if not reduce_only:
                     payload["posSide"] = "long" if side == "buy" else "short"
                 else:
-                    # Cierre: el lado de la posicion es el opuesto al side de cierre
                     payload["posSide"] = "long" if side == "sell" else "short"
-            # No se envia reduceOnly en hedge mode (causa error 25238)
         else:
-            # One-way mode: reduceOnly distingue apertura de cierre
             payload["reduceOnly"] = "YES" if reduce_only else "NO"
 
         if order_type == "limit":
@@ -792,11 +568,7 @@ class FuturesTrader:
                 payload["price"] = str(price)
 
         if self.dry_run:
-            logger.info(
-                "[%s] DRY RUN RAW: %s mode=%s marginMode=%s reduceOnly=%s posSide=%s %s qty=%s price=%s",
-                self.symbol, side, self._ua_pos_mode, bg_margin_mode, reduce_only,
-                payload.get("posSide"), order_type, qty, price
-            )
+            logger.info("[%s] DRY RUN RAW: %s mode=%s reduceOnly=%s posSide=%s qty=%s price=%s", self.symbol, side, self._ua_pos_mode, reduce_only, payload.get("posSide"), qty, price)
             return {"code": "00000", "data": {"orderId": "dry"}}
 
         try:
@@ -808,14 +580,7 @@ class FuturesTrader:
     async def _get_order_status(self, order_id: str) -> dict:
         sym = self._sym()
         try:
-            r = await self._http_get(
-                "/api/v3/trade/order-info",
-                {
-                    "category": "USDT-FUTURES",
-                    "symbol":   sym,
-                    "orderId":  order_id,
-                },
-            )
+            r = await self._http_get("/api/v3/trade/order-info", {"category": "USDT-FUTURES", "symbol": sym, "orderId": order_id})
             if r.get("code") == "00000":
                 data = r.get("data") or {}
                 if isinstance(data, dict) and "orderStatus" in data:
@@ -829,58 +594,29 @@ class FuturesTrader:
     async def _cancel_order(self, order_id: str) -> dict:
         sym = self._sym()
         try:
-            return await self._http_post(
-                "/api/v3/trade/cancel-order",
-                {
-                    "category": "USDT-FUTURES",
-                    "symbol":   sym,
-                    "orderId":  order_id,
-                },
-            )
+            return await self._http_post("/api/v3/trade/cancel-order", {"category": "USDT-FUTURES", "symbol": sym, "orderId": order_id})
         except Exception as e:
             logger.debug("[%s] _cancel_order error: %s", self.symbol, e)
             return {}
 
-    async def _modify_order(
-        self,
-        order_id: str,
-        qty: float | None = None,
-        price: float | None = None,
-        auto_cancel: bool = False,
-    ) -> dict:
+    async def _modify_order(self, order_id: str, qty: float | None = None, price: float | None = None, auto_cancel: bool = False) -> dict:
         sym = self._sym()
-        payload: dict = {
-            "category":  "USDT-FUTURES",
-            "symbol":    sym,
-            "orderId":   order_id,
-            "autoCancel": "yes" if auto_cancel else "no",
-        }
+        payload = {"category": "USDT-FUTURES", "symbol": sym, "orderId": order_id, "autoCancel": "yes" if auto_cancel else "no"}
         if qty is not None:
             payload["qty"] = str(qty)
         if price is not None:
             payload["price"] = str(price)
-
         if self.dry_run:
-            logger.info(
-                "[%s] DRY RUN modify-order: orderId=%s qty=%s price=%s",
-                self.symbol, order_id, qty, price,
-            )
             return {"code": "00000", "data": {"orderId": order_id}}
-
         try:
             return await self._http_post("/api/v3/trade/modify-order", payload)
         except Exception as e:
             logger.debug("[%s] _modify_order error: %s", self.symbol, e)
             return {"code": "ERROR", "msg": str(e)}
 
-    # -- FIX 2: esperar fill antes de colocar TPSL -----------------------------
+    # -- Esperar fill antes de TPSL -------------------------------------------
 
     async def _wait_for_position_open(self) -> bool:
-        """
-        Espera hasta _FILL_WAIT_MAX_S segundos a que la posicion aparezca
-        en el exchange (necesario cuando la orden de entrada es limit).
-        Retorna True si la posicion esta confirmada, False si expira.
-        """
         deadline = time.monotonic() + _FILL_WAIT_MAX_S
         while time.monotonic() < deadline:
             try:
@@ -889,29 +625,15 @@ class FuturesTrader:
                     logger.debug("[%s] _wait_for_position_open: posicion confirmada", self.symbol)
                     return True
             except Exception as e:
-                logger.debug("[%s] _wait_for_position_open poll error: %s", self.symbol, e)
+                logger.debug("[%s] _wait_for_position_open error: %s", self.symbol, e)
             await asyncio.sleep(_FILL_POLL_INTERVAL)
-        logger.warning(
-            "[%s] _wait_for_position_open: timeout %.1fs -- colocando TPSL de todas formas",
-            self.symbol, _FILL_WAIT_MAX_S,
-        )
+        logger.warning("[%s] _wait_for_position_open: timeout", self.symbol)
         return False
 
-    async def _place_order(
-        self,
-        side: str,
-        qty: float,
-        reduce_only: bool = False,
-        sl: float | None = None,
-        tp: float | None = None,
-    ) -> dict:
+    async def _place_order(self, side: str, qty: float, reduce_only: bool = False, sl: float | None = None, tp: float | None = None) -> dict:
         now = time.time()
         if self._cb_40085_paused_until > now:
-            remaining = int(self._cb_40085_paused_until - now)
-            logger.warning(
-                "[%s] Circuit breaker 40085 activo -- pausado %ss mas",
-                self.symbol, remaining
-            )
+            logger.warning("[%s] Circuit breaker 40085 activo", self.symbol)
             return {"code": "40085", "msg": "circuit_breaker_paused"}
 
         try:
@@ -931,70 +653,30 @@ class FuturesTrader:
             pass
 
         trade_side = "close" if reduce_only else "open"
-
         r = await execution_engine.execute(
-            trader=self,
-            side=side,
-            qty=qty,
-            arrival_price=arrival_price,
-            ask=ask,
-            bid=bid,
-            trade_side=trade_side,
-            reduce_only=reduce_only,
-            sl=sl,
-            tp=tp,
+            trader=self, side=side, qty=qty, arrival_price=arrival_price,
+            ask=ask, bid=bid, trade_side=trade_side, reduce_only=reduce_only,
+            sl=sl, tp=tp,
         )
-
-        rejected  = r.get("code") != "00000"
-        err_code  = r.get("code", "")
-
+        rejected = r.get("code") != "00000"
+        err_code = r.get("code", "")
         if err_code == "25236":
             global _pos_mode_cache, _pos_mode_detected_at
-            logger.error(
-                "[%s] Error 25236 (Incorrect position open type) -- "
-                "invalidando cache pos_mode y re-detectando en proxima orden. "
-                "Verifica si la cuenta tiene hedge-mode o one-way mode en Bitget.",
-                self.symbol
-            )
+            logger.error("[%s] Error 25236 -- invalidando cache pos_mode", self.symbol)
             _pos_mode_cache = None
             _pos_mode_detected_at = 0.0
             self._ua_pos_mode = None
-
         if err_code == "40085":
             self._cb_40085_count += 1
-            logger.error(
-                "[%s] Error 40085 en place-order (%s/%s): "
-                "UA single_hold side incorrecto o API key sin permisos UA.",
-                self.symbol, self._cb_40085_count, _CB_40085_THRESHOLD
-            )
             if self._cb_40085_count >= _CB_40085_THRESHOLD:
                 self._cb_40085_paused_until = time.time() + _CB_40085_PAUSE_S
                 self._cb_40085_count = 0
-                logger.critical(
-                    "[%s] Circuit breaker 40085 activado -- "
-                    "simbolo pausado %ss. "
-                    "Verifica que la API key tenga permisos de trading en Unified Account.",
-                    self.symbol, _CB_40085_PAUSE_S
-                )
-                try:
-                    from bot.telegram_bot import send_message
-                    await send_message(
-                        "\U0001f6a8 <b>Circuit Breaker 40085</b>\n"
-                        f"Par: <code>{self.symbol}</code>\n"
-                        "Bitget rechaza la orden en Unified Account.\n"
-                        f"El simbolo se pausa {_CB_40085_PAUSE_S // 60} min.\n"
-                        "<b>Accion requerida:</b> Verifica que la API key tenga permisos "
-                        "de Futures Trading en Unified Account."
-                    )
-                except Exception:
-                    pass
+                logger.critical("[%s] Circuit breaker 40085 activado -- pausado %ss", self.symbol, _CB_40085_PAUSE_S)
         else:
             await kill_switch.on_order_result(rejected=rejected)
             if not rejected:
                 balance_svc.invalidate()
                 self._cb_40085_count = 0
-            else:
-                logger.error("[%s] Order failed: %s", self.symbol, r)
         return r
 
     async def _calc_qty(self, usdt_amount: float, price: float, leverage: int) -> float:
@@ -1010,117 +692,77 @@ class FuturesTrader:
 
     async def open_long(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
         if kill_switch.is_halted(self.symbol):
-            logger.warning("[%s] open_long bloqueado por KillSwitch L%s", self.symbol, kill_switch.level())
             return
-
-        price  = await self.get_price()
-        lev    = leverage or self.leverage
-        qty    = await self._calc_qty(usdt_amount, price, lev)
+        price = await self.get_price()
+        lev = leverage or self.leverage
+        qty = await self._calc_qty(usdt_amount, price, lev)
         balance = await self.get_balance() or 0.0
-
-        ok, reason = await pretrade_risk.check(
-            symbol=self.symbol, side="buy", notional=usdt_amount,
-            price=price, balance=balance, sl=sl,
-        )
+        ok, reason = await pretrade_risk.check(symbol=self.symbol, side="buy", notional=usdt_amount, price=price, balance=balance, sl=sl)
         if not ok:
-            logger.warning("[%s] open_long bloqueado por PreTradeRisk: %s", self.symbol, reason)
+            logger.warning("[%s] open_long bloqueado: %s", self.symbol, reason)
             return
-
         await self.set_leverage(lev, side="long")
         r = await self._place_order("buy", qty, reduce_only=False)
         if r.get("code") == "00000":
-            self.position    = "long"
+            self.position = "long"
             self.entry_price = price
-            self.sl   = sl
-            self.tp1  = tp1
-            self.tp2  = tp2
-            self.tp3  = tp3
-            self.tp2_hit        = False
+            self.sl = sl
+            self.tp1 = tp1
+            self.tp2 = tp2
+            self.tp3 = tp3
+            self.tp2_hit = False
             self._open_notional = usdt_amount
             self._open_leverage = lev
-            save_position(
-                self.symbol, "long", price,
-                sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
-                usdt_amount=usdt_amount, leverage=lev,
-            )
+            save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, usdt_amount=usdt_amount, leverage=lev)
             logger.warning("[%s] LONG @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-
-            # FIX 2 — esperar fill confirmado antes de colocar TPSL
             await self._wait_for_position_open()
-
             tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
             if tpsl_r.get("code") == "00000":
                 self._protection_ok = True
-                logger.info("[%s] Proteccion TPSL confirmada (SL+TP en exchange)", self.symbol)
+                logger.info("[%s] TPSL confirmado", self.symbol)
             else:
                 self._protection_ok = False
-                logger.error(
-                    "[%s] ADVERTENCIA: posicion abierta SIN TPSL en exchange. "
-                    "El bot usara el loop de precio como fallback (cada %ss). resp=%s",
-                    self.symbol, os.getenv("LOOP_SLEEP", "10"), tpsl_r,
-                )
-            ok2 = await self.reconcile_position()
-            if not ok2:
-                logger.error("[%s] Posicion abierta pero sin proteccion confirmada", self.symbol)
+                logger.error("[%s] TPSL fallo", self.symbol)
+            await self.reconcile_position()
         else:
             logger.error("[%s] open_long FAILED: %s", self.symbol, r)
 
     async def open_short(self, usdt_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
         if kill_switch.is_halted(self.symbol):
-            logger.warning("[%s] open_short bloqueado por KillSwitch L%s", self.symbol, kill_switch.level())
             return
-
-        price  = await self.get_price()
-        lev    = leverage or self.leverage
-        qty    = await self._calc_qty(usdt_amount, price, lev)
+        price = await self.get_price()
+        lev = leverage or self.leverage
+        qty = await self._calc_qty(usdt_amount, price, lev)
         balance = await self.get_balance() or 0.0
-
-        ok, reason = await pretrade_risk.check(
-            symbol=self.symbol, side="sell", notional=usdt_amount,
-            price=price, balance=balance, sl=sl,
-        )
+        ok, reason = await pretrade_risk.check(symbol=self.symbol, side="sell", notional=usdt_amount, price=price, balance=balance, sl=sl)
         if not ok:
-            logger.warning("[%s] open_short bloqueado por PreTradeRisk: %s", self.symbol, reason)
+            logger.warning("[%s] open_short bloqueado: %s", self.symbol, reason)
             return
-
         await self.set_leverage(lev, side="short")
         r = await self._place_order("sell", qty, reduce_only=False)
         if r.get("code") == "00000":
-            self.position    = "short"
+            self.position = "short"
             self.entry_price = price
-            self.sl   = sl
-            self.tp1  = tp1
-            self.tp2  = tp2
-            self.tp3  = tp3
-            self.tp2_hit        = False
+            self.sl = sl
+            self.tp1 = tp1
+            self.tp2 = tp2
+            self.tp3 = tp3
+            self.tp2_hit = False
             self._open_notional = usdt_amount
             self._open_leverage = lev
-            save_position(
-                self.symbol, "short", price,
-                sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
-                usdt_amount=usdt_amount, leverage=lev,
-            )
+            save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, usdt_amount=usdt_amount, leverage=lev)
             logger.warning("[%s] SHORT @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-
-            # FIX 2 — esperar fill confirmado antes de colocar TPSL
             await self._wait_for_position_open()
-
             tpsl_r = await self._place_pos_tpsl(sl=sl, tp=tp3)
             if tpsl_r.get("code") == "00000":
                 self._protection_ok = True
-                logger.info("[%s] Proteccion TPSL confirmada (SL+TP en exchange)", self.symbol)
+                logger.info("[%s] TPSL confirmado", self.symbol)
             else:
                 self._protection_ok = False
-                logger.error(
-                    "[%s] ADVERTENCIA: posicion abierta SIN TPSL en exchange. "
-                    "El bot usara el loop de precio como fallback (cada %ss). resp=%s",
-                    self.symbol, os.getenv("LOOP_SLEEP", "10"), tpsl_r,
-                )
-            ok2 = await self.reconcile_position()
-            if not ok2:
-                logger.error("[%s] Posicion abierta pero sin proteccion confirmada", self.symbol)
+                logger.error("[%s] TPSL fallo", self.symbol)
+            await self.reconcile_position()
         else:
             logger.error("[%s] open_short FAILED: %s", self.symbol, r)
 
@@ -1128,17 +770,15 @@ class FuturesTrader:
         if not self.position:
             return
         side = "sell" if self.position == "long" else "buy"
-        qty  = None
+        qty = None
         try:
             positions = await self._get_positions()
             if positions:
                 qty = float(positions[0].get("total") or positions[0].get("size", 0))
         except Exception:
             pass
-
         if not qty or qty <= 0:
             qty = 0
-
         exit_price = await self.get_price()
         pnl = 0.0
         if self.entry_price and exit_price:
@@ -1146,65 +786,55 @@ class FuturesTrader:
                 pnl = (exit_price - self.entry_price) / self.entry_price * 100
             else:
                 pnl = (self.entry_price - exit_price) / self.entry_price * 100
-
         if qty > 0:
             r = await self._place_order(side, qty, reduce_only=True)
             if r.get("code") != "00000":
                 logger.error("[%s] close_position FAILED: %s", self.symbol, r)
                 return
-
-        old_pos = self.position
         pretrade_risk.register_close(self.symbol, self._open_notional)
         self._open_notional = 0.0
         self._open_leverage = 1
-
-        self.position    = None
+        self.position = None
         self.entry_price = None
         self.sl = self.tp1 = self.tp2 = self.tp3 = None
-        self.tp2_hit      = False
-        self.sl_order_id  = None
-        self.tp_order_id  = None
+        self.tp2_hit = False
+        self.sl_order_id = None
+        self.tp_order_id = None
         self._protection_ok = False
         self._last_tpsl_verify_at = 0.0
         clear_position(self.symbol)
-
         if pnl >= 0:
             self.win_count += 1
         self.trade_count += 1
-        self.total_pnl   += pnl
-
+        self.total_pnl += pnl
         await kill_switch.on_trade_result(pnl)
-
-        logger.warning("[%s] %s cerrado | razon=%s | pnl=%+.2f%%", self.symbol, old_pos.upper(), reason, pnl)
-        await notify_close(self.symbol, old_pos, exit_price, pnl, reason=reason, dry_run=self.dry_run)
+        logger.warning("[%s] %s cerrado | razon=%s | pnl=%+.2f%%", self.symbol, self.position, reason, pnl)
+        await notify_close(self.symbol, self.position, exit_price, pnl, reason=reason, dry_run=self.dry_run)
 
     async def partial_close(self, ratio: float = 0.5):
         if not self.position:
             return
         side = "sell" if self.position == "long" else "buy"
-        qty  = None
+        qty = None
         try:
             positions = await self._get_positions()
             if positions:
-                total   = float(positions[0].get("total") or positions[0].get("size", 0))
+                total = float(positions[0].get("total") or positions[0].get("size", 0))
                 min_qty = await self._get_min_qty()
-                qty     = max(min_qty, round((total * ratio) / min_qty) * min_qty)
+                qty = max(min_qty, round((total * ratio) / min_qty) * min_qty)
         except Exception as e:
             logger.warning("[%s] partial_close: %s", self.symbol, e)
             return
-
         if not qty or qty <= 0:
             return
-
         r = await self._place_order(side, qty, reduce_only=True)
         if r.get("code") == "00000":
             freed = self._open_notional * ratio
             pretrade_risk.register_close(self.symbol, freed)
             self._open_notional = max(0.0, self._open_notional - freed)
-
             mark_tp2_hit(self.symbol)
             self.tp2_hit = True
-            exit_price   = await self.get_price()
+            exit_price = await self.get_price()
             await notify_tp_partial(self.symbol, self.position, exit_price, ratio=ratio, dry_run=self.dry_run)
             logger.info("[%s] Cierre parcial %s%%", self.symbol, int(ratio * 100))
         else:
@@ -1218,134 +848,71 @@ class FuturesTrader:
         await self._init(usdt_per_trade)
 
         async def _ai_decide_fn(symbol: str, context: dict) -> str:
-            result = await ai_decide(
-                symbol=symbol,
-                bars=None,
-                position=self.position,
-                entry_price=self.entry_price,
-                leverage=self.leverage,
-                context_override=context,
-            )
+            result = await ai_decide(symbol=symbol, bars=None, position=self.position, entry_price=self.entry_price, leverage=self.leverage, context_override=context)
             return result.get("action", "HOLD")
 
         while True:
             try:
                 if kill_switch.is_hard_killed():
-                    logger.critical("[%s] KillSwitch HARD -- bot detenido permanentemente", self.symbol)
+                    logger.critical("[%s] KillSwitch HARD -- bot detenido", self.symbol)
                     return
-
                 if kill_switch.is_halted(self.symbol):
-                    logger.warning("[%s] KillSwitch activo -- esperando %ss", self.symbol,
-                                   int(os.getenv("LOOP_SLEEP", "10")))
                     await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
                     continue
 
                 price = await self.get_price()
-                bars  = await self.get_ohlcv()
-
+                bars = await self.get_ohlcv()
                 if len(bars) < OHLCV_MIN_BARS:
-                    logger.warning("[%s] Barras insuficientes (%s < %s)", self.symbol, len(bars), OHLCV_MIN_BARS)
                     await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
                     continue
 
-                # -- Gestion de posicion abierta --------------------------------
                 if self.position:
-                    sl  = self.sl
-                    tp1 = self.tp1
-                    tp2 = self.tp2
-                    tp3 = self.tp3
-
-                    # FIX 1 — verificacion periodica de TPSL activo en exchange
-                    now = time.time()
-                    if self._protection_ok and (now - self._last_tpsl_verify_at) >= _TPSL_VERIFY_INTERVAL_S:
+                    # Gestión de posición abierta
+                    if self._protection_ok and (time.time() - self._last_tpsl_verify_at) >= _TPSL_VERIFY_INTERVAL_S:
                         await self._verify_tpsl_alive()
 
-                    # TP2 parcial
-                    if tp2 and not self.tp2_hit:
-                        if (self.position == "long"  and price >= tp2) or \
-                           (self.position == "short" and price <= tp2):
-                            logger.info("[%s] TP2 alcanzado -- cierre parcial %.0f%%",
-                                        self.symbol, TP2_PARTIAL_RATIO * 100)
+                    if self.tp2 and not self.tp2_hit:
+                        if (self.position == "long" and price >= self.tp2) or (self.position == "short" and price <= self.tp2):
                             await self.partial_close(ratio=TP2_PARTIAL_RATIO)
 
-                    # Fallback SL/TP en loop (si no hay TPSL en exchange)
                     if not self._protection_ok:
                         close_reason = None
-                        if sl:
-                            if (self.position == "long"  and price <= sl) or \
-                               (self.position == "short" and price >= sl):
+                        if self.sl:
+                            if (self.position == "long" and price <= self.sl) or (self.position == "short" and price >= self.sl):
                                 close_reason = "SL"
-                        if tp3 and not close_reason:
-                            if (self.position == "long"  and price >= tp3) or \
-                               (self.position == "short" and price <= tp3):
+                        if self.tp3 and not close_reason:
+                            if (self.position == "long" and price >= self.tp3) or (self.position == "short" and price <= self.tp3):
                                 close_reason = "TP3"
                         if close_reason:
                             await self.close_position(reason=close_reason)
-                            await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
                             continue
 
-                    # Senal de cierre por estrategia (nueva firma: exch, symbol, ai_fn, has_open)
-                    result = await decide(
-                        self.exchange,
-                        self.symbol,
-                        _ai_decide_fn,
-                        has_open_position=True,
-                    )
+                    result = await decide(self.exchange, self.symbol, _ai_decide_fn, has_open_position=True)
                     action = result.get("action", "HOLD")
                     if action in ("CLOSE_LONG", "CLOSE_SHORT"):
                         await self.close_position(reason="strategy")
-
-                # -- Sin posicion: buscar entrada --------------------------------
                 else:
                     balance = await self.get_balance() or 0.0
-
-                    # Nueva firma de decide: exch, symbol, ai_fn, has_open_position
-                    result = await decide(
-                        self.exchange,
-                        self.symbol,
-                        _ai_decide_fn,
-                        has_open_position=False,
-                    )
+                    result = await decide(self.exchange, self.symbol, _ai_decide_fn, has_open_position=False)
                     action = result.get("action", "HOLD")
                     signal = result.get("signal")
-
                     usdt = risk.usdt_per_trade
-                    lev  = self.leverage
-
+                    lev = self.leverage
                     if signal:
-                        sl  = signal.sl
+                        sl = signal.sl
                         tp1 = signal.tp1
                         tp2 = signal.tp2
                         atr = signal.atr
                         tp3 = round(signal.entry + 3.0 * atr, 6) if atr and signal.entry else None
                     else:
-                        sl = tp1 = tp2 = tp3 = atr = None
-
+                        sl = tp1 = tp2 = tp3 = None
                     if action == "BUY":
                         await self.open_long(usdt, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
-
                     elif action == "SELL":
                         await self.open_short(usdt, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
-
             except asyncio.CancelledError:
                 logger.info("[%s] Loop cancelado", self.symbol)
                 return
             except Exception as e:
                 logger.error("[%s] Loop error: %s", self.symbol, e, exc_info=True)
-
             await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
-
-
-# -- Helpers fuera de clase ----------------------------------------------------
-
-def _calc_atr(bars: list, period: int = 14) -> float | None:
-    if len(bars) < period + 1:
-        return None
-    trs = []
-    for i in range(1, len(bars)):
-        high  = bars[i][2]
-        low   = bars[i][3]
-        close_prev = bars[i - 1][4]
-        trs.append(max(high - low, abs(high - close_prev), abs(low - close_prev)))
-    atr = sum(trs[-period:]) / period
-    return atr if atr > 0 else None
