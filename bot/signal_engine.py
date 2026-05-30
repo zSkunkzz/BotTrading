@@ -7,15 +7,22 @@ Modos de entrada (se exporta entry_mode en SignalResult):
   NORMAL  score 6-7, todos los TF alineados                    → lev 8-14x
   STRONG  score 8+, confluencia máxima                         → lev 14-15x
 
-Cambios v2:
-  - EARLY ahora cubre score==5 con 3 TF alineados (antes se descartaba silenciosamente)
-  - Score==5 con 4h neutral O alineado → EARLY siempre que 1h+15m confirmen
-  - Log explícito cuando una señal queda en NONE (score, RR o modo)
+Cambios v3:
+  - CVD (15m): delta acumulado de volumen, confirma presión compradora/vendedora
+  - ADX (4h + 1h): filtra mercados sin tendencia (ADX<20 penaliza, ADX>25 suma)
+  - VWAP desviación (15m): evita entradas sobreextendidas (>2% del VWAP)
+  - Filtro 1D: penaliza -2 si la tendencia diaria va en contra de la señal
+  - Score máximo teórico sube de 10 a 14 antes de microestructura
+
+Variables de entorno:
+  DAILY_TF_FILTER   (default: true) — activa/desactiva penalización por 1D
+  DAILY_TF_PENALTY  (default: 2)    — puntos a restar cuando 1D va en contra
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -49,13 +56,16 @@ EARLY_SIZE_RATIO = 0.5
 OB_IMBALANCE_THRESHOLD    = 0.15
 FUNDING_EXTREME_THRESHOLD = 0.0005
 
+DAILY_TF_FILTER  = os.getenv("DAILY_TF_FILTER",  "true").lower() != "false"
+DAILY_TF_PENALTY = int(os.getenv("DAILY_TF_PENALTY", "2"))
+
 
 @dataclass
 class SignalResult:
     symbol: str
     signal: str      = "NEUTRAL"
     score: int       = 0
-    max_score: int   = 12
+    max_score: int   = 14
     entry_mode: str  = "NONE"
     entry: float     = 0.0
     sl: float        = 0.0
@@ -70,6 +80,11 @@ class SignalResult:
     indicators: dict    = field(default_factory=dict)
     ob_imbalance: Optional[float]  = None
     funding_rate: Optional[float]  = None
+    # v3 extras
+    adx_1h: Optional[float]   = None
+    vwap_dev: Optional[float] = None
+    cvd_slope: Optional[float] = None
+    daily_trend: Optional[int] = None
     error: Optional[str] = None
 
     @property
@@ -83,7 +98,7 @@ class SignalResult:
 
     def summary(self) -> str:
         if not self.is_valid:
-            return f"{self.symbol} · NEUTRAL · Score {self.score}/12"
+            return f"{self.symbol} · NEUTRAL · Score {self.score}/14"
         em   = f"[{self.entry_mode}]"
         icon = "🟢" if self.signal == "LONG" else "🔴"
         extras = []
@@ -91,9 +106,13 @@ class SignalResult:
             extras.append(f"OB {self.ob_imbalance:+.2f}")
         if self.funding_rate is not None:
             extras.append(f"FR {self.funding_rate*100:+.4f}%")
+        if self.adx_1h is not None:
+            extras.append(f"ADX {self.adx_1h:.1f}")
+        if self.vwap_dev is not None:
+            extras.append(f"VWAP {self.vwap_dev:+.3f}%")
         extra_str = " · " + " · ".join(extras) if extras else ""
         return (
-            f"{icon} {self.symbol} · {self.signal} {em} · Score {self.score}/12 · "
+            f"{icon} {self.symbol} · {self.signal} {em} · Score {self.score}/14 · "
             f"R/R {self.rr:.1f} · Lev {self.suggested_lev}x · "
             f"Entry {self.entry:.4f} · SL {self.sl:.4f} · TP1 {self.tp1:.4f}{extra_str}"
         )
@@ -171,6 +190,7 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
     s: dict = {}
 
+    # --- EMA stack ---
     try:
         e9   = ta_lib.trend.ema_indicator(c, window=9).iloc[-1]
         e21  = ta_lib.trend.ema_indicator(c, window=21).iloc[-1]
@@ -185,6 +205,7 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     except Exception:
         s["ema_trend"] = s["ema200"] = 0
 
+    # --- RSI ---
     try:
         r = ta_lib.momentum.rsi(c, window=14).iloc[-1]
         s["rsi_val"] = round(r, 1)
@@ -196,6 +217,7 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     except Exception:
         s["rsi"] = 0; s["rsi_val"] = 50
 
+    # --- MACD ---
     try:
         macd_ind = ta_lib.trend.MACD(c, window_slow=26, window_fast=12, window_sign=9)
         ml  = macd_ind.macd().iloc[-1]
@@ -208,6 +230,7 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     except Exception:
         s["macd"] = 0
 
+    # --- Bollinger Bands ---
     try:
         bb = ta_lib.volatility.BollingerBands(c, window=20, window_dev=2)
         mid  = bb.bollinger_mavg().iloc[-1]
@@ -223,6 +246,7 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     except Exception:
         s["bb"] = 0
 
+    # --- StochRSI ---
     try:
         stoch = ta_lib.momentum.StochRSIIndicator(c, window=14, smooth1=3, smooth2=3)
         k = stoch.stochrsi_k().iloc[-1] * 100
@@ -236,8 +260,10 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     except Exception:
         s["stoch"] = 0; s["stoch_k"] = s["stoch_d"] = 50
 
+    # --- Supertrend ---
     s["supertrend"] = _supertrend_dir(df)
 
+    # --- Volume ratio ---
     try:
         vm = v.rolling(20).mean().iloc[-1]
         vr = v.iloc[-1] / vm if vm > 0 else 1.0
@@ -247,31 +273,74 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     except Exception:
         s["volume"] = 0; s["vol_ratio"] = 1.0
 
+    # --- v3: ADX ---
+    try:
+        adx_ind = ta_lib.trend.ADXIndicator(h, l, c, window=14)
+        adx_val = adx_ind.adx().iloc[-1]
+        s["adx"] = round(adx_val, 1)
+        # >25 = tendencia clara (+1), <20 = rango (-1), entre medio = neutro
+        s["adx_trend"] = 1 if adx_val > 25 else (-1 if adx_val < 20 else 0)
+    except Exception:
+        s["adx"] = 0.0; s["adx_trend"] = 0
+
+    # --- v3: CVD (Cumulative Volume Delta) slope últimas 5 velas ---
+    try:
+        prev_close = c.shift(1)
+        delta = np.where(c.values > prev_close.values, v.values, -v.values)
+        cvd = pd.Series(delta, index=c.index).cumsum()
+        cvd_slope = float(cvd.iloc[-1] - cvd.iloc[-6]) if len(cvd) >= 6 else 0.0
+        s["cvd_slope"] = round(cvd_slope, 2)
+        s["cvd"] = 1 if cvd_slope > 0 else (-1 if cvd_slope < 0 else 0)
+    except Exception:
+        s["cvd"] = 0; s["cvd_slope"] = 0.0
+
+    # --- v3: VWAP deviation ---
+    try:
+        typical = (h + l + c) / 3.0
+        vwap = (typical * v).cumsum() / v.cumsum()
+        vwap_last = float(vwap.iloc[-1])
+        px_last   = float(c.iloc[-1])
+        dev = (px_last - vwap_last) / vwap_last  # fraccion, e.g. 0.003 = +0.3%
+        s["vwap_dev"] = round(dev * 100, 3)       # guardamos en %
+        # +1: ligeramente sobre VWAP para LONG (0% a +0.5%), -1 si sobreextendido (>2%)
+        # La direccionalidad se aplica en _compute_score segun direction
+        if   0 < dev < 0.005:   s["vwap"] = 1    # precio justo sobre VWAP → bueno para long
+        elif -0.005 < dev < 0:  s["vwap"] = -1   # precio justo bajo VWAP  → bueno para short
+        elif dev > 0.02:        s["vwap"] = -1   # sobreextendido arriba   → malo para long
+        elif dev < -0.02:       s["vwap"] = 1    # sobreextendido abajo    → malo para short
+        else:                   s["vwap"] = 0
+    except Exception:
+        s["vwap"] = 0; s["vwap_dev"] = 0.0
+
     return s
 
 
 def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, int, str]:
     sl = ss = 0
 
-    for key in ("ema_trend", "macd", "ema200"):
+    # 4h: EMA stack, MACD, EMA200, ADX (v3)
+    for key in ("ema_trend", "macd", "ema200", "adx_trend"):
         sl += max(0,  s4h.get(key, 0))
         ss += max(0, -s4h.get(key, 0))
 
-    for key in ("ema_trend", "rsi", "supertrend"):
+    # 1h: EMA stack, RSI, Supertrend, ADX (v3)
+    for key in ("ema_trend", "rsi", "supertrend", "adx_trend"):
         sl += max(0,  s1h.get(key, 0))
         ss += max(0, -s1h.get(key, 0))
 
-    for key in ("ema_trend", "macd", "stoch", "volume"):
+    # 15m: EMA stack, MACD, StochRSI, Volume, CVD (v3), VWAP (v3)
+    for key in ("ema_trend", "macd", "stoch", "volume", "cvd", "vwap"):
         sl += max(0,  s15.get(key, 0))
         ss += max(0, -s15.get(key, 0))
 
+    # BB conjunto 15m+1h (sin cambios)
     if s15.get("bb", 0) == 1  and s1h.get("bb", 0) == 1:  sl += 1
     if s15.get("bb", 0) == -1 and s1h.get("bb", 0) == -1: ss += 1
 
     best      = max(sl, ss)
-    score     = min(best, 10)
+    score     = min(best, 14)   # techo subido de 10 a 14
     direction = "LONG" if sl >= ss else "SHORT"
-    return score, min(sl, 10), direction
+    return score, min(sl, 14), direction
 
 
 def _apply_microstructure(
@@ -314,16 +383,6 @@ def _apply_microstructure(
 
 
 def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction: str) -> tuple[str, int, float]:
-    """
-    FIX v2: EARLY ahora cubre score==5 con cualquier combinación de TF
-    siempre que 1h Y 15m estén alineados con la dirección.
-
-    Antes: EARLY solo si tf4h_aligned <= 0  (4h en contra o neutral)
-           → score==5 con los 3 TF alineados caía en NONE silenciosamente
-
-    Ahora: EARLY si score==5 y (1h alineado AND 15m alineado)
-           El 4h puede estar alineado, neutral o en contra.
-    """
     sign = 1 if direction == "LONG" else -1
 
     tf1h_aligned = s1h.get("ema_trend", 0) * sign
@@ -334,17 +393,16 @@ def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction:
 
     if score >= 8:
         mode  = "STRONG"
-        ratio = min((score - 8) / 2.0, 1.0)
+        ratio = min((score - 8) / 6.0, 1.0)   # ajustado al nuevo techo de 14
         lev   = round(LEV_STRONG_MIN + ratio * (LEV_STRONG_MAX - LEV_STRONG_MIN))
         return mode, lev, 1.0
 
     if score >= MIN_SCORE_FULL:  # >= 6
         mode  = "NORMAL"
-        ratio = min((score - MIN_SCORE_FULL) / 2.0, 1.0)
+        ratio = min((score - MIN_SCORE_FULL) / 4.0, 1.0)  # ajustado al nuevo techo
         lev   = round(LEV_NORMAL_MIN + ratio * (LEV_NORMAL_MAX - LEV_NORMAL_MIN))
         return mode, lev, 1.0
 
-    # score == 5 → EARLY si al menos 1h y 15m confirman
     if score == MIN_SCORE and tf1h_aligned > 0 and tf15_aligned > 0:
         quality = extra_1h + extra_15m
         ratio   = min(quality / 6.0, 1.0)
@@ -355,7 +413,6 @@ def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction:
         )
         return "EARLY", lev, EARLY_SIZE_RATIO
 
-    # Sin modo válido — log para diagnóstico
     log.debug(
         f"[signal] NONE — score={score}, 1h_aligned={tf1h_aligned}, "
         f"15m_aligned={tf15_aligned} (señal descartada)"
@@ -380,7 +437,32 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         s4h = _analyze_tf(df4h) if not df4h.empty else {}
         result.indicators = {"15m": s15, "1h": s1h, "4h": s4h}
 
+        # Guardar métricas v3 en el resultado
+        result.adx_1h    = s1h.get("adx")      if s1h else None
+        result.vwap_dev  = s15.get("vwap_dev")  if s15 else None
+        result.cvd_slope = s15.get("cvd_slope") if s15 else None
+
         score_base, _, direction = _compute_score(s4h, s1h, s15)
+
+        # --- v3: Filtro 1D ---
+        daily_trend = 0
+        if DAILY_TF_FILTER:
+            try:
+                df1d = await _fetch_ohlcv(exch, symbol, "1d", 50)
+                if not df1d.empty and len(df1d) >= 20:
+                    s1d = _analyze_tf(df1d)
+                    daily_trend = s1d.get("ema_trend", 0)
+                    sign = 1 if direction == "LONG" else -1
+                    if daily_trend != 0 and daily_trend * sign < 0:
+                        penalty = DAILY_TF_PENALTY
+                        log.info(
+                            f"[signal_engine] {symbol} 1D contratendencia "
+                            f"(daily={daily_trend}, signal={direction}) → −{penalty} score"
+                        )
+                        score_base = max(0, score_base - penalty)
+            except Exception as e:
+                log.debug(f"[signal_engine] {symbol} 1D filter error: {e}")
+        result.daily_trend = daily_trend
 
         ob_metrics   = None
         funding_rate = None
@@ -403,7 +485,7 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
 
         if mode == "NONE":
             log.info(
-                f"[signal_engine] {symbol} descartado — score={score}/12, "
+                f"[signal_engine] {symbol} descartado — score={score}/14, "
                 f"modo=NONE, dir={direction}"
             )
             return result
@@ -472,7 +554,7 @@ def _mode_emoji(mode: str) -> str:
 
 def format_signal_block(r: SignalResult) -> str:
     if not r.is_valid:
-        return f"📊 Score técnico: `{r.score}/12` — sin señal clara"
+        return f"📊 Score técnico: `{r.score}/14` — sin señal clara"
 
     i15 = r.indicators.get("15m", {})
     i1h = r.indicators.get("1h",  {})
@@ -493,8 +575,28 @@ def format_signal_block(r: SignalResult) -> str:
         emoji  = "🔥" if abs(fr_pct) > 0.05 else "⚪"
         fr_txt = f"\n  Funding {emoji} `{fr_pct:+.4f}%`"
 
+    # v3 extras
+    adx_txt = ""
+    if r.adx_1h is not None:
+        adx_emoji = "🟢" if r.adx_1h > 25 else ("🔴" if r.adx_1h < 20 else "⚪")
+        adx_txt = f"\n  ADX(1h) {adx_emoji} `{r.adx_1h:.1f}`"
+
+    vwap_txt = ""
+    if r.vwap_dev is not None:
+        vwap_txt = f"\n  VWAP dev `{r.vwap_dev:+.3f}%`"
+
+    cvd_txt = ""
+    if r.cvd_slope is not None:
+        cvd_arrow = "↑" if r.cvd_slope > 0 else "↓"
+        cvd_txt = f"\n  CVD {cvd_arrow} `{r.cvd_slope:+.0f}`"
+
+    daily_txt = ""
+    if r.daily_trend is not None and r.daily_trend != 0:
+        daily_emoji = "🟢" if r.daily_trend == 1 else "🔴"
+        daily_txt = f"\n  1D trend {daily_emoji}"
+
     lines = [
-        f"📊 *Análisis técnico* · Score `{r.score}/12` · R/R `{r.rr}:1`",
+        f"📊 *Análisis técnico* · Score `{r.score}/14` · R/R `{r.rr}:1`",
         f"{'\U0001f7e2 LONG' if d == 'LONG' else '\U0001f534 SHORT'} · Modo {me}`{r.entry_mode}` · Lev `{r.suggested_lev}x`{size_txt}",
         f"",
         f"  Entry `{r.entry}` · SL `{r.sl}` · TP1 `{r.tp1}`",
@@ -504,6 +606,8 @@ def format_signal_block(r: SignalResult) -> str:
         f"  MACD  {_ei(i4h.get('macd',0))}·{_ei(i1h.get('macd',0))}·{_ei(i15.get('macd',0))}",
         f"  RSI   {_ei(i4h.get('rsi',0))}·{_ei(i1h.get('rsi',0))}·{_ei(i15.get('rsi',0))} _({i15.get('rsi_val',0)})",
         f"  ST    {_ei(i4h.get('supertrend',0))}·{_ei(i1h.get('supertrend',0))}·{_ei(i15.get('supertrend',0))}",
+        f"  ADX   {_ei(i4h.get('adx_trend',0))}·{_ei(i1h.get('adx_trend',0))}·⚪",
+        f"  CVD   ⚪·⚪·{_ei(i15.get('cvd',0))} _{i15.get('cvd_slope',0):+.0f}_",
         f"  Vol   {_ei(i15.get('volume',0))} ×{i15.get('vol_ratio',1.0)}",
     ]
-    return "\n".join(lines) + ob_txt + fr_txt
+    return "\n".join(lines) + ob_txt + fr_txt + adx_txt + vwap_txt + cvd_txt + daily_txt
