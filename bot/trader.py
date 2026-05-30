@@ -37,20 +37,21 @@ _FORCE_POS_MODE = os.getenv("FORCE_POS_MODE", "").strip().lower()
 _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
 
 # ── FILL_WAIT: tiempo máximo esperando que la posición sea visible en UA v3 ──
-# UA v3 tiene mayor latencia de propagación que la cuenta clásica.
 _FILL_WAIT_MAX_S    = float(os.getenv("FILL_WAIT_MAX_S", "60.0"))
 _FILL_POLL_INTERVAL = float(os.getenv("FILL_POLL_INTERVAL", "0.5"))
 
-# ── TPSL retry config (fix code 31008) ────────────────────────────────────────────────
-# FIX: aumentado de 3.0s a 8.0s — UA v3 necesita más tiempo para propagar la posición
+# ── TPSL retry config (fix code 31008) ──────────────────────────────────────
 TPSL_WAIT_BEFORE_RETRY_S = float(os.getenv("TPSL_WAIT_BEFORE_RETRY_S", "8.0"))
-# FIX: aumentado de 8 a 12 reintentos
 _TPSL_MAX_RETRIES        = int(os.getenv("TPSL_MAX_RETRIES",   "12"))
-# FIX: aumentado de 1.0s a 2.0s el delay base del backoff exponencial
 _TPSL_RETRY_DELAY_S      = float(os.getenv("TPSL_RETRY_DELAY_S", "2.0"))
 
 # ── SL software margin: evita pisar el TPSL del servidor (0.1% por defecto) ──
 _SL_SW_MARGIN = float(os.getenv("SL_SW_MARGIN", "0.001"))
+
+# ── Intervalo para verificar si la posición sigue abierta en Bitget ──────────
+# Cada N segundos comprobamos si Bitget todavía tiene la posición registrada.
+# Si no la tiene, significa que fue cerrada por TPSL/SL del servidor.
+_POS_CHECK_INTERVAL_S = int(os.getenv("POS_CHECK_INTERVAL_S", "30"))
 
 _MIN_QTY_FALLBACK = {
     "BTCUSDT":   0.001,
@@ -126,6 +127,7 @@ class FuturesTrader:
         self._cb_40085_count   = 0
         self._cb_40085_paused_until = 0.0
         self._last_tpsl_verify_at: float = 0.0
+        self._last_pos_check_at: float = 0.0  # FIX: para detectar cierre externo
 
     # -- Helpers HTTP ----------------------------------------------------------
 
@@ -276,6 +278,7 @@ class FuturesTrader:
             self._open_leverage = saved.get("leverage", self.leverage)
             self._protection_ok = True
             self._last_tpsl_verify_at = 0.0
+            self._last_pos_check_at   = 0.0
             logger.info("[%s] Posicion restaurada: %s @ %s", self.symbol, self.position, self.entry_price)
 
         if not balance_svc.is_ready():
@@ -400,20 +403,16 @@ class FuturesTrader:
         Retorna posiciones abiertas del símbolo.
         pos_side: si se especifica, filtra por ese lado ('long'/'short') en modo hedge.
                   Si no se especifica, usa self.position (comportamiento original).
-                  Pasar pos_side='' (cadena vacía) fuerza búsqueda SIN filtro de holdSide
-                  (util durante _wait_for_position_open justo tras el fill).
+                  Pasar pos_side='' (cadena vacía) fuerza búsqueda SIN filtro de holdSide.
         """
         sym = self._sym()
         is_hedge = (self._ua_pos_mode == "hedge")
 
-        # Determinar el holdSide a usar en la query
-        # Si pos_side se pasa explícitamente como string vacío -> no filtrar
-        # Si pos_side es None -> usar self.position
         effective_side = pos_side if pos_side is not None else self.position
 
         try:
             params = {"category": "USDT-FUTURES", "symbol": sym}
-            if is_hedge and effective_side:  # solo filtrar si hay un lado válido
+            if is_hedge and effective_side:
                 params["holdSide"] = effective_side
             r = await self._http_get("/api/v3/position/current-position", params)
             if r.get("code") == "00000":
@@ -447,6 +446,75 @@ class FuturesTrader:
             pass
         logger.warning("[%s] _get_positions fallo", self.symbol)
         return None
+
+    # -- FIX: Detectar cierre externo (TPSL/SL servidor) ----------------------
+
+    async def _check_external_close(self) -> bool:
+        """
+        Comprueba si la posición fue cerrada externamente por Bitget (TPSL, SL servidor, liquidación).
+        Retorna True si la posición ya NO existe en Bitget (fue cerrada externamente).
+        Limpia el estado local automáticamente y notifica por Telegram.
+        """
+        if self.dry_run:
+            return False
+        try:
+            positions = await self._get_positions(pos_side="")
+            if positions is None:
+                # Error de red — no cambiar estado
+                return False
+            if len(positions) > 0:
+                # Posición sigue abierta
+                self._last_pos_check_at = time.time()
+                return False
+
+            # ── Posición ya NO existe en Bitget ──────────────────────────────
+            closed_side     = self.position
+            closed_entry    = self.entry_price
+            exit_price      = await self.get_price()
+
+            pnl = 0.0
+            if closed_entry and exit_price:
+                if closed_side == "long":
+                    pnl = (exit_price - closed_entry) / closed_entry * 100
+                else:
+                    pnl = (closed_entry - exit_price) / closed_entry * 100
+
+            logger.warning(
+                "[%s] 🔔 Posicion cerrada externamente (TPSL/SL servidor) | side=%s entry=%.4f exit=~%.4f pnl=~%+.2f%%",
+                self.symbol, closed_side, closed_entry or 0, exit_price, pnl,
+            )
+
+            # Limpiar estado
+            pretrade_risk.register_close(self.symbol, self._open_notional)
+            self._open_notional = 0.0
+            self._open_leverage = 1
+            self.position       = None
+            self.entry_price    = None
+            self.sl = self.tp1 = self.tp2 = self.tp3 = None
+            self.tp2_hit        = False
+            self.sl_order_id    = None
+            self.tp_order_id    = None
+            self._protection_ok = False
+            self._last_tpsl_verify_at = 0.0
+            self._last_pos_check_at   = time.time()
+            clear_position(self.symbol)
+
+            if pnl >= 0:
+                self.win_count += 1
+            self.trade_count += 1
+            self.total_pnl   += pnl
+            await kill_switch.on_trade_result(pnl)
+
+            # Notificar
+            await notify_close(
+                self.symbol, closed_side, exit_price, pnl,
+                reason="TPSL_SERVIDOR", dry_run=self.dry_run,
+            )
+            return True
+
+        except Exception as e:
+            logger.error("[%s] _check_external_close error: %s", self.symbol, e)
+            return False
 
     # -- TPSL server-side (Unified Account v3) ---------------------------------
 
@@ -517,8 +585,6 @@ class FuturesTrader:
     # -- TPSL con retry ante code 31008 ----------------------------------------
 
     async def _place_pos_tpsl_with_retry(self, sl: float | None = None, tp: float | None = None) -> dict:
-        # FIX: espera fija de 8s antes del primer intento — UA v3 necesita tiempo
-        # para propagar la posición internamente antes de aceptar órdenes TPSL.
         if TPSL_WAIT_BEFORE_RETRY_S > 0:
             logger.debug(
                 "[%s] _place_pos_tpsl_with_retry: esperando %.1fs antes del primer intento",
@@ -533,7 +599,6 @@ class FuturesTrader:
             if code == "00000":
                 return r
             if code == "31008":
-                # Backoff exponencial: 2, 4, 8, 16... segundos (cap a 30s)
                 wait = min(_TPSL_RETRY_DELAY_S * (2 ** (attempt - 1)), 30.0)
                 logger.warning(
                     "[%s] TPSL code 31008 (posicion aun no visible) -- reintento %d/%d en %.1fs",
@@ -693,20 +758,11 @@ class FuturesTrader:
     # -- Esperar fill antes de TPSL -------------------------------------------
 
     async def _wait_for_position_open(self, expected_side: str | None = None) -> bool:
-        """
-        Hace polling hasta que la posición sea visible en Bitget UA v3.
-        expected_side: 'long' o 'short'. Si se pasa, se usa para filtrar la búsqueda.
-        Durante el primer poll, buscamos SIN filtro de holdSide (pos_side='')
-        para evitar el race condition donde self.position está seteado pero
-        Bitget todavía no lo refleja en la query con holdSide.
-        """
         deadline = time.monotonic() + _FILL_WAIT_MAX_S
         attempt  = 0
         while time.monotonic() < deadline:
             attempt += 1
             try:
-                # FIX: usar pos_side='' (sin filtro holdSide) para los primeros polls
-                # Una vez encontrada la posición, el side no importa para verificar existencia
                 positions = await self._get_positions(pos_side="")
                 if positions:
                     elapsed = attempt * _FILL_POLL_INTERVAL
@@ -885,6 +941,7 @@ class FuturesTrader:
                 self.tp_order_id    = None
                 self._protection_ok = False
                 self._last_tpsl_verify_at = 0.0
+                self._last_pos_check_at   = time.time()
                 clear_position(self.symbol)
                 try:
                     from bot.telegram_bot import send_message
@@ -937,6 +994,7 @@ class FuturesTrader:
             self.tp2_hit = False
             self._open_notional = usdt_amount
             self._open_leverage = lev
+            self._last_pos_check_at = time.time()
             save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, usdt_amount=usdt_amount, leverage=lev)
             logger.warning("[%s] LONG @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
@@ -970,6 +1028,7 @@ class FuturesTrader:
             self.tp2_hit = False
             self._open_notional = usdt_amount
             self._open_leverage = lev
+            self._last_pos_check_at = time.time()
             save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, usdt_amount=usdt_amount, leverage=lev)
             logger.warning("[%s] SHORT @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
@@ -1000,11 +1059,21 @@ class FuturesTrader:
                 pnl = (exit_price - self.entry_price) / self.entry_price * 100
             else:
                 pnl = (self.entry_price - exit_price) / self.entry_price * 100
+
+        closed_side = self.position  # FIX: guardar antes de limpiar
+
         if qty > 0:
             r = await self._place_order(side, qty, reduce_only=True)
             if r.get("code") != "00000":
                 logger.error("[%s] close_position FAILED: %s", self.symbol, r)
+                # FIX: si la orden falla, verificar si la posición ya fue cerrada externamente
+                external = await self._check_external_close()
+                if not external:
+                    # Posición sigue abierta pero la orden de cierre falló — no limpiar estado
+                    return
+                # Si fue cerrada externamente, _check_external_close ya limpió el estado
                 return
+
         pretrade_risk.register_close(self.symbol, self._open_notional)
         self._open_notional = 0.0
         self._open_leverage = 1
@@ -1016,14 +1085,15 @@ class FuturesTrader:
         self.tp_order_id = None
         self._protection_ok = False
         self._last_tpsl_verify_at = 0.0
+        self._last_pos_check_at   = time.time()
         clear_position(self.symbol)
         if pnl >= 0:
             self.win_count += 1
         self.trade_count += 1
         self.total_pnl += pnl
         await kill_switch.on_trade_result(pnl)
-        logger.warning("[%s] %s cerrado | razon=%s | pnl=%+.2f%%", self.symbol, self.position, reason, pnl)
-        await notify_close(self.symbol, self.position, exit_price, pnl, reason=reason, dry_run=self.dry_run)
+        logger.warning("[%s] %s cerrado | razon=%s | pnl=%+.2f%%", self.symbol, closed_side, reason, pnl)
+        await notify_close(self.symbol, closed_side, exit_price, pnl, reason=reason, dry_run=self.dry_run)
 
     async def partial_close(self, ratio: float = 0.5):
         if not self.position:
@@ -1088,6 +1158,15 @@ class FuturesTrader:
                     continue
 
                 if self.position:
+                    # ── FIX: Detectar cierre externo (TPSL/SL servidor) ────────
+                    # Cada POS_CHECK_INTERVAL_S segundos verificamos si Bitget
+                    # todavía registra la posición. Si no, fue cerrada externamente.
+                    if (time.time() - self._last_pos_check_at) >= _POS_CHECK_INTERVAL_S:
+                        was_closed = await self._check_external_close()
+                        if was_closed:
+                            # Posición cerrada externamente — estado ya limpiado
+                            continue
+
                     # ── Verificar TPSL periodicamente ──────────────────────────
                     if self._protection_ok and (time.time() - self._last_tpsl_verify_at) >= _TPSL_VERIFY_INTERVAL_S:
                         await self._verify_tpsl_alive()
@@ -1133,7 +1212,6 @@ class FuturesTrader:
                     usdt = risk.usdt_per_trade
 
                     if signal:
-                        # FIX: usar el leverage sugerido por la señal en vez del default
                         lev = signal.suggested_lev if signal.suggested_lev else self.leverage
                         sl  = signal.sl
                         tp1 = signal.tp1
