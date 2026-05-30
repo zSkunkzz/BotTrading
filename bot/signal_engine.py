@@ -11,11 +11,15 @@ Cambios v2:
   - EARLY ahora cubre score==5 con 3 TF alineados (antes se descartaba silenciosamente)
   - Score==5 con 4h neutral O alineado → EARLY siempre que 1h+15m confirmen
   - Log explícito cuando una señal queda en NONE (score, RR o modo)
+
+Cambios v3:
+  - ATR_MULT_SL, TP1_MULT, TP2_MULT, TP3_MULT y MIN_RR configurables por variables de entorno
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -31,11 +35,11 @@ log = logging.getLogger(__name__)
 
 MIN_SCORE       = 5
 MIN_SCORE_FULL  = 6
-MIN_RR          = 1.8
-ATR_MULT_SL     = 1.2
-TP1_MULT        = 2.5
-TP2_MULT        = 4.0
-TP3_MULT        = 7.0
+MIN_RR          = float(os.getenv("MIN_RR",       "1.8"))
+ATR_MULT_SL     = float(os.getenv("ATR_MULT_SL",  "1.8"))
+TP1_MULT        = float(os.getenv("TP1_MULT",     "2.5"))
+TP2_MULT        = float(os.getenv("TP2_MULT",     "4.0"))
+TP3_MULT        = float(os.getenv("TP3_MULT",     "7.0"))
 
 LEV_EARLY_MIN   = 5
 LEV_EARLY_MAX   = 8
@@ -495,7 +499,7 @@ def format_signal_block(r: SignalResult) -> str:
 
     lines = [
         f"📊 *Análisis técnico* · Score `{r.score}/12` · R/R `{r.rr}:1`",
-        f"{'\U0001f7e2 LONG' if d == 'LONG' else '\U0001f534 SHORT'} · Modo {me}`{r.entry_mode}` · Lev `{r.suggested_lev}x`{size_txt}",
+        f"{'🟢 LONG' if d == 'LONG' else '🔴 SHORT'} · Modo {me}`{r.entry_mode}` · Lev `{r.suggested_lev}x`{size_txt}",
         f"",
         f"  Entry `{r.entry}` · SL `{r.sl}` · TP1 `{r.tp1}`",
         f"",
