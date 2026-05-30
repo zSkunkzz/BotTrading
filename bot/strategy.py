@@ -110,8 +110,6 @@ async def decide(
     i1h = signal.indicators.get("1h",  {})
     i4h = signal.indicators.get("4h",  {})
 
-    # context_override: dict de indicadores que ai_decide() recibe
-    # como context_override (no necesita bars/position/entry_price).
     context_override = {
         "symbol":        symbol,
         "signal":        signal.signal,
@@ -141,23 +139,24 @@ async def decide(
     log.info(f"[strategy] {symbol} 🤖 Consultando IA (score={signal.score}/10, mode=NORMAL)")
 
     try:
-        # ai_decide_fn(symbol, bars, position, entry_price, leverage, context_override)
-        # Cuando usamos context_override, bars/position/entry_price/leverage no se usan
-        # internamente (la función toma el path de context_override directamente).
+        # FIX: bars=[] es intencional aquí — ai_decide usa context_override y no accede a bars
+        # cuando context_override está presente. El guard en ai_decide protege el path else.
         ai_result = await ai_decide_fn(
             symbol,
             [],          # bars: no disponibles aquí, context_override tiene todo
             None,        # position
             None,        # entry_price
-            1,           # leverage (placeholder)
+            signal.suggested_lev,   # FIX: usar el leverage real de la señal en vez de 1
             context_override=context_override,
         )
     except Exception as e:
         log.warning(f"[strategy] IA falló, usando señal técnica directa: {e}")
-        ai_result = {"action": "BUY" if signal.signal == "LONG" else "SELL",
-                     "confidence": 7, "reason": "Fallback técnico"}
+        ai_result = {
+            "action":     "BUY" if signal.signal == "LONG" else "SELL",
+            "confidence": 7,
+            "reason":     "Fallback técnico",
+        }
 
-    # ai_decide devuelve un dict {action, confidence, reason/reasoning, ...}
     action     = str(ai_result.get("action", "HOLD")).upper().strip()
     confidence = ai_result.get("confidence", 0)
     ai_reason  = ai_result.get("reason", ai_result.get("reasoning", ""))

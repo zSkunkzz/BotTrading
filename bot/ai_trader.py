@@ -22,8 +22,6 @@ CACHE_TTL_BUY = int(os.getenv("AI_CACHE_TTL_BUY", "60"))
 _ai_cache: dict = {}
 
 # Caché del EnrichedContext: {symbol: (EnrichedContext, timestamp)}
-# Se reutiliza durante ENRICHED_CACHE_TTL segundos para evitar llamadas
-# duplicadas cuando múltiples señales llegan en el mismo tick.
 ENRICHED_CACHE_TTL = int(os.getenv("ENRICHED_CACHE_TTL", "120"))  # 2 min
 _enriched_cache: dict = {}
 
@@ -109,15 +107,15 @@ def build_market_context(symbol, bars, position, entry_price, leverage,
     lows   = [b[3] for b in bars]
     vols   = [b[5] for b in bars]
 
-    ema21         = ema(closes, 21)
-    ema50         = ema(closes, 50)
-    rsi14         = rsi(closes, 14)
+    ema21            = ema(closes, 21)
+    ema50            = ema(closes, 50)
+    rsi14            = rsi(closes, 14)
     m_line, s_line, hist = macd(closes, 12, 26, 9)
-    st_dir, _     = supertrend(highs, lows, closes, 10, 3.0)
-    atr14         = atr(highs, lows, closes, 14)
-    avg_vol       = sum(vols[-20:]) / 20 if len(vols) >= 20 else sum(vols) / len(vols)
-    vol_ratio     = round(vols[-1] / avg_vol, 2) if avg_vol > 0 else 1
-    last_3        = [
+    st_dir, _        = supertrend(highs, lows, closes, 10, 3.0)
+    atr14            = atr(highs, lows, closes, 14)
+    avg_vol          = sum(vols[-20:]) / 20 if len(vols) >= 20 else sum(vols) / len(vols)
+    vol_ratio        = round(vols[-1] / avg_vol, 2) if avg_vol > 0 else 1
+    last_3 = [
         {"o": bars[i][1], "h": bars[i][2], "l": bars[i][3],
          "c": bars[i][4], "v": round(bars[i][5], 2)}
         for i in range(-3, 0)
@@ -189,7 +187,7 @@ async def _call_gemini(context: dict):
                         logger.warning(f"Gemini HTTP {resp.status}: {body[:200]}")
                         return None
 
-                    data = await resp.json()
+                    data  = await resp.json()
                     cands = data.get("candidates", [])
                     if not cands:
                         logger.warning("Gemini: sin candidates")
@@ -305,7 +303,8 @@ def _pnl_check(position, entry_price, current_price, leverage) -> str | None:
 
 async def ai_decide(symbol, bars, position, entry_price, leverage,
                     context_override: dict | None = None):
-    current_price = bars[-1][4] if bars else (entry_price or 0)
+    # FIX: guard against empty bars list before indexing
+    current_price = bars[-1][4] if bars else (entry_price or 0.0)
 
     if position:
         close_reason = _pnl_check(position, entry_price, current_price, leverage)
@@ -317,21 +316,21 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
     price_bucket = _price_bucket(current_price)
 
     # Fetch enriched context (cached, no-throw)
-    enriched = await _get_enriched_context(symbol)
+    enriched     = await _get_enriched_context(symbol)
     enriched_str = format_context_for_prompt(enriched)
 
     if context_override:
-        context = context_override
-        tech_signal = context_override.get("signal", "NEUTRAL")
+        tech_signal     = context_override.get("signal", "NEUTRAL")
         fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
-        score = context_override.get("score", 0)
+        score           = context_override.get("score", 0)
 
         if score < AI_MIN_SCORE:
             logger.info(f"[{symbol}] \u23ed\ufe0f Score {score}/10 < {AI_MIN_SCORE} \u2192 HOLD sin IA")
-            return {"action": "HOLD", "confidence": 4, "reasoning": f"Score {score}/10 insuficiente", "key_factors": []}
+            return {"action": "HOLD", "confidence": 4,
+                    "reasoning": f"Score {score}/10 insuficiente", "key_factors": []}
 
         cache_key = f"{symbol}:{score}:{tech_signal}:{price_bucket}"
-        now = time.monotonic()
+        now       = time.monotonic()
         if cache_key in _ai_cache:
             cached_result, cached_ts = _ai_cache[cache_key]
             age = int(now - cached_ts)
@@ -344,31 +343,39 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         logger.info(f"[{symbol}] IA consultada (score={score}/10) + contexto externo")
 
     else:
+        # FIX: guard — si no hay bars suficientes no podemos calcular señal técnica
+        if not bars or len(bars) < 30:
+            logger.warning(f"[{symbol}] ai_decide: bars insuficientes ({len(bars) if bars else 0}), HOLD")
+            return {"action": "HOLD", "confidence": 3,
+                    "reasoning": "Bars insuficientes para señal técnica", "key_factors": []}
+
         tech = _technical_signal(bars)
         if tech["signal"] == "HOLD":
-            return {"action": "HOLD", "confidence": tech["confidence"], "reasoning": "Sin se\u00f1al t\u00e9cnica", "key_factors": []}
+            return {"action": "HOLD", "confidence": tech["confidence"],
+                    "reasoning": "Sin señal técnica", "key_factors": []}
 
-        context = build_market_context(symbol, bars, position, entry_price, leverage,
-                                       enriched_str=enriched_str)
         fallback_action = tech["signal"]
+        cache_key       = f"{symbol}:tech:{tech['signal']}:{price_bucket}"
+        now             = time.monotonic()
 
-        cache_key = f"{symbol}:tech:{tech['signal']}:{price_bucket}"
-        now = time.monotonic()
         if cache_key in _ai_cache:
             cached_result, cached_ts = _ai_cache[cache_key]
             age = int(now - cached_ts)
             if cached_result.get("action") in ("BUY", "SELL", "CLOSE") and age < CACHE_TTL_BUY:
-                logger.info(f"[{symbol}] \U0001f504 IA cached t\u00e9cnico ({age}s ago): {cached_result.get('action')}")
+                logger.info(f"[{symbol}] \U0001f504 IA cached técnico ({age}s ago): {cached_result.get('action')}")
                 return cached_result
 
-        logger.info(f"[{symbol}] T\u00e9cnico {tech['signal']} \u2192 IA + contexto externo")
+        context = build_market_context(symbol, bars, position, entry_price, leverage,
+                                       enriched_str=enriched_str)
+        logger.info(f"[{symbol}] Técnico {tech['signal']} → IA + contexto externo")
 
     result = await _call_gemini(context)
     if not result:
         result = await _call_groq(context)
     if not result:
-        logger.warning(f"[{symbol}] Sin IA \u2192 fallback t\u00e9cnico")
-        result = {"action": fallback_action, "confidence": 7, "reasoning": "Fallback t\u00e9cnico", "key_factors": []}
+        logger.warning(f"[{symbol}] Sin IA → fallback técnico")
+        result = {"action": fallback_action, "confidence": 7,
+                  "reasoning": "Fallback técnico", "key_factors": []}
 
     confidence = result.get("confidence", 5)
     min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "6"))

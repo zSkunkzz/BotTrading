@@ -18,11 +18,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import aiohttp
-import feedparser  # type: ignore
+
+try:
+    import feedparser  # type: ignore
+    _FEEDPARSER_OK = True
+except ImportError:
+    feedparser = None  # type: ignore
+    _FEEDPARSER_OK = False
 
 logger = logging.getLogger(__name__)
 
-# ── RSS feeds (Opción 2 — Messari + CoinDesk + Cointelegraph) ────────────────
+# ── RSS feeds ─────────────────────────────────────────────────────────────────
 RSS_FEEDS = [
     "https://messari.io/rss/all-news",
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -40,23 +46,23 @@ BULLISH_KEYWORDS = {
     "surge", "ath", "breakout", "accumulation", "institutional",
 }
 
-# ── Bitget REST base ─────────────────────────────────────────────────────────
-BITGET_BASE = "https://api.bitget.com"
+# ── Bitget REST base ──────────────────────────────────────────────────────────
+BITGET_BASE   = "https://api.bitget.com"
 FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
 
 
-# ── Data containers ──────────────────────────────────────────────────────────
+# ── Data containers ───────────────────────────────────────────────────────────
 
 @dataclass
 class FearGreedData:
-    value: int = 50
-    label: str = "Neutral"
+    value: int  = 50
+    label: str  = "Neutral"
     timestamp: str = ""
 
 
 @dataclass
 class OIData:
-    oi_usd: float = 0.0
+    oi_usd: float       = 0.0
     oi_delta_pct: float = 0.0   # % change vs ~4 candles ago
     funding_rate: float = 0.0   # current funding rate as %
 
@@ -72,10 +78,10 @@ class NewsItem:
 @dataclass
 class EnrichedContext:
     fear_greed: FearGreedData = field(default_factory=FearGreedData)
-    oi: OIData = field(default_factory=OIData)
-    news: list = field(default_factory=list)   # list[NewsItem]
-    fetched_at: str = ""
-    errors: list = field(default_factory=list)
+    oi: OIData                = field(default_factory=OIData)
+    news: list                = field(default_factory=list)   # list[NewsItem]
+    fetched_at: str           = ""
+    errors: list              = field(default_factory=list)
 
 
 # ── Individual fetchers ───────────────────────────────────────────────────────
@@ -86,12 +92,12 @@ async def _fetch_fear_greed(session: aiohttp.ClientSession) -> FearGreedData:
             FEAR_GREED_URL, timeout=aiohttp.ClientTimeout(total=5)
         ) as r:
             data = await r.json(content_type=None)
-            item = data["data"][0]
-            return FearGreedData(
-                value=int(item["value"]),
-                label=item["value_classification"],
-                timestamp=item.get("timestamp", ""),
-            )
+        item = data["data"][0]
+        return FearGreedData(
+            value=int(item["value"]),
+            label=item["value_classification"],
+            timestamp=item.get("timestamp", ""),
+        )
     except Exception as exc:
         logger.warning("[enricher] fear_greed: %s", exc)
         return FearGreedData()
@@ -99,44 +105,78 @@ async def _fetch_fear_greed(session: aiohttp.ClientSession) -> FearGreedData:
 
 async def _fetch_oi(session: aiohttp.ClientSession, symbol: str) -> OIData:
     """
-    Fetches current OI and computes delta using Bitget history endpoint.
-    No auth required for public market data.
+    Fetches current OI + funding rate from Bitget public endpoints.
+    OI delta is computed from the last two ticks returned by the
+    history-open-interest endpoint (4H granularity).
+
+    Bitget v2 OI endpoints (public, no auth required):
+      GET /api/v2/mix/market/open-interest          → current OI list
+      GET /api/v2/mix/market/history-open-interest  → historical OI (4H)
+      GET /api/v2/mix/market/current-fund-rate      → funding rate
     """
     params = {"symbol": symbol, "productType": "USDT-FUTURES"}
     try:
-        # Current OI
+        # ── Current OI ────────────────────────────────────────────────
         async with session.get(
             f"{BITGET_BASE}/api/v2/mix/market/open-interest",
             params=params,
-            timeout=aiohttp.ClientTimeout(total=5),
+            timeout=aiohttp.ClientTimeout(total=6),
         ) as r:
-            oi_resp = await r.json()
-        oi_list = oi_resp.get("data", {}).get("openInterestList", [])
-        current_oi = float(oi_list[0]["size"]) if oi_list else 0.0
+            oi_resp = await r.json(content_type=None)
 
-        # Historical OI (4H granularity, last 2 candles → delta)
-        async with session.get(
-            f"{BITGET_BASE}/api/v2/mix/market/history-open-interest",
-            params={**params, "period": "4H", "limit": "2"},
-            timeout=aiohttp.ClientTimeout(total=5),
-        ) as r:
-            hist_resp = await r.json()
-        hist = hist_resp.get("data", [])
-        if len(hist) >= 2:
-            prev_oi = float(hist[1].get("openInterestList", [{}])[0].get("size", current_oi))
-            delta_pct = ((current_oi - prev_oi) / prev_oi * 100) if prev_oi else 0.0
-        else:
+        # Response structure: {"data": {"openInterestList": [{"size": "...", ...}]}}
+        # or directly: {"data": [{"openInterest": "..."}]}
+        oi_data = oi_resp.get("data", {})
+        current_oi = 0.0
+        if isinstance(oi_data, dict):
+            oi_list = oi_data.get("openInterestList", [])
+            if oi_list:
+                current_oi = float(oi_list[0].get("size", 0))
+        elif isinstance(oi_data, list) and oi_data:
+            # Alternative flat structure
+            current_oi = float(oi_data[0].get("openInterest", oi_data[0].get("size", 0)))
+
+        # ── Historical OI (last 2 × 4H candles → delta) ───────────────
+        hist_params = {**params, "period": "4H", "limit": "2"}
+        try:
+            async with session.get(
+                f"{BITGET_BASE}/api/v2/mix/market/history-open-interest",
+                params=hist_params,
+                timeout=aiohttp.ClientTimeout(total=6),
+            ) as r:
+                hist_resp = await r.json(content_type=None)
+
+            hist = hist_resp.get("data", [])
+            # Each item: {"openInterest": "123456.78", "ts": "..."}
+            delta_pct = 0.0
+            if isinstance(hist, list) and len(hist) >= 2:
+                newest = float(hist[0].get("openInterest", hist[0].get("size", 0)))
+                oldest = float(hist[1].get("openInterest", hist[1].get("size", newest)))
+                if oldest > 0:
+                    delta_pct = (newest - oldest) / oldest * 100
+                # Use the freshest OI value if it's more accurate
+                if newest > 0:
+                    current_oi = newest
+            elif current_oi > 0:
+                delta_pct = 0.0
+        except Exception as hist_exc:
+            logger.debug("[enricher] OI history: %s", hist_exc)
             delta_pct = 0.0
 
-        # Funding rate
+        # ── Funding rate ──────────────────────────────────────────────
         async with session.get(
             f"{BITGET_BASE}/api/v2/mix/market/current-fund-rate",
             params=params,
-            timeout=aiohttp.ClientTimeout(total=5),
+            timeout=aiohttp.ClientTimeout(total=6),
         ) as r:
-            fr_resp = await r.json()
-        fr_list = fr_resp.get("data", [])
-        funding_rate = float(fr_list[0]["fundingRate"]) * 100 if fr_list else 0.0
+            fr_resp = await r.json(content_type=None)
+
+        fr_data = fr_resp.get("data", [])
+        funding_rate = 0.0
+        if isinstance(fr_data, list) and fr_data:
+            funding_rate = float(fr_data[0].get("fundingRate", 0)) * 100
+        elif isinstance(fr_data, dict):
+            funding_rate = float(fr_data.get("fundingRate", 0)) * 100
 
         return OIData(
             oi_usd=current_oi,
@@ -155,8 +195,12 @@ async def _fetch_news(
     """
     Parses public RSS feeds, filters by currency ticker,
     and classifies sentiment via keyword matching.
-    No API key required.
+    Requires feedparser; returns [] gracefully if not installed.
     """
+    if not _FEEDPARSER_OK:
+        logger.debug("[enricher] feedparser not installed, skipping news")
+        return []
+
     results: list = []
     currency_upper = base_currency.upper()
 
@@ -165,19 +209,23 @@ async def _fetch_news(
             break
         try:
             async with session.get(
-                feed_url, timeout=aiohttp.ClientTimeout(total=7)
+                feed_url, timeout=aiohttp.ClientTimeout(total=8)
             ) as r:
-                text = await r.text()
+                raw_bytes = await r.read()   # feedparser handles encoding internally
 
-            feed = feedparser.parse(text)
+            feed = feedparser.parse(raw_bytes)
             source_name = feed_url.split("/")[2].replace("www.", "")
 
             for entry in feed.entries[:20]:
                 if len(results) >= 5:
                     break
                 title: str = entry.get("title", "")
+                summary: str = entry.get("summary", "")
                 # Only include entries that mention the traded asset
-                if currency_upper not in title.upper() and currency_upper not in entry.get("summary", "").upper():
+                if (
+                    currency_upper not in title.upper()
+                    and currency_upper not in summary.upper()
+                ):
                     continue
 
                 title_lower = title.lower()
@@ -277,7 +325,11 @@ def format_context_for_prompt(ctx: EnrichedContext) -> str:
     if ctx.news:
         lines.append("Recent news:")
         for item in ctx.news:
-            icon = "\U0001f4c8" if item.sentiment == "bullish" else "\U0001f4c9" if item.sentiment == "bearish" else "\U0001f4f0"
+            icon = (
+                "\U0001f4c8" if item.sentiment == "bullish"
+                else "\U0001f4c9" if item.sentiment == "bearish"
+                else "\U0001f4f0"
+            )
             lines.append(f"  {icon} [{item.sentiment}] {item.title}")
     else:
         lines.append("Recent news: unavailable")
