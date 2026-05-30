@@ -3,14 +3,14 @@
 strategy.py — Lógica de decisión de BotTrading
 
 Flujo y coste IA:
-  NONE   (score<5)  → HOLD directo, sin IA
-  EARLY  (score 5-6) → HOLD directo, sin IA  (éste era el mayor gasto)
-  NORMAL (score 7)   → HOLD directo, sin IA  (score insuficiente para arriesgarse)
-  NORMAL (score >=8) → confirma con IA
+  NONE   (score<5)   → HOLD directo, sin IA
+  EARLY  (score 5-6) → HOLD directo, sin IA
+  NORMAL (score 7)   → HOLD directo, sin IA (score insuficiente)
+  NORMAL (score >=8) → confirma con IA (con contexto externo enriquecido)
   STRONG (score >=8) → entra directo, sin IA (máxima confluencia)
 
 Variables de entorno:
-  MIN_SIGNAL_SCORE   (default: 5)   — mínimo para activar cualquier modo
+  MIN_SIGNAL_SCORE   (default: 5)    — mínimo para activar cualquier modo
   MIN_RR_REQUIRED    (default: 1.8)
   SKIP_AI_ON_STRONG  (default: true) — omite IA cuando modo=STRONG
   AI_CALL_MIN_SCORE  (default: 8)    — score mínimo para llamar a la IA
@@ -33,7 +33,6 @@ log = logging.getLogger(__name__)
 MIN_SIGNAL_SCORE  = int(os.getenv("MIN_SIGNAL_SCORE",  str(MIN_SCORE)))
 MIN_RR_REQUIRED   = float(os.getenv("MIN_RR_REQUIRED", str(MIN_RR)))
 SKIP_AI_ON_STRONG = os.getenv("SKIP_AI_ON_STRONG", "true").lower() != "false"
-# Score mínimo para que vale la pena pagar una llamada a Gemini
 AI_CALL_MIN_SCORE = int(os.getenv("AI_CALL_MIN_SCORE", "8"))
 
 
@@ -51,6 +50,8 @@ async def decide(
         ai_used     : bool
         reason      : str
         signal_block: str (Markdown)
+        ai_confidence: int (0 if IA not used)
+        ai_reason   : str
     """
 
     if has_open_position:
@@ -67,7 +68,6 @@ async def decide(
         f"· {signal.signal} · RR={signal.rr} · lev={signal.suggested_lev}x"
     )
 
-    # Sin modo válido → HOLD
     if not signal.is_valid:
         return _result(
             "HOLD", signal, False,
@@ -91,26 +91,28 @@ async def decide(
             f"💥 STRONG entry directo · score={signal.score}/10 · lev={signal.suggested_lev}x"
         )
 
-    # EARLY: score bajo (5-6), nunca justifica pagar llamada a IA → HOLD
+    # EARLY: score bajo (5-6), no justifica llamada a IA
     if signal.entry_mode == "EARLY":
         return _result(
             "HOLD", signal, False,
-            f"⏭️ EARLY score={signal.score}/10 → HOLD sin IA (ahorro Gemini)"
+            f"⏭️ EARLY score={signal.score}/10 → HOLD sin IA"
         )
 
-    # NORMAL: solo llamar a IA si el score es suficientemente alto
+    # NORMAL con score bajo: sin IA
     if signal.score < AI_CALL_MIN_SCORE:
         return _result(
             "HOLD", signal, False,
-            f"⏭️ NORMAL score={signal.score}/10 < {AI_CALL_MIN_SCORE} → HOLD sin IA (ahorro Gemini)"
+            f"⏭️ NORMAL score={signal.score}/10 < {AI_CALL_MIN_SCORE} → HOLD sin IA"
         )
 
-    # NORMAL con score >= AI_CALL_MIN_SCORE: confirma con IA
+    # NORMAL con score >= AI_CALL_MIN_SCORE: confirmar con IA
     i15 = signal.indicators.get("15m", {})
     i1h = signal.indicators.get("1h",  {})
     i4h = signal.indicators.get("4h",  {})
 
-    context = {
+    # context_override: dict de indicadores que ai_decide() recibe
+    # como context_override (no necesita bars/position/entry_price).
+    context_override = {
         "symbol":        symbol,
         "signal":        signal.signal,
         "entry_mode":    signal.entry_mode,
@@ -139,26 +141,53 @@ async def decide(
     log.info(f"[strategy] {symbol} 🤖 Consultando IA (score={signal.score}/10, mode=NORMAL)")
 
     try:
-        ai_action = await ai_decide_fn(symbol, context)
+        # ai_decide_fn(symbol, bars, position, entry_price, leverage, context_override)
+        # Cuando usamos context_override, bars/position/entry_price/leverage no se usan
+        # internamente (la función toma el path de context_override directamente).
+        ai_result = await ai_decide_fn(
+            symbol,
+            [],          # bars: no disponibles aquí, context_override tiene todo
+            None,        # position
+            None,        # entry_price
+            1,           # leverage (placeholder)
+            context_override=context_override,
+        )
     except Exception as e:
         log.warning(f"[strategy] IA falló, usando señal técnica directa: {e}")
-        ai_action = "BUY" if signal.signal == "LONG" else "SELL"
+        ai_result = {"action": "BUY" if signal.signal == "LONG" else "SELL",
+                     "confidence": 7, "reason": "Fallback técnico"}
 
-    action = ai_action.upper().strip()
-    if action not in ("BUY", "SELL", "HOLD"):
+    # ai_decide devuelve un dict {action, confidence, reason/reasoning, ...}
+    action     = str(ai_result.get("action", "HOLD")).upper().strip()
+    confidence = ai_result.get("confidence", 0)
+    ai_reason  = ai_result.get("reason", ai_result.get("reasoning", ""))
+
+    if action not in ("BUY", "SELL", "HOLD", "CLOSE"):
         action = "HOLD"
 
     return _result(
         action, signal, True,
-        f"IA confirmó {action} · modo {signal.entry_mode} · score {signal.score}/10 · lev {signal.suggested_lev}x"
+        f"IA confirmó {action} ({confidence}/10) · modo {signal.entry_mode} · "
+        f"score {signal.score}/10 · lev {signal.suggested_lev}x | {ai_reason}",
+        ai_confidence=confidence,
+        ai_reason=ai_reason,
     )
 
 
-def _result(action: str, signal: Optional[SignalResult], ai_used: bool, reason: str) -> dict:
+def _result(
+    action: str,
+    signal: Optional[SignalResult],
+    ai_used: bool,
+    reason: str,
+    ai_confidence: int = 0,
+    ai_reason: str = "",
+) -> dict:
     return {
-        "action":       action,
-        "signal":       signal,
-        "ai_used":      ai_used,
-        "reason":       reason,
-        "signal_block": format_signal_block(signal) if signal else "",
+        "action":        action,
+        "signal":        signal,
+        "ai_used":       ai_used,
+        "reason":        reason,
+        "signal_block":  format_signal_block(signal) if signal else "",
+        "ai_confidence": ai_confidence,
+        "ai_reason":     ai_reason,
     }
