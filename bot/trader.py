@@ -554,9 +554,6 @@ class FuturesTrader:
         else:
             payload["reduceOnly"] = "yes"
 
-        # FIX: usar slTriggerType / tpTriggerType (campos correctos para API v3)
-        # El campo anterior "slTriggerBy"/"tpTriggerBy" es ignorado por Bitget v3
-        # causando que el TPSL se registre sin trigger real y nunca se active.
         if sl:
             payload["stopLoss"]       = str(sl)
             payload["slTriggerType"]  = "last_price"
@@ -637,7 +634,23 @@ class FuturesTrader:
                 self._last_tpsl_verify_at = time.time()
                 logger.debug("[%s] TPSL verify OK — %d orden(es) activa(s)", self.symbol, len(active))
                 return True
-            logger.error("[%s] TPSL verify FALLO — recolocando...", self.symbol)
+
+            # ── FIX: verificar que la posicion sigue abierta ANTES de recolocar ──
+            # Si no hay TPSL activo pero tampoco hay posicion, significa que fue
+            # cerrada externamente (TP/SL servidor ejecutado). No recolocar TPSL.
+            logger.warning("[%s] TPSL verify: sin ordenes activas -- comprobando posicion...", self.symbol)
+            positions = await self._get_positions(pos_side="")
+            if not positions:
+                logger.warning(
+                    "[%s] _verify_tpsl_alive: posicion ya cerrada externamente "
+                    "(sin TPSL activo + sin posicion) -- delegando a _check_external_close",
+                    self.symbol,
+                )
+                # Forzar check inmediato en el siguiente ciclo del loop
+                self._last_pos_check_at = 0.0
+                return False
+
+            logger.error("[%s] TPSL verify FALLO — posicion abierta sin proteccion, recolocando...", self.symbol)
             tpsl_r = await self._place_pos_tpsl_with_retry(sl=self.sl, tp=self.tp3)
             if tpsl_r.get("code") == "00000":
                 self._protection_ok = True
@@ -1159,9 +1172,6 @@ class FuturesTrader:
 
                 if self.position:
                     # ── FIX: SL software PRIMERO — antes de verificar cierre externo ──
-                    # El SL software actúa como red de seguridad urgente. Se ejecuta
-                    # antes de _check_external_close para no perder ticks críticos
-                    # donde el precio cruza el SL pero la posición aún existe en Bitget.
                     if self.sl:
                         sl_trigger_long  = self.sl * (1 - _SL_SW_MARGIN)
                         sl_trigger_short = self.sl * (1 + _SL_SW_MARGIN)
