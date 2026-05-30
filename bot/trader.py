@@ -35,7 +35,11 @@ _CB_40085_PAUSE_S   = int(os.getenv("CB_40085_PAUSE_S", "300"))
 _FORCE_POS_MODE = os.getenv("FORCE_POS_MODE", "").strip().lower()
 
 _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
-_FILL_WAIT_MAX_S   = float(os.getenv("FILL_WAIT_MAX_S", "8.0"))
+
+# ── FILL_WAIT: tiempo máximo esperando que la posición sea visible en UA v3 ──
+# UA v3 tiene mayor latencia de propagación que la cuenta clásica.
+# 8s era insuficiente — ahora 60s con polling cada 0.5s.
+_FILL_WAIT_MAX_S    = float(os.getenv("FILL_WAIT_MAX_S", "60.0"))
 _FILL_POLL_INTERVAL = float(os.getenv("FILL_POLL_INTERVAL", "0.5"))
 
 # ── TPSL retry config (fix code 31008) ────────────────────────────────────────
@@ -75,6 +79,8 @@ _MIN_QTY_FALLBACK = {
     "PEPEUSDT":  1000.0,
     "UBUSDT":    1.0,
     "ONDOUSDT":  1.0,
+    "FETUSDTUSDT": 1.0,
+    "FETUSDT":   1.0,
 }
 
 _min_qty_cache = {}
@@ -665,19 +671,33 @@ class FuturesTrader:
             return {"code": "ERROR", "msg": str(e)}
 
     # -- Esperar fill antes de TPSL -------------------------------------------
+    # FIX UA v3: timeout aumentado a 60s (env FILL_WAIT_MAX_S).
+    # Bitget UA v3 tiene mayor latencia de propagación que la cuenta clásica:
+    # la orden llena pero la posición tarda varios segundos en aparecer en
+    # /api/v3/position/current-position. El polling cada 0.5s garantiza
+    # que el TPSL solo se envía cuando la posición es realmente visible.
 
     async def _wait_for_position_open(self) -> bool:
         deadline = time.monotonic() + _FILL_WAIT_MAX_S
+        attempt  = 0
         while time.monotonic() < deadline:
+            attempt += 1
             try:
                 positions = await self._get_positions()
                 if positions:
-                    logger.debug("[%s] _wait_for_position_open: posicion confirmada", self.symbol)
+                    elapsed = attempt * _FILL_POLL_INTERVAL
+                    logger.debug(
+                        "[%s] _wait_for_position_open: posicion confirmada tras ~%.1fs (%d polls)",
+                        self.symbol, elapsed, attempt,
+                    )
                     return True
             except Exception as e:
                 logger.debug("[%s] _wait_for_position_open error: %s", self.symbol, e)
             await asyncio.sleep(_FILL_POLL_INTERVAL)
-        logger.warning("[%s] _wait_for_position_open: timeout", self.symbol)
+        logger.warning(
+            "[%s] _wait_for_position_open: timeout tras %.0fs (%d polls)",
+            self.symbol, _FILL_WAIT_MAX_S, attempt,
+        )
         return False
 
     async def _place_order(self, side: str, qty: float, reduce_only: bool = False, sl: float | None = None, tp: float | None = None) -> dict:
@@ -742,29 +762,32 @@ class FuturesTrader:
 
     async def _confirm_and_place_tpsl(self, sl: float | None, tp: float | None) -> bool:
         """
-        Espera a que la posicion sea visible en Bitget y luego coloca el TPSL
-        con reintentos ante code 31008. Devuelve True si el TPSL quedo activo.
-        Loggea y envia alerta Telegram si la posicion no se confirma a tiempo.
+        Espera a que la posicion sea visible en Bitget (hasta FILL_WAIT_MAX_S = 60s)
+        y luego coloca el TPSL con reintentos ante code 31008.
+        Devuelve True si el TPSL quedo activo.
+
+        FIX UA v3: si la posicion no se confirma en 60s, se intenta un cierre
+        de emergencia en lugar de dejar la posicion sin proteccion indefinidamente.
         """
         pos_confirmed = await self._wait_for_position_open()
         if not pos_confirmed:
-            # La posicion no aparece tras FILL_WAIT_MAX_S segundos.
-            # No enviamos TPSL para evitar errores; reconcile_position lo detectara.
-            logger.error(
-                "[%s] Posicion no confirmada en %.0fs -- TPSL omitido. "
-                "reconcile_position intentara recuperar el estado.",
+            # La posición no aparece tras 60s. En UA v3 esto es anómalo.
+            # Intentar cierre de emergencia para no quedar expuesto sin SL.
+            logger.critical(
+                "[%s] Posicion no confirmada en %.0fs (UA v3) -- intentando cierre de emergencia",
                 self.symbol, _FILL_WAIT_MAX_S,
             )
             try:
                 from bot.telegram_bot import send_message
                 await send_message(
-                    f"🚨 <b>TPSL omitido</b> — <code>{self.symbol}</code>\n"
-                    f"Posición no confirmada en {_FILL_WAIT_MAX_S:.0f}s.\n"
-                    f"SL={sl} TP={tp}\n"
-                    f"El watchdog intentará colocarlo en el próximo ciclo."
+                    f"🚨 <b>EMERGENCIA</b> — <code>{self.symbol}</code>\n"
+                    f"Posición no visible tras {_FILL_WAIT_MAX_S:.0f}s en UA v3.\n"
+                    f"Intentando cierre de emergencia. SL={sl} TP={tp}"
                 )
             except Exception:
                 pass
+            # Intento de cierre de emergencia
+            await self._emergency_close()
             return False
 
         tpsl_r = await self._place_pos_tpsl_with_retry(sl=sl, tp=tp)
@@ -772,8 +795,118 @@ class FuturesTrader:
             logger.info("[%s] TPSL confirmado", self.symbol)
             return True
         else:
-            logger.error("[%s] TPSL fallo tras reintentos: %s", self.symbol, tpsl_r)
+            # TPSL falló incluso con la posición visible. Cerrar de emergencia.
+            logger.critical(
+                "[%s] TPSL fallo tras reintentos (posicion visible pero TPSL rechazado): %s -- cierre emergencia",
+                self.symbol, tpsl_r,
+            )
+            try:
+                from bot.telegram_bot import send_message
+                await send_message(
+                    f"🚨 <b>TPSL FALLIDO</b> — <code>{self.symbol}</code>\n"
+                    f"Posición visible pero TPSL rechazado: <code>{tpsl_r}</code>\n"
+                    f"Ejecutando cierre de emergencia."
+                )
+            except Exception:
+                pass
+            await self._emergency_close()
             return False
+
+    # -- Cierre de emergencia --------------------------------------------------
+
+    async def _emergency_close(self) -> None:
+        """
+        Cierra la posición actual con una orden market reduce-only.
+        Se invoca cuando el TPSL no puede colocarse y la posición queda sin protección.
+        No lanza excepciones: registra el fallo pero siempre termina limpiamente.
+        """
+        if not self.position:
+            logger.warning("[%s] _emergency_close: no hay posicion registrada en estado local", self.symbol)
+            return
+
+        side = "sell" if self.position == "long" else "buy"
+        qty  = None
+
+        # Intentar obtener qty real desde Bitget
+        try:
+            positions = await self._get_positions()
+            if positions:
+                qty = float(positions[0].get("total") or positions[0].get("size", 0))
+        except Exception as e:
+            logger.error("[%s] _emergency_close: no se pudo obtener qty: %s", self.symbol, e)
+
+        if not qty or qty <= 0:
+            # Fallback: calcular qty a partir del notional guardado
+            try:
+                price = await self.get_price()
+                if price and self._open_notional and self._open_leverage:
+                    qty = await self._calc_qty(self._open_notional, price, self._open_leverage)
+            except Exception as e:
+                logger.error("[%s] _emergency_close: no se pudo calcular qty de fallback: %s", self.symbol, e)
+
+        if not qty or qty <= 0:
+            logger.critical(
+                "[%s] _emergency_close: NO SE PUDO DETERMINAR QTY -- posicion puede seguir abierta. "
+                "Cerrar manualmente en Bitget.",
+                self.symbol,
+            )
+            try:
+                from bot.telegram_bot import send_message
+                await send_message(
+                    f"🆘 <b>CIERRE EMERGENCIA FALLIDO</b> — <code>{self.symbol}</code>\n"
+                    f"No se pudo determinar la cantidad. "
+                    f"<b>Cerrar manualmente en Bitget.</b>"
+                )
+            except Exception:
+                pass
+            return
+
+        logger.critical(
+            "[%s] _emergency_close: cerrando %s %s @ market (reduce_only)",
+            self.symbol, qty, side,
+        )
+        try:
+            r = await self._place_order(side, qty, reduce_only=True)
+            if r.get("code") == "00000":
+                logger.warning("[%s] _emergency_close: cierre OK", self.symbol)
+                # Limpiar estado local
+                pretrade_risk.register_close(self.symbol, self._open_notional)
+                self._open_notional = 0.0
+                self._open_leverage = 1
+                self.position       = None
+                self.entry_price    = None
+                self.sl = self.tp1 = self.tp2 = self.tp3 = None
+                self.tp2_hit        = False
+                self.sl_order_id    = None
+                self.tp_order_id    = None
+                self._protection_ok = False
+                self._last_tpsl_verify_at = 0.0
+                clear_position(self.symbol)
+                try:
+                    from bot.telegram_bot import send_message
+                    await send_message(
+                        f"✅ <b>Cierre de emergencia OK</b> — <code>{self.symbol}</code>\n"
+                        f"Posición cerrada correctamente."
+                    )
+                except Exception:
+                    pass
+            else:
+                logger.critical(
+                    "[%s] _emergency_close FALLO: %s -- posicion puede seguir abierta. "
+                    "Cerrar manualmente en Bitget.",
+                    self.symbol, r,
+                )
+                try:
+                    from bot.telegram_bot import send_message
+                    await send_message(
+                        f"🆘 <b>CIERRE EMERGENCIA FALLIDO</b> — <code>{self.symbol}</code>\n"
+                        f"Error: <code>{r}</code>\n"
+                        f"<b>Cerrar manualmente en Bitget.</b>"
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.critical("[%s] _emergency_close exception: %s", self.symbol, e)
 
     # -- Abrir posiciones ------------------------------------------------------
 
@@ -803,11 +936,12 @@ class FuturesTrader:
             save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, usdt_amount=usdt_amount, leverage=lev)
             logger.warning("[%s] LONG @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "long", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            # ── FIX: esperar confirmacion de posicion ANTES del TPSL ──────────
+            # FIX UA v3: esperar confirmacion (hasta 60s) ANTES del TPSL.
+            # Si el TPSL falla incluso con la posicion visible, _emergency_close cierra.
             tpsl_ok = await self._confirm_and_place_tpsl(sl=sl, tp=tp3)
             self._protection_ok = tpsl_ok
-            # reconcile siempre, incluso si el TPSL fallo (watchdog lo reintentara)
-            await self.reconcile_position()
+            if tpsl_ok:
+                await self.reconcile_position()
         else:
             logger.error("[%s] open_long FAILED: %s", self.symbol, r)
 
@@ -837,11 +971,12 @@ class FuturesTrader:
             save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, usdt_amount=usdt_amount, leverage=lev)
             logger.warning("[%s] SHORT @ %.4f lev=%sx", self.symbol, price, lev)
             await notify_open(self.symbol, "short", price, lev, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-            # ── FIX: esperar confirmacion de posicion ANTES del TPSL ──────────
+            # FIX UA v3: esperar confirmacion (hasta 60s) ANTES del TPSL.
+            # Si el TPSL falla incluso con la posicion visible, _emergency_close cierra.
             tpsl_ok = await self._confirm_and_place_tpsl(sl=sl, tp=tp3)
             self._protection_ok = tpsl_ok
-            # reconcile siempre, incluso si el TPSL fallo (watchdog lo reintentara)
-            await self.reconcile_position()
+            if tpsl_ok:
+                await self.reconcile_position()
         else:
             logger.error("[%s] open_short FAILED: %s", self.symbol, r)
 
