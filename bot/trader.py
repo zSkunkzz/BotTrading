@@ -42,9 +42,12 @@ _FILL_WAIT_MAX_S    = float(os.getenv("FILL_WAIT_MAX_S", "60.0"))
 _FILL_POLL_INTERVAL = float(os.getenv("FILL_POLL_INTERVAL", "0.5"))
 
 # ── TPSL retry config (fix code 31008) ────────────────────────────────────────────────
-TPSL_WAIT_BEFORE_RETRY_S = float(os.getenv("TPSL_WAIT_BEFORE_RETRY_S", "3.0"))  # espera fija antes del primer intento
-_TPSL_MAX_RETRIES        = int(os.getenv("TPSL_MAX_RETRIES",   "8"))             # subido de 5 a 8
-_TPSL_RETRY_DELAY_S      = float(os.getenv("TPSL_RETRY_DELAY_S", "1.0"))         # subido de 0.5 a 1.0
+# FIX: aumentado de 3.0s a 8.0s — UA v3 necesita más tiempo para propagar la posición
+TPSL_WAIT_BEFORE_RETRY_S = float(os.getenv("TPSL_WAIT_BEFORE_RETRY_S", "8.0"))
+# FIX: aumentado de 8 a 12 reintentos
+_TPSL_MAX_RETRIES        = int(os.getenv("TPSL_MAX_RETRIES",   "12"))
+# FIX: aumentado de 1.0s a 2.0s el delay base del backoff exponencial
+_TPSL_RETRY_DELAY_S      = float(os.getenv("TPSL_RETRY_DELAY_S", "2.0"))
 
 # ── SL software margin: evita pisar el TPSL del servidor (0.1% por defecto) ──
 _SL_SW_MARGIN = float(os.getenv("SL_SW_MARGIN", "0.001"))
@@ -514,8 +517,8 @@ class FuturesTrader:
     # -- TPSL con retry ante code 31008 ----------------------------------------
 
     async def _place_pos_tpsl_with_retry(self, sl: float | None = None, tp: float | None = None) -> dict:
-        # FIX: espera fija antes del primer intento para dar tiempo a UA v3
-        # a propagar la posición internamente antes de colocar el TPSL.
+        # FIX: espera fija de 8s antes del primer intento — UA v3 necesita tiempo
+        # para propagar la posición internamente antes de aceptar órdenes TPSL.
         if TPSL_WAIT_BEFORE_RETRY_S > 0:
             logger.debug(
                 "[%s] _place_pos_tpsl_with_retry: esperando %.1fs antes del primer intento",
@@ -530,7 +533,8 @@ class FuturesTrader:
             if code == "00000":
                 return r
             if code == "31008":
-                wait = _TPSL_RETRY_DELAY_S * (2 ** (attempt - 1))
+                # Backoff exponencial: 2, 4, 8, 16... segundos (cap a 30s)
+                wait = min(_TPSL_RETRY_DELAY_S * (2 ** (attempt - 1)), 30.0)
                 logger.warning(
                     "[%s] TPSL code 31008 (posicion aun no visible) -- reintento %d/%d en %.1fs",
                     self.symbol, attempt, _TPSL_MAX_RETRIES, wait,
