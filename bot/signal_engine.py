@@ -3,13 +3,14 @@
 signal_engine.py — Motor de análisis técnico multi-timeframe (ASYNC)
 
 Modos de entrada (se exporta entry_mode en SignalResult):
-  EARLY   score 5-6, 4h neutral/débil, 1h+15m alineados → lev 5-8x
-  NORMAL  score 6-7, todos los TF alineados               → lev 8-14x
-  STRONG  score 8+, confluencia máxima                    → lev 14-15x
+  EARLY   score 5-6, cualquier alineación de 1h+15m            → lev 5-8x
+  NORMAL  score 6-7, todos los TF alineados                    → lev 8-14x
+  STRONG  score 8+, confluencia máxima                         → lev 14-15x
 
-Señales adicionales (microestructura, hasta +2 pts al score):
-  ob_imbalance  → OB L2 bid/ask imbalance del WS feed (+1 si confirma)
-  funding_bias  → Funding rate extremo filtra o penaliza señales contra-tendencia (+1)
+Cambios v2:
+  - EARLY ahora cubre score==5 con 3 TF alineados (antes se descartaba silenciosamente)
+  - Score==5 con 4h neutral O alineado → EARLY siempre que 1h+15m confirmen
+  - Log explícito cuando una señal queda en NONE (score, RR o modo)
 """
 
 from __future__ import annotations
@@ -36,7 +37,6 @@ TP1_MULT        = 2.5
 TP2_MULT        = 4.0
 TP3_MULT        = 7.0
 
-# Leverage por modo (rango 5-15x)
 LEV_EARLY_MIN   = 5
 LEV_EARLY_MAX   = 8
 LEV_NORMAL_MIN  = 8
@@ -46,11 +46,7 @@ LEV_STRONG_MAX  = 15
 
 EARLY_SIZE_RATIO = 0.5
 
-# Umbral de imbalance OB para considerar presión significativa (|imbalance| > esto)
-OB_IMBALANCE_THRESHOLD = 0.15
-
-# Funding extremo: por encima/debajo de este valor el funding es una señal relevante
-# Ej: 0.0005 = 0.05% por funding period (bastante elevado)
+OB_IMBALANCE_THRESHOLD    = 0.15
 FUNDING_EXTREME_THRESHOLD = 0.0005
 
 
@@ -59,7 +55,7 @@ class SignalResult:
     symbol: str
     signal: str      = "NEUTRAL"
     score: int       = 0
-    max_score: int   = 12   # +2 por microestructura
+    max_score: int   = 12
     entry_mode: str  = "NONE"
     entry: float     = 0.0
     sl: float        = 0.0
@@ -72,8 +68,8 @@ class SignalResult:
     size_ratio: float   = 1.0
     pct_tp3: float      = 0.0
     indicators: dict    = field(default_factory=dict)
-    ob_imbalance: Optional[float]  = None   # [-1..+1]
-    funding_rate: Optional[float]  = None   # float o None
+    ob_imbalance: Optional[float]  = None
+    funding_rate: Optional[float]  = None
     error: Optional[str] = None
 
     @property
@@ -104,10 +100,6 @@ class SignalResult:
 
 
 async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataFrame:
-    """
-    Intenta obtener OHLCV desde el WS feed (caché en memoria).
-    Si no hay datos suficientes cae al REST de ccxt.
-    """
     try:
         from bot.ws_feed import ws_feed
         sym_clean = symbol.replace("/", "").replace(":USDT", "")
@@ -288,72 +280,52 @@ def _apply_microstructure(
     ob_metrics: Optional[dict],
     funding_rate: Optional[float],
 ) -> tuple[int, Optional[float], Optional[float]]:
-    """
-    Aplica hasta +2 puntos adicionales al score base usando microestructura:
-
-    +1 OB imbalance confirma dirección:
-       LONG  + imbalance > +OB_IMBALANCE_THRESHOLD → presión compradora
-       SHORT + imbalance < -OB_IMBALANCE_THRESHOLD → presión vendedora
-
-    +1 Funding rate confirma o filtra:
-       LONG  + funding muy positivo  → -1 (mercado sobrecargado, penalización)
-       LONG  + funding muy negativo  → +1 (shorts pagando, favorece longs)
-       SHORT + funding muy negativo  → -1 (mercado sobrecargado short)
-       SHORT + funding muy positivo  → +1 (longs pagando, favorece shorts)
-
-    Retorna (score_ajustado, ob_imbalance, funding_rate)
-    """
     ob_imbalance_val = None
     fr_val           = None
     bonus            = 0
 
-    # ── Order Book imbalance ──────────────────────────────────────────
     if ob_metrics and isinstance(ob_metrics, dict):
         imbalance = ob_metrics.get("imbalance", 0.0)
         ob_imbalance_val = imbalance
         if direction == "LONG"  and imbalance >  OB_IMBALANCE_THRESHOLD:
             bonus += 1
-            log.debug(f"[micro] OB +1 LONG confirma imbalance={imbalance:+.3f}")
         elif direction == "SHORT" and imbalance < -OB_IMBALANCE_THRESHOLD:
             bonus += 1
-            log.debug(f"[micro] OB +1 SHORT confirma imbalance={imbalance:+.3f}")
         elif direction == "LONG"  and imbalance < -OB_IMBALANCE_THRESHOLD:
             bonus -= 1
-            log.debug(f"[micro] OB -1 LONG contra imbalance={imbalance:+.3f}")
         elif direction == "SHORT" and imbalance >  OB_IMBALANCE_THRESHOLD:
             bonus -= 1
-            log.debug(f"[micro] OB -1 SHORT contra imbalance={imbalance:+.3f}")
 
-    # ── Funding Rate bias ─────────────────────────────────────────────
     if funding_rate is not None:
         fr_val = funding_rate
         if direction == "LONG":
             if funding_rate > FUNDING_EXTREME_THRESHOLD:
-                # Mercado sobrecargado de longs, penalizar
                 bonus -= 1
-                log.debug(f"[micro] FR -1 LONG, funding muy positivo={funding_rate:.6f}")
             elif funding_rate < -FUNDING_EXTREME_THRESHOLD:
-                # Shorts pagando, favorece longs
                 bonus += 1
-                log.debug(f"[micro] FR +1 LONG, funding negativo={funding_rate:.6f}")
-        else:  # SHORT
+        else:
             if funding_rate < -FUNDING_EXTREME_THRESHOLD:
-                # Mercado sobrecargado de shorts, penalizar
                 bonus -= 1
-                log.debug(f"[micro] FR -1 SHORT, funding muy negativo={funding_rate:.6f}")
             elif funding_rate > FUNDING_EXTREME_THRESHOLD:
-                # Longs pagando, favorece shorts
                 bonus += 1
-                log.debug(f"[micro] FR +1 SHORT, funding positivo={funding_rate:.6f}")
 
     adjusted = max(0, score + bonus)
     return adjusted, ob_imbalance_val, fr_val
 
 
 def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction: str) -> tuple[str, int, float]:
+    """
+    FIX v2: EARLY ahora cubre score==5 con cualquier combinación de TF
+    siempre que 1h Y 15m estén alineados con la dirección.
+
+    Antes: EARLY solo si tf4h_aligned <= 0  (4h en contra o neutral)
+           → score==5 con los 3 TF alineados caía en NONE silenciosamente
+
+    Ahora: EARLY si score==5 y (1h alineado AND 15m alineado)
+           El 4h puede estar alineado, neutral o en contra.
+    """
     sign = 1 if direction == "LONG" else -1
 
-    tf4h_aligned = s4h.get("ema_trend", 0) * sign
     tf1h_aligned = s1h.get("ema_trend", 0) * sign
     tf15_aligned = s15.get("ema_trend", 0) * sign
 
@@ -366,18 +338,28 @@ def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction:
         lev   = round(LEV_STRONG_MIN + ratio * (LEV_STRONG_MAX - LEV_STRONG_MIN))
         return mode, lev, 1.0
 
-    if score >= MIN_SCORE_FULL:
+    if score >= MIN_SCORE_FULL:  # >= 6
         mode  = "NORMAL"
         ratio = min((score - MIN_SCORE_FULL) / 2.0, 1.0)
         lev   = round(LEV_NORMAL_MIN + ratio * (LEV_NORMAL_MAX - LEV_NORMAL_MIN))
         return mode, lev, 1.0
 
-    if score == 5 and tf1h_aligned > 0 and tf15_aligned > 0 and tf4h_aligned <= 0:
+    # score == 5 → EARLY si al menos 1h y 15m confirman
+    if score == MIN_SCORE and tf1h_aligned > 0 and tf15_aligned > 0:
         quality = extra_1h + extra_15m
         ratio   = min(quality / 6.0, 1.0)
         lev     = round(LEV_EARLY_MIN + ratio * (LEV_EARLY_MAX - LEV_EARLY_MIN))
+        log.debug(
+            f"[signal] EARLY activado — score=5, 1h={tf1h_aligned}, 15m={tf15_aligned}, "
+            f"quality={quality}, lev={lev}x"
+        )
         return "EARLY", lev, EARLY_SIZE_RATIO
 
+    # Sin modo válido — log para diagnóstico
+    log.debug(
+        f"[signal] NONE — score={score}, 1h_aligned={tf1h_aligned}, "
+        f"15m_aligned={tf15_aligned} (señal descartada)"
+    )
     return "NONE", 1, 0.0
 
 
@@ -400,7 +382,6 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
 
         score_base, _, direction = _compute_score(s4h, s1h, s15)
 
-        # ── Microestructura: OB L2 + Funding Rate ────────────────────────
         ob_metrics   = None
         funding_rate = None
         try:
@@ -417,11 +398,14 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         result.score        = score
         result.ob_imbalance = ob_imbalance_val
         result.funding_rate = fr_val
-        # ────────────────────────────────────────────────────────────
 
         mode, lev, size_ratio = _classify_entry_mode(score, s4h, s1h, s15, direction)
 
         if mode == "NONE":
+            log.info(
+                f"[signal_engine] {symbol} descartado — score={score}/12, "
+                f"modo=NONE, dir={direction}"
+            )
             return result
 
         try:
@@ -451,6 +435,10 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         rr = round(abs(tp1 - entry) / dist_entry_sl, 2) if dist_entry_sl > 0 else 0
 
         if rr < MIN_RR:
+            log.info(
+                f"[signal_engine] {symbol} descartado — R/R {rr:.2f} < {MIN_RR} "
+                f"(score={score}, modo={mode})"
+            )
             return result
 
         pct_tp3 = round(abs(tp3 - entry) / entry * 100, 2)

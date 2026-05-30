@@ -4,22 +4,10 @@ pretrade_risk.py — Motor de riesgo pre-trade institucional.
 Valida cada intención de orden ANTES de enviarla al exchange.
 Si cualquier check falla, devuelve (False, motivo_str) y la orden no se manda.
 
-Uso:
-    from bot.pretrade_risk import PreTradeRisk
-    pt = PreTradeRisk()              # toma config de env vars
-    ok, reason = await pt.check(
-        symbol   = "BTCUSDT",
-        side     = "buy",
-        notional = 250.0,            # USDT expuesto (usdt_amount)
-        price    = 67_000.0,
-        sl       = 66_000.0,
-        ask      = 67_002.0,
-        bid      = 66_998.0,
-        balance  = 1_200.0,
-    )
-    if not ok:
-        logger.warning(f"Pre-trade bloqueado: {reason}")
-        return
+Cambios v2:
+  - balance=None ya no bloquea (API caída → warning y se sigue)
+  - PT_BALANCE_USAGE_PCT subido a 0.90 (evitaba trades legítimos con 0.40)
+  - PT_MIN_SL_DISTANCE_BPS bajado a 8 bps (ATR 15m en BTC/ETH suele ser 5-15 bps)
 """
 from __future__ import annotations
 
@@ -30,7 +18,6 @@ from collections import deque
 
 logger = logging.getLogger("PreTradeRisk")
 
-# ── Parámetros leídos de env ──────────────────────────────────────────────────
 
 def _e(key: str, default: float) -> float:
     return float(os.getenv(key, str(default)))
@@ -38,21 +25,16 @@ def _e(key: str, default: float) -> float:
 
 class PreTradeRisk:
     """
-    Motor de controles pre-trade.
-
-    Variables de entorno (todas opcionales, con defaults conservadores):
+    Variables de entorno (todas opcionales):
 
       PT_MAX_NOTIONAL_PER_TRADE   USDT máximos por operación          (default 500)
       PT_MAX_SYMBOL_EXPOSURE      USDT máximos en un símbolo          (default 1000)
       PT_MAX_TOTAL_EXPOSURE       USDT máximos en todas las posiciones (default 3000)
       PT_MAX_SPREAD_BPS           Spread máximo permitido en bps       (default 30)
-      PT_MIN_SL_DISTANCE_BPS      Distancia mínima SL en bps           (default 20)
+      PT_MIN_SL_DISTANCE_BPS      Distancia mínima SL en bps           (default 8)  ← bajado de 20
       PT_MAX_SLIPPAGE_BPS         Slippage esperado máximo aceptable   (default 50)
       PT_MAX_ORDERS_PER_MIN       Órdenes máximas por minuto POR SÍMBOLO (default 6)
-      PT_BALANCE_USAGE_PCT        Máximo % del balance por trade       (default 0.40)
-
-    NOTA: el rate limit de órdenes se aplica POR SÍMBOLO, no globalmente.
-    Solo se cuentan las órdenes que el exchange acepta (code 00000).
+      PT_BALANCE_USAGE_PCT        Máximo % del balance por trade       (default 0.90) ← subido de 0.40
     """
 
     def __init__(self) -> None:
@@ -60,17 +42,13 @@ class PreTradeRisk:
         self.max_symbol_exposure    : float = _e("PT_MAX_SYMBOL_EXPOSURE",   1_000.0)
         self.max_total_exposure     : float = _e("PT_MAX_TOTAL_EXPOSURE",    3_000.0)
         self.max_spread_bps         : float = _e("PT_MAX_SPREAD_BPS",           30.0)
-        self.min_sl_distance_bps    : float = _e("PT_MIN_SL_DISTANCE_BPS",      20.0)
+        self.min_sl_distance_bps    : float = _e("PT_MIN_SL_DISTANCE_BPS",       8.0)  # era 20
         self.max_slippage_bps       : float = _e("PT_MAX_SLIPPAGE_BPS",         50.0)
         self.max_orders_per_min     : int   = int(_e("PT_MAX_ORDERS_PER_MIN",    6))
-        self.balance_usage_pct      : float = _e("PT_BALANCE_USAGE_PCT",         0.40)
+        self.balance_usage_pct      : float = _e("PT_BALANCE_USAGE_PCT",         0.90)  # era 0.40
 
-        # Estado interno
-        # exposure: {symbol -> notional_usdt_abierto}
-        self._symbol_exposure: dict[str, float] = {}
-        # FIX: ventana deslizante de timestamps POR SÍMBOLO (no global)
-        # {sym -> deque[float]}
-        self._order_timestamps: dict[str, deque] = {}
+        self._symbol_exposure  : dict[str, float] = {}
+        self._order_timestamps : dict[str, deque] = {}
 
     # ── API pública ───────────────────────────────────────────────────────────
 
@@ -80,20 +58,16 @@ class PreTradeRisk:
         side:     str,
         notional: float,
         price:    float,
-        balance:  float,
+        balance:  float | None,          # ← ahora acepta None explícitamente
         sl:       float | None = None,
         ask:      float | None = None,
         bid:      float | None = None,
     ) -> tuple[bool, str]:
-        """
-        Ejecuta todos los checks. Devuelve (True, "OK") o (False, motivo).
-        El orden importa: primero los más baratos computacionalmente.
-        """
         sym = symbol.replace("/", "").replace(":USDT", "")
 
         checks = [
             self._check_notional(notional),
-            self._check_balance_usage(notional, balance),
+            self._check_balance_usage(notional, balance),   # None-safe
             self._check_symbol_exposure(sym, notional),
             self._check_total_exposure(notional),
             self._check_order_rate(sym),
@@ -109,8 +83,6 @@ class PreTradeRisk:
                 )
                 return False, reason
 
-        # Todos los checks pasaron: registrar intención (se confirma en confirm_order)
-        # NO se incrementa el rate counter aquí — solo cuando el exchange acepta la orden
         self._register_exposure(sym, notional)
         logger.info(
             f"[PreTrade:{sym}] ✅ OK — side={side} notional={notional:.2f} "
@@ -119,10 +91,6 @@ class PreTradeRisk:
         return True, "OK"
 
     def confirm_order(self, symbol: str) -> None:
-        """
-        Llamar SOLO cuando el exchange confirma la orden (code 00000).
-        Registra el timestamp en el rate limiter por símbolo.
-        """
         sym = symbol.replace("/", "").replace(":USDT", "")
         if sym not in self._order_timestamps:
             self._order_timestamps[sym] = deque()
@@ -130,7 +98,6 @@ class PreTradeRisk:
         logger.debug(f"[PreTrade:{sym}] 📌 Orden confirmada — rate count={len(self._order_timestamps[sym])}")
 
     def register_close(self, symbol: str, notional: float) -> None:
-        """Llamar cuando una posición se cierra para liberar exposición."""
         sym = symbol.replace("/", "").replace(":USDT", "")
         prev = self._symbol_exposure.get(sym, 0.0)
         self._symbol_exposure[sym] = max(0.0, prev - notional)
@@ -146,7 +113,7 @@ class PreTradeRisk:
         sym = symbol.replace("/", "").replace(":USDT", "")
         return self._symbol_exposure.get(sym, 0.0)
 
-    # ── Checks individuales (devuelven (bool, str)) ───────────────────────────
+    # ── Checks individuales ───────────────────────────────────────────────────
 
     def _check_notional(self, notional: float) -> tuple[bool, str]:
         if notional > self.max_notional_per_trade:
@@ -156,9 +123,30 @@ class PreTradeRisk:
             )
         return True, ""
 
-    def _check_balance_usage(self, notional: float, balance: float) -> tuple[bool, str]:
+    def _check_balance_usage(self, notional: float, balance: float | None) -> tuple[bool, str]:
+        """
+        FIX v2:
+        - Si balance es None (API caída) → warning y se permite continuar.
+          El trade puede fallar al ejecutarse por fondos insuficientes, pero
+          no bloqueamos preventivamente cuando no tenemos datos fiables.
+        - Si balance es 0.0 exacto → bloquear (cuenta vacía confirmada).
+        - Límite de uso subido a 90% (antes 40% bloqueaba trades legítimos).
+        """
+        if balance is None:
+            logger.warning(
+                "[PreTrade] ⚠️ Balance desconocido (API falló) — "
+                f"asumiendo ≥ {notional:.2f} USDT para continuar"
+            )
+            return True, ""
+
         if balance <= 0:
-            return False, f"Balance {balance:.2f} USDT inválido"
+            return False, f"Balance {balance:.2f} USDT inválido (cuenta vacía)"
+
+        if notional > balance:
+            return False, (
+                f"Notional {notional:.2f} USDT supera balance disponible {balance:.2f} USDT"
+            )
+
         usage = notional / balance
         if usage > self.balance_usage_pct:
             return False, (
@@ -168,7 +156,7 @@ class PreTradeRisk:
         return True, ""
 
     def _check_symbol_exposure(self, sym: str, notional: float) -> tuple[bool, str]:
-        current = self._symbol_exposure.get(sym, 0.0)
+        current   = self._symbol_exposure.get(sym, 0.0)
         projected = current + notional
         if projected > self.max_symbol_exposure:
             return False, (
@@ -187,12 +175,10 @@ class PreTradeRisk:
         return True, ""
 
     def _check_order_rate(self, sym: str) -> tuple[bool, str]:
-        """Rate limit POR SÍMBOLO — no comparte cuota entre traders distintos."""
         now = time.monotonic()
         if sym not in self._order_timestamps:
             self._order_timestamps[sym] = deque()
         ts = self._order_timestamps[sym]
-        # Limpiar timestamps fuera de la ventana de 60 s
         while ts and now - ts[0] > 60.0:
             ts.popleft()
         if len(ts) >= self.max_orders_per_min:
@@ -206,7 +192,6 @@ class PreTradeRisk:
         self, ask: float | None, bid: float | None, price: float
     ) -> tuple[bool, str]:
         if ask is None or bid is None or price <= 0:
-            # Sin datos de orderbook: omitir check
             return True, ""
         spread_bps = (ask - bid) / price * 10_000
         if spread_bps > self.max_spread_bps:
@@ -219,6 +204,11 @@ class PreTradeRisk:
     def _check_sl_distance(
         self, price: float, sl: float | None, side: str
     ) -> tuple[bool, str]:
+        """
+        FIX v2: mínimo bajado a 8 bps (antes 20).
+        Con ATR_MULT_SL=1.2 en signal_engine, el SL en BTC 15m suele
+        quedar entre 5-15 bps. 20 bps bloqueaba la mayoría de señales.
+        """
         if sl is None or price <= 0:
             return True, ""
         if side in ("buy", "long"):
@@ -237,9 +227,8 @@ class PreTradeRisk:
     # ── Registro interno ──────────────────────────────────────────────────────
 
     def _register_exposure(self, sym: str, notional: float) -> None:
-        """Registra la exposición de capital (siempre, para controlar riesgo)."""
         self._symbol_exposure[sym] = self._symbol_exposure.get(sym, 0.0) + notional
 
 
-# Singleton global — mismo patrón que balance_svc
+# Singleton global
 pretrade_risk = PreTradeRisk()
