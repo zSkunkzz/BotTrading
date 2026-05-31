@@ -46,7 +46,7 @@ async def notify_startup(pairs: list, dry_run: bool, top_n: int):
     mode = "\U0001f9ea DRY RUN" if dry_run else "\U0001f4b0 REAL MONEY"
     pairs_str = _esc(", ".join(pairs[:10])) + (" ..." if len(pairs) > 10 else "")
     text = (
-        f"\U0001f916 <b>BitgetProBot arrancado</b> — {mode}\n"
+        f"\U0001f916 <b>HyperliquidBot arrancado</b> — {mode}\n"
         f"Pares activos ({top_n}): <code>{pairs_str}</code>"
     )
     await _send(text)
@@ -91,7 +91,7 @@ async def notify_close(symbol, side, exit_p, pnl, entry=None, reason="", dry_run
 
 
 async def notify_close_failed(symbol, reason, error):
-    """Alerta urgente cuando un cierre falla en Bitget — posición sigue abierta."""
+    """Alerta urgente cuando un cierre falla en Hyperliquid — posición sigue abierta."""
     await _send(
         f"\u26a0\ufe0f <b>\u274c CIERRE FALLIDO</b> <code>{_esc(symbol)}</code>\n"
         f"Razón: {_esc(reason)}\n"
