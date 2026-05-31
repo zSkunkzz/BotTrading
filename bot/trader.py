@@ -61,6 +61,21 @@ _SL_SW_MARGIN           = float(os.getenv("SL_SW_MARGIN", "0.001"))
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
+# Rate limiter global para llamadas REST a /info (compartido entre todos los traders)
+_HL_REST_LOCK   = asyncio.Lock()
+_HL_LAST_CALL   = 0.0
+_HL_MIN_INTERVAL = 0.15   # máx ~6 req/s compartido entre traders
+
+async def _hl_throttle():
+    """Espera el mínimo intervalo entre llamadas REST a Hyperliquid para evitar 429."""
+    global _HL_LAST_CALL
+    async with _HL_REST_LOCK:
+        now = time.monotonic()
+        wait = _HL_MIN_INTERVAL - (now - _HL_LAST_CALL)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _HL_LAST_CALL = time.monotonic()
+
 
 # ── Helpers de signing (alineados con hyperliquid-python-sdk/signing.py) ──────
 
@@ -163,40 +178,19 @@ class FuturesTrader:
         self.margin_mode = os.getenv("MARGIN_MODE", margin_mode or "isolated").lower()
         self.dry_run     = dry_run
 
-        # ── Autenticación según doc oficial HL ──────────────────────────
-        #
-        # Opción A — API key de agente:
-        #   HL_API_PRIVATE_KEY     = private key del wallet AGENTE
-        #   HL_API_WALLET_ADDRESS  = dirección del wallet PRINCIPAL (el que tiene fondos)
-        #
-        #   Flujo correcto (doc oficial):
-        #   - Firmar con la clave del AGENTE
-        #   - NO enviar vaultAddress en el payload (eso es solo para vaults/subaccounts)
-        #   - El agente debe estar aprobado en app.hyperliquid.xyz Settings > API
-        #   - Las consultas /info (balance, posiciones) se hacen con la dirección PRINCIPAL
-        #
-        # Opción B — private key directa del wallet principal:
-        #   HL_PRIVATE_KEY    = private key del wallet principal
-        #   HL_ACCOUNT_ADDR   = dirección pública (opcional, se deriva)
-
         api_pk     = os.getenv("HL_API_PRIVATE_KEY", "").strip()
         api_wallet = os.getenv("HL_API_WALLET_ADDRESS", "").strip()
 
         if api_pk:
-            # Opción A: firmar con clave de agente, sin vaultAddress en el payload
             self._private_key       = api_pk
             self._agent_mode        = True
-            # Dirección del agente (derivada de su clave) — usada para firmar
             agent_acct = Account.from_key(api_pk)
             self._agent_addr        = agent_acct.address
-            # Dirección principal — usada para consultas /info (balance, posiciones)
             self._master_addr       = api_wallet if api_wallet else self._agent_addr
-            # _account_addr apunta al master para que clearinghouseState y balance lean bien
             self._account_addr      = self._master_addr
             logger.info("[%s] Auth: API key agente → agente=%s master=%s",
                         symbol, self._agent_addr[:10] + "...", self._master_addr[:10] + "...")
         else:
-            # Opción B: private key directa
             pk = os.getenv("HL_PRIVATE_KEY", api_secret or "").strip()
             self._private_key  = pk
             self._account_addr = os.getenv("HL_ACCOUNT_ADDR", "").strip()
@@ -210,7 +204,6 @@ class FuturesTrader:
             logger.info("[%s] Auth: private key directa → addr=%s", symbol,
                         self._account_addr[:10] + "..." if self._account_addr else "N/A")
 
-        # Estado de posición
         self.position     = None
         self.entry_price  = None
         self.sl           = None
@@ -243,7 +236,8 @@ class FuturesTrader:
     # ── HTTP helpers ────────────────────────────────────────────────────
 
     async def _info_post(self, payload: dict) -> dict:
-        """POST a /info (sin autenticación)."""
+        """POST a /info con throttle para evitar 429."""
+        await _hl_throttle()
         async with aiohttp.ClientSession() as s:
             async with s.post(
                 f"{_API_URL}/info",
@@ -251,25 +245,19 @@ class FuturesTrader:
                 headers={"Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
+                if r.status == 429:
+                    logger.warning("[%s] 429 en /info, esperando 2s...", self.symbol)
+                    await asyncio.sleep(2.0)
+                    return {}
                 return _json.loads(await r.text())
 
     async def _exchange_post(self, action: dict) -> dict:
-        """
-        POST autenticado a /exchange con firma EIP-712 L1 (SDK oficial).
-
-        Según la doc oficial de Hyperliquid:
-        - Las API keys de agente firman directamente SIN vaultAddress.
-          vaultAddress solo se usa para vaults/subaccounts reales.
-        - El hash de la acción no incluye vault_address en modo agente.
-        """
+        """POST autenticado a /exchange con firma EIP-712 L1."""
         if not self._private_key:
             raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
 
         nonce      = int(time.time() * 1000)
         is_mainnet = not _USE_TESTNET
-
-        # Modo agente: no hay vault_address en el hash ni en el payload
-        # Modo directo (Opción B): tampoco, a menos que se opere sobre un vault
         vault_address = None
 
         signature = _sign_l1_action(
@@ -285,8 +273,6 @@ class FuturesTrader:
             "nonce":     nonce,
             "signature": signature,
         }
-        # NO añadir vaultAddress — eso solo es para vaults/subaccounts reales
-        # Ref: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint
 
         async with aiohttp.ClientSession() as s:
             async with s.post(
@@ -305,7 +291,6 @@ class FuturesTrader:
 
     async def _init(self, usdc_per_trade: float):
         import ccxt.async_support as ccxt
-        # ccxt usa la clave de firma (agente o principal) y la dirección para consultas
         self.exchange = ccxt.hyperliquid({
             "walletAddress": self._master_addr,
             "privateKey":    self._private_key,
@@ -350,6 +335,7 @@ class FuturesTrader:
         raise ValueError(f"No se pudo obtener precio para {self.coin}")
 
     async def get_ohlcv(self, tf: str = OHLCV_TF) -> list:
+        # 1. WS feed (sin coste de red)
         try:
             from bot.ws_feed import ws_feed
             if ws_feed.has_data(self.coin, tf=tf, min_candles=OHLCV_MIN_BARS):
@@ -365,6 +351,7 @@ class FuturesTrader:
         except Exception as e:
             logger.debug("[%s] get_ohlcv WS error: %s", self.symbol, e)
 
+        # 2. REST Hyperliquid con throttle
         try:
             tf_ms = {"15m": 15*60*1000, "1h": 60*60*1000, "4h": 4*60*60*1000}.get(tf, 15*60*1000)
             now   = int(time.time() * 1000)
@@ -373,6 +360,10 @@ class FuturesTrader:
                 "type": "candleSnapshot",
                 "req":  {"coin": self.coin, "interval": tf, "startTime": start, "endTime": now},
             })
+            # GUARD: data puede ser None, dict de error, o lista vacía si hubo 429
+            if not isinstance(data, list) or len(data) == 0:
+                logger.debug("[%s] get_ohlcv REST: respuesta inválida (%s)", self.symbol, type(data).__name__)
+                return []
             return [
                 [int(c["t"]), float(c["o"]), float(c["h"]),
                  float(c["l"]), float(c["c"]), float(c["v"])]
@@ -444,13 +435,12 @@ class FuturesTrader:
             "t": order_type_obj,
         }
 
-        # TP/SL: se envían como órdenes trigger separadas según la doc oficial
         if sl or tp:
             tpsl_parts = []
             if tp:
                 tpsl_parts.append({
                     "a": coin_idx,
-                    "b": not is_buy,  # cierre en dirección contraria
+                    "b": not is_buy,
                     "p": _float_to_wire(tp),
                     "s": _float_to_wire(qty),
                     "r": True,
@@ -636,9 +626,6 @@ class FuturesTrader:
         price   = await self.get_price()
         lev     = leverage or self.leverage
         qty     = await self._calc_qty(usdc_amount, price, lev)
-        # FIX: NO convertir None a 0.0 — pretrade_risk maneja None correctamente
-        # (asume balance suficiente y continúa). Convertir None→0 bloqueaba trades
-        # cuando la API de balance fallaba momentáneamente.
         balance = await self.get_balance()
         ok, reason = await pretrade_risk.check(
             symbol=self.symbol, side="buy", notional=usdc_amount,
@@ -675,7 +662,6 @@ class FuturesTrader:
         price   = await self.get_price()
         lev     = leverage or self.leverage
         qty     = await self._calc_qty(usdc_amount, price, lev)
-        # FIX: NO convertir None a 0.0 — pretrade_risk maneja None correctamente
         balance = await self.get_balance()
         ok, reason = await pretrade_risk.check(
             symbol=self.symbol, side="sell", notional=usdc_amount,
