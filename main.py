@@ -7,7 +7,6 @@ import os
 from dotenv import load_dotenv
 from bot.risk import RiskManager
 from bot.trader import FuturesTrader
-import bot.trader_run_patch  # noqa: F401 — añade FuturesTrader.run()
 from bot.global_risk import GlobalRisk
 from bot.pair_scanner import PairScanner
 from bot.ai_filter import ai_rank_pairs
