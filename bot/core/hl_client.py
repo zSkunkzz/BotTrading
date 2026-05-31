@@ -44,7 +44,7 @@ _BASE_URL = (
 _MARKET_SLIPPAGE = 0.03
 
 # Buffer aplicado al limit_px de las trigger TP para que Hyperliquid
-# acepte la orden (limit_px debe ser “peor” que trigger_px un mínimo).
+# acepte la orden (limit_px debe ser "peor" que trigger_px un mínimo).
 _TP_LIMIT_BUFFER = 0.001  # 0.1%
 
 # Retries para confirmar posición post-fill (propagación lenta en HL)
@@ -67,6 +67,11 @@ def _norm_coin(symbol: str) -> str:
 class _HLCore:
     """
     Singleton que mantiene UNA instancia de Exchange + Info.
+
+    Al inicializarse pre-carga el caché de szDecimals y pxDecimals
+    para TODOS los coins del universo de Hyperliquid de una sola
+    llamada a /info meta — evita latencia y posibles errores
+    'Order has invalid price' en la primera orden de cada trader.
     """
 
     _instance: "_HLCore | None" = None
@@ -107,10 +112,88 @@ class _HLCore:
         self._sz_decimals_cache: dict[str, int] = {}
         self._px_decimals_cache: dict[str, int] = {}
 
+        # Pre-calentar caché con TODOS los coins del universo HL de una
+        # sola llamada a meta() — sin esto el primer trader de cada coin
+        # puede fallar con 'Order has invalid price' mientras consulta
+        # pxDecimals en tiempo real durante la ejecución de la orden.
+        self._warm_decimals_cache()
+
         logger.info(
-            "[HLCore] SDK Exchange+Info inicializados | addr=%s | agente=%s",
+            "[HLCore] SDK Exchange+Info inicializados | addr=%s | agente=%s | "
+            "coins cacheados: sz=%d px=%d",
             self.account_addr[:10] + "...",
             self.agent_mode,
+            len(self._sz_decimals_cache),
+            len(self._px_decimals_cache),
+        )
+
+    def _warm_decimals_cache(self) -> None:
+        """
+        Pre-carga szDecimals y pxDecimals para todos los coins del universo
+        Hyperliquid en una sola llamada a /info meta.
+
+        pxDecimals se infiere del campo 'maxDecimals' si existe, o a partir
+        del precio actual del coin si no (usando l2_snapshot por coin es
+        demasiado costoso; aquí usamos la regla de rangos de precio con el
+        campo 'markPx' del all_mids si está disponible).
+
+        La lógica de inferencia es:
+          markPx >= 10 000 → 1 decimal
+          markPx >= 1 000  → 2 decimales
+          markPx >= 100    → 3 decimales
+          markPx >= 10     → 4 decimales
+          markPx >= 1      → 5 decimales
+          markPx < 1       → 6 decimales
+        """
+        try:
+            meta = self.info.meta()
+            universe = meta.get("universe", [])
+        except Exception as exc:
+            logger.warning("[HLCore] No se pudo obtener meta para pre-caché: %s", exc)
+            return
+
+        # Intentar obtener precios actuales para inferir pxDecimals
+        mid_prices: dict[str, float] = {}
+        try:
+            mids = self.info.all_mids()  # dict {coin: price_str}
+            mid_prices = {k: float(v) for k, v in mids.items()}
+        except Exception as exc:
+            logger.debug("[HLCore] all_mids no disponible para warm cache: %s", exc)
+
+        for asset in universe:
+            coin = asset.get("name", "")
+            if not coin:
+                continue
+
+            # szDecimals
+            sz_dec = int(asset.get("szDecimals", 4))
+            self._sz_decimals_cache[coin] = sz_dec
+
+            # pxDecimals: preferir campo explícito del meta
+            if "maxDecimals" in asset:
+                px_dec = int(asset["maxDecimals"])
+            else:
+                # Inferir por rango de precio
+                mid = mid_prices.get(coin, 0.0)
+                if mid >= 10_000:
+                    px_dec = 1
+                elif mid >= 1_000:
+                    px_dec = 2
+                elif mid >= 100:
+                    px_dec = 3
+                elif mid >= 10:
+                    px_dec = 4
+                elif mid >= 1:
+                    px_dec = 5
+                else:
+                    px_dec = 6  # monedas < $1 (DOGE, XRP, etc.)
+
+            self._px_decimals_cache[coin] = px_dec
+
+        logger.info(
+            "[HLCore] Caché de decimales pre-cargado: %d coins "
+            "(szDecimals + pxDecimals listos)",
+            len(universe),
         )
 
     @classmethod
@@ -182,7 +265,7 @@ class HLClient:
         self._agent_mode   = core.agent_mode
         self._core         = core
 
-    # ── METADATOS ──────────────────────────────────────────────────────
+    # ── METADATOS ──────────────────────────────────────────────────────────
 
     def _get_meta_asset(self) -> dict:
         """Devuelve el dict de metadatos de este coin desde /info meta."""
@@ -198,15 +281,16 @@ class HLClient:
     def get_sz_decimals(self) -> int:
         """
         Devuelve el número de decimales permitidos para el tamaño (sz).
-        Cacheado en _HLCore para no repetir la llamada HTTP.
+        Cacheado en _HLCore — normalmente ya estará precargado al arrancar.
         """
         cache = self._core._sz_decimals_cache
         if self.coin in cache:
             return cache[self.coin]
+        # Fallback: consulta individual si por alguna razón no está en caché
         asset = self._get_meta_asset()
         dec = int(asset.get("szDecimals", 4))
         cache[self.coin] = dec
-        logger.debug("[%s] szDecimals=%d", self.coin, dec)
+        logger.debug("[%s] szDecimals=%d (cargado individualmente)", self.coin, dec)
         return dec
 
     def get_px_decimals(self) -> int:
@@ -216,20 +300,14 @@ class HLClient:
         Hyperliquid rechaza órdenes con 'Order has invalid price' cuando
         limit_px o triggerPx tienen más decimales de los permitidos.
 
-        El SDK expone esto en el campo 'maxDecimals' (o 'priceDecimals') del
-        asset en /info meta. Si el campo no existe, inferimos a partir del
-        precio de mercado:
-          precio >= 1000 → 2 decimales
-          precio >= 100  → 3 decimales
-          precio >= 10   → 4 decimales
-          precio >= 1    → 5 decimales
-          precio < 1     → 6 decimales
+        Normalmente ya estará precargado por _warm_decimals_cache() al arrancar.
+        Si no está en caché, lo consulta individualmente con fallback por precio.
         """
         cache = self._core._px_decimals_cache
         if self.coin in cache:
             return cache[self.coin]
 
-        # Intentar leer del meta del SDK (campo 'maxDecimals')
+        # Fallback: campo maxDecimals del meta
         asset = self._get_meta_asset()
         if "maxDecimals" in asset:
             dec = int(asset["maxDecimals"])
@@ -237,10 +315,10 @@ class HLClient:
             logger.debug("[%s] pxDecimals=%d (meta.maxDecimals)", self.coin, dec)
             return dec
 
-        # Fallback: inferir a partir del mid price
-        dec = 5  # valor por defecto conservador
+        # Fallback: inferir del mid price con l2_snapshot
+        dec = 5
         try:
-            l2 = self._info.l2_snapshot(self.coin)
+            l2  = self._info.l2_snapshot(self.coin)
             ask = float(l2["levels"][1][0]["px"])
             bid = float(l2["levels"][0][0]["px"])
             mid = (ask + bid) / 2
@@ -260,19 +338,19 @@ class HLClient:
             logger.warning("[%s] No se pudo inferir pxDecimals: %s — usando %d", self.coin, exc, dec)
 
         cache[self.coin] = dec
-        logger.debug("[%s] pxDecimals=%d (inferido del precio)", self.coin, dec)
+        logger.debug("[%s] pxDecimals=%d (inferido individualmente)", self.coin, dec)
         return dec
 
     def round_px(self, price: float) -> float:
         """
         Redondea un precio al número de decimales válidos para este coin.
-        Usar SIEMPRE antes de enviar limit_px o triggerPx a HL.
+        Llamar SIEMPRE antes de enviar limit_px o triggerPx a Hyperliquid.
         """
         dec = self.get_px_decimals()
         factor = 10 ** dec
         return math.floor(price * factor) / factor
 
-    # ── ÓRDENES BÁSICAS ─────────────────────────────────────────────────
+    # ── ÓRDENES BÁSICAS ────────────────────────────────────────────────────
 
     def place_limit(
         self,
@@ -395,11 +473,11 @@ class HLClient:
     def place_bulk(self, orders: list[dict]) -> dict:
         """
         Coloca múltiples órdenes en bulk.
-        Redondea triggerPx y limit_px de cada orden antes de enviar.
+        Redondea triggerPx y limit_px de CADA orden antes de enviar.
         """
         cleaned = []
         for o in orders:
-            o = dict(o)  # copia superficial para no mutar el original
+            o  = dict(o)
             ot = o.get("order_type", {})
             if isinstance(ot, dict) and "trigger" in ot:
                 trig = dict(ot["trigger"])
@@ -413,7 +491,7 @@ class HLClient:
             cleaned.append(o)
         return self._exchange.bulk_orders(cleaned)
 
-    # ── CONSULTAS INFO ────────────────────────────────────────────────────
+    # ── CONSULTAS INFO ─────────────────────────────────────────────────────
 
     def get_user_state(self) -> dict:
         return self._info.user_state(self._account_addr)
