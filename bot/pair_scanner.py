@@ -48,13 +48,17 @@ class PairScanner:
     Escanea pares USDT perpetuos de Hyperliquid.
     Filtra por volumen 24h y volatilidad (% cambio).
     Devuelve nombres cortos de coin: "BTC", "ETH", "SOL"...
+
+    _last_scored: lista completa de dicts con datos enriquecidos del último scan.
+    Utilizada por main.py para pasar datos reales a ai_rank_pairs sin depender
+    del stub fetch_ticker que siempre devolvía quoteVolume=0.
     """
 
     def __init__(
         self,
         api_key=None, api_secret=None, passphrase=None,   # ignorados, compatibilidad
-        min_volume_usdt=5_000_000,
-        min_price_change_pct=1.5,
+        min_volume_usdt=1_000_000,
+        min_price_change_pct=0.5,
         top_n=15,
         refresh_interval_min=30,
     ):
@@ -63,13 +67,14 @@ class PairScanner:
         self.top_n                = top_n
         self.refresh_interval     = refresh_interval_min * 60
         self.active_pairs: list   = []
+        self._last_scored: list   = []   # ← expuesto para main.py
 
         extra = os.getenv("SYMBOL_BLACKLIST", "")
         self.blacklist = NON_CRYPTO_BASES | {
             s.strip().upper() for s in extra.split(",") if s.strip()
         }
 
-        # Stub: exchange attr para compatibilidad con main.py (fetch_ticker)
+        # Stub: exchange attr para compatibilidad con código legado
         self.exchange = _HLExchangeStub()
 
     def _is_valid(self, coin: str) -> bool:
@@ -98,7 +103,7 @@ class PairScanner:
             ctx = ctxs[i] if i < len(ctxs) else {}
 
             try:
-                day_volume   = float(ctx.get("dayNtlVlm",    0) or 0)   # volumen 24h en USDT
+                day_volume   = float(ctx.get("dayNtlVlm",    0) or 0)
                 mark_px      = float(ctx.get("markPx",       0) or 0)
                 prev_day_px  = float(ctx.get("prevDayPx",    0) or mark_px)
                 funding      = float(ctx.get("funding",      0) or 0)
@@ -126,6 +131,9 @@ class PairScanner:
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         top = scored[:self.top_n]
+
+        # Guardar lista completa para que main.py la use con ai_rank_pairs
+        self._last_scored = top
 
         logger.info("🏆 Top %d pares Hyperliquid seleccionados:", len(top))
         for p in top[:5]:
@@ -163,7 +171,7 @@ class PairScanner:
 
 
 class _HLExchangeStub:
-    """Stub mínimo para que main.py pueda llamar fetch_ticker sin crashear."""
+    """Stub mínimo para compatibilidad con código legado."""
     async def fetch_ticker(self, symbol: str) -> dict:
         """Consulta precio actual via /info allMids."""
         try:
