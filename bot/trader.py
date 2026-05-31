@@ -5,9 +5,6 @@ Autenticación soportada:
   Opción A (recomendada): API Key de agente
     - HL_API_PRIVATE_KEY     : private key del wallet AGENTE generado en app.hyperliquid.xyz
     - HL_API_WALLET_ADDRESS  : dirección del wallet PRINCIPAL (el que tiene fondos y aprobó el agente)
-    Las órdenes se firman con la clave del agente. El action_hash NO usa vault_address
-    (debe ser None) — el campo vaultAddress del payload JSON también va a None.
-    El endpoint /info usa master_addr para consultar posiciones y balance.
 
   Opción B: Private key directa
     - HL_PRIVATE_KEY         : private key del wallet principal
@@ -28,14 +25,13 @@ import logging
 import os
 import time
 import json as _json
-from decimal import Decimal
 from typing import Optional
 
 import aiohttp
 from eth_account import Account
 from eth_utils import to_hex
 
-# SDK oficial de Hyperliquid — garantiza el mismo signing que el exchange
+# SDK oficial de Hyperliquid
 from hyperliquid.utils.signing import sign_l1_action, float_to_wire
 
 from bot.strategy import decide
@@ -45,7 +41,6 @@ from bot.state import save_position, load_position, clear_position, mark_tp2_hit
 from bot.balance_service import balance_svc
 from bot.pretrade_risk import pretrade_risk
 from bot.kill_switch import kill_switch
-# Importamos siempre desde el módulo canónico bot.execution.execution_engine
 from bot.execution.execution_engine import execution_engine
 from bot.ohlcv_cache import ohlcv_cache
 
@@ -64,7 +59,7 @@ _SL_SW_MARGIN           = float(os.getenv("SL_SW_MARGIN", "0.001"))
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
-# ── Rate limiter global para /info ──────────────────────────────────────────
+# ── Rate limiter global para /info ─────────────────────────────────────────
 _HL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
 _HL_MIN_INTERVAL = 0.6
@@ -79,7 +74,7 @@ async def _hl_throttle():
         _HL_LAST_CALL = time.monotonic()
 
 
-# ── Nonce único global ───────────────────────────────────────────────────────
+# ── Nonce único global ──────────────────────────────────────────────────
 _NONCE_LOCK = asyncio.Lock()
 _NONCE_LAST = 0
 
@@ -93,7 +88,7 @@ async def _unique_nonce() -> int:
         return n
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────
 
 def _norm_coin(symbol: str) -> str:
     s = symbol.replace("/", "").replace(":USDT", "").upper()
@@ -104,7 +99,6 @@ def _norm_coin(symbol: str) -> str:
     return s
 
 
-# Alias para compatibilidad con el resto del código que usaba _float_to_wire
 _float_to_wire = float_to_wire
 
 
@@ -133,8 +127,13 @@ class FuturesTrader:
             agent_acct         = Account.from_key(api_pk)
             self._agent_addr   = agent_acct.address
             self._master_addr  = api_wallet
-            self._account_addr  = self._master_addr
+            self._account_addr = self._master_addr
             self._vault_address = None
+
+            # HLClient para cancel_all_open_tpsl y operaciones directas
+            from bot.core.hl_client import HLClient
+            self._hl_client = HLClient(symbol)
+
             logger.info(
                 "[%s] Auth: modo agente | master=%s | agente=%s",
                 symbol, self._master_addr[:10] + "...", self._agent_addr[:10] + "...",
@@ -156,6 +155,10 @@ class FuturesTrader:
                 self._account_addr = acct.address
                 logger.debug("[%s] HL_ACCOUNT_ADDR derivada: %s", symbol, self._account_addr)
             self._master_addr  = self._account_addr
+
+            from bot.core.hl_client import HLClient
+            self._hl_client = HLClient(symbol)
+
             logger.info(
                 "[%s] Auth: modo directo | addr=%s",
                 symbol, self._account_addr[:10] + "..." if self._account_addr else "N/A",
@@ -176,7 +179,7 @@ class FuturesTrader:
         self._last_tpsl_verify_at: float = 0.0
         self._ccxt_exchange = None
 
-    # ── ccxt ────────────────────────────────────────────────────────────
+    # ── ccxt ──────────────────────────────────────────────────────────────────
 
     async def _get_ccxt(self):
         if self._ccxt_exchange is None:
@@ -204,7 +207,7 @@ class FuturesTrader:
                 pass
             self._ccxt_exchange = None
 
-    # ── Coin index ──────────────────────────────────────────────────────
+    # ── Coin index ───────────────────────────────────────────────────────────
 
     _coin_index_cache: dict[str, int] = {}
 
@@ -216,7 +219,7 @@ class FuturesTrader:
             self._coin_index_cache[uni.get("name", "")] = i
         return self._coin_index_cache.get(self.coin, 0)
 
-    # ── HTTP helpers ────────────────────────────────────────────────────
+    # ── HTTP helpers ──────────────────────────────────────────────────────────
 
     async def _info_post(self, payload: dict) -> dict:
         await _hl_throttle()
@@ -240,19 +243,14 @@ class FuturesTrader:
                 return _json.loads(await r.text())
 
     async def _exchange_post(self, action: dict) -> dict:
-        """Signing manual vía SDK: usado SOLO para updateLeverage, cancel, orderStatus.
-        Las órdenes de entrada/salida van siempre por execution_engine → HLClient."""
+        """Signing manual vía SDK: usado SOLO para updateLeverage, cancel, orderStatus."""
         if not self._private_key:
             raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
 
-        nonce = await _unique_nonce()
-        wallet    = Account.from_key(self._private_key)
+        nonce  = await _unique_nonce()
+        wallet = Account.from_key(self._private_key)
         signature = sign_l1_action(
-            wallet,
-            action,
-            self._vault_address,
-            nonce,
-            not _USE_TESTNET,
+            wallet, action, self._vault_address, nonce, not _USE_TESTNET,
         )
 
         payload: dict = {
@@ -291,7 +289,7 @@ class FuturesTrader:
                 )
         return result
 
-    # ── Init / cleanup ───────────────────────────────────────────────────
+    # ── Init / cleanup ────────────────────────────────────────────────────────
 
     async def _init(self, usdc_per_trade: float):
         await self._get_ccxt()
@@ -324,7 +322,7 @@ class FuturesTrader:
     async def cleanup(self):
         await self._close_ccxt()
 
-    # ── Precio y OHLCV ───────────────────────────────────────────────────
+    # ── Precio y OHLCV ──────────────────────────────────────────────────────────
 
     async def get_price(self) -> float:
         try:
@@ -382,7 +380,7 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage ─────────────────────────────────────────────────────────
+    # ── Leverage ────────────────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int, side: str = "cross"):
         if self.dry_run:
@@ -397,18 +395,12 @@ class FuturesTrader:
         else:
             logger.debug("[%s] set_leverage respuesta: %s", self.symbol, r)
 
-    # ── Órdenes ──────────────────────────────────────────────────────────
+    # ── Órdenes ───────────────────────────────────────────────────────────────────
     #
     # NOTA: _place_order_raw ya NO existe.
-    # Toda ejecución de órdenes de entrada/salida pasa por execution_engine
-    # (bot/execution/execution_engine.py → HLClient).
-    # El TP/SL se coloca UNA SOLA VEZ dentro de execution_engine._place_tpsl_bulk,
-    # después de confirmar el fill. No hay TP/SL duplicados.
-    #
-    # _exchange_post sigue existiendo para operaciones auxiliares:
-    #   - updateLeverage
-    #   - cancel
-    #   - orderStatus
+    # Toda ejecución de órdenes pasa por execution_engine (HLClient).
+    # TP/SL se coloca UNA SOLA VEZ dentro de execution_engine._place_tpsl_bulk.
+    # _exchange_post sigue para: updateLeverage, cancel, orderStatus.
 
     async def _get_order_status(self, order_id) -> dict:
         try:
@@ -434,7 +426,7 @@ class FuturesTrader:
 
     async def _place_order(self, side: str, qty: float, reduce_only: bool = False,
                            sl: float | None = None, tp: float | None = None) -> dict:
-        """Wrapper público hacia execution_engine. TP/SL los gestiona el engine."""
+        """Wrapper público hacia execution_engine."""
         try:
             arrival_price = await self.get_price()
         except Exception:
@@ -463,7 +455,7 @@ class FuturesTrader:
             await kill_switch.on_order_result(rejected=True)
         return r
 
-    # ── Posiciones ───────────────────────────────────────────────────────
+    # ── Posiciones ─────────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list:
         try:
@@ -483,7 +475,7 @@ class FuturesTrader:
             logger.error("[%s] _get_positions error: %s", self.symbol, e)
             return []
 
-    # ── Loop principal ───────────────────────────────────────────────────
+    # ── Loop principal ───────────────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None):
         """Loop principal del trader para un símbolo."""
@@ -514,9 +506,9 @@ class FuturesTrader:
         did_check_exchange = False
         exchange_positions = []
         if now - self._last_pos_check_at >= _POS_CHECK_INTERVAL_S:
-            exchange_positions     = await self._get_positions()
+            exchange_positions      = await self._get_positions()
             self._last_pos_check_at = now
-            did_check_exchange     = True
+            did_check_exchange      = True
 
         if did_check_exchange:
             if exchange_positions:
@@ -529,6 +521,12 @@ class FuturesTrader:
             else:
                 if self.position is not None:
                     logger.info("[%s] Posición cerrada externamente.", self.symbol)
+                    # Cancelar trigger orders huérfanos
+                    try:
+                        self._hl_client.cancel_all_open_tpsl()
+                        logger.info("[%s] Trigger orders huérfanos cancelados.", self.symbol)
+                    except Exception as e:
+                        logger.warning("[%s] No se pudieron cancelar triggers huérfanos: %s", self.symbol, e)
                     self.position    = None
                     self.entry_price = None
                     self.sl = self.tp1 = self.tp2 = self.tp3 = None
@@ -607,52 +605,65 @@ class FuturesTrader:
             decision.get("reason", ""),
         )
 
-        # _place_order llama a execution_engine.execute(), que:
-        #   1. Ejecuta la entrada (limit o market) SIN TP/SL en el payload
-        #   2. Coloca los trigger TP/SL en bulk separado (una sola vez)
-        result = {"status": "ok"} if self.dry_run else await self._place_order(side, qty, sl=sl, tp=tp1)
+        result = {"status": "ok", "_fill_price": entry} if self.dry_run else await self._place_order(side, qty, sl=sl, tp=tp1)
 
-        if result.get("status") == "ok":
-            self.position       = "long" if action == "BUY" else "short"
-            self.entry_price    = entry
-            self.sl             = sl
-            self.tp1            = tp1
-            self.tp2            = tp2
-            self.tp3            = tp3
-            self.tp2_hit        = False
-            self._open_notional = notional
-            self._open_leverage = lev
-            self._protection_ok = False
-            self.trade_count   += 1
+        if result.get("status") != "ok":
+            return
 
-            save_position(self.symbol, {
-                "side":        self.position,
-                "entry":       self.entry_price,
-                "sl":          self.sl,
-                "tp1":         self.tp1,
-                "tp2":         self.tp2,
-                "tp3":         self.tp3,
-                "tp2_hit":     self.tp2_hit,
-                "usdc_amount": notional,
-                "leverage":    lev,
-            })
-
-            if global_risk:
-                await global_risk.register_open()
-
-            await notify_open(
-                symbol=self.symbol,
-                side=self.position,
-                entry=self.entry_price,
-                sl=self.sl,
-                tp1=self.tp1,
-                tp2=self.tp2,
-                size_usdc=notional,
-                leverage=lev,
-                signal_block=decision.get("signal_block", ""),
-                ai_used=decision.get("ai_used", False),
-                ai_confidence=decision.get("ai_confidence", 0),
+        # Usar fill real si está disponible
+        try:
+            fill_price = float(
+                result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
+                .get("filled", {}).get("avgPx") or entry
             )
+        except Exception:
+            fill_price = entry
+
+        if fill_price and fill_price != entry:
+            qty = round(notional / fill_price, 6)
+            logger.debug("[%s] Fill real: %.4f (estimado: %.4f) — qty ajustada a %.6f",
+                         self.symbol, fill_price, entry, qty)
+
+        self.position       = "long" if action == "BUY" else "short"
+        self.entry_price    = fill_price
+        self.sl             = sl
+        self.tp1            = tp1
+        self.tp2            = tp2
+        self.tp3            = tp3
+        self.tp2_hit        = False
+        self._open_notional = notional
+        self._open_leverage = lev
+        self._protection_ok = False
+        self.trade_count   += 1
+
+        save_position(self.symbol, {
+            "side":        self.position,
+            "entry":       self.entry_price,
+            "sl":          self.sl,
+            "tp1":         self.tp1,
+            "tp2":         self.tp2,
+            "tp3":         self.tp3,
+            "tp2_hit":     self.tp2_hit,
+            "usdc_amount": notional,
+            "leverage":    lev,
+        })
+
+        if global_risk:
+            await global_risk.register_open()
+
+        await notify_open(
+            symbol=self.symbol,
+            side=self.position,
+            entry=self.entry_price,
+            sl=self.sl,
+            tp1=self.tp1,
+            tp2=self.tp2,
+            size_usdc=notional,
+            leverage=lev,
+            signal_block=decision.get("signal_block", ""),
+            ai_used=decision.get("ai_used", False),
+            ai_confidence=decision.get("ai_confidence", 0),
+        )
 
     async def _manage_open_position(self, price: float, risk):
         """Gestiona TP parciales, trailing stop y cierre de posición."""
@@ -660,9 +671,8 @@ class FuturesTrader:
             return
 
         is_long = self.position == "long"
-        pnl_pct = ((price - self.entry_price) / self.entry_price) * (1 if is_long else -1) * 100
 
-        # TP2 parcial
+        # ── TP2 parcial ────────────────────────────────────────────────────
         if self.tp2 and not self.tp2_hit:
             tp2_triggered = (is_long and price >= self.tp2) or (not is_long and price <= self.tp2)
             if tp2_triggered:
@@ -671,12 +681,28 @@ class FuturesTrader:
                 partial_qty = round((self._open_notional / self.entry_price) * TP2_PARTIAL_RATIO, 6)
                 if partial_qty > 0 and not self.dry_run:
                     close_side = "sell" if is_long else "buy"
+
+                    # Cancelar triggers activos antes del parcial para evitar double-close
+                    try:
+                        self._hl_client.cancel_all_open_tpsl()
+                    except Exception as e:
+                        logger.warning("[%s] TP2: no se pudieron cancelar triggers: %s", self.symbol, e)
+
                     r = await self._place_order(close_side, partial_qty, reduce_only=True)
                     if r.get("status") == "ok":
                         logger.info("[%s] TP2 parcial ejecutado (%.1f%%)", self.symbol, TP2_PARTIAL_RATIO * 100)
                         await notify_tp_partial(self.symbol, self.position, price, self.tp2, partial_qty)
 
-        # Trailing stop
+                        # Re-colocar TP/SL con qty restante
+                        remaining_notional = self._open_notional * (1 - TP2_PARTIAL_RATIO)
+                        remaining_qty = round(remaining_notional / self.entry_price, 6)
+                        if remaining_qty > 0 and (self.tp3 or self.sl):
+                            try:
+                                await self._place_tpsl(remaining_qty, self.sl, self.tp3)
+                            except Exception as e:
+                                logger.warning("[%s] No se pudieron re-colocar TP/SL tras parcial: %s", self.symbol, e)
+
+        # ── Trailing stop ────────────────────────────────────────────────────
         if risk.trailing_sl and self.sl is not None:
             activation_px = self.entry_price * (
                 1 + risk.trailing_activation_pct / 100 if is_long
@@ -693,7 +719,7 @@ class FuturesTrader:
                     self.sl = new_sl
                     logger.debug("[%s] Trailing SL → %.4f", self.symbol, self.sl)
 
-        # Evaluar SL / TP
+        # ── Evaluar SL / TP ───────────────────────────────────────────────────
         sl_hit  = self.sl  and ((is_long and price <= self.sl)  or (not is_long and price >= self.sl))
         tp3_hit = self.tp3 and ((is_long and price >= self.tp3) or (not is_long and price <= self.tp3))
         tp1_hit = self.tp1 and not self.tp2 and ((is_long and price >= self.tp1) or (not is_long and price <= self.tp1))
@@ -718,15 +744,34 @@ class FuturesTrader:
             return
 
         close_side = "sell" if is_long else "buy"
-        if not self.dry_run:
-            await self._place_order(close_side, qty, reduce_only=True)
+        fill_price = price  # precio de referencia para notificación
 
+        if not self.dry_run:
+            # Cancelar triggers antes del cierre para evitar double-close
+            try:
+                self._hl_client.cancel_all_open_tpsl()
+            except Exception as e:
+                logger.warning("[%s] No se pudieron cancelar triggers antes del cierre: %s", self.symbol, e)
+
+            result = await self._place_order(close_side, qty, reduce_only=True)
+
+            # Extraer precio real de fill para PnL preciso
+            if result.get("status") == "ok":
+                try:
+                    fill_price = float(
+                        result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
+                        .get("filled", {}).get("avgPx", price)
+                    )
+                except Exception:
+                    pass
+
+        pnl_pct = ((fill_price - self.entry_price) / self.entry_price) * (1 if is_long else -1) * 100
         pnl_usd = (pnl_pct / 100) * self._open_notional
         if pnl_usd > 0:
             self.win_count += 1
         self.total_pnl += pnl_usd
-        logger.info("[%s] 🔒 Cerrado por %s · PnL=%.2f USDC (%.2f%%)",
-                    self.symbol, close_reason, pnl_usd, pnl_pct)
+        logger.info("[%s] 🔒 Cerrado por %s · fill=%.4f · PnL=%.2f USDC (%.2f%%)",
+                    self.symbol, close_reason, fill_price, pnl_usd, pnl_pct)
 
         entry_copy = self.entry_price
         pos_copy   = self.position
@@ -739,7 +784,26 @@ class FuturesTrader:
             symbol=self.symbol,
             side=pos_copy,
             entry=entry_copy,
-            exit_price=price,
+            exit_price=fill_price,
             pnl_usd=pnl_usd,
             reason=close_reason,
         )
+
+    async def _place_tpsl(self, qty: float, sl: float | None, tp: float | None) -> None:
+        """Coloca trigger orders TP/SL para una qty dada. Delega en HLClient."""
+        if not sl and not tp:
+            return
+        is_long = self.position == "long"
+        orders = []
+        if sl:
+            orders.append(("sl", not is_long, qty, sl))
+        if tp:
+            orders.append(("tp", not is_long, qty, tp))
+        for order_type, side_is_buy, q, px in orders:
+            try:
+                if order_type == "sl":
+                    self._hl_client.place_sl(is_buy=side_is_buy, sz=q, trigger_px=px)
+                else:
+                    self._hl_client.place_tp(is_buy=side_is_buy, sz=q, trigger_px=px)
+            except Exception as e:
+                logger.warning("[%s] No se pudo colocar %s tras parcial: %s", self.symbol, order_type, e)
