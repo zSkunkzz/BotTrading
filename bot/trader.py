@@ -5,8 +5,8 @@ Autenticación soportada:
   Opción A (recomendada): API Key de agente
     - HL_API_PRIVATE_KEY     : private key del wallet AGENTE generado en app.hyperliquid.xyz
     - HL_API_WALLET_ADDRESS  : dirección del wallet PRINCIPAL (el que tiene fondos y aprobó el agente)
-    Las órdenes se firman con la clave del agente. NO se usa vaultAddress en el payload
-    (eso es solo para vaults/subaccounts). El agente debe estar aprobado en app.hyperliquid.xyz.
+    Las órdenes se firman con la clave del agente. En modo agente el action_hash
+    DEBE incluir vault_address=master_addr para que la firma sea válida.
 
   Opción B: Private key directa
     - HL_PRIVATE_KEY         : private key del wallet principal
@@ -260,10 +260,14 @@ class FuturesTrader:
         nonce      = int(time.time() * 1000)
         is_mainnet = not _USE_TESTNET
 
-        # En modo agente: el hash debe incluir vault_address=None (no es vault),
-        # pero el payload REST debe incluir "vaultAddress": master_addr para que
-        # Hyperliquid sepa que la firma proviene de un agente aprobado.
-        vault_address = None
+        # En modo agente, el action_hash DEBE incluir master_addr como vault_address.
+        # Esto es lo que permite a Hyperliquid verificar que el agente está autorizado
+        # por ese master. Sin esto, el servidor reconstruye un wallet efímero distinto
+        # y devuelve "User or API Wallet ... does not exist".
+        if self._agent_mode and self._agent_addr.lower() != self._master_addr.lower():
+            vault_address = self._master_addr
+        else:
+            vault_address = None
 
         signature = _sign_l1_action(
             private_key=self._private_key,
@@ -279,9 +283,9 @@ class FuturesTrader:
             "signature": signature,
         }
 
-        # Incluir vaultAddress sólo en modo agente y cuando agente != master
-        if self._agent_mode and self._agent_addr.lower() != self._master_addr.lower():
-            payload["vaultAddress"] = self._master_addr
+        # vaultAddress en el payload REST también es necesario en modo agente
+        if vault_address is not None:
+            payload["vaultAddress"] = vault_address
 
         async with aiohttp.ClientSession() as s:
             async with s.post(
@@ -547,14 +551,8 @@ class FuturesTrader:
                 if pos.get("coin") == self.coin:
                     szi = float(pos.get("szi", 0))
                     if abs(szi) > 0:
-                        positions.append({
-                            "coin":          pos["coin"],
-                            "size":          abs(szi),
-                            "side":          "long" if szi > 0 else "short",
-                            "entryPx":       float(pos.get("entryPx") or 0),
-                            "unrealizedPnl": float(pos.get("unrealizedPnl") or 0),
-                        })
+                        positions.append(pos)
             return positions
         except Exception as e:
-            logger.debug("[%s] _get_positions error: %s", self.symbol, e)
+            logger.error("[%s] _get_positions error: %s", self.symbol, e)
             return []
