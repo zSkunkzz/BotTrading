@@ -3,10 +3,10 @@ trader.py — Motor de trading para Hyperliquid perpetuos.
 
 Cómo funciona el sizing en Hyperliquid (DIFERENTE a un CEX):
   - En HL mandas directamente el tamaño en moneda base (ej. 0.003 BTC)
-  - USDC_PER_TRADE = margen real que arriesgas (colateral)
-  - El leverage define cuánto colateral reserva HL, NO multiplica el tamaño
-  - qty = USDC_PER_TRADE / entry_price   (SIN multiplicar por leverage)
-  - notional real en HL = qty × precio   (= USDC_PER_TRADE, sin apalancamiento)
+  - USDC_PER_TRADE = margen real que quieres arriesgar (colateral)
+  - El leverage define el notional real: notional = USDC_PER_TRADE × leverage
+  - qty = (USDC_PER_TRADE × leverage) / entry_price
+  - Margen reservado en HL = notional / leverage = USDC_PER_TRADE  ✓
 
 Autenticación soportada:
   Opción A (recomendada): API Key de agente
@@ -208,7 +208,6 @@ class FuturesTrader:
         self._last_pos_check_at:   float = 0.0
         self._last_tpsl_verify_at: float = 0.0
         self._ccxt_exchange = None
-        # Guardamos referencia a global_risk para poder llamar register_close
         self._global_risk = None
 
     # ── Qty rounding respetando szDecimals ────────────────────────────
@@ -586,12 +585,6 @@ class FuturesTrader:
         self.tp2_hit = False
 
     async def _on_position_closed(self, pnl_pct: float) -> None:
-        """
-        Callback único a llamar SIEMPRE que una posición se cierra
-        (por SL, TP, cierre externo o parcial completo).
-        Decrementa el contador de GlobalRisk y libera exposición en PreTradeRisk.
-        """
-        # BUG FIX: register_close en GlobalRisk para decrementar _open
         if self._global_risk is not None:
             try:
                 await self._global_risk.register_close(pnl_pct)
@@ -602,7 +595,6 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning("[%s] GlobalRisk.register_close error: %s", self.symbol, e)
 
-        # BUG FIX: liberar exposición en PreTradeRisk
         try:
             pretrade_risk.register_close(self.symbol, self._open_notional)
         except Exception as e:
@@ -611,7 +603,6 @@ class FuturesTrader:
     # ── Loop principal ────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None):
-        # Guardamos referencia para usarla en _on_position_closed
         self._global_risk = global_risk
         await self._init(risk.usdc_per_trade)
         while True:
@@ -661,7 +652,6 @@ class FuturesTrader:
                         logger.info("[%s] Posición detectada: %s @ %s",
                                     self.symbol, self.position, self.entry_price)
             else:
-                # Posición cerrada externamente (SL/TP tocado en HL, liquidación, etc.)
                 if self.position is not None:
                     logger.info("[%s] Posición cerrada externamente.", self.symbol)
                     try:
@@ -669,7 +659,6 @@ class FuturesTrader:
                         await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
                     except Exception as e:
                         logger.warning("[%s] No se pudieron cancelar triggers huérfanos: %s", self.symbol, e)
-                    # BUG FIX: notificar al GlobalRisk y PreTradeRisk del cierre externo
                     await self._on_position_closed(pnl_pct=0.0)
                     self._clear_position_state()
                     clear_position(self.symbol)
@@ -691,15 +680,10 @@ class FuturesTrader:
                            self.symbol, balance, risk.usdc_per_trade)
             return
 
-        # BUG FIX: llamar pretrade_risk.check con la firma correcta
-        # Necesitamos precio y side ANTES de llamar, así que hacemos un check
-        # preliminar con los datos disponibles (side y sl se conocen tras decide();
-        # aquí hacemos el check de notional/balance/exposición que no dependen del side).
-        # El check completo incluyendo side/sl se hace tras decide().
         try:
             ok, pt_reason = await pretrade_risk.check(
                 symbol=self.symbol,
-                side="buy",           # valor provisional; el check de side no depende de esto
+                side="buy",
                 notional=risk.usdc_per_trade,
                 price=price,
                 balance=balance,
@@ -746,20 +730,38 @@ class FuturesTrader:
             lev = self.leverage
             atr = entry * 0.005
 
+        # Nunca superar el leverage configurado por el usuario
         lev = min(lev, self.leverage)
 
-        # ── SIZING CORRECTO PARA HYPERLIQUID ──────────────────────────
-        if lev != self.leverage:
-            await self._set_leverage(lev)
+        # ── FIX #1: aplicar leverage SIEMPRE antes de abrir posición ──
+        # (antes solo se aplicaba si lev != self.leverage, dejando casos
+        #  en que HL tenía el leverage por defecto y no el configurado)
+        if not self.dry_run:
+            try:
+                await asyncio.wait_for(
+                    self._set_leverage(lev),
+                    timeout=_SET_LEVERAGE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[%s] _set_leverage timeout pre-orden — continuando", self.symbol)
+            except Exception as e:
+                logger.warning("[%s] _set_leverage pre-orden error: %s", self.symbol, e)
 
+        # ── FIX #2: SIZING CORRECTO — notional incluye el leverage ────
+        # En HL el margen reservado = notional / leverage.
+        # Para arriesgar exactamente USDC_PER_TRADE de margen:
+        #   notional  = usdc_per_trade × leverage
+        #   qty       = notional / entry_price
+        # Ejemplo: 20 USDC × 5× lev = 100 USDC notional → ~3.33 ZEC a $30
         usdc_per_trade = risk.usdc_per_trade
-        qty    = self._round_qty(usdc_per_trade / entry)
+        notional_target = usdc_per_trade * lev
+        qty     = self._round_qty(notional_target / entry)
         notional = qty * entry
 
         logger.info(
-            "[%s] 📐 Sizing HL | usdc_per_trade=%.2f | entry=%.4f | qty=%s | "
-            "notional=%.2f USDC | lev=%dx | margen_reservado=%.2f USDC",
-            self.symbol, usdc_per_trade, entry, qty, notional, lev, notional / lev,
+            "[%s] 📐 Sizing HL | margen=%.2f USDC | lev=%dx | "
+            "notional=%.2f USDC | entry=%.4f | qty=%s",
+            self.symbol, usdc_per_trade, lev, notional, entry, qty,
         )
 
         if qty <= 0:
@@ -890,7 +892,6 @@ class FuturesTrader:
         if global_risk:
             await global_risk.register_open()
 
-        # Confirmar orden en pretrade (registra timestamp para rate limiter)
         pretrade_risk.confirm_order(self.symbol)
 
         await notify_open(
@@ -995,7 +996,6 @@ class FuturesTrader:
             return
         if not positions:
             logger.warning("[%s] Cierre por %s: ya cerrada en exchange.", self.symbol, close_reason)
-            # BUG FIX: notificar cierre aunque la orden ya no exista
             await self._on_position_closed(pnl_pct=0.0)
             self._clear_position_state()
             clear_position(self.symbol)
@@ -1037,7 +1037,6 @@ class FuturesTrader:
         entry_copy = self.entry_price
         pos_copy   = self.position
 
-        # BUG FIX: notificar GlobalRisk y PreTradeRisk ANTES de limpiar estado
         await self._on_position_closed(pnl_pct)
         self._clear_position_state()
         clear_position(self.symbol)
