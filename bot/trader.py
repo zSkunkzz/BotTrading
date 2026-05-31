@@ -115,6 +115,8 @@ def _action_hash(action: dict, vault_address: Optional[str], nonce: int,
     """
     Hash canónico de una acción L1.
     - msgpack.packb SIN opciones adicionales (igual que SDK oficial).
+    - vault_address debe ser None o un string de dirección válido (0x...).
+      Un string vacío "" es inválido y corrompe el hash → siempre normalizar.
     """
     data = msgpack.packb(action)   # ← sin use_bin_type, idéntico al SDK oficial
     data += nonce.to_bytes(8, "big")
@@ -201,30 +203,49 @@ class FuturesTrader:
             self._agent_mode   = True
             agent_acct         = Account.from_key(api_pk)
             self._agent_addr   = agent_acct.address
-            self._master_addr  = api_wallet if api_wallet else self._agent_addr
-            self._account_addr = self._master_addr
-            if not api_wallet:
-                logger.warning(
-                    "[%s] HL_API_WALLET_ADDRESS no configurada en modo agente. "
-                    "Usando dirección del agente como master. "
-                    "Si el agente no es el wallet principal, las órdenes fallarán.",
-                    symbol
+
+            if api_wallet:
+                # ── Caso normal: ambas variables configuradas ──
+                self._master_addr  = api_wallet
+                self._account_addr = self._master_addr
+                logger.info(
+                    "[%s] Auth: API key agente → agente=%s master=%s",
+                    symbol, self._agent_addr[:10] + "...", self._master_addr[:10] + "...",
                 )
-            logger.info("[%s] Auth: API key agente → agente=%s master=%s",
-                        symbol, self._agent_addr[:10] + "...", self._master_addr[:10] + "...")
+            else:
+                # ── BUG GUARD: HL_API_WALLET_ADDRESS no configurada ──
+                # vault_address="" corrompe _action_hash → firma inválida → "user does not exist".
+                # Usamos la dirección del agente como master (puede funcionar si el agente
+                # ES el wallet principal, pero lo habitual es que falle).
+                self._master_addr  = self._agent_addr
+                self._account_addr = self._master_addr
+                logger.error(
+                    "[%s] HL_API_WALLET_ADDRESS NO CONFIGURADA. "
+                    "En modo agente esta variable es OBLIGATORIA: debe ser la dirección "
+                    "del wallet PRINCIPAL que aprobó al agente en app.hyperliquid.xyz. "
+                    "Usando dirección del agente como master (%s) — las órdenes "
+                    "FALLARÁN con 'user does not exist' si no coincide.",
+                    symbol, self._agent_addr,
+                )
         else:
             pk = os.getenv("HL_PRIVATE_KEY", api_secret or "").strip()
             self._private_key  = pk
             self._account_addr = os.getenv("HL_ACCOUNT_ADDR", "").strip()
             self._agent_mode   = False
             self._agent_addr   = ""
-            self._master_addr  = self._account_addr
             if pk and not self._account_addr:
                 acct = Account.from_key(pk)
                 self._account_addr = acct.address
-                self._master_addr  = self._account_addr
-            logger.info("[%s] Auth: private key directa → addr=%s", symbol,
-                        self._account_addr[:10] + "..." if self._account_addr else "N/A")
+                logger.debug(
+                    "[%s] HL_ACCOUNT_ADDR no configurada — derivada automáticamente: %s",
+                    symbol, self._account_addr,
+                )
+            self._master_addr  = self._account_addr
+            logger.info(
+                "[%s] Auth: private key directa → addr=%s",
+                symbol,
+                self._account_addr[:10] + "..." if self._account_addr else "N/A",
+            )
 
         self.position     = None
         self.entry_price  = None
@@ -303,13 +324,21 @@ class FuturesTrader:
     async def _exchange_post(self, action: dict) -> dict:
         """
         POST autenticado a /exchange con firma EIP-712 L1.
+
+        FIX: vault_address se normaliza a None si es string vacío.
+        Un string vacío corrompe _action_hash y genera una firma inválida
+        que Hyperliquid rechaza con "user does not exist".
         """
         if not self._private_key:
             raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
 
         nonce      = await _unique_nonce()
         is_mainnet = not _USE_TESTNET
-        vault_address = self._master_addr if self._agent_mode else None
+
+        # CRÍTICO: vault_address debe ser None o una dirección válida.
+        # Nunca un string vacío — eso corrompe el action_hash.
+        raw_vault     = self._master_addr if self._agent_mode else None
+        vault_address = raw_vault if raw_vault else None  # "" → None
 
         signature = _sign_l1_action(
             private_key=self._private_key,
@@ -337,9 +366,26 @@ class FuturesTrader:
             ) as r:
                 text = await r.text()
                 try:
-                    return _json.loads(text)
+                    result = _json.loads(text)
                 except Exception:
-                    return {"status": "error", "response": text}
+                    result = {"status": "error", "response": text}
+
+        if result.get("status") != "ok":
+            resp_str = str(result.get("response", ""))
+            if "does not exist" in resp_str:
+                logger.error(
+                    "[%s] HL rechazó la orden con 'does not exist'. "
+                    "Causas más comunes:\n"
+                    "  1. HL_API_WALLET_ADDRESS no configurada o incorrecta.\n"
+                    "     Debe ser la master wallet que aprobó al agente.\n"
+                    "  2. El agente no está aprobado en app.hyperliquid.xyz → Settings → API.\n"
+                    "  DIAGNÓSTICO: master_addr=%s | agent_addr=%s | vault_en_payload=%s",
+                    self.symbol,
+                    self._master_addr or "NO CONFIGURADA",
+                    self._agent_addr  or "N/A (modo directo)",
+                    vault_address     or "None (modo directo)",
+                )
+        return result
 
     # ── Init ────────────────────────────────────────────────────────────
 
