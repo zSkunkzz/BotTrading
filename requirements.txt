@@ -1,16 +1,9 @@
 aiohttp>=3.9
-ccxt>=4.3
-eth-account>=0.11
+aiohttp-retry>=2.8
+ccxt>=4.0
+eth-account>=0.10
 eth-utils>=2.3
-msgpack>=1.0
-pandas>=2.0
-numpy>=1.26
-openai>=1.0
+hyperliquid-python-sdk>=0.1.9
 python-dotenv>=1.0
-fastapi>=0.110
-uvicorn>=0.29
-httpx>=0.27
 python-telegram-bot>=20.0
-ta>=0.10
-hyperliquid-python-sdk>=0.10
-# cache-bust: 20260531b
+websockets>=12.0
