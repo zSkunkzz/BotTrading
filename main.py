@@ -25,6 +25,11 @@ active_traders: dict = {}
 global_risk: GlobalRisk = None
 _trader_instances: dict = {}
 
+# ── Límite de traders simultáneos activos ──────────────────────────────────
+# Con 15 traders HL devuelve 429 continuos. Máximo recomendado: 5.
+# Sobreescribir con la variable de entorno MAX_ACTIVE_TRADERS.
+MAX_ACTIVE_TRADERS = int(os.getenv("MAX_ACTIVE_TRADERS", "5"))
+
 
 def _resolve_hl_address() -> str:
     """
@@ -63,8 +68,14 @@ def make_risk():
 
 
 async def _start_single_pair(symbol: str):
-    """Arranca un trader para el símbolo dado."""
+    """Arranca un trader para el símbolo dado, respetando MAX_ACTIVE_TRADERS."""
     if symbol in active_traders:
+        return
+    if len(active_traders) >= MAX_ACTIVE_TRADERS:
+        logger.info(
+            "[%s] Límite de traders activos alcanzado (%d/%d) — omitiendo",
+            symbol, len(active_traders), MAX_ACTIVE_TRADERS,
+        )
         return
     logger.info("🚀 Iniciando trader: %s", symbol)
 
@@ -104,19 +115,20 @@ async def stop_pair(symbol: str):
 
 async def on_pairs_updated(new_pairs: list):
     current = set(active_traders.keys())
-    updated = set(new_pairs)
+    # Sólo consideramos los primeros MAX_ACTIVE_TRADERS pares del nuevo scan
+    updated = set(new_pairs[:MAX_ACTIVE_TRADERS])
     added   = updated - current
     removed = current - updated
 
     if added:
         ws_feed.update_symbols(list(added))
-        await start_traders_staggered(list(added), _start_single_pair, delay=2.0)
+        await start_traders_staggered(list(added), _start_single_pair, delay=3.0)
 
     for sym in removed:
         await stop_pair(sym)
 
     await notify_scanner_update(added, removed, len(active_traders))
-    logger.info("📊 Traders activos: %d", len(active_traders))
+    logger.info("📊 Traders activos: %d/%d", len(active_traders), MAX_ACTIVE_TRADERS)
 
 
 async def main():
@@ -138,38 +150,37 @@ async def main():
                 hl_addr[:12] + "..." if hl_addr else "N/A")
 
     global_risk = GlobalRisk(
-        max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "5")),
+        max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", str(MAX_ACTIVE_TRADERS))),
         max_global_daily_loss_pct=float(os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")),
     )
 
     webhook_runner = await start_webhook_server()
 
-    # Umbrales bajos por defecto para no quedarse sin pares en mercados tranquilos.
-    # Sobreescribir con MIN_VOLUME_USDT y MIN_CHANGE_PCT en las variables de entorno.
+    # TOP_PAIRS: cuántos pares escanea el scanner. Escaneamos un poco más
+    # de lo que vamos a tradear para tener opciones de calidad.
+    # MAX_ACTIVE_TRADERS controla cuántos traders se arrancan realmente.
+    top_n = int(os.getenv("TOP_PAIRS", str(MAX_ACTIVE_TRADERS * 2)))  # por defecto 10
+    logger.info("⚙️  MAX_ACTIVE_TRADERS=%d | TOP_PAIRS=%d", MAX_ACTIVE_TRADERS, top_n)
+
     scanner = PairScanner(
-        min_volume_usdt=float(os.getenv("MIN_VOLUME_USDT", "1000000")),   # 1M (antes 5M)
-        min_price_change_pct=float(os.getenv("MIN_CHANGE_PCT", "0.5")),   # 0.5% (antes 1.5%)
-        top_n=int(os.getenv("TOP_PAIRS", "15")),
+        min_volume_usdt=float(os.getenv("MIN_VOLUME_USDT", "1000000")),
+        min_price_change_pct=float(os.getenv("MIN_CHANGE_PCT", "0.5")),
+        top_n=top_n,
         refresh_interval_min=int(os.getenv("SCANNER_REFRESH_MIN", "30")),
     )
 
     logger.info("🔍 Escaneando mercado Hyperliquid inicial...")
-    # scan() devuelve los nombres y almacena internamente los datos enriquecidos
     initial_pairs = await scanner.scan()
 
-    # Construir scored_data directamente desde el resultado del scanner.
     scored_data = []
     for entry in getattr(scanner, "_last_scored", []):
         scored_data.append(entry)
 
     if not scored_data and initial_pairs:
-        # Fallback: construir scored_data mínimo para que ai_rank_pairs reciba algo útil
         scored_data = [
             {"symbol": sym, "volume_usdt": 0, "change_pct": 0, "score": 0}
             for sym in initial_pairs
         ]
-
-    top_n = int(os.getenv("TOP_PAIRS", "15"))
 
     if scored_data:
         logger.info("🤖 Filtrando con IA (%d pares)...", len(scored_data))
@@ -191,12 +202,20 @@ async def main():
 
     logger.info("✅ Pares finales (%d): %s", len(final_pairs), ", ".join(final_pairs))
 
+    # El WS feed sigue escuchando todos los pares escaneados (para el scanner),
+    # pero sólo arrancamos traders para los primeros MAX_ACTIVE_TRADERS.
     ws_feed.start(final_pairs)
     logger.info("🔌 WS feed arrancado para %d símbolos", len(final_pairs))
 
     await asyncio.sleep(3)
 
-    await start_traders_staggered(final_pairs, _start_single_pair, delay=2.0)
+    # Sólo arrancamos los primeros MAX_ACTIVE_TRADERS pares
+    pairs_to_trade = final_pairs[:MAX_ACTIVE_TRADERS]
+    logger.info(
+        "🚀 Arrancando %d traders (de %d disponibles): %s",
+        len(pairs_to_trade), len(final_pairs), ", ".join(pairs_to_trade),
+    )
+    await start_traders_staggered(pairs_to_trade, _start_single_pair, delay=3.0)
 
     watchdog_task = asyncio.create_task(
         kill_switch.run_watchdog(_trader_instances)
@@ -204,7 +223,7 @@ async def main():
     logger.info("🐕 Kill Switch Watchdog arrancado")
 
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
-    await notify_startup(final_pairs, dry_run, top_n)
+    await notify_startup(pairs_to_trade, dry_run, top_n)
 
     try:
         await scanner.run_scanner_loop(on_pairs_updated)
