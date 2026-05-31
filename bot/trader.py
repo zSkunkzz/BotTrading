@@ -63,7 +63,6 @@ _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
 # Rate limiter global para llamadas REST a /info (compartido entre todos los traders)
-# Con 15 traders activos se necesita un intervalo más conservador para evitar 429s.
 _HL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
 _HL_MIN_INTERVAL = 0.35   # máx ~3 req/s compartido — suficiente para 15 traders sin 429s
@@ -99,10 +98,11 @@ def _address_to_bytes(address: str) -> bytes:
 def _action_hash(action: dict, vault_address: Optional[str], nonce: int,
                  expires_after: Optional[int] = None) -> bytes:
     """
-    Hash canónico de una acción L1 según el SDK oficial:
-      msgpack(action) + nonce(8 bytes BE) + vault_flag [+ vault_bytes] [+ expires_flag + expires(8 bytes BE)]
+    Hash canónico de una acción L1 según el SDK oficial.
+    IMPORTANTE: msgpack.packb SIN use_bin_type, igual que el SDK oficial.
+    Con use_bin_type=True las strings se serializan diferente → hash incorrecto → firma inválida.
     """
-    data = msgpack.packb(action, use_bin_type=True)
+    data = msgpack.packb(action)   # ← sin use_bin_type, idéntico al SDK oficial
     data += nonce.to_bytes(8, "big")
     if vault_address is None:
         data += b"\x00"
@@ -152,12 +152,13 @@ def _sign_l1_action(private_key: str, action: dict, vault_address: Optional[str]
     Firma una acción L1 (order, cancel, updateLeverage, etc.) exactamente como
     lo hace el SDK oficial de Hyperliquid.
     """
+    wallet    = Account.from_key(private_key)
     h         = _action_hash(action, vault_address, nonce, expires_after)
     agent     = _phantom_agent(h, is_mainnet)
     data      = _l1_payload(agent)
     structured = encode_typed_data(full_message=data)
-    signed    = Account.sign_message(structured, private_key=private_key)
-    return {"r": to_hex(signed.r), "s": to_hex(signed.s), "v": signed.v}
+    signed    = wallet.sign_message(structured)
+    return {"r": to_hex(signed["r"]), "s": to_hex(signed["s"]), "v": signed["v"]}
 
 
 def _norm_coin(symbol: str) -> str:
@@ -261,10 +262,8 @@ class FuturesTrader:
         nonce      = int(time.time() * 1000)
         is_mainnet = not _USE_TESTNET
 
-        # En modo agente, el action_hash DEBE incluir master_addr como vault_address.
-        # Esto es lo que permite a Hyperliquid verificar que el agente está autorizado
-        # por ese master. Sin esto, el servidor reconstruye un wallet efímero distinto
-        # y devuelve "User or API Wallet ... does not exist".
+        # En modo agente, vault_address = master_addr para que Hyperliquid verifique
+        # que el agente está autorizado por ese master.
         if self._agent_mode and self._agent_addr.lower() != self._master_addr.lower():
             vault_address = self._master_addr
         else:
@@ -284,7 +283,6 @@ class FuturesTrader:
             "signature": signature,
         }
 
-        # vaultAddress en el payload REST también es necesario en modo agente
         if vault_address is not None:
             payload["vaultAddress"] = vault_address
 
@@ -409,8 +407,6 @@ class FuturesTrader:
         if r.get("status") == "ok":
             logger.debug("[%s] Leverage %sx OK (cross=%s)", self.symbol, leverage, is_cross)
         else:
-            # En cuentas normales (no vault) Hyperliquid devuelve 'Vault not registered'.
-            # Es un comportamiento esperado — la operativa no se ve afectada.
             logger.debug("[%s] set_leverage no aplicable (cuenta normal, no vault): %s",
                          self.symbol, r)
 
