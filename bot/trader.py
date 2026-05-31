@@ -45,7 +45,8 @@ from bot.state import save_position, load_position, clear_position, mark_tp2_hit
 from bot.balance_service import balance_svc
 from bot.pretrade_risk import pretrade_risk
 from bot.kill_switch import kill_switch
-from bot.execution_engine import execution_engine
+# Importamos siempre desde el módulo canónico bot.execution.execution_engine
+from bot.execution.execution_engine import execution_engine
 from bot.ohlcv_cache import ohlcv_cache
 
 logger = logging.getLogger("Trader")
@@ -132,9 +133,6 @@ class FuturesTrader:
             agent_acct         = Account.from_key(api_pk)
             self._agent_addr   = agent_acct.address
             self._master_addr  = api_wallet
-            # En modo agente:
-            #   - _account_addr  → master (para consultas /info: balance, posiciones)
-            #   - _vault_address → None   (el agente firma SIN vault_address)
             self._account_addr  = self._master_addr
             self._vault_address = None
             logger.info(
@@ -242,21 +240,19 @@ class FuturesTrader:
                 return _json.loads(await r.text())
 
     async def _exchange_post(self, action: dict) -> dict:
+        """Signing manual vía SDK: usado SOLO para updateLeverage, cancel, orderStatus.
+        Las órdenes de entrada/salida van siempre por execution_engine → HLClient."""
         if not self._private_key:
             raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
 
         nonce = await _unique_nonce()
-
-        # Usar SDK oficial de Hyperliquid para signing — garantiza
-        # el mismo msgpack + EIP-712 phantom-agent que el exchange valida.
-        # vault_address=None en modo agente normal.
         wallet    = Account.from_key(self._private_key)
         signature = sign_l1_action(
             wallet,
             action,
-            self._vault_address,   # None en modo agente
+            self._vault_address,
             nonce,
-            not _USE_TESTNET,      # is_mainnet
+            not _USE_TESTNET,
         )
 
         payload: dict = {
@@ -402,73 +398,17 @@ class FuturesTrader:
             logger.debug("[%s] set_leverage respuesta: %s", self.symbol, r)
 
     # ── Órdenes ──────────────────────────────────────────────────────────
-
-    async def _place_order_raw(
-        self,
-        side:        str,
-        qty:         float,
-        order_type:  str = "market",
-        price:       float | None = None,
-        reduce_only: bool = False,
-        sl:          float | None = None,
-        tp:          float | None = None,
-        trade_side:  str = "open",
-        pos_side:    str | None = None,
-    ) -> dict:
-        if self.dry_run:
-            logger.info("[%s] DRY RUN: side=%s qty=%s price=%s sl=%s tp=%s",
-                        self.symbol, side, qty, price, sl, tp)
-            return {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"filled": {"oid": "dry"}}]}}}
-
-        coin_idx = await self._get_coin_index()
-        is_buy   = side in ("buy", "long")
-
-        if order_type == "limit" and price:
-            order_type_obj = {"limit": {"tif": "Gtc"}}
-            limit_px       = float_to_wire(price)
-        else:
-            current_price  = await self.get_price()
-            slippage       = 0.05
-            raw_px         = current_price * (1 + slippage) if is_buy else current_price * (1 - slippage)
-            slippage_px    = round(float(f"{raw_px:.5g}"), 6)
-            limit_px       = float_to_wire(slippage_px)
-            order_type_obj = {"limit": {"tif": "Ioc"}}
-
-        order: dict = {
-            "a": coin_idx, "b": is_buy,
-            "p": limit_px, "s": float_to_wire(qty),
-            "r": reduce_only, "t": order_type_obj,
-        }
-
-        tpsl_parts = []
-        if tp:
-            tpsl_parts.append({
-                "a": coin_idx, "b": not is_buy,
-                "p": float_to_wire(tp), "s": float_to_wire(qty), "r": True,
-                "t": {"trigger": {"triggerPx": float_to_wire(tp), "isMarket": True, "tpsl": "tp"}},
-            })
-        if sl:
-            tpsl_parts.append({
-                "a": coin_idx, "b": not is_buy,
-                "p": float_to_wire(sl), "s": float_to_wire(qty), "r": True,
-                "t": {"trigger": {"triggerPx": float_to_wire(sl), "isMarket": True, "tpsl": "sl"}},
-            })
-
-        if tpsl_parts:
-            action = {"type": "order", "orders": [order] + tpsl_parts, "grouping": "positionTpsl"}
-        else:
-            action = {"type": "order", "orders": [order], "grouping": "na"}
-
-        try:
-            result = await self._exchange_post(action)
-            if result.get("status") != "ok":
-                logger.error("[%s] _place_order_raw FAILED: %s", self.symbol, result)
-            else:
-                logger.debug("[%s] _place_order_raw OK: side=%s qty=%s", self.symbol, side, qty)
-            return result
-        except Exception as e:
-            logger.error("[%s] _place_order_raw exception: %s", self.symbol, e)
-            return {"status": "error", "response": str(e)}
+    #
+    # NOTA: _place_order_raw ya NO existe.
+    # Toda ejecución de órdenes de entrada/salida pasa por execution_engine
+    # (bot/execution/execution_engine.py → HLClient).
+    # El TP/SL se coloca UNA SOLA VEZ dentro de execution_engine._place_tpsl_bulk,
+    # después de confirmar el fill. No hay TP/SL duplicados.
+    #
+    # _exchange_post sigue existiendo para operaciones auxiliares:
+    #   - updateLeverage
+    #   - cancel
+    #   - orderStatus
 
     async def _get_order_status(self, order_id) -> dict:
         try:
@@ -494,6 +434,7 @@ class FuturesTrader:
 
     async def _place_order(self, side: str, qty: float, reduce_only: bool = False,
                            sl: float | None = None, tp: float | None = None) -> dict:
+        """Wrapper público hacia execution_engine. TP/SL los gestiona el engine."""
         try:
             arrival_price = await self.get_price()
         except Exception:
@@ -666,6 +607,9 @@ class FuturesTrader:
             decision.get("reason", ""),
         )
 
+        # _place_order llama a execution_engine.execute(), que:
+        #   1. Ejecuta la entrada (limit o market) SIN TP/SL en el payload
+        #   2. Coloca los trigger TP/SL en bulk separado (una sola vez)
         result = {"status": "ok"} if self.dry_run else await self._place_order(side, qty, sl=sl, tp=tp1)
 
         if result.get("status") == "ok":
