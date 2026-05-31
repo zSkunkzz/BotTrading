@@ -115,8 +115,10 @@ async def _iteration(self: FuturesTrader, risk: RiskManager, global_risk: Global
 
     # ── Decisión de trading ─────────────────────────────────────────
     try:
+        # Obtener la sesión ccxt (se crea lazy si no existe)
+        exch = await self._get_ccxt()
         decision = await decide(
-            exch=self.exchange,
+            exch=exch,
             symbol=self.symbol,
             ai_decide_fn=ai_decide,
             has_open_position=False,
