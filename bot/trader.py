@@ -5,8 +5,9 @@ Autenticación soportada:
   Opción A (recomendada): API Key de agente
     - HL_API_PRIVATE_KEY     : private key del wallet AGENTE generado en app.hyperliquid.xyz
     - HL_API_WALLET_ADDRESS  : dirección del wallet PRINCIPAL (el que tiene fondos y aprobó el agente)
-    Las órdenes se firman con la clave del agente. El action_hash INCLUYE master_addr
-    como vault_address (igual que SDK oficial). Sin esto la firma es inválida.
+    Las órdenes se firman con la clave del agente. El action_hash NO usa vault_address
+    (debe ser None) — el campo vaultAddress del payload JSON también va a None.
+    El endpoint /info usa master_addr para consultar posiciones y balance.
 
   Opción B: Private key directa
     - HL_PRIVATE_KEY         : private key del wallet principal
@@ -196,7 +197,12 @@ class FuturesTrader:
             agent_acct         = Account.from_key(api_pk)
             self._agent_addr   = agent_acct.address
             self._master_addr  = api_wallet
-            self._account_addr = self._master_addr
+            # En modo agente:
+            #   - _account_addr  → master (para consultas /info: balance, posiciones)
+            #   - _vault_address → None   (el agente firma SIN vault_address; HL lo
+            #                              identifica por la clave que firma, no por vault)
+            self._account_addr  = self._master_addr
+            self._vault_address = None
             logger.info(
                 "[%s] Auth: modo agente | master=%s | agente=%s",
                 symbol, self._master_addr[:10] + "...", self._agent_addr[:10] + "...",
@@ -208,10 +214,11 @@ class FuturesTrader:
                     f"[{symbol}] No hay ninguna clave configurada. "
                     "Configura HL_API_PRIVATE_KEY (modo agente) o HL_PRIVATE_KEY (modo directo)."
                 )
-            self._private_key  = pk
-            self._account_addr = os.getenv("HL_ACCOUNT_ADDR", "").strip()
-            self._agent_mode   = False
-            self._agent_addr   = ""
+            self._private_key   = pk
+            self._account_addr  = os.getenv("HL_ACCOUNT_ADDR", "").strip()
+            self._agent_mode    = False
+            self._agent_addr    = ""
+            self._vault_address = None
             if not self._account_addr:
                 acct = Account.from_key(pk)
                 self._account_addr = acct.address
@@ -305,9 +312,11 @@ class FuturesTrader:
             raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
 
         nonce         = await _unique_nonce()
-        raw_vault     = self._master_addr if self._agent_mode else None
-        vault_address = raw_vault if raw_vault else None
-        # FIX BUG 3: expires_after explícito — debe ser idéntico en firma y payload
+        # FIX: en modo agente vault_address=None.
+        # El agente firma en nombre de master_addr pero NO vía vault_address.
+        # Poner master_addr como vault generaba una sub-wallet efímera distinta
+        # en cada llamada, que Hyperliquid rechazaba con "does not exist".
+        vault_address: Optional[str] = self._vault_address  # siempre None salvo vault explícito
         expires_after: Optional[int] = None
 
         signature = _sign_l1_action(
@@ -318,8 +327,6 @@ class FuturesTrader:
             is_mainnet=not _USE_TESTNET,
             expires_after=expires_after,
         )
-        # FIX BUG 1: incluir expiresAfter en el payload (aunque sea null)
-        # El SDK oficial siempre envía esta key; sin ella algunos nodos rechazan.
         payload: dict = {
             "action":       action,
             "nonce":        nonce,
@@ -341,16 +348,18 @@ class FuturesTrader:
                     result = {"status": "error", "response": text}
 
         if result.get("status") != "ok":
-            if "does not exist" in str(result.get("response", "")):
+            err_str = str(result.get("response", ""))
+            if "does not exist" in err_str:
                 logger.error(
                     "[%s] HL rechazó con 'does not exist'.\n"
-                    "  1. HL_API_WALLET_ADDRESS incorrecta — debe ser la master wallet.\n"
-                    "  2. Agente no aprobado en app.hyperliquid.xyz → Settings → API.\n"
-                    "  DIAGNÓSTICO: master=%s | agente=%s | vault=%s",
+                    "  Verifica que HL_API_PRIVATE_KEY sea la clave del agente aprobado\n"
+                    "  en app.hyperliquid.xyz → Settings → API para la master=%s\n"
+                    "  agente=%s | vault=%s | respuesta HL: %s",
                     self.symbol,
                     self._master_addr or "NO CONFIGURADA",
                     self._agent_addr  or "N/A",
                     vault_address     or "None",
+                    err_str,
                 )
         return result
 
@@ -486,9 +495,6 @@ class FuturesTrader:
             order_type_obj = {"limit": {"tif": "Gtc"}}
             limit_px       = _float_to_wire(price)
         else:
-            # FIX BUG 2: redondear a 5 sig figs como hace el SDK oficial
-            # Exchange._slippage_price() hace: round(float(f"{px:.5g}"), 6 - sz_decimals)
-            # Esto evita que HL rechace precios con demasiados decimales.
             current_price  = await self.get_price()
             slippage       = 0.05
             raw_px         = current_price * (1 + slippage) if is_buy else current_price * (1 - slippage)
@@ -533,7 +539,6 @@ class FuturesTrader:
             return {"status": "error", "response": str(e)}
 
     async def _get_order_status(self, order_id) -> dict:
-        # FIX BUG 4: forzar int — el oid llega como str desde el JSON de respuesta
         try:
             return await self._info_post({
                 "type": "orderStatus",
@@ -632,7 +637,6 @@ class FuturesTrader:
             logger.warning("[%s] No se pudo obtener precio: %s", self.symbol, e)
             return
 
-        # Verificar posición en exchange cada _POS_CHECK_INTERVAL_S segundos
         now = time.monotonic()
         did_check_exchange = False
         exchange_positions = []
@@ -641,7 +645,6 @@ class FuturesTrader:
             self._last_pos_check_at = now
             did_check_exchange     = True
 
-        # Sincronizar solo cuando tenemos datos frescos (evita falso "cerrada externamente")
         if did_check_exchange:
             if exchange_positions:
                 ep = exchange_positions[0]
@@ -823,7 +826,6 @@ class FuturesTrader:
         if not close_reason:
             return
 
-        # Obtener qty real del exchange (guard qty > 0)
         positions = await self._get_positions()
         if not positions:
             logger.warning("[%s] Cierre por %s: posición no encontrada en exchange (ya cerrada?).",
@@ -850,7 +852,6 @@ class FuturesTrader:
         logger.info("[%s] 🔒 Cerrado por %s · PnL=%.2f USDC (%.2f%%)",
                     self.symbol, close_reason, pnl_usd, pnl_pct)
 
-        # Guardar copias ANTES de nullear (fix: entry_price ya sería None en notify_close)
         entry_copy = self.entry_price
         pos_copy   = self.position
         self.position = self.entry_price = self.sl = None
