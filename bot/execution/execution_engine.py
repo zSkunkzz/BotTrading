@@ -3,7 +3,7 @@ execution_engine.py — Motor de ejecución con TP/SL reales en Hyperliquid.
 
 Cambios respecto a la versión anterior:
   - Usa HLClient (SDK oficial) en lugar de _place_order_raw.
-  - Al abrir posición: coloca entrada + trigger TP + trigger SL en bulk.
+  - Al abrir posición: coloca entrada + trigger TP + trigger SL individualmente.
   - Al cerrar: cancela los trigger orders abiertos antes de la orden de cierre.
   - Si el bot se reinicia, el TP/SL sigue activo en el exchange.
   - ThreadPoolExecutor con max_workers=4 para no saturar el event loop
@@ -12,8 +12,8 @@ Cambios respecto a la versión anterior:
 Flujo de apertura:
   1. Calcular arrival_price (mid del orderbook o last)
   2. Intentar limit agresiva si spread <= umbral y depth suficiente
-  3. Si llena: colocar TP trigger + SL trigger en bulk
-  4. Si no llena en timeout: cancelar → fallback market + TP/SL bulk
+  3. Si llena: colocar TP trigger + SL trigger
+  4. Si no llena en timeout: cancelar → fallback market + TP/SL
   5. Registrar telemetría
 
 Variables de entorno (todas opcionales):
@@ -72,7 +72,7 @@ class ExecutionEngine:
     """
     Motor de ejecución:
       - Usa el SDK oficial de Hyperliquid (HLClient)
-      - Coloca TP y SL como trigger orders reales en el exchange (1 sola vez)
+      - Coloca TP y SL como trigger orders reales en el exchange
       - TP/SL sobreviven reinicios del bot
       - ThreadPoolExecutor propio con workers limitados
     """
@@ -149,7 +149,6 @@ class ExecutionEngine:
                     self._finalize_rec(rec, result, side, arrival_price)
                     return result
                 logger.info("[%s] ⚡ Limit sin fill → fallback market", sym)
-                # FIX: pasar arrival_price como ref_px (3er argumento requerido)
                 result = await self._run(client.place_market, is_buy, qty, arrival_price, reduce_only)
                 rec.order_type_used = "market"
                 rec.fill_price      = arrival_price
@@ -159,7 +158,6 @@ class ExecutionEngine:
                 if ask is not None else "sin datos de orderbook"
             )
             logger.debug("[%s] Market directo (%s)", sym, reason)
-            # FIX: pasar arrival_price como ref_px (3er argumento requerido)
             result = await self._run(client.place_market, is_buy, qty, arrival_price, reduce_only)
             rec.order_type_used = "market"
             rec.fill_price      = arrival_price
@@ -171,16 +169,16 @@ class ExecutionEngine:
             and trade_side == "open"
             and (sl is not None or tp is not None)
         ):
-            await self._place_tpsl_bulk(client, is_buy, qty, sl, tp, sym)
+            await self._place_tpsl(client, is_buy, qty, sl, tp, sym)
 
         self._finalize_rec(rec, result, side, arrival_price)
         return result
 
     # ────────────────────────────────────────────────────────────────────
-    # TP / SL TRIGGER ORDERS
+    # TP / SL TRIGGER ORDERS — usando place_tp / place_sl directamente
     # ────────────────────────────────────────────────────────────────────
 
-    async def _place_tpsl_bulk(
+    async def _place_tpsl(
         self,
         client: HLClient,
         is_buy: bool,
@@ -190,68 +188,35 @@ class ExecutionEngine:
         sym: str,
     ) -> None:
         """
-        Coloca TP y SL como trigger orders reales en el exchange.
+        Coloca TP y SL como trigger orders reales usando place_tp / place_sl.
         La dirección de cierre es la opuesta a la posición:
-          - Long (is_buy=True)  → cierre = vender (is_buy=False)
-          - Short (is_buy=False) → cierre = comprar (is_buy=True)
+          - Long (is_buy=True)  → cierre = vender (close_is_buy=False)
+          - Short (is_buy=False) → cierre = comprar (close_is_buy=True)
         """
-        close_side = not is_buy
-        orders_to_place = []
+        close_is_buy = not is_buy
 
         if tp is not None:
-            tp_order = {
-                "name":       client.coin,
-                "is_buy":     close_side,
-                "sz":         qty,
-                "limit_px":   tp if self.tp_as_limit else round(
-                    tp * (0.999 if close_side else 1.001), 6
-                ),
-                "order_type": {
-                    "trigger": {
-                        "triggerPx": tp,
-                        "isMarket":  not self.tp_as_limit,
-                        "tpsl":      "tp",
-                    }
-                },
-                "reduce_only": True,
-            }
-            orders_to_place.append(tp_order)
+            try:
+                limit_px = tp if self.tp_as_limit else None
+                result = await self._run(client.place_tp, close_is_buy, qty, tp, limit_px)
+                st = result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
+                if "error" in st:
+                    logger.error("[%s] ❌ Trigger TP fallido: %s", sym, st["error"])
+                else:
+                    logger.info("[%s] ✅ Trigger TP colocado en exchange @ %.6f", sym, tp)
+            except Exception as e:
+                logger.error("[%s] Error colocando trigger TP: %s", sym, e)
 
         if sl is not None:
-            # FIX: añadir limit_px con slippage para SL market (requerido por HL)
-            slippage_px = round(
-                sl * (0.998 if close_side else 1.002), 6
-            )
-            sl_order = {
-                "name":       client.coin,
-                "is_buy":     close_side,
-                "sz":         qty,
-                "limit_px":   slippage_px,
-                "order_type": {
-                    "trigger": {
-                        "triggerPx": sl,
-                        "isMarket":  True,
-                        "tpsl":      "sl",
-                    }
-                },
-                "reduce_only": True,
-            }
-            orders_to_place.append(sl_order)
-
-        if not orders_to_place:
-            return
-
-        try:
-            result = await self._run(client.place_bulk, orders_to_place)
-            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-            for i, st in enumerate(statuses):
-                label = "TP" if (i == 0 and tp is not None) else "SL"
+            try:
+                result = await self._run(client.place_sl, close_is_buy, qty, sl)
+                st = result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
                 if "error" in st:
-                    logger.error("[%s] ❌ Trigger %s fallido: %s", sym, label, st["error"])
+                    logger.error("[%s] ❌ Trigger SL fallido: %s", sym, st["error"])
                 else:
-                    logger.info("[%s] ✅ Trigger %s colocado en exchange (sobrevive reinicios)", sym, label)
-        except Exception as e:
-            logger.error("[%s] Error colocando trigger orders TP/SL: %s", sym, e)
+                    logger.info("[%s] ✅ Trigger SL colocado en exchange @ %.6f", sym, sl)
+            except Exception as e:
+                logger.error("[%s] Error colocando trigger SL: %s", sym, e)
 
     # ────────────────────────────────────────────────────────────────────
     # LIMIT INTERNO + TELEMETRÍA
