@@ -44,7 +44,6 @@ logger = logging.getLogger("ExecutionEngine")
 
 _AGENT_NOT_FOUND_SUBSTR = "does not exist"
 
-# Executor limitado: evita saturar threads cuando hay muchos símbolos
 _EXECUTOR_WORKERS = int(os.getenv("EE_EXECUTOR_WORKERS", "4"))
 _executor = ThreadPoolExecutor(max_workers=_EXECUTOR_WORKERS)
 
@@ -88,13 +87,11 @@ class ExecutionEngine:
         self._hl_clients: dict[str, HLClient] = {}
 
     def _get_client(self, symbol: str) -> HLClient:
-        """Devuelve o crea el HLClient para el símbolo."""
         if symbol not in self._hl_clients:
             self._hl_clients[symbol] = HLClient(symbol)
         return self._hl_clients[symbol]
 
     async def _run(self, fn, *args):
-        """Ejecuta una función síncrona en el executor limitado."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_executor, fn, *args)
 
@@ -115,17 +112,6 @@ class ExecutionEngine:
         sl:            Optional[float] = None,
         tp:            Optional[float] = None,
     ) -> dict:
-        """
-        Ejecuta una orden con TP/SL reales en el exchange.
-
-        Apertura (trade_side=="open", sl/tp provistos):
-          1. Abre la posición (limit o market) — SIN TP/SL en el payload
-          2. Coloca trigger TP + trigger SL en bulk separado
-
-        Cierre (reduce_only=True):
-          1. Cancela trigger orders abiertos del coin
-          2. Ejecuta cierre
-        """
         sym    = trader.symbol
         client = self._get_client(sym)
         rec    = TradeRecord(symbol=sym, side=side, qty=qty, arrival_price=arrival_price)
@@ -133,10 +119,9 @@ class ExecutionEngine:
 
         is_buy = side in ("buy", "long")
 
-        # Si es cierre manual → cancelar TP/SL previos del exchange
         if reduce_only:
             try:
-                cancelled = client.cancel_all_open_tpsl()
+                cancelled = await self._run(client.cancel_all_open_tpsl)
                 if cancelled:
                     logger.info("[%s] 🗑️ %d trigger order(s) canceladas antes del cierre.", sym, len(cancelled))
             except Exception as e:
@@ -178,9 +163,8 @@ class ExecutionEngine:
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
 
-        # ── Colocar TP/SL reales si la orden de apertura fue exitosa ─────────
-        # IMPORTANTE: el payload de apertura NO lleva TP/SL para evitar duplicados.
-        # Los trigger orders se colocan aquí, una sola vez, via _place_tpsl_bulk.
+        # FIX #5: solo colocar TP/SL si es apertura real (no reduce_only)
+        # y si el result fue ok — evita colocar triggers tras fallback de cierre
         if (
             result.get("status") == "ok"
             and not reduce_only
@@ -293,6 +277,17 @@ class ExecutionEngine:
             order_id = result["response"]["data"]["statuses"][0].get("resting", {}).get("oid")
         except (KeyError, IndexError, TypeError):
             order_id = None
+
+        # FIX #6: verificar fill inmediato ANTES del primer sleep
+        # Si la orden se llenó al instante (filled={} en lugar de resting={}),
+        # la detectamos aquí sin esperar el bucle.
+        try:
+            immediate_fill = result["response"]["data"]["statuses"][0].get("filled")
+            if immediate_fill is not None and order_id is None:
+                # La orden ya está filled — no hay oid resting
+                return result, True
+        except (KeyError, IndexError, TypeError):
+            pass
 
         deadline = time.monotonic() + self.limit_timeout_s
         filled   = False
