@@ -44,12 +44,19 @@ class AIBudgetManager:
         self._groq_minute_calls   = []
         self._gemini_minute_calls = []
 
+        # Cooldown por símbolo: evita llamar a la IA por el mismo par más de
+        # 1 vez cada AI_SYMBOL_COOLDOWN segundos (por defecto 5 minutos).
+        import os
+        self._symbol_cooldown = int(os.getenv("AI_SYMBOL_COOLDOWN", "300"))
+        self._symbol_last_call: dict[str, float] = {}
+
         self._lock = asyncio.Lock()
 
         logger.info(
             f"AIBudgetManager iniciado | "
             f"Groq: {GROQ_SAFE_DAILY_CALLS} calls/día, {GROQ_RPM_LIMIT} RPM | "
-            f"Gemini pagado: {GEMINI_RPD_LIMIT} calls/día, {GEMINI_RPM_LIMIT} RPM"
+            f"Gemini pagado: {GEMINI_RPD_LIMIT} calls/día, {GEMINI_RPM_LIMIT} RPM | "
+            f"Cooldown por símbolo: {self._symbol_cooldown}s"
         )
 
     @staticmethod
@@ -67,6 +74,30 @@ class AIBudgetManager:
     def _cleanup_minute_window(self, call_list):
         cutoff = time.time() - 60
         call_list[:] = [t for t in call_list if t > cutoff]
+
+    async def symbol_on_cooldown(self, symbol: str) -> bool:
+        """
+        Devuelve True si el símbolo recibió una llamada IA hace menos de
+        AI_SYMBOL_COOLDOWN segundos. Llamar ANTES de can_call_groq/gemini.
+        """
+        async with self._lock:
+            last = self._symbol_last_call.get(symbol, 0)
+            remaining = self._symbol_cooldown - (time.time() - last)
+            if remaining > 0:
+                logger.debug(
+                    f"[cooldown] {symbol} en espera {remaining:.0f}s — skip IA"
+                )
+                return True
+            return False
+
+    async def register_symbol_call(self, symbol: str):
+        """Registra que se hizo una llamada IA para este símbolo ahora."""
+        async with self._lock:
+            self._symbol_last_call[symbol] = time.time()
+            # Evitar crecimiento infinito
+            if len(self._symbol_last_call) > 200:
+                oldest = min(self._symbol_last_call, key=lambda k: self._symbol_last_call[k])
+                del self._symbol_last_call[oldest]
 
     async def can_call_groq(self) -> bool:
         async with self._lock:
@@ -123,6 +154,8 @@ class AIBudgetManager:
                 "gemini_calls_today": self._gemini_calls_today,
                 "gemini_daily_limit": GEMINI_RPD_LIMIT,
                 "gemini_rpm_used":    len(self._gemini_minute_calls),
+                "symbol_cooldown_s":  self._symbol_cooldown,
+                "symbols_tracked":    len(self._symbol_last_call),
             }
 
 
@@ -176,10 +209,6 @@ async def telegram_ai_status(update, context):
         if pct < 80:  return "🟡"
         return "🔴"
 
-    # Caché no implementada en este módulo — mostrar N/A
-    cache_count = 0
-    cache_ttl   = "N/A"
-
     text = (
         f"📊 *Estado IA — BitgetProBot*\n\n"
         f"*Gemini* (pagado)\n"
@@ -188,8 +217,8 @@ async def telegram_ai_status(update, context):
         f"*Groq* (free fallback)\n"
         f"{bar(groq_pct)} Hoy: {s['groq_calls_today']}/{s['groq_daily_limit']} calls ({groq_pct:.1f}%)\n"
         f"⏱ Último minuto: {s['groq_rpm_used']}/{GROQ_RPM_LIMIT} RPM\n\n"
-        f"*Caché*\n"
-        f"🗂 Símbolos en caché: {cache_count} | TTL: {cache_ttl}\n\n"
+        f"*Cooldown por símbolo*\n"
+        f"⏳ {s['symbol_cooldown_s']}s · {s['symbols_tracked']} símbolos tracked\n\n"
         f"_Reset a medianoche UTC_"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
