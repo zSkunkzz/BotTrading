@@ -50,7 +50,7 @@ def _resolve_hl_address() -> str:
 
 def make_risk():
     return RiskManager(
-        usdc_per_trade=float(os.getenv("USDC_PER_TRADE", "10")),
+        usdc_per_trade=float(os.getenv("USBC_PER_TRADE", "10")),
         tp_pct=float(os.getenv("TP_PCT", "4.0")),
         sl_pct=float(os.getenv("SL_PCT", "2.0")),
         trailing_sl=os.getenv("TRAILING_SL", "true").lower() == "true",
@@ -66,9 +66,17 @@ async def _start_single_pair(symbol: str):
     if symbol in active_traders:
         return
     logger.info("🚀 Iniciando trader: %s", symbol)
+
+    # Opción A: API key de agente (recomendada)
+    # Opción B: private key directa
+    private_key = (
+        os.getenv("HL_API_PRIVATE_KEY", "").strip()
+        or os.getenv("HL_PRIVATE_KEY", "").strip()
+    )
+
     trader = FuturesTrader(
-        api_key=None,
-        api_secret=os.getenv("HL_PRIVATE_KEY", ""),
+        api_key=os.getenv("HL_API_WALLET_ADDRESS", "").strip() or None,
+        api_secret=private_key,
         passphrase=None,
         symbol=symbol,
         leverage=int(os.getenv("LEVERAGE", "5")),
