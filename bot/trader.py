@@ -307,6 +307,8 @@ class FuturesTrader:
         nonce         = await _unique_nonce()
         raw_vault     = self._master_addr if self._agent_mode else None
         vault_address = raw_vault if raw_vault else None
+        # FIX BUG 3: expires_after explícito — debe ser idéntico en firma y payload
+        expires_after: Optional[int] = None
 
         signature = _sign_l1_action(
             private_key=self._private_key,
@@ -314,10 +316,17 @@ class FuturesTrader:
             vault_address=vault_address,
             nonce=nonce,
             is_mainnet=not _USE_TESTNET,
+            expires_after=expires_after,
         )
-        payload: dict = {"action": action, "nonce": nonce, "signature": signature}
-        if vault_address is not None:
-            payload["vaultAddress"] = vault_address
+        # FIX BUG 1: incluir expiresAfter en el payload (aunque sea null)
+        # El SDK oficial siempre envía esta key; sin ella algunos nodos rechazan.
+        payload: dict = {
+            "action":       action,
+            "nonce":        nonce,
+            "signature":    signature,
+            "vaultAddress": vault_address,
+            "expiresAfter": expires_after,
+        }
 
         async with aiohttp.ClientSession() as s:
             async with s.post(
@@ -477,8 +486,13 @@ class FuturesTrader:
             order_type_obj = {"limit": {"tif": "Gtc"}}
             limit_px       = _float_to_wire(price)
         else:
+            # FIX BUG 2: redondear a 5 sig figs como hace el SDK oficial
+            # Exchange._slippage_price() hace: round(float(f"{px:.5g}"), 6 - sz_decimals)
+            # Esto evita que HL rechace precios con demasiados decimales.
             current_price  = await self.get_price()
-            slippage_px    = current_price * 1.05 if is_buy else current_price * 0.95
+            slippage       = 0.05
+            raw_px         = current_price * (1 + slippage) if is_buy else current_price * (1 - slippage)
+            slippage_px    = round(float(f"{raw_px:.5g}"), 6)
             limit_px       = _float_to_wire(slippage_px)
             order_type_obj = {"limit": {"tif": "Ioc"}}
 
@@ -518,19 +532,24 @@ class FuturesTrader:
             logger.error("[%s] _place_order_raw exception: %s", self.symbol, e)
             return {"status": "error", "response": str(e)}
 
-    async def _get_order_status(self, order_id: int) -> dict:
+    async def _get_order_status(self, order_id) -> dict:
+        # FIX BUG 4: forzar int — el oid llega como str desde el JSON de respuesta
         try:
-            return await self._info_post({"type": "orderStatus", "user": self._account_addr, "oid": order_id})
+            return await self._info_post({
+                "type": "orderStatus",
+                "user": self._account_addr,
+                "oid":  int(order_id),
+            })
         except Exception as e:
             logger.debug("[%s] _get_order_status error: %s", self.symbol, e)
             return {}
 
-    async def _cancel_order(self, order_id: int) -> dict:
+    async def _cancel_order(self, order_id) -> dict:
         if self.dry_run:
             return {"status": "ok"}
         try:
             coin_idx = await self._get_coin_index()
-            action   = {"type": "cancel", "cancels": [{"a": coin_idx, "o": order_id}]}
+            action   = {"type": "cancel", "cancels": [{"a": coin_idx, "o": int(order_id)}]}
             return await self._exchange_post(action)
         except Exception as e:
             logger.debug("[%s] _cancel_order error: %s", self.symbol, e)
