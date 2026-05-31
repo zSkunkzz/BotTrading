@@ -6,6 +6,10 @@ Endpoint:
   → data.marginSummary.accountValue  (equity total en USDC)
 
 No requiere firma — es un endpoint público de lectura.
+
+IMPORTANTE: siempre debe consultarse la dirección del wallet MASTER
+(el que tiene fondos y aprobó el agente), nunca la del agente.
+El agente solo firma órdenes; el margen vive en la cuenta master.
 """
 import asyncio
 import logging
@@ -16,7 +20,6 @@ import aiohttp
 logger = logging.getLogger("BalanceSvc")
 
 _CACHE_TTL   = 30    # segundos entre refreshes
-_USE_TESTNET = False  # se actualiza desde init_hl()
 
 
 class _BalanceService:
@@ -34,14 +37,30 @@ class _BalanceService:
 
     def init(self, key: str = "", secret: str = "", passphrase: str = ""):
         """Stub de compatibilidad — usa init_hl() para Hyperliquid."""
-        if self._ready:
-            return
         logger.warning("[BalanceSvc] init() ignorado — usa init_hl(addr, info_post_fn)")
 
     def init_hl(self, addr: str, info_post_fn=None, testnet: bool = False):
-        """Inicializa con la dirección pública del wallet."""
-        if self._ready:
+        """
+        Inicializa con la dirección pública del wallet MASTER.
+
+        Puede llamarse múltiples veces (un trader por símbolo).
+        La primera llamada con una dirección válida gana; las siguientes
+        se ignoran a menos que la dirección cambie (no debería ocurrir).
+        """
+        if not addr:
+            logger.warning("[BalanceSvc] init_hl() llamado con addr vacía — ignorado")
             return
+
+        if self._ready:
+            # Verificar que todos los traders apuntan al mismo master
+            if self._addr.lower() != addr.lower():
+                logger.error(
+                    "[BalanceSvc] CONFLICTO de dirección: ya inicializado con %s, "
+                    "nueva llamada con %s — se mantiene la original.",
+                    self._addr[:10] + "...", addr[:10] + "...",
+                )
+            return
+
         self._addr         = addr
         self._info_post_fn = info_post_fn
         self._api_url      = (
@@ -49,8 +68,10 @@ class _BalanceService:
             else "https://api.hyperliquid.xyz"
         )
         self._ready = True
-        logger.info("[BalanceSvc] Inicializado (Hyperliquid) addr=%s",
-                    addr[:10] + "..." if addr else "N/A")
+        logger.info(
+            "[BalanceSvc] Inicializado — consultando balance de MASTER addr=%s",
+            addr,  # log completo para poder verificar en Railway
+        )
 
     def invalidate(self):
         """Fuerza refresco en la próxima llamada a get()."""
@@ -86,8 +107,17 @@ class _BalanceService:
                     headers={"Content-Type": "application/json"},
                     timeout=aiohttp.ClientTimeout(total=8),
                 ) as r:
-                    data = _json.loads(await r.text())
-                    return self._extract(data)
+                    text = await r.text()
+                    data = _json.loads(text)
+                    val  = self._extract(data)
+                    if val is None:
+                        logger.debug(
+                            "[BalanceSvc] _fetch_direct addr=%s → no se encontró balance. "
+                            "Keys presentes: %s",
+                            self._addr,
+                            list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                        )
+                    return val
         except Exception as e:
             logger.debug("[BalanceSvc] _fetch_direct error: %s", e)
             return None
@@ -122,14 +152,20 @@ class _BalanceService:
                 except (ValueError, TypeError):
                     pass
 
-        logger.debug("[BalanceSvc] No se encontró campo de balance en: %s", list(data.keys()))
+        logger.warning(
+            "[BalanceSvc] No se encontró campo de balance. "
+            "Keys en respuesta: %s | marginSummary keys: %s",
+            list(data.keys()),
+            list(ms.keys()) if isinstance(ms, dict) else ms,
+        )
         return None
 
     # ── API pública ────────────────────────────────────────────────────────────────
 
     async def get(self) -> float | None:
-        """Devuelve balance cacheado o refresca si ha caducado.
-        
+        """
+        Devuelve balance cacheado o refresca si ha caducado.
+
         IMPORTANTE: si el fetch falla, NO se cachea None.
         El caché solo guarda valores positivos confirmados.
         Si el balance real es 0.0 (cuenta vacía), sí se cachea.
@@ -160,10 +196,14 @@ class _BalanceService:
             if val is not None:
                 self._cache = val
                 self._ts    = time.time()
-                logger.info("[BalanceSvc] Balance actualizado: %.2f USDC", val)
+                logger.info("[BalanceSvc] Balance actualizado: %.2f USDC (addr=%s)",
+                            val, self._addr)
             else:
-                # NO cachear None — próxima llamada intentará de nuevo
-                logger.warning("[BalanceSvc] ⚠️ No se pudo obtener balance USDC (API falló)")
+                logger.warning(
+                    "[BalanceSvc] ⚠️ No se pudo obtener balance USDC "
+                    "(addr=%s — verifica que sea el wallet MASTER con fondos en perpetuals)",
+                    self._addr,
+                )
 
             return self._cache  # puede ser None o el último valor conocido
 
