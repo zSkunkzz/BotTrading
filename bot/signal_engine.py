@@ -144,6 +144,10 @@ async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
                 data = _json.loads(await r.text())
+        # Guard: la API puede devolver null, un dict de error, etc.
+        if not isinstance(data, list) or len(data) == 0:
+            log.warning("[OHLCV] %s %s REST HL respuesta vacía o inesperada: %s", coin, tf, str(data)[:120])
+            return pd.DataFrame()
         bars = [
             [int(c["t"]), float(c["o"]), float(c["h"]),
              float(c["l"]), float(c["c"]), float(c["v"])]
@@ -400,8 +404,6 @@ def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction:
         return mode, lev, 1.0
 
     # EARLY: score en el rango [MIN_SCORE, MIN_SCORE_FULL) con alineación 1h+15m
-    # FIX: era "== MIN_SCORE" → si microestructura sube score a MIN_SCORE+1
-    #      antes de llegar a MIN_SCORE_FULL, ese tick se descartaba erróneamente.
     if MIN_SCORE <= score < MIN_SCORE_FULL and tf1h_aligned > 0 and tf15_aligned > 0:
         quality = extra_1h + extra_15m
         ratio   = min(quality / 6.0, 1.0)
