@@ -200,7 +200,7 @@ class ExecutionEngine:
 
         if tp is not None:
             orders_to_place.append({
-                "name":       client.coin,
+                "coin":       client.coin,
                 "is_buy":     close_side,
                 "sz":         qty,
                 "limit_px":   tp if self.tp_as_limit else None,
@@ -216,7 +216,7 @@ class ExecutionEngine:
 
         if sl is not None:
             orders_to_place.append({
-                "name":       client.coin,
+                "coin":       client.coin,
                 "is_buy":     close_side,
                 "sz":         qty,
                 "limit_px":   sl,
