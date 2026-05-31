@@ -1,11 +1,20 @@
 """
 balance_service.py — Singleton de balance USDC para Hyperliquid.
 
-Endpoint:
-  POST /info  {type: "clearinghouseState", user: <address>}
-  → data.marginSummary.accountValue  (equity total en USDC)
+Endpoints consultados (en orden):
+  1. POST /info  {type: "clearinghouseState", user: <address>}
+     → data.marginSummary.accountValue  (equity perpetuals)
 
-No requiere firma — es un endpoint público de lectura.
+  2. Si el valor anterior es 0, fallback a:
+     POST /info  {type: "spotClearinghouseState", user: <address>}
+     → balances[coin=="USDC"].total  (saldo Spot en Cuenta Unificada)
+
+Con Cuenta Unificada de Hyperliquid el USDC depositado en Spot se usa
+directamente como colateral de perpetuals, pero clearinghouseState devuelve
+0 hasta que se realiza el primer trade perp. spotClearinghouseState refleja
+el saldo real disponible.
+
+No requiere firma — son endpoints públicos de lectura.
 
 IMPORTANTE: siempre debe consultarse la dirección del wallet MASTER
 (el que tiene fondos y aprobó el agente), nunca la del agente.
@@ -86,11 +95,28 @@ class _BalanceService:
         if not self._info_post_fn:
             return None
         try:
+            # 1. clearinghouseState → perpetuals equity
             data = await self._info_post_fn({
                 "type": "clearinghouseState",
                 "user": self._addr,
             })
-            return self._extract(data)
+            val = self._extract(data)
+
+            # 2. Si es 0, intentar spotClearinghouseState (Cuenta Unificada)
+            if val is not None and val == 0.0:
+                spot_data = await self._info_post_fn({
+                    "type": "spotClearinghouseState",
+                    "user": self._addr,
+                })
+                spot_val = self._extract_spot(spot_data)
+                if spot_val is not None and spot_val > 0:
+                    logger.info(
+                        "[BalanceSvc] Cuenta Unificada detectada — usando saldo Spot: %.2f USDC",
+                        spot_val,
+                    )
+                    return spot_val
+
+            return val
         except Exception as e:
             logger.debug("[BalanceSvc] callback error: %s", e)
             return None
@@ -103,29 +129,28 @@ class _BalanceService:
         """
         if not self._addr:
             return None
-        payload = {"type": "clearinghouseState", "user": self._addr}
 
         for attempt in range(_MAX_RETRIES):
             try:
                 async with aiohttp.ClientSession() as s:
+                    # ── 1. clearinghouseState ────────────────────────────
+                    payload = {"type": "clearinghouseState", "user": self._addr}
                     async with s.post(
                         f"{self._api_url}/info",
                         json=payload,
                         headers={"Content-Type": "application/json"},
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as r:
-                        # ── 429: rate limit ──────────────────────────────
                         if r.status == 429:
-                            wait = 2.0 * (attempt + 1)  # 2s, 4s, 6s, 8s
+                            wait = 2.0 * (attempt + 1)
                             logger.warning(
                                 "[BalanceSvc] 429 rate-limit en /info (intento %d/%d) — "
                                 "esperando %.0fs antes de reintentar...",
                                 attempt + 1, _MAX_RETRIES, wait,
                             )
                             await asyncio.sleep(wait)
-                            continue  # no parsear — reintentar
+                            continue
 
-                        # ── Otros errores HTTP ───────────────────────────
                         if r.status >= 500:
                             logger.warning(
                                 "[BalanceSvc] HTTP %s en /info (intento %d/%d)",
@@ -143,8 +168,32 @@ class _BalanceService:
                             continue
 
                         val = self._extract(data)
+
+                        # ── 2. Si es 0, probar spotClearinghouseState ────
+                        if val is not None and val == 0.0:
+                            spot_payload = {"type": "spotClearinghouseState", "user": self._addr}
+                            async with s.post(
+                                f"{self._api_url}/info",
+                                json=spot_payload,
+                                headers={"Content-Type": "application/json"},
+                                timeout=aiohttp.ClientTimeout(total=10),
+                            ) as spot_r:
+                                if spot_r.status == 200:
+                                    spot_text = await spot_r.text()
+                                    try:
+                                        spot_data = _json.loads(spot_text)
+                                        spot_val = self._extract_spot(spot_data)
+                                        if spot_val is not None and spot_val > 0:
+                                            logger.info(
+                                                "[BalanceSvc] Cuenta Unificada — "
+                                                "saldo Spot: %.2f USDC",
+                                                spot_val,
+                                            )
+                                            return spot_val
+                                    except Exception:
+                                        pass
+
                         if val is None:
-                            # Log completo del raw para poder diagnosticar desde Railway
                             logger.warning(
                                 "[BalanceSvc] _fetch_direct addr=%s → balance no encontrado.\n"
                                 "  HTTP status : %s\n"
@@ -159,8 +208,6 @@ class _BalanceService:
                                 data.get("crossMarginSummary") if isinstance(data, dict) else "N/A",
                                 text[:500],
                             )
-                            # Si la respuesta llegó bien pero no tiene balance,
-                            # no tiene sentido reintentar
                             return None
 
                         return val
@@ -235,6 +282,40 @@ class _BalanceService:
 
         return None
 
+    def _extract_spot(self, data: dict) -> float | None:
+        """
+        Extrae el saldo USDC de la respuesta spotClearinghouseState.
+
+        Estructura esperada:
+          { "balances": [ { "coin": "USDC", "token": 0, "total": "289.63", "hold": "0.0" }, ... ] }
+        """
+        if not isinstance(data, dict):
+            return None
+        balances = data.get("balances", [])
+        if not isinstance(balances, list):
+            return None
+        for entry in balances:
+            if not isinstance(entry, dict):
+                continue
+            # USDC puede aparecer como "USDC" o token id 0
+            coin = entry.get("coin", "")
+            token = entry.get("token")
+            if coin == "USDC" or token == 0:
+                for field in ("total", "withdrawable", "hold"):
+                    v = entry.get(field)
+                    if v is not None:
+                        try:
+                            val = float(v)
+                            if val > 0:
+                                logger.debug(
+                                    "[BalanceSvc] Spot balance=%.2f USDC (balances[USDC].%s)",
+                                    val, field,
+                                )
+                                return val
+                        except (ValueError, TypeError):
+                            pass
+        return None
+
     # ── API pública ────────────────────────────────────────────────────────────────
 
     async def get(self) -> float | None:
@@ -286,7 +367,7 @@ class _BalanceService:
                 else:
                     logger.warning(
                         "[BalanceSvc] ⚠️ No se pudo obtener balance USDC "
-                        "(addr=%s — verifica que sea el wallet MASTER con fondos en perpetuals)",
+                        "(addr=%s — verifica que sea el wallet MASTER con fondos)",
                         self._addr,
                     )
 
