@@ -9,6 +9,9 @@ No se requieren credenciales — es un endpoint público de lectura.
 
 Formato de símbolo devuelto: nombre corto de coin ("BTC", "ETH", "SOL")
 Compatible con ws_feed.py y trader.py que normalizan internamente.
+
+Método extra: inject_snapshot(raw_text) — inyecta datos de una tabla de
+mercados pegada manualmente (sin llamadas a IA) usando market_snapshot.py.
 """
 import logging
 import asyncio
@@ -56,6 +59,9 @@ class PairScanner:
     FIX: si prevDayPx es 0 o null (frecuente en el arranque o tras reset de
     mercado en Hyperliquid), el change_pct se marca como None y el filtro
     de cambio mínimo se OMITE para ese par — no se penaliza por dato faltante.
+
+    inject_snapshot(): acepta texto pegado de la UI del exchange y lo parsea
+    con market_snapshot.py, sin depender de ninguna IA externa.
     """
 
     def __init__(
@@ -87,6 +93,54 @@ class PairScanner:
         if len(coin) < 2 or len(coin) > 12:
             return False
         return True
+
+    # ------------------------------------------------------------------
+    # inject_snapshot — entrada manual sin IA
+    # ------------------------------------------------------------------
+
+    def inject_snapshot(self, raw_text: str) -> list[str]:
+        """
+        Parsea texto pegado de la UI del exchange y sobreescribe _last_scored.
+
+        No llama a ninguna IA. Usa market_snapshot.parse_snapshot() y
+        snapshot_to_scanner_format() para producir la misma estructura
+        que devuelve scan().
+
+        Parámetros de filtro reutilizados de la instancia:
+          - min_volume_usdt
+          - min_price_change_pct (como |change_pct|)
+          - top_n
+
+        Devuelve: lista de símbolos (igual que scan()).
+        Colaterales USDE/USDH/USDT se excluyen por defecto para no
+        duplicar pares (el bot opera en USDC).
+        """
+        from bot.market_snapshot import parse_snapshot, snapshot_to_scanner_format
+
+        rows = parse_snapshot(raw_text)
+        scored = snapshot_to_scanner_format(
+            rows,
+            min_volume_usdt=self.min_volume_usdt,
+            min_change_pct=self.min_price_change_pct,
+            top_n=self.top_n,
+            exclude_quotes={"USDE", "USDH", "USDT"},  # solo operar en USDC
+            exclude_collateral=set(),
+        )
+
+        self._last_scored = scored
+        self.active_pairs = [s["symbol"] for s in scored]
+
+        logger.info(
+            "[PairScanner] inject_snapshot: %d mercados activos → top %d seleccionados",
+            sum(1 for r in rows if r.active), len(scored),
+        )
+        for p in scored[:5]:
+            logger.info(
+                "  %-12s Vol: $%sM | Cambio: %.2f%% | Funding: %.4f%% | Score: %s",
+                p["symbol"], p["volume_usdt"], p["change_pct"], p["funding"], p["score"],
+            )
+
+        return self.active_pairs
 
     async def scan(self) -> list:
         """Devuelve lista de coins (ej: ["BTC", "ETH", "SOL"]) ordenada por score."""
