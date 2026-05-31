@@ -63,9 +63,10 @@ _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
 # Rate limiter global para llamadas REST a /info (compartido entre todos los traders)
-_HL_REST_LOCK   = asyncio.Lock()
-_HL_LAST_CALL   = 0.0
-_HL_MIN_INTERVAL = 0.15   # máx ~6 req/s compartido entre traders
+# Con 15 traders activos se necesita un intervalo más conservador para evitar 429s.
+_HL_REST_LOCK    = asyncio.Lock()
+_HL_LAST_CALL    = 0.0
+_HL_MIN_INTERVAL = 0.35   # máx ~3 req/s compartido — suficiente para 15 traders sin 429s
 
 async def _hl_throttle():
     """Espera el mínimo intervalo entre llamadas REST a Hyperliquid para evitar 429."""

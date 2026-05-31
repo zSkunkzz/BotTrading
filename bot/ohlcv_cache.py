@@ -2,13 +2,13 @@
 ohlcv_cache.py — Cache OHLCV compartido entre todos los traders.
 
 Problema que resuelve:
-  Con 14 traders corriendo en paralelo, cada uno pidiendo velas en 3
-  timeframes (15m, 1h, 4h), se generan ~42 requests simultáneos a
+  Con 15 traders corriendo en paralelo, cada uno pidiendo velas en 3
+  timeframes (15m, 1h, 4h), se generan ~45 requests simultáneos a
   api.hyperliquid.xyz/info, disparando 429s.
 
 Solución:
-  Un único OHLCVCache singleton con TTL de 30 segundos por (coin, tf).
-  Si BTC/1h ya fue pedido hace 15s, los demás traders reciben el valor
+  Un único OHLCVCache singleton con TTL de 60 segundos por (coin, tf).
+  Si BTC/1h ya fue pedido hace 30s, los demás traders reciben el valor
   cacheado sin hacer una nueva request REST.
 
   Además, usa un lock por clave para evitar el problema de "thundering herd":
@@ -24,7 +24,10 @@ from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger("OHLCVCache")
 
-_DEFAULT_TTL = 30.0  # segundos
+# TTL aumentado a 60s para reducir requests REST con 15 traders activos.
+# Las velas de 15m se actualizan cada 15min, por lo que 60s de caché no
+# afecta la calidad de las señales pero reduce los 429s significativamente.
+_DEFAULT_TTL = 60.0  # segundos
 
 
 class _OHLCVCache:

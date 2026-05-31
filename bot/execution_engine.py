@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("ExecutionEngine")
 
+_AGENT_NOT_FOUND_SUBSTR = "does not exist"
+
 
 def _e(key: str, default: float) -> float:
     return float(os.getenv(key, str(default)))
@@ -94,7 +96,10 @@ class ExecutionEngine:
                 rec.order_type_used = "limit"
                 rec.fill_price      = limit_price
             else:
-                rec.cancel_reason = "timeout"
+                # Si el error es de firma/agente no conocido, ir directo a market
+                agent_err = _AGENT_NOT_FOUND_SUBSTR in str(rec.cancel_reason)
+                if not agent_err:
+                    rec.cancel_reason = rec.cancel_reason or "timeout"
                 logger.info(f"[{sym}] ⚡ Limit sin fill → fallback market")
                 result = await trader._place_order_raw(
                     side, qty, trade_side=trade_side,
@@ -187,7 +192,12 @@ class ExecutionEngine:
             trade_side=trade_side, reduce_only=reduce_only, sl=sl, tp=tp,
         )
         if result.get("status") != "ok":
-            rec.cancel_reason = f"limit_rejected:{result.get('response', '')}"
+            err_str = str(result.get("response", ""))
+            rec.cancel_reason = f"limit_rejected:{err_str}"
+            # Si es error de agente no registrado, marcar explícitamente para
+            # que execute() vaya directo a market sin reintentar otra limit.
+            if _AGENT_NOT_FOUND_SUBSTR in err_str:
+                rec.cancel_reason = f"agent_not_found:{err_str}"
             return result, False
 
         # En Hyperliquid el orderId viene en response.data.statuses[0]
