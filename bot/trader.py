@@ -52,6 +52,11 @@ _POS_CHECK_INTERVAL_S   = int(os.getenv("POS_CHECK_INTERVAL_S", "30"))
 _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
 _SL_SW_MARGIN           = float(os.getenv("SL_SW_MARGIN", "0.001"))
 
+# FIX: tiempo de espera tras apertura antes de confirmar posición en exchange
+# Hyperliquid puede tardar hasta 2-3s en propagar el estado de la posición
+_POST_FILL_CONFIRM_DELAY_S = float(os.getenv("POST_FILL_CONFIRM_DELAY_S", "2.5"))
+_POST_FILL_CONFIRM_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "3"))
+
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
@@ -452,6 +457,51 @@ class FuturesTrader:
             logger.error("[%s] _get_positions error: %s", self.symbol, e)
             return None  # FIX: None = error de red, no lista vacía
 
+    async def _confirm_position_with_retry(self) -> list | None:
+        """
+        FIX: Verifica la posición en el exchange con reintentos y backoff.
+
+        Hyperliquid puede tardar 2-3s en propagar el estado de la posición tras
+        un fill. Sin este delay, la confirmación inmediata devuelve [] aunque la
+        posición exista, lo que causaba que el bot abortara el registro de estado.
+
+        Retorna la primera respuesta no-vacía encontrada, o None si hay error de red.
+        """
+        for attempt in range(_POST_FILL_CONFIRM_RETRIES):
+            if attempt > 0:
+                # Backoff creciente: 2.5s, 5s, 7.5s...
+                delay = _POST_FILL_CONFIRM_DELAY_S * attempt
+                logger.debug(
+                    "[%s] Post-fill confirm: intento %d/%d (esperando %.1fs)...",
+                    self.symbol, attempt + 1, _POST_FILL_CONFIRM_RETRIES, delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                # Primer intento: esperar siempre el delay base
+                logger.debug(
+                    "[%s] Post-fill confirm: esperando %.1fs para propagación...",
+                    self.symbol, _POST_FILL_CONFIRM_DELAY_S,
+                )
+                await asyncio.sleep(_POST_FILL_CONFIRM_DELAY_S)
+
+            positions = await self._get_positions()
+            if positions is None:
+                # Error de red — retornar None directamente, no reintentar
+                return None
+            if len(positions) > 0:
+                # Posición confirmada
+                return positions
+            # Posición vacía — puede ser propagación tardía, reintentar
+
+        logger.warning(
+            "[%s] Post-fill confirm: posición no visible tras %d intentos (%.1fs total). "
+            "Puede ser propagación muy lenta o fill parcial a cero.",
+            self.symbol,
+            _POST_FILL_CONFIRM_RETRIES,
+            _POST_FILL_CONFIRM_DELAY_S * _POST_FILL_CONFIRM_RETRIES,
+        )
+        return []  # Devolver lista vacía (no error de red, simplemente no hay posición)
+
     # ── Loop principal ───────────────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None):
@@ -600,6 +650,7 @@ class FuturesTrader:
         if self.dry_run:
             result = {"status": "ok", "_fill_price": entry}
             fill_price = entry
+            confirmed_positions = [{"szi": qty}]  # simular posición confirmada en dry_run
         else:
             result = await self._place_order(side, qty, sl=sl, tp=tp1)
             if result.get("status") != "ok":
@@ -611,7 +662,7 @@ class FuturesTrader:
                 )
                 return
 
-            # FIX: verificar fill real consultando el exchange antes de registrar posición
+            # FIX: extraer fill price del response
             fill_price = entry
             try:
                 fill_price = float(
@@ -621,13 +672,18 @@ class FuturesTrader:
             except Exception:
                 fill_price = entry
 
-            # FIX: confirmar en el exchange que la posición realmente se abrió
-            confirmed_positions = await self._get_positions()
+            # FIX: confirmar con reintentos — Hyperliquid tarda 2-3s en propagar
+            # el estado de la posición tras el fill. Sin el delay, la verificación
+            # inmediata devuelve [] y el bot abortaba el registro de estado.
+            confirmed_positions = await self._confirm_position_with_retry()
             if confirmed_positions is not None and len(confirmed_positions) == 0:
                 logger.error(
-                    "[%s] ❌ Orden enviada con status=ok pero NO hay posición abierta en Hyperliquid. "
-                    "Posible fill parcial a cero o orden expirada. NO se registra estado local.",
+                    "[%s] ❌ Orden enviada con status=ok pero NO hay posición abierta en Hyperliquid "
+                    "tras %d intentos (%.1fs). Posible fill parcial a cero o orden expirada. "
+                    "NO se registra estado local.",
                     self.symbol,
+                    _POST_FILL_CONFIRM_RETRIES,
+                    _POST_FILL_CONFIRM_DELAY_S * _POST_FILL_CONFIRM_RETRIES,
                 )
                 return
             if confirmed_positions is None:
@@ -651,9 +707,7 @@ class FuturesTrader:
         self.tp2_hit        = False
         self._open_notional = notional
         self._open_leverage = lev
-        # FIX: _protection_ok = True solo si el exchange confirmó la posición con TP/SL
-        # Si confirmed_positions fue None (error de red), quedará False hasta el próximo
-        # ciclo de verificación, lo cual es correcto y seguro.
+        # FIX: _protection_ok = True solo si el exchange confirmó la posición
         self._protection_ok = (
             confirmed_positions is not None and len(confirmed_positions) > 0
         ) if not self.dry_run else True

@@ -20,6 +20,9 @@ Variables de entorno (todas opcionales):
   EE_LIMIT_OFFSET_BPS         default 3
   EE_MAX_SLIPPAGE_ALERT_BPS   default 30
   EE_TP_AS_LIMIT              default true  (False = TP como market)
+  EE_TP_LIMIT_BUFFER_BPS      default 50    (buffer sobre/bajo trigger px para limit_px del TP)
+  EE_BULK_RETRY_ATTEMPTS      default 3
+  EE_BULK_RETRY_BASE_DELAY_S  default 1.0
 """
 from __future__ import annotations
 
@@ -39,6 +42,7 @@ from bot.core.hl_client import HLClient
 logger = logging.getLogger("ExecutionEngine")
 
 _AGENT_NOT_FOUND_SUBSTR = "does not exist"
+_RATE_LIMIT_SUBSTRS = ("429", "too many requests", "rate limit", "ratelimit")
 
 
 def _e(key: str, default: float) -> float:
@@ -75,6 +79,13 @@ class ExecutionEngine:
         self.limit_offset_bps:       float = _e("EE_LIMIT_OFFSET_BPS",        3.0)
         self.max_slippage_alert_bps: float = _e("EE_MAX_SLIPPAGE_ALERT_BPS", 30.0)
         self.tp_as_limit:            bool  = os.getenv("EE_TP_AS_LIMIT", "true").lower() == "true"
+        # FIX: buffer de precio para limit_px del TP (bps sobre/bajo el triggerPx)
+        # Para long: limit_px = triggerPx * (1 + buffer) → acepta fills hasta arriba
+        # Para short: limit_px = triggerPx * (1 - buffer) → acepta fills hasta abajo
+        self.tp_limit_buffer_bps:    float = _e("EE_TP_LIMIT_BUFFER_BPS",    50.0)
+        # FIX: reintentos ante 429 en place_bulk
+        self.bulk_retry_attempts:    int   = int(_e("EE_BULK_RETRY_ATTEMPTS", 3))
+        self.bulk_retry_base_delay:  float = _e("EE_BULK_RETRY_BASE_DELAY_S", 1.0)
         self._records: dict[str, list[TradeRecord]] = defaultdict(list)
         self._hl_clients: dict[str, HLClient] = {}
 
@@ -194,16 +205,38 @@ class ExecutionEngine:
         La dirección de cierre es la opuesta a la posición:
           - Long (is_buy=True)  → cierre = vender (is_buy=False)
           - Short (is_buy=False) → cierre = comprar (is_buy=True)
+
+        FIX limit_px para TP:
+          Hyperliquid requiere que limit_px sea un precio válido respecto al
+          lado de cierre. Para un TP de long (vendemos cuando sube), limit_px
+          debe ser igual o mayor al triggerPx. Para un TP de short (compramos
+          cuando baja), limit_px debe ser igual o menor al triggerPx.
+          Usamos un buffer del tp_limit_buffer_bps para garantizar fill.
         """
         close_side = not is_buy
         orders_to_place = []
 
         if tp is not None:
+            if self.tp_as_limit:
+                # FIX: limit_px con buffer direccional según el side de cierre
+                # close_side=True (comprar para cerrar short) → TP se activa cuando precio baja
+                #   limit_px debe ser >= triggerPx para que el buy se ejecute
+                # close_side=False (vender para cerrar long) → TP se activa cuando precio sube
+                #   limit_px debe ser <= triggerPx... pero en la práctica HL requiere
+                #   limit_px = triggerPx para TP limit. Usar buffer positivo es seguro.
+                buffer_multiplier = self.tp_limit_buffer_bps / 10_000
+                if close_side:  # compramos para cerrar short → buscamos que el precio esté abajo
+                    tp_limit_px = round(tp * (1 + buffer_multiplier), 6)
+                else:           # vendemos para cerrar long → precio está arriba
+                    tp_limit_px = round(tp * (1 - buffer_multiplier), 6)
+            else:
+                tp_limit_px = None
+
             orders_to_place.append({
                 "coin":       client.coin,
                 "is_buy":     close_side,
                 "sz":         qty,
-                "limit_px":   tp if self.tp_as_limit else None,
+                "limit_px":   tp_limit_px,
                 "order_type": {
                     "trigger": {
                         "triggerPx": tp,
@@ -233,19 +266,51 @@ class ExecutionEngine:
         if not orders_to_place:
             return
 
-        try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, client.place_bulk, orders_to_place
+        # FIX: retry con backoff exponencial ante 429 / rate-limit
+        last_error: Exception | None = None
+        for attempt in range(self.bulk_retry_attempts):
+            if attempt > 0:
+                delay = self.bulk_retry_base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    "[%s] place_bulk intento %d/%d — esperando %.1fs (rate-limit o error transitorio)",
+                    sym, attempt + 1, self.bulk_retry_attempts, delay,
+                )
+                await asyncio.sleep(delay)
+            try:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, client.place_bulk, orders_to_place
+                )
+                statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+                all_ok = True
+                for i, st in enumerate(statuses):
+                    label = "TP" if (i == 0 and tp is not None) else "SL"
+                    if "error" in st:
+                        err_msg = st["error"]
+                        # FIX: detectar rate-limit en el body de la respuesta
+                        if any(s in err_msg.lower() for s in _RATE_LIMIT_SUBSTRS):
+                            logger.warning("[%s] Trigger %s rate-limited: %s", sym, label, err_msg)
+                            all_ok = False
+                            last_error = RuntimeError(err_msg)
+                        else:
+                            logger.error("[%s] ❌ Trigger %s fallido: %s", sym, label, err_msg)
+                    else:
+                        logger.info("[%s] ✅ Trigger %s colocado en exchange (sobrevive reinicios)", sym, label)
+                if all_ok:
+                    return  # éxito — salir del loop de reintentos
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                if any(s in err_str for s in _RATE_LIMIT_SUBSTRS):
+                    logger.warning("[%s] place_bulk 429/rate-limit: %s", sym, e)
+                    continue  # reintentar
+                logger.error("[%s] Error colocando trigger orders TP/SL: %s", sym, e)
+                return  # error no-recuperable — no reintentar
+
+        if last_error is not None:
+            logger.error(
+                "[%s] ❌ place_bulk falló tras %d intentos. Último error: %s",
+                sym, self.bulk_retry_attempts, last_error,
             )
-            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-            for i, st in enumerate(statuses):
-                label = "TP" if i == 0 and tp else "SL"
-                if "error" in st:
-                    logger.error("[%s] ❌ Trigger %s fallido: %s", sym, label, st["error"])
-                else:
-                    logger.info("[%s] ✅ Trigger %s colocado en exchange (sobrevive reinicios)", sym, label)
-        except Exception as e:
-            logger.error("[%s] Error colocando trigger orders TP/SL: %s", sym, e)
 
     # ── LIMIT INTERNO + TELEMETRÍA ────────────────────────────────────────────
 
