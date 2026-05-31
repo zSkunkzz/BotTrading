@@ -62,10 +62,11 @@ _SL_SW_MARGIN           = float(os.getenv("SL_SW_MARGIN", "0.001"))
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
-# Rate limiter global para llamadas REST a /info (compartido entre todos los traders)
+# ── Rate limiter global para /info (compartido entre todos los traders) ──
+# Aumentado a 0.5s (~2 req/s) para evitar 429 con 14+ traders concurrentes.
 _HL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
-_HL_MIN_INTERVAL = 0.35   # máx ~3 req/s compartido
+_HL_MIN_INTERVAL = 0.5   # máx ~2 req/s compartido
 
 async def _hl_throttle():
     """Espera el mínimo intervalo entre llamadas REST a Hyperliquid para evitar 429."""
@@ -76,6 +77,24 @@ async def _hl_throttle():
         if wait > 0:
             await asyncio.sleep(wait)
         _HL_LAST_CALL = time.monotonic()
+
+
+# ── Nonce único global — evita colisiones entre traders concurrentes ──
+# time.time() * 1000 puede devolver el mismo ms cuando 14 traders firman
+# casi simultáneamente → mismo nonce → _action_hash idéntico → firma inválida
+# → "User or API Wallet 0x... does not exist".
+_NONCE_LOCK = asyncio.Lock()
+_NONCE_LAST = 0
+
+async def _unique_nonce() -> int:
+    """Devuelve un nonce en milisegundos garantizando unicidad global."""
+    global _NONCE_LAST
+    async with _NONCE_LOCK:
+        n = int(time.time() * 1000)
+        if n <= _NONCE_LAST:
+            n = _NONCE_LAST + 1
+        _NONCE_LAST = n
+        return n
 
 
 # ── Helpers de signing — idénticos a hyperliquid-python-sdk/signing.py v0.23.0 ──
@@ -279,13 +298,12 @@ class FuturesTrader:
         if not self._private_key:
             raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
 
-        nonce      = int(time.time() * 1000)
+        # Nonce único garantizado — evita colisiones entre traders concurrentes
+        # que antes generaban la misma firma → "Wallet does not exist"
+        nonce      = await _unique_nonce()
         is_mainnet = not _USE_TESTNET
 
         # SDK oficial: en agent mode, vault_address = master_addr SIEMPRE.
-        # Condición anterior (agent_addr != master_addr) era incorrecta:
-        # si HL_API_WALLET_ADDRESS no estaba configurada, master==agent y
-        # vault_address quedaba None → hash incorrecto → firma inválida.
         vault_address = self._master_addr if self._agent_mode else None
 
         signature = _sign_l1_action(
