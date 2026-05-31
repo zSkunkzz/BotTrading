@@ -52,6 +52,8 @@ class TradeRecord:
     order_type_used:    str   = "market"
     cancel_reason:      str   = ""
     success:            bool  = False
+    # FIX BUG 5: timestamp de inicio para calcular latencia real
+    _t0:                float = field(default=0.0, repr=False)
 
 
 class ExecutionEngine:
@@ -77,7 +79,8 @@ class ExecutionEngine:
     ) -> dict:
         sym = trader.symbol
         rec = TradeRecord(symbol=sym, side=side, qty=qty, arrival_price=arrival_price)
-        t0  = time.monotonic()
+        # FIX BUG 5: guardar t0 en el record para calcular latencia en _finalize_rec
+        rec._t0 = time.monotonic()
 
         spread_bps = self._calc_spread_bps(ask, bid, arrival_price)
         use_limit  = (
@@ -96,9 +99,6 @@ class ExecutionEngine:
                 rec.order_type_used = "limit"
                 rec.fill_price      = limit_price
             else:
-                # FIX BUG 1: si el error es de agente no registrado en HL, el fallback
-                # market fallará igual → abortar y devolver el error original.
-                # ANTES: el bloque no hacía return → devolvía None → AttributeError en caller.
                 agent_err = _AGENT_NOT_FOUND_SUBSTR in str(rec.cancel_reason)
                 if agent_err:
                     logger.error(
@@ -111,7 +111,6 @@ class ExecutionEngine:
                     )
                     rec.order_type_used = "market"
                     rec.fill_price      = arrival_price
-                    # ← FIX: return result explícito para no devolver None
                     self._finalize_rec(rec, result, side, arrival_price)
                     return result
                 else:
@@ -141,8 +140,9 @@ class ExecutionEngine:
         return result
 
     def _finalize_rec(self, rec: TradeRecord, result: dict, side: str, arrival_price: float) -> None:
-        """Calcula métricas finales del record y lo guarda. Extraído para evitar duplicación."""
-        rec.fill_latency_ms = (time.monotonic() - rec.arrival_price) if False else rec.fill_latency_ms
+        """Calcula métricas finales del record y lo guarda."""
+        # FIX BUG 5: latencia real usando rec._t0 guardado al inicio de execute()
+        rec.fill_latency_ms = (time.monotonic() - rec._t0) * 1000
         rec.success = result.get("status") == "ok"
 
         if rec.success and arrival_price > 0:
