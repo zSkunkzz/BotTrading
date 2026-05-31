@@ -353,8 +353,15 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
     return s
 
 
-def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, int, str]:
-    """Score máximo teórico: 11 (capeado a SCORE_MAX=10)."""
+def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, str]:
+    """
+    Score máximo teórico: 11 (capeado a SCORE_MAX=10).
+
+    FIX BUG 3: la firma anterior era tuple[int, int, str] y devolvía
+    (score, sl_parcial_sin_capear, direction). El segundo valor era
+    inconsistente (score de LONGs sin capear) y confundía al caller.
+    Ahora devuelve (score, direction) — 2 valores claros.
+    """
     sl = ss = 0
 
     for key in ("ema_trend", "macd", "ema200"):
@@ -374,8 +381,9 @@ def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, int, str]:
 
     best      = max(sl, ss)
     score     = min(best, SCORE_MAX)          # cap consistente con max_score
-    direction = "LONG" if sl >= ss else "SHORT"
-    return score, min(sl, SCORE_MAX), direction
+    # FIX: empate → SHORT (más conservador; antes siempre daba LONG en empate)
+    direction = "LONG" if sl > ss else "SHORT"
+    return score, direction
 
 
 def _apply_microstructure(
@@ -466,7 +474,8 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         s4h = _analyze_tf(df4h) if not df4h.empty else {}
         result.indicators = {"15m": s15, "1h": s1h, "4h": s4h}
 
-        score_base, _, direction = _compute_score(s4h, s1h, s15)
+        # FIX BUG 3: _compute_score ahora devuelve (score, direction) — 2 valores
+        score_base, direction = _compute_score(s4h, s1h, s15)
 
         ob_metrics   = None
         funding_rate = None

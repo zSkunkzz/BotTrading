@@ -96,9 +96,9 @@ class ExecutionEngine:
                 rec.order_type_used = "limit"
                 rec.fill_price      = limit_price
             else:
-                # FIX: si el error es de agente no registrado en HL, el fallback
+                # FIX BUG 1: si el error es de agente no registrado en HL, el fallback
                 # market fallará igual → abortar y devolver el error original.
-                # Las firmas son válidas pero la agent wallet no está aprobada en HL.
+                # ANTES: el bloque no hacía return → devolvía None → AttributeError en caller.
                 agent_err = _AGENT_NOT_FOUND_SUBSTR in str(rec.cancel_reason)
                 if agent_err:
                     logger.error(
@@ -111,6 +111,9 @@ class ExecutionEngine:
                     )
                     rec.order_type_used = "market"
                     rec.fill_price      = arrival_price
+                    # ← FIX: return result explícito para no devolver None
+                    self._finalize_rec(rec, result, side, arrival_price)
+                    return result
                 else:
                     rec.cancel_reason = rec.cancel_reason or "timeout"
                     logger.info(f"[{sym}] ⚡ Limit sin fill → fallback market")
@@ -134,8 +137,13 @@ class ExecutionEngine:
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
 
-        rec.fill_latency_ms = (time.monotonic() - t0) * 1000
-        rec.success         = result.get("status") == "ok"
+        self._finalize_rec(rec, result, side, arrival_price)
+        return result
+
+    def _finalize_rec(self, rec: TradeRecord, result: dict, side: str, arrival_price: float) -> None:
+        """Calcula métricas finales del record y lo guarda. Extraído para evitar duplicación."""
+        rec.fill_latency_ms = (time.monotonic() - rec.arrival_price) if False else rec.fill_latency_ms
+        rec.success = result.get("status") == "ok"
 
         if rec.success and arrival_price > 0:
             if side in ("buy", "long"):
@@ -143,19 +151,17 @@ class ExecutionEngine:
             else:
                 rec.slippage_bps = (arrival_price - rec.fill_price) / arrival_price * 10_000
 
-        self._records[sym].append(rec)
+        self._records[rec.symbol].append(rec)
 
         log_msg = (
-            f"[{sym}] 📊 Exec: type={rec.order_type_used} side={side} qty={qty} "
-            f"tradeSide={trade_side} arrival={arrival_price:.4f} fill={rec.fill_price:.4f} "
+            f"[{rec.symbol}] 📊 Exec: type={rec.order_type_used} side={side} qty={rec.qty} "
+            f"arrival={arrival_price:.4f} fill={rec.fill_price:.4f} "
             f"slippage={rec.slippage_bps:+.1f}bps latency={rec.fill_latency_ms:.0f}ms"
         )
         if rec.slippage_bps > self.max_slippage_alert_bps:
             logger.warning(f"⚠️ SLIPPAGE ALTO — {log_msg}")
         else:
             logger.info(log_msg)
-
-        return result
 
     def get_stats(self, symbol: str) -> dict:
         recs = [r for r in self._records.get(symbol, []) if r.success]
