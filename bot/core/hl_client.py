@@ -2,7 +2,7 @@
 hl_client.py — Cliente Hyperliquid basado en el SDK oficial.
 
 Reemplaza el signing manual de http_client.py por el SDK oficial:
-  pip install hyperliquid-python-sdk>=0.1.9
+  pip install hyperliquid-python-sdk==0.9.4
 
 Ventajas vs signing manual:
   - El SDK mantiene el formato EIP-712 actualizado automáticamente.
@@ -44,7 +44,6 @@ _BASE_URL = (
 _MARKET_SLIPPAGE = float(os.getenv("HL_MARKET_SLIPPAGE", "0.005"))
 
 # Strings que devuelve HL en el campo orderType para trigger orders.
-# Se comparan en lowercase para evitar diferencias de capitalización entre versiones del SDK.
 _TRIGGER_ORDER_KEYWORDS = ("stop market", "stop limit", "take profit", "trigger")
 
 
@@ -63,9 +62,9 @@ class HLClient:
 
     Uso:
         client = HLClient(symbol="BTC/USDT:USDT")
-        await client.place_limit(is_buy=True, sz=0.01, price=40000)
-        await client.place_tp(is_buy=False, sz=0.01, trigger_px=45000, limit_px=45000)
-        await client.place_sl(is_buy=False, sz=0.01, trigger_px=35000)
+        client.place_limit(is_buy=True, sz=0.01, price=40000)
+        client.place_tp(is_buy=False, sz=0.01, trigger_px=45000)
+        client.place_sl(is_buy=False, sz=0.01, trigger_px=35000)
     """
 
     def __init__(self, symbol: str):
@@ -112,11 +111,20 @@ class HLClient:
             self._exchange       = Exchange(wallet=wallet, base_url=_BASE_URL)
             logger.info("[%s] HLClient (SDK) • modo directo | addr=%s", symbol, addr[:10] + "...")
 
-        self._info = Info(base_url=_BASE_URL, skip_ws=True)
+        # FIX: Info se inicializa lazy para evitar 15 llamadas HTTP síncronas
+        # al arrancar todos los traders (causaban 429 en masa).
+        self._info: Optional[Info] = None
 
-    # ──────────────────────────────────────────────────────────────────────────
+    @property
+    def info(self) -> Info:
+        """Lazy-init: sólo crea la conexión Info cuando se necesita."""
+        if self._info is None:
+            self._info = Info(base_url=_BASE_URL, skip_ws=True)
+        return self._info
+
+    # ─────────────────────────────────────────────────────────────────────────
     # ÓRDENES BÁSICAS
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
 
     def place_limit(
         self,
@@ -148,8 +156,6 @@ class HLClient:
 
         Args:
             ref_px: Precio de referencia actual (mid o last).
-                    compra  → ref_px * (1 + _MARKET_SLIPPAGE)
-                    venta   → ref_px * (1 - _MARKET_SLIPPAGE)
         """
         slippage_px = round(
             ref_px * (1 + _MARKET_SLIPPAGE) if is_buy else ref_px * (1 - _MARKET_SLIPPAGE),
@@ -164,9 +170,9 @@ class HLClient:
             reduce_only=reduce_only,
         )
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # TRIGGER ORDERS — TP / SL REALES EN EL EXCHANGE
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
 
     def place_tp(
         self,
@@ -177,13 +183,6 @@ class HLClient:
     ) -> dict:
         """
         Coloca un Take Profit real en el exchange como trigger order.
-
-        Args:
-            is_buy:     False para cerrar long (vender), True para cerrar short (comprar).
-            sz:         Cantidad a cerrar.
-            trigger_px: Precio que activa la orden.
-            limit_px:   Si se especifica → orden límite al activarse.
-                        Si es None → orden de mercado (limit_px con slippage automático).
         """
         is_market = limit_px is None
         if is_market:
@@ -214,11 +213,6 @@ class HLClient:
     ) -> dict:
         """
         Coloca un Stop Loss real en el exchange como trigger order de mercado.
-
-        Slippage:
-            El limit_px es el precio PEOR CASO aceptable para el fill.
-            Cerrando long (is_buy=False, vendemos): limit_px = trigger * (1 - slippage)  [suelo]
-            Cerrando short (is_buy=True, compramos): limit_px = trigger * (1 + slippage)  [techo]
         """
         slippage_px = round(
             trigger_px * (1 - _MARKET_SLIPPAGE) if not is_buy else trigger_px * (1 + _MARKET_SLIPPAGE),
@@ -246,17 +240,17 @@ class HLClient:
         """Envía múltiples órdenes en una sola llamada a la API."""
         return self._exchange.bulk_orders(orders)
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # CONSULTAS INFO
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
 
     def get_user_state(self) -> dict:
         """Estado de la cuenta (balance, posiciones, margin)."""
-        return self._info.user_state(self._account_addr)
+        return self.info.user_state(self._account_addr)
 
     def get_open_orders(self) -> list:
         """Lista de órdenes abiertas (incluye trigger orders activos)."""
-        return self._info.open_orders(self._account_addr)
+        return self.info.open_orders(self._account_addr)
 
     def get_positions(self) -> list:
         """Posiciones abiertas filtradas por coin."""
@@ -279,12 +273,6 @@ class HLClient:
     def cancel_all_open_tpsl(self) -> list[dict]:
         """
         Cancela todos los trigger orders (TP/SL) abiertos para este coin.
-        Útil antes de colocar nuevos TP/SL o al cerrar posición manualmente.
-
-        Detección robusta: compara orderType en lowercase contra keywords conocidos
-        que HL devuelve ('stop market', 'stop limit', 'take profit', 'trigger').
-        Esto evita que diferencias de capitalización entre versiones del SDK
-        rompan la detección.
         """
         orders  = self.get_open_orders()
         results = []
