@@ -2,18 +2,16 @@
 execution_engine.py — Motor de ejecución con TP/SL reales en Hyperliquid.
 
 Cambios respecto a la versión anterior:
-  - Usa HLClient (SDK oficial) en lugar de _place_order_raw.
-  - Al abrir posición: coloca entrada + trigger TP + trigger SL individualmente.
+  - Usa HLClient (SDK oficial) en lugar de signing manual.
+  - Al abrir posición: coloca entrada + trigger TP + trigger SL en bulk.
   - Al cerrar: cancela los trigger orders abiertos antes de la orden de cierre.
   - Si el bot se reinicia, el TP/SL sigue activo en el exchange.
-  - ThreadPoolExecutor con max_workers=4 para no saturar el event loop
-    cuando hay muchos símbolos en paralelo.
 
 Flujo de apertura:
   1. Calcular arrival_price (mid del orderbook o last)
   2. Intentar limit agresiva si spread <= umbral y depth suficiente
-  3. Si llena: colocar TP trigger + SL trigger
-  4. Si no llena en timeout: cancelar → fallback market + TP/SL
+  3. Si llena: colocar TP trigger + SL trigger en bulk
+  4. Si no llena en timeout: cancelar → fallback market + TP/SL bulk
   5. Registrar telemetría
 
 Variables de entorno (todas opcionales):
@@ -22,7 +20,6 @@ Variables de entorno (todas opcionales):
   EE_LIMIT_OFFSET_BPS         default 3
   EE_MAX_SLIPPAGE_ALERT_BPS   default 30
   EE_TP_AS_LIMIT              default true  (False = TP como market)
-  EE_EXECUTOR_WORKERS         default 4
 """
 from __future__ import annotations
 
@@ -31,7 +28,6 @@ import logging
 import os
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
@@ -43,9 +39,6 @@ from bot.core.hl_client import HLClient
 logger = logging.getLogger("ExecutionEngine")
 
 _AGENT_NOT_FOUND_SUBSTR = "does not exist"
-
-_EXECUTOR_WORKERS = int(os.getenv("EE_EXECUTOR_WORKERS", "4"))
-_executor = ThreadPoolExecutor(max_workers=_EXECUTOR_WORKERS)
 
 
 def _e(key: str, default: float) -> float:
@@ -74,7 +67,6 @@ class ExecutionEngine:
       - Usa el SDK oficial de Hyperliquid (HLClient)
       - Coloca TP y SL como trigger orders reales en el exchange
       - TP/SL sobreviven reinicios del bot
-      - ThreadPoolExecutor propio con workers limitados
     """
 
     def __init__(self) -> None:
@@ -87,17 +79,12 @@ class ExecutionEngine:
         self._hl_clients: dict[str, HLClient] = {}
 
     def _get_client(self, symbol: str) -> HLClient:
+        """Devuelve o crea el HLClient para el símbolo."""
         if symbol not in self._hl_clients:
             self._hl_clients[symbol] = HLClient(symbol)
         return self._hl_clients[symbol]
 
-    async def _run(self, fn, *args):
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(_executor, fn, *args)
-
-    # ────────────────────────────────────────────────────────────────────
-    # EXECUTE PRINCIPAL
-    # ────────────────────────────────────────────────────────────────────
+    # ── EXECUTE PRINCIPAL ─────────────────────────────────────────────────────
 
     async def execute(
         self,
@@ -112,6 +99,17 @@ class ExecutionEngine:
         sl:            Optional[float] = None,
         tp:            Optional[float] = None,
     ) -> dict:
+        """
+        Ejecuta una orden con TP/SL reales en el exchange.
+
+        Si trade_side=="open" y se proporcionan sl/tp:
+          1. Abre la posición (limit o market)
+          2. Coloca trigger TP + trigger SL en bulk
+
+        Si reduce_only=True (cierre manual):
+          1. Cancela trigger orders abiertos del coin
+          2. Ejecuta cierre
+        """
         sym    = trader.symbol
         client = self._get_client(sym)
         rec    = TradeRecord(symbol=sym, side=side, qty=qty, arrival_price=arrival_price)
@@ -119,9 +117,10 @@ class ExecutionEngine:
 
         is_buy = side in ("buy", "long")
 
+        # Si es cierre manual → cancelar TP/SL previos del exchange
         if reduce_only:
             try:
-                cancelled = await self._run(client.cancel_all_open_tpsl)
+                cancelled = client.cancel_all_open_tpsl()
                 if cancelled:
                     logger.info("[%s] 🗑️ %d trigger order(s) canceladas antes del cierre.", sym, len(cancelled))
             except Exception as e:
@@ -149,7 +148,9 @@ class ExecutionEngine:
                     self._finalize_rec(rec, result, side, arrival_price)
                     return result
                 logger.info("[%s] ⚡ Limit sin fill → fallback market", sym)
-                result = await self._run(client.place_market, is_buy, qty, arrival_price, reduce_only)
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, client.place_market, is_buy, qty, reduce_only
+                )
                 rec.order_type_used = "market"
                 rec.fill_price      = arrival_price
         else:
@@ -158,27 +159,28 @@ class ExecutionEngine:
                 if ask is not None else "sin datos de orderbook"
             )
             logger.debug("[%s] Market directo (%s)", sym, reason)
-            result = await self._run(client.place_market, is_buy, qty, arrival_price, reduce_only)
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, client.place_market, is_buy, qty, reduce_only
+            )
             rec.order_type_used = "market"
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
 
+        # ── Colocar TP/SL reales si la apertura fue exitosa ───────────────────
         if (
             result.get("status") == "ok"
             and not reduce_only
             and trade_side == "open"
             and (sl is not None or tp is not None)
         ):
-            await self._place_tpsl(client, is_buy, qty, sl, tp, sym)
+            await self._place_tpsl_bulk(client, is_buy, qty, sl, tp, sym)
 
         self._finalize_rec(rec, result, side, arrival_price)
         return result
 
-    # ────────────────────────────────────────────────────────────────────
-    # TP / SL TRIGGER ORDERS — usando place_tp / place_sl directamente
-    # ────────────────────────────────────────────────────────────────────
+    # ── TP / SL TRIGGER ORDERS ────────────────────────────────────────────────
 
-    async def _place_tpsl(
+    async def _place_tpsl_bulk(
         self,
         client: HLClient,
         is_buy: bool,
@@ -188,39 +190,64 @@ class ExecutionEngine:
         sym: str,
     ) -> None:
         """
-        Coloca TP y SL como trigger orders reales usando place_tp / place_sl.
+        Coloca TP y SL como trigger orders reales en el exchange.
         La dirección de cierre es la opuesta a la posición:
-          - Long (is_buy=True)  → cierre = vender (close_is_buy=False)
-          - Short (is_buy=False) → cierre = comprar (close_is_buy=True)
+          - Long (is_buy=True)  → cierre = vender (is_buy=False)
+          - Short (is_buy=False) → cierre = comprar (is_buy=True)
         """
-        close_is_buy = not is_buy
+        close_side = not is_buy
+        orders_to_place = []
 
         if tp is not None:
-            try:
-                limit_px = tp if self.tp_as_limit else None
-                result = await self._run(client.place_tp, close_is_buy, qty, tp, limit_px)
-                st = result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-                if "error" in st:
-                    logger.error("[%s] ❌ Trigger TP fallido: %s", sym, st["error"])
-                else:
-                    logger.info("[%s] ✅ Trigger TP colocado en exchange @ %.6f", sym, tp)
-            except Exception as e:
-                logger.error("[%s] Error colocando trigger TP: %s", sym, e)
+            orders_to_place.append({
+                "name":       client.coin,
+                "is_buy":     close_side,
+                "sz":         qty,
+                "limit_px":   tp if self.tp_as_limit else None,
+                "order_type": {
+                    "trigger": {
+                        "triggerPx": tp,
+                        "isMarket":  not self.tp_as_limit,
+                        "tpsl":      "tp",
+                    }
+                },
+                "reduce_only": True,
+            })
 
         if sl is not None:
-            try:
-                result = await self._run(client.place_sl, close_is_buy, qty, sl)
-                st = result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-                if "error" in st:
-                    logger.error("[%s] ❌ Trigger SL fallido: %s", sym, st["error"])
-                else:
-                    logger.info("[%s] ✅ Trigger SL colocado en exchange @ %.6f", sym, sl)
-            except Exception as e:
-                logger.error("[%s] Error colocando trigger SL: %s", sym, e)
+            orders_to_place.append({
+                "name":       client.coin,
+                "is_buy":     close_side,
+                "sz":         qty,
+                "limit_px":   sl,
+                "order_type": {
+                    "trigger": {
+                        "triggerPx": sl,
+                        "isMarket":  True,
+                        "tpsl":      "sl",
+                    }
+                },
+                "reduce_only": True,
+            })
 
-    # ────────────────────────────────────────────────────────────────────
-    # LIMIT INTERNO + TELEMETRÍA
-    # ────────────────────────────────────────────────────────────────────
+        if not orders_to_place:
+            return
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, client.place_bulk, orders_to_place
+            )
+            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+            for i, st in enumerate(statuses):
+                label = "TP" if i == 0 and tp else "SL"
+                if "error" in st:
+                    logger.error("[%s] ❌ Trigger %s fallido: %s", sym, label, st["error"])
+                else:
+                    logger.info("[%s] ✅ Trigger %s colocado en exchange (sobrevive reinicios)", sym, label)
+        except Exception as e:
+            logger.error("[%s] Error colocando trigger orders TP/SL: %s", sym, e)
+
+    # ── LIMIT INTERNO + TELEMETRÍA ────────────────────────────────────────────
 
     async def _try_limit_sdk(
         self,
@@ -232,7 +259,9 @@ class ExecutionEngine:
     ) -> tuple[dict, bool]:
         """Intenta orden límite con timeout y devuelve (result, filled)."""
         try:
-            result = await self._run(client.place_limit, is_buy, qty, price, False)
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, client.place_limit, is_buy, qty, price, False
+            )
         except Exception as e:
             rec.cancel_reason = str(e)
             return {"status": "error", "response": str(e)}, False
@@ -249,13 +278,6 @@ class ExecutionEngine:
         except (KeyError, IndexError, TypeError):
             order_id = None
 
-        try:
-            immediate_fill = result["response"]["data"]["statuses"][0].get("filled")
-            if immediate_fill is not None and order_id is None:
-                return result, True
-        except (KeyError, IndexError, TypeError):
-            pass
-
         deadline = time.monotonic() + self.limit_timeout_s
         filled   = False
 
@@ -263,7 +285,9 @@ class ExecutionEngine:
             await asyncio.sleep(0.5)
             if order_id:
                 try:
-                    open_orders = await self._run(client.get_open_orders)
+                    open_orders = await asyncio.get_event_loop().run_in_executor(
+                        None, client.get_open_orders
+                    )
                     still_open = any(o.get("oid") == order_id for o in open_orders)
                     if not still_open:
                         filled = True
@@ -273,7 +297,9 @@ class ExecutionEngine:
 
         if not filled and order_id:
             try:
-                await self._run(client.cancel_order, order_id)
+                await asyncio.get_event_loop().run_in_executor(
+                    None, client.cancel_order, order_id
+                )
             except Exception as e:
                 logger.warning("[%s] Error cancelando limit: %s", rec.symbol, e)
             if not rec.cancel_reason:
