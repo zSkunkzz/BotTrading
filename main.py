@@ -26,6 +26,28 @@ global_risk: GlobalRisk = None
 _trader_instances: dict = {}
 
 
+def _resolve_hl_address() -> str:
+    """
+    Resuelve la dirección del wallet principal en orden de prioridad:
+      1. HL_API_WALLET_ADDRESS  (Opción A: API key agente)
+      2. HL_ACCOUNT_ADDR        (Opción B: dirección explícita)
+      3. Derivada de HL_PRIVATE_KEY (Opción B: derivación automática)
+    """
+    addr = os.getenv("HL_API_WALLET_ADDRESS", "").strip()
+    if addr:
+        return addr
+    addr = os.getenv("HL_ACCOUNT_ADDR", "").strip()
+    if addr:
+        return addr
+    pk = os.getenv("HL_PRIVATE_KEY", "").strip()
+    if pk:
+        import eth_account
+        addr = eth_account.Account.from_key(pk).address
+        logger.info("🔑 Dirección derivada de HL_PRIVATE_KEY: %s", addr[:12] + "...")
+        return addr
+    return ""
+
+
 def make_risk():
     return RiskManager(
         usdc_per_trade=float(os.getenv("USDC_PER_TRADE", "10")),
@@ -40,13 +62,18 @@ def make_risk():
 
 
 async def _start_single_pair(symbol: str):
-    """Arranca un trader para el símbolo dado (nombre corto de coin: 'BTC', 'ETH')."""
+    """Arranca un trader para el símbolo dado."""
     if symbol in active_traders:
         return
     logger.info("🚀 Iniciando trader: %s", symbol)
+
+    # Pasar las credenciales correctas según el modo configurado
+    # trader.py detecta automáticamente HL_API_WALLET_ADDRESS + HL_API_PRIVATE_KEY (Opción A)
+    # o HL_PRIVATE_KEY (Opción B) desde las variables de entorno.
+    # api_secret solo se usa como fallback si HL_PRIVATE_KEY no está en env.
     trader = FuturesTrader(
         api_key=None,
-        api_secret=os.getenv("HL_PRIVATE_KEY"),
+        api_secret=os.getenv("HL_PRIVATE_KEY", ""),
         passphrase=None,
         symbol=symbol,
         leverage=int(os.getenv("LEVERAGE", "5")),
@@ -97,17 +124,15 @@ async def main():
     logger.info("  HyperliquidBot v1.0 — IA + Scanner + Telegram + KS")
     logger.info("=" * 60)
 
-    # ── Balance service ────────────────────────────────────────────────────
-    hl_addr = os.getenv("HL_ACCOUNT_ADDR", "")
-    if not hl_addr and os.getenv("HL_PRIVATE_KEY"):
-        import eth_account
-        hl_addr = eth_account.Account.from_key(os.getenv("HL_PRIVATE_KEY")).address
-        logger.info("🔑 Dirección derivada de HL_PRIVATE_KEY: %s", hl_addr[:12] + "...")
+    # ── Balance service ──────────────────────────────────────────────
+    hl_addr = _resolve_hl_address()
+    if not hl_addr:
+        logger.warning("⚠️ No se pudo resolver dirección HL. Configura HL_API_WALLET_ADDRESS o HL_ACCOUNT_ADDR.")
     balance_svc.init_hl(
         addr=hl_addr,
         testnet=os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes"),
     )
-    logger.info("✅ Balance service inicializado")
+    logger.info("✅ Balance service inicializado (addr=%s)", hl_addr[:12] + "..." if hl_addr else "N/A")
 
     global_risk = GlobalRisk(
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "5")),
@@ -126,7 +151,6 @@ async def main():
     logger.info("🔍 Escaneando mercado Hyperliquid inicial...")
     initial_pairs = await scanner.scan()
 
-    # Recopilar datos para el filtro IA
     scored_data = []
     for sym in initial_pairs:
         try:
@@ -141,11 +165,10 @@ async def main():
             scored_data.append({"symbol": sym, "volume_usdt": 0, "change_pct": 0, "score": 0})
 
     logger.info("🤖 Filtrando con IA...")
-    ai_ranked  = await ai_rank_pairs(scored_data)
-    top_n      = int(os.getenv("TOP_PAIRS", "15"))
+    ai_ranked   = await ai_rank_pairs(scored_data)
+    top_n       = int(os.getenv("TOP_PAIRS", "15"))
     final_pairs = [scanner.normalize(s) for s in ai_ranked[:top_n]]
 
-    # Deduplicar preservando orden
     seen = set()
     final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
 
@@ -155,7 +178,6 @@ async def main():
 
     logger.info("✅ Pares finales (%d): %s", len(final_pairs), ", ".join(final_pairs))
 
-    # ── Arrancar WS feed ──────────────────────────────────────────────────
     ws_feed.start(final_pairs)
     logger.info("🔌 WS feed arrancado para %d símbolos", len(final_pairs))
 

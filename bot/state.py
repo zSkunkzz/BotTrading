@@ -1,8 +1,6 @@
 # ============================================================
 # bot/state.py  —  Persistencia de posiciones abiertas
 # Guarda/recupera estado en /tmp/bot_state.json
-# Railway no tiene volumen persistente entre deploys,
-# pero sí dentro del mismo proceso/restart del contenedor.
 # Para persistencia cross-deploy usa la variable de entorno
 # STATE_FILE=/data/bot_state.json (Railway Volume mount)
 # ============================================================
@@ -37,7 +35,7 @@ def _save_raw(data: dict):
 def save_position(symbol: str, position: str, entry_price: float,
                   sl: float | None, tp1: float | None,
                   tp2: float | None, tp3: float | None,
-                  usdt_amount: float, leverage: int,
+                  usdc_amount: float, leverage: int,
                   api_version: str | None = None,
                   ua_pos_mode: str | None = None,
                   v2_pos_mode: str | None = None):
@@ -51,7 +49,7 @@ def save_position(symbol: str, position: str, entry_price: float,
         "tp2":         tp2,
         "tp3":         tp3,
         "tp2_hit":     False,
-        "usdt_amount": usdt_amount,
+        "usdc_amount": usdc_amount,
         "leverage":    leverage,
     }
     if api_version:
