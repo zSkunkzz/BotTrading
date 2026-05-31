@@ -199,41 +199,40 @@ class FuturesTrader:
         api_wallet = os.getenv("HL_API_WALLET_ADDRESS", "").strip()
 
         if api_pk:
+            # ── Modo agente: HL_API_PRIVATE_KEY = clave del agente ──
+            # HL_API_WALLET_ADDRESS OBLIGATORIO = master wallet que aprobó al agente
+            if not api_wallet:
+                raise ValueError(
+                    f"[{symbol}] HL_API_WALLET_ADDRESS es OBLIGATORIA en modo agente. "
+                    "Debe ser la dirección del wallet PRINCIPAL (el que tiene fondos) "
+                    "que aprobó al agente en app.hyperliquid.xyz → Settings → API. "
+                    "El bot no puede arrancar sin esta variable."
+                )
             self._private_key  = api_pk
             self._agent_mode   = True
             agent_acct         = Account.from_key(api_pk)
             self._agent_addr   = agent_acct.address
-
-            if api_wallet:
-                # ── Caso normal: ambas variables configuradas ──
-                self._master_addr  = api_wallet
-                self._account_addr = self._master_addr
-                logger.info(
-                    "[%s] Auth: API key agente → agente=%s master=%s",
-                    symbol, self._agent_addr[:10] + "...", self._master_addr[:10] + "...",
-                )
-            else:
-                # ── BUG GUARD: HL_API_WALLET_ADDRESS no configurada ──
-                # vault_address="" corrompe _action_hash → firma inválida → "user does not exist".
-                # Usamos la dirección del agente como master (puede funcionar si el agente
-                # ES el wallet principal, pero lo habitual es que falle).
-                self._master_addr  = self._agent_addr
-                self._account_addr = self._master_addr
-                logger.error(
-                    "[%s] HL_API_WALLET_ADDRESS NO CONFIGURADA. "
-                    "En modo agente esta variable es OBLIGATORIA: debe ser la dirección "
-                    "del wallet PRINCIPAL que aprobó al agente en app.hyperliquid.xyz. "
-                    "Usando dirección del agente como master (%s) — las órdenes "
-                    "FALLARÁN con 'user does not exist' si no coincide.",
-                    symbol, self._agent_addr,
-                )
+            self._master_addr  = api_wallet
+            self._account_addr = self._master_addr
+            logger.info(
+                "[%s] Auth: modo agente | master=%s | agente=%s",
+                symbol,
+                self._master_addr[:10] + "...",
+                self._agent_addr[:10] + "...",
+            )
         else:
+            # ── Modo directo: HL_PRIVATE_KEY = clave del wallet principal ──
             pk = os.getenv("HL_PRIVATE_KEY", api_secret or "").strip()
+            if not pk:
+                raise ValueError(
+                    f"[{symbol}] No hay ninguna clave configurada. "
+                    "Configura HL_API_PRIVATE_KEY (modo agente) o HL_PRIVATE_KEY (modo directo)."
+                )
             self._private_key  = pk
             self._account_addr = os.getenv("HL_ACCOUNT_ADDR", "").strip()
             self._agent_mode   = False
             self._agent_addr   = ""
-            if pk and not self._account_addr:
+            if not self._account_addr:
                 acct = Account.from_key(pk)
                 self._account_addr = acct.address
                 logger.debug(
@@ -242,7 +241,7 @@ class FuturesTrader:
                 )
             self._master_addr  = self._account_addr
             logger.info(
-                "[%s] Auth: private key directa → addr=%s",
+                "[%s] Auth: modo directo | addr=%s",
                 symbol,
                 self._account_addr[:10] + "..." if self._account_addr else "N/A",
             )
@@ -266,12 +265,34 @@ class FuturesTrader:
     # ── ccxt session management ──────────────────────────────────────────
 
     async def _get_ccxt(self):
+        """
+        Inicializa el cliente ccxt de Hyperliquid.
+
+        FIX CRÍTICO (comparado con RobotTraders reference bot):
+        - Modo directo: walletAddress + privateKey de la MISMA wallet (igual que reference bot).
+        - Modo agente:  walletAddress = master, privateKey = agent key,
+          agentAddress en params = dirección del agente.
+          ccxt hyperliquid soporta este patrón desde v4.3.x.
+        """
         if self._ccxt_exchange is None:
             import ccxt.async_support as ccxt
-            self._ccxt_exchange = ccxt.hyperliquid({
-                "walletAddress": self._master_addr,
-                "privateKey":    self._private_key,
-            })
+            if self._agent_mode:
+                # Modo agente: master firma via agente
+                self._ccxt_exchange = ccxt.hyperliquid({
+                    "walletAddress": self._master_addr,
+                    "privateKey":    self._private_key,
+                    "enableRateLimit": True,
+                    "options": {
+                        "agentAddress": self._agent_addr,
+                    },
+                })
+            else:
+                # Modo directo: igual que el reference bot de RobotTraders
+                self._ccxt_exchange = ccxt.hyperliquid({
+                    "walletAddress": self._master_addr,
+                    "privateKey":    self._private_key,
+                    "enableRateLimit": True,
+                })
         return self._ccxt_exchange
 
     async def _close_ccxt(self):
@@ -376,8 +397,7 @@ class FuturesTrader:
                 logger.error(
                     "[%s] HL rechazó la orden con 'does not exist'. "
                     "Causas más comunes:\n"
-                    "  1. HL_API_WALLET_ADDRESS no configurada o incorrecta.\n"
-                    "     Debe ser la master wallet que aprobó al agente.\n"
+                    "  1. HL_API_WALLET_ADDRESS incorrecta — debe ser la master wallet.\n"
                     "  2. El agente no está aprobado en app.hyperliquid.xyz → Settings → API.\n"
                     "  DIAGNÓSTICO: master_addr=%s | agent_addr=%s | vault_en_payload=%s",
                     self.symbol,
@@ -410,8 +430,14 @@ class FuturesTrader:
             balance_svc.init_hl(self._master_addr, self._info_post)
 
         await self._set_leverage(self.leverage)
-        logger.info("[%s] Trader Hyperliquid iniciado | coin=%s | addr=%s | agent_mode=%s",
-                    self.symbol, self.coin, self._account_addr[:10] + "...", self._agent_mode)
+        logger.info(
+            "[%s] Trader Hyperliquid iniciado | coin=%s | master=%s | agent_mode=%s | agente=%s",
+            self.symbol,
+            self.coin,
+            self._master_addr[:10] + "..." if self._master_addr else "N/A",
+            self._agent_mode,
+            self._agent_addr[:10] + "..." if self._agent_addr else "N/A",
+        )
 
     async def cleanup(self):
         await self._close_ccxt()
