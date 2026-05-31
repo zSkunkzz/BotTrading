@@ -149,7 +149,8 @@ class ExecutionEngine:
                     self._finalize_rec(rec, result, side, arrival_price)
                     return result
                 logger.info("[%s] ⚡ Limit sin fill → fallback market", sym)
-                result = await self._run(client.place_market, is_buy, qty, reduce_only)
+                # FIX: pasar arrival_price como ref_px (3er argumento requerido)
+                result = await self._run(client.place_market, is_buy, qty, arrival_price, reduce_only)
                 rec.order_type_used = "market"
                 rec.fill_price      = arrival_price
         else:
@@ -158,13 +159,12 @@ class ExecutionEngine:
                 if ask is not None else "sin datos de orderbook"
             )
             logger.debug("[%s] Market directo (%s)", sym, reason)
-            result = await self._run(client.place_market, is_buy, qty, reduce_only)
+            # FIX: pasar arrival_price como ref_px (3er argumento requerido)
+            result = await self._run(client.place_market, is_buy, qty, arrival_price, reduce_only)
             rec.order_type_used = "market"
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
 
-        # FIX #5: solo colocar TP/SL si es apertura real (no reduce_only)
-        # y si el result fue ok — evita colocar triggers tras fallback de cierre
         if (
             result.get("status") == "ok"
             and not reduce_only
@@ -203,7 +203,9 @@ class ExecutionEngine:
                 "name":       client.coin,
                 "is_buy":     close_side,
                 "sz":         qty,
-                "limit_px":   tp if self.tp_as_limit else None,
+                "limit_px":   tp if self.tp_as_limit else round(
+                    tp * (0.999 if close_side else 1.001), 6
+                ),
                 "order_type": {
                     "trigger": {
                         "triggerPx": tp,
@@ -216,11 +218,15 @@ class ExecutionEngine:
             orders_to_place.append(tp_order)
 
         if sl is not None:
+            # FIX: añadir limit_px con slippage para SL market (requerido por HL)
+            slippage_px = round(
+                sl * (0.998 if close_side else 1.002), 6
+            )
             sl_order = {
                 "name":       client.coin,
                 "is_buy":     close_side,
                 "sz":         qty,
-                "limit_px":   sl,
+                "limit_px":   slippage_px,
                 "order_type": {
                     "trigger": {
                         "triggerPx": sl,
@@ -278,13 +284,9 @@ class ExecutionEngine:
         except (KeyError, IndexError, TypeError):
             order_id = None
 
-        # FIX #6: verificar fill inmediato ANTES del primer sleep
-        # Si la orden se llenó al instante (filled={} en lugar de resting={}),
-        # la detectamos aquí sin esperar el bucle.
         try:
             immediate_fill = result["response"]["data"]["statuses"][0].get("filled")
             if immediate_fill is not None and order_id is None:
-                # La orden ya está filled — no hay oid resting
                 return result, True
         except (KeyError, IndexError, TypeError):
             pass

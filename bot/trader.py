@@ -64,8 +64,6 @@ _EXCHANGE_POST_TIMEOUT = float(os.getenv("EXCHANGE_POST_TIMEOUT", "15"))
 _SET_LEVERAGE_TIMEOUT  = float(os.getenv("SET_LEVERAGE_TIMEOUT", "20"))
 
 # Detectar si el SDK instalado requiere 'expires_after' (versiones >= 1.0)
-# La firma antigua es: sign_l1_action(wallet, action, vault, nonce, is_mainnet)
-# La firma nueva es:   sign_l1_action(wallet, action, vault, nonce, is_mainnet, expires_after)
 _SIGN_PARAMS = inspect.signature(sign_l1_action).parameters
 _SDK_NEEDS_EXPIRES_AFTER = "expires_after" in _SIGN_PARAMS
 
@@ -274,16 +272,13 @@ class FuturesTrader:
         wallet = Account.from_key(self._private_key)
         is_mainnet = not _USE_TESTNET
 
-        # Compatibilidad con SDK antiguo (sin expires_after) y nuevo (con expires_after)
         if _SDK_NEEDS_EXPIRES_AFTER:
-            # SDK >= 1.0: expires_after en ms desde epoch (30 min de validez)
             expires_after = int(time.time() * 1000) + 30 * 60 * 1000
             signature = sign_l1_action(
                 wallet, action, self._vault_address, nonce,
                 is_mainnet=is_mainnet, expires_after=expires_after,
             )
         else:
-            # SDK < 1.0
             signature = sign_l1_action(
                 wallet, action, self._vault_address, nonce,
                 is_mainnet=is_mainnet,
@@ -435,8 +430,9 @@ class FuturesTrader:
             return
         coin_idx = await self._get_coin_index()
         is_cross = (self.margin_mode != "isolated")
-        action   = {"type": "updateLeverage", "asset": coin_idx,
-                    "isCross": is_cross, "leverage": leverage}
+        # FIX: coin_idx debe ser int, no str
+        action   = {"type": "updateLeverage", "asset": int(coin_idx),
+                    "isCross": is_cross, "leverage": int(leverage)}
         r = await self._exchange_post(action)
         if r.get("status") == "ok":
             logger.debug("[%s] Leverage %sx OK (cross=%s)", self.symbol, leverage, is_cross)
@@ -461,7 +457,7 @@ class FuturesTrader:
             return {"status": "ok"}
         try:
             coin_idx = await self._get_coin_index()
-            action   = {"type": "cancel", "cancels": [{"a": coin_idx, "o": int(order_id)}]}
+            action   = {"type": "cancel", "cancels": [{"a": int(coin_idx), "o": int(order_id)}]}
             return await self._exchange_post(action)
         except Exception as e:
             logger.debug("[%s] _cancel_order error: %s", self.symbol, e)
@@ -702,18 +698,16 @@ class FuturesTrader:
         if global_risk:
             await global_risk.register_open()
 
+        # FIX: alinear kwargs con la firma real de notify_open
         await notify_open(
             symbol=self.symbol,
             side=self.position,
-            entry=self.entry_price,
+            price=self.entry_price,
+            leverage=lev,
+            usdt=notional,
             sl=self.sl,
             tp1=self.tp1,
             tp2=self.tp2,
-            size_usdc=notional,
-            leverage=lev,
-            signal_block=decision.get("signal_block", ""),
-            ai_used=decision.get("ai_used", False),
-            ai_confidence=decision.get("ai_confidence", 0),
         )
 
     async def _manage_open_position(self, price: float, risk):
@@ -742,7 +736,14 @@ class FuturesTrader:
                     r = await self._place_order(close_side, partial_qty, reduce_only=True)
                     if r.get("status") == "ok":
                         logger.info("[%s] TP2 parcial ejecutado (%.1f%%)", self.symbol, TP2_PARTIAL_RATIO * 100)
-                        await notify_tp_partial(self.symbol, self.position, price, self.tp2, partial_qty)
+                        # FIX: alinear kwargs con firma real de notify_tp_partial
+                        await notify_tp_partial(
+                            symbol=self.symbol,
+                            side=self.position,
+                            price=price,
+                            tp_level=2,
+                            ratio=TP2_PARTIAL_RATIO,
+                        )
 
                         remaining_notional = self._open_notional * (1 - TP2_PARTIAL_RATIO)
                         remaining_qty = round(remaining_notional / self.entry_price, 6)
@@ -839,12 +840,13 @@ class FuturesTrader:
         self.tp2_hit = False
         clear_position(self.symbol)
 
+        # FIX: alinear kwargs con firma real de notify_close
         await notify_close(
             symbol=self.symbol,
             side=pos_copy,
+            exit_p=fill_price,
+            pnl=pnl_pct,
             entry=entry_copy,
-            exit_price=fill_price,
-            pnl_usd=pnl_usd,
             reason=close_reason,
         )
 
