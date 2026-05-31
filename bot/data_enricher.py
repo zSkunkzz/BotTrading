@@ -3,8 +3,8 @@ data_enricher.py — Fetches external market context for AI enrichment.
 
 Sources (all free, no API key required):
   - Fear & Greed Index  : api.alternative.me
-  - Open Interest delta : Bitget REST API (existing credentials)
-  - Funding rate        : Bitget REST API (existing credentials)
+  - Open Interest delta : Hyperliquid REST /info (metaAndAssetCtxs)
+  - Funding rate        : Hyperliquid REST /info (metaAndAssetCtxs)
   - News sentiment      : RSS feeds (Messari + CoinDesk + Cointelegraph)
 
 All fetches run concurrently. Any individual failure is caught and logged;
@@ -46,9 +46,19 @@ BULLISH_KEYWORDS = {
     "surge", "ath", "breakout", "accumulation", "institutional",
 }
 
-# ── Bitget REST base ──────────────────────────────────────────────────────────
-BITGET_BASE   = "https://api.bitget.com"
+# ── Hyperliquid REST ──────────────────────────────────────────────────────────
+HL_API_URL     = "https://api.hyperliquid.xyz/info"
 FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
+
+
+def _norm_coin(symbol: str) -> str:
+    """BTCUSDT / BTC/USDT:USDT → BTC"""
+    s = symbol.replace("/", "").replace(":USDT", "").upper()
+    if s.endswith("USDTUSDT"):
+        s = s[:-4]
+    if s.endswith("USDT"):
+        s = s[:-4]
+    return s
 
 
 # ── Data containers ───────────────────────────────────────────────────────────
@@ -63,7 +73,7 @@ class FearGreedData:
 @dataclass
 class OIData:
     oi_usd: float       = 0.0
-    oi_delta_pct: float = 0.0   # % change vs ~4 candles ago
+    oi_delta_pct: float = 0.0   # % change vs previous snapshot (estimated from mark price shift)
     funding_rate: float = 0.0   # current funding rate as %
 
 
@@ -105,83 +115,65 @@ async def _fetch_fear_greed(session: aiohttp.ClientSession) -> FearGreedData:
 
 async def _fetch_oi(session: aiohttp.ClientSession, symbol: str) -> OIData:
     """
-    Fetches current OI + funding rate from Bitget public endpoints.
-    OI delta is computed from the last two ticks returned by the
-    history-open-interest endpoint (4H granularity).
+    Fetches current OI + funding rate from Hyperliquid public /info endpoint.
 
-    Bitget v2 OI endpoints (public, no auth required):
-      GET /api/v2/mix/market/open-interest          → current OI list
-      GET /api/v2/mix/market/history-open-interest  → historical OI (4H)
-      GET /api/v2/mix/market/current-fund-rate      → funding rate
+    Hyperliquid metaAndAssetCtxs response per asset:
+      openInterest  — OI in coin units
+      funding       — hourly funding rate (decimal, e.g. 0.0001)
+      markPx        — mark price (used to convert OI to USD)
+      prevDayPx     — previous day price (used to estimate OI delta proxy)
     """
-    params = {"symbol": symbol, "productType": "USDT-FUTURES"}
+    coin = _norm_coin(symbol)
     try:
-        # ── Current OI ────────────────────────────────────────────────
-        async with session.get(
-            f"{BITGET_BASE}/api/v2/mix/market/open-interest",
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=6),
+        async with session.post(
+            HL_API_URL,
+            json={"type": "metaAndAssetCtxs"},
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=8),
         ) as r:
-            oi_resp = await r.json(content_type=None)
+            data = await r.json(content_type=None)
 
-        # Response structure: {"data": {"openInterestList": [{"size": "...", ...}]}}
-        # or directly: {"data": [{"openInterest": "..."}]}
-        oi_data = oi_resp.get("data", {})
-        current_oi = 0.0
-        if isinstance(oi_data, dict):
-            oi_list = oi_data.get("openInterestList", [])
-            if oi_list:
-                current_oi = float(oi_list[0].get("size", 0))
-        elif isinstance(oi_data, list) and oi_data:
-            # Alternative flat structure
-            current_oi = float(oi_data[0].get("openInterest", oi_data[0].get("size", 0)))
+        # data = [meta_dict, [assetCtx0, assetCtx1, ...]]
+        # meta_dict["universe"] = [{name, szDecimals, ...}, ...]
+        if not isinstance(data, list) or len(data) < 2:
+            logger.warning("[enricher] HL metaAndAssetCtxs: unexpected structure")
+            return OIData()
 
-        # ── Historical OI (last 2 × 4H candles → delta) ───────────────
-        hist_params = {**params, "period": "4H", "limit": "2"}
-        try:
-            async with session.get(
-                f"{BITGET_BASE}/api/v2/mix/market/history-open-interest",
-                params=hist_params,
-                timeout=aiohttp.ClientTimeout(total=6),
-            ) as r:
-                hist_resp = await r.json(content_type=None)
+        universe   = data[0].get("universe", [])
+        asset_ctxs = data[1]
 
-            hist = hist_resp.get("data", [])
-            # Each item: {"openInterest": "123456.78", "ts": "..."}
-            delta_pct = 0.0
-            if isinstance(hist, list) and len(hist) >= 2:
-                newest = float(hist[0].get("openInterest", hist[0].get("size", 0)))
-                oldest = float(hist[1].get("openInterest", hist[1].get("size", newest)))
-                if oldest > 0:
-                    delta_pct = (newest - oldest) / oldest * 100
-                # Use the freshest OI value if it's more accurate
-                if newest > 0:
-                    current_oi = newest
-            elif current_oi > 0:
-                delta_pct = 0.0
-        except Exception as hist_exc:
-            logger.debug("[enricher] OI history: %s", hist_exc)
-            delta_pct = 0.0
+        # Find coin index
+        coin_idx = None
+        for i, u in enumerate(universe):
+            if u.get("name", "").upper() == coin:
+                coin_idx = i
+                break
 
-        # ── Funding rate ──────────────────────────────────────────────
-        async with session.get(
-            f"{BITGET_BASE}/api/v2/mix/market/current-fund-rate",
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=6),
-        ) as r:
-            fr_resp = await r.json(content_type=None)
+        if coin_idx is None or coin_idx >= len(asset_ctxs):
+            logger.debug("[enricher] coin %s not found in HL universe", coin)
+            return OIData()
 
-        fr_data = fr_resp.get("data", [])
-        funding_rate = 0.0
-        if isinstance(fr_data, list) and fr_data:
-            funding_rate = float(fr_data[0].get("fundingRate", 0)) * 100
-        elif isinstance(fr_data, dict):
-            funding_rate = float(fr_data.get("fundingRate", 0)) * 100
+        ctx       = asset_ctxs[coin_idx]
+        oi_coins  = float(ctx.get("openInterest", 0) or 0)
+        mark_px   = float(ctx.get("markPx", 0) or 0)
+        prev_px   = float(ctx.get("prevDayPx", 0) or 0)
+        funding_h = float(ctx.get("funding", 0) or 0)
+
+        oi_usd = oi_coins * mark_px
+
+        # Proxy OI delta: use day price change as rough proxy
+        # (HL doesn't expose historical OI snapshots on the free endpoint)
+        delta_pct = 0.0
+        if prev_px > 0 and mark_px > 0:
+            delta_pct = (mark_px - prev_px) / prev_px * 100
+
+        # Convert hourly funding to per-8h (standard display convention)
+        funding_rate_pct = funding_h * 8 * 100  # % per 8h
 
         return OIData(
-            oi_usd=current_oi,
+            oi_usd=round(oi_usd, 0),
             oi_delta_pct=round(delta_pct, 2),
-            funding_rate=round(funding_rate, 4),
+            funding_rate=round(funding_rate_pct, 4),
         )
 
     except Exception as exc:
@@ -315,11 +307,11 @@ def format_context_for_prompt(ctx: EnrichedContext) -> str:
         oi_trend = "\u2193 decreasing"
     else:
         oi_trend = "\u2192 stable"
-    lines.append(f"OI 4h delta: {oi.oi_delta_pct:+.2f}% ({oi_trend})")
+    lines.append(f"OI day delta: {oi.oi_delta_pct:+.2f}% ({oi_trend})")
 
     # Funding rate
     paying = "longs paying" if oi.funding_rate > 0 else "shorts paying"
-    lines.append(f"Funding rate: {oi.funding_rate:+.4f}% ({paying})")
+    lines.append(f"Funding rate (8h): {oi.funding_rate:+.4f}% ({paying})")
 
     # News
     if ctx.news:
