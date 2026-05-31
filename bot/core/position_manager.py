@@ -7,6 +7,7 @@ Responsabilidades:
   - Evaluar SL / TP1 / TP3 y emitir señal de cierre
   - Persistir y limpiar estado de posición
   - Notificar cierres y TP parciales via Telegram
+  - Cancelar trigger orders huérfanos tras cierre/parcial
 
 Extraído de FuturesTrader._manage_open_position en trader.py.
 """
@@ -67,6 +68,22 @@ class PositionManager:
                 )
                 if partial_qty > 0 and not trader.dry_run:
                     close_side = "sell" if is_long else "buy"
+
+                    # Cancelar trigger orders activos ANTES del parcial para evitar
+                    # double-close: los TP/SL del exchange cubrían el 100% de la
+                    # posición; tras el parcial la qty restante es menor.
+                    try:
+                        trader._hl_client.cancel_all_open_tpsl()
+                        logger.info(
+                            "[%s] TP2 parcial: trigger orders cancelados antes del cierre parcial.",
+                            self.symbol,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] TP2 parcial: no se pudieron cancelar triggers: %s",
+                            self.symbol, e,
+                        )
+
                     r = await trader._place_order(close_side, partial_qty, reduce_only=True)
                     if r.get("status") == "ok":
                         logger.info(
@@ -76,6 +93,22 @@ class PositionManager:
                         await notify_tp_partial(
                             self.symbol, trader.position, price, trader.tp2, partial_qty
                         )
+
+                        # Re-colocar TP/SL con la qty restante para seguir protegidos
+                        remaining_notional = trader._open_notional * (1 - TP2_PARTIAL_RATIO)
+                        remaining_qty = round(remaining_notional / trader.entry_price, 6)
+                        if remaining_qty > 0 and (trader.tp3 or trader.sl):
+                            try:
+                                await trader._place_tpsl(remaining_qty, trader.sl, trader.tp3)
+                                logger.info(
+                                    "[%s] TP/SL re-colocados para qty restante=%.6f",
+                                    self.symbol, remaining_qty,
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "[%s] No se pudieron re-colocar TP/SL tras parcial: %s",
+                                    self.symbol, e,
+                                )
 
         # ── Trailing stop ─────────────────────────────────────────────────────
         if risk.trailing_sl and trader.sl is not None:
@@ -127,16 +160,39 @@ class PositionManager:
             return
 
         close_side = "sell" if is_long else "buy"
-        if not trader.dry_run:
-            await trader._place_order(close_side, qty, reduce_only=True)
+        fill_price = price  # precio de referencia para notificación
 
-        pnl_usd = (pnl_pct / 100) * trader._open_notional
+        if not trader.dry_run:
+            # Cancelar trigger orders huérfanos ANTES del cierre de mercado
+            # para evitar que el exchange intente cerrar una posición ya cerrada.
+            try:
+                trader._hl_client.cancel_all_open_tpsl()
+            except Exception as e:
+                logger.warning("[%s] No se pudieron cancelar triggers antes del cierre: %s", self.symbol, e)
+
+            result = await trader._place_order(close_side, qty, reduce_only=True)
+
+            # Intentar obtener el precio real de fill para un PnL más preciso
+            if result.get("status") == "ok":
+                try:
+                    fill_price = float(
+                        result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
+                        .get("filled", {}).get("avgPx", price)
+                    )
+                except Exception:
+                    pass  # Si no se puede extraer, usar precio de referencia
+
+        pnl_pct_final = (
+            (fill_price - trader.entry_price) / trader.entry_price
+        ) * (1 if is_long else -1) * 100
+        pnl_usd = (pnl_pct_final / 100) * trader._open_notional
+
         if pnl_usd > 0:
             trader.win_count += 1
         trader.total_pnl += pnl_usd
         logger.info(
-            "[%s] 🔒 Cerrado por %s · PnL=%.2f USDC (%.2f%%)",
-            self.symbol, close_reason, pnl_usd, pnl_pct,
+            "[%s] 🔒 Cerrado por %s · fill=%.4f · PnL=%.2f USDC (%.2f%%)",
+            self.symbol, close_reason, fill_price, pnl_usd, pnl_pct_final,
         )
 
         entry_copy = trader.entry_price
@@ -147,7 +203,7 @@ class PositionManager:
             symbol=self.symbol,
             side=pos_copy,
             entry=entry_copy,
-            exit_price=price,
+            exit_price=fill_price,
             pnl_usd=pnl_usd,
             reason=close_reason,
         )

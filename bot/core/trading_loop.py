@@ -120,6 +120,18 @@ class TradingLoop:
             else:
                 if trader.position is not None:
                     logger.info("[%s] Posición cerrada externamente.", self.symbol)
+
+                    # Cancelar trigger orders huérfanos (TP/SL que quedaron activos
+                    # en el exchange tras un cierre externo)
+                    try:
+                        trader._hl_client.cancel_all_open_tpsl()
+                        logger.info("[%s] Trigger orders huérfanos cancelados.", self.symbol)
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] No se pudieron cancelar triggers huérfanos: %s",
+                            self.symbol, e,
+                        )
+
                     trader.position    = None
                     trader.entry_price = None
                     trader.sl = trader.tp1 = trader.tp2 = trader.tp3 = None

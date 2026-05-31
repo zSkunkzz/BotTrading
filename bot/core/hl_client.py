@@ -40,6 +40,11 @@ _BASE_URL = (
     else "https://api.hyperliquid.xyz"
 )
 
+# Slippage permitido para órdenes de mercado (0.5 % por defecto).
+# El SDK requiere un limit_px concreto incluso para isMarket=True;
+# usamos precio * (1 ± slippage) para garantizar fill sin rechazos.
+_MARKET_SLIPPAGE = float(os.getenv("HL_MARKET_SLIPPAGE", "0.005"))
+
 
 def _norm_coin(symbol: str) -> str:
     """Normaliza símbolo a nombre de coin HL (e.g. 'BTC/USDT:USDT' → 'BTC')."""
@@ -133,15 +138,30 @@ class HLClient:
         self,
         is_buy: bool,
         sz: float,
+        ref_px: float,
         reduce_only: bool = False,
     ) -> dict:
-        """Orden de mercado."""
+        """
+        Orden de mercado.
+
+        Args:
+            ref_px: Precio de referencia actual (mid o last).
+                    Se usa para calcular el slippage limit_px que el SDK requiere:
+                    compra  → ref_px * (1 + _MARKET_SLIPPAGE)
+                    venta   → ref_px * (1 - _MARKET_SLIPPAGE)
+                    El exchange ejecuta al mejor precio disponible; el limit_px
+                    solo actúa como techo/suelo de protección.
+        """
+        slippage_px = round(
+            ref_px * (1 + _MARKET_SLIPPAGE) if is_buy else ref_px * (1 - _MARKET_SLIPPAGE),
+            6,
+        )
         return self._exchange.order(
             name=self.coin,
             is_buy=is_buy,
             sz=sz,
-            limit_px=None,
-            order_type={"market": {}},
+            limit_px=slippage_px,
+            order_type={"limit": {"tif": "Ioc"}},  # IOC actúa como market en HL
             reduce_only=reduce_only,
         )
 
@@ -164,14 +184,21 @@ class HLClient:
             sz:         Cantidad a cerrar.
             trigger_px: Precio que activa la orden.
             limit_px:   Si se especifica → orden límite al activarse.
-                        Si es None → orden de mercado al activarse.
+                        Si es None → orden de mercado al activarse
+                        (limit_px se calcula con slippage automático).
         """
         is_market = limit_px is None
+        if is_market:
+            # TP de mercado: slippage en dirección favorable
+            limit_px = round(
+                trigger_px * (1 - _MARKET_SLIPPAGE) if is_buy else trigger_px * (1 + _MARKET_SLIPPAGE),
+                6,
+            )
         return self._exchange.order(
             name=self.coin,
             is_buy=is_buy,
             sz=sz,
-            limit_px=limit_px if not is_market else trigger_px,
+            limit_px=limit_px,
             order_type={
                 "trigger": {
                     "triggerPx": trigger_px,
@@ -196,11 +223,16 @@ class HLClient:
             sz:         Cantidad a cerrar.
             trigger_px: Precio que activa el SL (se ejecuta como mercado).
         """
+        # SL de mercado: slippage en dirección desfavorable (peor caso)
+        slippage_px = round(
+            trigger_px * (1 - _MARKET_SLIPPAGE) if is_buy else trigger_px * (1 + _MARKET_SLIPPAGE),
+            6,
+        )
         return self._exchange.order(
             name=self.coin,
             is_buy=is_buy,
             sz=sz,
-            limit_px=trigger_px,   # SDK requiere un precio aunque isMarket=True
+            limit_px=slippage_px,
             order_type={
                 "trigger": {
                     "triggerPx": trigger_px,

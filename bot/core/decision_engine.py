@@ -131,7 +131,7 @@ class DecisionEngine:
 
         # ── Ejecutar orden ────────────────────────────────────────────────────
         result = (
-            {"status": "ok"}
+            {"status": "ok", "_fill_price": entry}
             if trader.dry_run
             else await trader._place_order(side, qty, sl=sl, tp=tp1)
         )
@@ -139,9 +139,28 @@ class DecisionEngine:
         if result.get("status") != "ok":
             return
 
+        # Usar el precio real de fill para calcular notional y qty reales.
+        # Si el exchange no devuelve avgPx (orden limit no llenada aún), se
+        # mantiene el precio estimado como fallback conservador.
+        try:
+            fill_price = float(
+                result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
+                .get("filled", {}).get("avgPx") or entry
+            )
+        except Exception:
+            fill_price = entry
+
+        if fill_price and fill_price != entry:
+            # Recalcular qty con el fill real para que _open_notional sea preciso
+            qty = round(notional / fill_price, 6)
+            logger.debug(
+                "[%s] Fill real: %.4f (estimado: %.4f) — qty ajustada a %.6f",
+                self.symbol, fill_price, entry, qty,
+            )
+
         # ── Actualizar estado del trader ──────────────────────────────────────
         trader.position       = "long" if action == "BUY" else "short"
-        trader.entry_price    = entry
+        trader.entry_price    = fill_price
         trader.sl             = sl
         trader.tp1            = tp1
         trader.tp2            = tp2
