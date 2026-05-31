@@ -45,6 +45,16 @@ _BASE_URL = (
 # Para sell: bajamos el precio un 3% (aceptamos recibir hasta un 3% menos).
 _MARKET_SLIPPAGE = 0.03
 
+# Buffer aplicado al limit_px de las trigger TP para que Hyperliquid
+# acepte la orden (limit_px debe ser "peor" que trigger_px un mínimo).
+# TP long (is_buy=False, sell): limit_px = trigger_px * (1 - buffer) → más bajo
+# TP short (is_buy=True, buy):  limit_px = trigger_px * (1 + buffer) → más alto
+_TP_LIMIT_BUFFER = 0.001  # 0.1%
+
+# Retries para confirmar posición post-fill (propagación lenta en HL)
+POST_FILL_CONFIRM_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
+POST_FILL_CONFIRM_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
+
 
 def _norm_coin(symbol: str) -> str:
     s = symbol.replace("/", "").replace(":USDT", "").upper()
@@ -287,12 +297,40 @@ class HLClient:
         trigger_px: float,
         limit_px: Optional[float] = None,
     ) -> dict:
+        """
+        Coloca una orden Take-Profit trigger.
+
+        Hyperliquid requiere que limit_px sea "peor" que trigger_px:
+          - TP long cerrado con SELL (is_buy=False):
+              trigger_px = precio objetivo ↑
+              limit_px debe ser <= trigger_px  →  trigger_px * (1 - buffer)
+          - TP short cerrado con BUY (is_buy=True):
+              trigger_px = precio objetivo ↓
+              limit_px debe ser >= trigger_px  →  trigger_px * (1 + buffer)
+
+        Si no se pasa limit_px, se calcula automáticamente con _TP_LIMIT_BUFFER.
+        """
         is_market = limit_px is None
+        if is_market:
+            # Trigger market TP — limit_px igual a trigger (se ignora en market)
+            effective_limit_px = trigger_px
+        else:
+            effective_limit_px = limit_px
+
+        # Aplicar buffer si es limit TP (no market) para evitar "invalid price"
+        if not is_market:
+            if not is_buy:
+                # Cerrando LONG con SELL: limit_px debe ser <= trigger_px
+                effective_limit_px = round(trigger_px * (1 - _TP_LIMIT_BUFFER), 6)
+            else:
+                # Cerrando SHORT con BUY: limit_px debe ser >= trigger_px
+                effective_limit_px = round(trigger_px * (1 + _TP_LIMIT_BUFFER), 6)
+
         return self._exchange.order(
             name=self.coin,
             is_buy=is_buy,
             sz=sz,
-            limit_px=limit_px if not is_market else trigger_px,
+            limit_px=effective_limit_px,
             order_type={
                 "trigger": {
                     "triggerPx": trigger_px,
