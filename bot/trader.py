@@ -268,8 +268,10 @@ class FuturesTrader:
 
         nonce  = await _unique_nonce()
         wallet = Account.from_key(self._private_key)
+        # FIX: pasar is_mainnet como kwarg para compatibilidad con SDK >= 0.9
         signature = sign_l1_action(
-            wallet, action, self._vault_address, nonce, not _USE_TESTNET,
+            wallet, action, self._vault_address, nonce,
+            is_mainnet=not _USE_TESTNET,
         )
 
         payload: dict = {
