@@ -47,7 +47,7 @@ async def _iteration(self: FuturesTrader, risk: RiskManager, global_risk: Global
     from bot.kill_switch import kill_switch
 
     # Kill switch activo → no operar
-    if kill_switch.is_triggered():
+    if kill_switch.is_halted(self.symbol):
         logger.debug("[%s] Kill switch activo — skip.", self.symbol)
         return
 
