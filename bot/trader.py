@@ -63,10 +63,11 @@ _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
 # ── Rate limiter global para /info (compartido entre todos los traders) ──
-# Aumentado a 0.5s (~2 req/s) para evitar 429 con 14+ traders concurrentes.
+# 0.6s entre llamadas → ~1.6 req/s máx para 14+ traders concurrentes.
+# Más conservador que el anterior 0.5s para evitar 429 persistentes.
 _HL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
-_HL_MIN_INTERVAL = 0.5   # máx ~2 req/s compartido
+_HL_MIN_INTERVAL = 0.6
 
 async def _hl_throttle():
     """Espera el mínimo intervalo entre llamadas REST a Hyperliquid para evitar 429."""
@@ -80,9 +81,6 @@ async def _hl_throttle():
 
 
 # ── Nonce único global — evita colisiones entre traders concurrentes ──
-# time.time() * 1000 puede devolver el mismo ms cuando 14 traders firman
-# casi simultáneamente → mismo nonce → _action_hash idéntico → firma inválida
-# → "User or API Wallet 0x... does not exist".
 _NONCE_LOCK = asyncio.Lock()
 _NONCE_LAST = 0
 
@@ -202,10 +200,6 @@ class FuturesTrader:
         api_wallet = os.getenv("HL_API_WALLET_ADDRESS", "").strip()
 
         if api_pk:
-            # Opción A: API key de agente
-            # HL_API_WALLET_ADDRESS DEBE estar configurada con la dirección del wallet master.
-            # Si no está, se usa la del agente (funcionará solo si el agente == master,
-            # lo que no es el caso habitual).
             self._private_key  = api_pk
             self._agent_mode   = True
             agent_acct         = Account.from_key(api_pk)
@@ -222,7 +216,6 @@ class FuturesTrader:
             logger.info("[%s] Auth: API key agente → agente=%s master=%s",
                         symbol, self._agent_addr[:10] + "...", self._master_addr[:10] + "...")
         else:
-            # Opción B: private key directa del wallet principal
             pk = os.getenv("HL_PRIVATE_KEY", api_secret or "").strip()
             self._private_key  = pk
             self._account_addr = os.getenv("HL_ACCOUNT_ADDR", "").strip()
@@ -250,7 +243,29 @@ class FuturesTrader:
         self._last_pos_check_at:   float = 0.0
         self._last_tpsl_verify_at: float = 0.0
 
-        self.exchange = None
+        # ccxt session reutilizable — se cierra en cleanup()
+        self._ccxt_exchange = None
+
+    # ── ccxt session management ──────────────────────────────────────────
+
+    async def _get_ccxt(self):
+        """Devuelve la instancia ccxt, creándola si no existe."""
+        if self._ccxt_exchange is None:
+            import ccxt.async_support as ccxt
+            self._ccxt_exchange = ccxt.hyperliquid({
+                "walletAddress": self._master_addr,
+                "privateKey":    self._private_key,
+            })
+        return self._ccxt_exchange
+
+    async def _close_ccxt(self):
+        """Cierra la sesión ccxt correctamente para evitar ResourceWarning."""
+        if self._ccxt_exchange is not None:
+            try:
+                await self._ccxt_exchange.close()
+            except Exception:
+                pass
+            self._ccxt_exchange = None
 
     # ── Coin index ──────────────────────────────────────────────────────
 
@@ -278,9 +293,18 @@ class FuturesTrader:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
                 if r.status == 429:
-                    logger.warning("[%s] 429 en /info, esperando 2s...", self.symbol)
-                    await asyncio.sleep(2.0)
-                    return {}
+                    logger.warning("[%s] 429 en /info, esperando 5s...", self.symbol)
+                    await asyncio.sleep(5.0)
+                    # Retry único después del backoff
+                    await _hl_throttle()
+                    async with aiohttp.ClientSession() as s2:
+                        async with s2.post(
+                            f"{_API_URL}/info",
+                            json=payload,
+                            headers={"Content-Type": "application/json"},
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as r2:
+                            return _json.loads(await r2.text())
                 return _json.loads(await r.text())
 
     async def _exchange_post(self, action: dict) -> dict:
@@ -289,8 +313,6 @@ class FuturesTrader:
 
         Modo agente (HL_API_PRIVATE_KEY):
           vault_address = master_addr  ← siempre, igual que SDK oficial.
-          El SDK no hace ninguna comparación agente vs master: simplemente
-          pasa active_pool (= master_addr) al action_hash y al payload REST.
 
         Modo directo (HL_PRIVATE_KEY):
           vault_address = None
@@ -298,12 +320,8 @@ class FuturesTrader:
         if not self._private_key:
             raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
 
-        # Nonce único garantizado — evita colisiones entre traders concurrentes
-        # que antes generaban la misma firma → "Wallet does not exist"
         nonce      = await _unique_nonce()
         is_mainnet = not _USE_TESTNET
-
-        # SDK oficial: en agent mode, vault_address = master_addr SIEMPRE.
         vault_address = self._master_addr if self._agent_mode else None
 
         signature = _sign_l1_action(
@@ -320,7 +338,6 @@ class FuturesTrader:
             "signature": signature,
         }
 
-        # vaultAddress en el payload REST solo cuando hay agente
         if vault_address is not None:
             payload["vaultAddress"] = vault_address
 
@@ -340,11 +357,8 @@ class FuturesTrader:
     # ── Init ────────────────────────────────────────────────────────────
 
     async def _init(self, usdc_per_trade: float):
-        import ccxt.async_support as ccxt
-        self.exchange = ccxt.hyperliquid({
-            "walletAddress": self._master_addr,
-            "privateKey":    self._private_key,
-        })
+        # Crear sesión ccxt reutilizable
+        await self._get_ccxt()
 
         saved = load_position(self.symbol)
         if saved:
@@ -366,6 +380,10 @@ class FuturesTrader:
         await self._set_leverage(self.leverage)
         logger.info("[%s] Trader Hyperliquid iniciado | coin=%s | addr=%s | agent_mode=%s",
                     self.symbol, self.coin, self._account_addr[:10] + "...", self._agent_mode)
+
+    async def cleanup(self):
+        """Cierra recursos (ccxt session). Llamar desde trader.run() en finally."""
+        await self._close_ccxt()
 
     # ── Precio y OHLCV ──────────────────────────────────────────────────
 

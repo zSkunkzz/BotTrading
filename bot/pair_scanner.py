@@ -142,8 +142,10 @@ class PairScanner:
                 p["symbol"], p["volume_usdt"], p["change_pct"], p["score"],
             )
 
-        self.active_pairs = [p["symbol"] for p in top]
-        return self.active_pairs
+        # NOTA: NO actualizamos self.active_pairs aquí — eso lo hace
+        # run_scanner_loop después de calcular diff, para no destruir
+        # la referencia que usa on_pairs_updated para detectar cambios.
+        return [p["symbol"] for p in top]
 
     def normalize(self, symbol: str) -> str:
         """Compatibilidad con main.py — Hyperliquid ya devuelve nombres cortos."""
@@ -151,20 +153,27 @@ class PairScanner:
 
     async def run_scanner_loop(self, on_update_callback):
         while True:
+            await asyncio.sleep(self.refresh_interval)
             try:
                 logger.info("🔍 Re-escaneando mercado Hyperliquid...")
                 new_pairs = await self.scan()
-                added     = set(new_pairs) - set(self.active_pairs)
-                removed   = set(self.active_pairs) - set(new_pairs)
+                if not new_pairs:
+                    logger.warning("⚠️ Scanner devolvió 0 pares — manteniendo pares actuales")
+                    continue
+                added   = set(new_pairs) - set(self.active_pairs)
+                removed = set(self.active_pairs) - set(new_pairs)
+                # Actualizar active_pairs DESPUÉS de calcular el diff
+                self.active_pairs = new_pairs
                 if added:
                     logger.info("➕ Nuevos pares: %s", ", ".join(added))
                 if removed:
                     logger.info("➖ Pares eliminados: %s", ", ".join(removed))
-                self.active_pairs = new_pairs
-                await on_update_callback(new_pairs)
+                if added or removed:
+                    await on_update_callback(new_pairs)
+                else:
+                    logger.info("✅ Pares sin cambios — no se reinician traders")
             except Exception as e:
                 logger.error("PairScanner error: %s", e)
-            await asyncio.sleep(self.refresh_interval)
 
     async def close(self):
         pass
