@@ -30,7 +30,7 @@ from typing import Optional
 
 import aiohttp
 import eth_account
-from eth_account.messages import encode_structured_data
+from eth_account.messages import encode_typed_data
 
 from bot.strategy import decide
 from bot.ai_trader import ai_decide
@@ -202,7 +202,7 @@ class FuturesTrader:
                 "connectionId": bytes.fromhex(action_hash[2:]),
             },
         }
-        encoded = encode_structured_data(primitive=structured)
+        encoded = encode_typed_data(full_message=structured)
         signed  = eth_account.Account.sign_message(encoded, private_key=self._private_key)
         return {"r": hex(signed.r), "s": hex(signed.s), "v": signed.v}
 
