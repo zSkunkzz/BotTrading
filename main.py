@@ -50,7 +50,8 @@ def _resolve_hl_address() -> str:
 
 def make_risk():
     return RiskManager(
-        usdc_per_trade=float(os.getenv("USBC_PER_TRADE", "10")),
+        # USDC_PER_TRADE (era USBC_PER_TRADE — typo corregido)
+        usdc_per_trade=float(os.getenv("USDC_PER_TRADE", os.getenv("USBC_PER_TRADE", "10"))),
         tp_pct=float(os.getenv("TP_PCT", "4.0")),
         sl_pct=float(os.getenv("SL_PCT", "2.0")),
         trailing_sl=os.getenv("TRAILING_SL", "true").lower() == "true",
@@ -67,8 +68,6 @@ async def _start_single_pair(symbol: str):
         return
     logger.info("🚀 Iniciando trader: %s", symbol)
 
-    # Opción A: API key de agente (recomendada)
-    # Opción B: private key directa
     private_key = (
         os.getenv("HL_API_PRIVATE_KEY", "").strip()
         or os.getenv("HL_PRIVATE_KEY", "").strip()
@@ -145,40 +144,54 @@ async def main():
 
     webhook_runner = await start_webhook_server()
 
+    # Umbrales bajos por defecto para no quedarse sin pares en mercados tranquilos.
+    # Sobreescribir con MIN_VOLUME_USDT y MIN_CHANGE_PCT en las variables de entorno.
     scanner = PairScanner(
-        min_volume_usdt=float(os.getenv("MIN_VOLUME_USDT", "5000000")),
-        min_price_change_pct=float(os.getenv("MIN_CHANGE_PCT", "1.5")),
+        min_volume_usdt=float(os.getenv("MIN_VOLUME_USDT", "1000000")),   # 1M (antes 5M)
+        min_price_change_pct=float(os.getenv("MIN_CHANGE_PCT", "0.5")),   # 0.5% (antes 1.5%)
         top_n=int(os.getenv("TOP_PAIRS", "15")),
         refresh_interval_min=int(os.getenv("SCANNER_REFRESH_MIN", "30")),
     )
 
     logger.info("🔍 Escaneando mercado Hyperliquid inicial...")
+    # scan() devuelve los nombres y almacena internamente los datos enriquecidos
     initial_pairs = await scanner.scan()
 
+    # Construir scored_data directamente desde el resultado del scanner.
+    # El stub fetch_ticker siempre devolvía quoteVolume=0 y percentage=0,
+    # haciendo que ai_rank_pairs recibiera basura. Ahora usamos los datos
+    # reales que scanner.scan() ya calculó (volume_usdt, change_pct, score).
     scored_data = []
-    for sym in initial_pairs:
-        try:
-            ticker = await scanner.exchange.fetch_ticker(sym)
-            scored_data.append({
-                "symbol":      sym,
-                "volume_usdt": round(float(ticker.get("quoteVolume") or 0) / 1e6, 2),
-                "change_pct":  round(abs(float(ticker.get("percentage") or 0)), 2),
-                "score":       0,
-            })
-        except Exception:
-            scored_data.append({"symbol": sym, "volume_usdt": 0, "change_pct": 0, "score": 0})
+    for entry in getattr(scanner, "_last_scored", []):
+        # Si el scanner expone _last_scored úsalo; si no, construir stub con datos mínimos
+        scored_data.append(entry)
 
-    logger.info("🤖 Filtrando con IA...")
-    ai_ranked   = await ai_rank_pairs(scored_data)
-    top_n       = int(os.getenv("TOP_PAIRS", "15"))
-    final_pairs = [scanner.normalize(s) for s in ai_ranked[:top_n]]
+    if not scored_data and initial_pairs:
+        # Fallback: construir scored_data mínimo para que ai_rank_pairs reciba algo útil
+        scored_data = [
+            {"symbol": sym, "volume_usdt": 0, "change_pct": 0, "score": 0}
+            for sym in initial_pairs
+        ]
 
-    seen = set()
-    final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
+    top_n = int(os.getenv("TOP_PAIRS", "15"))
+
+    if scored_data:
+        logger.info("🤖 Filtrando con IA (%d pares)...", len(scored_data))
+        ai_ranked   = await ai_rank_pairs(scored_data)
+        final_pairs = [scanner.normalize(s) for s in ai_ranked[:top_n]]
+        seen = set()
+        final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
+    else:
+        final_pairs = []
 
     if not final_pairs:
         logger.warning("⚠️ ai_rank_pairs vacío → usando scanner directamente")
-        final_pairs = initial_pairs[:top_n]
+        final_pairs = [scanner.normalize(s) for s in initial_pairs[:top_n]]
+        seen = set()
+        final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
+
+    if not final_pairs:
+        logger.error("❌ Scanner devolvió 0 pares. Revisa MIN_VOLUME_USDT y MIN_CHANGE_PCT.")
 
     logger.info("✅ Pares finales (%d): %s", len(final_pairs), ", ".join(final_pairs))
 
