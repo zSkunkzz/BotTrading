@@ -1,30 +1,30 @@
 """
 execution_engine.py — Motor de ejecución con TP/SL reales en Hyperliquid.
 
-Cambios respecto a la versión anterior:
-  - Usa HLClient (SDK oficial) en lugar de signing manual.
-  - Al abrir posición: coloca entrada + trigger TP + trigger SL en bulk.
-  - Al cerrar: cancela los trigger orders abiertos antes de la orden de cierre.
-  - Si el bot se reinicia, el TP/SL sigue activo en el exchange.
-
 Flujo de apertura:
   1. Guardia dura: si trade_side=="open" y falta sl o tp → abortar inmediatamente.
   2. Calcular arrival_price (mid del orderbook o last)
   3. Intentar limit agresiva si spread <= umbral y depth suficiente
-  4. Si llena: colocar TP trigger + SL trigger en bulk
-  5. Si no llena en timeout: cancelar → fallback market + TP/SL bulk
-     (FIX race condition: se usa `entry_ok` propio del fallback, no el result de la limit)
+  4. Si llena: colocar SL + TP via place_sl() / place_tp() del HLClient
+  5. Si no llena en timeout: cancelar → fallback market + SL/TP
+     (FIX race condition: se usa entry_ok propio del fallback, no el result de la limit)
   6. Registrar telemetría
+
+FIX CRÍTICO (2026-06-01):
+  El método anterior _place_tpsl_bulk construía dicts con claves en snake_case
+  ("order_type", "is_buy", etc.) y los pasaba a exchange.bulk_orders() que espera
+  camelCase ("orderType"). El bulk fallaba silenciosamente → posición sin SL/TP.
+  Solución: usar client.place_sl() + client.place_tp() directamente, que son los
+  métodos que YA FUNCIONABAN en las primeras operaciones del bot.
 
 Variables de entorno (todas opcionales):
   EE_LIMIT_TIMEOUT_S          default 4
   EE_MAX_SPREAD_BPS_LIMIT     default 15
   EE_LIMIT_OFFSET_BPS         default 3
   EE_MAX_SLIPPAGE_ALERT_BPS   default 30
-  EE_TP_AS_LIMIT              default true  (False = TP como market)
-  EE_TP_LIMIT_BUFFER_BPS      default 50    (buffer sobre/bajo trigger px para limit_px del TP)
-  EE_BULK_RETRY_ATTEMPTS      default 3
-  EE_BULK_RETRY_BASE_DELAY_S  default 1.0
+  EE_TP_AS_LIMIT              default true  (False = TP como market trigger)
+  EE_TPSL_RETRY_ATTEMPTS      default 3
+  EE_TPSL_RETRY_BASE_DELAY_S  default 1.5
   EE_MARKET_429_RETRIES       default 3
   EE_MARKET_429_DELAY_S       default 2.0
 """
@@ -74,7 +74,7 @@ class ExecutionEngine:
     """
     Motor de ejecución:
       - Usa el SDK oficial de Hyperliquid (HLClient)
-      - Coloca TP y SL como trigger orders reales en el exchange
+      - Coloca TP y SL como trigger orders reales via place_sl() / place_tp()
       - TP/SL sobreviven reinicios del bot
       - NUNCA abre una posición sin SL y TP válidos
     """
@@ -85,16 +85,14 @@ class ExecutionEngine:
         self.limit_offset_bps:       float = _e("EE_LIMIT_OFFSET_BPS",        3.0)
         self.max_slippage_alert_bps: float = _e("EE_MAX_SLIPPAGE_ALERT_BPS", 30.0)
         self.tp_as_limit:            bool  = os.getenv("EE_TP_AS_LIMIT", "true").lower() == "true"
-        self.tp_limit_buffer_bps:    float = _e("EE_TP_LIMIT_BUFFER_BPS",    50.0)
-        self.bulk_retry_attempts:    int   = int(_e("EE_BULK_RETRY_ATTEMPTS", 3))
-        self.bulk_retry_base_delay:  float = _e("EE_BULK_RETRY_BASE_DELAY_S", 1.0)
+        self.tpsl_retry_attempts:    int   = int(_e("EE_TPSL_RETRY_ATTEMPTS", 3))
+        self.tpsl_retry_base_delay:  float = _e("EE_TPSL_RETRY_BASE_DELAY_S", 1.5)
         self.market_429_retries:     int   = int(_e("EE_MARKET_429_RETRIES",  3))
         self.market_429_delay:       float = _e("EE_MARKET_429_DELAY_S",      2.0)
         self._records: dict[str, list[TradeRecord]] = defaultdict(list)
         self._hl_clients: dict[str, HLClient] = {}
 
     def _get_client(self, symbol: str) -> HLClient:
-        """Devuelve o crea el HLClient para el símbolo."""
         if symbol not in self._hl_clients:
             self._hl_clients[symbol] = HLClient(symbol)
         return self._hl_clients[symbol]
@@ -176,16 +174,15 @@ class ExecutionEngine:
                 self._finalize_rec(rec, {"status": "error", "response": msg}, side, arrival_price)
                 return {"status": "error", "response": msg}
 
-        # FIX B: redondear qty a los decimales permitidos por HL para este coin
         sz_dec = client.get_sz_decimals()
         qty    = self._round_qty(qty, sz_dec)
         rec.qty = qty
 
         if qty <= 0:
-            logger.error("[%s] qty redondeada a 0 (sz_decimals=%d, qty_raw=%.8f) — abortando", sym, sz_dec, rec.qty)
+            logger.error("[%s] qty redondeada a 0 (sz_decimals=%d) — abortando", sym, sz_dec)
             return {"status": "error", "response": "qty rounded to zero"}
 
-        # Si es cierre manual → cancelar TP/SL previos del exchange
+        # Cierre manual → cancelar TP/SL previos
         if reduce_only:
             try:
                 cancelled = client.cancel_all_open_tpsl()
@@ -209,10 +206,10 @@ class ExecutionEngine:
             limit_result, filled = await self._try_limit_sdk(client, is_buy, qty, limit_price, rec)
 
             if filled:
-                result               = limit_result
-                entry_ok             = True
-                rec.order_type_used  = "limit"
-                rec.fill_price       = limit_price
+                result              = limit_result
+                entry_ok            = True
+                rec.order_type_used = "limit"
+                rec.fill_price      = limit_price
             else:
                 if _AGENT_NOT_FOUND_SUBSTR in rec.cancel_reason:
                     self._log_agent_error(sym, trader)
@@ -229,10 +226,7 @@ class ExecutionEngine:
                 if result.get("status") == "ok":
                     entry_ok = True
                 else:
-                    logger.error(
-                        "[%s] ❌ Fallback market falló: %s",
-                        sym, result.get("response", ""),
-                    )
+                    logger.error("[%s] ❌ Fallback market falló: %s", sym, result.get("response", ""))
                 rec.order_type_used = "market"
                 rec.fill_price      = arrival_price
         else:
@@ -247,27 +241,31 @@ class ExecutionEngine:
             if result.get("status") == "ok":
                 entry_ok = True
             else:
-                logger.error(
-                    "[%s] ❌ Market order falló: %s",
-                    sym, result.get("response", ""),
-                )
+                logger.error("[%s] ❌ Market order falló: %s", sym, result.get("response", ""))
             rec.order_type_used = "market"
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
 
-        if (
-            entry_ok
-            and not reduce_only
-            and trade_side == "open"
-        ):
-            await self._place_tpsl_bulk(client, is_buy, qty, sl, tp, sym)
+        # ── Colocar SL + TP tras entrada confirmada ──────────────────
+        if entry_ok and not reduce_only and trade_side == "open":
+            await self._place_tpsl(client, is_buy, qty, sl, tp, sym)
 
         self._finalize_rec(rec, result, side, arrival_price)
         return result
 
-    # ── TP / SL TRIGGER ORDERS ──────────────────────────────────────────────
+    # ── SL + TP — MÉTODO CORREGIDO ─────────────────────────────────────────
+    #
+    # BUG ANTERIOR: _place_tpsl_bulk construía dicts con "order_type" (snake_case)
+    # y los pasaba a exchange.bulk_orders() que espera "orderType" (camelCase).
+    # El SDK ignoraba las órdenes o devolvía error que se tragaba → sin SL/TP.
+    #
+    # SOLUCIÓN: usar client.place_sl() y client.place_tp() directamente.
+    # Estas funciones llaman a exchange.order() con los parámetros correctos
+    # y son exactamente lo que funcionaba en las primeras operaciones del bot.
+    # Se colocan secuencialmente SL primero, luego TP (el más crítico primero).
+    # ──────────────────────────────────────────────────────────────────────────
 
-    async def _place_tpsl_bulk(
+    async def _place_tpsl(
         self,
         client: HLClient,
         is_buy: bool,
@@ -277,116 +275,110 @@ class ExecutionEngine:
         sym: str,
     ) -> None:
         """
-        Coloca TP y SL como trigger orders reales en el exchange.
-
-        Regla de limit_px para TP (CRÍTICO — causa de 'Invalid TP/SL price'):
-          Hyperliquid exige que limit_px sea "ejecutable" desde el lado del cierre:
-
-          • LONG  (is_buy=True)  → cierre es SELL  → limit_px DEBE ser >= triggerPx
-            (vendemos y aceptamos precio igual o MEJOR, es decir más alto)
-            → limit_px = triggerPx * (1 + buffer)
-
-          • SHORT (is_buy=False) → cierre es BUY   → limit_px DEBE ser <= triggerPx
-            (compramos y aceptamos precio igual o MEJOR, es decir más bajo)
-            → limit_px = triggerPx * (1 - buffer)
-
-          La versión anterior tenía esto invertido para LONG, causando el error.
+        Coloca SL y TP en el exchange usando place_sl() y place_tp() del HLClient.
+        SL primero (más crítico), luego TP.
+        Reintenta cada uno independientemente si hay rate-limit.
+        Funciona para TODOS los símbolos.
         """
-        close_side = not is_buy  # True = BUY (cerrar short), False = SELL (cerrar long)
-        orders_to_place = []
+        close_is_buy = not is_buy  # cerrar LONG = SELL (False) | cerrar SHORT = BUY (True)
 
-        if tp is not None:
-            tp_trigger = client.round_px(float(tp))
-
-            if self.tp_as_limit:
-                buffer_multiplier = self.tp_limit_buffer_bps / 10_000
-                if is_buy:
-                    # Cerrando LONG → vendemos → limit_px por ENCIMA del trigger (aceptamos >= trigger)
-                    tp_limit_px = client.round_px(tp_trigger * (1 + buffer_multiplier))
-                else:
-                    # Cerrando SHORT → compramos → limit_px por DEBAJO del trigger (aceptamos <= trigger)
-                    tp_limit_px = client.round_px(tp_trigger * (1 - buffer_multiplier))
-            else:
-                tp_limit_px = None
-
-            orders_to_place.append({
-                "coin":       client.coin,
-                "is_buy":     close_side,
-                "sz":         qty,
-                "limit_px":   tp_limit_px,
-                "order_type": {
-                    "trigger": {
-                        "triggerPx": tp_trigger,
-                        "isMarket":  not self.tp_as_limit,
-                        "tpsl":      "tp",
-                    }
-                },
-                "reduce_only": True,
-            })
-
-        if sl is not None:
-            sl_px = client.round_px(float(sl))
-            orders_to_place.append({
-                "coin":       client.coin,
-                "is_buy":     close_side,
-                "sz":         qty,
-                "limit_px":   sl_px,
-                "order_type": {
-                    "trigger": {
-                        "triggerPx": sl_px,
-                        "isMarket":  True,
-                        "tpsl":      "sl",
-                    }
-                },
-                "reduce_only": True,
-            })
-
-        if not orders_to_place:
-            return
-
-        last_error: Exception | None = None
-        for attempt in range(self.bulk_retry_attempts):
-            if attempt > 0:
-                delay = self.bulk_retry_base_delay * (2 ** (attempt - 1))
-                logger.warning(
-                    "[%s] place_bulk intento %d/%d — esperando %.1fs (rate-limit o error transitorio)",
-                    sym, attempt + 1, self.bulk_retry_attempts, delay,
-                )
-                await asyncio.sleep(delay)
-            try:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, client.place_bulk, orders_to_place
-                )
-                statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-                all_ok = True
-                for i, st in enumerate(statuses):
-                    label = "TP" if (i == 0 and tp is not None) else "SL"
+        # ── SL ────────────────────────────────────────────────────────
+        if sl is not None and sl > 0:
+            sl_placed = False
+            for attempt in range(self.tpsl_retry_attempts):
+                if attempt > 0:
+                    delay = self.tpsl_retry_base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        "[%s] SL retry %d/%d — esperando %.1fs",
+                        sym, attempt + 1, self.tpsl_retry_attempts, delay,
+                    )
+                    await asyncio.sleep(delay)
+                try:
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: client.place_sl(
+                            is_buy=close_is_buy,
+                            sz=qty,
+                            trigger_px=float(sl),
+                        ),
+                    )
+                    # Verificar respuesta del SDK
+                    statuses = result.get("response", {}).get("data", {}).get("statuses", [{}])
+                    st = statuses[0] if statuses else {}
                     if "error" in st:
-                        err_msg = st["error"]
-                        if any(s in err_msg.lower() for s in _RATE_LIMIT_SUBSTRS):
-                            logger.warning("[%s] Trigger %s rate-limited: %s", sym, label, err_msg)
-                            all_ok = False
-                            last_error = RuntimeError(err_msg)
-                        else:
-                            logger.error("[%s] ❌ Trigger %s fallido: %s", sym, label, err_msg)
+                        err = st["error"]
+                        if any(s in err.lower() for s in _RATE_LIMIT_SUBSTRS):
+                            logger.warning("[%s] SL rate-limited: %s", sym, err)
+                            continue
+                        logger.error("[%s] ❌ SL rechazado por exchange: %s", sym, err)
+                        break
                     else:
-                        logger.info("[%s] ✅ Trigger %s colocado en exchange (sobrevive reinicios)", sym, label)
-                if all_ok:
-                    return
-            except Exception as e:
-                last_error = e
-                err_str = str(e).lower()
-                if any(s in err_str for s in _RATE_LIMIT_SUBSTRS):
-                    logger.warning("[%s] place_bulk 429/rate-limit: %s", sym, e)
-                    continue
-                logger.error("[%s] Error colocando trigger orders TP/SL: %s", sym, e)
-                return
+                        logger.info("[%s] ✅ SL=%.5f colocado en exchange", sym, sl)
+                        sl_placed = True
+                        break
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if any(s in err_str for s in _RATE_LIMIT_SUBSTRS):
+                        logger.warning("[%s] SL exception rate-limit: %s", sym, e)
+                        continue
+                    logger.error("[%s] ❌ SL exception: %s", sym, e)
+                    break
 
-        if last_error is not None:
-            logger.error(
-                "[%s] ❌ place_bulk falló tras %d intentos. Último error: %s",
-                sym, self.bulk_retry_attempts, last_error,
-            )
+            if not sl_placed:
+                logger.error(
+                    "[%s] ❌ SL NO colocado tras %d intentos — POSICIÓN SIN STOP LOSS",
+                    sym, self.tpsl_retry_attempts,
+                )
+
+        # ── TP ────────────────────────────────────────────────────────
+        if tp is not None and tp > 0:
+            tp_placed = False
+            tp_limit  = None if not self.tp_as_limit else tp  # place_tp lo gestiona internamente
+
+            for attempt in range(self.tpsl_retry_attempts):
+                if attempt > 0:
+                    delay = self.tpsl_retry_base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        "[%s] TP retry %d/%d — esperando %.1fs",
+                        sym, attempt + 1, self.tpsl_retry_attempts, delay,
+                    )
+                    await asyncio.sleep(delay)
+                try:
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: client.place_tp(
+                            is_buy=close_is_buy,
+                            sz=qty,
+                            trigger_px=float(tp),
+                            limit_px=tp_limit,
+                        ),
+                    )
+                    statuses = result.get("response", {}).get("data", {}).get("statuses", [{}])
+                    st = statuses[0] if statuses else {}
+                    if "error" in st:
+                        err = st["error"]
+                        if any(s in err.lower() for s in _RATE_LIMIT_SUBSTRS):
+                            logger.warning("[%s] TP rate-limited: %s", sym, err)
+                            continue
+                        logger.error("[%s] ❌ TP rechazado por exchange: %s", sym, err)
+                        break
+                    else:
+                        logger.info("[%s] ✅ TP=%.5f colocado en exchange", sym, tp)
+                        tp_placed = True
+                        break
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if any(s in err_str for s in _RATE_LIMIT_SUBSTRS):
+                        logger.warning("[%s] TP exception rate-limit: %s", sym, e)
+                        continue
+                    logger.error("[%s] ❌ TP exception: %s", sym, e)
+                    break
+
+            if not tp_placed:
+                logger.error(
+                    "[%s] ❌ TP NO colocado tras %d intentos",
+                    sym, self.tpsl_retry_attempts,
+                )
 
     # ── LIMIT INTERNO + TELEMETRÍA ─────────────────────────────────────────
 
@@ -398,7 +390,6 @@ class ExecutionEngine:
         price: float,
         rec: TradeRecord,
     ) -> tuple[dict, bool]:
-        """Intenta orden límite con timeout y devuelve (result, filled)."""
         try:
             result = await asyncio.get_event_loop().run_in_executor(
                 None, client.place_limit, is_buy, qty, price, False
