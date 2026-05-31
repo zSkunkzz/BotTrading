@@ -99,6 +99,21 @@ def _norm_coin(symbol: str) -> str:
     return s
 
 
+def _hl_side_to_str(raw_side: str) -> str:
+    """Convierte el side que devuelve HL ('A'=ask=short, 'B'=bid=long) a 'long'/'short'."""
+    if raw_side == "B":
+        return "long"
+    if raw_side == "A":
+        return "short"
+    # Fallback: si ya viene como string legible, lo normalizamos
+    s = raw_side.lower()
+    if s in ("long", "buy"):
+        return "long"
+    if s in ("short", "sell"):
+        return "short"
+    raise ValueError(f"Side desconocido de HL: {raw_side!r}")
+
+
 _float_to_wire = float_to_wire
 
 
@@ -130,7 +145,6 @@ class FuturesTrader:
             self._account_addr = self._master_addr
             self._vault_address = None
 
-            # HLClient para cancel_all_open_tpsl y operaciones directas
             from bot.core.hl_client import HLClient
             self._hl_client = HLClient(symbol)
 
@@ -396,11 +410,6 @@ class FuturesTrader:
             logger.debug("[%s] set_leverage respuesta: %s", self.symbol, r)
 
     # ── Órdenes ───────────────────────────────────────────────────────────────────
-    #
-    # NOTA: _place_order_raw ya NO existe.
-    # Toda ejecución de órdenes pasa por execution_engine (HLClient).
-    # TP/SL se coloca UNA SOLA VEZ dentro de execution_engine._place_tpsl_bulk.
-    # _exchange_post sigue para: updateLeverage, cancel, orderStatus.
 
     async def _get_order_status(self, order_id) -> dict:
         try:
@@ -514,16 +523,25 @@ class FuturesTrader:
             if exchange_positions:
                 ep = exchange_positions[0]
                 if self.position is None:
-                    self.position    = ep["side"]
-                    self.entry_price = ep["entryPx"]
-                    logger.info("[%s] Posición detectada en exchange: %s @ %s",
-                                self.symbol, self.position, self.entry_price)
+                    # FIX #1: HL devuelve side como 'A'/'B' y entryPx como string
+                    raw_side = ep.get("side", "")
+                    try:
+                        parsed_side = _hl_side_to_str(raw_side)
+                    except ValueError:
+                        logger.warning("[%s] Side desconocido del exchange: %r — skip sync", self.symbol, raw_side)
+                        parsed_side = None
+                    if parsed_side:
+                        self.position    = parsed_side
+                        self.entry_price = float(ep.get("entryPx") or 0)
+                        logger.info("[%s] Posición detectada en exchange: %s @ %s",
+                                    self.symbol, self.position, self.entry_price)
             else:
                 if self.position is not None:
                     logger.info("[%s] Posición cerrada externamente.", self.symbol)
-                    # Cancelar trigger orders huérfanos
+                    # FIX #2: cancel_all_open_tpsl es síncrono — ejecutar en executor
                     try:
-                        self._hl_client.cancel_all_open_tpsl()
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
                         logger.info("[%s] Trigger orders huérfanos cancelados.", self.symbol)
                     except Exception as e:
                         logger.warning("[%s] No se pudieron cancelar triggers huérfanos: %s", self.symbol, e)
@@ -605,19 +623,21 @@ class FuturesTrader:
             decision.get("reason", ""),
         )
 
-        result = {"status": "ok", "_fill_price": entry} if self.dry_run else await self._place_order(side, qty, sl=sl, tp=tp1)
-
-        if result.get("status") != "ok":
-            return
-
-        # Usar fill real si está disponible
-        try:
-            fill_price = float(
-                result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-                .get("filled", {}).get("avgPx") or entry
-            )
-        except Exception:
+        if self.dry_run:
+            result = {"status": "ok", "_fill_price": entry}
             fill_price = entry
+        else:
+            result = await self._place_order(side, qty, sl=sl, tp=tp1)
+            if result.get("status") != "ok":
+                return
+            # FIX #4: extraer fill_price solo en modo real
+            try:
+                fill_price = float(
+                    result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
+                    .get("filled", {}).get("avgPx") or entry
+                )
+            except Exception:
+                fill_price = entry
 
         if fill_price and fill_price != entry:
             qty = round(notional / fill_price, 6)
@@ -682,9 +702,10 @@ class FuturesTrader:
                 if partial_qty > 0 and not self.dry_run:
                     close_side = "sell" if is_long else "buy"
 
-                    # Cancelar triggers activos antes del parcial para evitar double-close
+                    # FIX #2: cancelar triggers en executor (es función síncrona)
                     try:
-                        self._hl_client.cancel_all_open_tpsl()
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
                     except Exception as e:
                         logger.warning("[%s] TP2: no se pudieron cancelar triggers: %s", self.symbol, e)
 
@@ -693,7 +714,6 @@ class FuturesTrader:
                         logger.info("[%s] TP2 parcial ejecutado (%.1f%%)", self.symbol, TP2_PARTIAL_RATIO * 100)
                         await notify_tp_partial(self.symbol, self.position, price, self.tp2, partial_qty)
 
-                        # Re-colocar TP/SL con qty restante
                         remaining_notional = self._open_notional * (1 - TP2_PARTIAL_RATIO)
                         remaining_qty = round(remaining_notional / self.entry_price, 6)
                         if remaining_qty > 0 and (self.tp3 or self.sl):
@@ -712,12 +732,23 @@ class FuturesTrader:
             if activated:
                 callback = risk.trailing_callback_pct / 100
                 new_sl = price * (1 - callback if is_long else 1 + callback)
-                if is_long and new_sl > self.sl:
+                sl_moved = (
+                    (is_long and new_sl > self.sl) or
+                    (not is_long and new_sl < self.sl)
+                )
+                if sl_moved:
+                    old_sl = self.sl
                     self.sl = new_sl
-                    logger.debug("[%s] Trailing SL → %.4f", self.symbol, self.sl)
-                elif not is_long and new_sl < self.sl:
-                    self.sl = new_sl
-                    logger.debug("[%s] Trailing SL → %.4f", self.symbol, self.sl)
+                    logger.debug("[%s] Trailing SL → %.4f (era %.4f)", self.symbol, self.sl, old_sl)
+                    # FIX #3: actualizar el SL en el exchange, no solo en memoria
+                    try:
+                        qty_positions = await self._get_positions()
+                        if qty_positions:
+                            live_qty = abs(float(qty_positions[0].get("szi", 0)))
+                            if live_qty > 0:
+                                await self._place_tpsl(live_qty, self.sl, None)
+                    except Exception as e:
+                        logger.warning("[%s] No se pudo actualizar trailing SL en exchange: %s", self.symbol, e)
 
         # ── Evaluar SL / TP ───────────────────────────────────────────────────
         sl_hit  = self.sl  and ((is_long and price <= self.sl)  or (not is_long and price >= self.sl))
@@ -744,18 +775,18 @@ class FuturesTrader:
             return
 
         close_side = "sell" if is_long else "buy"
-        fill_price = price  # precio de referencia para notificación
+        fill_price = price
 
         if not self.dry_run:
-            # Cancelar triggers antes del cierre para evitar double-close
+            # FIX #2: cancelar triggers en executor
             try:
-                self._hl_client.cancel_all_open_tpsl()
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
             except Exception as e:
                 logger.warning("[%s] No se pudieron cancelar triggers antes del cierre: %s", self.symbol, e)
 
             result = await self._place_order(close_side, qty, reduce_only=True)
 
-            # Extraer precio real de fill para PnL preciso
             if result.get("status") == "ok":
                 try:
                     fill_price = float(
@@ -801,9 +832,10 @@ class FuturesTrader:
             orders.append(("tp", not is_long, qty, tp))
         for order_type, side_is_buy, q, px in orders:
             try:
+                loop = asyncio.get_event_loop()
                 if order_type == "sl":
-                    self._hl_client.place_sl(is_buy=side_is_buy, sz=q, trigger_px=px)
+                    await loop.run_in_executor(None, lambda: self._hl_client.place_sl(is_buy=side_is_buy, sz=q, trigger_px=px))
                 else:
-                    self._hl_client.place_tp(is_buy=side_is_buy, sz=q, trigger_px=px)
+                    await loop.run_in_executor(None, lambda: self._hl_client.place_tp(is_buy=side_is_buy, sz=q, trigger_px=px))
             except Exception as e:
                 logger.warning("[%s] No se pudo colocar %s tras parcial: %s", self.symbol, order_type, e)
