@@ -20,6 +20,7 @@ import aiohttp
 logger = logging.getLogger("BalanceSvc")
 
 _CACHE_TTL   = 30    # segundos entre refreshes
+_MAX_RETRIES = 4     # intentos máximos en _fetch_direct (con backoff)
 
 
 class _BalanceService:
@@ -95,41 +96,87 @@ class _BalanceService:
             return None
 
     async def _fetch_direct(self) -> float | None:
-        """Fallback: llama directamente al endpoint /info sin firma."""
+        """
+        Fallback: llama directamente al endpoint /info sin firma.
+        Reintenta hasta _MAX_RETRIES veces con backoff exponencial
+        ante 429 o errores de red.
+        """
         if not self._addr:
             return None
         payload = {"type": "clearinghouseState", "user": self._addr}
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    f"{self._api_url}/info",
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=8),
-                ) as r:
-                    text = await r.text()
-                    data = _json.loads(text)
-                    val  = self._extract(data)
-                    if val is None:
-                        # Log completo del raw para poder diagnosticar desde Railway
-                        logger.warning(
-                            "[BalanceSvc] _fetch_direct addr=%s → balance no encontrado.\n"
-                            "  HTTP status : %s\n"
-                            "  Keys top-level: %s\n"
-                            "  marginSummary : %s\n"
-                            "  crossMarginSummary: %s\n"
-                            "  Raw (500c) : %s",
-                            self._addr,
-                            r.status,
-                            list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-                            data.get("marginSummary") if isinstance(data, dict) else "N/A",
-                            data.get("crossMarginSummary") if isinstance(data, dict) else "N/A",
-                            text[:500],
-                        )
-                    return val
-        except Exception as e:
-            logger.debug("[BalanceSvc] _fetch_direct error: %s", e)
-            return None
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(
+                        f"{self._api_url}/info",
+                        json=payload,
+                        headers={"Content-Type": "application/json"},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as r:
+                        # ── 429: rate limit ──────────────────────────────
+                        if r.status == 429:
+                            wait = 2.0 * (attempt + 1)  # 2s, 4s, 6s, 8s
+                            logger.warning(
+                                "[BalanceSvc] 429 rate-limit en /info (intento %d/%d) — "
+                                "esperando %.0fs antes de reintentar...",
+                                attempt + 1, _MAX_RETRIES, wait,
+                            )
+                            await asyncio.sleep(wait)
+                            continue  # no parsear — reintentar
+
+                        # ── Otros errores HTTP ───────────────────────────
+                        if r.status >= 500:
+                            logger.warning(
+                                "[BalanceSvc] HTTP %s en /info (intento %d/%d)",
+                                r.status, attempt + 1, _MAX_RETRIES,
+                            )
+                            await asyncio.sleep(1.5)
+                            continue
+
+                        text = await r.text()
+                        try:
+                            data = _json.loads(text)
+                        except Exception:
+                            logger.warning("[BalanceSvc] Respuesta no-JSON: %s", text[:200])
+                            await asyncio.sleep(1.0)
+                            continue
+
+                        val = self._extract(data)
+                        if val is None:
+                            # Log completo del raw para poder diagnosticar desde Railway
+                            logger.warning(
+                                "[BalanceSvc] _fetch_direct addr=%s → balance no encontrado.\n"
+                                "  HTTP status : %s\n"
+                                "  Keys top-level: %s\n"
+                                "  marginSummary : %s\n"
+                                "  crossMarginSummary: %s\n"
+                                "  Raw (500c) : %s",
+                                self._addr,
+                                r.status,
+                                list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                                data.get("marginSummary") if isinstance(data, dict) else "N/A",
+                                data.get("crossMarginSummary") if isinstance(data, dict) else "N/A",
+                                text[:500],
+                            )
+                            # Si la respuesta llegó bien pero no tiene balance,
+                            # no tiene sentido reintentar
+                            return None
+
+                        return val
+
+            except aiohttp.ClientError as e:
+                logger.debug("[BalanceSvc] _fetch_direct red error (intento %d): %s", attempt + 1, e)
+                await asyncio.sleep(1.0)
+            except Exception as e:
+                logger.debug("[BalanceSvc] _fetch_direct error (intento %d): %s", attempt + 1, e)
+                await asyncio.sleep(1.0)
+
+        logger.warning(
+            "[BalanceSvc] _fetch_direct falló tras %d intentos (addr=%s)",
+            _MAX_RETRIES, self._addr,
+        )
+        return None
 
     def _extract(self, data: dict) -> float | None:
         """
@@ -194,46 +241,56 @@ class _BalanceService:
         """
         Devuelve balance cacheado o refresca si ha caducado.
 
-        IMPORTANTE: si el fetch falla, NO se cachea None.
-        El caché solo guarda valores positivos confirmados.
-        Si el balance real es 0.0 (cuenta vacía), sí se cachea.
+        REGLAS DE CACHÉ:
+        - Si el fetch tiene éxito → actualiza caché y timestamp.
+        - Si el fetch falla (429, red, etc.) → conserva el último valor conocido
+          en lugar de devolver 0 o None. Esto evita que un rate-limit
+          momentáneo pause todos los traders.
+        - Si nunca hubo un fetch exitoso y falla → devuelve None.
         """
         if not self._ready:
             logger.warning("[BalanceSvc] get() llamado antes de init_hl()")
             return None
 
         async with self._lock:
-            # Solo usar caché si tenemos un valor válido y no ha caducado
+            now = time.time()
+
+            # Caché válida — devolverla directamente
             if (
                 self._cache is not None
-                and time.time() - self._ts < _CACHE_TTL
+                and now - self._ts < _CACHE_TTL
             ):
                 return self._cache
 
-            # Intentar fetch con retry (2 intentos)
-            val = None
-            for attempt in range(2):
-                val = await self._fetch_via_callback()
-                if val is None:
-                    val = await self._fetch_direct()
-                if val is not None:
-                    break
-                if attempt == 0:
-                    await asyncio.sleep(1.0)  # breve pausa antes de retry
+            # Intentar actualizar
+            val = await self._fetch_via_callback()
+            if val is None:
+                val = await self._fetch_direct()
 
             if val is not None:
+                # Fetch exitoso → actualizar caché
                 self._cache = val
-                self._ts    = time.time()
-                logger.info("[BalanceSvc] Balance actualizado: %.2f USDC (addr=%s)",
-                            val, self._addr)
-            else:
-                logger.warning(
-                    "[BalanceSvc] ⚠️ No se pudo obtener balance USDC "
-                    "(addr=%s — verifica que sea el wallet MASTER con fondos en perpetuals)",
-                    self._addr,
+                self._ts    = now
+                logger.info(
+                    "[BalanceSvc] Balance actualizado: %.2f USDC (addr=%s)",
+                    val, self._addr,
                 )
+            else:
+                # Fetch fallido → mantener caché anterior si existe
+                if self._cache is not None:
+                    logger.warning(
+                        "[BalanceSvc] ⚠️ Fetch fallido — usando balance cacheado: %.2f USDC",
+                        self._cache,
+                    )
+                    # No actualizar self._ts para que reintente pronto
+                else:
+                    logger.warning(
+                        "[BalanceSvc] ⚠️ No se pudo obtener balance USDC "
+                        "(addr=%s — verifica que sea el wallet MASTER con fondos en perpetuals)",
+                        self._addr,
+                    )
 
-            return self._cache  # puede ser None o el último valor conocido
+            return self._cache  # puede ser None si nunca tuvo éxito
 
 
 balance_svc = _BalanceService()
