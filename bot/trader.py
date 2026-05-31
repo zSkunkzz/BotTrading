@@ -13,11 +13,11 @@ Autenticación soportada:
     - HL_ACCOUNT_ADDR        : dirección pública (opcional, se deriva automáticamente)
 
 Opcionales:
-  HL_TESTNET       — "true" para usar testnet de Hyperliquid
-  LOOP_SLEEP       — segundos entre iteraciones del loop (default 10)
-  OHLCV_TF         — timeframe OHLCV (default 15m)
-  OHLCV_LIMIT      — número de velas a cargar (default 200)
-  OHLCV_MIN_BARS   — mínimo de velas requeridas (default 55)
+  HL_TESTNET        — "true" para usar testnet de Hyperliquid
+  LOOP_SLEEP        — segundos entre iteraciones del loop (default 10)
+  OHLCV_TF          — timeframe OHLCV (default 15m)
+  OHLCV_LIMIT       — número de velas a cargar (default 200)
+  OHLCV_MIN_BARS    — mínimo de velas requeridas (default 55)
   TP2_PARTIAL_RATIO — ratio de cierre parcial en TP2 (default 0.5)
 """
 from __future__ import annotations
@@ -31,7 +31,6 @@ from decimal import Decimal
 from typing import Optional
 
 import aiohttp
-import eth_account
 import msgpack
 from eth_account import Account
 from eth_account.messages import encode_typed_data
@@ -39,9 +38,8 @@ from eth_utils import keccak, to_hex
 
 from bot.strategy import decide
 from bot.ai_trader import ai_decide
-from bot.telegram_bot import notify_open, notify_close
+from bot.telegram_bot import notify_open, notify_close, notify_tp_partial
 from bot.state import save_position, load_position, clear_position, mark_tp2_hit
-from bot.telegram_bot import notify_tp_partial
 from bot.balance_service import balance_svc
 from bot.pretrade_risk import pretrade_risk
 from bot.kill_switch import kill_switch
@@ -50,10 +48,11 @@ from bot.ohlcv_cache import ohlcv_cache
 
 logger = logging.getLogger("Trader")
 
+LOOP_SLEEP        = float(os.getenv("LOOP_SLEEP", "10"))
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
-OHLCV_TF         = os.getenv("OHLCV_TF", "15m")
-OHLCV_LIMIT      = int(os.getenv("OHLCV_LIMIT", "200"))
-OHLCV_MIN_BARS   = int(os.getenv("OHLCV_MIN_BARS", "55"))
+OHLCV_TF          = os.getenv("OHLCV_TF", "15m")
+OHLCV_LIMIT       = int(os.getenv("OHLCV_LIMIT", "200"))
+OHLCV_MIN_BARS    = int(os.getenv("OHLCV_MIN_BARS", "55"))
 
 _POS_CHECK_INTERVAL_S   = int(os.getenv("POS_CHECK_INTERVAL_S", "30"))
 _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
@@ -62,13 +61,12 @@ _SL_SW_MARGIN           = float(os.getenv("SL_SW_MARGIN", "0.001"))
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
-# ── Rate limiter global para /info (compartido entre todos los traders) ──
+# ── Rate limiter global para /info ──────────────────────────────────────────
 _HL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
 _HL_MIN_INTERVAL = 0.6
 
 async def _hl_throttle():
-    """Espera el mínimo intervalo entre llamadas REST a Hyperliquid para evitar 429."""
     global _HL_LAST_CALL
     async with _HL_REST_LOCK:
         now = time.monotonic()
@@ -78,12 +76,11 @@ async def _hl_throttle():
         _HL_LAST_CALL = time.monotonic()
 
 
-# ── Nonce único global — evita colisiones entre traders concurrentes ──
+# ── Nonce único global ───────────────────────────────────────────────────────
 _NONCE_LOCK = asyncio.Lock()
 _NONCE_LAST = 0
 
 async def _unique_nonce() -> int:
-    """Devuelve un nonce en milisegundos garantizando unicidad global."""
     global _NONCE_LAST
     async with _NONCE_LOCK:
         n = int(time.time() * 1000)
@@ -93,10 +90,9 @@ async def _unique_nonce() -> int:
         return n
 
 
-# ── Helpers de signing — idénticos a hyperliquid-python-sdk/signing.py v0.23.0 ──
+# ── Helpers de signing ───────────────────────────────────────────────────────
 
 def _float_to_wire(x: float) -> str:
-    """Convierte float a string sin notación científica, como exige Hyperliquid."""
     rounded = f"{x:.8f}"
     if abs(float(rounded) - x) >= 1e-12:
         raise ValueError(f"_float_to_wire rounding error: {x}")
@@ -112,13 +108,7 @@ def _address_to_bytes(address: str) -> bytes:
 
 def _action_hash(action: dict, vault_address: Optional[str], nonce: int,
                  expires_after: Optional[int] = None) -> bytes:
-    """
-    Hash canónico de una acción L1.
-    - msgpack.packb SIN opciones adicionales (igual que SDK oficial).
-    - vault_address debe ser None o un string de dirección válido (0x...).
-      Un string vacío "" es inválido y corrompe el hash → siempre normalizar.
-    """
-    data = msgpack.packb(action)   # ← sin use_bin_type, idéntico al SDK oficial
+    data = msgpack.packb(action)
     data += nonce.to_bytes(8, "big")
     if vault_address is None:
         data += b"\x00"
@@ -163,9 +153,6 @@ def _l1_payload(phantom_agent: dict) -> dict:
 def _sign_l1_action(private_key: str, action: dict, vault_address: Optional[str],
                     nonce: int, is_mainnet: bool,
                     expires_after: Optional[int] = None) -> dict:
-    """
-    Firma una acción L1 igual que sign_l1_action() del SDK oficial.
-    """
     wallet     = Account.from_key(private_key)
     h          = _action_hash(action, vault_address, nonce, expires_after)
     agent      = _phantom_agent(h, is_mainnet)
@@ -176,7 +163,6 @@ def _sign_l1_action(private_key: str, action: dict, vault_address: Optional[str]
 
 
 def _norm_coin(symbol: str) -> str:
-    """BTCUSDT / BTC/USDT:USDT → BTC"""
     s = symbol.replace("/", "").replace(":USDT", "").upper()
     if s.endswith("USDTUSDT"):
         s = s[:-4]
@@ -199,14 +185,11 @@ class FuturesTrader:
         api_wallet = os.getenv("HL_API_WALLET_ADDRESS", "").strip()
 
         if api_pk:
-            # ── Modo agente: HL_API_PRIVATE_KEY = clave del agente ──
-            # HL_API_WALLET_ADDRESS OBLIGATORIO = master wallet que aprobó al agente
             if not api_wallet:
                 raise ValueError(
                     f"[{symbol}] HL_API_WALLET_ADDRESS es OBLIGATORIA en modo agente. "
                     "Debe ser la dirección del wallet PRINCIPAL (el que tiene fondos) "
-                    "que aprobó al agente en app.hyperliquid.xyz → Settings → API. "
-                    "El bot no puede arrancar sin esta variable."
+                    "que aprobó al agente en app.hyperliquid.xyz → Settings → API."
                 )
             self._private_key  = api_pk
             self._agent_mode   = True
@@ -216,12 +199,9 @@ class FuturesTrader:
             self._account_addr = self._master_addr
             logger.info(
                 "[%s] Auth: modo agente | master=%s | agente=%s",
-                symbol,
-                self._master_addr[:10] + "...",
-                self._agent_addr[:10] + "...",
+                symbol, self._master_addr[:10] + "...", self._agent_addr[:10] + "...",
             )
         else:
-            # ── Modo directo: HL_PRIVATE_KEY = clave del wallet principal ──
             pk = os.getenv("HL_PRIVATE_KEY", api_secret or "").strip()
             if not pk:
                 raise ValueError(
@@ -235,62 +215,44 @@ class FuturesTrader:
             if not self._account_addr:
                 acct = Account.from_key(pk)
                 self._account_addr = acct.address
-                logger.debug(
-                    "[%s] HL_ACCOUNT_ADDR no configurada — derivada automáticamente: %s",
-                    symbol, self._account_addr,
-                )
+                logger.debug("[%s] HL_ACCOUNT_ADDR derivada: %s", symbol, self._account_addr)
             self._master_addr  = self._account_addr
             logger.info(
                 "[%s] Auth: modo directo | addr=%s",
-                symbol,
-                self._account_addr[:10] + "..." if self._account_addr else "N/A",
+                symbol, self._account_addr[:10] + "..." if self._account_addr else "N/A",
             )
 
-        self.position     = None
-        self.entry_price  = None
-        self.sl           = None
+        self.position       = None
+        self.entry_price    = None
+        self.sl             = None
         self.tp1 = self.tp2 = self.tp3 = None
-        self.tp2_hit      = False
-        self.trade_count  = 0
-        self.win_count    = 0
-        self.total_pnl    = 0.0
+        self.tp2_hit        = False
+        self.trade_count    = 0
+        self.win_count      = 0
+        self.total_pnl      = 0.0
         self._open_notional = 0.0
         self._open_leverage = 1
         self._protection_ok = False
         self._last_pos_check_at:   float = 0.0
         self._last_tpsl_verify_at: float = 0.0
-
         self._ccxt_exchange = None
 
-    # ── ccxt session management ──────────────────────────────────────────
+    # ── ccxt ────────────────────────────────────────────────────────────
 
     async def _get_ccxt(self):
-        """
-        Inicializa el cliente ccxt de Hyperliquid.
-
-        FIX CRÍTICO (comparado con RobotTraders reference bot):
-        - Modo directo: walletAddress + privateKey de la MISMA wallet (igual que reference bot).
-        - Modo agente:  walletAddress = master, privateKey = agent key,
-          agentAddress en params = dirección del agente.
-          ccxt hyperliquid soporta este patrón desde v4.3.x.
-        """
         if self._ccxt_exchange is None:
             import ccxt.async_support as ccxt
             if self._agent_mode:
-                # Modo agente: master firma via agente
                 self._ccxt_exchange = ccxt.hyperliquid({
-                    "walletAddress": self._master_addr,
-                    "privateKey":    self._private_key,
+                    "walletAddress":   self._master_addr,
+                    "privateKey":      self._private_key,
                     "enableRateLimit": True,
-                    "options": {
-                        "agentAddress": self._agent_addr,
-                    },
+                    "options": {"agentAddress": self._agent_addr},
                 })
             else:
-                # Modo directo: igual que el reference bot de RobotTraders
                 self._ccxt_exchange = ccxt.hyperliquid({
-                    "walletAddress": self._master_addr,
-                    "privateKey":    self._private_key,
+                    "walletAddress":   self._master_addr,
+                    "privateKey":      self._private_key,
                     "enableRateLimit": True,
                 })
         return self._ccxt_exchange
@@ -312,19 +274,16 @@ class FuturesTrader:
             return self._coin_index_cache[self.coin]
         data = await self._info_post({"type": "meta"})
         for i, uni in enumerate(data.get("universe", [])):
-            name = uni.get("name", "")
-            self._coin_index_cache[name] = i
+            self._coin_index_cache[uni.get("name", "")] = i
         return self._coin_index_cache.get(self.coin, 0)
 
     # ── HTTP helpers ────────────────────────────────────────────────────
 
     async def _info_post(self, payload: dict) -> dict:
-        """POST a /info con throttle para evitar 429."""
         await _hl_throttle()
         async with aiohttp.ClientSession() as s:
             async with s.post(
-                f"{_API_URL}/info",
-                json=payload,
+                f"{_API_URL}/info", json=payload,
                 headers={"Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
@@ -334,8 +293,7 @@ class FuturesTrader:
                     await _hl_throttle()
                     async with aiohttp.ClientSession() as s2:
                         async with s2.post(
-                            f"{_API_URL}/info",
-                            json=payload,
+                            f"{_API_URL}/info", json=payload,
                             headers={"Content-Type": "application/json"},
                             timeout=aiohttp.ClientTimeout(total=10),
                         ) as r2:
@@ -343,45 +301,27 @@ class FuturesTrader:
                 return _json.loads(await r.text())
 
     async def _exchange_post(self, action: dict) -> dict:
-        """
-        POST autenticado a /exchange con firma EIP-712 L1.
-
-        FIX: vault_address se normaliza a None si es string vacío.
-        Un string vacío corrompe _action_hash y genera una firma inválida
-        que Hyperliquid rechaza con "user does not exist".
-        """
         if not self._private_key:
             raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
 
-        nonce      = await _unique_nonce()
-        is_mainnet = not _USE_TESTNET
-
-        # CRÍTICO: vault_address debe ser None o una dirección válida.
-        # Nunca un string vacío — eso corrompe el action_hash.
+        nonce         = await _unique_nonce()
         raw_vault     = self._master_addr if self._agent_mode else None
-        vault_address = raw_vault if raw_vault else None  # "" → None
+        vault_address = raw_vault if raw_vault else None
 
         signature = _sign_l1_action(
             private_key=self._private_key,
             action=action,
             vault_address=vault_address,
             nonce=nonce,
-            is_mainnet=is_mainnet,
+            is_mainnet=not _USE_TESTNET,
         )
-
-        payload: dict = {
-            "action":    action,
-            "nonce":     nonce,
-            "signature": signature,
-        }
-
+        payload: dict = {"action": action, "nonce": nonce, "signature": signature}
         if vault_address is not None:
             payload["vaultAddress"] = vault_address
 
         async with aiohttp.ClientSession() as s:
             async with s.post(
-                f"{_API_URL}/exchange",
-                json=payload,
+                f"{_API_URL}/exchange", json=payload,
                 headers={"Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
@@ -392,35 +332,32 @@ class FuturesTrader:
                     result = {"status": "error", "response": text}
 
         if result.get("status") != "ok":
-            resp_str = str(result.get("response", ""))
-            if "does not exist" in resp_str:
+            if "does not exist" in str(result.get("response", "")):
                 logger.error(
-                    "[%s] HL rechazó la orden con 'does not exist'. "
-                    "Causas más comunes:\n"
+                    "[%s] HL rechazó con 'does not exist'.\n"
                     "  1. HL_API_WALLET_ADDRESS incorrecta — debe ser la master wallet.\n"
-                    "  2. El agente no está aprobado en app.hyperliquid.xyz → Settings → API.\n"
-                    "  DIAGNÓSTICO: master_addr=%s | agent_addr=%s | vault_en_payload=%s",
+                    "  2. Agente no aprobado en app.hyperliquid.xyz → Settings → API.\n"
+                    "  DIAGNÓSTICO: master=%s | agente=%s | vault=%s",
                     self.symbol,
                     self._master_addr or "NO CONFIGURADA",
-                    self._agent_addr  or "N/A (modo directo)",
-                    vault_address     or "None (modo directo)",
+                    self._agent_addr  or "N/A",
+                    vault_address     or "None",
                 )
         return result
 
-    # ── Init ────────────────────────────────────────────────────────────
+    # ── Init / cleanup ───────────────────────────────────────────────────
 
     async def _init(self, usdc_per_trade: float):
         await self._get_ccxt()
-
         saved = load_position(self.symbol)
         if saved:
-            self.position    = saved["side"]
-            self.entry_price = saved["entry"]
-            self.sl          = saved.get("sl")
-            self.tp1         = saved.get("tp1")
-            self.tp2         = saved.get("tp2")
-            self.tp3         = saved.get("tp3")
-            self.tp2_hit     = saved.get("tp2_hit", False)
+            self.position       = saved["side"]
+            self.entry_price    = saved["entry"]
+            self.sl             = saved.get("sl")
+            self.tp1            = saved.get("tp1")
+            self.tp2            = saved.get("tp2")
+            self.tp3            = saved.get("tp3")
+            self.tp2_hit        = saved.get("tp2_hit", False)
             self._open_notional = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
             self._open_leverage = saved.get("leverage", self.leverage)
             self._protection_ok = True
@@ -431,9 +368,8 @@ class FuturesTrader:
 
         await self._set_leverage(self.leverage)
         logger.info(
-            "[%s] Trader Hyperliquid iniciado | coin=%s | master=%s | agent_mode=%s | agente=%s",
-            self.symbol,
-            self.coin,
+            "[%s] Trader iniciado | coin=%s | master=%s | agent_mode=%s | agente=%s",
+            self.symbol, self.coin,
             self._master_addr[:10] + "..." if self._master_addr else "N/A",
             self._agent_mode,
             self._agent_addr[:10] + "..." if self._agent_addr else "N/A",
@@ -442,7 +378,7 @@ class FuturesTrader:
     async def cleanup(self):
         await self._close_ccxt()
 
-    # ── Precio y OHLCV ──────────────────────────────────────────────────
+    # ── Precio y OHLCV ───────────────────────────────────────────────────
 
     async def get_price(self) -> float:
         try:
@@ -483,8 +419,7 @@ class FuturesTrader:
                 "type": "candleSnapshot",
                 "req":  {"coin": self.coin, "interval": timeframe, "startTime": start, "endTime": now},
             })
-            if not isinstance(data, list) or len(data) == 0:
-                logger.debug("[%s] get_ohlcv REST: respuesta inválida (%s)", self.symbol, type(data).__name__)
+            if not isinstance(data, list) or not data:
                 return []
             return [
                 [int(c["t"]), float(c["o"]), float(c["h"]),
@@ -501,26 +436,22 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage ────────────────────────────────────────────────────────
+    # ── Leverage ─────────────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int, side: str = "cross"):
         if self.dry_run:
             return
         coin_idx = await self._get_coin_index()
         is_cross = (self.margin_mode != "isolated")
-        action   = {
-            "type":     "updateLeverage",
-            "asset":    coin_idx,
-            "isCross":  is_cross,
-            "leverage": leverage,
-        }
+        action   = {"type": "updateLeverage", "asset": coin_idx,
+                    "isCross": is_cross, "leverage": leverage}
         r = await self._exchange_post(action)
         if r.get("status") == "ok":
             logger.debug("[%s] Leverage %sx OK (cross=%s)", self.symbol, leverage, is_cross)
         else:
             logger.debug("[%s] set_leverage respuesta: %s", self.symbol, r)
 
-    # ── Órdenes ─────────────────────────────────────────────────────────
+    # ── Órdenes ──────────────────────────────────────────────────────────
 
     async def _place_order_raw(
         self,
@@ -552,42 +483,27 @@ class FuturesTrader:
             order_type_obj = {"limit": {"tif": "Ioc"}}
 
         order: dict = {
-            "a": coin_idx,
-            "b": is_buy,
-            "p": limit_px,
-            "s": _float_to_wire(qty),
-            "r": reduce_only,
-            "t": order_type_obj,
+            "a": coin_idx, "b": is_buy,
+            "p": limit_px, "s": _float_to_wire(qty),
+            "r": reduce_only, "t": order_type_obj,
         }
 
-        if sl or tp:
-            tpsl_parts = []
-            if tp:
-                tpsl_parts.append({
-                    "a": coin_idx,
-                    "b": not is_buy,
-                    "p": _float_to_wire(tp),
-                    "s": _float_to_wire(qty),
-                    "r": True,
-                    "t": {"trigger": {"triggerPx": _float_to_wire(tp), "isMarket": True, "tpsl": "tp"}},
-                })
-            if sl:
-                tpsl_parts.append({
-                    "a": coin_idx,
-                    "b": not is_buy,
-                    "p": _float_to_wire(sl),
-                    "s": _float_to_wire(qty),
-                    "r": True,
-                    "t": {"trigger": {"triggerPx": _float_to_wire(sl), "isMarket": True, "tpsl": "sl"}},
-                })
-            if tpsl_parts:
-                action = {
-                    "type":     "order",
-                    "orders":   [order] + tpsl_parts,
-                    "grouping": "positionTpsl",
-                }
-            else:
-                action = {"type": "order", "orders": [order], "grouping": "na"}
+        tpsl_parts = []
+        if tp:
+            tpsl_parts.append({
+                "a": coin_idx, "b": not is_buy,
+                "p": _float_to_wire(tp), "s": _float_to_wire(qty), "r": True,
+                "t": {"trigger": {"triggerPx": _float_to_wire(tp), "isMarket": True, "tpsl": "tp"}},
+            })
+        if sl:
+            tpsl_parts.append({
+                "a": coin_idx, "b": not is_buy,
+                "p": _float_to_wire(sl), "s": _float_to_wire(qty), "r": True,
+                "t": {"trigger": {"triggerPx": _float_to_wire(sl), "isMarket": True, "tpsl": "sl"}},
+            })
+
+        if tpsl_parts:
+            action = {"type": "order", "orders": [order] + tpsl_parts, "grouping": "positionTpsl"}
         else:
             action = {"type": "order", "orders": [order], "grouping": "na"}
 
@@ -650,12 +566,11 @@ class FuturesTrader:
             await kill_switch.on_order_result(rejected=True)
         return r
 
-    # ── Posiciones ──────────────────────────────────────────────────────
+    # ── Posiciones ───────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list:
         try:
             data = await self._info_post({"type": "clearinghouseState", "user": self._account_addr})
-            # FIX: _info_post puede devolver None si hay timeout o error de red
             if not data or not isinstance(data, dict):
                 logger.warning("[%s] _get_positions: respuesta vacía o inválida", self.symbol)
                 return []
@@ -670,3 +585,265 @@ class FuturesTrader:
         except Exception as e:
             logger.error("[%s] _get_positions error: %s", self.symbol, e)
             return []
+
+    # ── Loop principal ───────────────────────────────────────────────────
+
+    async def run(self, risk, *, global_risk=None):
+        """Loop principal del trader para un símbolo."""
+        await self._init(risk.usdc_per_trade)
+        while True:
+            try:
+                await self._iteration(risk, global_risk)
+            except asyncio.CancelledError:
+                logger.info("[%s] Trader cancelado.", self.symbol)
+                raise
+            except Exception as e:
+                logger.error("[%s] Error en iteración: %s", self.symbol, e, exc_info=True)
+            await asyncio.sleep(LOOP_SLEEP)
+
+    async def _iteration(self, risk, global_risk):
+        """Una iteración del loop de trading."""
+        if kill_switch.is_halted(self.symbol):
+            logger.debug("[%s] Kill switch activo — skip.", self.symbol)
+            return
+
+        try:
+            price = await self.get_price()
+        except Exception as e:
+            logger.warning("[%s] No se pudo obtener precio: %s", self.symbol, e)
+            return
+
+        # Verificar posición en exchange cada _POS_CHECK_INTERVAL_S segundos
+        now = time.monotonic()
+        did_check_exchange = False
+        exchange_positions = []
+        if now - self._last_pos_check_at >= _POS_CHECK_INTERVAL_S:
+            exchange_positions     = await self._get_positions()
+            self._last_pos_check_at = now
+            did_check_exchange     = True
+
+        # Sincronizar solo cuando tenemos datos frescos (evita falso "cerrada externamente")
+        if did_check_exchange:
+            if exchange_positions:
+                ep = exchange_positions[0]
+                if self.position is None:
+                    self.position    = ep["side"]
+                    self.entry_price = ep["entryPx"]
+                    logger.info("[%s] Posición detectada en exchange: %s @ %s",
+                                self.symbol, self.position, self.entry_price)
+            else:
+                if self.position is not None:
+                    logger.info("[%s] Posición cerrada externamente.", self.symbol)
+                    self.position    = None
+                    self.entry_price = None
+                    self.sl = self.tp1 = self.tp2 = self.tp3 = None
+                    self.tp2_hit = False
+                    clear_position(self.symbol)
+
+        if self.position is not None:
+            await self._manage_open_position(price, risk)
+            return
+
+        if global_risk:
+            allowed, reason = await global_risk.can_open()
+            if not allowed:
+                logger.debug("[%s] GlobalRisk: %s", self.symbol, reason)
+                return
+
+        balance = await self.get_balance()
+        if balance is not None and balance < risk.usdc_per_trade:
+            logger.warning("[%s] Balance insuficiente (%.2f < %.2f USDC).",
+                           self.symbol, balance, risk.usdc_per_trade)
+            return
+
+        try:
+            if not await pretrade_risk.check(self.symbol, risk, balance or 0.0):
+                logger.debug("[%s] pretrade_risk bloqueó la entrada.", self.symbol)
+                return
+        except Exception as e:
+            logger.debug("[%s] pretrade_risk error (ignorando): %s", self.symbol, e)
+
+        try:
+            exch = await self._get_ccxt()
+            decision = await decide(
+                exch=exch,
+                symbol=self.symbol,
+                ai_decide_fn=ai_decide,
+                has_open_position=False,
+                current_pnl=None,
+            )
+        except Exception as e:
+            logger.error("[%s] decide() error: %s", self.symbol, e)
+            return
+
+        action = decision.get("action", "HOLD")
+        signal = decision.get("signal")
+        if action not in ("BUY", "SELL"):
+            return
+
+        if signal:
+            entry = signal.entry or price
+            sl    = signal.sl
+            tp1   = signal.tp1
+            tp2   = signal.tp2
+            tp3   = getattr(signal, "tp3", None)
+            lev   = signal.suggested_lev or self.leverage
+        else:
+            entry = price
+            sl = tp1 = tp2 = tp3 = None
+            lev = self.leverage
+
+        lev = min(int(lev), self.leverage)
+        if lev != self.leverage:
+            await self._set_leverage(lev)
+
+        notional = risk.usdc_per_trade * lev
+        qty      = round(notional / entry, 6)
+        if qty <= 0:
+            logger.warning("[%s] Cantidad calculada <= 0, skip.", self.symbol)
+            return
+
+        side = "buy" if action == "BUY" else "sell"
+        logger.info(
+            "[%s] 📈 Abriendo %s · qty=%s · entry=~%s · sl=%s · tp1=%s | %s",
+            self.symbol, action, qty, round(entry, 4),
+            round(sl, 4) if sl else "N/A",
+            round(tp1, 4) if tp1 else "N/A",
+            decision.get("reason", ""),
+        )
+
+        result = {"status": "ok"} if self.dry_run else await self._place_order(side, qty, sl=sl, tp=tp1)
+
+        if result.get("status") == "ok":
+            self.position       = "long" if action == "BUY" else "short"
+            self.entry_price    = entry
+            self.sl             = sl
+            self.tp1            = tp1
+            self.tp2            = tp2
+            self.tp3            = tp3
+            self.tp2_hit        = False
+            self._open_notional = notional
+            self._open_leverage = lev
+            self._protection_ok = False
+            self.trade_count   += 1
+
+            save_position(self.symbol, {
+                "side":        self.position,
+                "entry":       self.entry_price,
+                "sl":          self.sl,
+                "tp1":         self.tp1,
+                "tp2":         self.tp2,
+                "tp3":         self.tp3,
+                "tp2_hit":     self.tp2_hit,
+                "usdc_amount": notional,
+                "leverage":    lev,
+            })
+
+            if global_risk:
+                await global_risk.register_open()
+
+            await notify_open(
+                symbol=self.symbol,
+                side=self.position,
+                entry=self.entry_price,
+                sl=self.sl,
+                tp1=self.tp1,
+                tp2=self.tp2,
+                size_usdc=notional,
+                leverage=lev,
+                signal_block=decision.get("signal_block", ""),
+                ai_used=decision.get("ai_used", False),
+                ai_confidence=decision.get("ai_confidence", 0),
+            )
+
+    async def _manage_open_position(self, price: float, risk):
+        """Gestiona TP parciales, trailing stop y cierre de posición."""
+        if self.position is None or self.entry_price is None:
+            return
+
+        is_long = self.position == "long"
+        pnl_pct = ((price - self.entry_price) / self.entry_price) * (1 if is_long else -1) * 100
+
+        # TP2 parcial
+        if self.tp2 and not self.tp2_hit:
+            tp2_triggered = (is_long and price >= self.tp2) or (not is_long and price <= self.tp2)
+            if tp2_triggered:
+                self.tp2_hit = True
+                mark_tp2_hit(self.symbol)
+                partial_qty = round((self._open_notional / self.entry_price) * TP2_PARTIAL_RATIO, 6)
+                if partial_qty > 0 and not self.dry_run:
+                    close_side = "sell" if is_long else "buy"
+                    r = await self._place_order(close_side, partial_qty, reduce_only=True)
+                    if r.get("status") == "ok":
+                        logger.info("[%s] TP2 parcial ejecutado (%.1f%%)", self.symbol, TP2_PARTIAL_RATIO * 100)
+                        await notify_tp_partial(self.symbol, self.position, price, self.tp2, partial_qty)
+
+        # Trailing stop
+        if risk.trailing_sl and self.sl is not None:
+            activation_px = self.entry_price * (
+                1 + risk.trailing_activation_pct / 100 if is_long
+                else 1 - risk.trailing_activation_pct / 100
+            )
+            activated = (is_long and price >= activation_px) or (not is_long and price <= activation_px)
+            if activated:
+                callback = risk.trailing_callback_pct / 100
+                new_sl = price * (1 - callback if is_long else 1 + callback)
+                if is_long and new_sl > self.sl:
+                    self.sl = new_sl
+                    logger.debug("[%s] Trailing SL → %.4f", self.symbol, self.sl)
+                elif not is_long and new_sl < self.sl:
+                    self.sl = new_sl
+                    logger.debug("[%s] Trailing SL → %.4f", self.symbol, self.sl)
+
+        # Evaluar SL / TP
+        sl_hit  = self.sl  and ((is_long and price <= self.sl)  or (not is_long and price >= self.sl))
+        tp3_hit = self.tp3 and ((is_long and price >= self.tp3) or (not is_long and price <= self.tp3))
+        tp1_hit = self.tp1 and not self.tp2 and ((is_long and price >= self.tp1) or (not is_long and price <= self.tp1))
+
+        close_reason = "SL" if sl_hit else ("TP3" if tp3_hit else ("TP1" if tp1_hit else None))
+        if not close_reason:
+            return
+
+        # Obtener qty real del exchange (guard qty > 0)
+        positions = await self._get_positions()
+        if not positions:
+            logger.warning("[%s] Cierre por %s: posición no encontrada en exchange (ya cerrada?).",
+                           self.symbol, close_reason)
+            self.position = self.entry_price = self.sl = None
+            self.tp1 = self.tp2 = self.tp3 = None
+            self.tp2_hit = False
+            clear_position(self.symbol)
+            return
+
+        qty = abs(float(positions[0].get("szi", 0)))
+        if qty <= 0:
+            logger.error("[%s] Cierre por %s: qty=0, no se envía orden.", self.symbol, close_reason)
+            return
+
+        close_side = "sell" if is_long else "buy"
+        if not self.dry_run:
+            await self._place_order(close_side, qty, reduce_only=True)
+
+        pnl_usd = (pnl_pct / 100) * self._open_notional
+        if pnl_usd > 0:
+            self.win_count += 1
+        self.total_pnl += pnl_usd
+        logger.info("[%s] 🔒 Cerrado por %s · PnL=%.2f USDC (%.2f%%)",
+                    self.symbol, close_reason, pnl_usd, pnl_pct)
+
+        # Guardar copias ANTES de nullear (fix: entry_price ya sería None en notify_close)
+        entry_copy = self.entry_price
+        pos_copy   = self.position
+        self.position = self.entry_price = self.sl = None
+        self.tp1 = self.tp2 = self.tp3 = None
+        self.tp2_hit = False
+        clear_position(self.symbol)
+
+        await notify_close(
+            symbol=self.symbol,
+            side=pos_copy,
+            entry=entry_copy,
+            exit_price=price,
+            pnl_usd=pnl_usd,
+            reason=close_reason,
+        )
