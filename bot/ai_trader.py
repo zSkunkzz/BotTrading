@@ -16,9 +16,11 @@ GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:
 GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Caché de decisiones IA
-CACHE_TTL     = int(os.getenv("AI_CACHE_TTL",     "60"))
-CACHE_TTL_BUY = int(os.getenv("AI_CACHE_TTL_BUY", "60"))
+# TTL del caché de decisiones IA
+# Default subido a 300s (5 min) para reducir drasticamente llamadas con 14 traders.
+# Ajusta con AI_CACHE_TTL y AI_CACHE_TTL_BUY en Railway si quieres más o menos frescura.
+CACHE_TTL     = int(os.getenv("AI_CACHE_TTL",     "300"))
+CACHE_TTL_BUY = int(os.getenv("AI_CACHE_TTL_BUY", "300"))
 _ai_cache: dict = {}
 
 # Caché del EnrichedContext: {symbol: (EnrichedContext, timestamp)}
@@ -26,8 +28,6 @@ ENRICHED_CACHE_TTL = int(os.getenv("ENRICHED_CACHE_TTL", "120"))  # 2 min
 _enriched_cache: dict = {}
 
 # AI_MIN_SCORE: solo aplica en el path directo SIN context_override.
-# Cuando viene de strategy.py (context_override presente), el score
-# ya fue validado con AI_CALL_MIN_SCORE — no se aplica doble filtro.
 AI_MIN_SCORE = int(os.getenv("AI_MIN_SCORE", "7"))
 
 SYSTEM_PROMPT = """You are a professional crypto futures trader. Reply ONLY with a JSON object, no extra text.
@@ -95,7 +95,6 @@ async def _get_enriched_context(symbol: str):
             return ctx
     ctx = await fetch_enriched_context(symbol)
     _enriched_cache[symbol] = (ctx, now)
-    # Evitar crecimiento infinito
     if len(_enriched_cache) > 50:
         oldest = min(_enriched_cache, key=lambda k: _enriched_cache[k][1])
         del _enriched_cache[oldest]
@@ -305,7 +304,6 @@ def _pnl_check(position, entry_price, current_price, leverage) -> str | None:
 
 async def ai_decide(symbol, bars, position, entry_price, leverage,
                     context_override: dict | None = None):
-    # FIX: guard against empty bars list before indexing
     current_price = bars[-1][4] if bars else (entry_price or 0.0)
 
     if position:
@@ -317,7 +315,16 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
 
     price_bucket = _price_bucket(current_price)
 
-    # Fetch enriched context (cached, no-throw)
+    # --- Cooldown por símbolo -------------------------------------------
+    # Evita llamar a la IA para el mismo par más de 1 vez cada
+    # AI_SYMBOL_COOLDOWN segundos (default 300s = 5 min).
+    # Con 14 traders esto limita el gasto a máximo 14 calls/5min = ~2.8 RPM.
+    if await budget.symbol_on_cooldown(symbol):
+        logger.debug(f"[{symbol}] cooldown activo — HOLD sin IA")
+        return {"action": "HOLD", "confidence": 4,
+                "reasoning": "Cooldown activo", "key_factors": []}
+    # ---------------------------------------------------------------------
+
     enriched     = await _get_enriched_context(symbol)
     enriched_str = format_context_for_prompt(enriched)
 
@@ -325,14 +332,6 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         tech_signal     = context_override.get("signal", "NEUTRAL")
         fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
         score           = context_override.get("score", 0)
-
-        # FIX: cuando viene de strategy.py con context_override, el score ya fue
-        # validado por AI_CALL_MIN_SCORE en strategy.py. NO aplicar doble filtro aquí.
-        # El guard AI_MIN_SCORE solo aplica en el path directo (sin strategy.py).
-        # Comentado para evitar el HOLD silencioso que bloqueaba todas las entradas.
-        # if score < AI_MIN_SCORE:
-        #     logger.info(f"[{symbol}] Score {score}/10 < {AI_MIN_SCORE} → HOLD sin IA")
-        #     return {"action": "HOLD", "confidence": 4, ...}
 
         cache_key = f"{symbol}:{score}:{tech_signal}:{price_bucket}"
         now       = time.monotonic()
@@ -343,12 +342,10 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
                 logger.info(f"[{symbol}] \U0001f504 IA cached ({age}s ago): {cached_result.get('action')}")
                 return cached_result
 
-        # Inject enriched context into the payload sent to the LLM
         context = {**context_override, "external": enriched_str}
         logger.info(f"[{symbol}] IA consultada (score={score}/10) + contexto externo")
 
     else:
-        # Path directo sin strategy.py: aquí sí aplicamos AI_MIN_SCORE
         if not bars or len(bars) < 30:
             logger.warning(f"[{symbol}] ai_decide: bars insuficientes ({len(bars) if bars else 0}), HOLD")
             return {"action": "HOLD", "confidence": 3,
@@ -381,6 +378,9 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         logger.warning(f"[{symbol}] Sin IA → fallback técnico")
         result = {"action": fallback_action, "confidence": 7,
                   "reasoning": "Fallback técnico", "key_factors": []}
+
+    # Registrar en cooldown DESPUÉS de la llamada real
+    await budget.register_symbol_call(symbol)
 
     confidence = result.get("confidence", 5)
     min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "5"))
