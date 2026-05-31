@@ -23,6 +23,8 @@ Variables de entorno (todas opcionales):
   EE_TP_LIMIT_BUFFER_BPS      default 50    (buffer sobre/bajo trigger px para limit_px del TP)
   EE_BULK_RETRY_ATTEMPTS      default 3
   EE_BULK_RETRY_BASE_DELAY_S  default 1.0
+  EE_MARKET_429_RETRIES       default 3
+  EE_MARKET_429_DELAY_S       default 2.0
 """
 from __future__ import annotations
 
@@ -83,6 +85,8 @@ class ExecutionEngine:
         self.tp_limit_buffer_bps:    float = _e("EE_TP_LIMIT_BUFFER_BPS",    50.0)
         self.bulk_retry_attempts:    int   = int(_e("EE_BULK_RETRY_ATTEMPTS", 3))
         self.bulk_retry_base_delay:  float = _e("EE_BULK_RETRY_BASE_DELAY_S", 1.0)
+        self.market_429_retries:     int   = int(_e("EE_MARKET_429_RETRIES",  3))
+        self.market_429_delay:       float = _e("EE_MARKET_429_DELAY_S",      2.0)
         self._records: dict[str, list[TradeRecord]] = defaultdict(list)
         self._hl_clients: dict[str, HLClient] = {}
 
@@ -92,7 +96,7 @@ class ExecutionEngine:
             self._hl_clients[symbol] = HLClient(symbol)
         return self._hl_clients[symbol]
 
-    # ── UTILIDADES ────────────────────────────────────────────────────────────
+    # ── UTILIDADES ──────────────────────────────────────────────────────
 
     @staticmethod
     def _round_qty(qty: float, sz_decimals: int) -> float:
@@ -109,7 +113,44 @@ class ExecutionEngine:
         factor = 10 ** sz_decimals
         return float(math.floor(qty * factor) / factor)
 
-    # ── EXECUTE PRINCIPAL ─────────────────────────────────────────────────────
+    async def _place_market_with_retry(
+        self,
+        client: HLClient,
+        is_buy: bool,
+        qty: float,
+        reduce_only: bool,
+        ref_price: float,
+        sym: str,
+    ) -> dict:
+        """
+        Llama a place_market con retry ante errores 429.
+        Lanza la excepción si todos los intentos fallan.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(self.market_429_retries):
+            if attempt > 0:
+                delay = self.market_429_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    "[%s] place_market 429 (intento %d/%d) — reintentando en %.1fs",
+                    sym, attempt + 1, self.market_429_retries, delay,
+                )
+                await asyncio.sleep(delay)
+            try:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, client.place_market, is_buy, qty, reduce_only, ref_price
+                )
+                return result
+            except Exception as e:
+                last_exc = e
+                err_str = str(e).lower()
+                if any(s in err_str for s in _RATE_LIMIT_SUBSTRS):
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        return {"status": "error", "response": "unknown"}
+
+    # ── EXECUTE PRINCIPAL ───────────────────────────────────────────────
 
     async def execute(
         self,
@@ -182,12 +223,8 @@ class ExecutionEngine:
                     self._finalize_rec(rec, result, side, arrival_price)
                     return result
                 logger.info("[%s] ⚡ Limit sin fill → fallback market", sym)
-                # FIX 1+2: sobreescribir result con el market real y pasar ref_price
-                # para no hacer una llamada extra al orderbook.
-                # Antes result quedaba con status='ok' del resting order cancelado,
-                # lo que causaba que se pusieran TP/SL sin posición abierta.
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, client.place_market, is_buy, qty, reduce_only, arrival_price
+                result = await self._place_market_with_retry(
+                    client, is_buy, qty, reduce_only, arrival_price, sym
                 )
                 if result.get("status") != "ok":
                     logger.error(
@@ -202,9 +239,8 @@ class ExecutionEngine:
                 if ask is not None else "sin datos de orderbook"
             )
             logger.debug("[%s] Market directo (%s)", sym, reason)
-            # FIX 2+3: pasar arrival_price como ref_price y verificar resultado
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, client.place_market, is_buy, qty, reduce_only, arrival_price
+            result = await self._place_market_with_retry(
+                client, is_buy, qty, reduce_only, arrival_price, sym
             )
             if result.get("status") != "ok":
                 logger.error(
@@ -215,9 +251,7 @@ class ExecutionEngine:
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
 
-        # ── Colocar TP/SL reales sólo si la apertura fue confirmada ──────────
-        # FIX 1: la guarda result.get("status") == "ok" ahora es fiable porque
-        # result siempre refleja la última orden ejecutada (market o limit filled).
+        # ── Colocar TP/SL reales sólo si la apertura fue confirmada ─────────
         if (
             result.get("status") == "ok"
             and not reduce_only
@@ -229,7 +263,7 @@ class ExecutionEngine:
         self._finalize_rec(rec, result, side, arrival_price)
         return result
 
-    # ── TP / SL TRIGGER ORDERS ────────────────────────────────────────────────
+    # ── TP / SL TRIGGER ORDERS ──────────────────────────────────────────────
 
     async def _place_tpsl_bulk(
         self,
@@ -243,25 +277,24 @@ class ExecutionEngine:
         """
         Coloca TP y SL como trigger orders reales en el exchange.
         La dirección de cierre es la opuesta a la posición:
-          - Long (is_buy=True)  → cierre = vender (is_buy=False)
-          - Short (is_buy=False) → cierre = comprar (is_buy=True)
+          - Long (is_buy=True)  → cierre = vender (close_side=False)
+          - Short (is_buy=False) → cierre = comprar (close_side=True)
 
-        Regla de limit_px para TP (FIX A):
-          HL exige que limit_px sea "igual o mejor" que triggerPx desde el
-          punto de vista del ejecutor de la orden:
-
-          • TP de SHORT → close_side=True (compramos para cerrar).
-            triggerPx está POR DEBAJO del precio actual (el precio ha bajado).
-            «Mejor» para el comprador = precio más bajo.
-            limit_px = triggerPx * (1 - buffer)  → límite más bajo que trigger ✓
+        Regla de limit_px para TP (FIX A — corrección definitiva):
+          HL exige que limit_px sea igual o mejor que triggerPx
+          desde el punto de vista del ejecutor:
 
           • TP de LONG → close_side=False (vendemos para cerrar).
-            triggerPx está POR ENCIMA del precio actual (el precio ha subido).
-            «Mejor» para el vendedor = precio más alto.
-            limit_px = triggerPx * (1 + buffer)  → límite más alto que trigger ✓
+            triggerPx está POR ENCIMA del precio actual.
+            Para vender, "mejor" = precio más BAJO (aceptamos recibir menos).
+            limit_px = triggerPx * (1 - buffer)  → límite por debajo del trigger ✓
 
-          La lógica anterior era la inversa, lo que causaba
-          'Order has invalid price' en HL.
+          • TP de SHORT → close_side=True (compramos para cerrar).
+            triggerPx está POR DEBAJO del precio actual.
+            Para comprar, "mejor" = precio más ALTO (aceptamos pagar más).
+            limit_px = triggerPx * (1 + buffer)  → límite por encima del trigger ✓
+
+          La versión anterior tenía la lógica invertida → 'Order has invalid price'.
         """
         close_side = not is_buy
         orders_to_place = []
@@ -269,13 +302,12 @@ class ExecutionEngine:
         if tp is not None:
             if self.tp_as_limit:
                 buffer_multiplier = self.tp_limit_buffer_bps / 10_000
-                # FIX A: invertir la lógica del buffer respecto a la versión anterior.
-                # close_side=True  → buy para cerrar short  → limit_px MENOR que trigger
-                # close_side=False → sell para cerrar long  → limit_px MAYOR que trigger
-                if close_side:  # compramos para cerrar short → queremos pagar lo menos posible
-                    tp_limit_px = round(tp * (1 - buffer_multiplier), 6)
-                else:           # vendemos para cerrar long → queremos cobrar lo más posible
+                # close_side=False → SELL para cerrar LONG → limit_px MENOR que trigger
+                # close_side=True  → BUY  para cerrar SHORT → limit_px MAYOR que trigger
+                if close_side:  # cerrar short: compramos, aceptamos pagar más
                     tp_limit_px = round(tp * (1 + buffer_multiplier), 6)
+                else:           # cerrar long:  vendemos, aceptamos recibir menos
+                    tp_limit_px = round(tp * (1 - buffer_multiplier), 6)
             else:
                 tp_limit_px = None
 
@@ -357,7 +389,7 @@ class ExecutionEngine:
                 sym, self.bulk_retry_attempts, last_error,
             )
 
-    # ── LIMIT INTERNO + TELEMETRÍA ────────────────────────────────────────────
+    # ── LIMIT INTERNO + TELEMETRÍA ─────────────────────────────────────────
 
     async def _try_limit_sdk(
         self,
