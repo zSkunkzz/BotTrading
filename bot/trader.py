@@ -21,7 +21,6 @@ Opcionales:
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import os
 import time
@@ -30,10 +29,6 @@ from typing import Optional
 
 import aiohttp
 from eth_account import Account
-from eth_utils import to_hex
-
-# SDK oficial de Hyperliquid
-from hyperliquid.utils.signing import sign_l1_action, float_to_wire
 
 from bot.strategy import decide
 from bot.ai_trader import ai_decide
@@ -60,12 +55,7 @@ _SL_SW_MARGIN           = float(os.getenv("SL_SW_MARGIN", "0.001"))
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
-_EXCHANGE_POST_TIMEOUT = float(os.getenv("EXCHANGE_POST_TIMEOUT", "15"))
-_SET_LEVERAGE_TIMEOUT  = float(os.getenv("SET_LEVERAGE_TIMEOUT", "20"))
-
-# Detectar si el SDK instalado requiere 'expires_after' (versiones >= 1.0)
-_SIGN_PARAMS = inspect.signature(sign_l1_action).parameters
-_SDK_NEEDS_EXPIRES_AFTER = "expires_after" in _SIGN_PARAMS
+_SET_LEVERAGE_TIMEOUT = float(os.getenv("SET_LEVERAGE_TIMEOUT", "20"))
 
 # ── Rate limiter global para /info ─────────────────────────────────────────
 _HL_REST_LOCK    = asyncio.Lock()
@@ -80,20 +70,6 @@ async def _hl_throttle():
         if wait > 0:
             await asyncio.sleep(wait)
         _HL_LAST_CALL = time.monotonic()
-
-
-# ── Nonce único global ──────────────────────────────────────────────────
-_NONCE_LOCK = asyncio.Lock()
-_NONCE_LAST = 0
-
-async def _unique_nonce() -> int:
-    global _NONCE_LAST
-    async with _NONCE_LOCK:
-        n = int(time.time() * 1000)
-        if n <= _NONCE_LAST:
-            n = _NONCE_LAST + 1
-        _NONCE_LAST = n
-        return n
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -119,9 +95,6 @@ def _hl_side_to_str(raw_side: str) -> str:
     if s in ("short", "sell"):
         return "short"
     raise ValueError(f"Side desconocido de HL: {raw_side!r}")
-
-
-_float_to_wire = float_to_wire
 
 
 class FuturesTrader:
@@ -150,7 +123,6 @@ class FuturesTrader:
             self._agent_addr   = agent_acct.address
             self._master_addr  = api_wallet
             self._account_addr = self._master_addr
-            self._vault_address = None
 
             from bot.core.hl_client import HLClient
             self._hl_client = HLClient(symbol)
@@ -170,7 +142,6 @@ class FuturesTrader:
             self._account_addr  = os.getenv("HL_ACCOUNT_ADDR", "").strip()
             self._agent_mode    = False
             self._agent_addr    = ""
-            self._vault_address = None
             if not self._account_addr:
                 acct = Account.from_key(pk)
                 self._account_addr = acct.address
@@ -228,18 +199,6 @@ class FuturesTrader:
                 pass
             self._ccxt_exchange = None
 
-    # ── Coin index ───────────────────────────────────────────────────────────
-
-    _coin_index_cache: dict[str, int] = {}
-
-    async def _get_coin_index(self) -> int:
-        if self.coin in self._coin_index_cache:
-            return self._coin_index_cache[self.coin]
-        data = await self._info_post({"type": "meta"})
-        for i, uni in enumerate(data.get("universe", [])):
-            self._coin_index_cache[uni.get("name", "")] = i
-        return self._coin_index_cache.get(self.coin, 0)
-
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
     async def _info_post(self, payload: dict) -> dict:
@@ -262,63 +221,6 @@ class FuturesTrader:
                         ) as r2:
                             return _json.loads(await r2.text())
                 return _json.loads(await r.text())
-
-    async def _exchange_post(self, action: dict) -> dict:
-        """Signing manual vía SDK: usado SOLO para updateLeverage, cancel, orderStatus."""
-        if not self._private_key:
-            raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
-
-        nonce  = await _unique_nonce()
-        wallet = Account.from_key(self._private_key)
-        is_mainnet = not _USE_TESTNET
-
-        if _SDK_NEEDS_EXPIRES_AFTER:
-            expires_after = int(time.time() * 1000) + 30 * 60 * 1000
-            signature = sign_l1_action(
-                wallet, action, self._vault_address, nonce,
-                is_mainnet=is_mainnet, expires_after=expires_after,
-            )
-        else:
-            signature = sign_l1_action(
-                wallet, action, self._vault_address, nonce,
-                is_mainnet=is_mainnet,
-            )
-
-        payload: dict = {
-            "action":       action,
-            "nonce":        nonce,
-            "signature":    {"r": to_hex(signature["r"]), "s": to_hex(signature["s"]), "v": signature["v"]},
-            "vaultAddress": self._vault_address,
-        }
-
-        timeout = aiohttp.ClientTimeout(total=_EXCHANGE_POST_TIMEOUT, connect=5)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.post(
-                f"{_API_URL}/exchange", json=payload,
-                headers={"Content-Type": "application/json"},
-            ) as r:
-                text = await r.text()
-                try:
-                    result = _json.loads(text)
-                except Exception:
-                    result = {"status": "error", "response": text}
-
-        if result.get("status") != "ok":
-            err_str = str(result.get("response", ""))
-            if "does not exist" in err_str:
-                logger.error(
-                    "[%s] HL rechazó con 'does not exist'.\n"
-                    "  agente=%s | vault=%s | respuesta HL: %s\n"
-                    "  → Verifica que el agente %s esté aprobado en\n"
-                    "    app.hyperliquid.xyz → Settings → API para la master=%s",
-                    self.symbol,
-                    self._agent_addr  or "N/A",
-                    self._vault_address or "None",
-                    err_str,
-                    self._agent_addr  or "N/A",
-                    self._master_addr or "NO CONFIGURADA",
-                )
-        return result
 
     # ── Init / cleanup ────────────────────────────────────────────────────────
 
@@ -423,21 +325,29 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage ────────────────────────────────────────────────────────────
+    # ── Leverage — usa SDK directamente (fix: evita signing manual) ──────────
 
-    async def _set_leverage(self, leverage: int, side: str = "cross"):
+    async def _set_leverage(self, leverage: int):
+        """
+        Establece el leverage usando el SDK oficial de Hyperliquid.
+
+        El SDK maneja internamente el signing EIP-712 con los tipos correctos,
+        evitando el error 'Unsupported type: str' del signing manual.
+        """
         if self.dry_run:
             return
-        coin_idx = await self._get_coin_index()
-        is_cross = (self.margin_mode != "isolated")
-        # FIX: coin_idx debe ser int, no str
-        action   = {"type": "updateLeverage", "asset": int(coin_idx),
-                    "isCross": is_cross, "leverage": int(leverage)}
-        r = await self._exchange_post(action)
-        if r.get("status") == "ok":
+        is_cross = self.margin_mode != "isolated"
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: self._hl_client._exchange.update_leverage(
+                int(leverage), self.coin, is_cross
+            ),
+        )
+        if isinstance(result, dict) and result.get("status") == "ok":
             logger.debug("[%s] Leverage %sx OK (cross=%s)", self.symbol, leverage, is_cross)
         else:
-            logger.debug("[%s] set_leverage respuesta: %s", self.symbol, r)
+            logger.debug("[%s] set_leverage respuesta: %s", self.symbol, result)
 
     # ── Órdenes ───────────────────────────────────────────────────────────────────
 
@@ -450,17 +360,6 @@ class FuturesTrader:
             })
         except Exception as e:
             logger.debug("[%s] _get_order_status error: %s", self.symbol, e)
-            return {}
-
-    async def _cancel_order(self, order_id) -> dict:
-        if self.dry_run:
-            return {"status": "ok"}
-        try:
-            coin_idx = await self._get_coin_index()
-            action   = {"type": "cancel", "cancels": [{"a": int(coin_idx), "o": int(order_id)}]}
-            return await self._exchange_post(action)
-        except Exception as e:
-            logger.debug("[%s] _cancel_order error: %s", self.symbol, e)
             return {}
 
     async def _place_order(self, side: str, qty: float, reduce_only: bool = False,
@@ -698,7 +597,6 @@ class FuturesTrader:
         if global_risk:
             await global_risk.register_open()
 
-        # FIX: alinear kwargs con la firma real de notify_open
         await notify_open(
             symbol=self.symbol,
             side=self.position,
@@ -736,7 +634,6 @@ class FuturesTrader:
                     r = await self._place_order(close_side, partial_qty, reduce_only=True)
                     if r.get("status") == "ok":
                         logger.info("[%s] TP2 parcial ejecutado (%.1f%%)", self.symbol, TP2_PARTIAL_RATIO * 100)
-                        # FIX: alinear kwargs con firma real de notify_tp_partial
                         await notify_tp_partial(
                             symbol=self.symbol,
                             side=self.position,
@@ -840,7 +737,6 @@ class FuturesTrader:
         self.tp2_hit = False
         clear_position(self.symbol)
 
-        # FIX: alinear kwargs con firma real de notify_close
         await notify_close(
             symbol=self.symbol,
             side=pos_copy,
