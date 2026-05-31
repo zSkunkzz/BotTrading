@@ -16,47 +16,54 @@ GEMINI_URL   = "https://generativelanguage.googleapis.com/v1beta/models/{model}:
 GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# TTL del caché de decisiones IA
-# Default subido a 300s (5 min) para reducir drasticamente llamadas con 14 traders.
-# Ajusta con AI_CACHE_TTL y AI_CACHE_TTL_BUY en Railway si quieres más o menos frescura.
 CACHE_TTL     = int(os.getenv("AI_CACHE_TTL",     "300"))
 CACHE_TTL_BUY = int(os.getenv("AI_CACHE_TTL_BUY", "300"))
 _ai_cache: dict = {}
 
-# Caché del EnrichedContext: {symbol: (EnrichedContext, timestamp)}
-ENRICHED_CACHE_TTL = int(os.getenv("ENRICHED_CACHE_TTL", "120"))  # 2 min
+ENRICHED_CACHE_TTL = int(os.getenv("ENRICHED_CACHE_TTL", "120"))
 _enriched_cache: dict = {}
 
-# AI_MIN_SCORE: solo aplica en el path directo SIN context_override.
 AI_MIN_SCORE = int(os.getenv("AI_MIN_SCORE", "7"))
 
+# ── Prompts ───────────────────────────────────────────────────────────────────
+
+# Prompt principal: gestión de posición abierta (CLOSE/HOLD).
+# Las reglas numéricas (RSI, funding, F&G, OI, vol_ratio) las aplica enriched_filter
+# antes de llegar aquí, así que este prompt NO las duplica.
 SYSTEM_PROMPT = """You are a professional crypto futures trader. Reply ONLY with a JSON object, no extra text.
 
 You receive:
-  1. Technical indicators across multiple timeframes (score 0-10)
-  2. External market context: Fear & Greed index, Open Interest delta, funding rate, recent news
+  1. Technical indicators across multiple timeframes
+  2. Current open position details (side, entry, PnL)
 
 Decision rules:
   - CLOSE if pnl > +3% or pnl < -1.5%
-  - No BUY if rsi > 70 | No SELL if rsi < 30
-  - vol_ratio > 1.5 confirms signal | vol_ratio < 0.7 weakens signal
-  - Fear & Greed < 20 + BUY signal → reduce confidence by 1 or HOLD
-  - Fear & Greed > 80 + BUY signal → euphoria risk, reduce confidence by 1
-  - Funding rate > +0.05% → crowded longs, favor SELL
-  - Funding rate < -0.05% → crowded shorts, favor BUY
-  - OI delta > +5% with price falling → bearish pressure, favor SELL
-  - OI delta > +5% with price rising → strong conviction, confirm signal
-  - Bearish news + BUY signal → reduce confidence by 1
-  - Bullish news + SELL signal → reduce confidence by 1
   - If unsure → HOLD
 
 JSON format (strict, no markdown):
 {"action":"BUY","confidence":8,"reason":"short reason max 15 words"}
 action must be one of: BUY SELL HOLD CLOSE"""
 
+# Prompt reducido para análisis SOLO de noticias.
+# Se usa cuando strategy.py llama con task="news_sentiment_only".
+# Ya NO incluye reglas de RSI/funding/OI porque enriched_filter las aplica antes.
+NEWS_SYSTEM_PROMPT = """You are a crypto news sentiment analyst. Reply ONLY with a JSON object, no extra text.
+
+You receive a trading signal direction and recent news headlines.
+Your ONLY job: decide if the news sentiment is strongly against the signal.
+
+Rules:
+  - HOLD only if news are STRONGLY and CLEARLY against the signal direction
+  - If news are neutral, mixed, or slightly against → do NOT block (return BUY or SELL)
+  - If news confirm or are unrelated → return BUY or SELL
+  - When in doubt → return BUY or SELL (do not over-block)
+
+JSON format (strict, no markdown):
+{"action":"BUY","confidence":8,"reason":"short reason max 15 words"}
+action must be one of: BUY SELL HOLD"""
+
 
 def _price_bucket(price: float) -> int:
-    """Rounds price to ~0.1% bucket to invalidate cache when market moves."""
     if not price or price <= 0:
         return 0
     import math
@@ -86,7 +93,6 @@ def _parse_ai_json(raw: str) -> dict:
 
 
 async def _get_enriched_context(symbol: str):
-    """Returns cached EnrichedContext or fetches a fresh one."""
     now = time.monotonic()
     cached = _enriched_cache.get(symbol)
     if cached:
@@ -148,7 +154,7 @@ def build_market_context(symbol, bars, position, entry_price, leverage,
     return ctx
 
 
-async def _call_gemini(context: dict):
+async def _call_gemini(context: dict, system_prompt: str = SYSTEM_PROMPT):
     key = os.getenv("GEMINI_API_KEY", "")
     if not key:
         return None
@@ -159,7 +165,7 @@ async def _call_gemini(context: dict):
             await budget.register_gemini_call()
             url      = GEMINI_URL.format(model=GEMINI_MODEL) + f"?key={key}"
             data_str = json.dumps(context, ensure_ascii=False, separators=(',', ':'))
-            prompt   = f"{SYSTEM_PROMPT}\nDATA:{data_str}"
+            prompt   = f"{system_prompt}\nDATA:{data_str}"
 
             for attempt in range(1, 4):
                 async with aiohttp.ClientSession() as s:
@@ -169,7 +175,7 @@ async def _call_gemini(context: dict):
                             "contents": [{"parts": [{"text": prompt}]}],
                             "generationConfig": {
                                 "temperature":     0.0,
-                                "maxOutputTokens": 512,
+                                "maxOutputTokens": 256,
                             },
                         },
                         timeout=aiohttp.ClientTimeout(total=15),
@@ -213,7 +219,7 @@ async def _call_gemini(context: dict):
         return None
 
 
-async def _call_groq(context: dict):
+async def _call_groq(context: dict, system_prompt: str = SYSTEM_PROMPT):
     key = os.getenv("GROQ_API_KEY", "")
     if not key:
         return None
@@ -229,10 +235,10 @@ async def _call_groq(context: dict):
                     json={
                         "model": GROQ_MODEL,
                         "messages": [
-                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "system", "content": system_prompt},
                             {"role": "user",   "content": json.dumps(context, separators=(',', ':'))},
                         ],
-                        "max_tokens": 150,
+                        "max_tokens": 128,
                         "temperature": 0.0,
                         "response_format": {"type": "json_object"},
                     },
@@ -304,6 +310,17 @@ def _pnl_check(position, entry_price, current_price, leverage) -> str | None:
 
 async def ai_decide(symbol, bars, position, entry_price, leverage,
                     context_override: dict | None = None):
+    """
+    Punto de entrada principal.
+
+    context_override con task="news_sentiment_only":
+      - Usa NEWS_SYSTEM_PROMPT (solo sentimiento de noticias)
+      - NO añade enriched_str del caché externo (las noticias ya vienen en el override)
+      - Evita tokens innecesarios y no duplica reglas numéricas de enriched_filter
+
+    Sin context_override:
+      - Path estándar: gestión de posición abierta (CLOSE/HOLD)
+    """
     current_price = bars[-1][4] if bars else (entry_price or 0.0)
 
     if position:
@@ -315,19 +332,70 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
 
     price_bucket = _price_bucket(current_price)
 
-    # --- Cooldown por símbolo -------------------------------------------
-    # Evita llamar a la IA para el mismo par más de 1 vez cada
-    # AI_SYMBOL_COOLDOWN segundos (default 300s = 5 min).
-    # Con 14 traders esto limita el gasto a máximo 14 calls/5min = ~2.8 RPM.
     if await budget.symbol_on_cooldown(symbol):
         logger.debug(f"[{symbol}] cooldown activo — HOLD sin IA")
         return {"action": "HOLD", "confidence": 4,
                 "reasoning": "Cooldown activo", "key_factors": []}
-    # ---------------------------------------------------------------------
 
-    enriched     = await _get_enriched_context(symbol)
-    enriched_str = format_context_for_prompt(enriched)
+    # ── Path A: análisis solo de noticias (llamado desde strategy.py) ─────────
+    if context_override and context_override.get("task") == "news_sentiment_only":
+        tech_signal     = context_override.get("signal", "NEUTRAL")
+        fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
+        score           = context_override.get("score", 0)
 
+        cache_key = f"{symbol}:news:{score}:{tech_signal}:{price_bucket}"
+        now       = time.monotonic()
+        if cache_key in _ai_cache:
+            cached_result, cached_ts = _ai_cache[cache_key]
+            age = int(now - cached_ts)
+            if age < CACHE_TTL:
+                logger.info(f"[{symbol}] \U0001f504 IA news cached ({age}s ago): {cached_result.get('action')}")
+                return cached_result
+
+        # Contexto mínimo: solo la dirección de señal + las noticias
+        # NO añadimos enriched_str del caché (ya viene en context_override["external"])
+        news_context = {
+            "symbol":  symbol,
+            "signal":  tech_signal,
+            "score":   score,
+            "rr":      context_override.get("rr"),
+            "external": context_override.get("external", ""),
+        }
+
+        logger.info(
+            f"[{symbol}] \U0001f4f0 IA news-only (score={score}, signal={tech_signal}) "
+            f"→ {len(context_override.get('external', '').splitlines())} líneas de contexto"
+        )
+
+        result = await _call_gemini(news_context, system_prompt=NEWS_SYSTEM_PROMPT)
+        if not result:
+            result = await _call_groq(news_context, system_prompt=NEWS_SYSTEM_PROMPT)
+        if not result:
+            logger.warning(f"[{symbol}] Sin IA news → fallback {fallback_action}")
+            result = {"action": fallback_action, "confidence": 6,
+                      "reasoning": "Fallback — IA no disponible", "key_factors": []}
+
+        await budget.register_symbol_call(symbol)
+
+        confidence = result.get("confidence", 5)
+        min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "5"))
+        if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
+            logger.info(f"[{symbol}] IA news confidence {confidence} < {min_conf} → mantiene señal")
+            # En el path de noticias, baja confianza NO bloquea — la regla está en strategy.py
+
+        if result.get("action") in ("BUY", "SELL", "HOLD"):
+            _ai_cache[cache_key] = (result, now)
+            if len(_ai_cache) > 200:
+                oldest_key = min(_ai_cache, key=lambda k: _ai_cache[k][1])
+                del _ai_cache[oldest_key]
+
+        logger.info(
+            f"\U0001f916 [{symbol}] news-only → {result['action']} "
+            f"({result.get('confidence', '?')}/10) | {result.get('reason', result.get('reasoning', ''))}"
+        )
+        return result
+
+    # ── Path B: context_override genérico (legado, sin task específico) ───────
     if context_override:
         tech_signal     = context_override.get("signal", "NEUTRAL")
         fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
@@ -342,34 +410,64 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
                 logger.info(f"[{symbol}] \U0001f504 IA cached ({age}s ago): {cached_result.get('action')}")
                 return cached_result
 
-        context = {**context_override, "external": enriched_str}
+        enriched     = await _get_enriched_context(symbol)
+        enriched_str = format_context_for_prompt(enriched)
+        context      = {**context_override, "external": enriched_str}
         logger.info(f"[{symbol}] IA consultada (score={score}/10) + contexto externo")
 
-    else:
-        if not bars or len(bars) < 30:
-            logger.warning(f"[{symbol}] ai_decide: bars insuficientes ({len(bars) if bars else 0}), HOLD")
-            return {"action": "HOLD", "confidence": 3,
-                    "reasoning": "Bars insuficientes para señal técnica", "key_factors": []}
+        result = await _call_gemini(context)
+        if not result:
+            result = await _call_groq(context)
+        if not result:
+            logger.warning(f"[{symbol}] Sin IA → fallback técnico")
+            result = {"action": fallback_action, "confidence": 7,
+                      "reasoning": "Fallback técnico", "key_factors": []}
 
-        tech = _technical_signal(bars)
-        if tech["signal"] == "HOLD":
-            return {"action": "HOLD", "confidence": tech["confidence"],
-                    "reasoning": "Sin señal técnica", "key_factors": []}
+        await budget.register_symbol_call(symbol)
 
-        fallback_action = tech["signal"]
-        cache_key       = f"{symbol}:tech:{tech['signal']}:{price_bucket}"
-        now             = time.monotonic()
+        confidence = result.get("confidence", 5)
+        min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "5"))
+        if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
+            logger.info(f"[{symbol}] IA confidence {confidence} < {min_conf} → HOLD")
+            result["action"] = "HOLD"
 
-        if cache_key in _ai_cache:
-            cached_result, cached_ts = _ai_cache[cache_key]
-            age = int(now - cached_ts)
-            if cached_result.get("action") in ("BUY", "SELL", "CLOSE") and age < CACHE_TTL_BUY:
-                logger.info(f"[{symbol}] \U0001f504 IA cached técnico ({age}s ago): {cached_result.get('action')}")
-                return cached_result
+        action = result.get("action")
+        if action in ("BUY", "SELL", "CLOSE"):
+            _ai_cache[cache_key] = (result, now)
+            if len(_ai_cache) > 200:
+                oldest_key = min(_ai_cache, key=lambda k: _ai_cache[k][1])
+                del _ai_cache[oldest_key]
 
-        context = build_market_context(symbol, bars, position, entry_price, leverage,
-                                       enriched_str=enriched_str)
-        logger.info(f"[{symbol}] Técnico {tech['signal']} → IA + contexto externo")
+        logger.info(f"\U0001f916 [{symbol}] {result['action']} ({result.get('confidence', '?')}/10) | {result.get('reasoning', result.get('reason', ''))}")
+        return result
+
+    # ── Path C: sin override — señal técnica pura (bars requeridos) ───────────
+    if not bars or len(bars) < 30:
+        logger.warning(f"[{symbol}] ai_decide: bars insuficientes ({len(bars) if bars else 0}), HOLD")
+        return {"action": "HOLD", "confidence": 3,
+                "reasoning": "Bars insuficientes para señal técnica", "key_factors": []}
+
+    tech = _technical_signal(bars)
+    if tech["signal"] == "HOLD":
+        return {"action": "HOLD", "confidence": tech["confidence"],
+                "reasoning": "Sin señal técnica", "key_factors": []}
+
+    fallback_action = tech["signal"]
+    cache_key       = f"{symbol}:tech:{tech['signal']}:{price_bucket}"
+    now             = time.monotonic()
+
+    if cache_key in _ai_cache:
+        cached_result, cached_ts = _ai_cache[cache_key]
+        age = int(now - cached_ts)
+        if cached_result.get("action") in ("BUY", "SELL", "CLOSE") and age < CACHE_TTL_BUY:
+            logger.info(f"[{symbol}] \U0001f504 IA cached técnico ({age}s ago): {cached_result.get('action')}")
+            return cached_result
+
+    enriched     = await _get_enriched_context(symbol)
+    enriched_str = format_context_for_prompt(enriched)
+    context      = build_market_context(symbol, bars, position, entry_price, leverage,
+                                        enriched_str=enriched_str)
+    logger.info(f"[{symbol}] Técnico {tech['signal']} → IA + contexto externo")
 
     result = await _call_gemini(context)
     if not result:
@@ -379,7 +477,6 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
         result = {"action": fallback_action, "confidence": 7,
                   "reasoning": "Fallback técnico", "key_factors": []}
 
-    # Registrar en cooldown DESPUÉS de la llamada real
     await budget.register_symbol_call(symbol)
 
     confidence = result.get("confidence", 5)
@@ -395,5 +492,5 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
             oldest_key = min(_ai_cache, key=lambda k: _ai_cache[k][1])
             del _ai_cache[oldest_key]
 
-    logger.info(f"\U0001f916 [{symbol}] {result['action']} ({confidence}/10) | {result.get('reasoning', result.get('reason', ''))}")
+    logger.info(f"\U0001f916 [{symbol}] {result['action']} ({result.get('confidence', '?')}/10) | {result.get('reasoning', result.get('reason', ''))}")
     return result
