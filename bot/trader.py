@@ -26,11 +26,15 @@ import logging
 import os
 import time
 import json as _json
+from decimal import Decimal
 from typing import Optional
 
 import aiohttp
 import eth_account
+import msgpack
+from eth_account import Account
 from eth_account.messages import encode_typed_data
+from eth_utils import keccak, to_hex
 
 from bot.strategy import decide
 from bot.ai_trader import ai_decide
@@ -55,7 +59,87 @@ _SL_SW_MARGIN           = float(os.getenv("SL_SW_MARGIN", "0.001"))
 
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
-_CHAIN_ID    = 421614 if _USE_TESTNET else 42161  # Arbitrum Goerli testnet vs Arbitrum One
+
+
+# ── Helpers de signing (alineados con hyperliquid-python-sdk/signing.py) ──────
+
+def _float_to_wire(x: float) -> str:
+    """Convierte float a string sin notación científica, como exige Hyperliquid."""
+    rounded = f"{x:.8f}"
+    if abs(float(rounded) - x) >= 1e-12:
+        raise ValueError(f"_float_to_wire rounding error: {x}")
+    if rounded == "-0":
+        rounded = "0"
+    normalized = Decimal(rounded).normalize()
+    return f"{normalized:f}"
+
+
+def _address_to_bytes(address: str) -> bytes:
+    return bytes.fromhex(address[2:] if address.startswith("0x") else address)
+
+
+def _action_hash(action: dict, vault_address: Optional[str], nonce: int,
+                 expires_after: Optional[int] = None) -> bytes:
+    """
+    Hash canónico de una acción L1 según el SDK oficial:
+      msgpack(action) + nonce(8 bytes BE) + vault_flag [+ vault_bytes] [+ expires_flag + expires(8 bytes BE)]
+    """
+    data = msgpack.packb(action, use_bin_type=True)
+    data += nonce.to_bytes(8, "big")
+    if vault_address is None:
+        data += b"\x00"
+    else:
+        data += b"\x01"
+        data += _address_to_bytes(vault_address)
+    if expires_after is not None:
+        data += b"\x00"
+        data += expires_after.to_bytes(8, "big")
+    return keccak(data)
+
+
+def _phantom_agent(hash_bytes: bytes, is_mainnet: bool) -> dict:
+    return {"source": "a" if is_mainnet else "b", "connectionId": hash_bytes}
+
+
+def _l1_payload(phantom_agent: dict) -> dict:
+    """Estructura EIP-712 que usa el SDK para firmar acciones L1 (órdenes, cancel, leverage, etc.)."""
+    return {
+        "domain": {
+            "chainId": 1337,
+            "name": "Exchange",
+            "verifyingContract": "0x0000000000000000000000000000000000000000",
+            "version": "1",
+        },
+        "types": {
+            "Agent": [
+                {"name": "source",       "type": "string"},
+                {"name": "connectionId", "type": "bytes32"},
+            ],
+            "EIP712Domain": [
+                {"name": "name",              "type": "string"},
+                {"name": "version",           "type": "string"},
+                {"name": "chainId",           "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+        },
+        "primaryType": "Agent",
+        "message": phantom_agent,
+    }
+
+
+def _sign_l1_action(private_key: str, action: dict, vault_address: Optional[str],
+                    nonce: int, is_mainnet: bool,
+                    expires_after: Optional[int] = None) -> dict:
+    """
+    Firma una acción L1 (order, cancel, updateLeverage, etc.) exactamente como
+    lo hace el SDK oficial de Hyperliquid.
+    """
+    h         = _action_hash(action, vault_address, nonce, expires_after)
+    agent     = _phantom_agent(h, is_mainnet)
+    data      = _l1_payload(agent)
+    structured = encode_typed_data(full_message=data)
+    signed    = Account.sign_message(structured, private_key=private_key)
+    return {"r": to_hex(signed.r), "s": to_hex(signed.s), "v": signed.v}
 
 
 def _norm_coin(symbol: str) -> str:
@@ -94,7 +178,7 @@ class FuturesTrader:
             self._account_addr = os.getenv("HL_ACCOUNT_ADDR", "").strip()
             self._agent_mode   = False
             if pk and not self._account_addr:
-                acct = eth_account.Account.from_key(pk)
+                acct = Account.from_key(pk)
                 self._account_addr = acct.address
             logger.info("[%s] Auth: private key directa → addr=%s", symbol,
                         self._account_addr[:10] + "..." if self._account_addr else "N/A")
@@ -116,7 +200,7 @@ class FuturesTrader:
 
         self.exchange = None
 
-    # ── Coin index ──────────────────────────────────────────────────
+    # ── Coin index ──────────────────────────────────────────────────────
 
     _coin_index_cache: dict[str, int] = {}
 
@@ -143,17 +227,32 @@ class FuturesTrader:
                 return _json.loads(await r.text())
 
     async def _exchange_post(self, action: dict) -> dict:
-        """POST autenticado a /exchange con firma EIP-712."""
-        nonce     = int(time.time() * 1000)
-        signature = self._sign_action(action, nonce)
-        payload   = {
+        """POST autenticado a /exchange con firma EIP-712 L1 (SDK oficial)."""
+        if not self._private_key:
+            raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
+
+        nonce      = int(time.time() * 1000)
+        is_mainnet = not _USE_TESTNET
+
+        # En modo agente, vault_address = wallet principal; en modo directo, None
+        vault_address = self._account_addr if self._agent_mode else None
+
+        signature = _sign_l1_action(
+            private_key=self._private_key,
+            action=action,
+            vault_address=vault_address,
+            nonce=nonce,
+            is_mainnet=is_mainnet,
+        )
+
+        payload: dict = {
             "action":    action,
             "nonce":     nonce,
             "signature": signature,
         }
-        # En modo agente, añadir vaultAddress = wallet principal
         if self._agent_mode:
             payload["vaultAddress"] = self._account_addr
+
         async with aiohttp.ClientSession() as s:
             async with s.post(
                 f"{_API_URL}/exchange",
@@ -166,45 +265,6 @@ class FuturesTrader:
                     return _json.loads(text)
                 except Exception:
                     return {"status": "error", "response": text}
-
-    def _sign_action(self, action: dict, nonce: int) -> dict:
-        """Firma la acción con EIP-712 usando eth-account."""
-        if not self._private_key:
-            raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
-
-        import hashlib
-        action_str  = _json.dumps(action, separators=(",", ":"), sort_keys=True)
-        action_hash = "0x" + hashlib.sha256(action_str.encode()).hexdigest()
-
-        domain = {
-            "name":              "HyperliquidSignTransaction",
-            "version":           "1",
-            "chainId":           _CHAIN_ID,
-            "verifyingContract": "0x0000000000000000000000000000000000000000",
-        }
-        structured = {
-            "types": {
-                "EIP712Domain": [
-                    {"name": "name",    "type": "string"},
-                    {"name": "version", "type": "string"},
-                    {"name": "chainId", "type": "uint256"},
-                    {"name": "verifyingContract", "type": "address"},
-                ],
-                "Agent": [
-                    {"name": "source",       "type": "string"},
-                    {"name": "connectionId", "type": "bytes32"},
-                ],
-            },
-            "primaryType": "Agent",
-            "domain": domain,
-            "message": {
-                "source":       "a" if not _USE_TESTNET else "b",
-                "connectionId": bytes.fromhex(action_hash[2:]),
-            },
-        }
-        encoded = encode_typed_data(full_message=structured)
-        signed  = eth_account.Account.sign_message(encoded, private_key=self._private_key)
-        return {"r": hex(signed.r), "s": hex(signed.s), "v": signed.v}
 
     # ── Init ────────────────────────────────────────────────────────────
 
@@ -236,7 +296,7 @@ class FuturesTrader:
         logger.info("[%s] Trader Hyperliquid iniciado | coin=%s | addr=%s | agent=%s",
                     self.symbol, self.coin, self._account_addr[:10] + "...", self._agent_mode)
 
-    # ── Precio y OHLCV ────────────────────────────────────────────────────
+    # ── Precio y OHLCV ──────────────────────────────────────────────────
 
     async def get_price(self) -> float:
         try:
@@ -289,7 +349,7 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage ────────────────────────────────────────────────────────────
+    # ── Leverage ────────────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int, side: str = "cross"):
         if self.dry_run:
@@ -308,7 +368,7 @@ class FuturesTrader:
         else:
             logger.warning("[%s] set_leverage error: %s", self.symbol, r)
 
-    # ── Órdenes ────────────────────────────────────────────────────────────────
+    # ── Órdenes ─────────────────────────────────────────────────────────
 
     async def _place_order_raw(
         self,
@@ -332,32 +392,53 @@ class FuturesTrader:
 
         if order_type == "limit" and price:
             order_type_obj = {"limit": {"tif": "Gtc"}}
-            limit_px       = str(price)
+            limit_px       = _float_to_wire(price)
         else:
-            current_price = await self.get_price()
-            limit_px      = str(round(current_price * 1.05, 6)) if is_buy else str(round(current_price * 0.95, 6))
+            current_price  = await self.get_price()
+            slippage_px    = current_price * 1.05 if is_buy else current_price * 0.95
+            limit_px       = _float_to_wire(slippage_px)
             order_type_obj = {"limit": {"tif": "Ioc"}}
 
         order: dict = {
             "a": coin_idx,
             "b": is_buy,
             "p": limit_px,
-            "s": str(qty),
+            "s": _float_to_wire(qty),
             "r": reduce_only,
             "t": order_type_obj,
         }
 
+        # TP/SL: se envían como órdenes trigger separadas según la doc oficial
         if sl or tp:
             tpsl_parts = []
             if tp:
-                tpsl_parts.append({"limit": {"tif": "Gtc"}, "triggerPx": str(tp), "isMarket": True, "tpsl": "tp"})
+                tpsl_parts.append({
+                    "a": coin_idx,
+                    "b": not is_buy,  # cierre en dirección contraria
+                    "p": _float_to_wire(tp),
+                    "s": _float_to_wire(qty),
+                    "r": True,
+                    "t": {"trigger": {"triggerPx": _float_to_wire(tp), "isMarket": True, "tpsl": "tp"}},
+                })
             if sl:
-                tpsl_parts.append({"limit": {"tif": "Gtc"}, "triggerPx": str(sl), "isMarket": True, "tpsl": "sl"})
+                tpsl_parts.append({
+                    "a": coin_idx,
+                    "b": not is_buy,
+                    "p": _float_to_wire(sl),
+                    "s": _float_to_wire(qty),
+                    "r": True,
+                    "t": {"trigger": {"triggerPx": _float_to_wire(sl), "isMarket": True, "tpsl": "sl"}},
+                })
             if tpsl_parts:
-                order["t"] = {"trigger": {"triggerPx": tpsl_parts[0]["triggerPx"],
-                                           "isMarket": True, "tpsl": tpsl_parts[0]["tpsl"]}}
-
-        action = {"type": "order", "orders": [order], "grouping": "na"}
+                action = {
+                    "type":     "order",
+                    "orders":   [order] + tpsl_parts,
+                    "grouping": "positionTpsl",
+                }
+            else:
+                action = {"type": "order", "orders": [order], "grouping": "na"}
+        else:
+            action = {"type": "order", "orders": [order], "grouping": "na"}
 
         try:
             result = await self._exchange_post(action)
@@ -418,7 +499,7 @@ class FuturesTrader:
             await kill_switch.on_order_result(rejected=True)
         return r
 
-    # ── Posiciones ────────────────────────────────────────────────────────────
+    # ── Posiciones ──────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list:
         try:
@@ -490,7 +571,7 @@ class FuturesTrader:
             logger.error("[%s] _check_external_close error: %s", self.symbol, e)
             return False
 
-    # ── Qty ───────────────────────────────────────────────────────────────────
+    # ── Qty ─────────────────────────────────────────────────────────────
 
     async def _get_min_qty(self) -> float:
         try:
@@ -511,7 +592,7 @@ class FuturesTrader:
         decimals = len(str(min_qty).rstrip("0").split(".")[-1]) if "." in str(min_qty) else 0
         return round(qty, decimals)
 
-    # ── Abrir posiciones ─────────────────────────────────────────────────────────
+    # ── Abrir posiciones ─────────────────────────────────────────────────
 
     async def open_long(self, usdc_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
         if kill_switch.is_halted(self.symbol):
@@ -664,7 +745,7 @@ class FuturesTrader:
         else:
             logger.warning("[%s] partial_close FAILED: %s", self.symbol, r)
 
-    # ── Loop principal ──────────────────────────────────────────────────────────
+    # ── Loop principal ──────────────────────────────────────────────────
 
     async def run(self, risk, global_risk=None):
         usdc_per_trade = risk.usdc_per_trade
