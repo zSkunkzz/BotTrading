@@ -46,6 +46,7 @@ from bot.balance_service import balance_svc
 from bot.pretrade_risk import pretrade_risk
 from bot.kill_switch import kill_switch
 from bot.execution_engine import execution_engine
+from bot.ohlcv_cache import ohlcv_cache
 
 logger = logging.getLogger("Trader")
 
@@ -334,8 +335,30 @@ class FuturesTrader:
             return float(mid)
         raise ValueError(f"No se pudo obtener precio para {self.coin}")
 
+    async def _fetch_ohlcv_rest(self, tf: str) -> list:
+        """Fetch OHLCV directo desde REST — llamado solo por OHLCVCache cuando no hay hit."""
+        try:
+            tf_ms = {"15m": 15*60*1000, "1h": 60*60*1000, "4h": 4*60*60*1000}.get(tf, 15*60*1000)
+            now   = int(time.time() * 1000)
+            start = now - OHLCV_LIMIT * tf_ms
+            data  = await self._info_post({
+                "type": "candleSnapshot",
+                "req":  {"coin": self.coin, "interval": tf, "startTime": start, "endTime": now},
+            })
+            if not isinstance(data, list) or len(data) == 0:
+                logger.debug("[%s] _fetch_ohlcv_rest: respuesta inválida (%s)", self.symbol, type(data).__name__)
+                return []
+            return [
+                [int(c["t"]), float(c["o"]), float(c["h"]),
+                 float(c["l"]), float(c["c"]), float(c["v"])]
+                for c in data
+            ]
+        except Exception as e:
+            logger.error("[%s] _fetch_ohlcv_rest error: %s", self.symbol, e)
+            return []
+
     async def get_ohlcv(self, tf: str = OHLCV_TF) -> list:
-        # 1. WS feed (sin coste de red)
+        # 1. WS feed (sin coste de red, sin cache)
         try:
             from bot.ws_feed import ws_feed
             if ws_feed.has_data(self.coin, tf=tf, min_candles=OHLCV_MIN_BARS):
@@ -351,27 +374,12 @@ class FuturesTrader:
         except Exception as e:
             logger.debug("[%s] get_ohlcv WS error: %s", self.symbol, e)
 
-        # 2. REST Hyperliquid con throttle
-        try:
-            tf_ms = {"15m": 15*60*1000, "1h": 60*60*1000, "4h": 4*60*60*1000}.get(tf, 15*60*1000)
-            now   = int(time.time() * 1000)
-            start = now - OHLCV_LIMIT * tf_ms
-            data  = await self._info_post({
-                "type": "candleSnapshot",
-                "req":  {"coin": self.coin, "interval": tf, "startTime": start, "endTime": now},
-            })
-            # GUARD: data puede ser None, dict de error, o lista vacía si hubo 429
-            if not isinstance(data, list) or len(data) == 0:
-                logger.debug("[%s] get_ohlcv REST: respuesta inválida (%s)", self.symbol, type(data).__name__)
-                return []
-            return [
-                [int(c["t"]), float(c["o"]), float(c["h"]),
-                 float(c["l"]), float(c["c"]), float(c["v"])]
-                for c in data
-            ]
-        except Exception as e:
-            logger.error("[%s] get_ohlcv REST error: %s", self.symbol, e)
-            return []
+        # 2. Cache compartido → REST (solo 1 request por (coin, tf) cada 30s entre todos los traders)
+        return await ohlcv_cache.get(
+            coin=self.coin,
+            tf=tf,
+            fetch_fn=self._fetch_ohlcv_rest,
+        )
 
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
