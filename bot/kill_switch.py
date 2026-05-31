@@ -266,16 +266,44 @@ class KillSwitch:
         if now_utc.hour == 0 and now_utc.minute < 1:
             self.reset_daily_pnl()
 
-        # Comprobar posiciones sin protección (state mismatch)
-        # Excluir símbolos con TPSL retry activo — es lag de API Bitget, no un mismatch real
+        # FIX: Comprobar posiciones sin protección verificando SIEMPRE contra el exchange.
+        # El estado local (trader.position) puede ser stale por 429 u otros errores de red.
+        # Solo se dispara state_mismatch si el exchange CONFIRMA que hay posición abierta
+        # pero _protection_ok es False — nunca basándose solo en estado local.
         for symbol, trader in list(traders.items()):
             try:
                 if symbol in self._tpsl_retrying:
                     logger.debug(f"[{symbol}] KS watchdog: omitido (TPSL retry en curso)")
                     continue
-                if trader.position and not trader._protection_ok:
-                    await self.on_state_mismatch(symbol)
-                    logger.warning(f"[{symbol}] ⚠️ Watchdog: posición sin protección detectada")
+
+                if not trader.position or trader._protection_ok:
+                    # Sin posición local o ya protegida → nada que comprobar
+                    continue
+
+                # FIX: verificar en el exchange antes de disparar state_mismatch
+                exchange_positions = await trader._get_positions()
+
+                if exchange_positions is None:
+                    # Error de red — no podemos saber el estado real, ignorar este ciclo
+                    logger.warning(
+                        f"[{symbol}] KS watchdog: no se pudo verificar posición en exchange "
+                        f"(error de red) — ignorando este ciclo para evitar falso positivo."
+                    )
+                    continue
+
+                if len(exchange_positions) == 0:
+                    # No hay posición en el exchange — el estado local está stale
+                    # Limpiar el estado local silenciosamente (el trader lo hará en su propio ciclo)
+                    logger.info(
+                        f"[{symbol}] KS watchdog: estado local dice 'posición abierta' pero "
+                        f"NO hay posición en Hyperliquid — estado local stale, skip state_mismatch."
+                    )
+                    continue
+
+                # Hay posición real en el exchange Y _protection_ok es False → mismatch real
+                await self.on_state_mismatch(symbol)
+                logger.warning(f"[{symbol}] ⚠️ Watchdog: posición sin protección detectada (confirmado en exchange)")
+
             except Exception as e:
                 logger.debug(f"KS watchdog tick error [{symbol}]: {e}")
 
