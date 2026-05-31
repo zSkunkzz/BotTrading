@@ -5,8 +5,8 @@ Autenticación soportada:
   Opción A (recomendada): API Key de agente
     - HL_API_PRIVATE_KEY     : private key del wallet AGENTE generado en app.hyperliquid.xyz
     - HL_API_WALLET_ADDRESS  : dirección del wallet PRINCIPAL (el que tiene fondos y aprobó el agente)
-    Las órdenes se firman con la clave del agente. En modo agente el action_hash
-    DEBE incluir vault_address=master_addr para que la firma sea válida.
+    Las órdenes se firman con la clave del agente. El action_hash INCLUYE master_addr
+    como vault_address (igual que SDK oficial). Sin esto la firma es inválida.
 
   Opción B: Private key directa
     - HL_PRIVATE_KEY         : private key del wallet principal
@@ -65,7 +65,7 @@ _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https
 # Rate limiter global para llamadas REST a /info (compartido entre todos los traders)
 _HL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
-_HL_MIN_INTERVAL = 0.35   # máx ~3 req/s compartido — suficiente para 15 traders sin 429s
+_HL_MIN_INTERVAL = 0.35   # máx ~3 req/s compartido
 
 async def _hl_throttle():
     """Espera el mínimo intervalo entre llamadas REST a Hyperliquid para evitar 429."""
@@ -78,7 +78,7 @@ async def _hl_throttle():
         _HL_LAST_CALL = time.monotonic()
 
 
-# ── Helpers de signing (alineados con hyperliquid-python-sdk/signing.py) ──────
+# ── Helpers de signing — idénticos a hyperliquid-python-sdk/signing.py v0.23.0 ──
 
 def _float_to_wire(x: float) -> str:
     """Convierte float a string sin notación científica, como exige Hyperliquid."""
@@ -98,9 +98,9 @@ def _address_to_bytes(address: str) -> bytes:
 def _action_hash(action: dict, vault_address: Optional[str], nonce: int,
                  expires_after: Optional[int] = None) -> bytes:
     """
-    Hash canónico de una acción L1 según el SDK oficial.
-    IMPORTANTE: msgpack.packb SIN use_bin_type, igual que el SDK oficial.
-    Con use_bin_type=True las strings se serializan diferente → hash incorrecto → firma inválida.
+    Hash canónico de una acción L1.
+    - msgpack.packb SIN opciones adicionales (igual que SDK oficial).
+      use_bin_type=True cambiaría la serialización → hash distinto → firma inválida.
     """
     data = msgpack.packb(action)   # ← sin use_bin_type, idéntico al SDK oficial
     data += nonce.to_bytes(8, "big")
@@ -120,7 +120,6 @@ def _phantom_agent(hash_bytes: bytes, is_mainnet: bool) -> dict:
 
 
 def _l1_payload(phantom_agent: dict) -> dict:
-    """Estructura EIP-712 que usa el SDK para firmar acciones L1 (órdenes, cancel, leverage, etc.)."""
     return {
         "domain": {
             "chainId": 1337,
@@ -149,15 +148,14 @@ def _sign_l1_action(private_key: str, action: dict, vault_address: Optional[str]
                     nonce: int, is_mainnet: bool,
                     expires_after: Optional[int] = None) -> dict:
     """
-    Firma una acción L1 (order, cancel, updateLeverage, etc.) exactamente como
-    lo hace el SDK oficial de Hyperliquid.
+    Firma una acción L1 igual que sign_l1_action() del SDK oficial.
     """
-    wallet    = Account.from_key(private_key)
-    h         = _action_hash(action, vault_address, nonce, expires_after)
-    agent     = _phantom_agent(h, is_mainnet)
-    data      = _l1_payload(agent)
+    wallet     = Account.from_key(private_key)
+    h          = _action_hash(action, vault_address, nonce, expires_after)
+    agent      = _phantom_agent(h, is_mainnet)
+    data       = _l1_payload(agent)
     structured = encode_typed_data(full_message=data)
-    signed    = wallet.sign_message(structured)
+    signed     = wallet.sign_message(structured)
     return {"r": to_hex(signed["r"]), "s": to_hex(signed["s"]), "v": signed["v"]}
 
 
@@ -185,15 +183,27 @@ class FuturesTrader:
         api_wallet = os.getenv("HL_API_WALLET_ADDRESS", "").strip()
 
         if api_pk:
-            self._private_key       = api_pk
-            self._agent_mode        = True
-            agent_acct = Account.from_key(api_pk)
-            self._agent_addr        = agent_acct.address
-            self._master_addr       = api_wallet if api_wallet else self._agent_addr
-            self._account_addr      = self._master_addr
+            # Opción A: API key de agente
+            # HL_API_WALLET_ADDRESS DEBE estar configurada con la dirección del wallet master.
+            # Si no está, se usa la del agente (funcionará solo si el agente == master,
+            # lo que no es el caso habitual).
+            self._private_key  = api_pk
+            self._agent_mode   = True
+            agent_acct         = Account.from_key(api_pk)
+            self._agent_addr   = agent_acct.address
+            self._master_addr  = api_wallet if api_wallet else self._agent_addr
+            self._account_addr = self._master_addr
+            if not api_wallet:
+                logger.warning(
+                    "[%s] HL_API_WALLET_ADDRESS no configurada en modo agente. "
+                    "Usando dirección del agente como master. "
+                    "Si el agente no es el wallet principal, las órdenes fallarán.",
+                    symbol
+                )
             logger.info("[%s] Auth: API key agente → agente=%s master=%s",
                         symbol, self._agent_addr[:10] + "...", self._master_addr[:10] + "...")
         else:
+            # Opción B: private key directa del wallet principal
             pk = os.getenv("HL_PRIVATE_KEY", api_secret or "").strip()
             self._private_key  = pk
             self._account_addr = os.getenv("HL_ACCOUNT_ADDR", "").strip()
@@ -255,19 +265,28 @@ class FuturesTrader:
                 return _json.loads(await r.text())
 
     async def _exchange_post(self, action: dict) -> dict:
-        """POST autenticado a /exchange con firma EIP-712 L1."""
+        """
+        POST autenticado a /exchange con firma EIP-712 L1.
+
+        Modo agente (HL_API_PRIVATE_KEY):
+          vault_address = master_addr  ← siempre, igual que SDK oficial.
+          El SDK no hace ninguna comparación agente vs master: simplemente
+          pasa active_pool (= master_addr) al action_hash y al payload REST.
+
+        Modo directo (HL_PRIVATE_KEY):
+          vault_address = None
+        """
         if not self._private_key:
             raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
 
         nonce      = int(time.time() * 1000)
         is_mainnet = not _USE_TESTNET
 
-        # En modo agente, vault_address = master_addr para que Hyperliquid verifique
-        # que el agente está autorizado por ese master.
-        if self._agent_mode and self._agent_addr.lower() != self._master_addr.lower():
-            vault_address = self._master_addr
-        else:
-            vault_address = None
+        # SDK oficial: en agent mode, vault_address = master_addr SIEMPRE.
+        # Condición anterior (agent_addr != master_addr) era incorrecta:
+        # si HL_API_WALLET_ADDRESS no estaba configurada, master==agent y
+        # vault_address quedaba None → hash incorrecto → firma inválida.
+        vault_address = self._master_addr if self._agent_mode else None
 
         signature = _sign_l1_action(
             private_key=self._private_key,
@@ -283,6 +302,7 @@ class FuturesTrader:
             "signature": signature,
         }
 
+        # vaultAddress en el payload REST solo cuando hay agente
         if vault_address is not None:
             payload["vaultAddress"] = vault_address
 
@@ -326,7 +346,7 @@ class FuturesTrader:
             balance_svc.init_hl(self._master_addr, self._info_post)
 
         await self._set_leverage(self.leverage)
-        logger.info("[%s] Trader Hyperliquid iniciado | coin=%s | addr=%s | agent=%s",
+        logger.info("[%s] Trader Hyperliquid iniciado | coin=%s | addr=%s | agent_mode=%s",
                     self.symbol, self.coin, self._account_addr[:10] + "...", self._agent_mode)
 
     # ── Precio y OHLCV ──────────────────────────────────────────────────
@@ -407,8 +427,7 @@ class FuturesTrader:
         if r.get("status") == "ok":
             logger.debug("[%s] Leverage %sx OK (cross=%s)", self.symbol, leverage, is_cross)
         else:
-            logger.debug("[%s] set_leverage no aplicable (cuenta normal, no vault): %s",
-                         self.symbol, r)
+            logger.debug("[%s] set_leverage respuesta: %s", self.symbol, r)
 
     # ── Órdenes ─────────────────────────────────────────────────────────
 
