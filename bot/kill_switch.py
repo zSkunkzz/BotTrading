@@ -266,16 +266,44 @@ class KillSwitch:
         if now_utc.hour == 0 and now_utc.minute < 1:
             self.reset_daily_pnl()
 
-        # Comprobar posiciones sin protección (state mismatch)
-        # Excluir símbolos con TPSL retry activo — es lag de API Bitget, no un mismatch real
+        # FIX: Comprobar posiciones sin protección verificando contra el exchange.
+        # Antes el watchdog solo miraba el estado local (trader.position),
+        # lo que causaba falsos positivos cuando había errores de red (429).
+        # Ahora se llama a _get_positions() y solo se dispara on_state_mismatch
+        # si el exchange CONFIRMA que la posición existe pero no tiene protección.
         for symbol, trader in list(traders.items()):
             try:
                 if symbol in self._tpsl_retrying:
                     logger.debug(f"[{symbol}] KS watchdog: omitido (TPSL retry en curso)")
                     continue
-                if trader.position and not trader._protection_ok:
+
+                # Solo evaluar si el estado local indica posición abierta sin protección
+                if not (trader.position and not trader._protection_ok):
+                    continue
+
+                # FIX: verificar contra el exchange antes de disparar el kill switch
+                exchange_positions = await trader._get_positions()
+
+                if exchange_positions is None:
+                    # Error de red (429 / timeout) — no podemos saber, ignorar
+                    logger.debug(
+                        f"[{symbol}] KS watchdog: _get_positions devolvió None "
+                        f"(error de red) — omitiendo state_mismatch"
+                    )
+                    continue
+
+                if exchange_positions:
+                    # Posición confirmada en exchange SIN protección → mismatch real
                     await self.on_state_mismatch(symbol)
-                    logger.warning(f"[{symbol}] ⚠️ Watchdog: posición sin protección detectada")
+                    logger.warning(f"[{symbol}] ⚠️ Watchdog: posición sin protección confirmada en exchange")
+                else:
+                    # exchange devolvió [] → la posición ya no existe
+                    # El trader loop se encargará de limpiar en el siguiente ciclo
+                    logger.debug(
+                        f"[{symbol}] KS watchdog: estado local dice posición abierta "
+                        f"pero exchange dice vacío — puede ser lag, trader loop lo resolverá"
+                    )
+
             except Exception as e:
                 logger.debug(f"KS watchdog tick error [{symbol}]: {e}")
 

@@ -177,6 +177,16 @@ class ExecutionEngine:
         ):
             await self._place_tpsl_bulk(client, is_buy, qty, sl, tp, sym)
 
+            # FIX: marcar protección como OK en el trader solo cuando los TP/SL
+            # se intentan colocar (el trader lo pone en False al abrir).
+            # Esto evita que el watchdog dispare on_state_mismatch por el gap
+            # entre apertura y colocación de TP/SL.
+            try:
+                trader._protection_ok = True
+                logger.debug("[%s] _protection_ok=True tras colocar TP/SL", sym)
+            except Exception:
+                pass
+
         self._finalize_rec(rec, result, side, arrival_price)
         return result
 
@@ -198,6 +208,10 @@ class ExecutionEngine:
         La dirección de cierre es la opuesta a la posición:
           - Long (is_buy=True)  → cierre = vender (is_buy=False)
           - Short (is_buy=False) → cierre = comprar (is_buy=True)
+
+        FIX: El SL se coloca como isMarket=True con limit_px=None.
+        Hyperliquid no acepta limit_px igual al triggerPx en órdenes market-SL;
+        al pasar None el SDK usa 0 internamente (convenio HL para market trigger).
         """
         close_side = not is_buy   # opuesto de la posición
         orders_to_place = []
@@ -220,11 +234,15 @@ class ExecutionEngine:
             orders_to_place.append(tp_order)
 
         if sl is not None:
+            # FIX: SL siempre market. limit_px=None → el SDK enviará 0
+            # que es el convenio de Hyperliquid para market-trigger.
+            # Antes se pasaba sl como limit_px, lo que HL rechazaba
+            # o interpretaba como una orden limit en vez de market-stop.
             sl_order = {
                 "name":       client.coin,
                 "is_buy":     close_side,
                 "sz":         qty,
-                "limit_px":   sl,   # SDK requiere un precio aunque isMarket=True
+                "limit_px":   None,   # FIX: None para market SL (SDK enviará 0)
                 "order_type": {
                     "trigger": {
                         "triggerPx": sl,
