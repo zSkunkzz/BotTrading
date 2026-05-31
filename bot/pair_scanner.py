@@ -1,168 +1,178 @@
+"""
+pair_scanner.py — Escáner de pares para Hyperliquid perpetuos.
+
+Hyperliquid solo tiene perpetuos USDT (todos contra USD sintético).
+La API /info con type="metaAndAssetCtxs" devuelve todos los mercados
+y sus métricas en tiempo real (volumen, funding, precio).
+
+No se requieren credenciales — es un endpoint público de lectura.
+
+Formato de símbolo devuelto: nombre corto de coin ("BTC", "ETH", "SOL")
+Compatible con ws_feed.py y trader.py que normalizan internamente.
+"""
 import logging
 import asyncio
 import os
-import ccxt.async_support as ccxt
+import aiohttp
+import json as _json
 
 logger = logging.getLogger("PairScanner")
 
-# Activos NO-crypto: acciones tokenizadas, ETFs, commodities, índices, metales preciosos
-# Bitget los lista como swaps pero su comportamiento es distinto al de criptomonedas
+# Activos no-crypto o con comportamiento distinto
 NON_CRYPTO_BASES = {
-    # Acciones tech
     "AAPL", "TSLA", "NVDA", "AMZN", "GOOGL", "META", "MSFT", "NFLX",
-    "AMD", "INTC", "MU", "SNDK", "QCOM", "AVGO", "CRM", "ORCL",
-    # Commodities
-    "CL", "GC", "SI", "NG", "HG", "ZC", "ZW", "ZS",
-    # Metales preciosos (futuros de oro/plata — comportamiento distinto)
+    "AMD", "INTC", "MU", "QCOM", "AVGO", "CRM", "ORCL",
+    "CL", "GC", "SI", "NG", "HG",
     "XAU", "XAG", "XAUT",
-    # Índices
     "SPX", "NDX", "DJI", "VIX",
-    # Acciones variadas
-    "COIN", "MSTR", "MARA", "RIOT", "BSB", "GME", "AMC",
-    "ABNB", "UBER", "LYFT", "SNAP", "PINS", "TWTR",
+    "COIN", "MSTR", "MARA", "RIOT",
 }
 
+_USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
+_API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
-def _normalize_symbol(symbol: str, markets: dict) -> str:
-    """
-    Garantiza que el símbolo sea siempre en formato ccxt estándar BASE/USDT:USDT.
-    Si viene como 'FFUSDT' o 'BTCUSDT', lo convierte al formato correcto
-    buscando en los mercados cargados. Si ya está en formato estándar, lo
-    devuelve sin cambios.
-    """
-    if symbol in markets:
-        return symbol
-    # Intentar construir el formato estándar a partir del símbolo comprimido
-    # Ej: FFUSDT -> base=FF, FF/USDT:USDT
-    if symbol.endswith("USDT"):
-        base = symbol[:-4]  # quitar 'USDT' del final
-        candidate = f"{base}/USDT:USDT"
-        if candidate in markets:
-            return candidate
-    return symbol
+
+async def _info_post(payload: dict) -> dict:
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            f"{_API_URL}/info",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            return _json.loads(await r.text())
 
 
 class PairScanner:
     """
-    Escanea en tiempo real todos los pares USDT de futuros perpetuos en Bitget.
-    Filtra por volumen, volatilidad y tendencia para elegir los mejores.
-    Solo opera pares crypto puros — excluye acciones tokenizadas, commodities
-    y metales preciosos (XAU, XAG, XAUT).
-    Se refresca cada X minutos para detectar pares nuevos automáticamente.
-    IMPORTANTE: todos los símbolos devueltos están en formato ccxt estándar
-    (BASE/USDT:USDT) para evitar traders duplicados.
+    Escanea pares USDT perpetuos de Hyperliquid.
+    Filtra por volumen 24h y volatilidad (% cambio).
+    Devuelve nombres cortos de coin: "BTC", "ETH", "SOL"...
     """
 
-    def __init__(self, api_key, api_secret, passphrase,
-                 min_volume_usdt=20_000_000,
-                 min_price_change_pct=1.5,
-                 top_n=15,
-                 refresh_interval_min=30):
-        self.exchange = ccxt.bitget({
-            "apiKey": api_key,
-            "secret": api_secret,
-            "password": passphrase,
-            "options": {"defaultType": "swap"},
-        })
-        self.min_volume_usdt = min_volume_usdt
+    def __init__(
+        self,
+        api_key=None, api_secret=None, passphrase=None,   # ignorados, compatibilidad
+        min_volume_usdt=5_000_000,
+        min_price_change_pct=1.5,
+        top_n=15,
+        refresh_interval_min=30,
+    ):
+        self.min_volume_usdt      = min_volume_usdt
         self.min_price_change_pct = min_price_change_pct
-        self.top_n = top_n
-        self.refresh_interval = refresh_interval_min * 60
-        self.active_pairs: list = []
-        self._markets: dict = {}  # cache de mercados para normalización
-        # Blacklist adicional configurable via .env
-        # Ej: SYMBOL_BLACKLIST=ZEC,BSB,MU
+        self.top_n                = top_n
+        self.refresh_interval     = refresh_interval_min * 60
+        self.active_pairs: list   = []
+
         extra = os.getenv("SYMBOL_BLACKLIST", "")
         self.blacklist = NON_CRYPTO_BASES | {
             s.strip().upper() for s in extra.split(",") if s.strip()
         }
 
-    def _is_crypto_pair(self, symbol: str, market: dict) -> bool:
-        """Devuelve True solo si el par es crypto pura, no accion/commodity/metal"""
-        base = market.get("base", "").upper()
-        if base in self.blacklist:
+        # Stub: exchange attr para compatibilidad con main.py (fetch_ticker)
+        self.exchange = _HLExchangeStub()
+
+    def _is_valid(self, coin: str) -> bool:
+        if coin.upper() in self.blacklist:
             return False
-        if len(base) < 2 or len(base) > 10:
+        if len(coin) < 2 or len(coin) > 12:
             return False
         return True
 
-    async def get_all_usdt_perp_pairs(self) -> list:
-        markets = await self.exchange.load_markets(reload=True)
-        self._markets = markets  # guardar para normalización posterior
-        pairs = [
-            s for s, m in markets.items()
-            if m.get("quote") == "USDT"
-            and m.get("type") == "swap"
-            and m.get("active", True)
-            and not m.get("expiry")
-            and self._is_crypto_pair(s, m)
-        ]
-        logger.info(f"📋 Pares USDT perp crypto disponibles: {len(pairs)}")
-        return pairs
-
-    async def score_pair(self, symbol: str) -> dict | None:
-        try:
-            ticker = await self.exchange.fetch_ticker(symbol)
-            volume_usdt = float(ticker.get("quoteVolume") or 0)
-            change_pct = abs(float(ticker.get("percentage") or 0))
-            last = float(ticker.get("last") or 0)
-            if volume_usdt < self.min_volume_usdt:
-                return None
-            if change_pct < self.min_price_change_pct:
-                return None
-            if last <= 0:
-                return None
-            score = (volume_usdt / 1_000_000) * 0.6 + change_pct * 0.4
-            return {
-                "symbol": symbol,  # ya en formato estándar (viene de get_all_usdt_perp_pairs)
-                "volume_usdt": round(volume_usdt / 1_000_000, 2),
-                "change_pct": round(change_pct, 2),
-                "last_price": last,
-                "score": round(score, 3),
-            }
-        except Exception:
-            return None
-
     async def scan(self) -> list:
-        all_pairs = await self.get_all_usdt_perp_pairs()
+        """Devuelve lista de coins (ej: ["BTC", "ETH", "SOL"]) ordenada por score."""
+        try:
+            data = await _info_post({"type": "metaAndAssetCtxs"})
+        except Exception as e:
+            logger.error("[PairScanner] Error fetching metaAndAssetCtxs: %s", e)
+            return []
+
+        universe = data[0].get("universe", []) if isinstance(data, list) and data else []
+        ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
+
         scored = []
-        batch_size = 20
-        for i in range(0, len(all_pairs), batch_size):
-            batch = all_pairs[i:i + batch_size]
-            results = await asyncio.gather(*[self.score_pair(s) for s in batch])
-            scored.extend([r for r in results if r])
-            await asyncio.sleep(0.5)
+        for i, meta in enumerate(universe):
+            coin = meta.get("name", "")
+            if not self._is_valid(coin):
+                continue
+            ctx = ctxs[i] if i < len(ctxs) else {}
+
+            try:
+                day_volume   = float(ctx.get("dayNtlVlm",    0) or 0)   # volumen 24h en USDT
+                mark_px      = float(ctx.get("markPx",       0) or 0)
+                prev_day_px  = float(ctx.get("prevDayPx",    0) or mark_px)
+                funding      = float(ctx.get("funding",      0) or 0)
+                open_interest= float(ctx.get("openInterest", 0) or 0)
+            except (ValueError, TypeError):
+                continue
+
+            if day_volume < self.min_volume_usdt or mark_px <= 0:
+                continue
+
+            change_pct = abs((mark_px - prev_day_px) / prev_day_px * 100) if prev_day_px > 0 else 0.0
+            if change_pct < self.min_price_change_pct:
+                continue
+
+            score = (day_volume / 1_000_000) * 0.6 + change_pct * 0.4
+            scored.append({
+                "symbol":      coin,
+                "volume_usdt": round(day_volume / 1_000_000, 2),
+                "change_pct":  round(change_pct, 2),
+                "last_price":  mark_px,
+                "funding":     round(funding * 100, 5),
+                "oi_usdt":     round(open_interest * mark_px / 1_000_000, 2),
+                "score":       round(score, 3),
+            })
+
         scored.sort(key=lambda x: x["score"], reverse=True)
         top = scored[:self.top_n]
-        logger.info(f"🏆 Top {len(top)} pares crypto seleccionados:")
+
+        logger.info("🏆 Top %d pares Hyperliquid seleccionados:", len(top))
         for p in top[:5]:
             logger.info(
-                f"  {p['symbol']:<20} Vol: ${p['volume_usdt']}M | "
-                f"Cambio: {p['change_pct']}% | Score: {p['score']}"
+                "  %-12s Vol: $%sM | Cambio: %s%% | Score: %s",
+                p["symbol"], p["volume_usdt"], p["change_pct"], p["score"],
             )
-        # Los símbolos ya vienen en formato BASE/USDT:USDT desde get_all_usdt_perp_pairs
-        return [p["symbol"] for p in top]
+
+        self.active_pairs = [p["symbol"] for p in top]
+        return self.active_pairs
 
     def normalize(self, symbol: str) -> str:
-        """Normaliza un símbolo externo al formato ccxt estándar usando el cache de mercados."""
-        return _normalize_symbol(symbol, self._markets)
+        """Compatibilidad con main.py — Hyperliquid ya devuelve nombres cortos."""
+        return symbol.replace("/", "").replace(":USDT", "").replace("USDT", "").upper()
 
     async def run_scanner_loop(self, on_update_callback):
         while True:
             try:
-                logger.info("🔍 Re-escaneando mercado...")
+                logger.info("🔍 Re-escaneando mercado Hyperliquid...")
                 new_pairs = await self.scan()
-                added   = set(new_pairs) - set(self.active_pairs)
-                removed = set(self.active_pairs) - set(new_pairs)
+                added     = set(new_pairs) - set(self.active_pairs)
+                removed   = set(self.active_pairs) - set(new_pairs)
                 if added:
-                    logger.info(f"➕ Nuevos pares: {', '.join(added)}")
+                    logger.info("➕ Nuevos pares: %s", ", ".join(added))
                 if removed:
-                    logger.info(f"➖ Pares eliminados: {', '.join(removed)}")
+                    logger.info("➖ Pares eliminados: %s", ", ".join(removed))
                 self.active_pairs = new_pairs
                 await on_update_callback(new_pairs)
             except Exception as e:
-                logger.error(f"PairScanner error: {e}")
+                logger.error("PairScanner error: %s", e)
             await asyncio.sleep(self.refresh_interval)
 
     async def close(self):
-        await self.exchange.close()
+        pass
+
+
+class _HLExchangeStub:
+    """Stub mínimo para que main.py pueda llamar fetch_ticker sin crashear."""
+    async def fetch_ticker(self, symbol: str) -> dict:
+        """Consulta precio actual via /info allMids."""
+        try:
+            data = await _info_post({"type": "allMids"})
+            coin = symbol.replace("/USDT:USDT", "").replace("/USDT", "").replace("USDT", "")
+            mid  = data.get(coin, 0)
+            return {"last": float(mid), "quoteVolume": 0, "percentage": 0}
+        except Exception:
+            return {"last": 0, "quoteVolume": 0, "percentage": 0}
+
+    async def close(self):
+        pass

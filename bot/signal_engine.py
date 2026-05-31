@@ -7,16 +7,11 @@ Modos de entrada (se exporta entry_mode en SignalResult):
   NORMAL  score 6-7, todos los TF alineados                    → lev 8-14x
   STRONG  score 8+, confluencia máxima                         → lev 14-15x
 
-Cambios v2:
-  - EARLY ahora cubre score==5 con 3 TF alineados (antes se descartaba silenciosamente)
-  - Score==5 con 4h neutral O alineado → EARLY siempre que 1h+15m confirmen
-  - Log explícito cuando una señal queda en NONE (score, RR o modo)
-
-Cambios v3:
-  - ATR_MULT_SL, TP1_MULT, TP2_MULT, TP3_MULT y MIN_RR configurables por variables de entorno
-
-Cambios v4:
-  - MIN_SCORE y MIN_SCORE_FULL configurables por variables de entorno
+Compatible con Hyperliquid:
+  - ws_feed.get_ohlcv(coin, tf)         coin = "BTC" (sin USDT)
+  - ws_feed.get_orderbook_metrics(coin)
+  - ws_feed.get_funding_rate(coin)      → None (no disponible en WS; ver REST)
+  - Fallback REST usa trader._info_post candleSnapshot
 """
 
 from __future__ import annotations
@@ -55,6 +50,16 @@ EARLY_SIZE_RATIO = 0.5
 
 OB_IMBALANCE_THRESHOLD    = 0.15
 FUNDING_EXTREME_THRESHOLD = 0.0005
+
+
+def _norm_coin(symbol: str) -> str:
+    """BTC/USDT:USDT  BTCUSDT  BTC  → BTC"""
+    s = symbol.replace("/", "").replace(":USDT", "").upper()
+    if s.endswith("USDTUSDT"):
+        s = s[:-4]
+    if s.endswith("USDT"):
+        s = s[:-4]
+    return s
 
 
 @dataclass
@@ -106,27 +111,80 @@ class SignalResult:
         )
 
 
-async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataFrame:
-    try:
-        from bot.ws_feed import ws_feed
-        sym_clean = symbol.replace("/", "").replace(":USDT", "")
-        df = ws_feed.get_ohlcv(sym_clean, tf)
-        if not df.empty and len(df) >= 55:
-            log.debug(f"[OHLCV] {symbol} {tf} ← WS ({len(df)} velas)")
-            return df
-        log.debug(f"[OHLCV] {symbol} {tf} WS insuficiente ({len(df)} velas), usando REST")
-    except Exception as e:
-        log.debug(f"[OHLCV] {symbol} {tf} WS error: {e}, usando REST")
+async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
+    """Obtiene OHLCV vía REST Hyperliquid (candleSnapshot)."""
+    import time as _time
+    import aiohttp
+    import json as _json
 
+    _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
+    api_url      = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
+    tf_ms = {"15m": 15*60*1000, "1h": 60*60*1000, "4h": 4*60*60*1000}.get(tf, 15*60*1000)
+    now   = int(_time.time() * 1000)
+    start = now - limit * tf_ms
+    payload = {"type": "candleSnapshot", "req": {
+        "coin": coin, "interval": tf, "startTime": start, "endTime": now
+    }}
     try:
-        raw = await exch.fetch_ohlcv(symbol, tf, limit=limit)
-        df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{api_url}/info", json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                data = _json.loads(await r.text())
+        bars = [
+            [int(c["t"]), float(c["o"]), float(c["h"]),
+             float(c["l"]), float(c["c"]), float(c["v"])]
+            for c in data
+        ]
+        df = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        log.debug(f"[OHLCV] {symbol} {tf} ← REST ({len(df)} velas)")
         return df.set_index("ts").astype(float)
     except Exception as e:
-        log.warning(f"[OHLCV] {symbol} {tf}: {e}")
+        log.warning("[OHLCV] %s %s REST HL error: %s", coin, tf, e)
         return pd.DataFrame()
+
+
+async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataFrame:
+    """
+    Obtiene OHLCV intentando en orden:
+      1. ws_feed (datos ya cacheados en memoria)
+      2. REST Hyperliquid candleSnapshot
+      3. ccxt exchange (si existe y es hiperliquid)
+    """
+    coin = _norm_coin(symbol)
+
+    # 1. WS Feed (rápido, sin coste de red)
+    try:
+        from bot.ws_feed import ws_feed
+        df = ws_feed.get_ohlcv(coin, tf)
+        if not df.empty and len(df) >= 55:
+            log.debug("[OHLCV] %s %s ← WS (%d velas)", coin, tf, len(df))
+            return df
+        log.debug("[OHLCV] %s %s WS insuficiente (%d velas)", coin, tf, len(df))
+    except Exception as e:
+        log.debug("[OHLCV] %s %s WS error: %s", coin, tf, e)
+
+    # 2. REST Hyperliquid
+    df = await _fetch_ohlcv_hl(coin, tf, limit)
+    if not df.empty and len(df) >= 55:
+        log.debug("[OHLCV] %s %s ← REST HL (%d velas)", coin, tf, len(df))
+        return df
+
+    # 3. Fallback ccxt (si exch está disponible)
+    if exch is not None:
+        try:
+            # ccxt hyperliquid usa coin directamente como symbol
+            raw = await exch.fetch_ohlcv(coin, tf, limit=limit)
+            df  = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            log.debug("[OHLCV] %s %s ← ccxt (%d velas)", coin, tf, len(df))
+            return df.set_index("ts").astype(float)
+        except Exception as e:
+            log.warning("[OHLCV] %s %s ccxt: %s", coin, tf, e)
+
+    return pd.DataFrame()
 
 
 def _supertrend_dir(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> int:
@@ -149,8 +207,8 @@ def _supertrend_dir(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> in
             atr[i] = (atr[i - 1] * (period - 1) + tr_full[i]) / period
 
         hl2 = (h + l) / 2.0
-        ub  = hl2 + mult * atr
-        lb  = hl2 - mult * atr
+        ub   = hl2 + mult * atr
+        lb   = hl2 - mult * atr
 
         st_arr    = np.full(len(c), np.nan)
         trend_arr = np.ones(len(c), dtype=int)
@@ -216,7 +274,7 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
         s["macd"] = 0
 
     try:
-        bb = ta_lib.volatility.BollingerBands(c, window=20, window_dev=2)
+        bb   = ta_lib.volatility.BollingerBands(c, window=20, window_dev=2)
         mid  = bb.bollinger_mavg().iloc[-1]
         pmid = bb.bollinger_mavg().iloc[-2]
         bbu  = bb.bollinger_hband().iloc[-1]
@@ -294,27 +352,19 @@ def _apply_microstructure(
     if ob_metrics and isinstance(ob_metrics, dict):
         imbalance = ob_metrics.get("imbalance", 0.0)
         ob_imbalance_val = imbalance
-        if direction == "LONG"  and imbalance >  OB_IMBALANCE_THRESHOLD:
-            bonus += 1
-        elif direction == "SHORT" and imbalance < -OB_IMBALANCE_THRESHOLD:
-            bonus += 1
-        elif direction == "LONG"  and imbalance < -OB_IMBALANCE_THRESHOLD:
-            bonus -= 1
-        elif direction == "SHORT" and imbalance >  OB_IMBALANCE_THRESHOLD:
-            bonus -= 1
+        if direction == "LONG"  and imbalance >  OB_IMBALANCE_THRESHOLD: bonus += 1
+        elif direction == "SHORT" and imbalance < -OB_IMBALANCE_THRESHOLD: bonus += 1
+        elif direction == "LONG"  and imbalance < -OB_IMBALANCE_THRESHOLD: bonus -= 1
+        elif direction == "SHORT" and imbalance >  OB_IMBALANCE_THRESHOLD: bonus -= 1
 
     if funding_rate is not None:
         fr_val = funding_rate
         if direction == "LONG":
-            if funding_rate > FUNDING_EXTREME_THRESHOLD:
-                bonus -= 1
-            elif funding_rate < -FUNDING_EXTREME_THRESHOLD:
-                bonus += 1
+            if funding_rate >  FUNDING_EXTREME_THRESHOLD: bonus -= 1
+            elif funding_rate < -FUNDING_EXTREME_THRESHOLD: bonus += 1
         else:
-            if funding_rate < -FUNDING_EXTREME_THRESHOLD:
-                bonus -= 1
-            elif funding_rate > FUNDING_EXTREME_THRESHOLD:
-                bonus += 1
+            if funding_rate < -FUNDING_EXTREME_THRESHOLD: bonus -= 1
+            elif funding_rate >  FUNDING_EXTREME_THRESHOLD: bonus += 1
 
     adjusted = max(0, score + bonus)
     return adjusted, ob_imbalance_val, fr_val
@@ -346,25 +396,26 @@ def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction:
         ratio   = min(quality / 6.0, 1.0)
         lev     = round(LEV_EARLY_MIN + ratio * (LEV_EARLY_MAX - LEV_EARLY_MIN))
         log.debug(
-            f"[signal] EARLY activado — score={score}, 1h={tf1h_aligned}, 15m={tf15_aligned}, "
-            f"quality={quality}, lev={lev}x"
+            "[signal] EARLY — score=%d, 1h=%d, 15m=%d, quality=%d, lev=%dx",
+            score, tf1h_aligned, tf15_aligned, quality, lev,
         )
         return "EARLY", lev, EARLY_SIZE_RATIO
 
     log.debug(
-        f"[signal] NONE — score={score}, 1h_aligned={tf1h_aligned}, "
-        f"15m_aligned={tf15_aligned} (señal descartada)"
+        "[signal] NONE — score=%d, 1h_aligned=%d, 15m_aligned=%d (descartado)",
+        score, tf1h_aligned, tf15_aligned,
     )
     return "NONE", 1, 0.0
 
 
 async def analyze_pair(exch, symbol: str) -> SignalResult:
-    result = SignalResult(symbol=symbol)
+    coin   = _norm_coin(symbol)
+    result = SignalResult(symbol=coin)
 
     try:
-        df15 = await _fetch_ohlcv(exch, symbol, "15m", 200)
-        df1h = await _fetch_ohlcv(exch, symbol, "1h",  200)
-        df4h = await _fetch_ohlcv(exch, symbol, "4h",  200)
+        df15 = await _fetch_ohlcv(exch, coin, "15m", 200)
+        df1h = await _fetch_ohlcv(exch, coin, "1h",  200)
+        df4h = await _fetch_ohlcv(exch, coin, "4h",  200)
 
         if df15.empty or len(df15) < 55:
             result.error = "Datos insuficientes 15m"
@@ -381,11 +432,10 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         funding_rate = None
         try:
             from bot.ws_feed import ws_feed
-            sym_clean    = symbol.replace("/", "").replace(":USDT", "")
-            ob_metrics   = ws_feed.get_orderbook_metrics(sym_clean)
-            funding_rate = ws_feed.get_funding_rate(sym_clean)
+            ob_metrics   = ws_feed.get_orderbook_metrics(coin)
+            funding_rate = ws_feed.get_funding_rate(coin)
         except Exception as e:
-            log.debug(f"[signal_engine] microestructura no disponible: {e}")
+            log.debug("[signal_engine] microestructura no disponible: %s", e)
 
         score, ob_imbalance_val, fr_val = _apply_microstructure(
             score_base, direction, ob_metrics, funding_rate
@@ -398,8 +448,8 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
 
         if mode == "NONE":
             log.info(
-                f"[signal_engine] {symbol} descartado — score={score}/12, "
-                f"modo=NONE, dir={direction}"
+                "[signal_engine] %s descartado — score=%d/12, modo=NONE, dir=%s",
+                coin, score, direction,
             )
             return result
 
@@ -431,8 +481,8 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
 
         if rr < MIN_RR:
             log.info(
-                f"[signal_engine] {symbol} descartado — R/R {rr:.2f} < {MIN_RR} "
-                f"(score={score}, modo={mode})"
+                "[signal_engine] %s descartado — R/R %.2f < %.1f (score=%d, modo=%s)",
+                coin, rr, MIN_RR, score, mode,
             )
             return result
 
@@ -452,7 +502,7 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
 
     except Exception as e:
         result.error = str(e)
-        log.error(f"[signal_engine] {symbol}: {e}")
+        log.error("[signal_engine] %s: %s", coin, e)
 
     return result
 

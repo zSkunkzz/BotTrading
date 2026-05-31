@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BitgetProBot v5.4 — IA + Scanner + Telegram + Webhook + Balance Service + Kill Switch"""
+"""HyperliquidBot v1.0 — IA + Scanner + Telegram + Webhook + Balance Service + Kill Switch"""
 
 import asyncio
 import logging
@@ -23,14 +23,7 @@ logger = setup_logger()
 
 active_traders: dict = {}
 global_risk: GlobalRisk = None
-
-# Mapa símbolo → instancia FuturesTrader (para el webhook y el watchdog)
 _trader_instances: dict = {}
-
-
-def _sym_clean(symbol: str) -> str:
-    """Convierte BTC/USDT:USDT o BTCUSDTUSDT → BTCUSDT (formato WS feed)."""
-    return symbol.replace("/", "").replace(":USDT", "").replace("USDTUSDT", "USDT")
 
 
 def make_risk():
@@ -47,25 +40,22 @@ def make_risk():
 
 
 async def _start_single_pair(symbol: str):
+    """Arranca un trader para el símbolo dado (nombre corto de coin: 'BTC', 'ETH')."""
     if symbol in active_traders:
         return
-    logger.info(f"🚀 Iniciando trader: {symbol}")
+    logger.info("🚀 Iniciando trader: %s", symbol)
     trader = FuturesTrader(
-        api_key=os.getenv("BITGET_API_KEY"),
-        api_secret=os.getenv("BITGET_API_SECRET"),
-        passphrase=os.getenv("BITGET_PASSPHRASE"),
+        api_key=None,
+        api_secret=os.getenv("HL_PRIVATE_KEY"),
+        passphrase=None,
         symbol=symbol,
         leverage=int(os.getenv("LEVERAGE", "5")),
         margin_mode=os.getenv("MARGIN_MODE", "isolated"),
         dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
     )
-    # Registrar instancia para el webhook y el watchdog
     _trader_instances[symbol] = trader
     register_traders(_trader_instances)
-
-    task = asyncio.create_task(
-        trader.run(make_risk(), global_risk=global_risk)
-    )
+    task = asyncio.create_task(trader.run(make_risk(), global_risk=global_risk))
     active_traders[symbol] = task
 
 
@@ -80,39 +70,42 @@ async def stop_pair(symbol: str):
     _trader_instances.pop(symbol, None)
     register_traders(_trader_instances)
     task.cancel()
-    logger.info(f"⏹ Trader detenido: {symbol}")
+    logger.info("⏹ Trader detenido: %s", symbol)
 
 
 async def on_pairs_updated(new_pairs: list):
     current = set(active_traders.keys())
     updated = set(new_pairs)
-    added = updated - current
+    added   = updated - current
     removed = current - updated
 
     if added:
-        # Añadir nuevos símbolos al WS feed antes de arrancar los traders
-        ws_feed.update_symbols([_sym_clean(s) for s in added])
+        ws_feed.update_symbols(list(added))
         await start_traders_staggered(list(added), _start_single_pair, delay=2.0)
 
     for sym in removed:
         await stop_pair(sym)
 
     await notify_scanner_update(added, removed, len(active_traders))
-    logger.info(f"📊 Traders activos: {len(active_traders)}")
+    logger.info("📊 Traders activos: %d", len(active_traders))
 
 
 async def main():
     global global_risk
 
     logger.info("=" * 60)
-    logger.info("  BitgetProBot v5.4 — IA + Scanner + Telegram + Webhook + KS")
+    logger.info("  HyperliquidBot v1.0 — IA + Scanner + Telegram + KS")
     logger.info("=" * 60)
 
-    # ── Inicializar servicio de balance (singleton, una sola vez) ──────────
-    balance_svc.init(
-        os.getenv("BITGET_API_KEY"),
-        os.getenv("BITGET_API_SECRET"),
-        os.getenv("BITGET_PASSPHRASE")
+    # ── Balance service ────────────────────────────────────────────────────
+    hl_addr = os.getenv("HL_ACCOUNT_ADDR", "")
+    if not hl_addr and os.getenv("HL_PRIVATE_KEY"):
+        import eth_account
+        hl_addr = eth_account.Account.from_key(os.getenv("HL_PRIVATE_KEY")).address
+        logger.info("🔑 Dirección derivada de HL_PRIVATE_KEY: %s", hl_addr[:12] + "...")
+    balance_svc.init_hl(
+        addr=hl_addr,
+        testnet=os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes"),
     )
     logger.info("✅ Balance service inicializado")
 
@@ -121,64 +114,55 @@ async def main():
         max_global_daily_loss_pct=float(os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")),
     )
 
-    # Arrancar webhook server en paralelo
     webhook_runner = await start_webhook_server()
 
     scanner = PairScanner(
-        api_key=os.getenv("BITGET_API_KEY"),
-        api_secret=os.getenv("BITGET_API_SECRET"),
-        passphrase=os.getenv("BITGET_PASSPHRASE"),
         min_volume_usdt=float(os.getenv("MIN_VOLUME_USDT", "5000000")),
         min_price_change_pct=float(os.getenv("MIN_CHANGE_PCT", "1.5")),
         top_n=int(os.getenv("TOP_PAIRS", "15")),
         refresh_interval_min=int(os.getenv("SCANNER_REFRESH_MIN", "30")),
     )
 
-    logger.info("🔍 Escaneando mercado inicial...")
+    logger.info("🔍 Escaneando mercado Hyperliquid inicial...")
     initial_pairs = await scanner.scan()
 
+    # Recopilar datos para el filtro IA
     scored_data = []
     for sym in initial_pairs:
         try:
             ticker = await scanner.exchange.fetch_ticker(sym)
             scored_data.append({
-                "symbol": sym,
+                "symbol":      sym,
                 "volume_usdt": round(float(ticker.get("quoteVolume") or 0) / 1e6, 2),
-                "change_pct": round(abs(float(ticker.get("percentage") or 0)), 2),
-                "score": 0,
+                "change_pct":  round(abs(float(ticker.get("percentage") or 0)), 2),
+                "score":       0,
             })
         except Exception:
-            pass
+            scored_data.append({"symbol": sym, "volume_usdt": 0, "change_pct": 0, "score": 0})
 
     logger.info("🤖 Filtrando con IA...")
-    ai_ranked = await ai_rank_pairs(scored_data)
-    top_n = int(os.getenv("TOP_PAIRS", "15"))
-
-    # Normalizar al formato estándar ccxt (BASE/USDT:USDT)
-    final_pairs = [scanner.normalize(sym) for sym in ai_ranked[:top_n]]
+    ai_ranked  = await ai_rank_pairs(scored_data)
+    top_n      = int(os.getenv("TOP_PAIRS", "15"))
+    final_pairs = [scanner.normalize(s) for s in ai_ranked[:top_n]]
 
     # Deduplicar preservando orden
     seen = set()
     final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
 
-    # Fallback: si IA devolvió lista vacía usar el scan inicial
     if not final_pairs:
         logger.warning("⚠️ ai_rank_pairs vacío → usando scanner directamente")
         final_pairs = initial_pairs[:top_n]
 
-    logger.info(f"✅ Pares finales ({len(final_pairs)}): {', '.join(final_pairs)}")
+    logger.info("✅ Pares finales (%d): %s", len(final_pairs), ", ".join(final_pairs))
 
-    # ── Arrancar WS feed antes que los traders ─────────────────────────
-    ws_symbols = [_sym_clean(s) for s in final_pairs]
-    ws_feed.start(ws_symbols)
-    logger.info(f"🔌 WS feed arrancado para {len(ws_symbols)} símbolos")
+    # ── Arrancar WS feed ──────────────────────────────────────────────────
+    ws_feed.start(final_pairs)
+    logger.info("🔌 WS feed arrancado para %d símbolos", len(final_pairs))
 
-    # Esperar mínimo 3s para que el WS haga snapshot inicial de candles
     await asyncio.sleep(3)
 
     await start_traders_staggered(final_pairs, _start_single_pair, delay=2.0)
 
-    # ── Commit 3: arrancar watchdog del kill switch ─────────────────────
     watchdog_task = asyncio.create_task(
         kill_switch.run_watchdog(_trader_instances)
     )
