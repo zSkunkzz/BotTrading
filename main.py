@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 from bot.risk import RiskManager
 from bot.trader import FuturesTrader
+import bot.trader_run_patch  # noqa: F401 — añade FuturesTrader.run()
 from bot.global_risk import GlobalRisk
 from bot.pair_scanner import PairScanner
 from bot.ai_filter import ai_rank_pairs
@@ -158,12 +159,8 @@ async def main():
     initial_pairs = await scanner.scan()
 
     # Construir scored_data directamente desde el resultado del scanner.
-    # El stub fetch_ticker siempre devolvía quoteVolume=0 y percentage=0,
-    # haciendo que ai_rank_pairs recibiera basura. Ahora usamos los datos
-    # reales que scanner.scan() ya calculó (volume_usdt, change_pct, score).
     scored_data = []
     for entry in getattr(scanner, "_last_scored", []):
-        # Si el scanner expone _last_scored úsalo; si no, construir stub con datos mínimos
         scored_data.append(entry)
 
     if not scored_data and initial_pairs:
