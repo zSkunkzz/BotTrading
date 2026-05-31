@@ -7,6 +7,8 @@ Flujo y coste IA:
   EARLY  (score 5)   → consulta IA si score >= AI_CALL_MIN_SCORE (default 6) → normalmente HOLD
   NORMAL (score 6-7) → confirma con IA
   NORMAL (score >=8) → confirma con IA; si IA dice HOLD y score>=8 → override técnico
+                       EXCEPCIÓN: si confidence de la IA >= AI_HIGH_CONFIDENCE_THRESHOLD,
+                       el HOLD de la IA se respeta aunque el score técnico sea alto.
   STRONG (score >=9) → entra directo, sin IA (máxima confluencia)
 
 Acciones válidas del bot:
@@ -15,11 +17,13 @@ Acciones válidas del bot:
   HOLD  → no hace nada (CLOSE de la IA se mapea a HOLD si no hay posición abierta)
 
 Variables de entorno:
-  MIN_SIGNAL_SCORE   (default: 5)    — mínimo para activar cualquier modo
-  MIN_RR_REQUIRED    (default: 1.8)
-  SKIP_AI_ON_STRONG  (default: true) — omite IA cuando modo=STRONG
-  AI_CALL_MIN_SCORE  (default: 6)    — score mínimo para llamar a la IA
-  AI_HOLD_OVERRIDE_SCORE (default: 8) — score a partir del cual se ignora HOLD de la IA
+  MIN_SIGNAL_SCORE             (default: 5)
+  MIN_RR_REQUIRED              (default: 1.8)
+  SKIP_AI_ON_STRONG            (default: true)
+  AI_CALL_MIN_SCORE            (default: 6)
+  AI_HOLD_OVERRIDE_SCORE       (default: 8)
+  AI_HIGH_CONFIDENCE_THRESHOLD (default: 8) — si la IA dice HOLD con confidence >= este valor,
+                                              el override técnico NO se ejecuta.
 """
 
 import logging
@@ -36,11 +40,12 @@ from bot.signal_engine import (
 
 log = logging.getLogger(__name__)
 
-MIN_SIGNAL_SCORE       = int(os.getenv("MIN_SIGNAL_SCORE",       "5"))
-MIN_RR_REQUIRED        = float(os.getenv("MIN_RR_REQUIRED",      "1.8"))
-SKIP_AI_ON_STRONG      = os.getenv("SKIP_AI_ON_STRONG",          "true").lower() != "false"
-AI_CALL_MIN_SCORE      = int(os.getenv("AI_CALL_MIN_SCORE",      "6"))
-AI_HOLD_OVERRIDE_SCORE = int(os.getenv("AI_HOLD_OVERRIDE_SCORE", "8"))
+MIN_SIGNAL_SCORE             = int(os.getenv("MIN_SIGNAL_SCORE",             "5"))
+MIN_RR_REQUIRED              = float(os.getenv("MIN_RR_REQUIRED",            "1.8"))
+SKIP_AI_ON_STRONG            = os.getenv("SKIP_AI_ON_STRONG",                "true").lower() != "false"
+AI_CALL_MIN_SCORE            = int(os.getenv("AI_CALL_MIN_SCORE",            "6"))
+AI_HOLD_OVERRIDE_SCORE       = int(os.getenv("AI_HOLD_OVERRIDE_SCORE",       "8"))
+AI_HIGH_CONFIDENCE_THRESHOLD = int(os.getenv("AI_HIGH_CONFIDENCE_THRESHOLD", "8"))
 
 
 async def decide(
@@ -142,9 +147,9 @@ async def decide(
     try:
         ai_result = await ai_decide_fn(
             symbol,
-            [],      # trades abiertos (no usados con context_override)
-            None,    # balance (no usado con context_override)
-            None,    # ticker (no usado con context_override)
+            [],
+            None,
+            None,
             signal.suggested_lev,
             context_override=context_override,
         )
@@ -160,21 +165,33 @@ async def decide(
     confidence = ai_result.get("confidence", 0)
     ai_reason  = ai_result.get("reason", ai_result.get("reasoning", ""))
 
-    # Normalizar acciones válidas:
-    # CLOSE mapeado a HOLD (no hay posición abierta que cerrar en este punto)
     if action not in ("BUY", "SELL"):
         action = "HOLD"
 
-    # Si la IA dice HOLD pero score técnico es alto → override técnico
+    # Override técnico: si la IA dice HOLD pero score alto → entramos
+    # EXCEPCIÓN: si la IA tiene alta confianza, respetamos su HOLD
     if action == "HOLD" and signal.score >= AI_HOLD_OVERRIDE_SCORE:
+        if confidence >= AI_HIGH_CONFIDENCE_THRESHOLD:
+            log.info(
+                f"[strategy] {symbol} 🛑 Override bloqueado: IA→HOLD con confidence={confidence}>={AI_HIGH_CONFIDENCE_THRESHOLD} "
+                f"(score técnico={signal.score} es alto pero IA muy segura)"
+            )
+            return _result(
+                "HOLD", signal, True,
+                f"🛑 HOLD respetado · IA alta confianza ({confidence}/10) bloqueó override técnico · "
+                f"score={signal.score}/{signal.max_score} | {ai_reason}",
+                ai_confidence=confidence,
+                ai_reason=ai_reason,
+            )
+
         override_action = "BUY" if signal.signal == "LONG" else "SELL"
         log.info(
-            f"[strategy] {symbol} 🔁 IA→HOLD pero score={signal.score}>={AI_HOLD_OVERRIDE_SCORE} "
+            f"[strategy] {symbol} 🔁 IA→HOLD (confidence={confidence}) pero score={signal.score}>={AI_HOLD_OVERRIDE_SCORE} "
             f"→ override técnico {override_action}"
         )
         return _result(
             override_action, signal, True,
-            f"🔁 Override técnico (score={signal.score}/{AI_HOLD_OVERRIDE_SCORE}) · IA dudó pero señal fuerte · "
+            f"🔁 Override técnico (score={signal.score}/{AI_HOLD_OVERRIDE_SCORE}) · IA dudó (conf={confidence}/10) · "
             f"lev {signal.suggested_lev}x | {ai_reason}",
             ai_confidence=confidence,
             ai_reason=ai_reason,

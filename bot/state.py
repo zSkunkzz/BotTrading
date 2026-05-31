@@ -1,8 +1,9 @@
 # ============================================================
 # bot/state.py  —  Persistencia de posiciones abiertas
-# Guarda/recupera estado en /tmp/bot_state.json
-# Para persistencia cross-deploy usa la variable de entorno
-# STATE_FILE=/data/bot_state.json (Railway Volume mount)
+#
+# Por defecto guarda en /tmp/bot_state.json (volátil en Railway).
+# Para persistencia cross-deploy DEBES montar un volumen en Railway
+# y configurar: STATE_FILE=/data/bot_state.json
 # ============================================================
 
 import json
@@ -13,6 +14,15 @@ from pathlib import Path
 logger = logging.getLogger("State")
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "/tmp/bot_state.json"))
+
+# Advertir en startup si el estado va a /tmp (se borra en cada deploy/restart)
+if str(STATE_FILE).startswith("/tmp"):
+    logger.warning(
+        "[State] ⚠️  STATE_FILE apunta a /tmp (%s). "
+        "El estado se perderá en cada restart/deploy de Railway. "
+        "Para persistencia real monta un volumen y configura STATE_FILE=/data/bot_state.json",
+        STATE_FILE,
+    )
 
 
 def _load_raw() -> dict:

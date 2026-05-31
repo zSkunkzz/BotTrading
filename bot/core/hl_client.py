@@ -41,9 +41,11 @@ _BASE_URL = (
 )
 
 # Slippage permitido para órdenes de mercado (0.5 % por defecto).
-# El SDK requiere un limit_px concreto incluso para isMarket=True;
-# usamos precio * (1 ± slippage) para garantizar fill sin rechazos.
 _MARKET_SLIPPAGE = float(os.getenv("HL_MARKET_SLIPPAGE", "0.005"))
+
+# Strings que devuelve HL en el campo orderType para trigger orders.
+# Se comparan en lowercase para evitar diferencias de capitalización entre versiones del SDK.
+_TRIGGER_ORDER_KEYWORDS = ("stop market", "stop limit", "take profit", "trigger")
 
 
 def _norm_coin(symbol: str) -> str:
@@ -81,13 +83,13 @@ class HLClient:
                     "y aprobó al agente en app.hyperliquid.xyz → Settings → API)."
                 )
             wallet               = Account.from_key(api_pk)
-            self._account_addr   = api_wallet          # master wallet (fondos)
-            self._agent_addr     = wallet.address      # agent wallet (firma)
+            self._account_addr   = api_wallet
+            self._agent_addr     = wallet.address
             self._agent_mode     = True
             self._exchange       = Exchange(
                 wallet=wallet,
                 base_url=_BASE_URL,
-                account_address=api_wallet,            # <── CLAVE: master addr para el SDK
+                account_address=api_wallet,
             )
             logger.info(
                 "[%s] HLClient (SDK) • modo agente | master=%s | agente=%s",
@@ -146,11 +148,8 @@ class HLClient:
 
         Args:
             ref_px: Precio de referencia actual (mid o last).
-                    Se usa para calcular el slippage limit_px que el SDK requiere:
                     compra  → ref_px * (1 + _MARKET_SLIPPAGE)
                     venta   → ref_px * (1 - _MARKET_SLIPPAGE)
-                    El exchange ejecuta al mejor precio disponible; el limit_px
-                    solo actúa como techo/suelo de protección.
         """
         slippage_px = round(
             ref_px * (1 + _MARKET_SLIPPAGE) if is_buy else ref_px * (1 - _MARKET_SLIPPAGE),
@@ -161,7 +160,7 @@ class HLClient:
             is_buy=is_buy,
             sz=sz,
             limit_px=slippage_px,
-            order_type={"limit": {"tif": "Ioc"}},  # IOC actúa como market en HL
+            order_type={"limit": {"tif": "Ioc"}},
             reduce_only=reduce_only,
         )
 
@@ -184,14 +183,12 @@ class HLClient:
             sz:         Cantidad a cerrar.
             trigger_px: Precio que activa la orden.
             limit_px:   Si se especifica → orden límite al activarse.
-                        Si es None → orden de mercado al activarse
-                        (limit_px se calcula con slippage automático).
+                        Si es None → orden de mercado (limit_px con slippage automático).
         """
         is_market = limit_px is None
         if is_market:
-            # TP de mercado: slippage en dirección favorable
             limit_px = round(
-                trigger_px * (1 - _MARKET_SLIPPAGE) if is_buy else trigger_px * (1 + _MARKET_SLIPPAGE),
+                trigger_px * (1 - _MARKET_SLIPPAGE) if not is_buy else trigger_px * (1 + _MARKET_SLIPPAGE),
                 6,
             )
         return self._exchange.order(
@@ -218,14 +215,13 @@ class HLClient:
         """
         Coloca un Stop Loss real en el exchange como trigger order de mercado.
 
-        Args:
-            is_buy:     False para cerrar long, True para cerrar short.
-            sz:         Cantidad a cerrar.
-            trigger_px: Precio que activa el SL (se ejecuta como mercado).
+        Slippage:
+            El limit_px es el precio PEOR CASO aceptable para el fill.
+            Cerrando long (is_buy=False, vendemos): limit_px = trigger * (1 - slippage)  [suelo]
+            Cerrando short (is_buy=True, compramos): limit_px = trigger * (1 + slippage)  [techo]
         """
-        # SL de mercado: slippage en dirección desfavorable (peor caso)
         slippage_px = round(
-            trigger_px * (1 - _MARKET_SLIPPAGE) if is_buy else trigger_px * (1 + _MARKET_SLIPPAGE),
+            trigger_px * (1 - _MARKET_SLIPPAGE) if not is_buy else trigger_px * (1 + _MARKET_SLIPPAGE),
             6,
         )
         return self._exchange.order(
@@ -247,10 +243,7 @@ class HLClient:
         self,
         orders: list[dict],
     ) -> dict:
-        """
-        Envía múltiples órdenes en una sola llamada a la API.
-        Cada dict tiene los mismos campos que exchange.order().
-        """
+        """Envía múltiples órdenes en una sola llamada a la API."""
         return self._exchange.bulk_orders(orders)
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -287,17 +280,25 @@ class HLClient:
         """
         Cancela todos los trigger orders (TP/SL) abiertos para este coin.
         Útil antes de colocar nuevos TP/SL o al cerrar posición manualmente.
+
+        Detección robusta: compara orderType en lowercase contra keywords conocidos
+        que HL devuelve ('stop market', 'stop limit', 'take profit', 'trigger').
+        Esto evita que diferencias de capitalización entre versiones del SDK
+        rompan la detección.
         """
         orders  = self.get_open_orders()
         results = []
         for o in orders:
             if o.get("coin") != self.coin:
                 continue
-            ot = o.get("orderType", "")
-            if "Trigger" in ot or "Stop" in ot or "Take Profit" in ot:
+            ot = o.get("orderType", "").lower()
+            if any(kw in ot for kw in _TRIGGER_ORDER_KEYWORDS):
                 oid = o.get("oid")
                 if oid:
                     r = self.cancel_order(oid)
                     results.append(r)
-                    logger.info("[%s] Trigger order cancelada: oid=%s type=%s", self.coin, oid, ot)
+                    logger.info(
+                        "[%s] Trigger order cancelada: oid=%s type=%s",
+                        self.coin, oid, o.get("orderType", "")
+                    )
         return results
