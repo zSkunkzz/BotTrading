@@ -28,7 +28,7 @@ _trader_instances: dict = {}
 
 def make_risk():
     return RiskManager(
-        usdt_per_trade=float(os.getenv("USDT_PER_TRADE", "10")),
+        usdc_per_trade=float(os.getenv("USDC_PER_TRADE", "10")),
         tp_pct=float(os.getenv("TP_PCT", "4.0")),
         sl_pct=float(os.getenv("SL_PCT", "2.0")),
         trailing_sl=os.getenv("TRAILING_SL", "true").lower() == "true",

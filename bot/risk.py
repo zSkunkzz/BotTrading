@@ -5,10 +5,10 @@ logger = logging.getLogger("Risk")
 
 
 class RiskManager:
-    def __init__(self, usdt_per_trade, tp_pct, sl_pct,
+    def __init__(self, usdc_per_trade, tp_pct, sl_pct,
                  trailing_sl, trailing_activation_pct, trailing_callback_pct,
                  max_daily_loss_pct, max_open_trades):
-        self.usdt_per_trade          = usdt_per_trade
+        self.usdc_per_trade          = usdc_per_trade
         self.tp_pct                  = tp_pct
         self.sl_pct                  = sl_pct
         self.trailing_sl             = trailing_sl
@@ -25,11 +25,11 @@ class RiskManager:
     def can_open_trade(self, balance):
         """
         balance puede ser:
-          - float > 0  : balance real conocido
+          - float > 0  : balance real conocido (USDC en Hyperliquid)
           - 0.0        : balance real cero (cuenta vacía)
           - None       : API falló, balance desconocido
 
-        Si es None, operamos con usdt_per_trade como estimación conservadora
+        Si es None, operamos con usdc_per_trade como estimación conservadora
         (el trade podría fallar al ejecutarse, pero no bloqueamos preventivamente).
         """
         if self.open_trades >= self.max_open_trades:
@@ -45,14 +45,14 @@ class RiskManager:
             # API de balance no disponible — permitir con warning
             logger.warning(
                 "[Risk] ⚠️ Balance desconocido (API falló) — "
-                f"asumiendo ≥ {self.usdt_per_trade:.2f} USDT para continuar"
+                f"asumiendo ≥ {self.usdc_per_trade:.2f} USDC para continuar"
             )
             return True, "OK (balance desconocido)"
 
-        if balance < self.usdt_per_trade:
+        if balance < self.usdc_per_trade:
             return False, (
-                f"Balance insuficiente: {balance:.2f} USDT "
-                f"(necesario: {self.usdt_per_trade:.2f} USDT)"
+                f"Balance insuficiente: {balance:.2f} USDC "
+                f"(necesario: {self.usdc_per_trade:.2f} USDC)"
             )
 
         return True, "OK"
