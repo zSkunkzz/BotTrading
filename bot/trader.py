@@ -636,7 +636,10 @@ class FuturesTrader:
         price   = await self.get_price()
         lev     = leverage or self.leverage
         qty     = await self._calc_qty(usdc_amount, price, lev)
-        balance = await self.get_balance() or 0.0
+        # FIX: NO convertir None a 0.0 — pretrade_risk maneja None correctamente
+        # (asume balance suficiente y continúa). Convertir None→0 bloqueaba trades
+        # cuando la API de balance fallaba momentáneamente.
+        balance = await self.get_balance()
         ok, reason = await pretrade_risk.check(
             symbol=self.symbol, side="buy", notional=usdc_amount,
             price=price, balance=balance, sl=sl,
@@ -672,7 +675,8 @@ class FuturesTrader:
         price   = await self.get_price()
         lev     = leverage or self.leverage
         qty     = await self._calc_qty(usdc_amount, price, lev)
-        balance = await self.get_balance() or 0.0
+        # FIX: NO convertir None a 0.0 — pretrade_risk maneja None correctamente
+        balance = await self.get_balance()
         ok, reason = await pretrade_risk.check(
             symbol=self.symbol, side="sell", notional=usdc_amount,
             price=price, balance=balance, sl=sl,

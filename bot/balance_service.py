@@ -55,6 +55,7 @@ class _BalanceService:
     def invalidate(self):
         """Fuerza refresco en la próxima llamada a get()."""
         self._ts = 0.0
+        self._cache = None
 
     # ── HTTP ────────────────────────────────────────────────────────────────
 
@@ -127,25 +128,44 @@ class _BalanceService:
     # ── API pública ────────────────────────────────────────────────────────────────
 
     async def get(self) -> float | None:
-        """Devuelve balance cacheado o refresca si ha caducado."""
+        """Devuelve balance cacheado o refresca si ha caducado.
+        
+        IMPORTANTE: si el fetch falla, NO se cachea None.
+        El caché solo guarda valores positivos confirmados.
+        Si el balance real es 0.0 (cuenta vacía), sí se cachea.
+        """
         if not self._ready:
             logger.warning("[BalanceSvc] get() llamado antes de init_hl()")
             return None
 
         async with self._lock:
-            if time.time() - self._ts < _CACHE_TTL and self._cache is not None:
+            # Solo usar caché si tenemos un valor válido y no ha caducado
+            if (
+                self._cache is not None
+                and time.time() - self._ts < _CACHE_TTL
+            ):
                 return self._cache
 
-            val = await self._fetch_via_callback()
-            if val is None:
-                val = await self._fetch_direct()
+            # Intentar fetch con retry (2 intentos)
+            val = None
+            for attempt in range(2):
+                val = await self._fetch_via_callback()
+                if val is None:
+                    val = await self._fetch_direct()
+                if val is not None:
+                    break
+                if attempt == 0:
+                    await asyncio.sleep(1.0)  # breve pausa antes de retry
 
             if val is not None:
                 self._cache = val
                 self._ts    = time.time()
+                logger.info("[BalanceSvc] Balance actualizado: %.2f USDC", val)
             else:
-                logger.warning("[BalanceSvc] ⚠️ No se pudo obtener balance USDC")
-            return self._cache
+                # NO cachear None — próxima llamada intentará de nuevo
+                logger.warning("[BalanceSvc] ⚠️ No se pudo obtener balance USDC (API falló)")
+
+            return self._cache  # puede ser None o el último valor conocido
 
 
 balance_svc = _BalanceService()
