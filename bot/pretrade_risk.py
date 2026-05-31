@@ -4,6 +4,12 @@ pretrade_risk.py — Motor de riesgo pre-trade institucional.
 Valida cada intención de orden ANTES de enviarla al exchange.
 Si cualquier check falla, devuelve (False, motivo_str) y la orden no se manda.
 
+Flujo correcto de exposición:
+  1. check()         — solo valida, NO registra exposición
+  2. <orden ejecutada y fill confirmado>
+  3. confirm_order() — registra timestamp de rate limiter Y +notional de exposición
+  4. register_close()— libera exposición al cerrar
+
 Nota sobre sizing en Hyperliquid:
   En HL el notional por trade = USDC_PER_TRADE (sin multiplicar por leverage).
   El leverage solo afecta el margen reservado internamente.
@@ -57,7 +63,7 @@ class PreTradeRisk:
         self._symbol_exposure  : dict[str, float] = {}
         self._order_timestamps : dict[str, deque] = {}
 
-    # ── API pública ────────────────────────────────────────────────────────────────
+    # ── API pública ──────────────────────────────────────────────────────
 
     async def check(
         self,
@@ -70,6 +76,11 @@ class PreTradeRisk:
         ask:      float | None = None,
         bid:      float | None = None,
     ) -> tuple[bool, str]:
+        """
+        Valida la orden. NO registra exposición.
+        La exposición se registra únicamente en confirm_order(),
+        que debe llamarse solo tras un fill confirmado.
+        """
         sym = symbol.replace("/", "").replace(":USDT", "")
 
         checks = [
@@ -90,20 +101,34 @@ class PreTradeRisk:
                 )
                 return False, reason
 
-        self._register_exposure(sym, notional)
         logger.info(
             f"[PreTrade:{sym}] ✅ OK — side={side} notional={notional:.2f} "
             f"price={price:.4f} sl={sl}"
         )
         return True, "OK"
 
-    def confirm_order(self, symbol: str) -> None:
+    def confirm_order(self, symbol: str, notional: float = 0.0) -> None:
+        """
+        Llamar SOLO tras fill confirmado en exchange.
+        Registra:
+          - timestamp para el rate limiter de órdenes
+          - exposición real del símbolo (+notional)
+        """
         sym = symbol.replace("/", "").replace(":USDT", "")
+        # rate limiter
         if sym not in self._order_timestamps:
             self._order_timestamps[sym] = deque()
         self._order_timestamps[sym].append(time.monotonic())
+        # exposición real
+        if notional > 0:
+            self._symbol_exposure[sym] = self._symbol_exposure.get(sym, 0.0) + notional
+            logger.debug(
+                f"[PreTrade:{sym}] Exposición registrada: +{notional:.2f} USDC "
+                f"(total {self._symbol_exposure[sym]:.2f})"
+            )
 
     def register_close(self, symbol: str, notional: float) -> None:
+        """Llamar al cerrar una posición para liberar exposición."""
         sym  = symbol.replace("/", "").replace(":USDT", "")
         prev = self._symbol_exposure.get(sym, 0.0)
         self._symbol_exposure[sym] = max(0.0, prev - notional)
@@ -119,7 +144,7 @@ class PreTradeRisk:
         sym = symbol.replace("/", "").replace(":USDT", "")
         return self._symbol_exposure.get(sym, 0.0)
 
-    # ── Checks individuales ──────────────────────────────────────────────────────────
+    # ── Checks individuales ──────────────────────────────────────────────────
 
     def _check_notional(self, notional: float) -> tuple[bool, str]:
         if notional > self.max_notional_per_trade:
@@ -213,9 +238,6 @@ class PreTradeRisk:
                 f"(mínimo {self.min_sl_distance_bps:.0f} bps)"
             )
         return True, ""
-
-    def _register_exposure(self, sym: str, notional: float) -> None:
-        self._symbol_exposure[sym] = self._symbol_exposure.get(sym, 0.0) + notional
 
 
 pretrade_risk = PreTradeRisk()
