@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from collections import defaultdict
@@ -91,6 +92,23 @@ class ExecutionEngine:
             self._hl_clients[symbol] = HLClient(symbol)
         return self._hl_clients[symbol]
 
+    # ── UTILIDADES ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _round_qty(qty: float, sz_decimals: int) -> float:
+        """
+        Redondea qty al número de decimales permitidos por HL para este coin.
+
+        FIX B — 'Order has invalid size':
+          Coins de precio bajo (DOGE, XRP, SHIB...) tienen szDecimals=0,
+          lo que significa que HL sólo acepta cantidades enteras.
+          Usar math.floor (truncar hacia abajo) para no exceder el balance.
+        """
+        if sz_decimals <= 0:
+            return float(math.floor(qty))
+        factor = 10 ** sz_decimals
+        return float(math.floor(qty * factor) / factor)
+
     # ── EXECUTE PRINCIPAL ─────────────────────────────────────────────────────
 
     async def execute(
@@ -123,6 +141,15 @@ class ExecutionEngine:
         rec._t0 = time.monotonic()
 
         is_buy = side in ("buy", "long")
+
+        # FIX B: redondear qty a los decimales permitidos por HL para este coin
+        sz_dec = client.get_sz_decimals()
+        qty    = self._round_qty(qty, sz_dec)
+        rec.qty = qty
+
+        if qty <= 0:
+            logger.error("[%s] qty redondeada a 0 (sz_decimals=%d, qty_raw=%.8f) — abortando", sym, sz_dec, rec.qty)
+            return {"status": "error", "response": "qty rounded to zero"}
 
         # Si es cierre manual → cancelar TP/SL previos del exchange
         if reduce_only:
@@ -218,6 +245,23 @@ class ExecutionEngine:
         La dirección de cierre es la opuesta a la posición:
           - Long (is_buy=True)  → cierre = vender (is_buy=False)
           - Short (is_buy=False) → cierre = comprar (is_buy=True)
+
+        Regla de limit_px para TP (FIX A):
+          HL exige que limit_px sea "igual o mejor" que triggerPx desde el
+          punto de vista del ejecutor de la orden:
+
+          • TP de SHORT → close_side=True (compramos para cerrar).
+            triggerPx está POR DEBAJO del precio actual (el precio ha bajado).
+            «Mejor» para el comprador = precio más bajo.
+            limit_px = triggerPx * (1 - buffer)  → límite más bajo que trigger ✓
+
+          • TP de LONG → close_side=False (vendemos para cerrar).
+            triggerPx está POR ENCIMA del precio actual (el precio ha subido).
+            «Mejor» para el vendedor = precio más alto.
+            limit_px = triggerPx * (1 + buffer)  → límite más alto que trigger ✓
+
+          La lógica anterior era la inversa, lo que causaba
+          'Order has invalid price' en HL.
         """
         close_side = not is_buy
         orders_to_place = []
@@ -225,10 +269,13 @@ class ExecutionEngine:
         if tp is not None:
             if self.tp_as_limit:
                 buffer_multiplier = self.tp_limit_buffer_bps / 10_000
-                if close_side:  # compramos para cerrar short → precio está abajo
-                    tp_limit_px = round(tp * (1 + buffer_multiplier), 6)
-                else:           # vendemos para cerrar long → precio está arriba
+                # FIX A: invertir la lógica del buffer respecto a la versión anterior.
+                # close_side=True  → buy para cerrar short  → limit_px MENOR que trigger
+                # close_side=False → sell para cerrar long  → limit_px MAYOR que trigger
+                if close_side:  # compramos para cerrar short → queremos pagar lo menos posible
                     tp_limit_px = round(tp * (1 - buffer_multiplier), 6)
+                else:           # vendemos para cerrar long → queremos cobrar lo más posible
+                    tp_limit_px = round(tp * (1 + buffer_multiplier), 6)
             else:
                 tp_limit_px = None
 

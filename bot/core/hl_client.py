@@ -103,6 +103,9 @@ class _HLCore:
         self.exchange = self._build_exchange_with_retry(exchange_wallet, exchange_kwargs)
         self.info     = self._build_info_with_retry()
 
+        # Cache de szDecimals por coin para evitar llamadas repetidas a meta()
+        self._sz_decimals_cache: dict[str, int] = {}
+
         logger.info(
             "[HLCore] SDK Exchange+Info inicializados | addr=%s | agente=%s",
             self.account_addr[:10] + "...",
@@ -182,6 +185,37 @@ class HLClient:
         self._account_addr = core.account_addr
         self._agent_addr   = core.agent_addr
         self._agent_mode   = core.agent_mode
+        self._core         = core
+
+    # ── METADATOS ─────────────────────────────────────────────────────────
+
+    def get_sz_decimals(self) -> int:
+        """
+        Devuelve el número de decimales permitidos para el tamaño (sz) de este
+        coin en Hyperliquid. Resultado cacheado en el singleton _HLCore para
+        no repetir la llamada HTTP por cada orden.
+
+        Ejemplos:
+          BTC  → 5 (0.00001)
+          ETH  → 4 (0.0001)
+          DOGE → 0 (enteros)
+          XMR  → 4
+        """
+        cache = self._core._sz_decimals_cache
+        if self.coin in cache:
+            return cache[self.coin]
+        try:
+            meta = self._info.meta()
+            for asset in meta.get("universe", []):
+                if asset.get("name") == self.coin:
+                    dec = int(asset.get("szDecimals", 4))
+                    cache[self.coin] = dec
+                    return dec
+        except Exception as exc:
+            logger.warning("[%s] No se pudo obtener szDecimals: %s — usando 4", self.coin, exc)
+        # Fallback conservador: 4 decimales
+        cache[self.coin] = 4
+        return 4
 
     # ── ÓRDENES BÁSICAS ─────────────────────────────────────────────────────
 
