@@ -131,30 +131,28 @@ async def _fetch_oi(session: aiohttp.ClientSession, symbol: str) -> OIData:
             headers={"Content-Type": "application/json"},
             timeout=aiohttp.ClientTimeout(total=8),
         ) as r:
-            data = await r.json(content_type=None)
+            raw_text = await r.text()
+            try:
+                data = __import__("json").loads(raw_text)
+            except Exception:
+                logger.warning("[enricher] metaAndAssetCtxs: JSON inválido (HTTP %s) raw=%s",
+                               r.status, raw_text[:200])
+                return OIData()
 
         # data = [meta_dict, [assetCtx0, assetCtx1, ...]]
         # meta_dict["universe"] = [{name, szDecimals, ...}, ...]
         if not isinstance(data, list) or len(data) < 2:
             logger.warning(
-                "[enricher] HL metaAndAssetCtxs: estructura inesperada "
-                "— tipo=%s len=%s preview=%s",
+                "[enricher] metaAndAssetCtxs: estructura inesperada "
+                "type=%s len=%s preview=%s",
                 type(data).__name__,
                 len(data) if isinstance(data, list) else "N/A",
-                str(data)[:200],
+                str(data)[:300],
             )
             return OIData()
 
         universe   = data[0].get("universe", [])
         asset_ctxs = data[1]
-
-        if not isinstance(asset_ctxs, list):
-            logger.warning(
-                "[enricher] asset_ctxs no es lista: tipo=%s preview=%s",
-                type(asset_ctxs).__name__,
-                str(asset_ctxs)[:200],
-            )
-            return OIData()
 
         # Find coin index
         coin_idx = None
@@ -164,8 +162,7 @@ async def _fetch_oi(session: aiohttp.ClientSession, symbol: str) -> OIData:
                 break
 
         if coin_idx is None or coin_idx >= len(asset_ctxs):
-            logger.debug("[enricher] coin %s not found in HL universe (total=%d)",
-                         coin, len(universe))
+            logger.debug("[enricher] coin %s not found in HL universe", coin)
             return OIData()
 
         ctx       = asset_ctxs[coin_idx]
@@ -177,6 +174,7 @@ async def _fetch_oi(session: aiohttp.ClientSession, symbol: str) -> OIData:
         oi_usd = oi_coins * mark_px
 
         # Proxy OI delta: use day price change as rough proxy
+        # (HL doesn't expose historical OI snapshots on the free endpoint)
         delta_pct = 0.0
         if prev_px > 0 and mark_px > 0:
             delta_pct = (mark_px - prev_px) / prev_px * 100
@@ -227,6 +225,7 @@ async def _fetch_news(
                     break
                 title: str = entry.get("title", "")
                 summary: str = entry.get("summary", "")
+                # Only include entries that mention the traded asset
                 if (
                     currency_upper not in title.upper()
                     and currency_upper not in summary.upper()
@@ -259,6 +258,13 @@ async def _fetch_news(
 async def fetch_enriched_context(symbol: str) -> EnrichedContext:
     """
     Main entry point. Fetches all external data concurrently.
+
+    Args:
+        symbol: trading symbol, e.g. "BTCUSDT"
+
+    Returns:
+        EnrichedContext — always returns, never raises.
+        Partial results are available even if some sources fail.
     """
     base_currency = re.sub(r"(USDT|PERP|USD|BUSD)$", "", symbol.upper())
     ctx = EnrichedContext(fetched_at=datetime.now(timezone.utc).isoformat())
@@ -291,19 +297,21 @@ def format_context_for_prompt(ctx: EnrichedContext) -> str:
     """
     lines: list = []
 
+    # Fear & Greed
     fg = ctx.fear_greed
     if fg.value < 25:
-        fg_emoji = "\U0001f631"
+        fg_emoji = "\U0001f631"   # 😱
     elif fg.value < 45:
-        fg_emoji = "\U0001f628"
+        fg_emoji = "\U0001f628"   # 😨
     elif fg.value < 55:
-        fg_emoji = "\U0001f610"
+        fg_emoji = "\U0001f610"   # 😐
     elif fg.value < 75:
-        fg_emoji = "\U0001f60a"
+        fg_emoji = "\U0001f60a"   # 😊
     else:
-        fg_emoji = "\U0001f911"
+        fg_emoji = "\U0001f911"   # 🤑
     lines.append(f"Fear & Greed: {fg.value}/100 ({fg.label}) {fg_emoji}")
 
+    # Open Interest
     oi = ctx.oi
     if oi.oi_delta_pct > 1:
         oi_trend = "\u2191 increasing"
@@ -313,9 +321,11 @@ def format_context_for_prompt(ctx: EnrichedContext) -> str:
         oi_trend = "\u2192 stable"
     lines.append(f"OI day delta: {oi.oi_delta_pct:+.2f}% ({oi_trend})")
 
+    # Funding rate
     paying = "longs paying" if oi.funding_rate > 0 else "shorts paying"
     lines.append(f"Funding rate (8h): {oi.funding_rate:+.4f}% ({paying})")
 
+    # News
     if ctx.news:
         lines.append("Recent news:")
         for item in ctx.news:

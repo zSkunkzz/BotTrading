@@ -111,11 +111,20 @@ class _BalanceService:
                     data = _json.loads(text)
                     val  = self._extract(data)
                     if val is None:
-                        logger.debug(
-                            "[BalanceSvc] _fetch_direct addr=%s → no se encontró balance. "
-                            "Keys presentes: %s",
+                        # Log completo del raw para poder diagnosticar desde Railway
+                        logger.warning(
+                            "[BalanceSvc] _fetch_direct addr=%s → balance no encontrado.\n"
+                            "  HTTP status : %s\n"
+                            "  Keys top-level: %s\n"
+                            "  marginSummary : %s\n"
+                            "  crossMarginSummary: %s\n"
+                            "  Raw (500c) : %s",
                             self._addr,
+                            r.status,
                             list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                            data.get("marginSummary") if isinstance(data, dict) else "N/A",
+                            data.get("crossMarginSummary") if isinstance(data, dict) else "N/A",
+                            text[:500],
                         )
                     return val
         except Exception as e:
@@ -125,39 +134,58 @@ class _BalanceService:
     def _extract(self, data: dict) -> float | None:
         """
         Extrae el equity disponible de la respuesta clearinghouseState.
-        Campos candidatos (en orden de preferencia):
-          marginSummary.accountValue   ← equity total en USDC
-          marginSummary.withdrawable   ← disponible para retirar
+
+        Hyperliquid puede devolver el balance en distintas ubicaciones
+        dependiendo del modo de margen (cross vs isolated) y versión de API:
+
+          marginSummary.accountValue        ← equity cross (más común)
+          crossMarginSummary.accountValue   ← alias en algunas versiones
+          marginSummary.withdrawable        ← disponible para retirar
+          withdrawable                      ← a veces en el root
         """
         if not isinstance(data, dict):
             return None
 
+        # 1. Intentar marginSummary (campo estándar)
         ms = data.get("marginSummary", {})
-        for field in ("accountValue", "withdrawable", "totalNtlPos"):
-            v = ms.get(field)
+        if isinstance(ms, dict):
+            for field in ("accountValue", "withdrawable"):
+                v = ms.get(field)
+                if v is not None:
+                    try:
+                        val = float(v)
+                        if val >= 0:
+                            logger.debug("[BalanceSvc] Balance=%.2f USDC (marginSummary.%s)", val, field)
+                            return val
+                    except (ValueError, TypeError):
+                        pass
+
+        # 2. Intentar crossMarginSummary (alias en cuentas cross)
+        cms = data.get("crossMarginSummary", {})
+        if isinstance(cms, dict):
+            for field in ("accountValue", "withdrawable"):
+                v = cms.get(field)
+                if v is not None:
+                    try:
+                        val = float(v)
+                        if val >= 0:
+                            logger.debug("[BalanceSvc] Balance=%.2f USDC (crossMarginSummary.%s)", val, field)
+                            return val
+                    except (ValueError, TypeError):
+                        pass
+
+        # 3. Campos en el root del objeto
+        for field in ("withdrawable", "totalRawUsd", "crossAccountValue"):
+            v = data.get(field)
             if v is not None:
                 try:
                     val = float(v)
                     if val >= 0:
-                        logger.debug("[BalanceSvc] Balance=%.2f USDC (campo=%s)", val, field)
+                        logger.debug("[BalanceSvc] Balance=%.2f USDC (root.%s)", val, field)
                         return val
                 except (ValueError, TypeError):
                     pass
 
-        for field in ("crossMaintenanceMarginUsed", "totalRawUsd"):
-            v = data.get(field)
-            if v is not None:
-                try:
-                    return float(v)
-                except (ValueError, TypeError):
-                    pass
-
-        logger.warning(
-            "[BalanceSvc] No se encontró campo de balance. "
-            "Keys en respuesta: %s | marginSummary keys: %s",
-            list(data.keys()),
-            list(ms.keys()) if isinstance(ms, dict) else ms,
-        )
         return None
 
     # ── API pública ────────────────────────────────────────────────────────────────

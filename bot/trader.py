@@ -335,30 +335,8 @@ class FuturesTrader:
             return float(mid)
         raise ValueError(f"No se pudo obtener precio para {self.coin}")
 
-    async def _fetch_ohlcv_rest(self, tf: str) -> list:
-        """Fetch OHLCV directo desde REST — llamado solo por OHLCVCache cuando no hay hit."""
-        try:
-            tf_ms = {"15m": 15*60*1000, "1h": 60*60*1000, "4h": 4*60*60*1000}.get(tf, 15*60*1000)
-            now   = int(time.time() * 1000)
-            start = now - OHLCV_LIMIT * tf_ms
-            data  = await self._info_post({
-                "type": "candleSnapshot",
-                "req":  {"coin": self.coin, "interval": tf, "startTime": start, "endTime": now},
-            })
-            if not isinstance(data, list) or len(data) == 0:
-                logger.debug("[%s] _fetch_ohlcv_rest: respuesta inválida (%s)", self.symbol, type(data).__name__)
-                return []
-            return [
-                [int(c["t"]), float(c["o"]), float(c["h"]),
-                 float(c["l"]), float(c["c"]), float(c["v"])]
-                for c in data
-            ]
-        except Exception as e:
-            logger.error("[%s] _fetch_ohlcv_rest error: %s", self.symbol, e)
-            return []
-
     async def get_ohlcv(self, tf: str = OHLCV_TF) -> list:
-        # 1. WS feed (sin coste de red, sin cache)
+        # 1. WS feed (sin coste de red)
         try:
             from bot.ws_feed import ws_feed
             if ws_feed.has_data(self.coin, tf=tf, min_candles=OHLCV_MIN_BARS):
@@ -374,12 +352,29 @@ class FuturesTrader:
         except Exception as e:
             logger.debug("[%s] get_ohlcv WS error: %s", self.symbol, e)
 
-        # 2. Cache compartido → REST (solo 1 request por (coin, tf) cada 30s entre todos los traders)
-        return await ohlcv_cache.get(
-            coin=self.coin,
-            tf=tf,
-            fetch_fn=self._fetch_ohlcv_rest,
-        )
+        # 2. Cache compartido (evita 429 con múltiples traders)
+        async def _fetch_rest(timeframe: str) -> list:
+            tf_ms = {"15m": 15*60*1000, "1h": 60*60*1000, "4h": 4*60*60*1000}.get(timeframe, 15*60*1000)
+            now   = int(time.time() * 1000)
+            start = now - OHLCV_LIMIT * tf_ms
+            data  = await self._info_post({
+                "type": "candleSnapshot",
+                "req":  {"coin": self.coin, "interval": timeframe, "startTime": start, "endTime": now},
+            })
+            if not isinstance(data, list) or len(data) == 0:
+                logger.debug("[%s] get_ohlcv REST: respuesta inválida (%s)", self.symbol, type(data).__name__)
+                return []
+            return [
+                [int(c["t"]), float(c["o"]), float(c["h"]),
+                 float(c["l"]), float(c["c"]), float(c["v"])]
+                for c in data
+            ]
+
+        try:
+            return await ohlcv_cache.get(self.coin, tf, _fetch_rest)
+        except Exception as e:
+            logger.error("[%s] get_ohlcv cache error: %s", self.symbol, e)
+            return []
 
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
@@ -555,324 +550,3 @@ class FuturesTrader:
         except Exception as e:
             logger.debug("[%s] _get_positions error: %s", self.symbol, e)
             return []
-
-    async def _check_external_close(self) -> bool:
-        if self.dry_run:
-            return False
-        try:
-            positions = await self._get_positions()
-            if positions:
-                self._last_pos_check_at = time.time()
-                return False
-
-            closed_side  = self.position
-            closed_entry = self.entry_price
-            exit_price   = await self.get_price()
-
-            pnl = 0.0
-            if closed_entry and exit_price:
-                if closed_side == "long":
-                    pnl = (exit_price - closed_entry) / closed_entry * 100
-                else:
-                    pnl = (closed_entry - exit_price) / closed_entry * 100
-
-            logger.warning(
-                "[%s] 🔔 Posicion cerrada externamente (TPSL) | side=%s entry=%.4f exit=~%.4f pnl=~%+.2f%%",
-                self.symbol, closed_side, closed_entry or 0, exit_price, pnl,
-            )
-
-            pretrade_risk.register_close(self.symbol, self._open_notional)
-            self._open_notional = 0.0
-            self._open_leverage = 1
-            self.position       = None
-            self.entry_price    = None
-            self.sl = self.tp1 = self.tp2 = self.tp3 = None
-            self.tp2_hit        = False
-            self._protection_ok = False
-            self._last_pos_check_at   = time.time()
-            self._last_tpsl_verify_at = 0.0
-            clear_position(self.symbol)
-
-            if pnl >= 0:
-                self.win_count += 1
-            self.trade_count += 1
-            self.total_pnl   += pnl
-            await kill_switch.on_trade_result(pnl)
-            await notify_close(self.symbol, closed_side, exit_price, pnl,
-                               reason="TPSL_SERVIDOR", dry_run=self.dry_run)
-            return True
-        except Exception as e:
-            logger.error("[%s] _check_external_close error: %s", self.symbol, e)
-            return False
-
-    # ── Qty ─────────────────────────────────────────────────────────────
-
-    async def _get_min_qty(self) -> float:
-        try:
-            data = await self._info_post({"type": "meta"})
-            for uni in data.get("universe", []):
-                if uni.get("name") == self.coin:
-                    decimals = int(uni.get("szDecimals", 3))
-                    return 10 ** (-decimals)
-        except Exception:
-            pass
-        return 0.001
-
-    async def _calc_qty(self, usdc_amount: float, price: float, leverage: int) -> float:
-        effective_lev = leverage or self.leverage
-        raw_qty  = (usdc_amount * effective_lev) / price
-        min_qty  = await self._get_min_qty()
-        qty      = max(min_qty, round(raw_qty / min_qty) * min_qty)
-        decimals = len(str(min_qty).rstrip("0").split(".")[-1]) if "." in str(min_qty) else 0
-        return round(qty, decimals)
-
-    # ── Abrir posiciones ─────────────────────────────────────────────────
-
-    async def open_long(self, usdc_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
-        if kill_switch.is_halted(self.symbol):
-            return
-        price   = await self.get_price()
-        lev     = leverage or self.leverage
-        qty     = await self._calc_qty(usdc_amount, price, lev)
-        balance = await self.get_balance()
-        ok, reason = await pretrade_risk.check(
-            symbol=self.symbol, side="buy", notional=usdc_amount,
-            price=price, balance=balance, sl=sl,
-        )
-        if not ok:
-            logger.warning("[%s] open_long bloqueado: %s", self.symbol, reason)
-            return
-        await self._set_leverage(lev)
-        r = await self._place_order("buy", qty, reduce_only=False, sl=sl, tp=tp3)
-        if r.get("status") == "ok":
-            self.position       = "long"
-            self.entry_price    = price
-            self.sl   = sl
-            self.tp1  = tp1
-            self.tp2  = tp2
-            self.tp3  = tp3
-            self.tp2_hit        = False
-            self._open_notional = usdc_amount
-            self._open_leverage = lev
-            self._protection_ok = bool(sl or tp3)
-            self._last_pos_check_at = time.time()
-            save_position(self.symbol, "long", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
-                          usdc_amount=usdc_amount, leverage=lev)
-            logger.warning("[%s] LONG @ %.4f lev=%sx sl=%s tp=%s", self.symbol, price, lev, sl, tp3)
-            await notify_open(self.symbol, "long", price, lev, sl=sl,
-                              tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-        else:
-            logger.error("[%s] open_long FAILED: %s", self.symbol, r)
-
-    async def open_short(self, usdc_amount, sl=None, tp1=None, tp2=None, tp3=None, leverage=None):
-        if kill_switch.is_halted(self.symbol):
-            return
-        price   = await self.get_price()
-        lev     = leverage or self.leverage
-        qty     = await self._calc_qty(usdc_amount, price, lev)
-        balance = await self.get_balance()
-        ok, reason = await pretrade_risk.check(
-            symbol=self.symbol, side="sell", notional=usdc_amount,
-            price=price, balance=balance, sl=sl,
-        )
-        if not ok:
-            logger.warning("[%s] open_short bloqueado: %s", self.symbol, reason)
-            return
-        await self._set_leverage(lev)
-        r = await self._place_order("sell", qty, reduce_only=False, sl=sl, tp=tp3)
-        if r.get("status") == "ok":
-            self.position       = "short"
-            self.entry_price    = price
-            self.sl   = sl
-            self.tp1  = tp1
-            self.tp2  = tp2
-            self.tp3  = tp3
-            self.tp2_hit        = False
-            self._open_notional = usdc_amount
-            self._open_leverage = lev
-            self._protection_ok = bool(sl or tp3)
-            self._last_pos_check_at = time.time()
-            save_position(self.symbol, "short", price, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
-                          usdc_amount=usdc_amount, leverage=lev)
-            logger.warning("[%s] SHORT @ %.4f lev=%sx sl=%s tp=%s", self.symbol, price, lev, sl, tp3)
-            await notify_open(self.symbol, "short", price, lev, sl=sl,
-                              tp1=tp1, tp2=tp2, tp3=tp3, dry_run=self.dry_run)
-        else:
-            logger.error("[%s] open_short FAILED: %s", self.symbol, r)
-
-    async def close_position(self, reason: str = ""):
-        if not self.position:
-            return
-        side = "sell" if self.position == "long" else "buy"
-        qty  = 0.0
-        try:
-            positions = await self._get_positions()
-            if positions:
-                qty = float(positions[0].get("size", 0))
-        except Exception:
-            pass
-
-        exit_price = await self.get_price()
-        pnl = 0.0
-        if self.entry_price and exit_price:
-            if self.position == "long":
-                pnl = (exit_price - self.entry_price) / self.entry_price * 100
-            else:
-                pnl = (self.entry_price - exit_price) / self.entry_price * 100
-
-        closed_side = self.position
-        if qty > 0:
-            r = await self._place_order(side, qty, reduce_only=True)
-            if r.get("status") != "ok":
-                logger.error("[%s] close_position FAILED: %s", self.symbol, r)
-                await self._check_external_close()
-                return
-
-        pretrade_risk.register_close(self.symbol, self._open_notional)
-        self._open_notional = 0.0
-        self._open_leverage = 1
-        self.position       = None
-        self.entry_price    = None
-        self.sl = self.tp1 = self.tp2 = self.tp3 = None
-        self.tp2_hit        = False
-        self._protection_ok = False
-        self._last_tpsl_verify_at = 0.0
-        self._last_pos_check_at   = time.time()
-        clear_position(self.symbol)
-
-        if pnl >= 0:
-            self.win_count += 1
-        self.trade_count += 1
-        self.total_pnl   += pnl
-        await kill_switch.on_trade_result(pnl)
-        logger.warning("[%s] %s cerrado | razon=%s | pnl=%+.2f%%", self.symbol, closed_side, reason, pnl)
-        await notify_close(self.symbol, closed_side, exit_price, pnl,
-                           reason=reason, dry_run=self.dry_run)
-
-    async def partial_close(self, ratio: float = 0.5):
-        if not self.position:
-            return
-        side = "sell" if self.position == "long" else "buy"
-        qty  = 0.0
-        try:
-            positions = await self._get_positions()
-            if positions:
-                total   = float(positions[0].get("size", 0))
-                min_qty = await self._get_min_qty()
-                qty     = max(min_qty, round((total * ratio) / min_qty) * min_qty)
-        except Exception as e:
-            logger.warning("[%s] partial_close: %s", self.symbol, e)
-            return
-        if not qty:
-            return
-        r = await self._place_order(side, qty, reduce_only=True)
-        if r.get("status") == "ok":
-            freed = self._open_notional * ratio
-            pretrade_risk.register_close(self.symbol, freed)
-            self._open_notional = max(0.0, self._open_notional - freed)
-            mark_tp2_hit(self.symbol)
-            self.tp2_hit = True
-            exit_price   = await self.get_price()
-            await notify_tp_partial(self.symbol, self.position, exit_price,
-                                    ratio=ratio, dry_run=self.dry_run)
-            logger.info("[%s] Cierre parcial %s%%", self.symbol, int(ratio * 100))
-        else:
-            logger.warning("[%s] partial_close FAILED: %s", self.symbol, r)
-
-    # ── Loop principal ──────────────────────────────────────────────────
-
-    async def run(self, risk, global_risk=None):
-        usdc_per_trade = risk.usdc_per_trade
-        await self._init(usdc_per_trade)
-
-        async def _ai_decide_fn(symbol, bars, position, entry_price, leverage, context_override=None):
-            return await ai_decide(
-                symbol=symbol, bars=bars, position=position,
-                entry_price=entry_price, leverage=leverage,
-                context_override=context_override,
-            )
-
-        while True:
-            try:
-                if kill_switch.is_hard_killed():
-                    logger.critical("[%s] KillSwitch HARD -- bot detenido", self.symbol)
-                    return
-                if kill_switch.is_halted(self.symbol):
-                    await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
-                    continue
-
-                price = await self.get_price()
-                bars  = await self.get_ohlcv()
-                if len(bars) < OHLCV_MIN_BARS:
-                    await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
-                    continue
-
-                if self.position:
-                    if self.sl:
-                        sl_long  = self.sl * (1 - _SL_SW_MARGIN)
-                        sl_short = self.sl * (1 + _SL_SW_MARGIN)
-                        if (self.position == "long"  and price <= sl_long) or \
-                           (self.position == "short" and price >= sl_short):
-                            logger.warning("[%s] 🛑 SL_SOFTWARE @ %.4f", self.symbol, price)
-                            await self.close_position(reason="SL_SOFTWARE")
-                            continue
-
-                    if self.tp3:
-                        if (self.position == "long"  and price >= self.tp3) or \
-                           (self.position == "short" and price <= self.tp3):
-                            logger.info("[%s] 🎯 TP3_SOFTWARE @ %.4f", self.symbol, price)
-                            await self.close_position(reason="TP3_SOFTWARE")
-                            continue
-
-                    if (time.time() - self._last_pos_check_at) >= _POS_CHECK_INTERVAL_S:
-                        was_closed = await self._check_external_close()
-                        if was_closed:
-                            continue
-
-                    if self.tp2 and not self.tp2_hit:
-                        if (self.position == "long"  and price >= self.tp2) or \
-                           (self.position == "short" and price <= self.tp2):
-                            await self.partial_close(ratio=TP2_PARTIAL_RATIO)
-
-                    result = await decide(self.exchange, self.symbol, _ai_decide_fn, has_open_position=True)
-                    action = result.get("action", "HOLD")
-                    if action in ("CLOSE_LONG", "CLOSE_SHORT"):
-                        await self.close_position(reason="strategy")
-
-                else:
-                    result = await decide(self.exchange, self.symbol, _ai_decide_fn, has_open_position=False)
-                    action = result.get("action", "HOLD")
-                    signal = result.get("signal")
-                    usdc   = risk.usdc_per_trade
-
-                    if signal:
-                        lev     = signal.suggested_lev if signal.suggested_lev else self.leverage
-                        sl      = signal.sl
-                        tp1     = signal.tp1
-                        tp2     = signal.tp2
-                        atr_val = signal.atr
-                        tp3     = round(signal.entry + 3.0 * atr_val, 6) if atr_val and signal.entry else None
-                        if signal.signal == "SHORT" and signal.entry and atr_val:
-                            tp3 = round(signal.entry - 3.0 * atr_val, 6)
-                    else:
-                        lev = self.leverage
-                        sl  = tp1 = tp2 = tp3 = None
-
-                    if action == "BUY":
-                        await self.open_long(usdc, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
-                    elif action == "SELL":
-                        await self.open_short(usdc, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3, leverage=lev)
-
-            except asyncio.CancelledError:
-                logger.info("[%s] Loop cancelado", self.symbol)
-                break
-            except Exception as e:
-                logger.error("[%s] Loop error: %s", self.symbol, e, exc_info=True)
-            await asyncio.sleep(int(os.getenv("LOOP_SLEEP", "10")))
-
-        if self.exchange:
-            try:
-                await self.exchange.close()
-            except Exception:
-                pass
-            self.exchange = None
