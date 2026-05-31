@@ -15,7 +15,6 @@ logger = logging.getLogger("State")
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "/tmp/bot_state.json"))
 
-# Advertir en startup si el estado va a /tmp (se borra en cada deploy/restart)
 if str(STATE_FILE).startswith("/tmp"):
     logger.warning(
         "[State] ⚠️  STATE_FILE apunta a /tmp (%s). "
@@ -42,40 +41,69 @@ def _save_raw(data: dict):
         logger.error(f"[State] No se pudo guardar {STATE_FILE}: {e}")
 
 
-def save_position(symbol: str, position: str, entry_price: float,
-                  sl: float | None, tp1: float | None,
-                  tp2: float | None, tp3: float | None,
-                  usdc_amount: float, leverage: int,
-                  api_version: str | None = None,
-                  ua_pos_mode: str | None = None,
-                  v2_pos_mode: str | None = None):
-    """Persiste una posición abierta."""
+def save_position(symbol: str, position_or_dict, entry_price=None,
+                  sl=None, tp1=None, tp2=None, tp3=None,
+                  usdc_amount=None, leverage=None,
+                  api_version=None, ua_pos_mode=None, v2_pos_mode=None):
+    """
+    Persiste una posición abierta.
+
+    Acepta dos formas de llamada:
+      1. save_position(symbol, dict_con_datos)          ← forma usada en trader.py
+      2. save_position(symbol, side, entry, sl, ...)    ← forma posicional legacy
+    """
     data = _load_raw()
-    entry = {
-        "position":    position,
-        "entry_price": entry_price,
-        "sl":          sl,
-        "tp1":         tp1,
-        "tp2":         tp2,
-        "tp3":         tp3,
-        "tp2_hit":     False,
-        "usdc_amount": usdc_amount,
-        "leverage":    leverage,
-    }
-    if api_version:
-        entry["api_version"] = api_version
-    if ua_pos_mode:
-        entry["ua_pos_mode"] = ua_pos_mode
-    if v2_pos_mode:
-        entry["v2_pos_mode"] = v2_pos_mode
+
+    if isinstance(position_or_dict, dict):
+        # Forma nueva: segundo argumento es el dict completo
+        d = position_or_dict
+        entry = {
+            "position":    d.get("side") or d.get("position"),
+            "entry_price": d.get("entry") or d.get("entry_price"),
+            "sl":          d.get("sl"),
+            "tp1":         d.get("tp1"),
+            "tp2":         d.get("tp2"),
+            "tp3":         d.get("tp3"),
+            "tp2_hit":     d.get("tp2_hit", False),
+            "usdc_amount": d.get("usdc_amount") or d.get("usdt_amount", 0.0),
+            "leverage":    d.get("leverage", 1),
+        }
+    else:
+        # Forma posicional legacy
+        entry = {
+            "position":    position_or_dict,
+            "entry_price": entry_price,
+            "sl":          sl,
+            "tp1":         tp1,
+            "tp2":         tp2,
+            "tp3":         tp3,
+            "tp2_hit":     False,
+            "usdc_amount": usdc_amount,
+            "leverage":    leverage,
+        }
+        if api_version:
+            entry["api_version"] = api_version
+        if ua_pos_mode:
+            entry["ua_pos_mode"] = ua_pos_mode
+        if v2_pos_mode:
+            entry["v2_pos_mode"] = v2_pos_mode
+
     data[symbol] = entry
     _save_raw(data)
-    logger.info(f"[State] Guardado {symbol} {position} @ {entry_price}")
+    logger.info(f"[State] Guardado {symbol} {entry['position']} @ {entry['entry_price']}")
 
 
 def load_position(symbol: str) -> dict | None:
     """Recupera estado de posición para un símbolo, o None si no hay."""
-    return _load_raw().get(symbol)
+    raw = _load_raw().get(symbol)
+    if raw is None:
+        return None
+    # Normalizar claves legacy: 'position' → 'side', 'entry_price' → 'entry'
+    if "side" not in raw and "position" in raw:
+        raw["side"] = raw["position"]
+    if "entry" not in raw and "entry_price" in raw:
+        raw["entry"] = raw["entry_price"]
+    return raw
 
 
 def clear_position(symbol: str):

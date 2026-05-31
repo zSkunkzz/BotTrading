@@ -21,6 +21,7 @@ Opcionales:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import time
@@ -59,10 +60,14 @@ _SL_SW_MARGIN           = float(os.getenv("SL_SW_MARGIN", "0.001"))
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
-# Timeout para llamadas a /exchange (leverage, cancel, etc.)
 _EXCHANGE_POST_TIMEOUT = float(os.getenv("EXCHANGE_POST_TIMEOUT", "15"))
-# Timeout total para _set_leverage (incluye _get_coin_index + _exchange_post)
 _SET_LEVERAGE_TIMEOUT  = float(os.getenv("SET_LEVERAGE_TIMEOUT", "20"))
+
+# Detectar si el SDK instalado requiere 'expires_after' (versiones >= 1.0)
+# La firma antigua es: sign_l1_action(wallet, action, vault, nonce, is_mainnet)
+# La firma nueva es:   sign_l1_action(wallet, action, vault, nonce, is_mainnet, expires_after)
+_SIGN_PARAMS = inspect.signature(sign_l1_action).parameters
+_SDK_NEEDS_EXPIRES_AFTER = "expires_after" in _SIGN_PARAMS
 
 # ── Rate limiter global para /info ─────────────────────────────────────────
 _HL_REST_LOCK    = asyncio.Lock()
@@ -110,7 +115,6 @@ def _hl_side_to_str(raw_side: str) -> str:
         return "long"
     if raw_side == "A":
         return "short"
-    # Fallback: si ya viene como string legible, lo normalizamos
     s = raw_side.lower()
     if s in ("long", "buy"):
         return "long"
@@ -268,11 +272,22 @@ class FuturesTrader:
 
         nonce  = await _unique_nonce()
         wallet = Account.from_key(self._private_key)
-        # FIX: pasar is_mainnet como kwarg para compatibilidad con SDK >= 0.9
-        signature = sign_l1_action(
-            wallet, action, self._vault_address, nonce,
-            is_mainnet=not _USE_TESTNET,
-        )
+        is_mainnet = not _USE_TESTNET
+
+        # Compatibilidad con SDK antiguo (sin expires_after) y nuevo (con expires_after)
+        if _SDK_NEEDS_EXPIRES_AFTER:
+            # SDK >= 1.0: expires_after en ms desde epoch (30 min de validez)
+            expires_after = int(time.time() * 1000) + 30 * 60 * 1000
+            signature = sign_l1_action(
+                wallet, action, self._vault_address, nonce,
+                is_mainnet=is_mainnet, expires_after=expires_after,
+            )
+        else:
+            # SDK < 1.0
+            signature = sign_l1_action(
+                wallet, action, self._vault_address, nonce,
+                is_mainnet=is_mainnet,
+            )
 
         payload: dict = {
             "action":       action,
@@ -281,7 +296,6 @@ class FuturesTrader:
             "vaultAddress": self._vault_address,
         }
 
-        # FIX: timeout explícito en connect + total para evitar hang indefinido
         timeout = aiohttp.ClientTimeout(total=_EXCHANGE_POST_TIMEOUT, connect=5)
         async with aiohttp.ClientSession(timeout=timeout) as s:
             async with s.post(
@@ -332,7 +346,6 @@ class FuturesTrader:
         if not balance_svc.is_ready():
             balance_svc.init_hl(self._master_addr, self._info_post)
 
-        # FIX: _set_leverage con timeout global para evitar que _init se cuelgue
         try:
             await asyncio.wait_for(
                 self._set_leverage(self.leverage),
@@ -544,7 +557,6 @@ class FuturesTrader:
             if exchange_positions:
                 ep = exchange_positions[0]
                 if self.position is None:
-                    # FIX #1: HL devuelve side como 'A'/'B' y entryPx como string
                     raw_side = ep.get("side", "")
                     try:
                         parsed_side = _hl_side_to_str(raw_side)
@@ -559,7 +571,6 @@ class FuturesTrader:
             else:
                 if self.position is not None:
                     logger.info("[%s] Posición cerrada externamente.", self.symbol)
-                    # FIX #2: cancel_all_open_tpsl es síncrono — ejecutar en executor
                     try:
                         loop = asyncio.get_event_loop()
                         await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
@@ -651,7 +662,6 @@ class FuturesTrader:
             result = await self._place_order(side, qty, sl=sl, tp=tp1)
             if result.get("status") != "ok":
                 return
-            # FIX #4: extraer fill_price solo en modo real
             try:
                 fill_price = float(
                     result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
@@ -723,7 +733,6 @@ class FuturesTrader:
                 if partial_qty > 0 and not self.dry_run:
                     close_side = "sell" if is_long else "buy"
 
-                    # FIX #2: cancelar triggers en executor (es función síncrona)
                     try:
                         loop = asyncio.get_event_loop()
                         await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
@@ -761,7 +770,6 @@ class FuturesTrader:
                     old_sl = self.sl
                     self.sl = new_sl
                     logger.debug("[%s] Trailing SL → %.4f (era %.4f)", self.symbol, self.sl, old_sl)
-                    # FIX #3: actualizar el SL en el exchange, no solo en memoria
                     try:
                         qty_positions = await self._get_positions()
                         if qty_positions:
@@ -799,7 +807,6 @@ class FuturesTrader:
         fill_price = price
 
         if not self.dry_run:
-            # FIX #2: cancelar triggers en executor
             try:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
@@ -842,7 +849,7 @@ class FuturesTrader:
         )
 
     async def _place_tpsl(self, qty: float, sl: float | None, tp: float | None) -> None:
-        """Coloca trigger orders TP/SL para una qty dada. Delega en HLClient."""
+        """Coloca trigger orders TP/SL para una qty dada."""
         if not sl and not tp:
             return
         is_long = self.position == "long"
@@ -859,4 +866,4 @@ class FuturesTrader:
                 else:
                     await loop.run_in_executor(None, lambda: self._hl_client.place_tp(is_buy=side_is_buy, sz=q, trigger_px=px))
             except Exception as e:
-                logger.warning("[%s] No se pudo colocar %s tras parcial: %s", self.symbol, order_type, e)
+                logger.warning("[%s] No se pudo colocar %s: %s", self.symbol, order_type, e)
