@@ -14,6 +14,7 @@ Extraído de FuturesTrader._iteration en trader.py.
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 from bot.strategy import decide
@@ -38,7 +39,7 @@ class DecisionEngine:
 
     async def evaluate(
         self,
-        trader,       # FuturesTrader — contexto con _place_order, get_price, get_balance
+        trader,
         risk,
         global_risk=None,
     ) -> None:
@@ -115,9 +116,10 @@ class DecisionEngine:
             await trader._set_leverage(lev)
 
         notional = risk.usdc_per_trade * lev
-        qty      = round(notional / entry, 6)
+        # FIX: respetar szDecimals del coin — usar _round_qty del trader
+        qty = trader._round_qty(notional / entry)
         if qty <= 0:
-            logger.warning("[%s] qty calculada <= 0, skip.", self.symbol)
+            logger.warning("[%s] qty calculada <= 0 tras redondeo szDecimals, skip.", self.symbol)
             return
 
         side = "buy" if action == "BUY" else "sell"
@@ -139,9 +141,6 @@ class DecisionEngine:
         if result.get("status") != "ok":
             return
 
-        # Usar el precio real de fill para calcular notional y qty reales.
-        # Si el exchange no devuelve avgPx (orden limit no llenada aún), se
-        # mantiene el precio estimado como fallback conservador.
         try:
             fill_price = float(
                 result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
@@ -151,10 +150,10 @@ class DecisionEngine:
             fill_price = entry
 
         if fill_price and fill_price != entry:
-            # Recalcular qty con el fill real para que _open_notional sea preciso
-            qty = round(notional / fill_price, 6)
+            # FIX: también szDecimals al recalcular con fill real
+            qty = trader._round_qty(notional / fill_price)
             logger.debug(
-                "[%s] Fill real: %.4f (estimado: %.4f) — qty ajustada a %.6f",
+                "[%s] Fill real: %.4f (estimado: %.4f) — qty ajustada a %s",
                 self.symbol, fill_price, entry, qty,
             )
 

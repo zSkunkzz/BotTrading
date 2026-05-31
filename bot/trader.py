@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 import json as _json
@@ -52,10 +53,10 @@ _POS_CHECK_INTERVAL_S   = int(os.getenv("POS_CHECK_INTERVAL_S", "30"))
 _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
 _SL_SW_MARGIN           = float(os.getenv("SL_SW_MARGIN", "0.001"))
 
-# FIX: tiempo de espera tras apertura antes de confirmar posición en exchange
-# Hyperliquid puede tardar hasta 2-3s en propagar el estado de la posición
-_POST_FILL_CONFIRM_DELAY_S = float(os.getenv("POST_FILL_CONFIRM_DELAY_S", "2.5"))
-_POST_FILL_CONFIRM_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "3"))
+# FIX: tiempos de confirmación post-fill aumentados
+# Hyperliquid puede tardar hasta 10-15s en propagar estado de posición
+_POST_FILL_CONFIRM_DELAY_S = float(os.getenv("POST_FILL_CONFIRM_DELAY_S", "3.0"))
+_POST_FILL_CONFIRM_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
 
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
@@ -176,6 +177,27 @@ class FuturesTrader:
         self._last_tpsl_verify_at: float = 0.0
         self._ccxt_exchange = None
 
+    # ── Qty rounding respetando szDecimals ────────────────────────────────────
+
+    def _round_qty(self, qty: float) -> float:
+        """
+        FIX: Redondea qty al número de decimales permitidos por Hyperliquid
+        para este coin (szDecimals del meta). Usar SIEMPRE antes de enviar
+        una orden al exchange.
+
+        Ejemplos:
+          WLD/DOGE szDecimals=0 → solo enteros: 469.6 → 469
+          HYPE     szDecimals=2 → 2 decimales:  25.123 → 25.12
+          BTC      szDecimals=5 → 5 decimales:  0.00312 → 0.00312
+        """
+        try:
+            sz_dec = self._hl_client.get_sz_decimals()
+        except Exception:
+            sz_dec = 4  # fallback conservador
+        factor = 10 ** sz_dec
+        # Usar floor para no exceder el notional disponible
+        return math.floor(qty * factor) / factor
+
     # ── ccxt ──────────────────────────────────────────────────────────────────
 
     async def _get_ccxt(self):
@@ -233,8 +255,6 @@ class FuturesTrader:
         await self._get_ccxt()
         saved = load_position(self.symbol)
         if saved:
-            # FIX: verificar en el exchange que la posición guardada realmente existe
-            # antes de restaurarla — evita state mismatch si fue cerrada externamente
             exchange_pos = await self._get_positions()
             if exchange_pos is not None and len(exchange_pos) > 0:
                 self.position       = saved["side"]
@@ -249,14 +269,12 @@ class FuturesTrader:
                 self._protection_ok = True
                 logger.info("[%s] Posicion restaurada: %s @ %s", self.symbol, self.position, self.entry_price)
             elif exchange_pos is not None and len(exchange_pos) == 0:
-                # Posición guardada pero ya no existe en Hyperliquid — limpiar
                 logger.warning(
                     "[%s] Posición guardada localmente pero NO existe en exchange — limpiando estado.",
                     self.symbol,
                 )
                 clear_position(self.symbol)
             else:
-                # exchange_pos es None → error de red, restaurar con cautela sin _protection_ok
                 logger.warning(
                     "[%s] No se pudo verificar posición en exchange al arrancar (error de red) — "
                     "restaurando estado local sin marcar protección OK.",
@@ -271,7 +289,7 @@ class FuturesTrader:
                 self.tp2_hit        = saved.get("tp2_hit", False)
                 self._open_notional = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
                 self._open_leverage = saved.get("leverage", self.leverage)
-                self._protection_ok = False  # forzar reverificación en próximo ciclo
+                self._protection_ok = False
 
         if not balance_svc.is_ready():
             balance_svc.init_hl(self._master_addr, self._info_post)
@@ -358,15 +376,9 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage — usa SDK directamente (fix: evita signing manual) ────────
+    # ── Leverage ────────────────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int):
-        """
-        Establece el leverage usando el SDK oficial de Hyperliquid.
-
-        El SDK maneja internamente el signing EIP-712 con los tipos correctos,
-        evitando el error 'Unsupported type: str' del signing manual.
-        """
         if self.dry_run:
             return
         is_cross = self.margin_mode != "isolated"
@@ -429,22 +441,11 @@ class FuturesTrader:
     # ── Posiciones ──────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list | None:
-        """
-        Consulta posiciones abiertas en Hyperliquid para este símbolo.
-
-        Retorna:
-          - list[dict]  : lista de posiciones (puede ser vacía si no hay ninguna)
-          - None        : error de red / API — no se pudo determinar el estado real
-
-        IMPORTANTE: retornar None en vez de [] ante errores permite a los llamantes
-        distinguir "sin posición" de "no lo sé", evitando limpiar estado local
-        innecesariamente por un 429 o timeout.
-        """
         try:
             data = await self._info_post({"type": "clearinghouseState", "user": self._account_addr})
             if not data or not isinstance(data, dict):
                 logger.warning("[%s] _get_positions: respuesta vacía o inválida", self.symbol)
-                return None  # FIX: None = error, no lista vacía
+                return None
             positions = []
             for p in data.get("assetPositions", []):
                 pos = p.get("position", {})
@@ -455,43 +456,34 @@ class FuturesTrader:
             return positions
         except Exception as e:
             logger.error("[%s] _get_positions error: %s", self.symbol, e)
-            return None  # FIX: None = error de red, no lista vacía
+            return None
 
     async def _confirm_position_with_retry(self) -> list | None:
         """
         FIX: Verifica la posición en el exchange con reintentos y backoff.
-
-        Hyperliquid puede tardar 2-3s en propagar el estado de la posición tras
-        un fill. Sin este delay, la confirmación inmediata devuelve [] aunque la
-        posición exista, lo que causaba que el bot abortara el registro de estado.
-
-        Retorna la primera respuesta no-vacía encontrada, o None si hay error de red.
+        Ventana total: RETRIES * DELAY_S (default 6 * 3.0 = 18s).
+        Cubre los casos de propagación lenta que HL puede sufrir en horas
+        de alta actividad (observado hasta 10-12s en producción).
         """
         for attempt in range(_POST_FILL_CONFIRM_RETRIES):
+            delay = _POST_FILL_CONFIRM_DELAY_S
             if attempt > 0:
-                # Backoff creciente: 2.5s, 5s, 7.5s...
-                delay = _POST_FILL_CONFIRM_DELAY_S * attempt
                 logger.debug(
                     "[%s] Post-fill confirm: intento %d/%d (esperando %.1fs)...",
                     self.symbol, attempt + 1, _POST_FILL_CONFIRM_RETRIES, delay,
                 )
-                await asyncio.sleep(delay)
             else:
-                # Primer intento: esperar siempre el delay base
                 logger.debug(
                     "[%s] Post-fill confirm: esperando %.1fs para propagación...",
-                    self.symbol, _POST_FILL_CONFIRM_DELAY_S,
+                    self.symbol, delay,
                 )
-                await asyncio.sleep(_POST_FILL_CONFIRM_DELAY_S)
+            await asyncio.sleep(delay)
 
             positions = await self._get_positions()
             if positions is None:
-                # Error de red — retornar None directamente, no reintentar
                 return None
             if len(positions) > 0:
-                # Posición confirmada
                 return positions
-            # Posición vacía — puede ser propagación tardía, reintentar
 
         logger.warning(
             "[%s] Post-fill confirm: posición no visible tras %d intentos (%.1fs total). "
@@ -500,7 +492,7 @@ class FuturesTrader:
             _POST_FILL_CONFIRM_RETRIES,
             _POST_FILL_CONFIRM_DELAY_S * _POST_FILL_CONFIRM_RETRIES,
         )
-        return []  # Devolver lista vacía (no error de red, simplemente no hay posición)
+        return []
 
     # ── Loop principal ────────────────────────────────────────────────────────
 
@@ -531,7 +523,7 @@ class FuturesTrader:
 
         now = time.monotonic()
         did_check_exchange = False
-        exchange_positions = None  # FIX: None = no consultado aún
+        exchange_positions = None
         if now - self._last_pos_check_at >= _POS_CHECK_INTERVAL_S:
             exchange_positions      = await self._get_positions()
             self._last_pos_check_at = now
@@ -539,7 +531,6 @@ class FuturesTrader:
 
         if did_check_exchange:
             if exchange_positions is None:
-                # FIX: error de red — NO tocar el estado local, solo loggear
                 logger.warning(
                     "[%s] No se pudo verificar posición en exchange (error de red) — "
                     "manteniendo estado local sin cambios.",
@@ -560,7 +551,6 @@ class FuturesTrader:
                         logger.info("[%s] Posición detectada en exchange: %s @ %s",
                                     self.symbol, self.position, self.entry_price)
             else:
-                # exchange_positions == [] → confirmado que NO hay posición abierta
                 if self.position is not None:
                     logger.info("[%s] Posición cerrada externamente.", self.symbol)
                     try:
@@ -633,16 +623,13 @@ class FuturesTrader:
             await self._set_leverage(lev)
 
         notional = risk.usdc_per_trade * lev
-        qty      = round(notional / entry, 6)
+        # FIX: respetar szDecimals del coin — WLD=0 (enteros), HYPE=2, BTC=5, etc.
+        qty = self._round_qty(notional / entry)
         if qty <= 0:
-            logger.warning("[%s] Cantidad calculada <= 0, skip.", self.symbol)
+            logger.warning("[%s] Cantidad calculada <= 0 tras redondeo szDecimals, skip.", self.symbol)
             return
 
         side = "buy" if action == "BUY" else "sell"
-
-        # FIX: usar el primer TP disponible para el trigger de apertura.
-        # Si tp1 es None pero hay tp2 o tp3, el execution_engine no colocaba
-        # ningún TP en el exchange y la posición quedaba sin protección.
         first_tp = tp1 or tp2 or tp3
 
         logger.info(
@@ -656,13 +643,10 @@ class FuturesTrader:
         if self.dry_run:
             result = {"status": "ok", "_fill_price": entry}
             fill_price = entry
-            confirmed_positions = [{"szi": qty}]  # simular posición confirmada en dry_run
+            confirmed_positions = [{"szi": qty}]
         else:
-            # FIX: pasar first_tp (tp1 or tp2 or tp3) para garantizar que el
-            # execution_engine siempre tiene un TP real que colocar en el exchange.
             result = await self._place_order(side, qty, sl=sl, tp=first_tp)
             if result.get("status") != "ok":
-                # FIX: la orden falló — NO actualizar self.position ni guardar estado
                 logger.error(
                     "[%s] ❌ Orden rechazada por el exchange — NO se registra posición local. "
                     "Respuesta: %s",
@@ -670,7 +654,6 @@ class FuturesTrader:
                 )
                 return
 
-            # FIX: extraer fill price del response
             fill_price = entry
             try:
                 fill_price = float(
@@ -680,9 +663,6 @@ class FuturesTrader:
             except Exception:
                 fill_price = entry
 
-            # FIX: confirmar con reintentos — Hyperliquid tarda 2-3s en propagar
-            # el estado de la posición tras el fill. Sin el delay, la verificación
-            # inmediata devuelve [] y el bot abortaba el registro de estado.
             confirmed_positions = await self._confirm_position_with_retry()
             if confirmed_positions is not None and len(confirmed_positions) == 0:
                 logger.error(
@@ -702,8 +682,9 @@ class FuturesTrader:
                 )
 
         if fill_price and fill_price != entry:
-            qty = round(notional / fill_price, 6)
-            logger.debug("[%s] Fill real: %.4f (estimado: %.4f) — qty ajustada a %.6f",
+            # FIX: también respetar szDecimals al recalcular qty con fill real
+            qty = self._round_qty(notional / fill_price)
+            logger.debug("[%s] Fill real: %.4f (estimado: %.4f) — qty ajustada a %s",
                          self.symbol, fill_price, entry, qty)
 
         self.position       = "long" if action == "BUY" else "short"
@@ -715,7 +696,6 @@ class FuturesTrader:
         self.tp2_hit        = False
         self._open_notional = notional
         self._open_leverage = lev
-        # FIX: _protection_ok = True solo si el exchange confirmó la posición
         self._protection_ok = (
             confirmed_positions is not None and len(confirmed_positions) > 0
         ) if not self.dry_run else True
@@ -760,7 +740,10 @@ class FuturesTrader:
             if tp2_triggered:
                 self.tp2_hit = True
                 mark_tp2_hit(self.symbol)
-                partial_qty = round((self._open_notional / self.entry_price) * TP2_PARTIAL_RATIO, 6)
+                # FIX: usar _round_qty para respetar szDecimals en cierre parcial
+                partial_qty = self._round_qty(
+                    (self._open_notional / self.entry_price) * TP2_PARTIAL_RATIO
+                )
                 if partial_qty > 0 and not self.dry_run:
                     close_side = "sell" if is_long else "buy"
 
@@ -782,7 +765,8 @@ class FuturesTrader:
                         )
 
                         remaining_notional = self._open_notional * (1 - TP2_PARTIAL_RATIO)
-                        remaining_qty = round(remaining_notional / self.entry_price, 6)
+                        # FIX: también szDecimals en qty residual
+                        remaining_qty = self._round_qty(remaining_notional / self.entry_price)
                         if remaining_qty > 0 and (self.tp3 or self.sl):
                             try:
                                 await self._place_tpsl(remaining_qty, self.sl, self.tp3)
@@ -827,7 +811,6 @@ class FuturesTrader:
 
         positions = await self._get_positions()
         if positions is None:
-            # FIX: error de red — no intentar cerrar, reintentar en próxima iteración
             logger.warning(
                 "[%s] Cierre por %s: no se pudo verificar posición en exchange (error de red) — "
                 "reintentando en próxima iteración.",
@@ -843,6 +826,7 @@ class FuturesTrader:
             clear_position(self.symbol)
             return
 
+        # Usar qty real del exchange (no calcular localmente)
         qty = abs(float(positions[0].get("szi", 0)))
         if qty <= 0:
             logger.error("[%s] Cierre por %s: qty=0, no se envía orden.", self.symbol, close_reason)
