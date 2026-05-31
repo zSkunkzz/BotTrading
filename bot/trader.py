@@ -1,29 +1,11 @@
 """
 trader.py — Motor de trading para Hyperliquid perpetuos.
 
-Cómo funciona el sizing en Hyperliquid (DIFERENTE a un CEX):
-  - En HL mandas directamente el tamaño en moneda base (ej. 0.003 BTC)
-  - USDC_PER_TRADE = margen real que quieres arriesgar (colateral)
-  - El leverage define el notional real: notional = USDC_PER_TRADE × leverage
-  - qty = (USDC_PER_TRADE × leverage) / entry_price
-  - Margen reservado en HL = notional / leverage = USDC_PER_TRADE  ✓
-
-Autenticación soportada:
-  Opción A (recomendada): API Key de agente
-    - HL_API_PRIVATE_KEY     : private key del wallet AGENTE generado en app.hyperliquid.xyz
-    - HL_API_WALLET_ADDRESS  : dirección del wallet PRINCIPAL (el que tiene fondos y aprobó el agente)
-
-  Opción B: Private key directa
-    - HL_PRIVATE_KEY         : private key del wallet principal
-    - HL_ACCOUNT_ADDR        : dirección pública (opcional, se deriva automáticamente)
-
-Opcionales:
-  HL_TESTNET        — "true" para usar testnet de Hyperliquid
-  LOOP_SLEEP        — segundos entre iteraciones del loop (default 10)
-  OHLCV_TF          — timeframe OHLCV (default 15m)
-  OHLCV_LIMIT       — número de velas a cargar (default 200)
-  OHLCV_MIN_BARS    — mínimo de velas requeridas (default 55)
-  TP2_PARTIAL_RATIO — ratio de cierre parcial en TP2 (default 0.5)
+Sizing en Hyperliquid:
+  notional = USDC_PER_TRADE × leverage_efectivo
+  qty      = notional / entry_price
+  El leverage_efectivo = min(LEVERAGE_env, signal.suggested_lev, maxLeverage_del_exchange)
+  El margen reservado = notional / leverage = USDC_PER_TRADE
 """
 from __future__ import annotations
 
@@ -68,7 +50,6 @@ _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https
 
 _SET_LEVERAGE_TIMEOUT = float(os.getenv("SET_LEVERAGE_TIMEOUT", "20"))
 
-# Multiplicadores ATR para fallback SL/TP cuando signal los trae vacíos
 _FALLBACK_ATR_SL_MULT  = float(os.getenv("FALLBACK_ATR_SL_MULT",  "1.8"))
 _FALLBACK_ATR_TP1_MULT = float(os.getenv("FALLBACK_ATR_TP1_MULT", "3.5"))
 _FALLBACK_ATR_TP2_MULT = float(os.getenv("FALLBACK_ATR_TP2_MULT", "5.0"))
@@ -113,7 +94,6 @@ def _hl_side_to_str(raw_side: str) -> str:
 
 
 def _nonzero(v) -> Optional[float]:
-    """Devuelve float si v es un número > 0, None en caso contrario."""
     try:
         f = float(v)
         return f if f > 0 else None
@@ -145,7 +125,7 @@ class FuturesTrader:
                  passphrase=None):
         self.symbol      = symbol
         self.coin        = _norm_coin(symbol)
-        self.leverage    = leverage
+        self.leverage    = leverage          # leverage máximo configurado por el usuario
         self.margin_mode = os.getenv("MARGIN_MODE", margin_mode or "isolated").lower()
         self.dry_run     = dry_run
 
@@ -210,7 +190,20 @@ class FuturesTrader:
         self._ccxt_exchange = None
         self._global_risk = None
 
-    # ── Qty rounding respetando szDecimals ────────────────────────────
+    # ── Max leverage efectivo del exchange ──────────────────────────────
+
+    def _exchange_max_lev(self) -> int:
+        """
+        Consulta el maxLeverage del exchange para este coin.
+        Se usa para caparlo junto al LEVERAGE del .env.
+        """
+        try:
+            return self._hl_client.get_max_leverage()
+        except Exception as e:
+            logger.warning("[%s] No se pudo obtener maxLeverage — usando 20: %s", self.symbol, e)
+            return 20
+
+    # ── Qty rounding ────────────────────────────────────────────────
 
     def _round_qty(self, qty: float) -> float:
         try:
@@ -315,9 +308,24 @@ class FuturesTrader:
         if not balance_svc.is_ready():
             balance_svc.init_hl(self._master_addr, self._info_post)
 
+        # Logear el maxLeverage real del exchange al arrancar
+        exchange_max = self._exchange_max_lev()
+        effective    = min(self.leverage, exchange_max)
+        if effective < self.leverage:
+            logger.warning(
+                "[%s] ⚠️  LEVERAGE config=%dx > maxLeverage exchange=%dx — "
+                "se usará %dx en todas las operaciones.",
+                self.symbol, self.leverage, exchange_max, effective,
+            )
+        else:
+            logger.info(
+                "[%s] Leverage efectivo: %dx (config=%dx, exchange_max=%dx)",
+                self.symbol, effective, self.leverage, exchange_max,
+            )
+
         try:
             await asyncio.wait_for(
-                self._set_leverage(self.leverage),
+                self._set_leverage(effective),
                 timeout=_SET_LEVERAGE_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -497,7 +505,7 @@ class FuturesTrader:
         )
         return []
 
-    # ── Recolocar SL/TP si el bulk falló ──────────────────────────────
+    # ── Recolocar SL/TP ────────────────────────────────────────────────
 
     async def _ensure_tpsl_on_exchange(
         self,
@@ -570,15 +578,13 @@ class FuturesTrader:
                 await asyncio.sleep(2.0)
 
         logger.error(
-            "[%s] ❌ No se pudieron confirmar SL/TP en exchange tras %d intentos. "
-            "POSICIÓN SIN PROTECCIÓN — revisar manualmente.",
+            "[%s] ❌ No se pudieron confirmar SL/TP en exchange tras %d intentos.",
             self.symbol, MAX_TRIES,
         )
 
-    # ── Helpers de cierre de posición ─────────────────────────────────
+    # ── Helpers de cierre ─────────────────────────────────────────────
 
     def _clear_position_state(self) -> None:
-        """Limpia el estado interno de posición abierta."""
         self.position    = None
         self.entry_price = None
         self.sl = self.tp1 = self.tp2 = self.tp3 = None
@@ -588,13 +594,8 @@ class FuturesTrader:
         if self._global_risk is not None:
             try:
                 await self._global_risk.register_close(pnl_pct)
-                logger.debug(
-                    "[%s] GlobalRisk.register_close(%.2f%%) — OK",
-                    self.symbol, pnl_pct,
-                )
             except Exception as e:
                 logger.warning("[%s] GlobalRisk.register_close error: %s", self.symbol, e)
-
         try:
             pretrade_risk.register_close(self.symbol, self._open_notional)
         except Exception as e:
@@ -667,7 +668,6 @@ class FuturesTrader:
             await self._manage_open_position(price, risk)
             return
 
-        # ── Pre-checks para abrir nueva posición ──────────────────────
         if global_risk:
             allowed, reason = await global_risk.can_open()
             if not allowed:
@@ -680,7 +680,6 @@ class FuturesTrader:
                            self.symbol, balance, risk.usdc_per_trade)
             return
 
-        # Pre-check inicial: solo con margen base (antes de conocer lev real de la señal)
         try:
             ok, pt_reason = await pretrade_risk.check(
                 symbol=self.symbol,
@@ -691,7 +690,7 @@ class FuturesTrader:
                 sl=None,
                 ask=None,
                 bid=None,
-                leverage=1,  # notional == margen en este punto
+                leverage=1,
             )
             if not ok:
                 logger.debug("[%s] pretrade_risk bloqueó la entrada: %s", self.symbol, pt_reason)
@@ -717,7 +716,6 @@ class FuturesTrader:
         if action not in ("BUY", "SELL"):
             return
 
-        # ── Extraer parámetros de la señal ────────────────────────────
         if signal:
             entry = signal.entry or price
             sl    = _nonzero(signal.sl)
@@ -732,10 +730,19 @@ class FuturesTrader:
             lev = self.leverage
             atr = entry * 0.005
 
-        # Nunca superar el leverage configurado por el usuario
-        lev = min(lev, self.leverage)
+        # ── Capar leverage: min(config, señal, exchange_max) ────────────────
+        exchange_max_lev = self._exchange_max_lev()
+        lev = min(lev, self.leverage, exchange_max_lev)
+        if lev < 1:
+            lev = 1
 
-        # ── Aplicar leverage SIEMPRE antes de abrir posición ──────────
+        logger.debug(
+            "[%s] Leverage seleccionado: %dx (señal=%s, config=%d, exchange_max=%d)",
+            self.symbol, lev,
+            signal.suggested_lev if signal else "N/A",
+            self.leverage, exchange_max_lev,
+        )
+
         if not self.dry_run:
             try:
                 await asyncio.wait_for(
@@ -747,16 +754,16 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning("[%s] _set_leverage pre-orden error: %s", self.symbol, e)
 
-        # ── SIZING: notional = margen × leverage ──────────────────────
+        # ── Sizing ──────────────────────────────────────────────────
         usdc_per_trade  = risk.usdc_per_trade
         notional_target = usdc_per_trade * lev
         qty     = self._round_qty(notional_target / entry)
         notional = qty * entry
 
         logger.info(
-            "[%s] 📐 Sizing HL | margen=%.2f USDC | lev=%dx | "
+            "[%s] 📐 Sizing | margen=%.2f USDC | lev=%dx (max_exchange=%dx) | "
             "notional=%.2f USDC | entry=%.4f | qty=%s",
-            self.symbol, usdc_per_trade, lev, notional, entry, qty,
+            self.symbol, usdc_per_trade, lev, exchange_max_lev, notional, entry, qty,
         )
 
         if qty <= 0:
@@ -766,7 +773,7 @@ class FuturesTrader:
         pos_side = "long" if action == "BUY" else "short"
         trade_side_str = "buy" if action == "BUY" else "sell"
 
-        # ── GARANTIZAR SL y TP — NUNCA abrir sin ambos ─────────────────
+        # ── Garantizar SL y TP ────────────────────────────────────────────
         if sl is None or tp1 is None:
             fb_sl, fb_tp1, fb_tp2 = _compute_fallback_tpsl(pos_side, entry, float(atr))
             if sl is None:
@@ -781,7 +788,7 @@ class FuturesTrader:
         assert sl  and sl  > 0, f"[{self.symbol}] SL inválido: {sl}"
         assert tp1 and tp1 > 0, f"[{self.symbol}] TP1 inválido: {tp1}"
 
-        # ── Check pretrade FINAL con notional real y leverage real ──────
+        # ── Check pretrade FINAL ─────────────────────────────────────────
         ask = bid = None
         try:
             from bot.ws_feed import ws_feed
@@ -802,7 +809,7 @@ class FuturesTrader:
                 sl=sl,
                 ask=ask,
                 bid=bid,
-                leverage=lev,   # ← clave: pretrade divide notional/lev para obtener margen
+                leverage=lev,
             )
             if not ok:
                 logger.info("[%s] pretrade_risk bloqueó tras señal: %s", self.symbol, pt_reason)
@@ -848,7 +855,6 @@ class FuturesTrader:
                     self.symbol,
                 )
 
-        # Ajustar SL/TP al fill real (slippage)
         if fill_price and fill_price != entry:
             delta = fill_price - entry
             sl  = round(sl  + delta, 6)
@@ -914,7 +920,6 @@ class FuturesTrader:
 
         is_long = self.position == "long"
 
-        # ── TP2 parcial ───────────────────────────────────────────────
         if self.tp2 and not self.tp2_hit:
             tp2_triggered = (is_long and price >= self.tp2) or (not is_long and price <= self.tp2)
             if tp2_triggered:
@@ -950,7 +955,6 @@ class FuturesTrader:
                             except Exception as e:
                                 logger.warning("[%s] No se pudo re-colocar TP/SL tras parcial: %s", self.symbol, e)
 
-        # ── Trailing stop ─────────────────────────────────────────────
         if risk.trailing_sl and self.sl is not None:
             activation_px = self.entry_price * (
                 1 + risk.trailing_activation_pct / 100 if is_long
@@ -977,7 +981,6 @@ class FuturesTrader:
                     except Exception as e:
                         logger.warning("[%s] No se pudo actualizar trailing SL: %s", self.symbol, e)
 
-        # ── Evaluar SL / TP ───────────────────────────────────────────
         sl_hit  = self.sl  and ((is_long and price <= self.sl)  or (not is_long and price >= self.sl))
         tp3_hit = self.tp3 and ((is_long and price >= self.tp3) or (not is_long and price <= self.tp3))
         tp1_hit = self.tp1 and not self.tp2 and ((is_long and price >= self.tp1) or (not is_long and price <= self.tp1))
@@ -1067,4 +1070,4 @@ class FuturesTrader:
                         None, lambda: self._hl_client.place_tp(is_buy=side_is_buy, sz=q, trigger_px=px)
                     )
             except Exception as e:
-                logger.warning("[%s] No se pudo colocar %s: %s", self.symbol, order_type, e)
+            	    logger.warning("[%s] No se pudo colocar %s: %s", self.symbol, order_type, e)
