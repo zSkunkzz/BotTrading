@@ -4,10 +4,12 @@ pretrade_risk.py — Motor de riesgo pre-trade institucional.
 Valida cada intención de orden ANTES de enviarla al exchange.
 Si cualquier check falla, devuelve (False, motivo_str) y la orden no se manda.
 
-Cambios v2:
-  - balance=None ya no bloquea (API caída → warning y se sigue)
-  - PT_BALANCE_USAGE_PCT subido a 0.90 (evitaba trades legítimos con 0.40)
-  - PT_MIN_SL_DISTANCE_BPS bajado a 8 bps (ATR 15m en BTC/ETH suele ser 5-15 bps)
+Defaults ajustados para cuentas pequeñas (10-100 USDC por trade):
+  - PT_MAX_NOTIONAL_PER_TRADE : 200 USDC  (antes 500)
+  - PT_MAX_SYMBOL_EXPOSURE    : 200 USDC  (antes 1000)
+  - PT_MAX_TOTAL_EXPOSURE     : 500 USDC  (antes 3000)
+  - PT_MIN_SL_DISTANCE_BPS    :   8 bps   (ok, sin cambios)
+  - PT_BALANCE_USAGE_PCT      :  0.90     (ok, sin cambios)
 """
 from __future__ import annotations
 
@@ -27,30 +29,30 @@ class PreTradeRisk:
     """
     Variables de entorno (todas opcionales):
 
-      PT_MAX_NOTIONAL_PER_TRADE   USDT máximos por operación          (default 500)
-      PT_MAX_SYMBOL_EXPOSURE      USDT máximos en un símbolo          (default 1000)
-      PT_MAX_TOTAL_EXPOSURE       USDT máximos en todas las posiciones (default 3000)
+      PT_MAX_NOTIONAL_PER_TRADE   USDC máximos por operación          (default 200)
+      PT_MAX_SYMBOL_EXPOSURE      USDC máximos en un símbolo          (default 200)
+      PT_MAX_TOTAL_EXPOSURE       USDC máximos en todas las posiciones (default 500)
       PT_MAX_SPREAD_BPS           Spread máximo permitido en bps       (default 30)
-      PT_MIN_SL_DISTANCE_BPS      Distancia mínima SL en bps           (default 8)  ← bajado de 20
+      PT_MIN_SL_DISTANCE_BPS      Distancia mínima SL en bps           (default 8)
       PT_MAX_SLIPPAGE_BPS         Slippage esperado máximo aceptable   (default 50)
       PT_MAX_ORDERS_PER_MIN       Órdenes máximas por minuto POR SÍMBOLO (default 6)
-      PT_BALANCE_USAGE_PCT        Máximo % del balance por trade       (default 0.90) ← subido de 0.40
+      PT_BALANCE_USAGE_PCT        Máximo % del balance por trade       (default 0.90)
     """
 
     def __init__(self) -> None:
-        self.max_notional_per_trade : float = _e("PT_MAX_NOTIONAL_PER_TRADE", 500.0)
-        self.max_symbol_exposure    : float = _e("PT_MAX_SYMBOL_EXPOSURE",   1_000.0)
-        self.max_total_exposure     : float = _e("PT_MAX_TOTAL_EXPOSURE",    3_000.0)
-        self.max_spread_bps         : float = _e("PT_MAX_SPREAD_BPS",           30.0)
-        self.min_sl_distance_bps    : float = _e("PT_MIN_SL_DISTANCE_BPS",       8.0)  # era 20
-        self.max_slippage_bps       : float = _e("PT_MAX_SLIPPAGE_BPS",         50.0)
-        self.max_orders_per_min     : int   = int(_e("PT_MAX_ORDERS_PER_MIN",    6))
-        self.balance_usage_pct      : float = _e("PT_BALANCE_USAGE_PCT",         0.90)  # era 0.40
+        self.max_notional_per_trade : float = _e("PT_MAX_NOTIONAL_PER_TRADE", 200.0)
+        self.max_symbol_exposure    : float = _e("PT_MAX_SYMBOL_EXPOSURE",   200.0)
+        self.max_total_exposure     : float = _e("PT_MAX_TOTAL_EXPOSURE",    500.0)
+        self.max_spread_bps         : float = _e("PT_MAX_SPREAD_BPS",         30.0)
+        self.min_sl_distance_bps    : float = _e("PT_MIN_SL_DISTANCE_BPS",    8.0)
+        self.max_slippage_bps       : float = _e("PT_MAX_SLIPPAGE_BPS",       50.0)
+        self.max_orders_per_min     : int   = int(_e("PT_MAX_ORDERS_PER_MIN",  6))
+        self.balance_usage_pct      : float = _e("PT_BALANCE_USAGE_PCT",       0.90)
 
         self._symbol_exposure  : dict[str, float] = {}
         self._order_timestamps : dict[str, deque] = {}
 
-    # ── API pública ───────────────────────────────────────────────────────────
+    # ── API pública ────────────────────────────────────────────────────────────────
 
     async def check(
         self,
@@ -58,7 +60,7 @@ class PreTradeRisk:
         side:     str,
         notional: float,
         price:    float,
-        balance:  float | None,          # ← ahora acepta None explícitamente
+        balance:  float | None,
         sl:       float | None = None,
         ask:      float | None = None,
         bid:      float | None = None,
@@ -67,7 +69,7 @@ class PreTradeRisk:
 
         checks = [
             self._check_notional(notional),
-            self._check_balance_usage(notional, balance),   # None-safe
+            self._check_balance_usage(notional, balance),
             self._check_symbol_exposure(sym, notional),
             self._check_total_exposure(notional),
             self._check_order_rate(sym),
@@ -95,14 +97,13 @@ class PreTradeRisk:
         if sym not in self._order_timestamps:
             self._order_timestamps[sym] = deque()
         self._order_timestamps[sym].append(time.monotonic())
-        logger.debug(f"[PreTrade:{sym}] 📌 Orden confirmada — rate count={len(self._order_timestamps[sym])}")
 
     def register_close(self, symbol: str, notional: float) -> None:
-        sym = symbol.replace("/", "").replace(":USDT", "")
+        sym  = symbol.replace("/", "").replace(":USDT", "")
         prev = self._symbol_exposure.get(sym, 0.0)
         self._symbol_exposure[sym] = max(0.0, prev - notional)
         logger.debug(
-            f"[PreTrade:{sym}] Exposición liberada: -{notional:.2f} "
+            f"[PreTrade:{sym}] Exposición liberada: -{notional:.2f} USDC "
             f"(queda {self._symbol_exposure[sym]:.2f})"
         )
 
@@ -113,40 +114,29 @@ class PreTradeRisk:
         sym = symbol.replace("/", "").replace(":USDT", "")
         return self._symbol_exposure.get(sym, 0.0)
 
-    # ── Checks individuales ───────────────────────────────────────────────────
+    # ── Checks individuales ──────────────────────────────────────────────────────────
 
     def _check_notional(self, notional: float) -> tuple[bool, str]:
         if notional > self.max_notional_per_trade:
             return False, (
-                f"Notional {notional:.2f} USDT supera límite por trade "
-                f"{self.max_notional_per_trade:.0f} USDT"
+                f"Notional {notional:.2f} USDC supera límite por trade "
+                f"{self.max_notional_per_trade:.0f} USDC"
             )
         return True, ""
 
     def _check_balance_usage(self, notional: float, balance: float | None) -> tuple[bool, str]:
-        """
-        FIX v2:
-        - Si balance es None (API caída) → warning y se permite continuar.
-          El trade puede fallar al ejecutarse por fondos insuficientes, pero
-          no bloqueamos preventivamente cuando no tenemos datos fiables.
-        - Si balance es 0.0 exacto → bloquear (cuenta vacía confirmada).
-        - Límite de uso subido a 90% (antes 40% bloqueaba trades legítimos).
-        """
         if balance is None:
             logger.warning(
                 "[PreTrade] ⚠️ Balance desconocido (API falló) — "
-                f"asumiendo ≥ {notional:.2f} USDT para continuar"
+                f"asumiendo ≥ {notional:.2f} USDC para continuar"
             )
             return True, ""
-
         if balance <= 0:
-            return False, f"Balance {balance:.2f} USDT inválido (cuenta vacía)"
-
+            return False, f"Balance {balance:.2f} USDC inválido (cuenta vacía)"
         if notional > balance:
             return False, (
-                f"Notional {notional:.2f} USDT supera balance disponible {balance:.2f} USDT"
+                f"Notional {notional:.2f} USDC supera balance disponible {balance:.2f} USDC"
             )
-
         usage = notional / balance
         if usage > self.balance_usage_pct:
             return False, (
@@ -160,8 +150,8 @@ class PreTradeRisk:
         projected = current + notional
         if projected > self.max_symbol_exposure:
             return False, (
-                f"Exposición en {sym} llegaría a {projected:.2f} USDT "
-                f"(límite {self.max_symbol_exposure:.0f} USDT)"
+                f"Exposición en {sym} llegaría a {projected:.2f} USDC "
+                f"(límite {self.max_symbol_exposure:.0f} USDC)"
             )
         return True, ""
 
@@ -169,8 +159,8 @@ class PreTradeRisk:
         projected = self.get_total_exposure() + notional
         if projected > self.max_total_exposure:
             return False, (
-                f"Exposición total llegaría a {projected:.2f} USDT "
-                f"(límite {self.max_total_exposure:.0f} USDT)"
+                f"Exposición total llegaría a {projected:.2f} USDC "
+                f"(límite {self.max_total_exposure:.0f} USDC)"
             )
         return True, ""
 
@@ -204,11 +194,6 @@ class PreTradeRisk:
     def _check_sl_distance(
         self, price: float, sl: float | None, side: str
     ) -> tuple[bool, str]:
-        """
-        FIX v2: mínimo bajado a 8 bps (antes 20).
-        Con ATR_MULT_SL=1.2 en signal_engine, el SL en BTC 15m suele
-        quedar entre 5-15 bps. 20 bps bloqueaba la mayoría de señales.
-        """
         if sl is None or price <= 0:
             return True, ""
         if side in ("buy", "long"):
@@ -224,11 +209,8 @@ class PreTradeRisk:
             )
         return True, ""
 
-    # ── Registro interno ──────────────────────────────────────────────────────
-
     def _register_exposure(self, sym: str, notional: float) -> None:
         self._symbol_exposure[sym] = self._symbol_exposure.get(sym, 0.0) + notional
 
 
-# Singleton global
 pretrade_risk = PreTradeRisk()

@@ -57,7 +57,7 @@ def make_risk():
         trailing_activation_pct=float(os.getenv("TRAILING_ACTIVATION_PCT", "1.5")),
         trailing_callback_pct=float(os.getenv("TRAILING_CALLBACK_PCT", "0.8")),
         max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0")),
-        max_open_trades=1,
+        max_open_trades=int(os.getenv("MAX_OPEN_TRADES_PER_SYMBOL", "1")),
     )
 
 
@@ -66,11 +66,6 @@ async def _start_single_pair(symbol: str):
     if symbol in active_traders:
         return
     logger.info("🚀 Iniciando trader: %s", symbol)
-
-    # Pasar las credenciales correctas según el modo configurado
-    # trader.py detecta automáticamente HL_API_WALLET_ADDRESS + HL_API_PRIVATE_KEY (Opción A)
-    # o HL_PRIVATE_KEY (Opción B) desde las variables de entorno.
-    # api_secret solo se usa como fallback si HL_PRIVATE_KEY no está en env.
     trader = FuturesTrader(
         api_key=None,
         api_secret=os.getenv("HL_PRIVATE_KEY", ""),
@@ -132,7 +127,8 @@ async def main():
         addr=hl_addr,
         testnet=os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes"),
     )
-    logger.info("✅ Balance service inicializado (addr=%s)", hl_addr[:12] + "..." if hl_addr else "N/A")
+    logger.info("✅ Balance service inicializado (addr=%s)",
+                hl_addr[:12] + "..." if hl_addr else "N/A")
 
     global_risk = GlobalRisk(
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "5")),

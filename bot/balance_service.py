@@ -1,9 +1,9 @@
 """
-balance_service.py — Singleton de balance USDT para Hyperliquid.
+balance_service.py — Singleton de balance USDC para Hyperliquid.
 
 Endpoint:
   POST /info  {type: "clearinghouseState", user: <address>}
-  → data.marginSummary.accountValue  (equity total en USDT)
+  → data.marginSummary.accountValue  (equity total en USDC)
 
 No requiere firma — es un endpoint público de lectura.
 """
@@ -15,25 +15,23 @@ import aiohttp
 
 logger = logging.getLogger("BalanceSvc")
 
-_CACHE_TTL  = 30    # segundos entre refreshes
+_CACHE_TTL   = 30    # segundos entre refreshes
 _USE_TESTNET = False  # se actualiza desde init_hl()
 
 
 class _BalanceService:
     def __init__(self):
-        self._addr:   str   = ""
-        self._cache:  float | None = None
-        self._ts:     float = 0.0
-        self._lock    = asyncio.Lock()
-        self._ready   = False
-        self._api_url = "https://api.hyperliquid.xyz"
-        # Callback opcional al info_post del trader (evita duplicar lógica HTTP)
+        self._addr:        str   = ""
+        self._cache:       float | None = None
+        self._ts:          float = 0.0
+        self._lock         = asyncio.Lock()
+        self._ready        = False
+        self._api_url      = "https://api.hyperliquid.xyz"
         self._info_post_fn = None
 
     def is_ready(self) -> bool:
         return self._ready
 
-    # ── Compatibilidad con la firma de Bitget (ignoramos key/secret/pass) ──
     def init(self, key: str = "", secret: str = "", passphrase: str = ""):
         """Stub de compatibilidad — usa init_hl() para Hyperliquid."""
         if self._ready:
@@ -44,23 +42,24 @@ class _BalanceService:
         """Inicializa con la dirección pública del wallet."""
         if self._ready:
             return
-        self._addr        = addr
+        self._addr         = addr
         self._info_post_fn = info_post_fn
-        self._api_url     = (
+        self._api_url      = (
             "https://api.hyperliquid-testnet.xyz" if testnet
             else "https://api.hyperliquid.xyz"
         )
         self._ready = True
-        logger.info("[BalanceSvc] Inicializado (Hyperliquid) addr=%s", addr[:10] + "...")
+        logger.info("[BalanceSvc] Inicializado (Hyperliquid) addr=%s",
+                    addr[:10] + "..." if addr else "N/A")
 
     def invalidate(self):
         """Fuerza refresco en la próxima llamada a get()."""
         self._ts = 0.0
 
-    # ── HTTP ──────────────────────────────────────────────────────────────────
+    # ── HTTP ────────────────────────────────────────────────────────────────
 
     async def _fetch_via_callback(self) -> float | None:
-        """Usa el info_post del trader si está disponible (reutiliza sesión)."""
+        """Usa el info_post del trader si está disponible."""
         if not self._info_post_fn:
             return None
         try:
@@ -86,8 +85,7 @@ class _BalanceService:
                     headers={"Content-Type": "application/json"},
                     timeout=aiohttp.ClientTimeout(total=8),
                 ) as r:
-                    text = await r.text()
-                    data = _json.loads(text)
+                    data = _json.loads(await r.text())
                     return self._extract(data)
         except Exception as e:
             logger.debug("[BalanceSvc] _fetch_direct error: %s", e)
@@ -97,9 +95,8 @@ class _BalanceService:
         """
         Extrae el equity disponible de la respuesta clearinghouseState.
         Campos candidatos (en orden de preferencia):
-          marginSummary.accountValue   ← equity total
+          marginSummary.accountValue   ← equity total en USDC
           marginSummary.withdrawable   ← disponible para retirar
-          crossMaintenanceMarginUsed   ← fallback
         """
         if not isinstance(data, dict):
             return None
@@ -111,12 +108,11 @@ class _BalanceService:
                 try:
                     val = float(v)
                     if val >= 0:
-                        logger.debug("[BalanceSvc] Balance=%.2f USDT (campo=%s)", val, field)
+                        logger.debug("[BalanceSvc] Balance=%.2f USDC (campo=%s)", val, field)
                         return val
                 except (ValueError, TypeError):
                     pass
 
-        # Fallback: cross account value
         for field in ("crossMaintenanceMarginUsed", "totalRawUsd"):
             v = data.get(field)
             if v is not None:
@@ -128,7 +124,7 @@ class _BalanceService:
         logger.debug("[BalanceSvc] No se encontró campo de balance en: %s", list(data.keys()))
         return None
 
-    # ── API pública ───────────────────────────────────────────────────────────
+    # ── API pública ────────────────────────────────────────────────────────────────
 
     async def get(self) -> float | None:
         """Devuelve balance cacheado o refresca si ha caducado."""
@@ -148,7 +144,7 @@ class _BalanceService:
                 self._cache = val
                 self._ts    = time.time()
             else:
-                logger.warning("[BalanceSvc] ⚠️ No se pudo obtener balance")
+                logger.warning("[BalanceSvc] ⚠️ No se pudo obtener balance USDC")
             return self._cache
 
 
