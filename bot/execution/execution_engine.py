@@ -103,14 +103,6 @@ class ExecutionEngine:
 
     @staticmethod
     def _round_qty(qty: float, sz_decimals: int) -> float:
-        """
-        Redondea qty al número de decimales permitidos por HL para este coin.
-
-        FIX B — 'Order has invalid size':
-          Coins de precio bajo (DOGE, XRP, SHIB...) tienen szDecimals=0,
-          lo que significa que HL sólo acepta cantidades enteras.
-          Usar math.floor (truncar hacia abajo) para no exceder el balance.
-        """
         if sz_decimals <= 0:
             return float(math.floor(qty))
         factor = 10 ** sz_decimals
@@ -125,10 +117,6 @@ class ExecutionEngine:
         ref_price: float,
         sym: str,
     ) -> dict:
-        """
-        Llama a place_market con retry ante errores 429.
-        Lanza la excepción si todos los intentos fallan.
-        """
         last_exc: Exception | None = None
         for attempt in range(self.market_429_retries):
             if attempt > 0:
@@ -168,24 +156,6 @@ class ExecutionEngine:
         sl:            Optional[float] = None,
         tp:            Optional[float] = None,
     ) -> dict:
-        """
-        Ejecuta una orden con TP/SL reales en el exchange.
-
-        GUARDIA DURA (apertura):
-          Si trade_side=="open" y sl o tp son None/0 → rechaza inmediatamente.
-          Ninguna posición se abre sin ambos niveles de protección.
-
-        Si trade_side=="open" y sl+tp válidos:
-          1. Abre la posición (limit o market)
-          2. Coloca trigger TP + trigger SL en bulk
-          FIX race condition: `entry_ok` se actualiza con el resultado REAL
-          de la orden ejecutada (limit fill o market fallback), nunca con el
-          result de la limit "resting" que todavía no está filled.
-
-        Si reduce_only=True (cierre manual):
-          1. Cancela trigger orders abiertos del coin
-          2. Ejecuta cierre
-        """
         sym    = trader.symbol
         client = self._get_client(sym)
         rec    = TradeRecord(symbol=sym, side=side, qty=qty, arrival_price=arrival_price)
@@ -231,11 +201,6 @@ class ExecutionEngine:
             and spread_bps <= self.max_spread_bps_limit
         )
 
-        # `entry_ok` indica si la orden de entrada fue confirmada — es la
-        # única variable que controla si se colocan los TP/SL.
-        # FIX race condition: NO se usa result.get("status") directamente porque
-        # cuando la limit queda en "resting" su status es "ok" pero NO está filled.
-        # Solo ponemos entry_ok=True cuando sabemos con certeza que hay posición abierta.
         entry_ok = False
         result   = {"status": "error", "response": "not executed"}
 
@@ -244,7 +209,6 @@ class ExecutionEngine:
             limit_result, filled = await self._try_limit_sdk(client, is_buy, qty, limit_price, rec)
 
             if filled:
-                # Limit se ejecutó completamente
                 result               = limit_result
                 entry_ok             = True
                 rec.order_type_used  = "limit"
@@ -258,8 +222,6 @@ class ExecutionEngine:
                     return limit_result
 
                 logger.info("[%s] ⚡ Limit sin fill → fallback market", sym)
-                # FIX: usamos el result del MARKET (no del limit resting)
-                # para determinar entry_ok correctamente.
                 market_result = await self._place_market_with_retry(
                     client, is_buy, qty, reduce_only, arrival_price, sym
                 )
@@ -293,15 +255,11 @@ class ExecutionEngine:
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
 
-        # ── Colocar TP/SL reales SÓLO si la apertura fue confirmada ─────
-        # Usa entry_ok (no result["status"]) para evitar la race condition
-        # donde la limit "resting" devuelve status=ok sin estar filled.
         if (
             entry_ok
             and not reduce_only
             and trade_side == "open"
         ):
-            # sl y tp ya fueron validados por la guardia dura arriba
             await self._place_tpsl_bulk(client, is_buy, qty, sl, tp, sym)
 
         self._finalize_rec(rec, result, side, arrival_price)
@@ -321,15 +279,20 @@ class ExecutionEngine:
         """
         Coloca TP y SL como trigger orders reales en el exchange.
 
-        FIX: todos los precios (triggerPx y limit_px) se redondean con
-        client.round_px() para garantizar que sean válidos para CUALQUIER
-        coin — evita 'Order has invalid price' en HYPE, DOGE, XRP, etc.
+        Regla de limit_px para TP (CRÍTICO — causa de 'Invalid TP/SL price'):
+          Hyperliquid exige que limit_px sea "ejecutable" desde el lado del cierre:
 
-        Regla de limit_px para TP:
-          • TP de LONG  → close_side=SELL → limit_px = triggerPx * (1 - buffer)  ✓
-          • TP de SHORT → close_side=BUY  → limit_px = triggerPx * (1 + buffer)  ✓
+          • LONG  (is_buy=True)  → cierre es SELL  → limit_px DEBE ser >= triggerPx
+            (vendemos y aceptamos precio igual o MEJOR, es decir más alto)
+            → limit_px = triggerPx * (1 + buffer)
+
+          • SHORT (is_buy=False) → cierre es BUY   → limit_px DEBE ser <= triggerPx
+            (compramos y aceptamos precio igual o MEJOR, es decir más bajo)
+            → limit_px = triggerPx * (1 - buffer)
+
+          La versión anterior tenía esto invertido para LONG, causando el error.
         """
-        close_side = not is_buy
+        close_side = not is_buy  # True = BUY (cerrar short), False = SELL (cerrar long)
         orders_to_place = []
 
         if tp is not None:
@@ -337,9 +300,11 @@ class ExecutionEngine:
 
             if self.tp_as_limit:
                 buffer_multiplier = self.tp_limit_buffer_bps / 10_000
-                if close_side:  # cerrar short: compramos, aceptamos pagar más
+                if is_buy:
+                    # Cerrando LONG → vendemos → limit_px por ENCIMA del trigger (aceptamos >= trigger)
                     tp_limit_px = client.round_px(tp_trigger * (1 + buffer_multiplier))
-                else:           # cerrar long:  vendemos, aceptamos recibir menos
+                else:
+                    # Cerrando SHORT → compramos → limit_px por DEBAJO del trigger (aceptamos <= trigger)
                     tp_limit_px = client.round_px(tp_trigger * (1 - buffer_multiplier))
             else:
                 tp_limit_px = None
