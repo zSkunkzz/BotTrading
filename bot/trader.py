@@ -62,7 +62,7 @@ _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https
 
 _SET_LEVERAGE_TIMEOUT = float(os.getenv("SET_LEVERAGE_TIMEOUT", "20"))
 
-# ── Rate limiter global para /info ─────────────────────────────────────────
+# ── Rate limiter global para /info ─────────────────────────────────────────────
 _HL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
 _HL_MIN_INTERVAL = 0.6
@@ -77,7 +77,7 @@ async def _hl_throttle():
         _HL_LAST_CALL = time.monotonic()
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────
 
 def _norm_coin(symbol: str) -> str:
     s = symbol.replace("/", "").replace(":USDT", "").upper()
@@ -227,7 +227,7 @@ class FuturesTrader:
                             return _json.loads(await r2.text())
                 return _json.loads(await r.text())
 
-    # ── Init / cleanup ────────────────────────────────────────────────────────
+    # ── Init / cleanup ──────────────────────────────────────────────────────────
 
     async def _init(self, usdc_per_trade: float):
         await self._get_ccxt()
@@ -300,7 +300,7 @@ class FuturesTrader:
     async def cleanup(self):
         await self._close_ccxt()
 
-    # ── Precio y OHLCV ──────────────────────────────────────────────────────────
+    # ── Precio y OHLCV ────────────────────────────────────────────────────────
 
     async def get_price(self) -> float:
         try:
@@ -358,7 +358,7 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage — usa SDK directamente (fix: evita signing manual) ──────────
+    # ── Leverage — usa SDK directamente (fix: evita signing manual) ────────
 
     async def _set_leverage(self, leverage: int):
         """
@@ -382,7 +382,7 @@ class FuturesTrader:
         else:
             logger.debug("[%s] set_leverage respuesta: %s", self.symbol, result)
 
-    # ── Órdenes ───────────────────────────────────────────────────────────────────
+    # ── Órdenes ──────────────────────────────────────────────────────────────────
 
     async def _get_order_status(self, order_id) -> dict:
         try:
@@ -426,7 +426,7 @@ class FuturesTrader:
             await kill_switch.on_order_result(rejected=True)
         return r
 
-    # ── Posiciones ─────────────────────────────────────────────────────────────
+    # ── Posiciones ──────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list | None:
         """
@@ -502,7 +502,7 @@ class FuturesTrader:
         )
         return []  # Devolver lista vacía (no error de red, simplemente no hay posición)
 
-    # ── Loop principal ───────────────────────────────────────────────────────────
+    # ── Loop principal ────────────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None):
         """Loop principal del trader para un símbolo."""
@@ -639,11 +639,17 @@ class FuturesTrader:
             return
 
         side = "buy" if action == "BUY" else "sell"
+
+        # FIX: usar el primer TP disponible para el trigger de apertura.
+        # Si tp1 es None pero hay tp2 o tp3, el execution_engine no colocaba
+        # ningún TP en el exchange y la posición quedaba sin protección.
+        first_tp = tp1 or tp2 or tp3
+
         logger.info(
             "[%s] 📈 Abriendo %s · qty=%s · entry=~%s · sl=%s · tp1=%s | %s",
             self.symbol, action, qty, round(entry, 4),
             round(sl, 4) if sl else "N/A",
-            round(tp1, 4) if tp1 else "N/A",
+            round(first_tp, 4) if first_tp else "N/A",
             decision.get("reason", ""),
         )
 
@@ -652,7 +658,9 @@ class FuturesTrader:
             fill_price = entry
             confirmed_positions = [{"szi": qty}]  # simular posición confirmada en dry_run
         else:
-            result = await self._place_order(side, qty, sl=sl, tp=tp1)
+            # FIX: pasar first_tp (tp1 or tp2 or tp3) para garantizar que el
+            # execution_engine siempre tiene un TP real que colocar en el exchange.
+            result = await self._place_order(side, qty, sl=sl, tp=first_tp)
             if result.get("status") != "ok":
                 # FIX: la orden falló — NO actualizar self.position ni guardar estado
                 logger.error(
@@ -746,7 +754,7 @@ class FuturesTrader:
 
         is_long = self.position == "long"
 
-        # ── TP2 parcial ────────────────────────────────────────────────────
+        # ── TP2 parcial ───────────────────────────────────────────────────
         if self.tp2 and not self.tp2_hit:
             tp2_triggered = (is_long and price >= self.tp2) or (not is_long and price <= self.tp2)
             if tp2_triggered:
@@ -781,7 +789,7 @@ class FuturesTrader:
                             except Exception as e:
                                 logger.warning("[%s] No se pudieron re-colocar TP/SL tras parcial: %s", self.symbol, e)
 
-        # ── Trailing stop ────────────────────────────────────────────────────
+        # ── Trailing stop ────────────────────────────────────────────────
         if risk.trailing_sl and self.sl is not None:
             activation_px = self.entry_price * (
                 1 + risk.trailing_activation_pct / 100 if is_long
@@ -808,7 +816,7 @@ class FuturesTrader:
                     except Exception as e:
                         logger.warning("[%s] No se pudo actualizar trailing SL en exchange: %s", self.symbol, e)
 
-        # ── Evaluar SL / TP ───────────────────────────────────────────────────
+        # ── Evaluar SL / TP ───────────────────────────────────────────────
         sl_hit  = self.sl  and ((is_long and price <= self.sl)  or (not is_long and price >= self.sl))
         tp3_hit = self.tp3 and ((is_long and price >= self.tp3) or (not is_long and price <= self.tp3))
         tp1_hit = self.tp1 and not self.tp2 and ((is_long and price >= self.tp1) or (not is_long and price <= self.tp1))
