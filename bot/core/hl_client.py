@@ -319,6 +319,12 @@ class HLClient:
     def cancel_all_open_tpsl(self) -> list[dict]:
         """
         Cancela todos los trigger orders (TP/SL) abiertos para este coin.
+
+        FIX 4: en lugar de buscar strings en orderType (frágil, depende del
+        idioma y versión del SDK), inspeccionamos el campo 'tpsl' dentro del
+        dict orderType cuando está disponible. Fallback al filtro por string
+        para compatibilidad con versiones antiguas del SDK que devuelven
+        orderType como string.
         """
         orders  = self.get_open_orders()
         results = []
@@ -326,10 +332,25 @@ class HLClient:
             if o.get("coin") != self.coin:
                 continue
             ot = o.get("orderType", "")
-            if "Trigger" in ot or "Stop" in ot or "Take Profit" in ot:
+            is_tpsl = False
+            if isinstance(ot, dict):
+                # SDK v3+: orderType es un dict con clave 'trigger'
+                trigger = ot.get("trigger", {})
+                tpsl_val = trigger.get("tpsl", "")
+                is_tpsl = tpsl_val in ("tp", "sl")
+            elif isinstance(ot, str):
+                # SDK anterior: orderType es string
+                is_tpsl = any(
+                    kw in ot
+                    for kw in ("Trigger", "Stop", "Take Profit", "trigger", "stop", "tp", "sl")
+                )
+            if is_tpsl:
                 oid = o.get("oid")
                 if oid:
                     r = self.cancel_order(oid)
                     results.append(r)
-                    logger.info("[%s] Trigger order cancelada: oid=%s type=%s", self.coin, oid, ot)
+                    logger.info(
+                        "[%s] Trigger order cancelada: oid=%s type=%s",
+                        self.coin, oid, ot,
+                    )
         return results

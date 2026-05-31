@@ -79,11 +79,7 @@ class ExecutionEngine:
         self.limit_offset_bps:       float = _e("EE_LIMIT_OFFSET_BPS",        3.0)
         self.max_slippage_alert_bps: float = _e("EE_MAX_SLIPPAGE_ALERT_BPS", 30.0)
         self.tp_as_limit:            bool  = os.getenv("EE_TP_AS_LIMIT", "true").lower() == "true"
-        # FIX: buffer de precio para limit_px del TP (bps sobre/bajo el triggerPx)
-        # Para long: limit_px = triggerPx * (1 + buffer) → acepta fills hasta arriba
-        # Para short: limit_px = triggerPx * (1 - buffer) → acepta fills hasta abajo
         self.tp_limit_buffer_bps:    float = _e("EE_TP_LIMIT_BUFFER_BPS",    50.0)
-        # FIX: reintentos ante 429 en place_bulk
         self.bulk_retry_attempts:    int   = int(_e("EE_BULK_RETRY_ATTEMPTS", 3))
         self.bulk_retry_base_delay:  float = _e("EE_BULK_RETRY_BASE_DELAY_S", 1.0)
         self._records: dict[str, list[TradeRecord]] = defaultdict(list)
@@ -159,9 +155,18 @@ class ExecutionEngine:
                     self._finalize_rec(rec, result, side, arrival_price)
                     return result
                 logger.info("[%s] ⚡ Limit sin fill → fallback market", sym)
+                # FIX 1+2: sobreescribir result con el market real y pasar ref_price
+                # para no hacer una llamada extra al orderbook.
+                # Antes result quedaba con status='ok' del resting order cancelado,
+                # lo que causaba que se pusieran TP/SL sin posición abierta.
                 result = await asyncio.get_event_loop().run_in_executor(
-                    None, client.place_market, is_buy, qty, reduce_only
+                    None, client.place_market, is_buy, qty, reduce_only, arrival_price
                 )
+                if result.get("status") != "ok":
+                    logger.error(
+                        "[%s] ❌ Fallback market falló: %s",
+                        sym, result.get("response", ""),
+                    )
                 rec.order_type_used = "market"
                 rec.fill_price      = arrival_price
         else:
@@ -170,14 +175,22 @@ class ExecutionEngine:
                 if ask is not None else "sin datos de orderbook"
             )
             logger.debug("[%s] Market directo (%s)", sym, reason)
+            # FIX 2+3: pasar arrival_price como ref_price y verificar resultado
             result = await asyncio.get_event_loop().run_in_executor(
-                None, client.place_market, is_buy, qty, reduce_only
+                None, client.place_market, is_buy, qty, reduce_only, arrival_price
             )
+            if result.get("status") != "ok":
+                logger.error(
+                    "[%s] ❌ Market order falló: %s",
+                    sym, result.get("response", ""),
+                )
             rec.order_type_used = "market"
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
 
-        # ── Colocar TP/SL reales si la apertura fue exitosa ───────────────────
+        # ── Colocar TP/SL reales sólo si la apertura fue confirmada ──────────
+        # FIX 1: la guarda result.get("status") == "ok" ahora es fiable porque
+        # result siempre refleja la última orden ejecutada (market o limit filled).
         if (
             result.get("status") == "ok"
             and not reduce_only
@@ -205,27 +218,14 @@ class ExecutionEngine:
         La dirección de cierre es la opuesta a la posición:
           - Long (is_buy=True)  → cierre = vender (is_buy=False)
           - Short (is_buy=False) → cierre = comprar (is_buy=True)
-
-        FIX limit_px para TP:
-          Hyperliquid requiere que limit_px sea un precio válido respecto al
-          lado de cierre. Para un TP de long (vendemos cuando sube), limit_px
-          debe ser igual o mayor al triggerPx. Para un TP de short (compramos
-          cuando baja), limit_px debe ser igual o menor al triggerPx.
-          Usamos un buffer del tp_limit_buffer_bps para garantizar fill.
         """
         close_side = not is_buy
         orders_to_place = []
 
         if tp is not None:
             if self.tp_as_limit:
-                # FIX: limit_px con buffer direccional según el side de cierre
-                # close_side=True (comprar para cerrar short) → TP se activa cuando precio baja
-                #   limit_px debe ser >= triggerPx para que el buy se ejecute
-                # close_side=False (vender para cerrar long) → TP se activa cuando precio sube
-                #   limit_px debe ser <= triggerPx... pero en la práctica HL requiere
-                #   limit_px = triggerPx para TP limit. Usar buffer positivo es seguro.
                 buffer_multiplier = self.tp_limit_buffer_bps / 10_000
-                if close_side:  # compramos para cerrar short → buscamos que el precio esté abajo
+                if close_side:  # compramos para cerrar short → precio está abajo
                     tp_limit_px = round(tp * (1 + buffer_multiplier), 6)
                 else:           # vendemos para cerrar long → precio está arriba
                     tp_limit_px = round(tp * (1 - buffer_multiplier), 6)
@@ -266,7 +266,6 @@ class ExecutionEngine:
         if not orders_to_place:
             return
 
-        # FIX: retry con backoff exponencial ante 429 / rate-limit
         last_error: Exception | None = None
         for attempt in range(self.bulk_retry_attempts):
             if attempt > 0:
@@ -286,7 +285,6 @@ class ExecutionEngine:
                     label = "TP" if (i == 0 and tp is not None) else "SL"
                     if "error" in st:
                         err_msg = st["error"]
-                        # FIX: detectar rate-limit en el body de la respuesta
                         if any(s in err_msg.lower() for s in _RATE_LIMIT_SUBSTRS):
                             logger.warning("[%s] Trigger %s rate-limited: %s", sym, label, err_msg)
                             all_ok = False
@@ -296,15 +294,15 @@ class ExecutionEngine:
                     else:
                         logger.info("[%s] ✅ Trigger %s colocado en exchange (sobrevive reinicios)", sym, label)
                 if all_ok:
-                    return  # éxito — salir del loop de reintentos
+                    return
             except Exception as e:
                 last_error = e
                 err_str = str(e).lower()
                 if any(s in err_str for s in _RATE_LIMIT_SUBSTRS):
                     logger.warning("[%s] place_bulk 429/rate-limit: %s", sym, e)
-                    continue  # reintentar
+                    continue
                 logger.error("[%s] Error colocando trigger orders TP/SL: %s", sym, e)
-                return  # error no-recuperable — no reintentar
+                return
 
         if last_error is not None:
             logger.error(
