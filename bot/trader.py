@@ -113,8 +113,7 @@ def _hl_side_to_str(raw_side: str) -> str:
 
 
 def _nonzero(v) -> Optional[float]:
-    """Devuelve float si v es un número > 0, None en caso contrario.
-    Evita pasar 0.0 como precio válido a HL (lo rechazaría)."""
+    """Devuelve float si v es un número > 0, None en caso contrario."""
     try:
         f = float(v)
         return f if f > 0 else None
@@ -127,10 +126,6 @@ def _compute_fallback_tpsl(
     entry: float,
     atr: float,
 ) -> tuple[float, float, float]:
-    """
-    Calcula SL, TP1 y TP2 basados en ATR cuando la señal no los trae.
-    Garantiza que SIEMPRE haya SL y TP antes de abrir.
-    """
     is_long = side == "long"
     risk_dist = atr * _FALLBACK_ATR_SL_MULT
     if is_long:
@@ -213,6 +208,8 @@ class FuturesTrader:
         self._last_pos_check_at:   float = 0.0
         self._last_tpsl_verify_at: float = 0.0
         self._ccxt_exchange = None
+        # Guardamos referencia a global_risk para poder llamar register_close
+        self._global_risk = None
 
     # ── Qty rounding respetando szDecimals ────────────────────────────
 
@@ -510,10 +507,6 @@ class FuturesTrader:
         tp1: float,
         pos_side: str,
     ) -> None:
-        """
-        Verifica que los trigger orders de SL y TP existen en el exchange
-        tras la apertura. Si no los hay, los recoloca con reintentos.
-        """
         MAX_TRIES = 3
         for attempt in range(1, MAX_TRIES + 1):
             try:
@@ -583,9 +576,43 @@ class FuturesTrader:
             self.symbol, MAX_TRIES,
         )
 
+    # ── Helpers de cierre de posición ─────────────────────────────────
+
+    def _clear_position_state(self) -> None:
+        """Limpia el estado interno de posición abierta."""
+        self.position    = None
+        self.entry_price = None
+        self.sl = self.tp1 = self.tp2 = self.tp3 = None
+        self.tp2_hit = False
+
+    async def _on_position_closed(self, pnl_pct: float) -> None:
+        """
+        Callback único a llamar SIEMPRE que una posición se cierra
+        (por SL, TP, cierre externo o parcial completo).
+        Decrementa el contador de GlobalRisk y libera exposición en PreTradeRisk.
+        """
+        # BUG FIX: register_close en GlobalRisk para decrementar _open
+        if self._global_risk is not None:
+            try:
+                await self._global_risk.register_close(pnl_pct)
+                logger.debug(
+                    "[%s] GlobalRisk.register_close(%.2f%%) — OK",
+                    self.symbol, pnl_pct,
+                )
+            except Exception as e:
+                logger.warning("[%s] GlobalRisk.register_close error: %s", self.symbol, e)
+
+        # BUG FIX: liberar exposición en PreTradeRisk
+        try:
+            pretrade_risk.register_close(self.symbol, self._open_notional)
+        except Exception as e:
+            logger.warning("[%s] PreTradeRisk.register_close error: %s", self.symbol, e)
+
     # ── Loop principal ────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None):
+        # Guardamos referencia para usarla en _on_position_closed
+        self._global_risk = global_risk
         await self._init(risk.usdc_per_trade)
         while True:
             try:
@@ -634,6 +661,7 @@ class FuturesTrader:
                         logger.info("[%s] Posición detectada: %s @ %s",
                                     self.symbol, self.position, self.entry_price)
             else:
+                # Posición cerrada externamente (SL/TP tocado en HL, liquidación, etc.)
                 if self.position is not None:
                     logger.info("[%s] Posición cerrada externamente.", self.symbol)
                     try:
@@ -641,16 +669,16 @@ class FuturesTrader:
                         await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
                     except Exception as e:
                         logger.warning("[%s] No se pudieron cancelar triggers huérfanos: %s", self.symbol, e)
-                    self.position    = None
-                    self.entry_price = None
-                    self.sl = self.tp1 = self.tp2 = self.tp3 = None
-                    self.tp2_hit = False
+                    # BUG FIX: notificar al GlobalRisk y PreTradeRisk del cierre externo
+                    await self._on_position_closed(pnl_pct=0.0)
+                    self._clear_position_state()
                     clear_position(self.symbol)
 
         if self.position is not None:
             await self._manage_open_position(price, risk)
             return
 
+        # ── Pre-checks para abrir nueva posición ──────────────────────
         if global_risk:
             allowed, reason = await global_risk.can_open()
             if not allowed:
@@ -663,12 +691,27 @@ class FuturesTrader:
                            self.symbol, balance, risk.usdc_per_trade)
             return
 
+        # BUG FIX: llamar pretrade_risk.check con la firma correcta
+        # Necesitamos precio y side ANTES de llamar, así que hacemos un check
+        # preliminar con los datos disponibles (side y sl se conocen tras decide();
+        # aquí hacemos el check de notional/balance/exposición que no dependen del side).
+        # El check completo incluyendo side/sl se hace tras decide().
         try:
-            if not await pretrade_risk.check(self.symbol, risk, balance or 0.0):
-                logger.debug("[%s] pretrade_risk bloqueó la entrada.", self.symbol)
+            ok, pt_reason = await pretrade_risk.check(
+                symbol=self.symbol,
+                side="buy",           # valor provisional; el check de side no depende de esto
+                notional=risk.usdc_per_trade,
+                price=price,
+                balance=balance,
+                sl=None,
+                ask=None,
+                bid=None,
+            )
+            if not ok:
+                logger.debug("[%s] pretrade_risk bloqueó la entrada: %s", self.symbol, pt_reason)
                 return
         except Exception as e:
-            logger.debug("[%s] pretrade_risk error (ignorando): %s", self.symbol, e)
+            logger.warning("[%s] pretrade_risk.check error: %s", self.symbol, e)
 
         try:
             exch = await self._get_ccxt()
@@ -703,27 +746,15 @@ class FuturesTrader:
             lev = self.leverage
             atr = entry * 0.005
 
-        # Respetar techo de leverage configurado
         lev = min(lev, self.leverage)
 
         # ── SIZING CORRECTO PARA HYPERLIQUID ──────────────────────────
-        # En HL el tamaño se manda en moneda base directamente.
-        # USDC_PER_TRADE = colateral real que arriesgas.
-        # El leverage ajusta el margen reservado por HL, NO el tamaño.
-        #
-        #   qty      = USDC_PER_TRADE / entry_price
-        #   notional = qty × entry_price  = USDC_PER_TRADE  (sin ×lev)
-        #   margen reservado por HL = notional / leverage
-        #
-        # Si leverage cambió respecto al configurado, actualizar en HL.
         if lev != self.leverage:
             await self._set_leverage(lev)
 
-        usdc_per_trade = risk.usdc_per_trade          # ej. 20 USDC
-        qty = self._round_qty(usdc_per_trade / entry)  # ej. 0.0003 BTC
-
-        # notional = lo que HL ve como tamaño real de la posición
-        notional = qty * entry  # ≈ usdc_per_trade (diferencia por redondeo)
+        usdc_per_trade = risk.usdc_per_trade
+        qty    = self._round_qty(usdc_per_trade / entry)
+        notional = qty * entry
 
         logger.info(
             "[%s] 📐 Sizing HL | usdc_per_trade=%.2f | entry=%.4f | qty=%s | "
@@ -736,28 +767,51 @@ class FuturesTrader:
             return
 
         pos_side = "long" if action == "BUY" else "short"
+        trade_side_str = "buy" if action == "BUY" else "sell"
 
-        # ── GARANTIZAR SL y TP — SIEMPRE, SIN EXCEPCIONES ────────────
+        # ── GARANTIZAR SL y TP — SIEMPRE ──────────────────────────────
         if sl is None or tp1 is None:
             fb_sl, fb_tp1, fb_tp2 = _compute_fallback_tpsl(pos_side, entry, float(atr))
             if sl is None:
                 sl = fb_sl
-                logger.warning(
-                    "[%s] ⚠️ signal.sl vacío — fallback ATR: SL=%.5f", self.symbol, sl,
-                )
+                logger.warning("[%s] ⚠️ signal.sl vacío — fallback ATR: SL=%.5f", self.symbol, sl)
             if tp1 is None:
                 tp1 = fb_tp1
-                logger.warning(
-                    "[%s] ⚠️ signal.tp1 vacío — fallback ATR: TP1=%.5f", self.symbol, tp1,
-                )
+                logger.warning("[%s] ⚠️ signal.tp1 vacío — fallback ATR: TP1=%.5f", self.symbol, tp1)
             if tp2 is None:
                 tp2 = fb_tp2
 
-        # Doble-check: sl y tp1 NUNCA pueden ser None ni 0
         assert sl  and sl  > 0, f"[{self.symbol}] SL inválido: {sl}"
         assert tp1 and tp1 > 0, f"[{self.symbol}] TP1 inválido: {tp1}"
 
-        side = "buy" if action == "BUY" else "sell"
+        # ── Check pretrade final con side y sl conocidos ──────────────
+        ask = bid = None
+        try:
+            from bot.ws_feed import ws_feed
+            ob = ws_feed.get_orderbook_metrics(self.coin)
+            if ob:
+                ask = ob.get("ask")
+                bid = ob.get("bid")
+        except Exception:
+            pass
+
+        try:
+            ok, pt_reason = await pretrade_risk.check(
+                symbol=self.symbol,
+                side=trade_side_str,
+                notional=notional,
+                price=entry,
+                balance=balance,
+                sl=sl,
+                ask=ask,
+                bid=bid,
+            )
+            if not ok:
+                logger.info("[%s] pretrade_risk bloqueó tras señal: %s", self.symbol, pt_reason)
+                return
+        except Exception as e:
+            logger.warning("[%s] pretrade_risk.check (post-señal) error: %s", self.symbol, e)
+
         logger.info(
             "[%s] 📈 Abriendo %s · qty=%s · entry=~%.4f · sl=%.4f · tp1=%.4f | %s",
             self.symbol, action, qty, entry, sl, tp1,
@@ -769,7 +823,7 @@ class FuturesTrader:
             fill_price = entry
             confirmed_positions = [{"szi": qty}]
         else:
-            result = await self._place_order(side, qty, sl=sl, tp=tp1)
+            result = await self._place_order(trade_side_str, qty, sl=sl, tp=tp1)
             if result.get("status") != "ok":
                 logger.error("[%s] ❌ Orden rechazada: %s", self.symbol, result)
                 return
@@ -805,7 +859,6 @@ class FuturesTrader:
                 tp2 = round(tp2 + delta, 6)
             if tp3:
                 tp3 = round(tp3 + delta, 6)
-            # recalcular notional con fill real
             notional = qty * fill_price
 
         self.position       = pos_side
@@ -837,6 +890,9 @@ class FuturesTrader:
         if global_risk:
             await global_risk.register_open()
 
+        # Confirmar orden en pretrade (registra timestamp para rate limiter)
+        pretrade_risk.confirm_order(self.symbol)
+
         await notify_open(
             symbol=self.symbol,
             side=self.position,
@@ -848,7 +904,6 @@ class FuturesTrader:
             tp2=self.tp2,
         )
 
-        # ── GARANTÍA FINAL: verificar y recolocar SL/TP ───────────────
         if not self.dry_run and confirmed_positions:
             live_qty = abs(float(confirmed_positions[0].get("szi", qty)))
             real_qty = live_qty if live_qty > 0 else qty
@@ -862,7 +917,7 @@ class FuturesTrader:
 
         is_long = self.position == "long"
 
-        # ── TP2 parcial ──────────────────────────────────────────────
+        # ── TP2 parcial ───────────────────────────────────────────────
         if self.tp2 and not self.tp2_hit:
             tp2_triggered = (is_long and price >= self.tp2) or (not is_long and price <= self.tp2)
             if tp2_triggered:
@@ -890,6 +945,7 @@ class FuturesTrader:
                             ratio=TP2_PARTIAL_RATIO,
                         )
                         remaining_notional = self._open_notional * (1 - TP2_PARTIAL_RATIO)
+                        self._open_notional = remaining_notional
                         remaining_qty = self._round_qty(remaining_notional / self.entry_price)
                         if remaining_qty > 0 and (self.tp3 or self.sl):
                             try:
@@ -939,9 +995,9 @@ class FuturesTrader:
             return
         if not positions:
             logger.warning("[%s] Cierre por %s: ya cerrada en exchange.", self.symbol, close_reason)
-            self.position = self.entry_price = self.sl = None
-            self.tp1 = self.tp2 = self.tp3 = None
-            self.tp2_hit = False
+            # BUG FIX: notificar cierre aunque la orden ya no exista
+            await self._on_position_closed(pnl_pct=0.0)
+            self._clear_position_state()
             clear_position(self.symbol)
             return
 
@@ -980,9 +1036,10 @@ class FuturesTrader:
 
         entry_copy = self.entry_price
         pos_copy   = self.position
-        self.position = self.entry_price = self.sl = None
-        self.tp1 = self.tp2 = self.tp3 = None
-        self.tp2_hit = False
+
+        # BUG FIX: notificar GlobalRisk y PreTradeRisk ANTES de limpiar estado
+        await self._on_position_closed(pnl_pct)
+        self._clear_position_state()
         clear_position(self.symbol)
 
         await notify_close(
