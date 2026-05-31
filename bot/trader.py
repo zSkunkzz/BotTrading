@@ -680,6 +680,7 @@ class FuturesTrader:
                            self.symbol, balance, risk.usdc_per_trade)
             return
 
+        # Pre-check inicial: solo con margen base (antes de conocer lev real de la señal)
         try:
             ok, pt_reason = await pretrade_risk.check(
                 symbol=self.symbol,
@@ -690,6 +691,7 @@ class FuturesTrader:
                 sl=None,
                 ask=None,
                 bid=None,
+                leverage=1,  # notional == margen en este punto
             )
             if not ok:
                 logger.debug("[%s] pretrade_risk bloqueó la entrada: %s", self.symbol, pt_reason)
@@ -733,9 +735,7 @@ class FuturesTrader:
         # Nunca superar el leverage configurado por el usuario
         lev = min(lev, self.leverage)
 
-        # ── FIX #1: aplicar leverage SIEMPRE antes de abrir posición ──
-        # (antes solo se aplicaba si lev != self.leverage, dejando casos
-        #  en que HL tenía el leverage por defecto y no el configurado)
+        # ── Aplicar leverage SIEMPRE antes de abrir posición ──────────
         if not self.dry_run:
             try:
                 await asyncio.wait_for(
@@ -747,13 +747,8 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning("[%s] _set_leverage pre-orden error: %s", self.symbol, e)
 
-        # ── FIX #2: SIZING CORRECTO — notional incluye el leverage ────
-        # En HL el margen reservado = notional / leverage.
-        # Para arriesgar exactamente USDC_PER_TRADE de margen:
-        #   notional  = usdc_per_trade × leverage
-        #   qty       = notional / entry_price
-        # Ejemplo: 20 USDC × 5× lev = 100 USDC notional → ~3.33 ZEC a $30
-        usdc_per_trade = risk.usdc_per_trade
+        # ── SIZING: notional = margen × leverage ──────────────────────
+        usdc_per_trade  = risk.usdc_per_trade
         notional_target = usdc_per_trade * lev
         qty     = self._round_qty(notional_target / entry)
         notional = qty * entry
@@ -771,7 +766,7 @@ class FuturesTrader:
         pos_side = "long" if action == "BUY" else "short"
         trade_side_str = "buy" if action == "BUY" else "sell"
 
-        # ── GARANTIZAR SL y TP — SIEMPRE ──────────────────────────────
+        # ── GARANTIZAR SL y TP — NUNCA abrir sin ambos ─────────────────
         if sl is None or tp1 is None:
             fb_sl, fb_tp1, fb_tp2 = _compute_fallback_tpsl(pos_side, entry, float(atr))
             if sl is None:
@@ -786,7 +781,7 @@ class FuturesTrader:
         assert sl  and sl  > 0, f"[{self.symbol}] SL inválido: {sl}"
         assert tp1 and tp1 > 0, f"[{self.symbol}] TP1 inválido: {tp1}"
 
-        # ── Check pretrade final con side y sl conocidos ──────────────
+        # ── Check pretrade FINAL con notional real y leverage real ──────
         ask = bid = None
         try:
             from bot.ws_feed import ws_feed
@@ -807,6 +802,7 @@ class FuturesTrader:
                 sl=sl,
                 ask=ask,
                 bid=bid,
+                leverage=lev,   # ← clave: pretrade divide notional/lev para obtener margen
             )
             if not ok:
                 logger.info("[%s] pretrade_risk bloqueó tras señal: %s", self.symbol, pt_reason)

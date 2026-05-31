@@ -10,17 +10,14 @@ Flujo correcto de exposición:
   3. confirm_order() — registra timestamp de rate limiter Y +notional de exposición
   4. register_close()— libera exposición al cerrar
 
-Nota sobre sizing en Hyperliquid:
-  En HL el notional por trade = USDC_PER_TRADE (sin multiplicar por leverage).
-  El leverage solo afecta el margen reservado internamente.
-  Por tanto los límites aquí se expresan en USDC reales por trade.
+Límites en USDC de MARGEN (no de notional bruto):
+  PT_MAX_MARGIN_PER_TRADE  : 60 USDC   — margen máximo por operación
+  PT_MAX_SYMBOL_EXPOSURE   : 60 USDC   — margen máximo en un símbolo
+  PT_MAX_TOTAL_EXPOSURE    : 300 USDC  — margen máximo total (~1.5× balance típico)
 
-Defaults ajustados para cuentas medianas (20-50 USDC por trade, balance ~200 USDC):
-  - PT_MAX_NOTIONAL_PER_TRADE : 60 USDC   (3× USDC_PER_TRADE típico)
-  - PT_MAX_SYMBOL_EXPOSURE    : 60 USDC
-  - PT_MAX_TOTAL_EXPOSURE     : 300 USDC  (~1.5× balance típico, permite 5 posiciones)
-  - PT_MIN_SL_DISTANCE_BPS    :   8 bps
-  - PT_BALANCE_USAGE_PCT      :  0.90
+El check recibe `notional` y `leverage` por separado;
+  margen_efectivo = notional / leverage
+Así el límite aplica sobre el colateral real, no sobre el notional apalancado.
 """
 from __future__ import annotations
 
@@ -40,25 +37,31 @@ class PreTradeRisk:
     """
     Variables de entorno (todas opcionales):
 
-      PT_MAX_NOTIONAL_PER_TRADE   USDC máximos por operación           (default 60)
-      PT_MAX_SYMBOL_EXPOSURE      USDC máximos en un símbolo           (default 60)
-      PT_MAX_TOTAL_EXPOSURE       USDC máximos en todas las posiciones (default 300)
-      PT_MAX_SPREAD_BPS           Spread máximo permitido en bps        (default 30)
-      PT_MIN_SL_DISTANCE_BPS      Distancia mínima SL en bps            (default 8)
-      PT_MAX_SLIPPAGE_BPS         Slippage esperado máximo aceptable    (default 50)
-      PT_MAX_ORDERS_PER_MIN       Órdenes máximas por minuto POR SÍMBOLO (default 6)
-      PT_BALANCE_USAGE_PCT        Máximo % del balance por trade        (default 0.90)
+      PT_MAX_MARGIN_PER_TRADE     USDC de MARGEN máximos por operación     (default 60)
+      PT_MAX_SYMBOL_EXPOSURE      USDC de MARGEN máximos en un símbolo     (default 60)
+      PT_MAX_TOTAL_EXPOSURE       USDC de MARGEN máximos total              (default 300)
+      PT_MAX_SPREAD_BPS           Spread máximo permitido en bps            (default 30)
+      PT_MIN_SL_DISTANCE_BPS      Distancia mínima SL en bps                (default 8)
+      PT_MAX_SLIPPAGE_BPS         Slippage esperado máximo aceptable        (default 50)
+      PT_MAX_ORDERS_PER_MIN       Órdenes máximas por minuto POR SÍMBOLO   (default 6)
+      PT_BALANCE_USAGE_PCT        Máximo % del balance por trade            (default 0.90)
+
+      [LEGADO] PT_MAX_NOTIONAL_PER_TRADE — alias de PT_MAX_MARGIN_PER_TRADE
     """
 
     def __init__(self) -> None:
-        self.max_notional_per_trade : float = _e("PT_MAX_NOTIONAL_PER_TRADE", 60.0)
-        self.max_symbol_exposure    : float = _e("PT_MAX_SYMBOL_EXPOSURE",    60.0)
-        self.max_total_exposure     : float = _e("PT_MAX_TOTAL_EXPOSURE",    300.0)
-        self.max_spread_bps         : float = _e("PT_MAX_SPREAD_BPS",          30.0)
-        self.min_sl_distance_bps    : float = _e("PT_MIN_SL_DISTANCE_BPS",     8.0)
-        self.max_slippage_bps       : float = _e("PT_MAX_SLIPPAGE_BPS",        50.0)
-        self.max_orders_per_min     : int   = int(_e("PT_MAX_ORDERS_PER_MIN",   6))
-        self.balance_usage_pct      : float = _e("PT_BALANCE_USAGE_PCT",        0.90)
+        # Soporte legado: PT_MAX_NOTIONAL_PER_TRADE como alias
+        legacy = os.getenv("PT_MAX_NOTIONAL_PER_TRADE")
+        default_margin = float(legacy) if legacy else 60.0
+
+        self.max_margin_per_trade   : float = _e("PT_MAX_MARGIN_PER_TRADE",  default_margin)
+        self.max_symbol_exposure    : float = _e("PT_MAX_SYMBOL_EXPOSURE",   60.0)
+        self.max_total_exposure     : float = _e("PT_MAX_TOTAL_EXPOSURE",   300.0)
+        self.max_spread_bps         : float = _e("PT_MAX_SPREAD_BPS",         30.0)
+        self.min_sl_distance_bps    : float = _e("PT_MIN_SL_DISTANCE_BPS",    8.0)
+        self.max_slippage_bps       : float = _e("PT_MAX_SLIPPAGE_BPS",       50.0)
+        self.max_orders_per_min     : int   = int(_e("PT_MAX_ORDERS_PER_MIN",  6))
+        self.balance_usage_pct      : float = _e("PT_BALANCE_USAGE_PCT",       0.90)
 
         self._symbol_exposure  : dict[str, float] = {}
         self._order_timestamps : dict[str, deque] = {}
@@ -75,19 +78,24 @@ class PreTradeRisk:
         sl:       float | None = None,
         ask:      float | None = None,
         bid:      float | None = None,
+        leverage: int = 1,
     ) -> tuple[bool, str]:
         """
         Valida la orden. NO registra exposición.
-        La exposición se registra únicamente en confirm_order(),
-        que debe llamarse solo tras un fill confirmado.
+
+        `notional` = qty × price  (valor bruto de la posición).
+        `leverage`  = apalancamiento real usado.
+        El margen efectivo = notional / leverage.
+        Los límites se comparan contra el margen, no contra el notional bruto.
         """
         sym = symbol.replace("/", "").replace(":USDT", "")
+        margin = notional / max(leverage, 1)
 
         checks = [
-            self._check_notional(notional),
-            self._check_balance_usage(notional, balance),
-            self._check_symbol_exposure(sym, notional),
-            self._check_total_exposure(notional),
+            self._check_margin(margin),
+            self._check_balance_usage(margin, balance),
+            self._check_symbol_exposure(sym, margin),
+            self._check_total_exposure(margin),
             self._check_order_rate(sym),
             self._check_spread(ask, bid, price),
             self._check_sl_distance(price, sl, side),
@@ -97,13 +105,13 @@ class PreTradeRisk:
             if not ok:
                 logger.warning(
                     f"[PreTrade:{sym}] ❌ BLOQUEADO — {reason} "
-                    f"| side={side} notional={notional:.2f} price={price:.4f}"
+                    f"| side={side} margen={margin:.2f} notional={notional:.2f} lev={leverage}x price={price:.4f}"
                 )
                 return False, reason
 
         logger.info(
-            f"[PreTrade:{sym}] ✅ OK — side={side} notional={notional:.2f} "
-            f"price={price:.4f} sl={sl}"
+            f"[PreTrade:{sym}] ✅ OK — side={side} margen={margin:.2f} USDC "
+            f"notional={notional:.2f} lev={leverage}x price={price:.4f} sl={sl}"
         )
         return True, "OK"
 
@@ -115,11 +123,9 @@ class PreTradeRisk:
           - exposición real del símbolo (+notional)
         """
         sym = symbol.replace("/", "").replace(":USDT", "")
-        # rate limiter
         if sym not in self._order_timestamps:
             self._order_timestamps[sym] = deque()
         self._order_timestamps[sym].append(time.monotonic())
-        # exposición real
         if notional > 0:
             self._symbol_exposure[sym] = self._symbol_exposure.get(sym, 0.0) + notional
             logger.debug(
@@ -146,28 +152,28 @@ class PreTradeRisk:
 
     # ── Checks individuales ──────────────────────────────────────────────────
 
-    def _check_notional(self, notional: float) -> tuple[bool, str]:
-        if notional > self.max_notional_per_trade:
+    def _check_margin(self, margin: float) -> tuple[bool, str]:
+        if margin > self.max_margin_per_trade:
             return False, (
-                f"Notional {notional:.2f} USDC supera límite por trade "
-                f"{self.max_notional_per_trade:.0f} USDC"
+                f"Margen {margin:.2f} USDC supera límite por trade "
+                f"{self.max_margin_per_trade:.0f} USDC"
             )
         return True, ""
 
-    def _check_balance_usage(self, notional: float, balance: float | None) -> tuple[bool, str]:
+    def _check_balance_usage(self, margin: float, balance: float | None) -> tuple[bool, str]:
         if balance is None:
             logger.warning(
                 "[PreTrade] ⚠️ Balance desconocido (API falló) — "
-                f"asumiendo ≥ {notional:.2f} USDC para continuar"
+                f"asumiendo ≥ {margin:.2f} USDC para continuar"
             )
             return True, ""
         if balance <= 0:
             return False, f"Balance {balance:.2f} USDC inválido (cuenta vacía)"
-        if notional > balance:
+        if margin > balance:
             return False, (
-                f"Notional {notional:.2f} USDC supera balance disponible {balance:.2f} USDC"
+                f"Margen {margin:.2f} USDC supera balance disponible {balance:.2f} USDC"
             )
-        usage = notional / balance
+        usage = margin / balance
         if usage > self.balance_usage_pct:
             return False, (
                 f"Uso de balance {usage*100:.1f}% supera límite "
@@ -175,9 +181,9 @@ class PreTradeRisk:
             )
         return True, ""
 
-    def _check_symbol_exposure(self, sym: str, notional: float) -> tuple[bool, str]:
+    def _check_symbol_exposure(self, sym: str, margin: float) -> tuple[bool, str]:
         current   = self._symbol_exposure.get(sym, 0.0)
-        projected = current + notional
+        projected = current + margin
         if projected > self.max_symbol_exposure:
             return False, (
                 f"Exposición en {sym} llegaría a {projected:.2f} USDC "
@@ -185,8 +191,8 @@ class PreTradeRisk:
             )
         return True, ""
 
-    def _check_total_exposure(self, notional: float) -> tuple[bool, str]:
-        projected = self.get_total_exposure() + notional
+    def _check_total_exposure(self, margin: float) -> tuple[bool, str]:
+        projected = self.get_total_exposure() + margin
         if projected > self.max_total_exposure:
             return False, (
                 f"Exposición total llegaría a {projected:.2f} USDC "
