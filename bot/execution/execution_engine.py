@@ -276,38 +276,28 @@ class ExecutionEngine:
     ) -> None:
         """
         Coloca TP y SL como trigger orders reales en el exchange.
-        La dirección de cierre es la opuesta a la posición:
-          - Long (is_buy=True)  → cierre = vender (close_side=False)
-          - Short (is_buy=False) → cierre = comprar (close_side=True)
 
-        Regla de limit_px para TP (FIX A — corrección definitiva):
-          HL exige que limit_px sea igual o mejor que triggerPx
-          desde el punto de vista del ejecutor:
+        FIX: todos los precios (triggerPx y limit_px) se redondean con
+        client.round_px() para garantizar que sean válidos para CUALQUIER
+        coin — evita 'Order has invalid price' en HYPE, DOGE, XRP, etc.
 
-          • TP de LONG → close_side=False (vendemos para cerrar).
-            triggerPx está POR ENCIMA del precio actual.
-            Para vender, "mejor" = precio más BAJO (aceptamos recibir menos).
-            limit_px = triggerPx * (1 - buffer)  → límite por debajo del trigger ✓
-
-          • TP de SHORT → close_side=True (compramos para cerrar).
-            triggerPx está POR DEBAJO del precio actual.
-            Para comprar, "mejor" = precio más ALTO (aceptamos pagar más).
-            limit_px = triggerPx * (1 + buffer)  → límite por encima del trigger ✓
-
-          La versión anterior tenía la lógica invertida → 'Order has invalid price'.
+        Regla de limit_px para TP:
+          • TP de LONG  → close_side=SELL → limit_px = triggerPx * (1 - buffer)  ✓
+          • TP de SHORT → close_side=BUY  → limit_px = triggerPx * (1 + buffer)  ✓
         """
         close_side = not is_buy
         orders_to_place = []
 
         if tp is not None:
+            # FIX: round_px en lugar de round(..., 6)
+            tp_trigger = client.round_px(float(tp))
+
             if self.tp_as_limit:
                 buffer_multiplier = self.tp_limit_buffer_bps / 10_000
-                # close_side=False → SELL para cerrar LONG → limit_px MENOR que trigger
-                # close_side=True  → BUY  para cerrar SHORT → limit_px MAYOR que trigger
                 if close_side:  # cerrar short: compramos, aceptamos pagar más
-                    tp_limit_px = round(tp * (1 + buffer_multiplier), 6)
+                    tp_limit_px = client.round_px(tp_trigger * (1 + buffer_multiplier))
                 else:           # cerrar long:  vendemos, aceptamos recibir menos
-                    tp_limit_px = round(tp * (1 - buffer_multiplier), 6)
+                    tp_limit_px = client.round_px(tp_trigger * (1 - buffer_multiplier))
             else:
                 tp_limit_px = None
 
@@ -318,7 +308,7 @@ class ExecutionEngine:
                 "limit_px":   tp_limit_px,
                 "order_type": {
                     "trigger": {
-                        "triggerPx": tp,
+                        "triggerPx": tp_trigger,
                         "isMarket":  not self.tp_as_limit,
                         "tpsl":      "tp",
                     }
@@ -327,14 +317,16 @@ class ExecutionEngine:
             })
 
         if sl is not None:
+            # FIX: round_px en lugar de valor crudo
+            sl_px = client.round_px(float(sl))
             orders_to_place.append({
                 "coin":       client.coin,
                 "is_buy":     close_side,
                 "sz":         qty,
-                "limit_px":   sl,
+                "limit_px":   sl_px,
                 "order_type": {
                     "trigger": {
-                        "triggerPx": sl,
+                        "triggerPx": sl_px,
                         "isMarket":  True,
                         "tpsl":      "sl",
                     }
