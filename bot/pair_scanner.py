@@ -12,6 +12,8 @@ Compatible con ws_feed.py y trader.py que normalizan internamente.
 
 Método extra: inject_snapshot(raw_text) — inyecta datos de una tabla de
 mercados pegada manualmente (sin llamadas a IA) usando market_snapshot.py.
+El snapshot incluye max_leverage por par, que main.py usa para capar el
+leverage efectivo de cada trader al instanciarlo.
 """
 import logging
 import asyncio
@@ -53,12 +55,9 @@ class PairScanner:
     Devuelve nombres cortos de coin: "BTC", "ETH", "SOL"...
 
     _last_scored: lista completa de dicts con datos enriquecidos del último scan.
-    Utilizada por main.py para pasar datos reales a ai_rank_pairs sin depender
-    del stub fetch_ticker que siempre devolvía quoteVolume=0.
-
-    FIX: si prevDayPx es 0 o null (frecuente en el arranque o tras reset de
-    mercado en Hyperliquid), el change_pct se marca como None y el filtro
-    de cambio mínimo se OMITE para ese par — no se penaliza por dato faltante.
+    Incluye el campo "max_leverage" cuando los datos provienen de un snapshot
+    (inject_snapshot). En el scan via API, max_leverage se obtiene de la API
+    de metadatos de HL (campo "maxLeverage" en universe[i]).
 
     inject_snapshot(): acepta texto pegado de la UI del exchange y lo parsea
     con market_snapshot.py, sin depender de ninguna IA externa.
@@ -106,6 +105,9 @@ class PairScanner:
         snapshot_to_scanner_format() para producir la misma estructura
         que devuelve scan().
 
+        Los dicts resultantes incluyen "max_leverage" (int) para que
+        main.py pueda capar el leverage efectivo de cada trader.
+
         Parámetros de filtro reutilizados de la instancia:
           - min_volume_usdt
           - min_price_change_pct (como |change_pct|)
@@ -136,8 +138,9 @@ class PairScanner:
         )
         for p in scored[:5]:
             logger.info(
-                "  %-12s Vol: $%sM | Cambio: %.2f%% | Funding: %.4f%% | Score: %s",
-                p["symbol"], p["volume_usdt"], p["change_pct"], p["funding"], p["score"],
+                "  %-12s Vol: $%sM | Cambio: %.2f%% | Funding: %.4f%% | MaxLev: %dx | Score: %s",
+                p["symbol"], p["volume_usdt"], p["change_pct"], p["funding"],
+                p.get("max_leverage", 0), p["score"],
             )
 
         return self.active_pairs
@@ -174,6 +177,8 @@ class PairScanner:
                 prev_day_px   = float(prev_day_px_r) if prev_day_px_r not in (None, "", "0", 0) else 0.0
                 funding       = float(ctx.get("funding",      0) or 0)
                 open_interest = float(ctx.get("openInterest", 0) or 0)
+                # maxLeverage viene en universe[i], no en ctxs[i]
+                max_lev       = int(meta.get("maxLeverage", 0) or 0)
             except (ValueError, TypeError):
                 continue
 
@@ -181,27 +186,25 @@ class PairScanner:
                 skipped_volume += 1
                 continue
 
-            # FIX: si prevDayPx no está disponible (0/null), change_pct=None
-            # → omitir el filtro de cambio mínimo (no penalizar por dato faltante).
-            # Esto ocurre frecuentemente en el primer scan tras arranque del bot.
             if prev_day_px > 0:
                 change_pct: float | None = abs((mark_px - prev_day_px) / prev_day_px * 100)
                 if change_pct < self.min_price_change_pct:
                     skipped_change += 1
                     continue
             else:
-                change_pct = None  # desconocido — no filtrar
+                change_pct = None
 
             score_change = change_pct if change_pct is not None else 0.0
             score = (day_volume / 1_000_000) * 0.6 + score_change * 0.4
             scored.append({
-                "symbol":      coin,
-                "volume_usdt": round(day_volume / 1_000_000, 2),
-                "change_pct":  round(change_pct, 2) if change_pct is not None else None,
-                "last_price":  mark_px,
-                "funding":     round(funding * 100, 5),
-                "oi_usdt":     round(open_interest * mark_px / 1_000_000, 2),
-                "score":       round(score, 3),
+                "symbol":        coin,
+                "volume_usdt":   round(day_volume / 1_000_000, 2),
+                "change_pct":    round(change_pct, 2) if change_pct is not None else None,
+                "last_price":    mark_px,
+                "funding":       round(funding * 100, 5),
+                "oi_usdt":       round(open_interest * mark_px / 1_000_000, 2),
+                "score":         round(score, 3),
+                "max_leverage":  max_lev,   # ← nuevo: de universe[i].maxLeverage
             })
 
         logger.debug(
@@ -212,20 +215,17 @@ class PairScanner:
         scored.sort(key=lambda x: x["score"], reverse=True)
         top = scored[:self.top_n]
 
-        # Guardar lista completa para que main.py la use con ai_rank_pairs
         self._last_scored = top
 
         logger.info("🏆 Top %d pares Hyperliquid seleccionados:", len(top))
         for p in top[:5]:
             change_str = f"{p['change_pct']}%" if p["change_pct"] is not None else "N/A"
             logger.info(
-                "  %-12s Vol: $%sM | Cambio: %s | Score: %s",
-                p["symbol"], p["volume_usdt"], change_str, p["score"],
+                "  %-12s Vol: $%sM | Cambio: %s | MaxLev: %dx | Score: %s",
+                p["symbol"], p["volume_usdt"], change_str,
+                p.get("max_leverage", 0), p["score"],
             )
 
-        # NOTA: NO actualizamos self.active_pairs aquí — eso lo hace
-        # run_scanner_loop después de calcular diff, para no destruir
-        # la referencia que usa on_pairs_updated para detectar cambios.
         return [p["symbol"] for p in top]
 
     def normalize(self, symbol: str) -> str:
@@ -243,7 +243,12 @@ class PairScanner:
                     continue
                 added   = set(new_pairs) - set(self.active_pairs)
                 removed = set(self.active_pairs) - set(new_pairs)
-                # Actualizar active_pairs DESPUÉS de calcular el diff
+                # Actualizar mapa de leverage con el nuevo scan
+                try:
+                    import main as _main
+                    _main._update_leverage_map(self._last_scored)
+                except Exception:
+                    pass
                 self.active_pairs = new_pairs
                 if added:
                     logger.info("➕ Nuevos pares: %s", ", ".join(added))

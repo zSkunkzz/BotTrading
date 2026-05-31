@@ -27,8 +27,14 @@ _trader_instances: dict = {}
 
 # ── Límite de traders simultáneos activos ──────────────────────────────────
 # Con 15 traders HL devuelve 429 continuos. Máximo recomendado: 5.
-# Sobreescribir con la variable de entorno MAX_ACTIVE_TRADERS.
 MAX_ACTIVE_TRADERS = int(os.getenv("MAX_ACTIVE_TRADERS", "5"))
+
+# Leverage base del usuario (techo por defecto — se capará con max_leverage del par)
+_LEVERAGE_BASE = int(os.getenv("LEVERAGE", "5"))
+
+# Índice de max_leverage por símbolo: {"ZEC": 10, "LIT": 5, ...}
+# Se rellena desde el snapshot y se consulta al arrancar cada trader.
+_max_leverage_map: dict[str, int] = {}
 
 
 def _resolve_hl_address() -> str:
@@ -55,7 +61,6 @@ def _resolve_hl_address() -> str:
 
 def make_risk():
     return RiskManager(
-        # USDC_PER_TRADE (era USBC_PER_TRADE — typo corregido)
         usdc_per_trade=float(os.getenv("USDC_PER_TRADE", os.getenv("USBC_PER_TRADE", "10"))),
         tp_pct=float(os.getenv("TP_PCT", "4.0")),
         sl_pct=float(os.getenv("SL_PCT", "2.0")),
@@ -65,6 +70,27 @@ def make_risk():
         max_daily_loss_pct=float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0")),
         max_open_trades=int(os.getenv("MAX_OPEN_TRADES_PER_SYMBOL", "1")),
     )
+
+
+def _effective_leverage(symbol: str) -> int:
+    """
+    Devuelve min(LEVERAGE_BASE, max_leverage_del_par).
+
+    Si el par no está en el mapa (scanner API, sin snapshot),
+    se usa LEVERAGE_BASE directamente — trader.py luego lo capará
+    con _exchange_max_lev() al arrancar.
+    """
+    snapshot_max = _max_leverage_map.get(symbol.upper())
+    if snapshot_max and snapshot_max > 0:
+        effective = min(_LEVERAGE_BASE, snapshot_max)
+        if effective < _LEVERAGE_BASE:
+            logger.info(
+                "[%s] ⚙️  Leverage capado por snapshot: %dx → %dx (max=%dx)",
+                symbol, _LEVERAGE_BASE, effective, snapshot_max,
+            )
+        return effective
+    # Sin dato de snapshot — usamos la base; trader.py consultará la API
+    return _LEVERAGE_BASE
 
 
 async def _start_single_pair(symbol: str):
@@ -77,7 +103,7 @@ async def _start_single_pair(symbol: str):
             symbol, len(active_traders), MAX_ACTIVE_TRADERS,
         )
         return
-    logger.info("🚀 Iniciando trader: %s", symbol)
+    logger.info("🚀 Iniciando trader: %s (leverage=%dx)", symbol, _effective_leverage(symbol))
 
     private_key = (
         os.getenv("HL_API_PRIVATE_KEY", "").strip()
@@ -89,7 +115,7 @@ async def _start_single_pair(symbol: str):
         api_secret=private_key,
         passphrase=None,
         symbol=symbol,
-        leverage=int(os.getenv("LEVERAGE", "5")),
+        leverage=_effective_leverage(symbol),   # ← capado por max_leverage del par
         margin_mode=os.getenv("MARGIN_MODE", "isolated"),
         dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
     )
@@ -113,9 +139,29 @@ async def stop_pair(symbol: str):
     logger.info("⏹ Trader detenido: %s", symbol)
 
 
+def _update_leverage_map(scored_data: list[dict]) -> None:
+    """
+    Rellena _max_leverage_map con los datos del último snapshot/scanner.
+    Acepta tanto el formato del snapshot (max_leverage) como el de la API
+    (no tiene ese campo — se ignora y se deja la entrada anterior si existe).
+    """
+    updated = 0
+    for entry in scored_data:
+        sym = entry.get("symbol", "").upper()
+        ml  = entry.get("max_leverage")
+        if sym and ml and isinstance(ml, int) and ml > 0:
+            _max_leverage_map[sym] = ml
+            updated += 1
+    if updated:
+        logger.info(
+            "⚙️  Mapa de leverage actualizado: %d pares | ejemplo: %s",
+            updated,
+            ", ".join(f"{k}={v}x" for k, v in list(_max_leverage_map.items())[:5]),
+        )
+
+
 async def on_pairs_updated(new_pairs: list):
     current = set(active_traders.keys())
-    # Sólo consideramos los primeros MAX_ACTIVE_TRADERS pares del nuevo scan
     updated = set(new_pairs[:MAX_ACTIVE_TRADERS])
     added   = updated - current
     removed = current - updated
@@ -156,11 +202,9 @@ async def main():
 
     webhook_runner = await start_webhook_server()
 
-    # TOP_PAIRS: cuántos pares escanea el scanner. Escaneamos un poco más
-    # de lo que vamos a tradear para tener opciones de calidad.
-    # MAX_ACTIVE_TRADERS controla cuántos traders se arrancan realmente.
-    top_n = int(os.getenv("TOP_PAIRS", str(MAX_ACTIVE_TRADERS * 2)))  # por defecto 10
-    logger.info("⚙️  MAX_ACTIVE_TRADERS=%d | TOP_PAIRS=%d", MAX_ACTIVE_TRADERS, top_n)
+    top_n = int(os.getenv("TOP_PAIRS", str(MAX_ACTIVE_TRADERS * 2)))
+    logger.info("⚙️  MAX_ACTIVE_TRADERS=%d | TOP_PAIRS=%d | LEVERAGE_BASE=%dx",
+                MAX_ACTIVE_TRADERS, top_n, _LEVERAGE_BASE)
 
     scanner = PairScanner(
         min_volume_usdt=float(os.getenv("MIN_VOLUME_USDT", "1000000")),
@@ -172,15 +216,15 @@ async def main():
     logger.info("🔍 Escaneando mercado Hyperliquid inicial...")
     initial_pairs = await scanner.scan()
 
-    scored_data = []
-    for entry in getattr(scanner, "_last_scored", []):
-        scored_data.append(entry)
-
+    scored_data = list(getattr(scanner, "_last_scored", []))
     if not scored_data and initial_pairs:
         scored_data = [
             {"symbol": sym, "volume_usdt": 0, "change_pct": 0, "score": 0}
             for sym in initial_pairs
         ]
+
+    # ── Poblar mapa de leverage desde el scan inicial ────────────────
+    _update_leverage_map(scored_data)
 
     if scored_data:
         logger.info("🤖 Filtrando con IA (%d pares)...", len(scored_data))
@@ -202,14 +246,11 @@ async def main():
 
     logger.info("✅ Pares finales (%d): %s", len(final_pairs), ", ".join(final_pairs))
 
-    # El WS feed sigue escuchando todos los pares escaneados (para el scanner),
-    # pero sólo arrancamos traders para los primeros MAX_ACTIVE_TRADERS.
     ws_feed.start(final_pairs)
     logger.info("🔌 WS feed arrancado para %d símbolos", len(final_pairs))
 
     await asyncio.sleep(3)
 
-    # Sólo arrancamos los primeros MAX_ACTIVE_TRADERS pares
     pairs_to_trade = final_pairs[:MAX_ACTIVE_TRADERS]
     logger.info(
         "🚀 Arrancando %d traders (de %d disponibles): %s",
