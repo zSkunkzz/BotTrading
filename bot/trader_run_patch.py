@@ -91,9 +91,11 @@ async def _iteration(self: FuturesTrader, risk: RiskManager, global_risk: Global
         return
 
     # ── Verificar límites de riesgo global ──────────────────────────
-    if global_risk and not global_risk.can_open_trade():
-        logger.debug("[%s] GlobalRisk: límite de trades concurrentes alcanzado.", self.symbol)
-        return
+    if global_risk:
+        allowed, reason = await global_risk.can_open()
+        if not allowed:
+            logger.debug("[%s] GlobalRisk: %s", self.symbol, reason)
+            return
 
     # ── Check de balance mínimo ─────────────────────────────────────
     balance = await self.get_balance()
@@ -196,7 +198,7 @@ async def _iteration(self: FuturesTrader, risk: RiskManager, global_risk: Global
         })
 
         if global_risk:
-            global_risk.register_open_trade(self.symbol)
+            await global_risk.register_open()
 
         await notify_open(
             symbol=self.symbol,
