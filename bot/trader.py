@@ -259,6 +259,10 @@ class FuturesTrader:
 
         nonce      = int(time.time() * 1000)
         is_mainnet = not _USE_TESTNET
+
+        # En modo agente: el hash debe incluir vault_address=None (no es vault),
+        # pero el payload REST debe incluir "vaultAddress": master_addr para que
+        # Hyperliquid sepa que la firma proviene de un agente aprobado.
         vault_address = None
 
         signature = _sign_l1_action(
@@ -274,6 +278,10 @@ class FuturesTrader:
             "nonce":     nonce,
             "signature": signature,
         }
+
+        # Incluir vaultAddress sólo en modo agente y cuando agente != master
+        if self._agent_mode and self._agent_addr.lower() != self._master_addr.lower():
+            payload["vaultAddress"] = self._master_addr
 
         async with aiohttp.ClientSession() as s:
             async with s.post(
