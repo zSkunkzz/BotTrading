@@ -1,13 +1,11 @@
 """
 hl_client.py — Cliente Hyperliquid basado en el SDK oficial.
 
-Reemplaza el signing manual de http_client.py por el SDK oficial:
-  pip install hyperliquid-python-sdk>=0.1.9
-
-Ventajas vs signing manual:
-  - El SDK mantiene el formato EIP-712 actualizado automáticamente.
-  - Soporte nativo para trigger orders (TP/SL) sin construir payloads a mano.
-  - Menos superficie de error en nonce, vault_address y hash.
+Cada instancia de HLClient (una por symbol/coin) comparte un único objeto
+Exchange + Info cargado al inicio (singleton _HLCore). Esto evita el
+problema de rate-limiting (429) que ocurría cuando se instanciaban 15+
+traders simultáneamente y cada uno hacía sus propias llamadas HTTP a
+/info (meta + spot_meta) al construir Exchange e Info.
 
 Autenticación soportada:
   Opción A (recomendada): API Wallet
@@ -25,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Optional
 
 from eth_account import Account
@@ -42,7 +41,6 @@ _BASE_URL = (
 
 
 def _norm_coin(symbol: str) -> str:
-    """Normaliza símbolo a nombre de coin HL (e.g. 'BTC/USDT:USDT' → 'BTC')."""
     s = symbol.replace("/", "").replace(":USDT", "").upper()
     for suffix in ("USDTUSDT", "USDT"):
         if s.endswith(suffix):
@@ -50,64 +48,136 @@ def _norm_coin(symbol: str) -> str:
     return s
 
 
-class HLClient:
+# ─────────────────────────────────────────────────────────────────
+# _HLCore: singleton que contiene el Exchange + Info compartidos
+# ─────────────────────────────────────────────────────────────────
+
+class _HLCore:
     """
-    Wrapper del SDK oficial de Hyperliquid.
+    Singleton que mantiene UNA instancia de Exchange + Info.
 
-    Uso:
-        client = HLClient(symbol="BTC/USDT:USDT")
-        client.place_limit(is_buy=True, sz=0.01, price=40000)
-        client.place_tp(is_buy=False, sz=0.01, trigger_px=45000)
-        client.place_sl(is_buy=False, sz=0.01, trigger_px=35000)
+    Exchange.__init__ y Info.__init__ llaman sincrónicamente a /info
+    (meta + spot_meta). Instanciarlos una sola vez y compartirlos entre
+    todos los HLClient evita la ráfaga de requests HTTP en el arranque
+    que provocaba 429 para todos los traders.
     """
 
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.coin   = _norm_coin(symbol)
+    _instance: "_HLCore | None" = None
 
+    def __init__(self) -> None:
         api_pk     = os.getenv("HL_API_PRIVATE_KEY", "").strip()
         api_wallet = os.getenv("HL_API_WALLET_ADDRESS", "").strip()
 
         if api_pk:
             if not api_wallet:
                 raise ValueError(
-                    "HL_API_WALLET_ADDRESS es obligatoria en modo agente. "
-                    "Debe ser la dirección del wallet PRINCIPAL (el que tiene fondos "
-                    "y aprobó al agente en app.hyperliquid.xyz → Settings → API)."
+                    "HL_API_WALLET_ADDRESS es obligatoria en modo agente."
                 )
-            wallet               = Account.from_key(api_pk)
-            self._account_addr   = api_wallet
-            self._agent_addr     = wallet.address
-            self._agent_mode     = True
-            self._exchange       = Exchange(
-                wallet=wallet,
-                base_url=_BASE_URL,
-                account_address=api_wallet,
-            )
-            logger.info(
-                "[%s] HLClient (SDK) • modo agente | master=%s | agente=%s",
-                symbol,
-                api_wallet[:10] + "...",
-                wallet.address[:10] + "...",
-            )
+            wallet             = Account.from_key(api_pk)
+            self.account_addr  = api_wallet
+            self.agent_addr    = wallet.address
+            self.agent_mode    = True
+            exchange_wallet    = wallet
+            exchange_kwargs    = {"account_address": api_wallet}
         else:
             pk = os.getenv("HL_PRIVATE_KEY", "").strip()
             if not pk:
                 raise ValueError(
-                    "Sin clave configurada. Define HL_API_PRIVATE_KEY (modo agente) "
-                    "o HL_PRIVATE_KEY (modo directo)."
+                    "Sin clave configurada. Define HL_API_PRIVATE_KEY o HL_PRIVATE_KEY."
                 )
-            wallet               = Account.from_key(pk)
-            addr                 = os.getenv("HL_ACCOUNT_ADDR", "").strip() or wallet.address
-            self._account_addr   = addr
-            self._agent_addr     = ""
-            self._agent_mode     = False
-            self._exchange       = Exchange(wallet=wallet, base_url=_BASE_URL)
-            logger.info("[%s] HLClient (SDK) • modo directo | addr=%s", symbol, addr[:10] + "...")
+            wallet             = Account.from_key(pk)
+            addr               = os.getenv("HL_ACCOUNT_ADDR", "").strip() or wallet.address
+            self.account_addr  = addr
+            self.agent_addr    = ""
+            self.agent_mode    = False
+            exchange_wallet    = wallet
+            exchange_kwargs    = {}
 
-        self._info = Info(base_url=_BASE_URL, skip_ws=True)
+        # Retry con backoff exponencial para sobrevivir 429 en el arranque
+        self.exchange = self._build_exchange_with_retry(exchange_wallet, exchange_kwargs)
+        self.info     = self._build_info_with_retry()
 
-    # ── ÓRDENES BÁSICAS ───────────────────────────────────────────────────────
+        logger.info(
+            "[HLCore] SDK Exchange+Info inicializados | addr=%s | agente=%s",
+            self.account_addr[:10] + "...",
+            self.agent_mode,
+        )
+
+    @classmethod
+    def get(cls) -> "_HLCore":
+        """Retorna (o crea) el singleton."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @staticmethod
+    def _build_exchange_with_retry(wallet, kwargs: dict, retries: int = 6) -> Exchange:
+        delay = 2.0
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            try:
+                return Exchange(wallet=wallet, base_url=_BASE_URL, **kwargs)
+            except Exception as exc:
+                err = str(exc)
+                if "429" in err or "ClientError" in type(exc).__name__:
+                    logger.warning(
+                        "[HLCore] Exchange init 429 (intento %d/%d) — reintentando en %.1fs",
+                        attempt + 1, retries, delay,
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30.0)
+                    last_exc = exc
+                else:
+                    raise
+        raise RuntimeError(f"[HLCore] No se pudo inicializar Exchange tras {retries} intentos") from last_exc
+
+    @staticmethod
+    def _build_info_with_retry(retries: int = 6) -> Info:
+        delay = 2.0
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            try:
+                return Info(base_url=_BASE_URL, skip_ws=True)
+            except Exception as exc:
+                err = str(exc)
+                if "429" in err or "ClientError" in type(exc).__name__:
+                    logger.warning(
+                        "[HLCore] Info init 429 (intento %d/%d) — reintentando en %.1fs",
+                        attempt + 1, retries, delay,
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30.0)
+                    last_exc = exc
+                else:
+                    raise
+        raise RuntimeError(f"[HLCore] No se pudo inicializar Info tras {retries} intentos") from last_exc
+
+
+# ─────────────────────────────────────────────────────────────────
+# HLClient: un cliente ligero por symbol, comparte _HLCore
+# ─────────────────────────────────────────────────────────────────
+
+class HLClient:
+    """
+    Cliente ligero por symbol. Comparte Exchange + Info via _HLCore singleton.
+
+    Uso:
+        client = HLClient(symbol="BTC/USDT:USDT")
+        client.place_limit(is_buy=True, sz=0.01, price=40000)
+    """
+
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+        self.coin   = _norm_coin(symbol)
+        core = _HLCore.get()
+        # Exponer _exchange e _info para compatibilidad con trader.py
+        self._exchange     = core.exchange
+        self._info         = core.info
+        self._account_addr = core.account_addr
+        self._agent_addr   = core.agent_addr
+        self._agent_mode   = core.agent_mode
+
+    # ── ÓRDENES BÁSICAS ─────────────────────────────────────────────────────
 
     def place_limit(
         self,
@@ -117,7 +187,6 @@ class HLClient:
         reduce_only: bool = False,
         tif: str = "Gtc",
     ) -> dict:
-        """Orden límite estándar."""
         return self._exchange.order(
             name=self.coin,
             is_buy=is_buy,
@@ -133,7 +202,6 @@ class HLClient:
         sz: float,
         reduce_only: bool = False,
     ) -> dict:
-        """Orden de mercado."""
         return self._exchange.order(
             name=self.coin,
             is_buy=is_buy,
@@ -143,7 +211,7 @@ class HLClient:
             reduce_only=reduce_only,
         )
 
-    # ── TRIGGER ORDERS — TP / SL REALES EN EL EXCHANGE ───────────────────────
+    # ── TRIGGER ORDERS — TP / SL ──────────────────────────────────────────
 
     def place_tp(
         self,
@@ -152,16 +220,6 @@ class HLClient:
         trigger_px: float,
         limit_px: Optional[float] = None,
     ) -> dict:
-        """
-        Coloca un Take Profit real en el exchange como trigger order.
-
-        Args:
-            is_buy:     False para cerrar long (vender), True para cerrar short (comprar).
-            sz:         Cantidad a cerrar.
-            trigger_px: Precio que activa la orden.
-            limit_px:   Si se especifica → orden límite al activarse.
-                        Si es None → orden de mercado al activarse.
-        """
         is_market = limit_px is None
         return self._exchange.order(
             name=self.coin,
@@ -184,14 +242,6 @@ class HLClient:
         sz: float,
         trigger_px: float,
     ) -> dict:
-        """
-        Coloca un Stop Loss real en el exchange como trigger order de mercado.
-
-        Args:
-            is_buy:     False para cerrar long, True para cerrar short.
-            sz:         Cantidad a cerrar.
-            trigger_px: Precio que activa el SL (se ejecuta como mercado).
-        """
         return self._exchange.order(
             name=self.coin,
             is_buy=is_buy,
@@ -208,21 +258,17 @@ class HLClient:
         )
 
     def place_bulk(self, orders: list[dict]) -> dict:
-        """Envía múltiples órdenes en una sola llamada a la API."""
         return self._exchange.bulk_orders(orders)
 
-    # ── CONSULTAS INFO ────────────────────────────────────────────────────────
+    # ── CONSULTAS INFO ─────────────────────────────────────────────────────
 
     def get_user_state(self) -> dict:
-        """Estado de la cuenta (balance, posiciones, margin)."""
         return self._info.user_state(self._account_addr)
 
     def get_open_orders(self) -> list:
-        """Lista de órdenes abiertas (incluye trigger orders activos)."""
         return self._info.open_orders(self._account_addr)
 
     def get_positions(self) -> list:
-        """Posiciones abiertas filtradas por coin."""
         state = self.get_user_state()
         return [
             p for p in state.get("assetPositions", [])
@@ -231,18 +277,15 @@ class HLClient:
         ]
 
     def get_balance_usdc(self) -> float:
-        """Balance disponible en USDC."""
         state = self.get_user_state()
         return float(state.get("crossMarginSummary", {}).get("accountValue", 0.0))
 
     def cancel_order(self, order_id: int) -> dict:
-        """Cancela una orden por su ID."""
         return self._exchange.cancel(self.coin, order_id)
 
     def cancel_all_open_tpsl(self) -> list[dict]:
         """
         Cancela todos los trigger orders (TP/SL) abiertos para este coin.
-        Útil antes de colocar nuevos TP/SL o al cerrar posición manualmente.
         """
         orders  = self.get_open_orders()
         results = []
