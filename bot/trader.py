@@ -59,6 +59,11 @@ _SL_SW_MARGIN           = float(os.getenv("SL_SW_MARGIN", "0.001"))
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
+# Timeout para llamadas a /exchange (leverage, cancel, etc.)
+_EXCHANGE_POST_TIMEOUT = float(os.getenv("EXCHANGE_POST_TIMEOUT", "15"))
+# Timeout total para _set_leverage (incluye _get_coin_index + _exchange_post)
+_SET_LEVERAGE_TIMEOUT  = float(os.getenv("SET_LEVERAGE_TIMEOUT", "20"))
+
 # ── Rate limiter global para /info ─────────────────────────────────────────
 _HL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
@@ -274,11 +279,12 @@ class FuturesTrader:
             "vaultAddress": self._vault_address,
         }
 
-        async with aiohttp.ClientSession() as s:
+        # FIX: timeout explícito en connect + total para evitar hang indefinido
+        timeout = aiohttp.ClientTimeout(total=_EXCHANGE_POST_TIMEOUT, connect=5)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
             async with s.post(
                 f"{_API_URL}/exchange", json=payload,
                 headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
                 text = await r.text()
                 try:
@@ -324,7 +330,20 @@ class FuturesTrader:
         if not balance_svc.is_ready():
             balance_svc.init_hl(self._master_addr, self._info_post)
 
-        await self._set_leverage(self.leverage)
+        # FIX: _set_leverage con timeout global para evitar que _init se cuelgue
+        try:
+            await asyncio.wait_for(
+                self._set_leverage(self.leverage),
+                timeout=_SET_LEVERAGE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] _set_leverage tardó más de %ss — continuando sin confirmar leverage",
+                self.symbol, _SET_LEVERAGE_TIMEOUT,
+            )
+        except Exception as e:
+            logger.warning("[%s] _set_leverage error (no crítico): %s", self.symbol, e)
+
         logger.info(
             "[%s] Trader iniciado | coin=%s | master=%s | agent_mode=%s | agente=%s",
             self.symbol, self.coin,
