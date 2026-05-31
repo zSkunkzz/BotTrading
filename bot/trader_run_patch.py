@@ -51,7 +51,7 @@ async def _iteration(self: FuturesTrader, risk: RiskManager, global_risk: Global
         logger.debug("[%s] Kill switch activo — skip.", self.symbol)
         return
 
-    # ── Obtener precio actual ────────────────────────────────────────
+    # ── Obtener precio actual ────────────────────────────────────
     try:
         price = await self.get_price()
     except Exception as e:
@@ -60,51 +60,57 @@ async def _iteration(self: FuturesTrader, risk: RiskManager, global_risk: Global
 
     # ── Verificar posición abierta en el exchange ────────────────────
     now = time.monotonic()
+    did_check_exchange = False
     exchange_positions = []
+
     if now - self._last_pos_check_at >= _POS_CHECK_INTERVAL_S:
         exchange_positions = await self._get_positions()
         self._last_pos_check_at = now
+        did_check_exchange = True
 
-    # Sincronizar estado local con el exchange
-    if exchange_positions:
-        ep = exchange_positions[0]
-        if self.position is None:
-            # Posición abierta en el exchange pero no registrada localmente
-            self.position    = ep["side"]
-            self.entry_price = ep["entryPx"]
-            logger.info("[%s] Posición detectada en exchange: %s @ %s",
-                        self.symbol, self.position, self.entry_price)
-    elif not exchange_positions and self.position is not None:
-        # Posición cerrada externamente
-        logger.info("[%s] Posición cerrada externamente.", self.symbol)
-        self.position    = None
-        self.entry_price = None
-        self.sl = self.tp1 = self.tp2 = self.tp3 = None
-        self.tp2_hit = False
-        clear_position(self.symbol)
+    # FIX Bug 2: solo sincronizar cuando tenemos datos frescos del exchange.
+    # Si did_check_exchange es False, exchange_positions es [] pero eso NO
+    # significa que no haya posición — simplemente no hemos preguntado todavía.
+    if did_check_exchange:
+        if exchange_positions:
+            ep = exchange_positions[0]
+            if self.position is None:
+                self.position    = ep["side"]
+                self.entry_price = ep["entryPx"]
+                logger.info("[%s] Posición detectada en exchange: %s @ %s",
+                            self.symbol, self.position, self.entry_price)
+        else:
+            # Lista vacía Y hemos consultado → posición cerrada externamente
+            if self.position is not None:
+                logger.info("[%s] Posición cerrada externamente.", self.symbol)
+                self.position    = None
+                self.entry_price = None
+                self.sl = self.tp1 = self.tp2 = self.tp3 = None
+                self.tp2_hit = False
+                clear_position(self.symbol)
 
     has_position = self.position is not None
 
-    # ── Gestión de posición abierta ──────────────────────────────────
+    # ── Gestión de posición abierta ──────────────────────────────
     if has_position:
         await _manage_open_position(self, price, risk)
         return
 
-    # ── Verificar límites de riesgo global ──────────────────────────
+    # ── Verificar límites de riesgo global ───────────────────────
     if global_risk:
         allowed, reason = await global_risk.can_open()
         if not allowed:
             logger.debug("[%s] GlobalRisk: %s", self.symbol, reason)
             return
 
-    # ── Check de balance mínimo ─────────────────────────────────────
+    # ── Check de balance mínimo ───────────────────────────────
     balance = await self.get_balance()
     if balance is not None and balance < risk.usdc_per_trade:
         logger.warning("[%s] Balance insuficiente (%.2f < %.2f USDC).",
                        self.symbol, balance, risk.usdc_per_trade)
         return
 
-    # ── Pre-trade risk check ────────────────────────────────────────
+    # ── Pre-trade risk check ──────────────────────────────────
     try:
         from bot.pretrade_risk import pretrade_risk
         if not await pretrade_risk.check(self.symbol, risk, balance or 0.0):
@@ -113,9 +119,8 @@ async def _iteration(self: FuturesTrader, risk: RiskManager, global_risk: Global
     except Exception as e:
         logger.debug("[%s] pretrade_risk error (ignorando): %s", self.symbol, e)
 
-    # ── Decisión de trading ─────────────────────────────────────────
+    # ── Decisión de trading ────────────────────────────────────
     try:
-        # Obtener la sesión ccxt (se crea lazy si no existe)
         exch = await self._get_ccxt()
         decision = await decide(
             exch=exch,
@@ -134,7 +139,7 @@ async def _iteration(self: FuturesTrader, risk: RiskManager, global_risk: Global
     if action not in ("BUY", "SELL"):
         return
 
-    # ── Calcular niveles de entrada ─────────────────────────────────
+    # ── Calcular niveles de entrada ─────────────────────────────
     if signal:
         entry  = signal.entry  or price
         sl     = signal.sl
@@ -147,12 +152,10 @@ async def _iteration(self: FuturesTrader, risk: RiskManager, global_risk: Global
         sl = tp1 = tp2 = tp3 = None
         lev = self.leverage
 
-    # Usar leverage sugerido por la señal (dentro del máximo configurado)
     lev = min(int(lev), self.leverage)
     if lev != self.leverage:
         await self._set_leverage(lev)
 
-    # Calcular tamaño
     notional = risk.usdc_per_trade * lev
     qty = round(notional / entry, 6)
     if qty <= 0:
@@ -225,7 +228,7 @@ async def _manage_open_position(self: FuturesTrader, price: float, risk: RiskMan
     is_long = self.position == "long"
     pnl_pct = ((price - self.entry_price) / self.entry_price) * (1 if is_long else -1) * 100
 
-    # ── TP2 parcial ─────────────────────────────────────────────────
+    # ── TP2 parcial ──────────────────────────────────────────
     if self.tp2 and not self.tp2_hit:
         tp2_hit = (is_long and price >= self.tp2) or (not is_long and price <= self.tp2)
         if tp2_hit:
@@ -241,7 +244,7 @@ async def _manage_open_position(self: FuturesTrader, price: float, risk: RiskMan
                     logger.info("[%s] TP2 parcial ejecutado (%.1f%%)", self.symbol, TP2_PARTIAL_RATIO * 100)
                     await notify_tp_partial(self.symbol, self.position, price, self.tp2, partial_qty)
 
-    # ── Trailing stop ────────────────────────────────────────────────
+    # ── Trailing stop ─────────────────────────────────────────
     if risk.trailing_sl and self.sl is not None:
         activation_px = self.entry_price * (
             1 + risk.trailing_activation_pct / 100 if is_long
@@ -259,7 +262,7 @@ async def _manage_open_position(self: FuturesTrader, price: float, risk: RiskMan
                 self.sl = new_sl
                 logger.debug("[%s] Trailing SL actualizado: %.4f", self.symbol, self.sl)
 
-    # ── Comprobar SL y TP3 ───────────────────────────────────────────
+    # ── Comprobar SL y TPs ──────────────────────────────────────
     sl_hit  = self.sl  and ((is_long and price <= self.sl)  or (not is_long and price >= self.sl))
     tp3_hit = self.tp3 and ((is_long and price >= self.tp3) or (not is_long and price <= self.tp3))
     tp1_hit = self.tp1 and not self.tp2 and ((is_long and price >= self.tp1) or (not is_long and price <= self.tp1))
@@ -273,12 +276,32 @@ async def _manage_open_position(self: FuturesTrader, price: float, risk: RiskMan
         close_reason = "TP1"
 
     if close_reason:
+        # FIX Bug 3: guard qty > 0 para no enviar orden de cierre con cantidad cero
         positions = await self._get_positions()
-        if positions:
-            qty = positions[0]["size"]
-            close_side = "sell" if is_long else "buy"
-            if not self.dry_run:
-                await self._place_order(close_side, qty, reduce_only=True)
+        if not positions:
+            logger.warning(
+                "[%s] Cierre por %s: no hay posición activa en el exchange (ya cerrada?).",
+                self.symbol, close_reason,
+            )
+            # Limpiar estado local igualmente
+            self.position = self.entry_price = self.sl = None
+            self.tp1 = self.tp2 = self.tp3 = None
+            self.tp2_hit = False
+            clear_position(self.symbol)
+            return
+
+        qty = float(positions[0].get("szi", 0))
+        qty = abs(qty)  # szi puede ser negativo en shorts
+        if qty <= 0:
+            logger.error(
+                "[%s] Cierre por %s: qty=0 en posición del exchange, no se envía orden.",
+                self.symbol, close_reason,
+            )
+            return
+
+        close_side = "sell" if is_long else "buy"
+        if not self.dry_run:
+            await self._place_order(close_side, qty, reduce_only=True)
 
         pnl_usd = (pnl_pct / 100) * self._open_notional
         if pnl_usd > 0:
@@ -288,7 +311,9 @@ async def _manage_open_position(self: FuturesTrader, price: float, risk: RiskMan
         logger.info("[%s] 🔒 Cerrado por %s · PnL=%.2f USDC (%.2f%%)",
                     self.symbol, close_reason, pnl_usd, pnl_pct)
 
-        pos_copy = self.position
+        # FIX Bug 1: guardar copia de entry_price y position ANTES de nullear
+        entry_copy = self.entry_price
+        pos_copy   = self.position
         self.position = self.entry_price = self.sl = None
         self.tp1 = self.tp2 = self.tp3 = None
         self.tp2_hit = False
@@ -297,16 +322,16 @@ async def _manage_open_position(self: FuturesTrader, price: float, risk: RiskMan
         await notify_close(
             symbol=self.symbol,
             side=pos_copy,
-            entry=self.entry_price or 0,
+            entry=entry_copy,   # ← FIX: usar la copia, no self.entry_price (ya es None)
             exit_price=price,
             pnl_usd=pnl_usd,
             reason=close_reason,
         )
 
 
-# Constantes locales (importadas de trader.py scope global)
-TP2_PARTIAL_RATIO    = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
+# Constantes locales
+TP2_PARTIAL_RATIO     = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 _POS_CHECK_INTERVAL_S = int(os.getenv("POS_CHECK_INTERVAL_S", "30"))
 
-# ── Monkey-patch ─────────────────────────────────────────────────────────────
+# ── Monkey-patch ───────────────────────────────────────────────────────────
 FuturesTrader.run = _run
