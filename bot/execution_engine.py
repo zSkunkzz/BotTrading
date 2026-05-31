@@ -96,17 +96,30 @@ class ExecutionEngine:
                 rec.order_type_used = "limit"
                 rec.fill_price      = limit_price
             else:
-                # Si el error es de firma/agente no conocido, ir directo a market
+                # FIX: si el error es de agente no registrado en HL, el fallback
+                # market fallará igual → abortar y devolver el error original.
+                # Las firmas son válidas pero la agent wallet no está aprobada en HL.
                 agent_err = _AGENT_NOT_FOUND_SUBSTR in str(rec.cancel_reason)
-                if not agent_err:
+                if agent_err:
+                    logger.error(
+                        "[%s] Agent wallet not found in HL — verifique que "
+                        "HL_API_WALLET_ADDRESS sea la master wallet que aprobó "
+                        "al agente en app.hyperliquid.xyz. master_addr=%s agent_addr=%s",
+                        sym,
+                        getattr(trader, '_master_addr', 'N/A'),
+                        getattr(trader, '_agent_addr',  'N/A'),
+                    )
+                    rec.order_type_used = "market"
+                    rec.fill_price      = arrival_price
+                else:
                     rec.cancel_reason = rec.cancel_reason or "timeout"
-                logger.info(f"[{sym}] ⚡ Limit sin fill → fallback market")
-                result = await trader._place_order_raw(
-                    side, qty, trade_side=trade_side,
-                    reduce_only=reduce_only, sl=sl, tp=tp,
-                )
-                rec.order_type_used = "market"
-                rec.fill_price      = arrival_price
+                    logger.info(f"[{sym}] ⚡ Limit sin fill → fallback market")
+                    result = await trader._place_order_raw(
+                        side, qty, trade_side=trade_side,
+                        reduce_only=reduce_only, sl=sl, tp=tp,
+                    )
+                    rec.order_type_used = "market"
+                    rec.fill_price      = arrival_price
         else:
             reason = (
                 f"spread {spread_bps:.1f} bps > {self.max_spread_bps_limit:.0f} bps"
@@ -194,13 +207,10 @@ class ExecutionEngine:
         if result.get("status") != "ok":
             err_str = str(result.get("response", ""))
             rec.cancel_reason = f"limit_rejected:{err_str}"
-            # Si es error de agente no registrado, marcar explícitamente para
-            # que execute() vaya directo a market sin reintentar otra limit.
             if _AGENT_NOT_FOUND_SUBSTR in err_str:
                 rec.cancel_reason = f"agent_not_found:{err_str}"
             return result, False
 
-        # En Hyperliquid el orderId viene en response.data.statuses[0]
         try:
             order_id = result["response"]["data"]["statuses"][0].get("resting", {}).get("oid")
         except (KeyError, IndexError, TypeError):

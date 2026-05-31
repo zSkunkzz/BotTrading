@@ -63,8 +63,6 @@ _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
 # ── Rate limiter global para /info (compartido entre todos los traders) ──
-# 0.6s entre llamadas → ~1.6 req/s máx para 14+ traders concurrentes.
-# Más conservador que el anterior 0.5s para evitar 429 persistentes.
 _HL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
 _HL_MIN_INTERVAL = 0.6
@@ -117,7 +115,6 @@ def _action_hash(action: dict, vault_address: Optional[str], nonce: int,
     """
     Hash canónico de una acción L1.
     - msgpack.packb SIN opciones adicionales (igual que SDK oficial).
-      use_bin_type=True cambiaría la serialización → hash distinto → firma inválida.
     """
     data = msgpack.packb(action)   # ← sin use_bin_type, idéntico al SDK oficial
     data += nonce.to_bytes(8, "big")
@@ -243,13 +240,11 @@ class FuturesTrader:
         self._last_pos_check_at:   float = 0.0
         self._last_tpsl_verify_at: float = 0.0
 
-        # ccxt session reutilizable — se cierra en cleanup()
         self._ccxt_exchange = None
 
     # ── ccxt session management ──────────────────────────────────────────
 
     async def _get_ccxt(self):
-        """Devuelve la instancia ccxt, creándola si no existe."""
         if self._ccxt_exchange is None:
             import ccxt.async_support as ccxt
             self._ccxt_exchange = ccxt.hyperliquid({
@@ -259,7 +254,6 @@ class FuturesTrader:
         return self._ccxt_exchange
 
     async def _close_ccxt(self):
-        """Cierra la sesión ccxt correctamente para evitar ResourceWarning."""
         if self._ccxt_exchange is not None:
             try:
                 await self._ccxt_exchange.close()
@@ -295,7 +289,6 @@ class FuturesTrader:
                 if r.status == 429:
                     logger.warning("[%s] 429 en /info, esperando 5s...", self.symbol)
                     await asyncio.sleep(5.0)
-                    # Retry único después del backoff
                     await _hl_throttle()
                     async with aiohttp.ClientSession() as s2:
                         async with s2.post(
@@ -310,12 +303,6 @@ class FuturesTrader:
     async def _exchange_post(self, action: dict) -> dict:
         """
         POST autenticado a /exchange con firma EIP-712 L1.
-
-        Modo agente (HL_API_PRIVATE_KEY):
-          vault_address = master_addr  ← siempre, igual que SDK oficial.
-
-        Modo directo (HL_PRIVATE_KEY):
-          vault_address = None
         """
         if not self._private_key:
             raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
@@ -357,7 +344,6 @@ class FuturesTrader:
     # ── Init ────────────────────────────────────────────────────────────
 
     async def _init(self, usdc_per_trade: float):
-        # Crear sesión ccxt reutilizable
         await self._get_ccxt()
 
         saved = load_position(self.symbol)
@@ -382,7 +368,6 @@ class FuturesTrader:
                     self.symbol, self.coin, self._account_addr[:10] + "...", self._agent_mode)
 
     async def cleanup(self):
-        """Cierra recursos (ccxt session). Llamar desde trader.run() en finally."""
         await self._close_ccxt()
 
     # ── Precio y OHLCV ──────────────────────────────────────────────────
@@ -403,7 +388,6 @@ class FuturesTrader:
         raise ValueError(f"No se pudo obtener precio para {self.coin}")
 
     async def get_ohlcv(self, tf: str = OHLCV_TF) -> list:
-        # 1. WS feed (sin coste de red)
         try:
             from bot.ws_feed import ws_feed
             if ws_feed.has_data(self.coin, tf=tf, min_candles=OHLCV_MIN_BARS):
@@ -419,7 +403,6 @@ class FuturesTrader:
         except Exception as e:
             logger.debug("[%s] get_ohlcv WS error: %s", self.symbol, e)
 
-        # 2. Cache compartido (evita 429 con múltiples traders)
         async def _fetch_rest(timeframe: str) -> list:
             tf_ms = {"15m": 15*60*1000, "1h": 60*60*1000, "4h": 4*60*60*1000}.get(timeframe, 15*60*1000)
             now   = int(time.time() * 1000)
@@ -600,6 +583,10 @@ class FuturesTrader:
     async def _get_positions(self) -> list:
         try:
             data = await self._info_post({"type": "clearinghouseState", "user": self._account_addr})
+            # FIX: _info_post puede devolver None si hay timeout o error de red
+            if not data or not isinstance(data, dict):
+                logger.warning("[%s] _get_positions: respuesta vacía o inválida", self.symbol)
+                return []
             positions = []
             for p in data.get("assetPositions", []):
                 pos = p.get("position", {})
