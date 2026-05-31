@@ -39,6 +39,12 @@ _BASE_URL = (
     else "https://api.hyperliquid.xyz"
 )
 
+# Slippage máximo aceptado en órdenes de mercado (3%).
+# El SDK de HL requiere un limit_px real incluso para market orders.
+# Para buy: subimos el precio un 3% (aceptamos pagar hasta un 3% más).
+# Para sell: bajamos el precio un 3% (aceptamos recibir hasta un 3% menos).
+_MARKET_SLIPPAGE = 0.03
+
 
 def _norm_coin(symbol: str) -> str:
     s = symbol.replace("/", "").replace(":USDT", "").upper()
@@ -201,13 +207,40 @@ class HLClient:
         is_buy: bool,
         sz: float,
         reduce_only: bool = False,
+        ref_price: Optional[float] = None,
     ) -> dict:
+        """
+        Orden de mercado compatible con el SDK de Hyperliquid.
+
+        El SDK requiere un limit_px real (no None) incluso para market orders.
+        Si se proporciona ref_price, se calcula un precio límite con slippage
+        del 3% (buy sube, sell baja). Si no se proporciona ref_price, se
+        consulta el mid del orderbook para obtener el precio de referencia.
+        """
+        if ref_price is None or ref_price <= 0:
+            try:
+                l2 = self._info.l2_snapshot(self.coin)
+                best_ask = float(l2["levels"][1][0]["px"])  # asks[0]
+                best_bid = float(l2["levels"][0][0]["px"])  # bids[0]
+                ref_price = (best_ask + best_bid) / 2
+            except Exception:
+                ref_price = 0.0
+
+        if ref_price and ref_price > 0:
+            if is_buy:
+                slippage_px = round(ref_price * (1 + _MARKET_SLIPPAGE), 6)
+            else:
+                slippage_px = round(ref_price * (1 - _MARKET_SLIPPAGE), 6)
+        else:
+            # Sin precio de referencia: usar ioc con precio extremo como fallback
+            slippage_px = 999_999_999.0 if is_buy else 0.000001
+
         return self._exchange.order(
             name=self.coin,
             is_buy=is_buy,
             sz=sz,
-            limit_px=None,
-            order_type={"market": {}},
+            limit_px=slippage_px,
+            order_type={"limit": {"tif": "Ioc"}},
             reduce_only=reduce_only,
         )
 
