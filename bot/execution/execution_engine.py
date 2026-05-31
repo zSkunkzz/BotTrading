@@ -8,11 +8,13 @@ Cambios respecto a la versión anterior:
   - Si el bot se reinicia, el TP/SL sigue activo en el exchange.
 
 Flujo de apertura:
-  1. Calcular arrival_price (mid del orderbook o last)
-  2. Intentar limit agresiva si spread <= umbral y depth suficiente
-  3. Si llena: colocar TP trigger + SL trigger en bulk
-  4. Si no llena en timeout: cancelar → fallback market + TP/SL bulk
-  5. Registrar telemetría
+  1. Guardia dura: si trade_side=="open" y falta sl o tp → abortar inmediatamente.
+  2. Calcular arrival_price (mid del orderbook o last)
+  3. Intentar limit agresiva si spread <= umbral y depth suficiente
+  4. Si llena: colocar TP trigger + SL trigger en bulk
+  5. Si no llena en timeout: cancelar → fallback market + TP/SL bulk
+     (FIX race condition: se usa `entry_ok` propio del fallback, no el result de la limit)
+  6. Registrar telemetría
 
 Variables de entorno (todas opcionales):
   EE_LIMIT_TIMEOUT_S          default 4
@@ -74,6 +76,7 @@ class ExecutionEngine:
       - Usa el SDK oficial de Hyperliquid (HLClient)
       - Coloca TP y SL como trigger orders reales en el exchange
       - TP/SL sobreviven reinicios del bot
+      - NUNCA abre una posición sin SL y TP válidos
     """
 
     def __init__(self) -> None:
@@ -168,9 +171,16 @@ class ExecutionEngine:
         """
         Ejecuta una orden con TP/SL reales en el exchange.
 
-        Si trade_side=="open" y se proporcionan sl/tp:
+        GUARDIA DURA (apertura):
+          Si trade_side=="open" y sl o tp son None/0 → rechaza inmediatamente.
+          Ninguna posición se abre sin ambos niveles de protección.
+
+        Si trade_side=="open" y sl+tp válidos:
           1. Abre la posición (limit o market)
           2. Coloca trigger TP + trigger SL en bulk
+          FIX race condition: `entry_ok` se actualiza con el resultado REAL
+          de la orden ejecutada (limit fill o market fallback), nunca con el
+          result de la limit "resting" que todavía no está filled.
 
         Si reduce_only=True (cierre manual):
           1. Cancela trigger orders abiertos del coin
@@ -182,6 +192,19 @@ class ExecutionEngine:
         rec._t0 = time.monotonic()
 
         is_buy = side in ("buy", "long")
+
+        # ── GUARDIA DURA: NUNCA abrir sin SL y TP ─────────────────────
+        if trade_side == "open" and not reduce_only:
+            missing = []
+            if not sl or sl <= 0:
+                missing.append("SL")
+            if not tp or tp <= 0:
+                missing.append("TP")
+            if missing:
+                msg = f"Apertura bloqueada — faltan: {', '.join(missing)}. No se abre ninguna posición sin SL y TP."
+                logger.error("[%s] 🚫 %s", sym, msg)
+                self._finalize_rec(rec, {"status": "error", "response": msg}, side, arrival_price)
+                return {"status": "error", "response": msg}
 
         # FIX B: redondear qty a los decimales permitidos por HL para este coin
         sz_dec = client.get_sz_decimals()
@@ -208,25 +231,42 @@ class ExecutionEngine:
             and spread_bps <= self.max_spread_bps_limit
         )
 
+        # `entry_ok` indica si la orden de entrada fue confirmada — es la
+        # única variable que controla si se colocan los TP/SL.
+        # FIX race condition: NO se usa result.get("status") directamente porque
+        # cuando la limit queda en "resting" su status es "ok" pero NO está filled.
+        # Solo ponemos entry_ok=True cuando sabemos con certeza que hay posición abierta.
+        entry_ok = False
+        result   = {"status": "error", "response": "not executed"}
+
         if use_limit:
             limit_price = self._calc_limit_price(side, arrival_price, ask, bid)
-            result, filled = await self._try_limit_sdk(client, is_buy, qty, limit_price, rec)
+            limit_result, filled = await self._try_limit_sdk(client, is_buy, qty, limit_price, rec)
 
             if filled:
-                rec.order_type_used = "limit"
-                rec.fill_price      = limit_price
+                # Limit se ejecutó completamente
+                result               = limit_result
+                entry_ok             = True
+                rec.order_type_used  = "limit"
+                rec.fill_price       = limit_price
             else:
                 if _AGENT_NOT_FOUND_SUBSTR in rec.cancel_reason:
                     self._log_agent_error(sym, trader)
                     rec.order_type_used = "market"
                     rec.fill_price      = arrival_price
-                    self._finalize_rec(rec, result, side, arrival_price)
-                    return result
+                    self._finalize_rec(rec, limit_result, side, arrival_price)
+                    return limit_result
+
                 logger.info("[%s] ⚡ Limit sin fill → fallback market", sym)
-                result = await self._place_market_with_retry(
+                # FIX: usamos el result del MARKET (no del limit resting)
+                # para determinar entry_ok correctamente.
+                market_result = await self._place_market_with_retry(
                     client, is_buy, qty, reduce_only, arrival_price, sym
                 )
-                if result.get("status") != "ok":
+                result = market_result
+                if result.get("status") == "ok":
+                    entry_ok = True
+                else:
                     logger.error(
                         "[%s] ❌ Fallback market falló: %s",
                         sym, result.get("response", ""),
@@ -242,7 +282,9 @@ class ExecutionEngine:
             result = await self._place_market_with_retry(
                 client, is_buy, qty, reduce_only, arrival_price, sym
             )
-            if result.get("status") != "ok":
+            if result.get("status") == "ok":
+                entry_ok = True
+            else:
                 logger.error(
                     "[%s] ❌ Market order falló: %s",
                     sym, result.get("response", ""),
@@ -251,13 +293,15 @@ class ExecutionEngine:
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
 
-        # ── Colocar TP/SL reales sólo si la apertura fue confirmada ─────────
+        # ── Colocar TP/SL reales SÓLO si la apertura fue confirmada ─────
+        # Usa entry_ok (no result["status"]) para evitar la race condition
+        # donde la limit "resting" devuelve status=ok sin estar filled.
         if (
-            result.get("status") == "ok"
+            entry_ok
             and not reduce_only
             and trade_side == "open"
-            and (sl is not None or tp is not None)
         ):
+            # sl y tp ya fueron validados por la guardia dura arriba
             await self._place_tpsl_bulk(client, is_buy, qty, sl, tp, sym)
 
         self._finalize_rec(rec, result, side, arrival_price)
@@ -289,7 +333,6 @@ class ExecutionEngine:
         orders_to_place = []
 
         if tp is not None:
-            # FIX: round_px en lugar de round(..., 6)
             tp_trigger = client.round_px(float(tp))
 
             if self.tp_as_limit:
@@ -317,7 +360,6 @@ class ExecutionEngine:
             })
 
         if sl is not None:
-            # FIX: round_px en lugar de valor crudo
             sl_px = client.round_px(float(sl))
             orders_to_place.append({
                 "coin":       client.coin,
