@@ -4,12 +4,17 @@ pretrade_risk.py — Motor de riesgo pre-trade institucional.
 Valida cada intención de orden ANTES de enviarla al exchange.
 Si cualquier check falla, devuelve (False, motivo_str) y la orden no se manda.
 
-Defaults ajustados para cuentas pequeñas (10-100 USDC por trade):
-  - PT_MAX_NOTIONAL_PER_TRADE : 200 USDC  (antes 500)
-  - PT_MAX_SYMBOL_EXPOSURE    : 200 USDC  (antes 1000)
-  - PT_MAX_TOTAL_EXPOSURE     : 500 USDC  (antes 3000)
-  - PT_MIN_SL_DISTANCE_BPS    :   8 bps   (ok, sin cambios)
-  - PT_BALANCE_USAGE_PCT      :  0.90     (ok, sin cambios)
+Nota sobre sizing en Hyperliquid:
+  En HL el notional por trade = USDC_PER_TRADE (sin multiplicar por leverage).
+  El leverage solo afecta el margen reservado internamente.
+  Por tanto los límites aquí se expresan en USDC reales por trade.
+
+Defaults ajustados para cuentas medianas (20-50 USDC por trade, balance ~200 USDC):
+  - PT_MAX_NOTIONAL_PER_TRADE : 60 USDC   (3× USDC_PER_TRADE típico)
+  - PT_MAX_SYMBOL_EXPOSURE    : 60 USDC
+  - PT_MAX_TOTAL_EXPOSURE     : 300 USDC  (~1.5× balance típico, permite 5 posiciones)
+  - PT_MIN_SL_DISTANCE_BPS    :   8 bps
+  - PT_BALANCE_USAGE_PCT      :  0.90
 """
 from __future__ import annotations
 
@@ -29,25 +34,25 @@ class PreTradeRisk:
     """
     Variables de entorno (todas opcionales):
 
-      PT_MAX_NOTIONAL_PER_TRADE   USDC máximos por operación          (default 200)
-      PT_MAX_SYMBOL_EXPOSURE      USDC máximos en un símbolo          (default 200)
-      PT_MAX_TOTAL_EXPOSURE       USDC máximos en todas las posiciones (default 500)
-      PT_MAX_SPREAD_BPS           Spread máximo permitido en bps       (default 30)
-      PT_MIN_SL_DISTANCE_BPS      Distancia mínima SL en bps           (default 8)
-      PT_MAX_SLIPPAGE_BPS         Slippage esperado máximo aceptable   (default 50)
+      PT_MAX_NOTIONAL_PER_TRADE   USDC máximos por operación           (default 60)
+      PT_MAX_SYMBOL_EXPOSURE      USDC máximos en un símbolo           (default 60)
+      PT_MAX_TOTAL_EXPOSURE       USDC máximos en todas las posiciones (default 300)
+      PT_MAX_SPREAD_BPS           Spread máximo permitido en bps        (default 30)
+      PT_MIN_SL_DISTANCE_BPS      Distancia mínima SL en bps            (default 8)
+      PT_MAX_SLIPPAGE_BPS         Slippage esperado máximo aceptable    (default 50)
       PT_MAX_ORDERS_PER_MIN       Órdenes máximas por minuto POR SÍMBOLO (default 6)
-      PT_BALANCE_USAGE_PCT        Máximo % del balance por trade       (default 0.90)
+      PT_BALANCE_USAGE_PCT        Máximo % del balance por trade        (default 0.90)
     """
 
     def __init__(self) -> None:
-        self.max_notional_per_trade : float = _e("PT_MAX_NOTIONAL_PER_TRADE", 200.0)
-        self.max_symbol_exposure    : float = _e("PT_MAX_SYMBOL_EXPOSURE",   200.0)
-        self.max_total_exposure     : float = _e("PT_MAX_TOTAL_EXPOSURE",    500.0)
-        self.max_spread_bps         : float = _e("PT_MAX_SPREAD_BPS",         30.0)
-        self.min_sl_distance_bps    : float = _e("PT_MIN_SL_DISTANCE_BPS",    8.0)
-        self.max_slippage_bps       : float = _e("PT_MAX_SLIPPAGE_BPS",       50.0)
-        self.max_orders_per_min     : int   = int(_e("PT_MAX_ORDERS_PER_MIN",  6))
-        self.balance_usage_pct      : float = _e("PT_BALANCE_USAGE_PCT",       0.90)
+        self.max_notional_per_trade : float = _e("PT_MAX_NOTIONAL_PER_TRADE", 60.0)
+        self.max_symbol_exposure    : float = _e("PT_MAX_SYMBOL_EXPOSURE",    60.0)
+        self.max_total_exposure     : float = _e("PT_MAX_TOTAL_EXPOSURE",    300.0)
+        self.max_spread_bps         : float = _e("PT_MAX_SPREAD_BPS",          30.0)
+        self.min_sl_distance_bps    : float = _e("PT_MIN_SL_DISTANCE_BPS",     8.0)
+        self.max_slippage_bps       : float = _e("PT_MAX_SLIPPAGE_BPS",        50.0)
+        self.max_orders_per_min     : int   = int(_e("PT_MAX_ORDERS_PER_MIN",   6))
+        self.balance_usage_pct      : float = _e("PT_BALANCE_USAGE_PCT",        0.90)
 
         self._symbol_exposure  : dict[str, float] = {}
         self._order_timestamps : dict[str, deque] = {}

@@ -1,6 +1,13 @@
 """
 trader.py — Motor de trading para Hyperliquid perpetuos.
 
+Cómo funciona el sizing en Hyperliquid (DIFERENTE a un CEX):
+  - En HL mandas directamente el tamaño en moneda base (ej. 0.003 BTC)
+  - USDC_PER_TRADE = margen real que arriesgas (colateral)
+  - El leverage define cuánto colateral reserva HL, NO multiplica el tamaño
+  - qty = USDC_PER_TRADE / entry_price   (SIN multiplicar por leverage)
+  - notional real en HL = qty × precio   (= USDC_PER_TRADE, sin apalancamiento)
+
 Autenticación soportada:
   Opción A (recomendada): API Key de agente
     - HL_API_PRIVATE_KEY     : private key del wallet AGENTE generado en app.hyperliquid.xyz
@@ -125,15 +132,15 @@ def _compute_fallback_tpsl(
     Garantiza que SIEMPRE haya SL y TP antes de abrir.
     """
     is_long = side == "long"
-    risk = atr * _FALLBACK_ATR_SL_MULT
+    risk_dist = atr * _FALLBACK_ATR_SL_MULT
     if is_long:
-        sl  = entry - risk
-        tp1 = entry + risk * _FALLBACK_ATR_TP1_MULT
-        tp2 = entry + risk * _FALLBACK_ATR_TP2_MULT
+        sl  = entry - risk_dist
+        tp1 = entry + risk_dist * _FALLBACK_ATR_TP1_MULT
+        tp2 = entry + risk_dist * _FALLBACK_ATR_TP2_MULT
     else:
-        sl  = entry + risk
-        tp1 = entry - risk * _FALLBACK_ATR_TP1_MULT
-        tp2 = entry - risk * _FALLBACK_ATR_TP2_MULT
+        sl  = entry + risk_dist
+        tp1 = entry - risk_dist * _FALLBACK_ATR_TP1_MULT
+        tp2 = entry - risk_dist * _FALLBACK_ATR_TP2_MULT
     return round(sl, 6), round(tp1, 6), round(tp2, 6)
 
 
@@ -504,10 +511,8 @@ class FuturesTrader:
         pos_side: str,
     ) -> None:
         """
-        FIX CENTRAL: verifica que los trigger orders de SL y TP existen en el
-        exchange tras la apertura. Si no los hay (bulk falló silenciosamente),
-        los vuelve a colocar con reintentos.
-        Llama SIEMPRE después de abrir posición.
+        Verifica que los trigger orders de SL y TP existen en el exchange
+        tras la apertura. Si no los hay, los recoloca con reintentos.
         """
         MAX_TRIES = 3
         for attempt in range(1, MAX_TRIES + 1):
@@ -532,18 +537,18 @@ class FuturesTrader:
                     return
 
                 logger.warning(
-                    "[%s] ⚠️ Intento %d/%d — SL=%s TP=%s NO confirmados en exchange. Recolocando...",
+                    "[%s] ⚠️ Intento %d/%d — SL=%s TP=%s NO confirmados. Recolocando...",
                     self.symbol, attempt, MAX_TRIES, has_sl, has_tp,
                 )
 
-                is_long = pos_side == "long"
+                is_long      = pos_side == "long"
                 close_is_buy = not is_long
-                client = self._hl_client
-                orders = []
+                client       = self._hl_client
+                orders       = []
 
                 if not has_tp:
-                    tp_px = client.round_px(tp1)
-                    buf   = 0.005  # 50bps buffer
+                    tp_px  = client.round_px(tp1)
+                    buf    = 0.005
                     tp_lim = client.round_px(tp_px * (1 - buf) if is_long else tp_px * (1 + buf))
                     orders.append({
                         "coin": client.coin, "is_buy": close_is_buy, "sz": qty,
@@ -563,7 +568,7 @@ class FuturesTrader:
 
                 if orders:
                     await loop.run_in_executor(None, lambda: client.place_bulk(orders))
-                    await asyncio.sleep(2.0)  # dejar propagar
+                    await asyncio.sleep(2.0)
 
             except Exception as e:
                 logger.warning(
@@ -613,7 +618,7 @@ class FuturesTrader:
 
         if did_check_exchange:
             if exchange_positions is None:
-                logger.warning("[%s] No se pudo verificar posición en exchange — manteniendo estado local.", self.symbol)
+                logger.warning("[%s] No se pudo verificar posición — manteniendo estado local.", self.symbol)
             elif exchange_positions:
                 ep = exchange_positions[0]
                 if self.position is None:
@@ -621,12 +626,12 @@ class FuturesTrader:
                     try:
                         parsed_side = _hl_side_to_str(raw_side)
                     except ValueError:
-                        logger.warning("[%s] Side desconocido del exchange: %r", self.symbol, raw_side)
+                        logger.warning("[%s] Side desconocido: %r", self.symbol, raw_side)
                         parsed_side = None
                     if parsed_side:
                         self.position    = parsed_side
                         self.entry_price = float(ep.get("entryPx") or 0)
-                        logger.info("[%s] Posición detectada en exchange: %s @ %s",
+                        logger.info("[%s] Posición detectada: %s @ %s",
                                     self.symbol, self.position, self.entry_price)
             else:
                 if self.position is not None:
@@ -690,7 +695,7 @@ class FuturesTrader:
             tp1   = _nonzero(signal.tp1)
             tp2   = _nonzero(signal.tp2)
             tp3   = _nonzero(getattr(signal, "tp3", None))
-            lev   = signal.suggested_lev or self.leverage
+            lev   = int(signal.suggested_lev or self.leverage)
             atr   = getattr(signal, "atr", None) or (entry * 0.005)
         else:
             entry = price
@@ -698,12 +703,34 @@ class FuturesTrader:
             lev = self.leverage
             atr = entry * 0.005
 
-        lev = min(int(lev), self.leverage)
+        # Respetar techo de leverage configurado
+        lev = min(lev, self.leverage)
+
+        # ── SIZING CORRECTO PARA HYPERLIQUID ──────────────────────────
+        # En HL el tamaño se manda en moneda base directamente.
+        # USDC_PER_TRADE = colateral real que arriesgas.
+        # El leverage ajusta el margen reservado por HL, NO el tamaño.
+        #
+        #   qty      = USDC_PER_TRADE / entry_price
+        #   notional = qty × entry_price  = USDC_PER_TRADE  (sin ×lev)
+        #   margen reservado por HL = notional / leverage
+        #
+        # Si leverage cambió respecto al configurado, actualizar en HL.
         if lev != self.leverage:
             await self._set_leverage(lev)
 
-        notional = risk.usdc_per_trade * lev
-        qty = self._round_qty(notional / entry)
+        usdc_per_trade = risk.usdc_per_trade          # ej. 20 USDC
+        qty = self._round_qty(usdc_per_trade / entry)  # ej. 0.0003 BTC
+
+        # notional = lo que HL ve como tamaño real de la posición
+        notional = qty * entry  # ≈ usdc_per_trade (diferencia por redondeo)
+
+        logger.info(
+            "[%s] 📐 Sizing HL | usdc_per_trade=%.2f | entry=%.4f | qty=%s | "
+            "notional=%.2f USDC | lev=%dx | margen_reservado=%.2f USDC",
+            self.symbol, usdc_per_trade, entry, qty, notional, lev, notional / lev,
+        )
+
         if qty <= 0:
             logger.warning("[%s] qty <= 0 tras redondeo, skip.", self.symbol)
             return
@@ -716,27 +743,24 @@ class FuturesTrader:
             if sl is None:
                 sl = fb_sl
                 logger.warning(
-                    "[%s] ⚠️ signal.sl vacío — usando fallback ATR: SL=%.5f",
-                    self.symbol, sl,
+                    "[%s] ⚠️ signal.sl vacío — fallback ATR: SL=%.5f", self.symbol, sl,
                 )
             if tp1 is None:
                 tp1 = fb_tp1
                 logger.warning(
-                    "[%s] ⚠️ signal.tp1 vacío — usando fallback ATR: TP1=%.5f",
-                    self.symbol, tp1,
+                    "[%s] ⚠️ signal.tp1 vacío — fallback ATR: TP1=%.5f", self.symbol, tp1,
                 )
             if tp2 is None:
                 tp2 = fb_tp2
 
-        # Doble-check: sl y tp1 NUNCA pueden ser None ni 0 a partir de aquí
+        # Doble-check: sl y tp1 NUNCA pueden ser None ni 0
         assert sl  and sl  > 0, f"[{self.symbol}] SL inválido: {sl}"
         assert tp1 and tp1 > 0, f"[{self.symbol}] TP1 inválido: {tp1}"
 
         side = "buy" if action == "BUY" else "sell"
         logger.info(
-            "[%s] 📈 Abriendo %s · qty=%s · entry=~%s · sl=%s · tp1=%s | %s",
-            self.symbol, action, qty, round(entry, 4),
-            round(sl, 4), round(tp1, 4),
+            "[%s] 📈 Abriendo %s · qty=%s · entry=~%.4f · sl=%.4f · tp1=%.4f | %s",
+            self.symbol, action, qty, entry, sl, tp1,
             decision.get("reason", ""),
         )
 
@@ -762,21 +786,18 @@ class FuturesTrader:
             confirmed_positions = await self._confirm_position_with_retry()
             if confirmed_positions is not None and len(confirmed_positions) == 0:
                 logger.error(
-                    "[%s] ❌ status=ok pero posición NO visible en exchange tras %d intentos.",
+                    "[%s] ❌ status=ok pero posición NO visible tras %d intentos.",
                     self.symbol, _POST_FILL_CONFIRM_RETRIES,
                 )
                 return
             if confirmed_positions is None:
-                logger.warning("[%s] ⚠️ No se pudo confirmar posición (red) — registrando sin protección OK.", self.symbol)
+                logger.warning(
+                    "[%s] ⚠️ No se pudo confirmar posición (red) — registrando sin protección OK.",
+                    self.symbol,
+                )
 
-        # Recalcular qty con fill real si difiere
+        # Ajustar SL/TP al fill real (slippage)
         if fill_price and fill_price != entry:
-            qty = self._round_qty(notional / fill_price)
-            logger.debug("[%s] Fill real: %.4f — qty ajustada a %s", self.symbol, fill_price, qty)
-
-        # Recalcular SL/TP sobre fill_price real para mayor precisión
-        if fill_price and fill_price != entry and signal:
-            # Desplazamiento proporcional al deslizamiento
             delta = fill_price - entry
             sl  = round(sl  + delta, 6)
             tp1 = round(tp1 + delta, 6)
@@ -784,6 +805,8 @@ class FuturesTrader:
                 tp2 = round(tp2 + delta, 6)
             if tp3:
                 tp3 = round(tp3 + delta, 6)
+            # recalcular notional con fill real
+            notional = qty * fill_price
 
         self.position       = pos_side
         self.entry_price    = fill_price
@@ -825,7 +848,7 @@ class FuturesTrader:
             tp2=self.tp2,
         )
 
-        # ── GARANTÍA FINAL: verificar y recolocar SL/TP si el bulk falló ──
+        # ── GARANTÍA FINAL: verificar y recolocar SL/TP ───────────────
         if not self.dry_run and confirmed_positions:
             live_qty = abs(float(confirmed_positions[0].get("szi", qty)))
             real_qty = live_qty if live_qty > 0 else qty
@@ -872,7 +895,7 @@ class FuturesTrader:
                             try:
                                 await self._place_tpsl(remaining_qty, self.sl, self.tp3)
                             except Exception as e:
-                                logger.warning("[%s] No se pudieron re-colocar TP/SL tras parcial: %s", self.symbol, e)
+                                logger.warning("[%s] No se pudo re-colocar TP/SL tras parcial: %s", self.symbol, e)
 
         # ── Trailing stop ─────────────────────────────────────────────
         if risk.trailing_sl and self.sl is not None:
@@ -984,8 +1007,12 @@ class FuturesTrader:
             try:
                 loop = asyncio.get_event_loop()
                 if order_type == "sl":
-                    await loop.run_in_executor(None, lambda: self._hl_client.place_sl(is_buy=side_is_buy, sz=q, trigger_px=px))
+                    await loop.run_in_executor(
+                        None, lambda: self._hl_client.place_sl(is_buy=side_is_buy, sz=q, trigger_px=px)
+                    )
                 else:
-                    await loop.run_in_executor(None, lambda: self._hl_client.place_tp(is_buy=side_is_buy, sz=q, trigger_px=px))
+                    await loop.run_in_executor(
+                        None, lambda: self._hl_client.place_tp(is_buy=side_is_buy, sz=q, trigger_px=px)
+                    )
             except Exception as e:
                 logger.warning("[%s] No se pudo colocar %s: %s", self.symbol, order_type, e)
