@@ -408,7 +408,10 @@ class FuturesTrader:
         if r.get("status") == "ok":
             logger.debug("[%s] Leverage %sx OK (cross=%s)", self.symbol, leverage, is_cross)
         else:
-            logger.warning("[%s] set_leverage error: %s", self.symbol, r)
+            # En cuentas normales (no vault) Hyperliquid devuelve 'Vault not registered'.
+            # Es un comportamiento esperado — la operativa no se ve afectada.
+            logger.debug("[%s] set_leverage no aplicable (cuenta normal, no vault): %s",
+                         self.symbol, r)
 
     # ── Órdenes ─────────────────────────────────────────────────────────
 

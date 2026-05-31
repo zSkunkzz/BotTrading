@@ -23,6 +23,7 @@ Compatible con Hyperliquid:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
@@ -61,6 +62,11 @@ OB_IMBALANCE_THRESHOLD    = 0.15
 FUNDING_EXTREME_THRESHOLD = 0.0005
 
 SCORE_MAX = 10  # Cap real de _compute_score
+
+# Semáforo global: máximo 4 requests REST simultáneos a Hyperliquid.
+# Con 14 traders corriendo en paralelo cada uno pide 3 TF × 2 fuentes
+# (REST + ccxt) = hasta 84 requests concurrentes sin esto → flood de 429.
+_OHLCV_SEM = asyncio.Semaphore(4)
 
 
 def _norm_coin(symbol: str) -> str:
@@ -123,7 +129,11 @@ class SignalResult:
 
 
 async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
-    """Obtiene OHLCV vía REST Hyperliquid (candleSnapshot)."""
+    """Obtiene OHLCV vía REST Hyperliquid (candleSnapshot).
+
+    Limita la concurrencia con _OHLCV_SEM (máx 4 simultáneos) y reintenta
+    hasta 3 veces con backoff exponencial ante respuestas 429.
+    """
     import time as _time
     import aiohttp
     import json as _json
@@ -136,36 +146,53 @@ async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
     payload = {"type": "candleSnapshot", "req": {
         "coin": coin, "interval": tf, "startTime": start, "endTime": now
     }}
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{api_url}/info", json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                data = _json.loads(await r.text())
-        # Guard: la API puede devolver null, un dict de error, etc.
-        if not isinstance(data, list) or len(data) == 0:
-            log.warning("[OHLCV] %s %s REST HL respuesta vacía o inesperada: %s", coin, tf, str(data)[:120])
+
+    for attempt in range(3):
+        try:
+            async with _OHLCV_SEM:
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(
+                        f"{api_url}/info", json=payload,
+                        headers={"Content-Type": "application/json"},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as r:
+                        if r.status == 429:
+                            wait = 2 ** attempt  # 1s, 2s, 4s
+                            log.debug("[OHLCV] %s %s 429 → reintentando en %ds (intento %d/3)",
+                                      coin, tf, wait, attempt + 1)
+                            await asyncio.sleep(wait)
+                            continue
+                        data = _json.loads(await r.text())
+
+            # Guard: la API puede devolver null, un dict de error, etc.
+            if not isinstance(data, list) or len(data) == 0:
+                log.warning("[OHLCV] %s %s REST HL respuesta vacía o inesperada: %s",
+                            coin, tf, str(data)[:120])
+                return pd.DataFrame()
+
+            bars = [
+                [int(c["t"]), float(c["o"]), float(c["h"]),
+                 float(c["l"]), float(c["c"]), float(c["v"])]
+                for c in data
+            ]
+            df = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            return df.set_index("ts").astype(float)
+
+        except Exception as e:
+            log.warning("[OHLCV] %s %s REST HL error: %s", coin, tf, e)
             return pd.DataFrame()
-        bars = [
-            [int(c["t"]), float(c["o"]), float(c["h"]),
-             float(c["l"]), float(c["c"]), float(c["v"])]
-            for c in data
-        ]
-        df = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        return df.set_index("ts").astype(float)
-    except Exception as e:
-        log.warning("[OHLCV] %s %s REST HL error: %s", coin, tf, e)
-        return pd.DataFrame()
+
+    # Agotados los reintentos
+    log.warning("[OHLCV] %s %s REST HL: 3 intentos fallidos (429 persistente)", coin, tf)
+    return pd.DataFrame()
 
 
 async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataFrame:
     """
     Obtiene OHLCV en orden:
       1. ws_feed (datos ya cacheados en memoria)
-      2. REST Hyperliquid candleSnapshot
+      2. REST Hyperliquid candleSnapshot  ← throttleado con _OHLCV_SEM
       3. ccxt exchange (fallback)
     """
     coin = _norm_coin(symbol)
