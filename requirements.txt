@@ -12,4 +12,5 @@ uvicorn>=0.29
 httpx>=0.27
 python-telegram-bot>=20.0
 ta>=0.10
-# cache-bust: 20260531
+hyperliquid-python-sdk>=0.10
+# cache-bust: 20260531b

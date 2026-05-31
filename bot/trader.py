@@ -32,10 +32,11 @@ from decimal import Decimal
 from typing import Optional
 
 import aiohttp
-import msgpack
 from eth_account import Account
-from eth_account.messages import encode_typed_data
-from eth_utils import keccak, to_hex
+from eth_utils import to_hex
+
+# SDK oficial de Hyperliquid — garantiza el mismo signing que el exchange
+from hyperliquid.utils.signing import sign_l1_action, float_to_wire
 
 from bot.strategy import decide
 from bot.ai_trader import ai_decide
@@ -91,77 +92,7 @@ async def _unique_nonce() -> int:
         return n
 
 
-# ── Helpers de signing ───────────────────────────────────────────────────────
-
-def _float_to_wire(x: float) -> str:
-    rounded = f"{x:.8f}"
-    if abs(float(rounded) - x) >= 1e-12:
-        raise ValueError(f"_float_to_wire rounding error: {x}")
-    if rounded == "-0":
-        rounded = "0"
-    normalized = Decimal(rounded).normalize()
-    return f"{normalized:f}"
-
-
-def _address_to_bytes(address: str) -> bytes:
-    return bytes.fromhex(address[2:] if address.startswith("0x") else address)
-
-
-def _action_hash(action: dict, vault_address: Optional[str], nonce: int,
-                 expires_after: Optional[int] = None) -> bytes:
-    data = msgpack.packb(action)
-    data += nonce.to_bytes(8, "big")
-    if vault_address is None:
-        data += b"\x00"
-    else:
-        data += b"\x01"
-        data += _address_to_bytes(vault_address)
-    if expires_after is not None:
-        data += b"\x00"
-        data += expires_after.to_bytes(8, "big")
-    return keccak(data)
-
-
-def _phantom_agent(hash_bytes: bytes, is_mainnet: bool) -> dict:
-    return {"source": "a" if is_mainnet else "b", "connectionId": hash_bytes}
-
-
-def _l1_payload(phantom_agent: dict) -> dict:
-    return {
-        "domain": {
-            "chainId": 1337,
-            "name": "Exchange",
-            "verifyingContract": "0x0000000000000000000000000000000000000000",
-            "version": "1",
-        },
-        "types": {
-            "Agent": [
-                {"name": "source",       "type": "string"},
-                {"name": "connectionId", "type": "bytes32"},
-            ],
-            "EIP712Domain": [
-                {"name": "name",              "type": "string"},
-                {"name": "version",           "type": "string"},
-                {"name": "chainId",           "type": "uint256"},
-                {"name": "verifyingContract", "type": "address"},
-            ],
-        },
-        "primaryType": "Agent",
-        "message": phantom_agent,
-    }
-
-
-def _sign_l1_action(private_key: str, action: dict, vault_address: Optional[str],
-                    nonce: int, is_mainnet: bool,
-                    expires_after: Optional[int] = None) -> dict:
-    wallet     = Account.from_key(private_key)
-    h          = _action_hash(action, vault_address, nonce, expires_after)
-    agent      = _phantom_agent(h, is_mainnet)
-    data       = _l1_payload(agent)
-    structured = encode_typed_data(full_message=data)
-    signed     = wallet.sign_message(structured)
-    return {"r": to_hex(signed["r"]), "s": to_hex(signed["s"]), "v": signed["v"]}
-
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _norm_coin(symbol: str) -> str:
     s = symbol.replace("/", "").replace(":USDT", "").upper()
@@ -170,6 +101,10 @@ def _norm_coin(symbol: str) -> str:
     if s.endswith("USDT"):
         s = s[:-4]
     return s
+
+
+# Alias para compatibilidad con el resto del código que usaba _float_to_wire
+_float_to_wire = float_to_wire
 
 
 class FuturesTrader:
@@ -199,8 +134,7 @@ class FuturesTrader:
             self._master_addr  = api_wallet
             # En modo agente:
             #   - _account_addr  → master (para consultas /info: balance, posiciones)
-            #   - _vault_address → None   (el agente firma SIN vault_address; HL lo
-            #                              identifica por la clave que firma, no por vault)
+            #   - _vault_address → None   (el agente firma SIN vault_address)
             self._account_addr  = self._master_addr
             self._vault_address = None
             logger.info(
@@ -311,28 +245,25 @@ class FuturesTrader:
         if not self._private_key:
             raise ValueError("No hay clave configurada (HL_API_PRIVATE_KEY o HL_PRIVATE_KEY)")
 
-        nonce         = await _unique_nonce()
-        # FIX: en modo agente vault_address=None.
-        # El agente firma en nombre de master_addr pero NO vía vault_address.
-        # Poner master_addr como vault generaba una sub-wallet efímera distinta
-        # en cada llamada, que Hyperliquid rechazaba con "does not exist".
-        vault_address: Optional[str] = self._vault_address  # siempre None salvo vault explícito
-        expires_after: Optional[int] = None
+        nonce = await _unique_nonce()
 
-        signature = _sign_l1_action(
-            private_key=self._private_key,
-            action=action,
-            vault_address=vault_address,
-            nonce=nonce,
-            is_mainnet=not _USE_TESTNET,
-            expires_after=expires_after,
+        # Usar SDK oficial de Hyperliquid para signing — garantiza
+        # el mismo msgpack + EIP-712 phantom-agent que el exchange valida.
+        # vault_address=None en modo agente normal.
+        wallet    = Account.from_key(self._private_key)
+        signature = sign_l1_action(
+            wallet,
+            action,
+            self._vault_address,   # None en modo agente
+            nonce,
+            not _USE_TESTNET,      # is_mainnet
         )
+
         payload: dict = {
             "action":       action,
             "nonce":        nonce,
-            "signature":    signature,
-            "vaultAddress": vault_address,
-            "expiresAfter": expires_after,
+            "signature":    {"r": to_hex(signature["r"]), "s": to_hex(signature["s"]), "v": signature["v"]},
+            "vaultAddress": self._vault_address,
         }
 
         async with aiohttp.ClientSession() as s:
@@ -352,14 +283,15 @@ class FuturesTrader:
             if "does not exist" in err_str:
                 logger.error(
                     "[%s] HL rechazó con 'does not exist'.\n"
-                    "  Verifica que HL_API_PRIVATE_KEY sea la clave del agente aprobado\n"
-                    "  en app.hyperliquid.xyz → Settings → API para la master=%s\n"
-                    "  agente=%s | vault=%s | respuesta HL: %s",
+                    "  agente=%s | vault=%s | respuesta HL: %s\n"
+                    "  → Verifica que el agente %s esté aprobado en\n"
+                    "    app.hyperliquid.xyz → Settings → API para la master=%s",
                     self.symbol,
-                    self._master_addr or "NO CONFIGURADA",
                     self._agent_addr  or "N/A",
-                    vault_address     or "None",
+                    self._vault_address or "None",
                     err_str,
+                    self._agent_addr  or "N/A",
+                    self._master_addr or "NO CONFIGURADA",
                 )
         return result
 
@@ -493,18 +425,18 @@ class FuturesTrader:
 
         if order_type == "limit" and price:
             order_type_obj = {"limit": {"tif": "Gtc"}}
-            limit_px       = _float_to_wire(price)
+            limit_px       = float_to_wire(price)
         else:
             current_price  = await self.get_price()
             slippage       = 0.05
             raw_px         = current_price * (1 + slippage) if is_buy else current_price * (1 - slippage)
             slippage_px    = round(float(f"{raw_px:.5g}"), 6)
-            limit_px       = _float_to_wire(slippage_px)
+            limit_px       = float_to_wire(slippage_px)
             order_type_obj = {"limit": {"tif": "Ioc"}}
 
         order: dict = {
             "a": coin_idx, "b": is_buy,
-            "p": limit_px, "s": _float_to_wire(qty),
+            "p": limit_px, "s": float_to_wire(qty),
             "r": reduce_only, "t": order_type_obj,
         }
 
@@ -512,14 +444,14 @@ class FuturesTrader:
         if tp:
             tpsl_parts.append({
                 "a": coin_idx, "b": not is_buy,
-                "p": _float_to_wire(tp), "s": _float_to_wire(qty), "r": True,
-                "t": {"trigger": {"triggerPx": _float_to_wire(tp), "isMarket": True, "tpsl": "tp"}},
+                "p": float_to_wire(tp), "s": float_to_wire(qty), "r": True,
+                "t": {"trigger": {"triggerPx": float_to_wire(tp), "isMarket": True, "tpsl": "tp"}},
             })
         if sl:
             tpsl_parts.append({
                 "a": coin_idx, "b": not is_buy,
-                "p": _float_to_wire(sl), "s": _float_to_wire(qty), "r": True,
-                "t": {"trigger": {"triggerPx": _float_to_wire(sl), "isMarket": True, "tpsl": "sl"}},
+                "p": float_to_wire(sl), "s": float_to_wire(qty), "r": True,
+                "t": {"trigger": {"triggerPx": float_to_wire(sl), "isMarket": True, "tpsl": "sl"}},
             })
 
         if tpsl_parts:
