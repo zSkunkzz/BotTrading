@@ -6,6 +6,7 @@
 import asyncio
 import time
 import logging
+import os
 
 logger = logging.getLogger("AIRateLimiter")
 
@@ -18,6 +19,9 @@ GROQ_SAFE_DAILY_CALLS = int(GROQ_TPD_LIMIT / TOKENS_PER_CALL_GROQ)  # ~125
 # ── Gemini pagado ───────────────────────────
 GEMINI_RPM_LIMIT = 60
 GEMINI_RPD_LIMIT = 5_000
+
+# ── Límite de traders simultáneos (mismo valor que main.py) ─────────────────
+_MAX_ACTIVE_TRADERS = int(os.getenv("MAX_ACTIVE_TRADERS", "5"))
 
 
 class AIBudgetManager:
@@ -46,7 +50,6 @@ class AIBudgetManager:
 
         # Cooldown por símbolo: evita llamar a la IA por el mismo par más de
         # 1 vez cada AI_SYMBOL_COOLDOWN segundos (por defecto 5 minutos).
-        import os
         self._symbol_cooldown = int(os.getenv("AI_SYMBOL_COOLDOWN", "300"))
         self._symbol_last_call: dict[str, float] = {}
 
@@ -187,15 +190,32 @@ class RateLimitExhausted(Exception):
         super().__init__(f"Budget {provider} agotado — usando fallback técnico")
 
 
-async def start_traders_staggered(pairs: list, start_trader_fn, delay: float = 2.0):
+async def start_traders_staggered(
+    pairs: list,
+    start_trader_fn,
+    delay: float = 3.0,
+    max_traders: int | None = None,
+):
+    """
+    Arranca traders de forma escalonada con un delay entre cada uno.
+
+    - `delay` (segundos): tiempo de espera entre arranques (default 3s).
+      Mayor delay = menos riesgo de 429 en Hyperliquid al inicio.
+    - `max_traders`: límite de traders a arrancar en esta llamada.
+      Si es None usa MAX_ACTIVE_TRADERS del env (default 5).
+    """
+    limit = max_traders if max_traders is not None else _MAX_ACTIVE_TRADERS
+    pairs_to_start = pairs[:limit]
+
     logger.info(
-        f"Iniciando {len(pairs)} traders escalonados "
-        f"(delay={delay}s, total ~{len(pairs)*delay:.0f}s)"
+        "Iniciando %d traders escalonados "
+        "(delay=%.1fs, total ~%.0fs, límite=%d)",
+        len(pairs_to_start), delay, len(pairs_to_start) * delay, limit,
     )
-    for i, pair in enumerate(pairs):
+    for i, pair in enumerate(pairs_to_start):
         asyncio.create_task(start_trader_fn(pair))
-        logger.info(f"Trader {i+1}/{len(pairs)}: {pair}")
-        if i < len(pairs) - 1:
+        logger.info("Trader %d/%d: %s", i + 1, len(pairs_to_start), pair)
+        if i < len(pairs_to_start) - 1:
             await asyncio.sleep(delay)
 
 
