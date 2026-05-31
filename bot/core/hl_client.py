@@ -22,6 +22,7 @@ Opcionales:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from typing import Optional
@@ -40,15 +41,10 @@ _BASE_URL = (
 )
 
 # Slippage máximo aceptado en órdenes de mercado (3%).
-# El SDK de HL requiere un limit_px real incluso para market orders.
-# Para buy: subimos el precio un 3% (aceptamos pagar hasta un 3% más).
-# Para sell: bajamos el precio un 3% (aceptamos recibir hasta un 3% menos).
 _MARKET_SLIPPAGE = 0.03
 
 # Buffer aplicado al limit_px de las trigger TP para que Hyperliquid
-# acepte la orden (limit_px debe ser "peor" que trigger_px un mínimo).
-# TP long (is_buy=False, sell): limit_px = trigger_px * (1 - buffer) → más bajo
-# TP short (is_buy=True, buy):  limit_px = trigger_px * (1 + buffer) → más alto
+# acepte la orden (limit_px debe ser “peor” que trigger_px un mínimo).
 _TP_LIMIT_BUFFER = 0.001  # 0.1%
 
 # Retries para confirmar posición post-fill (propagación lenta en HL)
@@ -71,11 +67,6 @@ def _norm_coin(symbol: str) -> str:
 class _HLCore:
     """
     Singleton que mantiene UNA instancia de Exchange + Info.
-
-    Exchange.__init__ y Info.__init__ llaman sincrónicamente a /info
-    (meta + spot_meta). Instanciarlos una sola vez y compartirlos entre
-    todos los HLClient evita la ráfaga de requests HTTP en el arranque
-    que provocaba 429 para todos los traders.
     """
 
     _instance: "_HLCore | None" = None
@@ -109,12 +100,12 @@ class _HLCore:
             exchange_wallet    = wallet
             exchange_kwargs    = {}
 
-        # Retry con backoff exponencial para sobrevivir 429 en el arranque
         self.exchange = self._build_exchange_with_retry(exchange_wallet, exchange_kwargs)
         self.info     = self._build_info_with_retry()
 
-        # Cache de szDecimals por coin para evitar llamadas repetidas a meta()
+        # Cache de szDecimals y pxDecimals por coin
         self._sz_decimals_cache: dict[str, int] = {}
+        self._px_decimals_cache: dict[str, int] = {}
 
         logger.info(
             "[HLCore] SDK Exchange+Info inicializados | addr=%s | agente=%s",
@@ -124,7 +115,6 @@ class _HLCore:
 
     @classmethod
     def get(cls) -> "_HLCore":
-        """Retorna (o crea) el singleton."""
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
@@ -179,17 +169,12 @@ class _HLCore:
 class HLClient:
     """
     Cliente ligero por symbol. Comparte Exchange + Info via _HLCore singleton.
-
-    Uso:
-        client = HLClient(symbol="BTC/USDT:USDT")
-        client.place_limit(is_buy=True, sz=0.01, price=40000)
     """
 
     def __init__(self, symbol: str):
         self.symbol = symbol
         self.coin   = _norm_coin(symbol)
         core = _HLCore.get()
-        # Exponer _exchange e _info para compatibilidad con trader.py
         self._exchange     = core.exchange
         self._info         = core.info
         self._account_addr = core.account_addr
@@ -197,37 +182,97 @@ class HLClient:
         self._agent_mode   = core.agent_mode
         self._core         = core
 
-    # ── METADATOS ─────────────────────────────────────────────────────────
+    # ── METADATOS ──────────────────────────────────────────────────────
 
-    def get_sz_decimals(self) -> int:
-        """
-        Devuelve el número de decimales permitidos para el tamaño (sz) de este
-        coin en Hyperliquid. Resultado cacheado en el singleton _HLCore para
-        no repetir la llamada HTTP por cada orden.
-
-        Ejemplos:
-          BTC  → 5 (0.00001)
-          ETH  → 4 (0.0001)
-          DOGE → 0 (enteros)
-          XMR  → 4
-        """
-        cache = self._core._sz_decimals_cache
-        if self.coin in cache:
-            return cache[self.coin]
+    def _get_meta_asset(self) -> dict:
+        """Devuelve el dict de metadatos de este coin desde /info meta."""
         try:
             meta = self._info.meta()
             for asset in meta.get("universe", []):
                 if asset.get("name") == self.coin:
-                    dec = int(asset.get("szDecimals", 4))
-                    cache[self.coin] = dec
-                    return dec
+                    return asset
         except Exception as exc:
-            logger.warning("[%s] No se pudo obtener szDecimals: %s — usando 4", self.coin, exc)
-        # Fallback conservador: 4 decimales
-        cache[self.coin] = 4
-        return 4
+            logger.warning("[%s] No se pudo obtener meta: %s", self.coin, exc)
+        return {}
 
-    # ── ÓRDENES BÁSICAS ─────────────────────────────────────────────────────
+    def get_sz_decimals(self) -> int:
+        """
+        Devuelve el número de decimales permitidos para el tamaño (sz).
+        Cacheado en _HLCore para no repetir la llamada HTTP.
+        """
+        cache = self._core._sz_decimals_cache
+        if self.coin in cache:
+            return cache[self.coin]
+        asset = self._get_meta_asset()
+        dec = int(asset.get("szDecimals", 4))
+        cache[self.coin] = dec
+        logger.debug("[%s] szDecimals=%d", self.coin, dec)
+        return dec
+
+    def get_px_decimals(self) -> int:
+        """
+        Devuelve el número de decimales válidos para precios de este coin.
+
+        Hyperliquid rechaza órdenes con 'Order has invalid price' cuando
+        limit_px o triggerPx tienen más decimales de los permitidos.
+
+        El SDK expone esto en el campo 'maxDecimals' (o 'priceDecimals') del
+        asset en /info meta. Si el campo no existe, inferimos a partir del
+        precio de mercado:
+          precio >= 1000 → 2 decimales
+          precio >= 100  → 3 decimales
+          precio >= 10   → 4 decimales
+          precio >= 1    → 5 decimales
+          precio < 1     → 6 decimales
+        """
+        cache = self._core._px_decimals_cache
+        if self.coin in cache:
+            return cache[self.coin]
+
+        # Intentar leer del meta del SDK (campo 'maxDecimals')
+        asset = self._get_meta_asset()
+        if "maxDecimals" in asset:
+            dec = int(asset["maxDecimals"])
+            cache[self.coin] = dec
+            logger.debug("[%s] pxDecimals=%d (meta.maxDecimals)", self.coin, dec)
+            return dec
+
+        # Fallback: inferir a partir del mid price
+        dec = 5  # valor por defecto conservador
+        try:
+            l2 = self._info.l2_snapshot(self.coin)
+            ask = float(l2["levels"][1][0]["px"])
+            bid = float(l2["levels"][0][0]["px"])
+            mid = (ask + bid) / 2
+            if mid >= 10_000:
+                dec = 1
+            elif mid >= 1_000:
+                dec = 2
+            elif mid >= 100:
+                dec = 3
+            elif mid >= 10:
+                dec = 4
+            elif mid >= 1:
+                dec = 5
+            else:
+                dec = 6
+        except Exception as exc:
+            logger.warning("[%s] No se pudo inferir pxDecimals: %s — usando %d", self.coin, exc, dec)
+
+        cache[self.coin] = dec
+        logger.debug("[%s] pxDecimals=%d (inferido del precio)", self.coin, dec)
+        return dec
+
+    def round_px(self, price: float) -> float:
+        """
+        Redondea un precio al número de decimales válidos para este coin.
+        Usar SIEMPRE antes de enviar limit_px o triggerPx a HL.
+        """
+        dec = self.get_px_decimals()
+        factor = 10 ** dec
+        return math.floor(price * factor) / factor
+
+    # ── ÓRDENES BÁSICAS ─────────────────────────────────────────────────
 
     def place_limit(
         self,
@@ -237,6 +282,7 @@ class HLClient:
         reduce_only: bool = False,
         tif: str = "Gtc",
     ) -> dict:
+        price = self.round_px(price)
         return self._exchange.order(
             name=self.coin,
             is_buy=is_buy,
@@ -255,28 +301,23 @@ class HLClient:
     ) -> dict:
         """
         Orden de mercado compatible con el SDK de Hyperliquid.
-
-        El SDK requiere un limit_px real (no None) incluso para market orders.
-        Si se proporciona ref_price, se calcula un precio límite con slippage
-        del 3% (buy sube, sell baja). Si no se proporciona ref_price, se
-        consulta el mid del orderbook para obtener el precio de referencia.
+        limit_px se calcula con slippage del 3% y se redondea a pxDecimals.
         """
         if ref_price is None or ref_price <= 0:
             try:
                 l2 = self._info.l2_snapshot(self.coin)
-                best_ask = float(l2["levels"][1][0]["px"])  # asks[0]
-                best_bid = float(l2["levels"][0][0]["px"])  # bids[0]
+                best_ask = float(l2["levels"][1][0]["px"])
+                best_bid = float(l2["levels"][0][0]["px"])
                 ref_price = (best_ask + best_bid) / 2
             except Exception:
                 ref_price = 0.0
 
         if ref_price and ref_price > 0:
             if is_buy:
-                slippage_px = round(ref_price * (1 + _MARKET_SLIPPAGE), 6)
+                slippage_px = self.round_px(ref_price * (1 + _MARKET_SLIPPAGE))
             else:
-                slippage_px = round(ref_price * (1 - _MARKET_SLIPPAGE), 6)
+                slippage_px = self.round_px(ref_price * (1 - _MARKET_SLIPPAGE))
         else:
-            # Sin precio de referencia: usar ioc con precio extremo como fallback
             slippage_px = 999_999_999.0 if is_buy else 0.000001
 
         return self._exchange.order(
@@ -299,32 +340,20 @@ class HLClient:
     ) -> dict:
         """
         Coloca una orden Take-Profit trigger.
-
-        Hyperliquid requiere que limit_px sea "peor" que trigger_px:
-          - TP long cerrado con SELL (is_buy=False):
-              trigger_px = precio objetivo ↑
-              limit_px debe ser <= trigger_px  →  trigger_px * (1 - buffer)
-          - TP short cerrado con BUY (is_buy=True):
-              trigger_px = precio objetivo ↓
-              limit_px debe ser >= trigger_px  →  trigger_px * (1 + buffer)
-
-        Si no se pasa limit_px, se calcula automáticamente con _TP_LIMIT_BUFFER.
+        triggerPx y limit_px se redondean a pxDecimals antes de enviar.
         """
-        is_market = limit_px is None
+        trigger_px = self.round_px(trigger_px)
+        is_market  = limit_px is None
+
         if is_market:
-            # Trigger market TP — limit_px igual a trigger (se ignora en market)
             effective_limit_px = trigger_px
         else:
-            effective_limit_px = limit_px
-
-        # Aplicar buffer si es limit TP (no market) para evitar "invalid price"
-        if not is_market:
             if not is_buy:
                 # Cerrando LONG con SELL: limit_px debe ser <= trigger_px
-                effective_limit_px = round(trigger_px * (1 - _TP_LIMIT_BUFFER), 6)
+                effective_limit_px = self.round_px(trigger_px * (1 - _TP_LIMIT_BUFFER))
             else:
                 # Cerrando SHORT con BUY: limit_px debe ser >= trigger_px
-                effective_limit_px = round(trigger_px * (1 + _TP_LIMIT_BUFFER), 6)
+                effective_limit_px = self.round_px(trigger_px * (1 + _TP_LIMIT_BUFFER))
 
         return self._exchange.order(
             name=self.coin,
@@ -347,6 +376,7 @@ class HLClient:
         sz: float,
         trigger_px: float,
     ) -> dict:
+        trigger_px = self.round_px(trigger_px)
         return self._exchange.order(
             name=self.coin,
             is_buy=is_buy,
@@ -363,9 +393,27 @@ class HLClient:
         )
 
     def place_bulk(self, orders: list[dict]) -> dict:
-        return self._exchange.bulk_orders(orders)
+        """
+        Coloca múltiples órdenes en bulk.
+        Redondea triggerPx y limit_px de cada orden antes de enviar.
+        """
+        cleaned = []
+        for o in orders:
+            o = dict(o)  # copia superficial para no mutar el original
+            ot = o.get("order_type", {})
+            if isinstance(ot, dict) and "trigger" in ot:
+                trig = dict(ot["trigger"])
+                if "triggerPx" in trig:
+                    trig["triggerPx"] = self.round_px(float(trig["triggerPx"]))
+                ot = dict(ot)
+                ot["trigger"] = trig
+                o["order_type"] = ot
+            if "limit_px" in o and o["limit_px"] is not None:
+                o["limit_px"] = self.round_px(float(o["limit_px"]))
+            cleaned.append(o)
+        return self._exchange.bulk_orders(cleaned)
 
-    # ── CONSULTAS INFO ─────────────────────────────────────────────────────
+    # ── CONSULTAS INFO ────────────────────────────────────────────────────
 
     def get_user_state(self) -> dict:
         return self._info.user_state(self._account_addr)
@@ -391,12 +439,6 @@ class HLClient:
     def cancel_all_open_tpsl(self) -> list[dict]:
         """
         Cancela todos los trigger orders (TP/SL) abiertos para este coin.
-
-        FIX 4: en lugar de buscar strings en orderType (frágil, depende del
-        idioma y versión del SDK), inspeccionamos el campo 'tpsl' dentro del
-        dict orderType cuando está disponible. Fallback al filtro por string
-        para compatibilidad con versiones antiguas del SDK que devuelven
-        orderType como string.
         """
         orders  = self.get_open_orders()
         results = []
@@ -406,12 +448,10 @@ class HLClient:
             ot = o.get("orderType", "")
             is_tpsl = False
             if isinstance(ot, dict):
-                # SDK v3+: orderType es un dict con clave 'trigger'
-                trigger = ot.get("trigger", {})
+                trigger  = ot.get("trigger", {})
                 tpsl_val = trigger.get("tpsl", "")
-                is_tpsl = tpsl_val in ("tp", "sl")
+                is_tpsl  = tpsl_val in ("tp", "sl")
             elif isinstance(ot, str):
-                # SDK anterior: orderType es string
                 is_tpsl = any(
                     kw in ot
                     for kw in ("Trigger", "Stop", "Take Profit", "trigger", "stop", "tp", "sl")
