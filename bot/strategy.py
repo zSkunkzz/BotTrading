@@ -4,16 +4,22 @@ strategy.py — Lógica de decisión de BotTrading
 
 Flujo y coste IA:
   NONE   (score<5)   → HOLD directo, sin IA
-  EARLY  (score 5-6) → consulta IA si score >= AI_CALL_MIN_SCORE (default 6)
-  NORMAL (score 7)   → confirma con IA
+  EARLY  (score 5)   → consulta IA si score >= AI_CALL_MIN_SCORE (default 6) → normalmente HOLD
+  NORMAL (score 6-7) → confirma con IA
   NORMAL (score >=8) → confirma con IA; si IA dice HOLD y score>=8 → override técnico
   STRONG (score >=9) → entra directo, sin IA (máxima confluencia)
+
+Acciones válidas del bot:
+  BUY   → abre LONG
+  SELL  → abre SHORT
+  HOLD  → no hace nada (CLOSE de la IA se mapea a HOLD si no hay posición abierta)
 
 Variables de entorno:
   MIN_SIGNAL_SCORE   (default: 5)    — mínimo para activar cualquier modo
   MIN_RR_REQUIRED    (default: 1.8)
   SKIP_AI_ON_STRONG  (default: true) — omite IA cuando modo=STRONG
   AI_CALL_MIN_SCORE  (default: 6)    — score mínimo para llamar a la IA
+  AI_HOLD_OVERRIDE_SCORE (default: 8) — score a partir del cual se ignora HOLD de la IA
 """
 
 import logging
@@ -30,10 +36,10 @@ from bot.signal_engine import (
 
 log = logging.getLogger(__name__)
 
-MIN_SIGNAL_SCORE  = int(os.getenv("MIN_SIGNAL_SCORE",  "5"))
-MIN_RR_REQUIRED   = float(os.getenv("MIN_RR_REQUIRED", "1.8"))
-SKIP_AI_ON_STRONG = os.getenv("SKIP_AI_ON_STRONG", "true").lower() != "false"
-AI_CALL_MIN_SCORE = int(os.getenv("AI_CALL_MIN_SCORE", "6"))
+MIN_SIGNAL_SCORE       = int(os.getenv("MIN_SIGNAL_SCORE",       "5"))
+MIN_RR_REQUIRED        = float(os.getenv("MIN_RR_REQUIRED",      "1.8"))
+SKIP_AI_ON_STRONG      = os.getenv("SKIP_AI_ON_STRONG",          "true").lower() != "false"
+AI_CALL_MIN_SCORE      = int(os.getenv("AI_CALL_MIN_SCORE",      "6"))
 AI_HOLD_OVERRIDE_SCORE = int(os.getenv("AI_HOLD_OVERRIDE_SCORE", "8"))
 
 
@@ -65,14 +71,14 @@ async def decide(
         return _result("HOLD", None, False, f"Error en análisis técnico: {e}")
 
     log.info(
-        f"[strategy] {symbol} · score={signal.score}/10 · mode={signal.entry_mode} "
+        f"[strategy] {symbol} · score={signal.score}/{signal.max_score} · mode={signal.entry_mode} "
         f"· {signal.signal} · RR={signal.rr} · lev={signal.suggested_lev}x"
     )
 
     if not signal.is_valid:
         return _result(
             "HOLD", signal, False,
-            f"Sin modo de entrada válido (score={signal.score}/10, mode={signal.entry_mode})"
+            f"Sin modo de entrada válido (score={signal.score}/{signal.max_score}, mode={signal.entry_mode})"
         )
 
     if signal.rr < MIN_RR_REQUIRED:
@@ -89,14 +95,14 @@ async def decide(
         action = "BUY" if signal.signal == "LONG" else "SELL"
         return _result(
             action, signal, False,
-            f"💥 STRONG entry directo · score={signal.score}/10 · lev={signal.suggested_lev}x"
+            f"💥 STRONG entry directo · score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x"
         )
 
     # score demasiado bajo para llamar a la IA
     if signal.score < AI_CALL_MIN_SCORE:
         return _result(
             "HOLD", signal, False,
-            f"⏭️ score={signal.score}/10 < {AI_CALL_MIN_SCORE} → HOLD sin IA"
+            f"⏭️ score={signal.score}/{signal.max_score} < {AI_CALL_MIN_SCORE} → HOLD sin IA"
         )
 
     # EARLY/NORMAL con score >= AI_CALL_MIN_SCORE: confirmar con IA
@@ -109,6 +115,7 @@ async def decide(
         "signal":        signal.signal,
         "entry_mode":    signal.entry_mode,
         "score":         signal.score,
+        "max_score":     signal.max_score,
         "rr":            signal.rr,
         "entry":         signal.entry,
         "sl":            signal.sl,
@@ -130,14 +137,14 @@ async def decide(
         "rsi_15m":       i15.get("rsi_val", 50),
     }
 
-    log.info(f"[strategy] {symbol} 🤖 Consultando IA (score={signal.score}/10, mode={signal.entry_mode})")
+    log.info(f"[strategy] {symbol} 🤖 Consultando IA (score={signal.score}/{signal.max_score}, mode={signal.entry_mode})")
 
     try:
         ai_result = await ai_decide_fn(
             symbol,
-            [],
-            None,
-            None,
+            [],      # trades abiertos (no usados con context_override)
+            None,    # balance (no usado con context_override)
+            None,    # ticker (no usado con context_override)
             signal.suggested_lev,
             context_override=context_override,
         )
@@ -153,7 +160,9 @@ async def decide(
     confidence = ai_result.get("confidence", 0)
     ai_reason  = ai_result.get("reason", ai_result.get("reasoning", ""))
 
-    if action not in ("BUY", "SELL", "HOLD", "CLOSE"):
+    # Normalizar acciones válidas:
+    # CLOSE mapeado a HOLD (no hay posición abierta que cerrar en este punto)
+    if action not in ("BUY", "SELL"):
         action = "HOLD"
 
     # Si la IA dice HOLD pero score técnico es alto → override técnico
@@ -174,7 +183,7 @@ async def decide(
     return _result(
         action, signal, True,
         f"IA confirmó {action} ({confidence}/10) · modo {signal.entry_mode} · "
-        f"score {signal.score}/10 · lev {signal.suggested_lev}x | {ai_reason}",
+        f"score {signal.score}/{signal.max_score} · lev {signal.suggested_lev}x | {ai_reason}",
         ai_confidence=confidence,
         ai_reason=ai_reason,
     )

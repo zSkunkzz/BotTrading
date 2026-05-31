@@ -3,15 +3,22 @@
 signal_engine.py — Motor de análisis técnico multi-timeframe (ASYNC)
 
 Modos de entrada (se exporta entry_mode en SignalResult):
-  EARLY   score 5-6, cualquier alineación de 1h+15m            → lev 5-8x
-  NORMAL  score 6-7, todos los TF alineados                    → lev 8-14x
-  STRONG  score 8+, confluencia máxima                         → lev 14-15x
+  EARLY   score 5,   1h+15m alineados                         → lev 5-8x, size 50%
+  NORMAL  score 6-7, todos los TF alineados                   → lev 8-14x
+  STRONG  score 8+,  confluencia máxima                       → lev 14-15x
+
+Score real máximo:
+  4h: ema_trend, macd, ema200                                  = 3
+  1h: ema_trend, rsi, supertrend                               = 3
+  15m: ema_trend, macd, stoch, volume                          = 4
+  BB bonus (1h+15m alineados)                                  = 1
+  Total                                                        = 11 (capeado a 10)
 
 Compatible con Hyperliquid:
   - ws_feed.get_ohlcv(coin, tf)         coin = "BTC" (sin USDT)
   - ws_feed.get_orderbook_metrics(coin)
   - ws_feed.get_funding_rate(coin)      → None (no disponible en WS; ver REST)
-  - Fallback REST usa trader._info_post candleSnapshot
+  - Fallback REST usa candleSnapshot
 """
 
 from __future__ import annotations
@@ -35,9 +42,11 @@ MIN_SCORE       = int(os.getenv("MIN_SCORE",      "5"))
 MIN_SCORE_FULL  = int(os.getenv("MIN_SCORE_FULL", "6"))
 MIN_RR          = float(os.getenv("MIN_RR",       "1.8"))
 ATR_MULT_SL     = float(os.getenv("ATR_MULT_SL",  "1.8"))
-TP1_MULT        = float(os.getenv("TP1_MULT",     "2.5"))
-TP2_MULT        = float(os.getenv("TP2_MULT",     "4.0"))
-TP3_MULT        = float(os.getenv("TP3_MULT",     "7.0"))
+# TP1_MULT debe ser > ATR_MULT_SL * MIN_RR para que el check de R/R pase.
+# Con ATR_MULT_SL=1.8 y MIN_RR=1.8 necesitamos > 3.24 → default 3.5
+TP1_MULT        = float(os.getenv("TP1_MULT",     "3.5"))   # era 2.5 → RR=1.38 nunca pasaba
+TP2_MULT        = float(os.getenv("TP2_MULT",     "5.0"))   # era 4.0
+TP3_MULT        = float(os.getenv("TP3_MULT",     "8.0"))   # era 7.0
 
 LEV_EARLY_MIN   = 5
 LEV_EARLY_MAX   = 8
@@ -50,6 +59,8 @@ EARLY_SIZE_RATIO = 0.5
 
 OB_IMBALANCE_THRESHOLD    = 0.15
 FUNDING_EXTREME_THRESHOLD = 0.0005
+
+SCORE_MAX = 10  # Cap real de _compute_score
 
 
 def _norm_coin(symbol: str) -> str:
@@ -67,7 +78,7 @@ class SignalResult:
     symbol: str
     signal: str      = "NEUTRAL"
     score: int       = 0
-    max_score: int   = 12
+    max_score: int   = SCORE_MAX   # 10 (consistente con _compute_score)
     entry_mode: str  = "NONE"
     entry: float     = 0.0
     sl: float        = 0.0
@@ -95,7 +106,7 @@ class SignalResult:
 
     def summary(self) -> str:
         if not self.is_valid:
-            return f"{self.symbol} · NEUTRAL · Score {self.score}/12"
+            return f"{self.symbol} · NEUTRAL · Score {self.score}/{self.max_score}"
         em   = f"[{self.entry_mode}]"
         icon = "🟢" if self.signal == "LONG" else "🔴"
         extras = []
@@ -105,7 +116,7 @@ class SignalResult:
             extras.append(f"FR {self.funding_rate*100:+.4f}%")
         extra_str = " · " + " · ".join(extras) if extras else ""
         return (
-            f"{icon} {self.symbol} · {self.signal} {em} · Score {self.score}/12 · "
+            f"{icon} {self.symbol} · {self.signal} {em} · Score {self.score}/{self.max_score} · "
             f"R/R {self.rr:.1f} · Lev {self.suggested_lev}x · "
             f"Entry {self.entry:.4f} · SL {self.sl:.4f} · TP1 {self.tp1:.4f}{extra_str}"
         )
@@ -148,14 +159,13 @@ async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
 
 async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataFrame:
     """
-    Obtiene OHLCV intentando en orden:
+    Obtiene OHLCV en orden:
       1. ws_feed (datos ya cacheados en memoria)
       2. REST Hyperliquid candleSnapshot
-      3. ccxt exchange (si existe y es hiperliquid)
+      3. ccxt exchange (fallback)
     """
     coin = _norm_coin(symbol)
 
-    # 1. WS Feed (rápido, sin coste de red)
     try:
         from bot.ws_feed import ws_feed
         df = ws_feed.get_ohlcv(coin, tf)
@@ -166,16 +176,13 @@ async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataF
     except Exception as e:
         log.debug("[OHLCV] %s %s WS error: %s", coin, tf, e)
 
-    # 2. REST Hyperliquid
     df = await _fetch_ohlcv_hl(coin, tf, limit)
     if not df.empty and len(df) >= 55:
         log.debug("[OHLCV] %s %s ← REST HL (%d velas)", coin, tf, len(df))
         return df
 
-    # 3. Fallback ccxt (si exch está disponible)
     if exch is not None:
         try:
-            # ccxt hyperliquid usa coin directamente como symbol
             raw = await exch.fetch_ohlcv(coin, tf, limit=limit)
             df  = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
@@ -316,6 +323,7 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
 
 
 def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, int, str]:
+    """Score máximo teórico: 11 (capeado a SCORE_MAX=10)."""
     sl = ss = 0
 
     for key in ("ema_trend", "macd", "ema200"):
@@ -334,9 +342,9 @@ def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, int, str]:
     if s15.get("bb", 0) == -1 and s1h.get("bb", 0) == -1: ss += 1
 
     best      = max(sl, ss)
-    score     = min(best, 10)
+    score     = min(best, SCORE_MAX)          # cap consistente con max_score
     direction = "LONG" if sl >= ss else "SHORT"
-    return score, min(sl, 10), direction
+    return score, min(sl, SCORE_MAX), direction
 
 
 def _apply_microstructure(
@@ -366,7 +374,7 @@ def _apply_microstructure(
             if funding_rate < -FUNDING_EXTREME_THRESHOLD: bonus -= 1
             elif funding_rate >  FUNDING_EXTREME_THRESHOLD: bonus += 1
 
-    adjusted = max(0, score + bonus)
+    adjusted = max(0, min(score + bonus, SCORE_MAX))
     return adjusted, ob_imbalance_val, fr_val
 
 
@@ -391,7 +399,10 @@ def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction:
         lev   = round(LEV_NORMAL_MIN + ratio * (LEV_NORMAL_MAX - LEV_NORMAL_MIN))
         return mode, lev, 1.0
 
-    if score == MIN_SCORE and tf1h_aligned > 0 and tf15_aligned > 0:
+    # EARLY: score en el rango [MIN_SCORE, MIN_SCORE_FULL) con alineación 1h+15m
+    # FIX: era "== MIN_SCORE" → si microestructura sube score a MIN_SCORE+1
+    #      antes de llegar a MIN_SCORE_FULL, ese tick se descartaba erróneamente.
+    if MIN_SCORE <= score < MIN_SCORE_FULL and tf1h_aligned > 0 and tf15_aligned > 0:
         quality = extra_1h + extra_15m
         ratio   = min(quality / 6.0, 1.0)
         lev     = round(LEV_EARLY_MIN + ratio * (LEV_EARLY_MAX - LEV_EARLY_MIN))
@@ -448,8 +459,8 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
 
         if mode == "NONE":
             log.info(
-                "[signal_engine] %s descartado — score=%d/12, modo=NONE, dir=%s",
-                coin, score, direction,
+                "[signal_engine] %s descartado — score=%d/%d, modo=NONE, dir=%s",
+                coin, score, SCORE_MAX, direction,
             )
             return result
 
@@ -517,7 +528,7 @@ def _mode_emoji(mode: str) -> str:
 
 def format_signal_block(r: SignalResult) -> str:
     if not r.is_valid:
-        return f"📊 Score técnico: `{r.score}/12` — sin señal clara"
+        return f"📊 Score técnico: `{r.score}/{r.max_score}` — sin señal clara"
 
     i15 = r.indicators.get("15m", {})
     i1h = r.indicators.get("1h",  {})
@@ -539,8 +550,8 @@ def format_signal_block(r: SignalResult) -> str:
         fr_txt = f"\n  Funding {emoji} `{fr_pct:+.4f}%`"
 
     lines = [
-        f"📊 *Análisis técnico* · Score `{r.score}/12` · R/R `{r.rr}:1`",
-        f"{'🟢 LONG' if d == 'LONG' else '🔴 SHORT'} · Modo {me}`{r.entry_mode}` · Lev `{r.suggested_lev}x`{size_txt}",
+        f"📊 *Análisis técnico* · Score `{r.score}/{r.max_score}` · R/R `{r.rr}:1`",
+        f"{'\U0001f7e2 LONG' if d == 'LONG' else '\U0001f534 SHORT'} · Modo {me}`{r.entry_mode}` · Lev `{r.suggested_lev}x`{size_txt}",
         f"",
         f"  Entry `{r.entry}` · SL `{r.sl}` · TP1 `{r.tp1}`",
         f"",
