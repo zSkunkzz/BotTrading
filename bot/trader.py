@@ -153,8 +153,9 @@ def _norm_coin(symbol: str) -> str:
 
 
 class FuturesTrader:
-    def __init__(self, api_key, api_secret, passphrase, symbol,
-                 leverage, margin_mode, dry_run):
+    def __init__(self, api_key, api_secret, symbol,
+                 leverage, margin_mode, dry_run,
+                 passphrase=None):
         self.symbol      = symbol
         self.coin        = _norm_coin(symbol)
         self.leverage    = leverage
