@@ -52,6 +52,10 @@ class PairScanner:
     _last_scored: lista completa de dicts con datos enriquecidos del último scan.
     Utilizada por main.py para pasar datos reales a ai_rank_pairs sin depender
     del stub fetch_ticker que siempre devolvía quoteVolume=0.
+
+    FIX: si prevDayPx es 0 o null (frecuente en el arranque o tras reset de
+    mercado en Hyperliquid), el change_pct se marca como None y el filtro
+    de cambio mínimo se OMITE para ese par — no se penaliza por dato faltante.
     """
 
     def __init__(
@@ -95,39 +99,61 @@ class PairScanner:
         universe = data[0].get("universe", []) if isinstance(data, list) and data else []
         ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
 
+        total_seen = 0
+        skipped_blacklist = 0
+        skipped_volume = 0
+        skipped_change = 0
+
         scored = []
         for i, meta in enumerate(universe):
             coin = meta.get("name", "")
             if not self._is_valid(coin):
+                skipped_blacklist += 1
                 continue
+            total_seen += 1
             ctx = ctxs[i] if i < len(ctxs) else {}
 
             try:
-                day_volume   = float(ctx.get("dayNtlVlm",    0) or 0)
-                mark_px      = float(ctx.get("markPx",       0) or 0)
-                prev_day_px  = float(ctx.get("prevDayPx",    0) or mark_px)
-                funding      = float(ctx.get("funding",      0) or 0)
-                open_interest= float(ctx.get("openInterest", 0) or 0)
+                day_volume    = float(ctx.get("dayNtlVlm",    0) or 0)
+                mark_px       = float(ctx.get("markPx",       0) or 0)
+                prev_day_px_r = ctx.get("prevDayPx")
+                prev_day_px   = float(prev_day_px_r) if prev_day_px_r not in (None, "", "0", 0) else 0.0
+                funding       = float(ctx.get("funding",      0) or 0)
+                open_interest = float(ctx.get("openInterest", 0) or 0)
             except (ValueError, TypeError):
                 continue
 
             if day_volume < self.min_volume_usdt or mark_px <= 0:
+                skipped_volume += 1
                 continue
 
-            change_pct = abs((mark_px - prev_day_px) / prev_day_px * 100) if prev_day_px > 0 else 0.0
-            if change_pct < self.min_price_change_pct:
-                continue
+            # FIX: si prevDayPx no está disponible (0/null), change_pct=None
+            # → omitir el filtro de cambio mínimo (no penalizar por dato faltante).
+            # Esto ocurre frecuentemente en el primer scan tras arranque del bot.
+            if prev_day_px > 0:
+                change_pct: float | None = abs((mark_px - prev_day_px) / prev_day_px * 100)
+                if change_pct < self.min_price_change_pct:
+                    skipped_change += 1
+                    continue
+            else:
+                change_pct = None  # desconocido — no filtrar
 
-            score = (day_volume / 1_000_000) * 0.6 + change_pct * 0.4
+            score_change = change_pct if change_pct is not None else 0.0
+            score = (day_volume / 1_000_000) * 0.6 + score_change * 0.4
             scored.append({
                 "symbol":      coin,
                 "volume_usdt": round(day_volume / 1_000_000, 2),
-                "change_pct":  round(change_pct, 2),
+                "change_pct":  round(change_pct, 2) if change_pct is not None else None,
                 "last_price":  mark_px,
                 "funding":     round(funding * 100, 5),
                 "oi_usdt":     round(open_interest * mark_px / 1_000_000, 2),
                 "score":       round(score, 3),
             })
+
+        logger.debug(
+            "[PairScanner] scan: total=%d | blacklist=%d | vol_filter=%d | change_filter=%d | passed=%d",
+            total_seen, skipped_blacklist, skipped_volume, skipped_change, len(scored),
+        )
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         top = scored[:self.top_n]
@@ -137,9 +163,10 @@ class PairScanner:
 
         logger.info("🏆 Top %d pares Hyperliquid seleccionados:", len(top))
         for p in top[:5]:
+            change_str = f"{p['change_pct']}%" if p["change_pct"] is not None else "N/A"
             logger.info(
-                "  %-12s Vol: $%sM | Cambio: %s%% | Score: %s",
-                p["symbol"], p["volume_usdt"], p["change_pct"], p["score"],
+                "  %-12s Vol: $%sM | Cambio: %s | Score: %s",
+                p["symbol"], p["volume_usdt"], change_str, p["score"],
             )
 
         # NOTA: NO actualizamos self.active_pairs aquí — eso lo hace
