@@ -228,17 +228,45 @@ class FuturesTrader:
         await self._get_ccxt()
         saved = load_position(self.symbol)
         if saved:
-            self.position       = saved["side"]
-            self.entry_price    = saved["entry"]
-            self.sl             = saved.get("sl")
-            self.tp1            = saved.get("tp1")
-            self.tp2            = saved.get("tp2")
-            self.tp3            = saved.get("tp3")
-            self.tp2_hit        = saved.get("tp2_hit", False)
-            self._open_notional = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
-            self._open_leverage = saved.get("leverage", self.leverage)
-            self._protection_ok = True
-            logger.info("[%s] Posicion restaurada: %s @ %s", self.symbol, self.position, self.entry_price)
+            # FIX: verificar en el exchange que la posición guardada realmente existe
+            # antes de restaurarla — evita state mismatch si fue cerrada externamente
+            exchange_pos = await self._get_positions()
+            if exchange_pos is not None and len(exchange_pos) > 0:
+                self.position       = saved["side"]
+                self.entry_price    = saved["entry"]
+                self.sl             = saved.get("sl")
+                self.tp1            = saved.get("tp1")
+                self.tp2            = saved.get("tp2")
+                self.tp3            = saved.get("tp3")
+                self.tp2_hit        = saved.get("tp2_hit", False)
+                self._open_notional = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
+                self._open_leverage = saved.get("leverage", self.leverage)
+                self._protection_ok = True
+                logger.info("[%s] Posicion restaurada: %s @ %s", self.symbol, self.position, self.entry_price)
+            elif exchange_pos is not None and len(exchange_pos) == 0:
+                # Posición guardada pero ya no existe en Hyperliquid — limpiar
+                logger.warning(
+                    "[%s] Posición guardada localmente pero NO existe en exchange — limpiando estado.",
+                    self.symbol,
+                )
+                clear_position(self.symbol)
+            else:
+                # exchange_pos es None → error de red, restaurar con cautela sin _protection_ok
+                logger.warning(
+                    "[%s] No se pudo verificar posición en exchange al arrancar (error de red) — "
+                    "restaurando estado local sin marcar protección OK.",
+                    self.symbol,
+                )
+                self.position       = saved["side"]
+                self.entry_price    = saved["entry"]
+                self.sl             = saved.get("sl")
+                self.tp1            = saved.get("tp1")
+                self.tp2            = saved.get("tp2")
+                self.tp3            = saved.get("tp3")
+                self.tp2_hit        = saved.get("tp2_hit", False)
+                self._open_notional = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
+                self._open_leverage = saved.get("leverage", self.leverage)
+                self._protection_ok = False  # forzar reverificación en próximo ciclo
 
         if not balance_svc.is_ready():
             balance_svc.init_hl(self._master_addr, self._info_post)
@@ -395,12 +423,23 @@ class FuturesTrader:
 
     # ── Posiciones ─────────────────────────────────────────────────────────────
 
-    async def _get_positions(self) -> list:
+    async def _get_positions(self) -> list | None:
+        """
+        Consulta posiciones abiertas en Hyperliquid para este símbolo.
+
+        Retorna:
+          - list[dict]  : lista de posiciones (puede ser vacía si no hay ninguna)
+          - None        : error de red / API — no se pudo determinar el estado real
+
+        IMPORTANTE: retornar None en vez de [] ante errores permite a los llamantes
+        distinguir "sin posición" de "no lo sé", evitando limpiar estado local
+        innecesariamente por un 429 o timeout.
+        """
         try:
             data = await self._info_post({"type": "clearinghouseState", "user": self._account_addr})
             if not data or not isinstance(data, dict):
                 logger.warning("[%s] _get_positions: respuesta vacía o inválida", self.symbol)
-                return []
+                return None  # FIX: None = error, no lista vacía
             positions = []
             for p in data.get("assetPositions", []):
                 pos = p.get("position", {})
@@ -411,7 +450,7 @@ class FuturesTrader:
             return positions
         except Exception as e:
             logger.error("[%s] _get_positions error: %s", self.symbol, e)
-            return []
+            return None  # FIX: None = error de red, no lista vacía
 
     # ── Loop principal ───────────────────────────────────────────────────────────
 
@@ -442,14 +481,21 @@ class FuturesTrader:
 
         now = time.monotonic()
         did_check_exchange = False
-        exchange_positions = []
+        exchange_positions = None  # FIX: None = no consultado aún
         if now - self._last_pos_check_at >= _POS_CHECK_INTERVAL_S:
             exchange_positions      = await self._get_positions()
             self._last_pos_check_at = now
             did_check_exchange      = True
 
         if did_check_exchange:
-            if exchange_positions:
+            if exchange_positions is None:
+                # FIX: error de red — NO tocar el estado local, solo loggear
+                logger.warning(
+                    "[%s] No se pudo verificar posición en exchange (error de red) — "
+                    "manteniendo estado local sin cambios.",
+                    self.symbol,
+                )
+            elif exchange_positions:
                 ep = exchange_positions[0]
                 if self.position is None:
                     raw_side = ep.get("side", "")
@@ -464,6 +510,7 @@ class FuturesTrader:
                         logger.info("[%s] Posición detectada en exchange: %s @ %s",
                                     self.symbol, self.position, self.entry_price)
             else:
+                # exchange_positions == [] → confirmado que NO hay posición abierta
                 if self.position is not None:
                     logger.info("[%s] Posición cerrada externamente.", self.symbol)
                     try:
@@ -556,7 +603,16 @@ class FuturesTrader:
         else:
             result = await self._place_order(side, qty, sl=sl, tp=tp1)
             if result.get("status") != "ok":
+                # FIX: la orden falló — NO actualizar self.position ni guardar estado
+                logger.error(
+                    "[%s] ❌ Orden rechazada por el exchange — NO se registra posición local. "
+                    "Respuesta: %s",
+                    self.symbol, result,
+                )
                 return
+
+            # FIX: verificar fill real consultando el exchange antes de registrar posición
+            fill_price = entry
             try:
                 fill_price = float(
                     result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
@@ -564,6 +620,22 @@ class FuturesTrader:
                 )
             except Exception:
                 fill_price = entry
+
+            # FIX: confirmar en el exchange que la posición realmente se abrió
+            confirmed_positions = await self._get_positions()
+            if confirmed_positions is not None and len(confirmed_positions) == 0:
+                logger.error(
+                    "[%s] ❌ Orden enviada con status=ok pero NO hay posición abierta en Hyperliquid. "
+                    "Posible fill parcial a cero o orden expirada. NO se registra estado local.",
+                    self.symbol,
+                )
+                return
+            if confirmed_positions is None:
+                logger.warning(
+                    "[%s] ⚠️ No se pudo confirmar posición en exchange (error de red) tras apertura. "
+                    "Registrando estado local pero marcando protección pendiente.",
+                    self.symbol,
+                )
 
         if fill_price and fill_price != entry:
             qty = round(notional / fill_price, 6)
@@ -579,7 +651,12 @@ class FuturesTrader:
         self.tp2_hit        = False
         self._open_notional = notional
         self._open_leverage = lev
-        self._protection_ok = False
+        # FIX: _protection_ok = True solo si el exchange confirmó la posición con TP/SL
+        # Si confirmed_positions fue None (error de red), quedará False hasta el próximo
+        # ciclo de verificación, lo cual es correcto y seguro.
+        self._protection_ok = (
+            confirmed_positions is not None and len(confirmed_positions) > 0
+        ) if not self.dry_run else True
         self.trade_count   += 1
 
         save_position(self.symbol, {
@@ -687,6 +764,14 @@ class FuturesTrader:
             return
 
         positions = await self._get_positions()
+        if positions is None:
+            # FIX: error de red — no intentar cerrar, reintentar en próxima iteración
+            logger.warning(
+                "[%s] Cierre por %s: no se pudo verificar posición en exchange (error de red) — "
+                "reintentando en próxima iteración.",
+                self.symbol, close_reason,
+            )
+            return
         if not positions:
             logger.warning("[%s] Cierre por %s: posición no encontrada en exchange (ya cerrada?).",
                            self.symbol, close_reason)
