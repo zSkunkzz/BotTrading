@@ -193,6 +193,13 @@ class FuturesTrader:
         self._ccxt_exchange = None
         self._global_risk   = None
 
+        # ── Guard para evitar órdenes duplicadas ──────────────────────────
+        # Se activa justo ANTES de enviar la orden y se libera al confirmar
+        # la posición (o si la orden falla). Impide que una segunda iteración
+        # del loop entre en el path de apertura mientras la primera orden
+        # aún está siendo confirmada con el exchange.
+        self._opening_position: bool = False
+
         if _DE_AVAILABLE:
             self._decision_engine = _DecisionEngine(symbol)
         else:
@@ -682,6 +689,7 @@ class FuturesTrader:
         self.entry_price = None
         self.sl = self.tp1 = self.tp2 = self.tp3 = None
         self.tp2_hit = False
+        self._opening_position = False  # ← limpiar guard también al cerrar
 
     async def _on_position_closed(self, pnl_pct: float, reason: str = "") -> None:
         """
@@ -730,6 +738,11 @@ class FuturesTrader:
     async def _iteration(self, risk, global_risk):
         if kill_switch.is_halted(self.symbol):
             logger.debug("[%s] Kill switch activo — skip.", self.symbol)
+            return
+
+        # ── Guard anti-duplicado: si ya hay una apertura en curso, skip ──
+        if self._opening_position:
+            logger.debug("[%s] Apertura en curso — skip para evitar orden duplicada.", self.symbol)
             return
 
         try:
@@ -896,72 +909,87 @@ class FuturesTrader:
         assert sl  and sl  > 0, f"[{self.symbol}] SL inválido: {sl}"
         assert tp1 and tp1 > 0, f"[{self.symbol}] TP1 inválido: {tp1}"
 
-        # ── FIX: pasar sl y tp1 para que ExecutionEngine no bloquee la apertura ──
-        order_result = await self._place_order(trade_side_str, qty, sl=sl, tp=tp1)
-        if order_result.get("status") != "ok":
-            logger.error("[%s] ❌ Orden rechazada: %s", self.symbol, order_result)
-            return
+        # ── Activar guard ANTES de enviar la orden ────────────────────────
+        # Impide que el siguiente tick del loop abra una segunda orden
+        # mientras esta está siendo confirmada con el exchange.
+        self._opening_position = True
+        logger.debug("[%s] Guard _opening_position=True", self.symbol)
 
-        positions = await self._confirm_position_with_retry()
-        if positions is None or len(positions) == 0:
-            logger.warning("[%s] Orden ejecutada pero posición no confirmada.", self.symbol)
-            return
+        try:
+            order_result = await self._place_order(trade_side_str, qty, sl=sl, tp=tp1)
+            if order_result.get("status") != "ok":
+                logger.error("[%s] ❌ Orden rechazada: %s", self.symbol, order_result)
+                self._opening_position = False
+                return
 
-        pos_data    = positions[0]
-        fill_entry  = float(pos_data.get("entryPx") or entry)
-        fill_qty    = abs(float(pos_data.get("szi", qty)))
+            positions = await self._confirm_position_with_retry()
+            if positions is None or len(positions) == 0:
+                logger.warning("[%s] Orden ejecutada pero posición no confirmada.", self.symbol)
+                self._opening_position = False
+                return
 
-        self.position       = pos_side
-        self.entry_price    = fill_entry
-        self.sl             = sl
-        self.tp1            = tp1
-        self.tp2            = tp2
-        self.tp3            = tp3
-        self.tp2_hit        = False
-        # ── Guardar margen real y notional por separado ────────────────────
-        self._open_margin   = margin_usdc          # ← MARGEN REAL (usdc_per_trade)
-        self._open_notional = fill_qty * fill_entry # ← notional real post-fill
-        self._open_leverage = lev
-        self._open_entry_mode = entry_mode
+            pos_data    = positions[0]
+            fill_entry  = float(pos_data.get("entryPx") or entry)
+            fill_qty    = abs(float(pos_data.get("szi", qty)))
 
-        save_position(self.symbol, {
-            "side":        pos_side,
-            "entry":       fill_entry,
-            "sl":          sl,
-            "tp1":         tp1,
-            "tp2":         tp2,
-            "tp3":         tp3,
-            "tp2_hit":     False,
-            "leverage":    lev,
-            "usdc_amount": self._open_notional,   # notional (retrocompatibilidad)
-            "margin_usdc": margin_usdc,            # ← NUEVO: margen real
-            "entry_mode":  entry_mode,
-        })
+            self.position       = pos_side
+            self.entry_price    = fill_entry
+            self.sl             = sl
+            self.tp1            = tp1
+            self.tp2            = tp2
+            self.tp3            = tp3
+            self.tp2_hit        = False
+            # ── Guardar margen real y notional por separado ────────────────────
+            self._open_margin   = margin_usdc          # ← MARGEN REAL (usdc_per_trade)
+            self._open_notional = fill_qty * fill_entry # ← notional real post-fill
+            self._open_leverage = lev
+            self._open_entry_mode = entry_mode
 
-        # ── pretrade_risk: confirmar con el MARGEN real ────────────────────
-        pretrade_risk.confirm_order(self.symbol, margin_usdc)
+            save_position(self.symbol, {
+                "side":        pos_side,
+                "entry":       fill_entry,
+                "sl":          sl,
+                "tp1":         tp1,
+                "tp2":         tp2,
+                "tp3":         tp3,
+                "tp2_hit":     False,
+                "leverage":    lev,
+                "usdc_amount": self._open_notional,   # notional (retrocompatibilidad)
+                "margin_usdc": margin_usdc,            # ← NUEVO: margen real
+                "entry_mode":  entry_mode,
+            })
 
-        await self._place_tpsl(qty=fill_qty, sl=sl, tp=tp1, entry_px=fill_entry)
-        self._protection_ok = True
+            # ── pretrade_risk: confirmar con el MARGEN real ────────────────
+            pretrade_risk.confirm_order(self.symbol, margin_usdc)
 
-        # ── FIX: usar 'price' en lugar de 'entry' (nombre correcto del parámetro) ──
-        await notify_open(
-            symbol=self.symbol,
-            side=pos_side,
-            price=fill_entry,      # ← antes era entry=fill_entry → TypeError
-            sl=sl,
-            tp1=tp1,
-            tp2=tp2,
-            usdt=margin_usdc,
-            leverage=lev,
-        )
+            await self._place_tpsl(qty=fill_qty, sl=sl, tp=tp1, entry_px=fill_entry)
+            self._protection_ok = True
 
-        logger.info(
-            "[%s] ✅ Posición abierta | %s @ %.5f | margen=%.2f USDC | "
-            "notional=%.2f USDC | qty=%s | lev=%dx | SL=%.5f | TP1=%.5f",
-            self.symbol, pos_side, fill_entry, margin_usdc,
-            self._open_notional, fill_qty, lev, sl, tp1,
-        )
+            await notify_open(
+                symbol=self.symbol,
+                side=pos_side,
+                price=fill_entry,
+                sl=sl,
+                tp1=tp1,
+                tp2=tp2,
+                usdt=margin_usdc,
+                leverage=lev,
+            )
+
+            logger.info(
+                "[%s] ✅ Posición abierta | %s @ %.5f | margen=%.2f USDC | "
+                "notional=%.2f USDC | qty=%s | lev=%dx | SL=%.5f | TP1=%.5f",
+                self.symbol, pos_side, fill_entry, margin_usdc,
+                self._open_notional, fill_qty, lev, sl, tp1,
+            )
+
+        finally:
+            # El guard se libera en _clear_position_state() al cerrar,
+            # pero si la apertura falla antes de setear self.position,
+            # lo liberamos aquí para no bloquear el loop indefinidamente.
+            if self.position is None:
+                self._opening_position = False
+                logger.debug("[%s] Guard _opening_position liberado (no se abrió posición).", self.symbol)
 
     async def _manage_open_position(self, price: float, risk) -> None:
         if not self.position or not self.entry_price:
