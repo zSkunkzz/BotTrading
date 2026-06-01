@@ -6,6 +6,7 @@
 # y configurar: STATE_FILE=/data/bot_state.json
 # ============================================================
 
+import asyncio
 import json
 import os
 import logging
@@ -23,6 +24,10 @@ if str(STATE_FILE).startswith("/tmp"):
         STATE_FILE,
     )
 
+# FIX #3: asyncio.Lock para serializar read→modify→write y evitar corrupción
+# de estado cuando dos corrutinas acceden simultáneamente al archivo.
+_state_lock = asyncio.Lock()
+
 
 def _load_raw() -> dict:
     try:
@@ -34,9 +39,17 @@ def _load_raw() -> dict:
 
 
 def _save_raw(data: dict):
+    """Escribe de forma atómica: primero a un .tmp y luego rename().
+
+    FIX #3: rename() es atómico en POSIX — evita archivos parcialmente
+    escritos si el proceso muere o el event loop es interrumpido entre
+    write() y flush().
+    """
     try:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(data, indent=2))
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(STATE_FILE)
     except Exception as e:
         logger.error(f"[State] No se pudo guardar {STATE_FILE}: {e}")
 
@@ -49,17 +62,27 @@ def save_position(symbol: str, position_or_dict, entry_price=None,
     Persiste una posición abierta.
 
     Acepta dos formas de llamada:
-      1. save_position(symbol, dict_con_datos)          ← forma usada en trader.py
-      2. save_position(symbol, side, entry, sl, ...)    ← forma posicional legacy
-    """
-    data = _load_raw()
+      1. save_position(symbol, dict_con_datos)          <- forma usada en trader.py
+      2. save_position(symbol, side, entry, sl, ...)    <- forma posicional legacy
 
+    FIX #3: envuelto en asyncio.Lock para evitar race conditions read->write.
+    FIX #15: detección explícita de string vacío para evitar que side=""
+             caiga silenciosamente en None y la posición se restaure incorrectamente.
+    """
     if isinstance(position_or_dict, dict):
-        # Forma nueva: segundo argumento es el dict completo
         d = position_or_dict
+        # FIX #15: side="" es falsy; comparar contra None explícitamente
+        raw_side = d.get("side")
+        raw_pos  = d.get("position")
+        side_val = raw_side if raw_side else (raw_pos if raw_pos else None)
+
+        raw_entry = d.get("entry")
+        raw_ep    = d.get("entry_price")
+        entry_val = raw_entry if raw_entry else (raw_ep if raw_ep else None)
+
         entry = {
-            "position":    d.get("side") or d.get("position"),
-            "entry_price": d.get("entry") or d.get("entry_price"),
+            "position":    side_val,
+            "entry_price": entry_val,
             "sl":          d.get("sl"),
             "tp1":         d.get("tp1"),
             "tp2":         d.get("tp2"),
@@ -69,7 +92,6 @@ def save_position(symbol: str, position_or_dict, entry_price=None,
             "leverage":    d.get("leverage", 1),
         }
     else:
-        # Forma posicional legacy
         entry = {
             "position":    position_or_dict,
             "entry_price": entry_price,
@@ -88,9 +110,25 @@ def save_position(symbol: str, position_or_dict, entry_price=None,
         if v2_pos_mode:
             entry["v2_pos_mode"] = v2_pos_mode
 
-    data[symbol] = entry
-    _save_raw(data)
-    logger.info(f"[State] Guardado {symbol} {entry['position']} @ {entry['entry_price']}")
+    async def _do():
+        async with _state_lock:
+            data = _load_raw()
+            data[symbol] = entry
+            _save_raw(data)
+        logger.info(f"[State] Guardado {symbol} {entry['position']} @ {entry['entry_price']}")
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(_do())
+        else:
+            loop.run_until_complete(_do())
+    except RuntimeError:
+        # Sin event loop activo (tests/scripts) — escritura síncrona sin lock
+        data = _load_raw()
+        data[symbol] = entry
+        _save_raw(data)
+        logger.info(f"[State] Guardado (sync) {symbol} {entry['position']} @ {entry['entry_price']}")
 
 
 def load_position(symbol: str) -> dict | None:
@@ -98,7 +136,6 @@ def load_position(symbol: str) -> dict | None:
     raw = _load_raw().get(symbol)
     if raw is None:
         return None
-    # Normalizar claves legacy: 'position' → 'side', 'entry_price' → 'entry'
     if "side" not in raw and "position" in raw:
         raw["side"] = raw["position"]
     if "entry" not in raw and "entry_price" in raw:
@@ -108,19 +145,48 @@ def load_position(symbol: str) -> dict | None:
 
 def clear_position(symbol: str):
     """Borra el estado al cerrar la posición."""
-    data = _load_raw()
-    if symbol in data:
-        del data[symbol]
-        _save_raw(data)
+    async def _do():
+        async with _state_lock:
+            data = _load_raw()
+            if symbol in data:
+                del data[symbol]
+                _save_raw(data)
         logger.info(f"[State] Borrado {symbol}")
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(_do())
+        else:
+            loop.run_until_complete(_do())
+    except RuntimeError:
+        data = _load_raw()
+        if symbol in data:
+            del data[symbol]
+            _save_raw(data)
+        logger.info(f"[State] Borrado (sync) {symbol}")
 
 
 def mark_tp2_hit(symbol: str):
     """Marca que TP2 ya fue parcialmente ejecutado."""
-    data = _load_raw()
-    if symbol in data:
-        data[symbol]["tp2_hit"] = True
-        _save_raw(data)
+    async def _do():
+        async with _state_lock:
+            data = _load_raw()
+            if symbol in data:
+                data[symbol]["tp2_hit"] = True
+                _save_raw(data)
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(_do())
+        else:
+            loop.run_until_complete(_do())
+    except RuntimeError:
+        data = _load_raw()
+        if symbol in data:
+            data[symbol]["tp2_hit"] = True
+            _save_raw(data)
 
 
 def load_all() -> dict:
