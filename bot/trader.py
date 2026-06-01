@@ -785,11 +785,14 @@ class FuturesTrader:
                            self.symbol, balance, risk.usdc_per_trade)
             return
 
+        # FIX: eliminados kwargs inválidos (price=, sl=, ask=, bid=) — check() no los acepta
         try:
             ok, pt_reason = await pretrade_risk.check(
-                symbol=self.symbol, side="buy",
-                notional=risk.usdc_per_trade, price=price,
-                balance=balance, sl=None, ask=None, bid=None, leverage=1,
+                symbol=self.symbol,
+                side="buy",
+                notional=risk.usdc_per_trade,
+                leverage=1,
+                balance=balance,
             )
             if not ok:
                 logger.debug("[%s] pretrade_risk bloqueó la entrada: %s", self.symbol, pt_reason)
@@ -892,11 +895,14 @@ class FuturesTrader:
         except Exception:
             pass
 
+        # FIX: eliminados kwargs inválidos (price=, sl=, ask=, bid=) — check() no los acepta
         try:
             ok, pt_reason = await pretrade_risk.check(
-                symbol=self.symbol, side=trade_side_str,
-                notional=notional, price=entry, balance=balance,
-                sl=sl, ask=ask, bid=bid, leverage=lev,
+                symbol=self.symbol,
+                side=trade_side_str,
+                notional=notional,
+                leverage=lev,
+                balance=balance,
             )
             if not ok:
                 logger.info("[%s] pretrade_risk bloqueó tras señal: %s", self.symbol, pt_reason)
@@ -983,7 +989,8 @@ class FuturesTrader:
 
         if global_risk:
             await global_risk.register_open()
-        pretrade_risk.confirm_order(self.symbol)
+        # FIX: añadido segundo argumento obligatorio notional_or_margin
+        pretrade_risk.confirm_order(self.symbol, notional)
 
         await notify_open(
             symbol=self.symbol, side=self.position, price=self.entry_price,
