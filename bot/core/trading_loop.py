@@ -23,6 +23,7 @@ import time
 from bot.state import load_position, clear_position
 from bot.balance_service import balance_svc
 from bot.kill_switch import kill_switch
+from bot.signal_cooldown import signal_cooldown
 from bot.core.decision_engine import DecisionEngine
 from bot.core.position_manager import PositionManager
 
@@ -38,12 +39,16 @@ class TradingLoop:
     Orquesta el loop de trading para un símbolo específico.
     Utiliza DecisionEngine para evaluar entradas y PositionManager
     para gestionar posiciones abiertas.
+
+    DecisionEngine y PositionManager están conectados mediante
+    bind_position_manager() para que entry_mode fluya correctamente
+    desde la apertura hasta el cooldown de cierre.
     """
 
     def __init__(self, symbol: str):
         self.symbol           = symbol
-        self._decision_engine = DecisionEngine(symbol)
         self._position_mgr    = PositionManager(symbol)
+        self._decision_engine = DecisionEngine(symbol, position_mgr=self._position_mgr)
         self._last_pos_check_at: float = 0.0
 
     async def run(self, trader, risk, *, global_risk=None) -> None:
@@ -74,6 +79,11 @@ class TradingLoop:
             trader._open_notional = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
             trader._open_leverage = saved.get("leverage", trader.leverage)
             trader._protection_ok = True
+            trader._tp1_be_done   = False
+            # Restaurar entry_mode si fue guardado (compatibilidad futura)
+            entry_mode = saved.get("entry_mode", "")
+            if entry_mode:
+                self._position_mgr.set_entry_mode(entry_mode)
             logger.info(
                 "[%s] Posición restaurada: %s @ %s",
                 self.symbol, trader.position, trader.entry_price,
@@ -105,7 +115,7 @@ class TradingLoop:
         # ── Sincronización periódica con exchange ─────────────────────────────
         now = time.monotonic()
         if now - self._last_pos_check_at >= _POS_CHECK_INTERVAL_S:
-            exchange_positions       = await trader._get_positions()
+            exchange_positions      = await trader._get_positions()
             self._last_pos_check_at = now
 
             if exchange_positions:
@@ -121,8 +131,7 @@ class TradingLoop:
                 if trader.position is not None:
                     logger.info("[%s] Posición cerrada externamente.", self.symbol)
 
-                    # Cancelar trigger orders huérfanos (TP/SL que quedaron activos
-                    # en el exchange tras un cierre externo)
+                    # Cancelar trigger orders huérfanos
                     try:
                         trader._hl_client.cancel_all_open_tpsl()
                         logger.info("[%s] Trigger orders huérfanos cancelados.", self.symbol)
@@ -132,10 +141,19 @@ class TradingLoop:
                             self.symbol, e,
                         )
 
+                    # Cooldown de reapertura tras cierre externo (sin entry_mode conocido)
+                    signal_cooldown.mark_closed(
+                        self.symbol,
+                        entry_mode=self._position_mgr._entry_mode or "NORMAL",
+                        reason="external",
+                    )
+
                     trader.position    = None
                     trader.entry_price = None
                     trader.sl = trader.tp1 = trader.tp2 = trader.tp3 = None
-                    trader.tp2_hit = False
+                    trader.tp2_hit     = False
+                    trader._tp1_be_done = False
+                    self._position_mgr.set_entry_mode("")
                     clear_position(self.symbol)
 
         # ── Gestionar posición abierta o evaluar nueva entrada ────────────────
