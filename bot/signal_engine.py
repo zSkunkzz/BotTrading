@@ -2,21 +2,25 @@
 """
 signal_engine.py — Motor de análisis técnico multi-timeframe (ASYNC)
 
-MEJORAS v3:
+MEJORAS v4:
   #1 Trailing stop → position_manager.py
   #2 Pesos diferenciados por TF/indicador:
        4h: ema_trend=2, macd=1, ema200=1        (total max=4)
        1h: ema_trend=2, rsi=1, supertrend=1     (total max=4)
        15m: ema_trend=1, macd=1, stoch=1, vol=1 (total max=4)
        BB bonus (1h+15m)                        (+1)
+       Structure bonus (BOS+HH/HL via structure_analyzer) (+1/+2)
        Total máximo                             =13 → capeado a 10
   #3 Filtro ADX anti-chop:
        ADX calculado sobre 1h. Si ADX < ADX_MIN_THRESHOLD (default 20) → NEUTRAL
        Desactivar con ADX_FILTER=false en Railway
   #4 Cooldown diferenciado por entry_mode → signal_cooldown.py
   #5 Sesión aiohttp persistente a nivel de módulo: evita crear/destruir
-     ClientSession en cada llamada a _fetch_ohlcv_hl (ahorro ~5-10ms/llamada
-     y evita fuga de descriptores de fichero).
+     ClientSession en cada llamada a _fetch_ohlcv_hl.
+  #6 SL anclado a estructura de mercado (swing low/high + buffer ATR*0.2)
+     en vez de ATR plano. Fallback a ATR plano si no hay swings.
+     Config: SL_STRUCTURE_ENABLED (default true)
+             SL_STRUCTURE_BUFFER_MULT (default 0.2)
 
 Modos de entrada (se exporta entry_mode en SignalResult):
   EARLY   score 5,   1h+15m alineados                         → lev 5-8x, size 50%
@@ -54,14 +58,17 @@ REQUIRE_4H_ALIGNMENT = os.getenv("REQUIRE_4H_ALIGNMENT", "true").lower() != "fal
 
 # #3 Filtro ADX
 ADX_FILTER        = os.getenv("ADX_FILTER",         "true").lower() != "false"
-ADX_MIN_THRESHOLD = float(os.getenv("ADX_MIN_THRESHOLD", "20"))  # < 20 → mercado en chop
+ADX_MIN_THRESHOLD = float(os.getenv("ADX_MIN_THRESHOLD", "20"))
 
-# TP dinámicos: multiplicadores ajustados por ADX (mercado en tendencia fuerte → TPs más ambiciosos)
-# ADX >= ADX_STRONG_THRESHOLD → usar TP_STRONG_MULT_* en vez de los defaults
+# TP dinámicos por ADX fuerte
 ADX_STRONG_THRESHOLD = float(os.getenv("ADX_STRONG_THRESHOLD", "30"))
 TP1_STRONG_MULT      = float(os.getenv("TP1_STRONG_MULT", "4.5"))
 TP2_STRONG_MULT      = float(os.getenv("TP2_STRONG_MULT", "7.0"))
 TP3_STRONG_MULT      = float(os.getenv("TP3_STRONG_MULT", "11.0"))
+
+# #6 SL estructural
+SL_STRUCTURE_ENABLED     = os.getenv("SL_STRUCTURE_ENABLED",     "true").lower() != "false"
+SL_STRUCTURE_BUFFER_MULT = float(os.getenv("SL_STRUCTURE_BUFFER_MULT", "0.2"))
 
 LEV_EARLY_MIN   = 5
 LEV_EARLY_MAX   = 8
@@ -80,14 +87,10 @@ SCORE_MAX = 10
 _OHLCV_SEM = asyncio.Semaphore(4)
 
 # ── Sesión HTTP persistente ────────────────────────────────────────────────────
-# Una única ClientSession por proceso: evita el overhead de crear/destruir la
-# sesión en cada llamada a _fetch_ohlcv_hl y reduce el número de file-descriptors
-# abiertos. Se inicializa de forma lazy la primera vez que se necesita.
 _http_session: Optional["aiohttp.ClientSession"] = None
 
 
 def _get_http_session() -> "aiohttp.ClientSession":
-    """Devuelve la sesión aiohttp del módulo, creándola si aún no existe."""
     global _http_session
     import aiohttp
     if _http_session is None or _http_session.closed:
@@ -96,7 +99,6 @@ def _get_http_session() -> "aiohttp.ClientSession":
 
 
 async def close_http_session() -> None:
-    """Cerrar la sesión al apagar el bot (llamar desde main.py en el shutdown)."""
     global _http_session
     if _http_session and not _http_session.closed:
         await _http_session.close()
@@ -137,6 +139,7 @@ class SignalResult:
     ob_imbalance: Optional[float]  = None
     funding_rate: Optional[float]  = None
     error: Optional[str] = None
+    sl_source: str = "atr"  # 'structure' | 'atr' — para logging/debug
 
     @property
     def is_valid(self) -> bool:
@@ -163,7 +166,7 @@ class SignalResult:
         return (
             f"{icon} {self.symbol} · {self.signal} {em} · Score {self.score}/{self.max_score} · "
             f"R/R {self.rr:.1f} · Lev {self.suggested_lev}x · "
-            f"Entry {self.entry:.4f} · SL {self.sl:.4f} · TP1 {self.tp1:.4f}{extra_str}"
+            f"Entry {self.entry:.4f} · SL {self.sl:.4f} [{self.sl_source}] · TP1 {self.tp1:.4f}{extra_str}"
         )
 
 
@@ -288,13 +291,6 @@ def _supertrend_dir(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> in
 
 
 def _calc_adx(df: pd.DataFrame, period: int = 14) -> float:
-    """
-    Calcula ADX sobre un DataFrame OHLCV.
-    Retorna el valor ADX actual (última vela) o 0.0 si falla.
-    ADX < 20 → mercado en rango/chop → no tendencia.
-    ADX 20-30 → tendencia moderada.
-    ADX > 30 → tendencia fuerte.
-    """
     try:
         if ta_lib is None or len(df) < period * 2:
             return 0.0
@@ -397,30 +393,30 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
 
 def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, str]:
     """
-    #2 Pesos diferenciados por TF:
+    Pesos diferenciados por TF:
       4h: ema_trend×2, macd×1, ema200×1  → max 4
       1h: ema_trend×2, rsi×1, supertrend×1 → max 4
       15m: ema_trend×1, macd×1, stoch×1, volume×1 → max 4
       BB bonus (1h+15m) → +1
-      Total → capeado a 10
+      Total → capeado a 10 (structure bonus se añade en analyze_pair)
     """
     sl = ss = 0
 
-    # 4h — ema_trend pesa doble
+    # 4h
     sl += max(0,  s4h.get("ema_trend", 0)) * 2
     ss += max(0, -s4h.get("ema_trend", 0)) * 2
     for key in ("macd", "ema200"):
         sl += max(0,  s4h.get(key, 0))
         ss += max(0, -s4h.get(key, 0))
 
-    # 1h — ema_trend pesa doble
+    # 1h
     sl += max(0,  s1h.get("ema_trend", 0)) * 2
     ss += max(0, -s1h.get("ema_trend", 0)) * 2
     for key in ("rsi", "supertrend"):
         sl += max(0,  s1h.get(key, 0))
         ss += max(0, -s1h.get(key, 0))
 
-    # 15m — todos pesan 1 (ruidosos, no merecen más)
+    # 15m
     for key in ("ema_trend", "macd", "stoch", "volume"):
         sl += max(0,  s15.get(key, 0))
         ss += max(0, -s15.get(key, 0))
@@ -435,11 +431,75 @@ def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, str]:
     return score, direction
 
 
+def _calc_structural_sl(
+    df1h: pd.DataFrame,
+    entry: float,
+    direction: str,
+    atr: float,
+) -> tuple[float, str]:
+    """
+    Calcula el SL anclado al swing low/high más cercano.
+
+    Lógica:
+      LONG:  SL = swing_low más alto que sea < entry, con buffer -ATR*MULT
+             Si ningún swing está < entry → fallback ATR plano
+      SHORT: SL = swing_high más bajo que sea > entry, con buffer +ATR*MULT
+             Si ningún swing está > entry → fallback ATR plano
+
+    Returns:
+        (sl_price, source) donde source es 'structure' o 'atr'
+    """
+    if not SL_STRUCTURE_ENABLED or df1h.empty or len(df1h) < 15:
+        sl_atr = entry - atr * ATR_MULT_SL if direction == "LONG" else entry + atr * ATR_MULT_SL
+        return sl_atr, "atr"
+
+    try:
+        from bot.structure_analyzer import _find_swings, STRUCTURE_SWING_N
+        swing_highs, swing_lows = _find_swings(df1h, STRUCTURE_SWING_N)
+        buffer = atr * SL_STRUCTURE_BUFFER_MULT
+
+        if direction == "LONG" and swing_lows:
+            # Swing lows por debajo del entry, tomar el más alto (el más cercano)
+            candidates = [sl for _, sl in swing_lows if sl < entry]
+            if candidates:
+                nearest_low = max(candidates)
+                sl_struct = nearest_low - buffer
+                # Validar que el SL estructural no sea demasiado lejos (> 3x ATR)
+                max_sl_dist = atr * ATR_MULT_SL * 2.0
+                if entry - sl_struct <= max_sl_dist:
+                    log.debug(
+                        "[SL] %s LONG SL estructural=%.4f (swing_low=%.4f, buffer=%.4f)",
+                        "", sl_struct, nearest_low, buffer,
+                    )
+                    return sl_struct, "structure"
+
+        elif direction == "SHORT" and swing_highs:
+            # Swing highs por encima del entry, tomar el más bajo (el más cercano)
+            candidates = [sh for _, sh in swing_highs if sh > entry]
+            if candidates:
+                nearest_high = min(candidates)
+                sl_struct = nearest_high + buffer
+                max_sl_dist = atr * ATR_MULT_SL * 2.0
+                if sl_struct - entry <= max_sl_dist:
+                    log.debug(
+                        "[SL] %s SHORT SL estructural=%.4f (swing_high=%.4f, buffer=%.4f)",
+                        "", sl_struct, nearest_high, buffer,
+                    )
+                    return sl_struct, "structure"
+
+    except Exception as e:
+        log.debug("[SL] _calc_structural_sl error: %s", e)
+
+    # Fallback
+    sl_atr = entry - atr * ATR_MULT_SL if direction == "LONG" else entry + atr * ATR_MULT_SL
+    return sl_atr, "atr"
+
+
 def _apply_microstructure(
     score: int,
     direction: str,
-    ob_metrics: Optional[dict],
-    funding_rate: Optional[float],
+    ob_metrics,
+    funding_rate,
 ) -> tuple[int, Optional[float], Optional[float]]:
     ob_imbalance_val = None
     fr_val           = None
@@ -469,7 +529,6 @@ def _apply_microstructure(
 def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction: str) -> tuple[str, int, float]:
     sign = 1 if direction == "LONG" else -1
 
-    # Gate 4h obligatorio
     if REQUIRE_4H_ALIGNMENT:
         tf4h_trend = s4h.get("ema_trend", 0)
         if tf4h_trend * sign < 0:
@@ -521,7 +580,7 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         s1h = _analyze_tf(df1h) if not df1h.empty else {}
         s4h = _analyze_tf(df4h) if not df4h.empty else {}
 
-        # #3 Filtro ADX anti-chop (calculado en 1h, más estable que 15m)
+        # Filtro ADX
         adx_df  = df1h if (not df1h.empty and len(df1h) >= 28) else df15
         adx_val = _calc_adx(adx_df)
         result.adx = adx_val
@@ -545,6 +604,25 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
 
         score_base, direction = _compute_score(s4h, s1h, s15)
 
+        # ── #6 Structure bonus (BOS + HH/HL) ──────────────────────────────
+        struct_result = {"score": 0, "bos": False, "hh_hl": 0, "last_sh": 0.0, "last_sl": 0.0}
+        try:
+            from bot.structure_analyzer import analyze_structure
+            struct_df = df1h if (not df1h.empty and len(df1h) >= 20) else df15
+            dir_int   = 1 if direction == "LONG" else -1
+            struct_result = analyze_structure(struct_df, direction=dir_int)
+            struct_bonus  = struct_result.get("score", 0)
+            if struct_bonus != 0:
+                log.debug(
+                    "[signal_engine] %s structure bonus=%d (BOS=%s, HH/HL=%d)",
+                    coin, struct_bonus, struct_result.get("bos"), struct_result.get("hh_hl"),
+                )
+        except Exception as e:
+            struct_bonus = 0
+            log.debug("[signal_engine] structure_analyzer error: %s", e)
+
+        result.indicators["structure"] = struct_result
+
         ob_metrics   = None
         funding_rate = None
         try:
@@ -554,8 +632,9 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         except Exception as e:
             log.debug("[signal_engine] microestructura no disponible: %s", e)
 
+        score_with_struct = min(score_base + struct_bonus, SCORE_MAX)
         score, ob_imbalance_val, fr_val = _apply_microstructure(
-            score_base, direction, ob_metrics, funding_rate
+            score_with_struct, direction, ob_metrics, funding_rate
         )
         result.score        = score
         result.ob_imbalance = ob_imbalance_val
@@ -570,7 +649,7 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
             )
             return result
 
-        # ATR sobre 1h (más estable)
+        # ATR sobre 1h
         atr_df = df1h if (not df1h.empty and len(df1h) >= 20) else df15
         try:
             atr_s = ta_lib.volatility.AverageTrueRange(
@@ -582,22 +661,29 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
 
         result.atr = round(atr, 8)
         entry = float(df15["close"].iloc[-1])
-        risk  = atr * ATR_MULT_SL
 
-        # #6 TP dinámicos: si ADX fuerte → TPs más ambiciosos
+        # ── #6 SL estructural (ancla a swing, fallback ATR) ────────────────
+        sl, sl_source = _calc_structural_sl(df1h, entry, direction, atr)
+        result.sl_source = sl_source
+        risk = abs(entry - sl)  # distancia real entry→SL (cualquier fuente)
+
+        if risk <= 0:
+            # Fallback defensivo
+            risk = atr * ATR_MULT_SL
+            sl   = entry - risk if direction == "LONG" else entry + risk
+            result.sl_source = "atr_fallback"
+
+        # TP dinámicos por ADX
         if adx_val >= ADX_STRONG_THRESHOLD:
             tp1_m, tp2_m, tp3_m = TP1_STRONG_MULT, TP2_STRONG_MULT, TP3_STRONG_MULT
-            log.debug("[signal_engine] %s ADX=%.1f ≥ %.0f → TPs ampliados", coin, adx_val, ADX_STRONG_THRESHOLD)
         else:
             tp1_m, tp2_m, tp3_m = TP1_MULT, TP2_MULT, TP3_MULT
 
         if direction == "LONG":
-            sl  = entry - risk
             tp1 = entry + risk * tp1_m
             tp2 = entry + risk * tp2_m
             tp3 = entry + risk * tp3_m
         else:
-            sl  = entry + risk
             tp1 = entry - risk * tp1_m
             tp2 = entry - risk * tp2_m
             tp3 = entry - risk * tp3_m
@@ -607,8 +693,8 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
 
         if rr < MIN_RR:
             log.info(
-                "[signal_engine] %s descartado — R/R %.2f < %.1f (score=%d, modo=%s)",
-                coin, rr, MIN_RR, score, mode,
+                "[signal_engine] %s descartado — R/R %.2f < %.1f (score=%d, modo=%s, sl_src=%s)",
+                coin, rr, MIN_RR, score, mode, sl_source,
             )
             return result
 
@@ -649,6 +735,7 @@ def format_signal_block(r: SignalResult) -> str:
     i15 = r.indicators.get("15m", {})
     i1h = r.indicators.get("1h",  {})
     i4h = r.indicators.get("4h",  {})
+    ist = r.indicators.get("structure", {})
     d   = r.signal
     me  = _mode_emoji(r.entry_mode)
 
@@ -667,11 +754,21 @@ def format_signal_block(r: SignalResult) -> str:
         emoji  = "🔥" if abs(fr_pct) > 0.05 else "⚪"
         fr_txt = f"\n  Funding {emoji} `{fr_pct:+.4f}%`"
 
+    sl_src_icon = "🏗" if r.sl_source == "structure" else "📐"
+    struct_txt = ""
+    if ist:
+        bos_txt = "✅ BOS" if ist.get("bos") else ""
+        hhhl    = ist.get("hh_hl", 0)
+        hhhl_txt = "HH/HL" if hhhl == 1 else ("LH/LL" if hhhl == -1 else "")
+        parts = [x for x in [bos_txt, hhhl_txt] if x]
+        if parts:
+            struct_txt = f"\n  Estructura {' · '.join(parts)}"
+
     lines = [
         f"📊 *Análisis técnico* · Score `{r.score}/{r.max_score}` · R/R `{r.rr}:1`{adx_txt}",
         f"{'🟢 LONG' if d == 'LONG' else '🔴 SHORT'} · Modo {me}`{r.entry_mode}` · Lev `{r.suggested_lev}x`{size_txt}",
         f"",
-        f"  Entry `{r.entry}` · SL `{r.sl}` · TP1 `{r.tp1}`",
+        f"  Entry `{r.entry}` · SL {sl_src_icon}`{r.sl}` · TP1 `{r.tp1}`",
         f"",
         f"  `4h·1h·15m`",
         f"  EMA   {_ei(i4h.get('ema_trend',0))}·{_ei(i1h.get('ema_trend',0))}·{_ei(i15.get('ema_trend',0))}",
@@ -680,4 +777,4 @@ def format_signal_block(r: SignalResult) -> str:
         f"  ST    {_ei(i4h.get('supertrend',0))}·{_ei(i1h.get('supertrend',0))}·{_ei(i15.get('supertrend',0))}",
         f"  Vol   {_ei(i15.get('volume',0))} ×{i15.get('vol_ratio',1.0)}",
     ]
-    return "\n".join(lines) + ob_txt + fr_txt
+    return "\n".join(lines) + ob_txt + fr_txt + struct_txt
