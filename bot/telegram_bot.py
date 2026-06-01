@@ -1,6 +1,7 @@
+import asyncio
 import logging
 import os
-from telegram import Bot
+from telegram import Bot, Update
 from telegram.error import TelegramError
 
 logger = logging.getLogger("TelegramBot")
@@ -143,5 +144,162 @@ async def notify_kill_switch(level: int, trigger: str):
         f"\U0001f6d1 <b>KILL SWITCH ACTIVADO</b>\n"
         f"Nivel: <b>{label}</b>\n"
         f"Trigger: <code>{_esc(trigger[:300])}</code>\n"
-        f"{'\\u26a0\\ufe0f RE-ARM MANUAL requerido' if level >= 3 else '\\u2705 Se puede resetear automáticamente'}"
+        f"{'⚠️ RE-ARM MANUAL requerido' if level >= 3 else '✅ Se puede resetear automáticamente'}"
     )
+
+
+# ── Comandos Telegram (polling ligero, sin Application) ───────────────────────
+
+_ALLOWED_CHAT: str = ""   # se rellena en setup_telegram_commands()
+
+
+async def _handle_update(update: Update) -> None:
+    """Despacha un update entrante al handler correcto."""
+    msg = update.message
+    if not msg or not msg.text:
+        return
+
+    # Seguridad: solo responder al chat autorizado
+    if _ALLOWED_CHAT and str(msg.chat_id) != _ALLOWED_CHAT:
+        logger.warning("[Telegram] Mensaje ignorado de chat no autorizado: %s", msg.chat_id)
+        return
+
+    text = msg.text.strip()
+    if text.startswith("/resetks"):
+        parts = text.split()
+        args  = parts[1:]
+        await _cmd_resetks(msg.chat_id, args)
+    elif text.startswith("/ksstatus"):
+        await _cmd_resetks(msg.chat_id, ["status"])
+
+
+async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
+    """
+    Lógica del comando /resetks.
+
+    /resetks status           → estado actual del KS
+    /resetks <clave>          → re-arm completo (cualquier nivel)
+    /resetks <clave> daily    → solo resetear contadores diarios
+    """
+    from bot.kill_switch import kill_switch  # diferida para evitar circular
+
+    bot = _get_bot()
+    if not bot:
+        return
+
+    async def reply(text: str):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        except TelegramError as e:
+            logger.warning("[Telegram cmd_resetks] %s", e)
+
+    # ── /resetks  o  /resetks status ────────────────────────────────
+    if not args or args[0].lower() == "status":
+        lvl     = kill_switch.level()
+        trigger = kill_switch._trigger or "—"
+        halted  = ", ".join(kill_switch._halted_symbols) or "ninguno"
+        hard    = "SÍ 💀" if kill_switch.is_hard_killed() else "no"
+        daily   = kill_switch._daily_pnl
+        consec  = kill_switch._consec_losses
+        await reply(
+            f"🛑 <b>Kill Switch — Estado actual</b>\n"
+            f"Nivel: <b>L{lvl}</b> {'✅ OK' if lvl == 0 else '⚠️ ACTIVO'}\n"
+            f"Trigger: <code>{_esc(trigger[:200])}</code>\n"
+            f"Hard killed: {hard}\n"
+            f"Símbolos pausados: <code>{_esc(halted)}</code>\n"
+            f"PnL diario acum: <code>{daily:+.2f}%</code>\n"
+            f"Pérdidas consecutivas: <code>{consec}</code>"
+        )
+        return
+
+    key        = args[0]
+    daily_only = len(args) >= 2 and args[1].lower() == "daily"
+
+    # ── /resetks <clave> daily ───────────────────────────────────────
+    if daily_only:
+        if key != os.getenv("KILL_SWITCH_REARM_KEY", "REARM-BOTTRADING"):
+            await reply("🚫 <b>Clave incorrecta.</b> Kill switch sin cambios.")
+            return
+        kill_switch.reset_daily_pnl()
+        await reply(
+            "✅ <b>Contadores diarios reseteados</b>\n"
+            "PnL diario, pérdidas consecutivas y reconexiones API → 0\n"
+            "El <b>nivel del KS no ha cambiado</b>."
+        )
+        return
+
+    # ── /resetks <clave>  →  re-arm completo ────────────────────────
+    ok = await kill_switch.manual_reset(key)
+    if ok:
+        await reply(
+            "✅ <b>Kill Switch RE-ARMADO</b>\n"
+            "Nivel: <b>L0 — OK</b>\n"
+            "Todos los contadores y flags reseteados.\n"
+            "El bot puede volver a abrir posiciones."
+        )
+        # Notificar también en el canal de alertas
+        await _send(
+            "🔓 <b>Kill Switch re-armado manualmente</b> vía Telegram.\n"
+            "Bot vuelve a estar operativo."
+        )
+    else:
+        await reply(
+            "🚫 <b>Clave incorrecta.</b>\n"
+            "El kill switch sigue activo."
+        )
+
+
+async def _polling_loop() -> None:
+    """
+    Loop de long-polling ligero usando Bot.get_updates directamente.
+    Corre como asyncio.Task; se cancela con el resto del programa.
+    Compatible con el Bot directo ya existente — no necesita Application.
+    """
+    bot = _get_bot()
+    if not bot:
+        logger.info("[Telegram polling] Sin token — comandos desactivados.")
+        return
+
+    offset: int | None = None
+    logger.info("[Telegram polling] Iniciado — escuchando /resetks y /ksstatus")
+
+    while True:
+        try:
+            updates = await bot.get_updates(
+                offset=offset,
+                timeout=30,
+                allowed_updates=["message"],
+            )
+            for upd in updates:
+                offset = upd.update_id + 1
+                try:
+                    await _handle_update(upd)
+                except Exception as e:
+                    logger.warning("[Telegram polling] Error en handler: %s", e)
+        except asyncio.CancelledError:
+            logger.info("[Telegram polling] Cancelado.")
+            break
+        except TelegramError as e:
+            logger.warning("[Telegram polling] %s — reintentando en 10 s", e)
+            await asyncio.sleep(10)
+        except Exception as e:
+            logger.error("[Telegram polling] Error inesperado: %s", e)
+            await asyncio.sleep(10)
+
+
+def setup_telegram_commands() -> asyncio.Task | None:
+    """
+    Lanza el loop de polling como asyncio.Task.
+    Llamar desde main() DESPUÉS de que el event loop esté corriendo.
+
+    Retorna la Task (para cancelarla al shutdown) o None si no hay token.
+    """
+    global _ALLOWED_CHAT
+    _ALLOWED_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    token = os.getenv("TELEGRAM_TOKEN", "")
+    if not token:
+        logger.info("[Telegram] Sin TELEGRAM_TOKEN — comandos no disponibles.")
+        return None
+
+    return asyncio.create_task(_polling_loop(), name="telegram_polling")
