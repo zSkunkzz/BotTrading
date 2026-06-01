@@ -3,10 +3,12 @@ decision_engine.py — Toma de decisiones de trading.
 
 Responsabilidades:
   - Obtener precio y OHLCV
-  - Verificar balance y risk pre-trade
+  - Verificar cooldown de reapertura (signal_cooldown)
+  - Verificar balance y risk pre-trade (pretrade_risk con firma correcta)
   - Llamar a decide() + ai_decide()
   - Calcular qty y apalancamiento
   - Abrir posición y persistir estado
+  - Registrar exposición en pretrade_risk tras fill confirmado
   - Notificar apertura via Telegram
 
 Extraído de FuturesTrader._iteration en trader.py.
@@ -14,7 +16,6 @@ Extraído de FuturesTrader._iteration en trader.py.
 from __future__ import annotations
 
 import logging
-import math
 import os
 
 from bot.strategy import decide
@@ -24,6 +25,7 @@ from bot.state import save_position
 from bot.balance_service import balance_svc
 from bot.pretrade_risk import pretrade_risk
 from bot.kill_switch import kill_switch
+from bot.signal_cooldown import signal_cooldown
 
 logger = logging.getLogger("DecisionEngine")
 
@@ -34,8 +36,14 @@ class DecisionEngine:
     Recibe el trader como contexto para acceder a precio, OHLCV y órdenes.
     """
 
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str, position_mgr=None):
         self.symbol = symbol
+        # Referencia al PositionManager para comunicar entry_mode al cooldown
+        self._position_mgr = position_mgr
+
+    def bind_position_manager(self, pm) -> None:
+        """Conecta el PositionManager para que reciba entry_mode al abrir."""
+        self._position_mgr = pm
 
     async def evaluate(
         self,
@@ -49,6 +57,14 @@ class DecisionEngine:
         """
         if kill_switch.is_halted(self.symbol):
             logger.debug("[%s] Kill switch activo — skip.", self.symbol)
+            return
+
+        # ── #4 Cooldown de reapertura ─────────────────────────────────────────
+        if signal_cooldown.is_blocked(self.symbol):
+            remaining = signal_cooldown.remaining(self.symbol)
+            logger.debug(
+                "[%s] Cooldown activo — %.0fs restantes.", self.symbol, remaining
+            )
             return
 
         # ── Verificaciones previas ────────────────────────────────────────────
@@ -66,14 +82,7 @@ class DecisionEngine:
             )
             return
 
-        try:
-            if not await pretrade_risk.check(self.symbol, risk, balance or 0.0):
-                logger.debug("[%s] pretrade_risk bloqueó la entrada.", self.symbol)
-                return
-        except Exception as e:
-            logger.debug("[%s] pretrade_risk error (ignorando): %s", self.symbol, e)
-
-        # ── Señal de estrategia ───────────────────────────────────────────────
+        # ── Señal de estrategia (necesitamos precio y señal antes del check) ──
         try:
             exch     = await trader._get_ccxt()
             decision = await decide(
@@ -100,29 +109,51 @@ class DecisionEngine:
             return
 
         if signal:
-            entry = signal.entry or price
-            sl    = signal.sl
-            tp1   = signal.tp1
-            tp2   = signal.tp2
-            tp3   = getattr(signal, "tp3", None)
-            lev   = signal.suggested_lev or trader.leverage
+            entry      = signal.entry or price
+            sl         = signal.sl
+            tp1        = signal.tp1
+            tp2        = signal.tp2
+            tp3        = getattr(signal, "tp3", None)
+            lev        = signal.suggested_lev or trader.leverage
+            entry_mode = getattr(signal, "entry_mode", "") or ""
         else:
-            entry = price
+            entry      = price
             sl = tp1 = tp2 = tp3 = None
-            lev = trader.leverage
+            lev        = trader.leverage
+            entry_mode = ""
 
         lev = min(int(lev), trader.leverage)
         if lev != trader.leverage:
             await trader._set_leverage(lev)
 
         notional = risk.usdc_per_trade * lev
+        side     = "buy" if action == "BUY" else "sell"
+
+        # ── pretrade_risk.check() con firma correcta ──────────────────────────
+        # La firma es: check(symbol, side, notional, price, balance, sl, leverage)
+        # Devuelve tuple (ok: bool, reason: str) — NO es un bool directo.
+        try:
+            ok, reason = await pretrade_risk.check(
+                symbol=self.symbol,
+                side=side,
+                notional=notional,
+                price=entry,
+                balance=balance,
+                sl=sl,
+                leverage=lev,
+            )
+            if not ok:
+                logger.debug("[%s] pretrade_risk bloqueó la entrada: %s", self.symbol, reason)
+                return
+        except Exception as e:
+            logger.warning("[%s] pretrade_risk.check() error: %s — continuando", self.symbol, e)
+
         # FIX: respetar szDecimals del coin — usar _round_qty del trader
         qty = trader._round_qty(notional / entry)
         if qty <= 0:
-            logger.warning("[%s] qty calculada <= 0 tras redondeo szDecimals, skip.", self.symbol)
+            logger.warning("[%s] qty <= 0 tras redondeo szDecimals, skip.", self.symbol)
             return
 
-        side = "buy" if action == "BUY" else "sell"
         logger.info(
             "[%s] 📈 Abriendo %s · qty=%s · entry=~%s · sl=%s · tp1=%s | %s",
             self.symbol, action, qty, round(entry, 4),
@@ -140,6 +171,9 @@ class DecisionEngine:
 
         if result.get("status") != "ok":
             return
+
+        # ── pretrade_risk: registrar exposición tras fill confirmado ──────────
+        pretrade_risk.confirm_order(self.symbol, notional)
 
         try:
             fill_price = float(
@@ -165,10 +199,15 @@ class DecisionEngine:
         trader.tp2            = tp2
         trader.tp3            = tp3
         trader.tp2_hit        = False
+        trader._tp1_be_done   = False
         trader._open_notional = notional
         trader._open_leverage = lev
         trader._protection_ok = False
         trader.trade_count   += 1
+
+        # Comunicar entry_mode al PositionManager para cooldown correcto al cerrar
+        if self._position_mgr is not None:
+            self._position_mgr.set_entry_mode(entry_mode)
 
         save_position(self.symbol, {
             "side":        trader.position,

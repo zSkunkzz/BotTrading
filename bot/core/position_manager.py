@@ -2,12 +2,14 @@
 position_manager.py — Gestión de posición abierta.
 
 Responsabilidades:
-  - Detectar TP2 parcial
+  - Detectar TP1 y hacer SL → breakeven (#1)
+  - Detectar TP2 parcial y hacer SL → TP1 (#1)
   - Calcular y actualizar trailing stop
   - Evaluar SL / TP1 / TP3 y emitir señal de cierre
   - Persistir y limpiar estado de posición
   - Notificar cierres y TP parciales via Telegram
   - Cancelar trigger orders huérfanos tras cierre/parcial
+  - Llamar signal_cooldown.mark_closed() al cerrar (#4)
 
 Extraído de FuturesTrader._manage_open_position en trader.py.
 """
@@ -20,6 +22,8 @@ from typing import Optional
 
 from bot.state import save_position, clear_position, mark_tp2_hit
 from bot.telegram_bot import notify_close, notify_tp_partial
+from bot.signal_cooldown import signal_cooldown
+from bot.pretrade_risk import pretrade_risk
 
 logger = logging.getLogger("PositionManager")
 
@@ -35,6 +39,12 @@ class PositionManager:
 
     def __init__(self, symbol: str):
         self.symbol = symbol
+        # entry_mode de la posición activa (guardado al abrir, usado en cooldown)
+        self._entry_mode: str = ""
+
+    def set_entry_mode(self, mode: str) -> None:
+        """Llamar desde DecisionEngine al abrir posición."""
+        self._entry_mode = (mode or "").upper()
 
     async def manage(
         self,
@@ -54,6 +64,58 @@ class PositionManager:
             (price - trader.entry_price) / trader.entry_price
         ) * (1 if is_long else -1) * 100
 
+        # ── #1 Breakeven en TP1 ───────────────────────────────────────────────
+        # Cuando el precio toca TP1 por primera vez, el SL sube a entry_price
+        # (breakeven). Solo si TP2 existe (hay recorrido mayor al que apuntar).
+        if (
+            trader.tp1
+            and trader.tp2
+            and not getattr(trader, "_tp1_be_done", False)
+            and trader.sl is not None
+            and trader.entry_price is not None
+        ):
+            tp1_hit_be = (
+                (is_long  and price >= trader.tp1)
+                or (not is_long and price <= trader.tp1)
+            )
+            if tp1_hit_be:
+                # Solo mover SL a breakeven si mejora la protección
+                if is_long and trader.entry_price > trader.sl:
+                    trader.sl = trader.entry_price
+                    logger.info(
+                        "[%s] 🟡 TP1 alcanzado → SL movido a breakeven (%.4f)",
+                        self.symbol, trader.sl,
+                    )
+                    save_position(self.symbol, {
+                        "side":        trader.position,
+                        "entry":       trader.entry_price,
+                        "sl":          trader.sl,
+                        "tp1":         trader.tp1,
+                        "tp2":         trader.tp2,
+                        "tp3":         trader.tp3,
+                        "tp2_hit":     trader.tp2_hit,
+                        "usdc_amount": trader._open_notional,
+                        "leverage":    trader._open_leverage,
+                    })
+                elif not is_long and trader.entry_price < trader.sl:
+                    trader.sl = trader.entry_price
+                    logger.info(
+                        "[%s] 🟡 TP1 alcanzado → SL movido a breakeven (%.4f)",
+                        self.symbol, trader.sl,
+                    )
+                    save_position(self.symbol, {
+                        "side":        trader.position,
+                        "entry":       trader.entry_price,
+                        "sl":          trader.sl,
+                        "tp1":         trader.tp1,
+                        "tp2":         trader.tp2,
+                        "tp3":         trader.tp3,
+                        "tp2_hit":     trader.tp2_hit,
+                        "usdc_amount": trader._open_notional,
+                        "leverage":    trader._open_leverage,
+                    })
+                trader._tp1_be_done = True
+
         # ── TP2 parcial ───────────────────────────────────────────────────────
         if trader.tp2 and not trader.tp2_hit:
             tp2_triggered = (
@@ -63,15 +125,37 @@ class PositionManager:
             if tp2_triggered:
                 trader.tp2_hit = True
                 mark_tp2_hit(self.symbol)
+
+                # #1 SL → TP1 al tocar TP2
+                if trader.tp1 and trader.sl is not None:
+                    move_sl = (
+                        (is_long  and trader.tp1 > trader.sl)
+                        or (not is_long and trader.tp1 < trader.sl)
+                    )
+                    if move_sl:
+                        trader.sl = trader.tp1
+                        logger.info(
+                            "[%s] 🟠 TP2 alcanzado → SL movido a TP1 (%.4f)",
+                            self.symbol, trader.sl,
+                        )
+                        save_position(self.symbol, {
+                            "side":        trader.position,
+                            "entry":       trader.entry_price,
+                            "sl":          trader.sl,
+                            "tp1":         trader.tp1,
+                            "tp2":         trader.tp2,
+                            "tp3":         trader.tp3,
+                            "tp2_hit":     True,
+                            "usdc_amount": trader._open_notional,
+                            "leverage":    trader._open_leverage,
+                        })
+
                 partial_qty = round(
                     (trader._open_notional / trader.entry_price) * TP2_PARTIAL_RATIO, 6
                 )
                 if partial_qty > 0 and not trader.dry_run:
                     close_side = "sell" if is_long else "buy"
 
-                    # Cancelar trigger orders activos ANTES del parcial para evitar
-                    # double-close: los TP/SL del exchange cubrían el 100% de la
-                    # posición; tras el parcial la qty restante es menor.
                     try:
                         trader._hl_client.cancel_all_open_tpsl()
                         logger.info(
@@ -94,7 +178,6 @@ class PositionManager:
                             self.symbol, trader.position, price, trader.tp2, partial_qty
                         )
 
-                        # Re-colocar TP/SL con la qty restante para seguir protegidos
                         remaining_notional = trader._open_notional * (1 - TP2_PARTIAL_RATIO)
                         remaining_qty = round(remaining_notional / trader.entry_price, 6)
                         if remaining_qty > 0 and (trader.tp3 or trader.sl):
@@ -160,11 +243,9 @@ class PositionManager:
             return
 
         close_side = "sell" if is_long else "buy"
-        fill_price = price  # precio de referencia para notificación
+        fill_price = price
 
         if not trader.dry_run:
-            # Cancelar trigger orders huérfanos ANTES del cierre de mercado
-            # para evitar que el exchange intente cerrar una posición ya cerrada.
             try:
                 trader._hl_client.cancel_all_open_tpsl()
             except Exception as e:
@@ -172,7 +253,6 @@ class PositionManager:
 
             result = await trader._place_order(close_side, qty, reduce_only=True)
 
-            # Intentar obtener el precio real de fill para un PnL más preciso
             if result.get("status") == "ok":
                 try:
                     fill_price = float(
@@ -180,7 +260,7 @@ class PositionManager:
                         .get("filled", {}).get("avgPx", price)
                     )
                 except Exception:
-                    pass  # Si no se puede extraer, usar precio de referencia
+                    pass
 
         pnl_pct_final = (
             (fill_price - trader.entry_price) / trader.entry_price
@@ -197,7 +277,19 @@ class PositionManager:
 
         entry_copy = trader.entry_price
         pos_copy   = trader.position
+        notional_copy = trader._open_notional
+
         self._reset_trader_state(trader)
+
+        # Liberar exposición en pretrade_risk
+        pretrade_risk.register_close(self.symbol, notional_copy)
+
+        # #4 Cooldown diferenciado por entry_mode
+        signal_cooldown.mark_closed(
+            self.symbol,
+            entry_mode=self._entry_mode,
+            reason=close_reason,
+        )
 
         await notify_close(
             symbol=self.symbol,
@@ -215,4 +307,6 @@ class PositionManager:
         trader.sl          = None
         trader.tp1 = trader.tp2 = trader.tp3 = None
         trader.tp2_hit = False
+        trader._tp1_be_done = False
+        self._entry_mode = ""
         clear_position(self.symbol)
