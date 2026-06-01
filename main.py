@@ -36,6 +36,10 @@ _LEVERAGE_BASE = int(os.getenv("LEVERAGE", "5"))
 # Se rellena desde el snapshot y se consulta al arrancar cada trader.
 _max_leverage_map: dict[str, int] = {}
 
+# BUG #4 FIX: timeout máximo (segundos) esperando que un trader saliente
+# setee _stopped_event en su cleanup(). Configurable via env var.
+_TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
+
 # ── USDC por operación — fuente ÚNICA: variable de entorno USDC_PER_TRADE ──
 # NOTA: el antiguo fallback "USBC_PER_TRADE" era un typo (B en vez de D).
 #       Se elimina para evitar confusión. El default es 20 USDC.
@@ -173,18 +177,78 @@ def _update_leverage_map(scored_data: list[dict]) -> None:
         )
 
 
-async def on_pairs_updated(new_pairs: list):
-    current = set(active_traders.keys())
-    updated = set(new_pairs[:MAX_ACTIVE_TRADERS])
-    added   = updated - current
-    removed = current - updated
+async def _stop_pair_with_cleanup(symbol: str) -> None:
+    """
+    BUG #4 FIX: cancela la tarea del trader y espera a que cleanup()
+    setee _stopped_event antes de continuar, con timeout de seguridad.
 
+    Esto evita la race condition donde el nuevo trader arranca mientras
+    el anterior aún tiene posición abierta o locks adquiridos.
+    """
+    task = active_traders.pop(symbol, None)
+    trader = _trader_instances.pop(symbol, None)
+    register_traders(_trader_instances)
+
+    if task and not task.done():
+        task.cancel()
+
+    if trader is not None:
+        try:
+            await asyncio.wait_for(
+                trader._stopped_event.wait(),
+                timeout=_TRADER_STOP_TIMEOUT_S,
+            )
+            logger.info("[%s] Trader parado limpiamente (BUG#4).", symbol)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] Trader no paró en %.0fs — continuando de todas formas.",
+                symbol, _TRADER_STOP_TIMEOUT_S,
+            )
+        # cleanup() ya fue llamado desde dentro del trader (run() finally),
+        # pero lo llamamos también aquí por si la tarea fue cancelada antes
+        # de llegar al finally.
+        try:
+            await trader.cleanup()
+        except Exception as e:
+            logger.debug("[%s] cleanup() secundario: %s", symbol, e)
+    else:
+        logger.info("⏹ Trader detenido: %s", symbol)
+
+
+async def on_pairs_updated(new_pairs: list, added: set = None, removed: set = None):
+    """
+    BUG #4 FIX: callback con firma nueva (new_pairs, added, removed).
+
+    pair_scanner.py detecta automáticamente esta firma con inspect.signature
+    y la llama con los 3 argumentos. Si se llama con firma antigua (solo
+    new_pairs), added/removed son None y se recalculan aquí.
+
+    El orden importa:
+      1. Primero hacer cleanup de traders SALIENTES (con espera de _stopped_event).
+      2. Después arrancar traders ENTRANTES.
+
+    Esto garantiza que no hay dos traders operando el mismo símbolo
+    simultáneamente ni tampoco traders zombi bloqueando locks/márgenes.
+    """
+    current = set(active_traders.keys())
+    capped  = set(new_pairs[:MAX_ACTIVE_TRADERS])
+
+    # Recalcular si se llama con firma antigua
+    if added is None:
+        added = capped - current
+    if removed is None:
+        removed = current - capped
+
+    # ── 1. Cleanup traders salientes PRIMERO ──────────────────────────────
+    if removed:
+        logger.info("➖ Deteniendo traders salientes: %s", ", ".join(removed))
+        stop_tasks = [_stop_pair_with_cleanup(sym) for sym in removed]
+        await asyncio.gather(*stop_tasks, return_exceptions=True)
+
+    # ── 2. Arrancar traders entrantes ─────────────────────────────────────
     if added:
         ws_feed.update_symbols(list(added))
         await start_traders_staggered(list(added), _start_single_pair, delay=3.0)
-
-    for sym in removed:
-        await stop_pair(sym)
 
     await notify_scanner_update(added, removed, len(active_traders))
     logger.info("📊 Traders activos: %d/%d", len(active_traders), MAX_ACTIVE_TRADERS)
