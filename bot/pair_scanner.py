@@ -1,19 +1,14 @@
 """
-pair_scanner.py — Escáner de pares para Hyperliquid perpetuos.
+pair_scanner.py — Escaner de pares para Hyperliquid perpetuos.
 
-Hyperliquid solo tiene perpetuos USDT (todos contra USD sintético).
-La API /info con type="metaAndAssetCtxs" devuelve todos los mercados
-y sus métricas en tiempo real (volumen, funding, precio).
-
-No se requieren credenciales — es un endpoint público de lectura.
-
-Formato de símbolo devuelto: nombre corto de coin ("BTC", "ETH", "SOL")
-Compatible con ws_feed.py y trader.py que normalizan internamente.
-
-Método extra: inject_snapshot(raw_text) — inyecta datos de una tabla de
-mercados pegada manualmente (sin llamadas a IA) usando market_snapshot.py.
-El snapshot incluye max_leverage por par, que main.py usa para capar el
-leverage efectivo de cada trader al instanciarlo.
+BUG #4 FIX: rotacion de par sin esperar cleanup del trader
+  run_scanner_loop ahora llama on_update_callback con (new_pairs, removed)
+  para que main.py pueda hacer cleanup SELECTIVO de los traders salientes
+  antes de arrancar los nuevos. El callback debe:
+    1. Para cada par en 'removed': cancelar tarea, llamar trader.cleanup(),
+       y await trader._stopped_event.wait() con timeout.
+    2. Arrancar traders para pares en 'added'.
+  Si el callback solo acepta (new_pairs,), se hace fallback seguro.
 """
 import logging
 import asyncio
@@ -23,7 +18,6 @@ import json as _json
 
 logger = logging.getLogger("PairScanner")
 
-# Activos no-crypto o con comportamiento distinto
 NON_CRYPTO_BASES = {
     "AAPL", "TSLA", "NVDA", "AMZN", "GOOGL", "META", "MSFT", "NFLX",
     "AMD", "INTC", "MU", "QCOM", "AVGO", "CRM", "ORCL",
@@ -35,6 +29,9 @@ NON_CRYPTO_BASES = {
 
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
+
+# BUG #4: timeout maximo para esperar cleanup de un trader saliente
+_TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
 
 
 async def _info_post(payload: dict) -> dict:
@@ -49,23 +46,9 @@ async def _info_post(payload: dict) -> dict:
 
 
 class PairScanner:
-    """
-    Escanea pares USDT perpetuos de Hyperliquid.
-    Filtra por volumen 24h y volatilidad (% cambio).
-    Devuelve nombres cortos de coin: "BTC", "ETH", "SOL"...
-
-    _last_scored: lista completa de dicts con datos enriquecidos del último scan.
-    Incluye el campo "max_leverage" cuando los datos provienen de un snapshot
-    (inject_snapshot). En el scan via API, max_leverage se obtiene de la API
-    de metadatos de HL (campo "maxLeverage" en universe[i]).
-
-    inject_snapshot(): acepta texto pegado de la UI del exchange y lo parsea
-    con market_snapshot.py, sin depender de ninguna IA externa.
-    """
-
     def __init__(
         self,
-        api_key=None, api_secret=None, passphrase=None,   # ignorados, compatibilidad
+        api_key=None, api_secret=None, passphrase=None,
         min_volume_usdt=1_000_000,
         min_price_change_pct=0.5,
         top_n=15,
@@ -76,14 +59,13 @@ class PairScanner:
         self.top_n                = top_n
         self.refresh_interval     = refresh_interval_min * 60
         self.active_pairs: list   = []
-        self._last_scored: list   = []   # ← expuesto para main.py
+        self._last_scored: list   = []
 
         extra = os.getenv("SYMBOL_BLACKLIST", "")
         self.blacklist = NON_CRYPTO_BASES | {
             s.strip().upper() for s in extra.split(",") if s.strip()
         }
 
-        # Stub: exchange attr para compatibilidad con código legado
         self.exchange = _HLExchangeStub()
 
     def _is_valid(self, coin: str) -> bool:
@@ -93,45 +75,19 @@ class PairScanner:
             return False
         return True
 
-    # ------------------------------------------------------------------
-    # inject_snapshot — entrada manual sin IA
-    # ------------------------------------------------------------------
-
     def inject_snapshot(self, raw_text: str) -> list[str]:
-        """
-        Parsea texto pegado de la UI del exchange y sobreescribe _last_scored.
-
-        No llama a ninguna IA. Usa market_snapshot.parse_snapshot() y
-        snapshot_to_scanner_format() para producir la misma estructura
-        que devuelve scan().
-
-        Los dicts resultantes incluyen "max_leverage" (int) para que
-        main.py pueda capar el leverage efectivo de cada trader.
-
-        Parámetros de filtro reutilizados de la instancia:
-          - min_volume_usdt
-          - min_price_change_pct (como |change_pct|)
-          - top_n
-
-        Devuelve: lista de símbolos (igual que scan()).
-        Colaterales USDE/USDH/USDT se excluyen por defecto para no
-        duplicar pares (el bot opera en USDC).
-        """
         from bot.market_snapshot import parse_snapshot, snapshot_to_scanner_format
-
         rows = parse_snapshot(raw_text)
         scored = snapshot_to_scanner_format(
             rows,
             min_volume_usdt=self.min_volume_usdt,
             min_change_pct=self.min_price_change_pct,
             top_n=self.top_n,
-            exclude_quotes={"USDE", "USDH", "USDT"},  # solo operar en USDC
+            exclude_quotes={"USDE", "USDH", "USDT"},
             exclude_collateral=set(),
         )
-
         self._last_scored = scored
         self.active_pairs = [s["symbol"] for s in scored]
-
         logger.info(
             "[PairScanner] inject_snapshot: %d mercados activos → top %d seleccionados",
             sum(1 for r in rows if r.active), len(scored),
@@ -142,11 +98,9 @@ class PairScanner:
                 p["symbol"], p["volume_usdt"], p["change_pct"], p["funding"],
                 p.get("max_leverage", 0), p["score"],
             )
-
         return self.active_pairs
 
     async def scan(self) -> list:
-        """Devuelve lista de coins (ej: ["BTC", "ETH", "SOL"]) ordenada por score."""
         try:
             data = await _info_post({"type": "metaAndAssetCtxs"})
         except Exception as e:
@@ -177,7 +131,6 @@ class PairScanner:
                 prev_day_px   = float(prev_day_px_r) if prev_day_px_r not in (None, "", "0", 0) else 0.0
                 funding       = float(ctx.get("funding",      0) or 0)
                 open_interest = float(ctx.get("openInterest", 0) or 0)
-                # maxLeverage viene en universe[i], no en ctxs[i]
                 max_lev       = int(meta.get("maxLeverage", 0) or 0)
             except (ValueError, TypeError):
                 continue
@@ -204,7 +157,7 @@ class PairScanner:
                 "funding":       round(funding * 100, 5),
                 "oi_usdt":       round(open_interest * mark_px / 1_000_000, 2),
                 "score":         round(score, 3),
-                "max_leverage":  max_lev,   # ← nuevo: de universe[i].maxLeverage
+                "max_leverage":  max_lev,
             })
 
         logger.debug(
@@ -214,7 +167,6 @@ class PairScanner:
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         top = scored[:self.top_n]
-
         self._last_scored = top
 
         logger.info("🏆 Top %d pares Hyperliquid seleccionados:", len(top))
@@ -229,53 +181,71 @@ class PairScanner:
         return [p["symbol"] for p in top]
 
     def normalize(self, symbol: str) -> str:
-        """Compatibilidad con main.py — Hyperliquid ya devuelve nombres cortos."""
         return symbol.replace("/", "").replace(":USDT", "").replace("USDT", "").upper()
 
     async def run_scanner_loop(self, on_update_callback):
+        """
+        BUG #4 FIX: el callback recibe (new_pairs, added, removed) para
+        que main.py pueda hacer cleanup SELECTIVO antes de arrancar nuevos.
+
+        Protocolo del callback en main.py:
+          async def _on_pairs_updated(new_pairs, added, removed):
+              # 1. Cleanup traders salientes
+              for sym in removed:
+                  trader = active_traders.get(sym)
+                  if trader:
+                      task = trader_tasks.get(sym)
+                      if task: task.cancel()
+                      try:
+                          await asyncio.wait_for(
+                              trader._stopped_event.wait(),
+                              timeout=TRADER_STOP_TIMEOUT_S
+                          )
+                      except asyncio.TimeoutError:
+                          logger.warning("Trader %s no paro en tiempo", sym)
+                      await trader.cleanup()
+              # 2. Arrancar traders para pares nuevos
+              for sym in added:
+                  start_trader(sym)
+
+        Fallback: si el callback solo acepta 1 argumento (new_pairs),
+        se llama con la firma antigua para compatibilidad.
+        """
+        import inspect
+        cb_params = len(inspect.signature(on_update_callback).parameters)
+
         while True:
             await asyncio.sleep(self.refresh_interval)
             try:
                 logger.info("🔍 Re-escaneando mercado Hyperliquid...")
                 new_pairs = await self.scan()
                 if not new_pairs:
-                    logger.warning("⚠️ Scanner devolvió 0 pares — manteniendo pares actuales")
+                    logger.warning("⚠️ Scanner devolvio 0 pares — manteniendo pares actuales")
                     continue
+
                 added   = set(new_pairs) - set(self.active_pairs)
                 removed = set(self.active_pairs) - set(new_pairs)
-                # Actualizar mapa de leverage con el nuevo scan
+
                 try:
                     import main as _main
                     _main._update_leverage_map(self._last_scored)
                 except Exception:
                     pass
+
                 self.active_pairs = new_pairs
+
                 if added:
                     logger.info("➕ Nuevos pares: %s", ", ".join(added))
                 if removed:
                     logger.info("➖ Pares eliminados: %s", ", ".join(removed))
+
                 if added or removed:
-                    await on_update_callback(new_pairs)
-                else:
-                    logger.info("✅ Pares sin cambios — no se reinician traders")
-            except Exception as e:
-                logger.error("PairScanner error: %s", e)
-
-    async def close(self):
-        pass
-
-
-class _HLExchangeStub:
-    """Stub mínimo para compatibilidad con código legado."""
-    async def fetch_ticker(self, symbol: str) -> dict:
-        """Consulta precio actual via /info allMids."""
-        try:
-            data = await _info_post({"type": "allMids"})
-            coin = symbol.replace("/USDT:USDT", "").replace("/USDT", "").replace("USDT", "")
-            mid  = data.get(coin, 0)
-            return {"last": float(mid), "quoteVolume": 0, "percentage": 0}
-        except Exception:
-            return {"last": 0, "quoteVolume": 0, "percentage": 0}
-
-    async def close(self):
-        pass
+                    # BUG #4 FIX: pasar added y removed al callback
+                    if cb_params >= 3:
+                        # Nueva firma: callback(new_pairs, added, removed)
+                        await on_update_callback(new_pairs, added, removed)
+                    else:
+                        # Fallback: firma antigua callback(new_pairs)
+                        logger.warning(
+                            "[PairScanner] Callback con firma antigua — "
+                            "traders salientes no esperaran
