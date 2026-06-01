@@ -2,35 +2,134 @@
 """
 signal_engine.py — Motor de señales de trading.
 
-v2 — BUG #7 FIX: sin cooldown por dirección → flip-flop de posiciones
-
-  El bug original permitía generar señales opuestas en <2 velas cuando
-  el mercado hacía zigzag, causando cierres y reaperturas repetidos con
-  doble comisión en cada flip.
-
-  Fix:
-    - _last_signal_by_symbol: dict[symbol, (side, ts)] almacena la última
-      señal generada por símbolo.
-    - Si se genera señal opuesta a la anterior en menos de
-      SIGNAL_FLIP_COOLDOWN_S (default 120s = 2 velas 1m / 0.1 velas 15m),
-      la señal se descarta con WARNING.
-    - El cooldown solo aplica a inversiones de dirección (long→short o
-      short→long), no a señales en la misma dirección.
-    - Se puede desactivar con SIGNAL_FLIP_COOLDOWN_S=0.
+Exporta:
+  - SignalResult          : dataclass con el resultado de analyze_pair()
+  - analyze_pair()        : analiza un par y devuelve SignalResult
+  - format_signal_block() : formatea SignalResult como bloque Markdown
+  - MIN_SCORE             : puntuación mínima para señal válida (env: MIN_SIGNAL_SCORE)
+  - MIN_RR                : ratio R/R mínimo (env: MIN_RR_REQUIRED)
+  - SignalFlipGuard       : previene flip-flop de señales opuestas (BUG #7 fix)
+  - signal_flip_guard     : singleton exportado de SignalFlipGuard
 """
 from __future__ import annotations
 
 import logging
 import os
 import time
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-_FLIP_COOLDOWN_S = float(os.getenv("SIGNAL_FLIP_COOLDOWN_S", "120"))
+# ─── Constantes exportadas ────────────────────────────────────────────────────
 
-# Tipo de señal devuelto por decide() / ai_decide()
-# Se asume que es un objeto con atributo .side (str: 'long'/'short') o None
+MIN_SCORE: int = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
+MIN_RR: float = float(os.getenv("MIN_RR_REQUIRED", "1.8"))
+
+# ─── SignalResult ─────────────────────────────────────────────────────────────
+
+@dataclass
+class SignalResult:
+    """Resultado completo de analyze_pair()."""
+    symbol: str
+    signal: str                          # "LONG" | "SHORT" | "NEUTRAL"
+    entry_mode: str                      # "STRONG" | "NORMAL" | "EARLY" | "HOLD"
+    score: int
+    max_score: int
+    entry: float
+    sl: float
+    tp1: float
+    tp2: float
+    atr: float
+    rr: float
+    suggested_lev: int
+    indicators: Dict                     # indicadores por timeframe
+    is_valid: bool = True
+    reason: str = ""
+    # campos opcionales para compatibilidad
+    signal_block: str = ""
+    extra: Dict = field(default_factory=dict)
+
+
+# ─── analyze_pair ─────────────────────────────────────────────────────────────
+
+async def analyze_pair(exch, symbol: str) -> SignalResult:
+    """
+    Analiza un par y devuelve un SignalResult.
+
+    Importa la lógica real desde bot.market_snapshot + bot.indicators
+    para evitar duplicar código. Si algún import falla, devuelve HOLD seguro.
+    """
+    try:
+        from bot.market_snapshot import build_snapshot
+        from bot.indicators import compute_indicators as _ci
+    except ImportError as e:
+        log.error(f"[signal_engine] import error en analyze_pair: {e}")
+        return _hold_result(symbol, f"ImportError: {e}")
+
+    try:
+        snapshot = await build_snapshot(exch, symbol)
+    except Exception as e:
+        log.error(f"[signal_engine] build_snapshot({symbol}) falló: {e}")
+        return _hold_result(symbol, f"snapshot error: {e}")
+
+    try:
+        result: SignalResult = _ci(snapshot)
+        return result
+    except Exception as e:
+        log.error(f"[signal_engine] compute_indicators({symbol}) falló: {e}")
+        return _hold_result(symbol, f"indicators error: {e}")
+
+
+def _hold_result(symbol: str, reason: str) -> SignalResult:
+    """Devuelve un SignalResult de HOLD seguro cuando hay error."""
+    return SignalResult(
+        symbol=symbol,
+        signal="NEUTRAL",
+        entry_mode="HOLD",
+        score=0,
+        max_score=10,
+        entry=0.0,
+        sl=0.0,
+        tp1=0.0,
+        tp2=0.0,
+        atr=0.0,
+        rr=0.0,
+        suggested_lev=1,
+        indicators={},
+        is_valid=False,
+        reason=reason,
+    )
+
+
+# ─── format_signal_block ──────────────────────────────────────────────────────
+
+def format_signal_block(signal: Optional[SignalResult]) -> str:
+    """Formatea un SignalResult como bloque Markdown para Telegram/logs."""
+    if signal is None:
+        return ""
+
+    arrow = "🟢 LONG" if signal.signal == "LONG" else "🔴 SHORT" if signal.signal == "SHORT" else "⚪ NEUTRAL"
+    lev = f"{signal.suggested_lev}x" if signal.suggested_lev else "—"
+    rr = f"{signal.rr:.2f}" if signal.rr else "—"
+
+    lines = [
+        f"**{signal.symbol}** · {arrow}",
+        f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
+    ]
+
+    if signal.entry:
+        lines.append(f"Entry: `{signal.entry}` | SL: `{signal.sl}` | TP1: `{signal.tp1}` | TP2: `{signal.tp2}`")
+
+    if signal.reason:
+        lines.append(f"_{signal.reason}_")
+
+    return "\n".join(lines)
+
+
+# ─── SignalFlipGuard (BUG #7 FIX) ─────────────────────────────────────────────
+
+_FLIP_COOLDOWN_S = float(os.getenv("SIGNAL_FLIP_COOLDOWN_S", "120"))
 
 
 class SignalFlipGuard:
@@ -54,26 +153,19 @@ class SignalFlipGuard:
     def allow(self, symbol: str, signal) -> bool:
         """
         Devuelve True si la señal debe procesarse, False si debe bloquearse.
-
-        signal puede ser:
-          - None o sin atributo .side → se permite (señal nula)
-          - objeto con .side in ('long', 'short', 'buy', 'sell')
         """
         if self._cooldown <= 0:
             return True
         if signal is None:
             return True
 
-        # Obtener side de la señal
         side = getattr(signal, "side", None)
         if not side:
-            # Si la señal tiene dirección como string directamente
             if isinstance(signal, str) and signal in ("long", "short", "buy", "sell"):
                 side = signal
             else:
-                return True  # señal sin side definido → dejar pasar
+                return True
 
-        # Normalizar
         side_norm = "long" if side in ("long", "buy") else "short"
 
         last = self._last.get(symbol)
@@ -89,7 +181,6 @@ class SignalFlipGuard:
                 )
                 return False
 
-        # Actualizar registro y permitir
         self._last[symbol] = (side_norm, time.monotonic())
         return True
 
@@ -103,7 +194,5 @@ class SignalFlipGuard:
         self._last[symbol] = (side_norm, time.monotonic())
 
 
-# Singleton exportado — importar desde trader.py:
-#   from bot.signal_engine import signal_flip_guard
-#   if not signal_flip_guard.allow(symbol, signal): continue
+# Singleton exportado
 signal_flip_guard = SignalFlipGuard()
