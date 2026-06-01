@@ -21,6 +21,16 @@ BUG #8 FIX: cierre de emergencia reduce-only en sl_hit cuando _protection_ok=Fal
   - Si el SL del exchange no fue confirmado (_protection_ok=False) y el precio
     cruza el SL local, se envia orden de mercado reduce-only antes de limpiar estado.
 
+BUG #9 FIX: _ensure_tpsl usa reduce_only=True como fuente de verdad
+  - _tpsl_type() eliminado: parseaba orderType cuyo formato varía entre versiones
+    de HL/ccxt y nunca matcheaba → has_sl=False, has_tp=False siempre
+  - Nueva detección: cuenta órdenes con reduce_only=True para la coin
+    · ≥1 reduce_only  → has_sl=True  (orden de protección presente)
+    · ≥2 reduce_only  → has_tp=True  (ambas órdenes presentes)
+  - cancel_all_orders_reduce_only(): cancela todas las órdenes reduce_only
+    de la coin directamente por oid, evitando depender de _tpsl_type()
+  - Corrige bucle donde las órdenes se acumulaban indefinidamente sin cancelarse
+
 OHLCV FIX: decide() recibe ohlcv_fn=self.get_ohlcv para usar WS→caché→REST
   - Evita 3 REST hits extra por ciclo (antes analyze_pair llamaba exch.fetch_ohlcv directamente)
 """
@@ -150,6 +160,36 @@ def _compute_fallback_tpsl(
         tp1 = entry - risk_dist * _FALLBACK_ATR_TP1_MULT
         tp2 = entry - risk_dist * _FALLBACK_ATR_TP2_MULT
     return round(sl, 6), round(tp1, 6), round(tp2, 6)
+
+
+# BUG #9 FIX: helper que no depende del formato de orderType
+def _is_reduce_only_order(o: dict) -> bool:
+    """
+    Devuelve True si la orden es reduce_only.
+
+    Hyperliquid puede representar reduce_only de dos formas:
+      1. Campo explícito: o["reduceOnly"] = True  (ccxt normaliza a "reduceOnly")
+      2. Campo explícito: o["reduce_only"] = True  (algunas versiones)
+      3. Inferido: orderType dict con trigger.tpsl in ("sl", "tp")
+
+    Usar reduce_only como fuente de verdad es más robusto que parsear
+    orderType, cuyo formato varía entre versiones de HL y ccxt.
+    """
+    # Forma directa (ccxt ≥ 4.x normaliza a "reduceOnly")
+    if o.get("reduceOnly") is True:
+        return True
+    if o.get("reduce_only") is True:
+        return True
+    # Inferido desde orderType dict (formato nativo HL SDK)
+    ot = o.get("orderType", "")
+    if isinstance(ot, dict):
+        tpsl = ot.get("trigger", {}).get("tpsl", "")
+        if tpsl in ("sl", "tp"):
+            return True
+        tpsl2 = ot.get("limit", {}).get("tpsl", "")
+        if tpsl2 in ("sl", "tp"):
+            return True
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -705,7 +745,49 @@ class FuturesTrader:
                 logger.error("[%s] No se pudo colocar TP: %s", self.symbol, e)
                 raise
 
-    # ── _ensure_tpsl_on_exchange ────────────────────────────────────────────────────────────
+    # ── _cancel_all_orders_reduce_only (BUG #9 FIX) ──────────────────────────────────
+    #
+    # Cancela TODAS las órdenes reduce_only de la coin directamente por oid.
+    # No depende de _tpsl_type() ni de cancel_all_open_tpsl() de HLClient,
+    # que podían no cancelar nada si el formato de orderType no matcheaba.
+
+    async def _cancel_all_orders_reduce_only(self, coin_orders: list) -> int:
+        """
+        Cancela todas las órdenes reduce_only de coin_orders.
+        Devuelve el número de órdenes canceladas exitosamente.
+        """
+        ro_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
+        if not ro_orders:
+            return 0
+
+        loop = asyncio.get_event_loop()
+        cancelled = 0
+        for o in ro_orders:
+            oid = o.get("oid") or o.get("id") or o.get("orderId")
+            if not oid:
+                logger.warning("[%s] Orden reduce_only sin oid — skip: %s", self.symbol, o)
+                continue
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda _oid=oid: self._hl_client._exchange.cancel_order(
+                        str(_oid), self.coin
+                    ),
+                )
+                logger.debug("[%s] Orden reduce_only cancelada: oid=%s", self.symbol, oid)
+                cancelled += 1
+            except Exception as e:
+                logger.warning(
+                    "[%s] No se pudo cancelar orden reduce_only oid=%s: %s",
+                    self.symbol, oid, e,
+                )
+        logger.info(
+            "[%s] _cancel_all_orders_reduce_only: %d/%d órdenes canceladas",
+            self.symbol, cancelled, len(ro_orders),
+        )
+        return cancelled
+
+    # ── _ensure_tpsl_on_exchange (BUG #9 FIX) ──────────────────────────────────────────
 
     async def _ensure_tpsl_on_exchange(
         self,
@@ -725,30 +807,26 @@ class FuturesTrader:
 
         coin_orders = [o for o in (raw_orders or []) if o.get("coin") == self.coin]
 
-        def _tpsl_type(o: dict) -> str | None:
-            ot = o.get("orderType", "")
-            if isinstance(ot, dict):
-                tpsl = ot.get("trigger", {}).get("tpsl", "")
-                if tpsl in ("sl", "tp"):
-                    return tpsl
-                tpsl2 = ot.get("limit", {}).get("tpsl", "")
-                if tpsl2 in ("sl", "tp"):
-                    return tpsl2
-                return None
-            if isinstance(ot, str):
-                ot_l = ot.lower()
-                if "stop" in ot_l or ot_l == "sl":
-                    return "sl"
-                if "take profit" in ot_l or "take_profit" in ot_l or ot_l == "tp":
-                    return "tp"
-            return None
+        # BUG #9 FIX: usar reduce_only como fuente de verdad.
+        # No parseamos orderType porque su formato varía entre versiones.
+        # Log diagnóstico: muestra los orderType raw para debugging futuro.
+        ro_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
+        if coin_orders:
+            sample_types = [o.get("orderType", "?") for o in coin_orders[:5]]
+            logger.debug(
+                "[%s] _ensure_tpsl — orderTypes (muestra): %s",
+                self.symbol, sample_types,
+            )
 
-        has_sl = any(_tpsl_type(o) == "sl" for o in coin_orders)
-        has_tp = any(_tpsl_type(o) == "tp" for o in coin_orders)
+        # Lógica de detección:
+        #   ≥1 orden reduce_only → SL presente
+        #   ≥2 órdenes reduce_only → SL + TP presentes
+        has_sl = len(ro_orders) >= 1
+        has_tp = len(ro_orders) >= 2
 
         logger.info(
-            "[%s] _ensure_tpsl — SL_ok=%s TP_ok=%s | ordenes_coin=%d | qty=%.4f",
-            self.symbol, has_sl, has_tp, len(coin_orders), safe_qty,
+            "[%s] _ensure_tpsl — SL_ok=%s TP_ok=%s | ro_orders=%d | total_coin=%d | qty=%.4f",
+            self.symbol, has_sl, has_tp, len(ro_orders), len(coin_orders), safe_qty,
         )
 
         if has_sl and has_tp:
@@ -764,23 +842,19 @@ class FuturesTrader:
                 logger.error("[%s] No se pudo reponer TP: %s", self.symbol, e)
             return
 
-        if not has_sl and has_tp:
-            logger.warning("[%s] Falta SL en exchange — colocando SL=%.5f (TP intacto)", self.symbol, sl)
-            try:
-                await self._place_tpsl(qty=safe_qty, sl=sl, tp=None)
-                self._protection_ok = True
-            except Exception as e:
-                logger.error("[%s] No se pudo reponer SL: %s", self.symbol, e)
-            return
-
+        # has_sl=False → ni SL ni TP presentes (o 0 órdenes reduce_only)
         logger.warning(
-            "[%s] Faltan SL y TP — cancelando y recolocando bulk (SL=%.5f TP=%.5f qty=%.4f)",
+            "[%s] Faltan SL y TP — cancelando reduce_only acumulados y recolocando bulk (SL=%.5f TP=%.5f qty=%.4f)",
             self.symbol, sl, tp1, safe_qty,
         )
+
+        # BUG #9 FIX: usar _cancel_all_orders_reduce_only en lugar de
+        # cancel_all_open_tpsl() que no cancelaba nada
         if coin_orders:
             try:
-                await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
-                await asyncio.sleep(0.5)
+                cancelled = await self._cancel_all_orders_reduce_only(coin_orders)
+                if cancelled > 0:
+                    await asyncio.sleep(0.5)
             except Exception as e:
                 logger.warning("[%s] _ensure_tpsl: error cancelando ordenes previas: %s", self.symbol, e)
 
