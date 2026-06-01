@@ -30,6 +30,14 @@ from bot.kill_switch import kill_switch
 from bot.execution.execution_engine import execution_engine
 from bot.ohlcv_cache import ohlcv_cache
 
+# ── DecisionEngine (opcional) ─────────────────────────────────────────────────
+try:
+    from bot.core.decision_engine import DecisionEngine as _DecisionEngine
+    _DE_AVAILABLE = True
+except ImportError:
+    _DecisionEngine = None
+    _DE_AVAILABLE = False
+
 logger = logging.getLogger("Trader")
 
 LOOP_SLEEP        = float(os.getenv("LOOP_SLEEP", "10"))
@@ -177,11 +185,19 @@ class FuturesTrader:
         self.total_pnl      = 0.0
         self._open_notional = 0.0
         self._open_leverage = 1
+        self._open_margin   = 0.0   # margen real = notional / leverage
+        self._open_entry_mode = ""  # entry_mode para cooldown dinámico
         self._protection_ok = False
         self._last_pos_check_at:   float = 0.0
         self._last_tpsl_verify_at: float = 0.0
         self._ccxt_exchange = None
         self._global_risk   = None
+
+        # DecisionEngine propio del trader (para on_position_closed)
+        if _DE_AVAILABLE:
+            self._decision_engine = _DecisionEngine(symbol)
+        else:
+            self._decision_engine = None
 
     # ── Max leverage efectivo del exchange ─────────────────────────────────
 
@@ -261,16 +277,21 @@ class FuturesTrader:
         if saved:
             exchange_pos = await self._get_positions()
             if exchange_pos is not None and len(exchange_pos) > 0:
-                self.position       = saved["side"]
-                self.entry_price    = saved["entry"]
-                self.sl             = saved.get("sl")
-                self.tp1            = saved.get("tp1")
-                self.tp2            = saved.get("tp2")
-                self.tp3            = saved.get("tp3")
-                self.tp2_hit        = saved.get("tp2_hit", False)
-                self._open_notional = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
-                self._open_leverage = saved.get("leverage", self.leverage)
-                self._protection_ok = True
+                self.position         = saved["side"]
+                self.entry_price      = saved["entry"]
+                self.sl               = saved.get("sl")
+                self.tp1              = saved.get("tp1")
+                self.tp2              = saved.get("tp2")
+                self.tp3              = saved.get("tp3")
+                self.tp2_hit          = saved.get("tp2_hit", False)
+                self._open_notional   = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
+                self._open_leverage   = saved.get("leverage", self.leverage)
+                self._open_margin     = (
+                    self._open_notional / self._open_leverage
+                    if self._open_leverage > 0 else self._open_notional
+                )
+                self._open_entry_mode = saved.get("entry_mode", "")
+                self._protection_ok   = True
                 logger.info("[%s] Posición restaurada: %s @ %s", self.symbol, self.position, self.entry_price)
             elif exchange_pos is not None and len(exchange_pos) == 0:
                 logger.warning(
@@ -283,16 +304,21 @@ class FuturesTrader:
                     "[%s] No se pudo verificar posición en exchange al arrancar — restaurando sin protección OK.",
                     self.symbol,
                 )
-                self.position       = saved["side"]
-                self.entry_price    = saved["entry"]
-                self.sl             = saved.get("sl")
-                self.tp1            = saved.get("tp1")
-                self.tp2            = saved.get("tp2")
-                self.tp3            = saved.get("tp3")
-                self.tp2_hit        = saved.get("tp2_hit", False)
-                self._open_notional = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
-                self._open_leverage = saved.get("leverage", self.leverage)
-                self._protection_ok = False
+                self.position         = saved["side"]
+                self.entry_price      = saved["entry"]
+                self.sl               = saved.get("sl")
+                self.tp1              = saved.get("tp1")
+                self.tp2              = saved.get("tp2")
+                self.tp3              = saved.get("tp3")
+                self.tp2_hit          = saved.get("tp2_hit", False)
+                self._open_notional   = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
+                self._open_leverage   = saved.get("leverage", self.leverage)
+                self._open_margin     = (
+                    self._open_notional / self._open_leverage
+                    if self._open_leverage > 0 else self._open_notional
+                )
+                self._open_entry_mode = saved.get("entry_mode", "")
+                self._protection_ok   = False
 
         if not balance_svc.is_ready():
             balance_svc.init_hl(self._master_addr, self._info_post)
@@ -382,8 +408,6 @@ class FuturesTrader:
         return await balance_svc.get()
 
     # ── Leverage ───────────────────────────────────────────────────────────────
-    # Una sola llamada limpia. Si falla, propaga la excepción al caller.
-    # El caller decide si abortar o continuar — sin loops ocultos aquí.
 
     async def _set_leverage(self, leverage: int) -> None:
         if self.dry_run:
@@ -492,24 +516,7 @@ class FuturesTrader:
         )
         return []
 
-    # ================================================================
-    # ── _place_tpsl
-    #
-    # CAUSA RAÍZ del fallo anterior:
-    #   El path "bulk" construía las órdenes manualmente sin pasar entry_px,
-    #   por lo que _adjust_sl_px / _adjust_tp_px en HLClient nunca validaban
-    #   que SL < entry (LONG) y TP > entry (LONG). Con precios redondeados
-    #   a pocos decimales el SL podía quedar == entry_px → HL rechazaba
-    #   con "Invalid TPSL price".
-    #   Además el buffer tp_lim se aplicaba al revés para SHORT.
-    #
-    # SOLUCIÓN:
-    #   Eliminar el bulk manual. Usar siempre place_sl / place_tp del
-    #   HLClient pasando entry_px. Esas funciones tienen toda la lógica
-    #   de validación y ajuste de ticks correcta.
-    #   bulk_orders se mantiene solo como optimización de latencia cuando
-    #   AMBAS órdenes son válidas — pero construido via los métodos del cliente.
-    # ================================================================
+    # ── _place_tpsl ─────────────────────────────────────────────────────────────
 
     async def _place_tpsl(
         self,
@@ -518,10 +525,6 @@ class FuturesTrader:
         tp: float | None,
         entry_px: float | None = None,
     ) -> None:
-        """
-        Coloca SL y TP en el exchange usando HLClient.place_sl / place_tp.
-        Siempre pasa entry_px para que HLClient valide y ajuste ticks.
-        """
         if not sl and not tp:
             return
 
@@ -530,15 +533,12 @@ class FuturesTrader:
         client       = self._hl_client
         loop         = asyncio.get_event_loop()
 
-        # entry_px para validación: usa el registrado en self si no se pasa explícito
         ep = entry_px if (entry_px and entry_px > 0) else self.entry_price
 
         if sl and tp:
-            # Intentar bulk para reducir latencia, pero construido correctamente
             try:
                 sl_px = client._adjust_sl_px(sl, ep, is_long)
                 tp_px = client._adjust_tp_px(tp, ep, is_long)
-                # limit_px del TP: un tick peor que el trigger para garantizar ejecución
                 tick      = client.get_tick_size()
                 tp_lim_px = client.round_px(tp_px - tick if is_long else tp_px + tick)
                 orders = [
@@ -562,7 +562,6 @@ class FuturesTrader:
                 result = await loop.run_in_executor(
                     None, lambda: client._exchange.bulk_orders(orders)
                 )
-                # Validar que el exchange aceptó ambas
                 statuses = (
                     result.get("response", {}).get("data", {}).get("statuses", [])
                     if isinstance(result, dict) else []
@@ -581,7 +580,6 @@ class FuturesTrader:
                     self.symbol, e,
                 )
 
-        # Fallback individual — siempre usa los métodos del cliente con entry_px
         if sl:
             try:
                 await loop.run_in_executor(
@@ -610,11 +608,7 @@ class FuturesTrader:
                 logger.error("[%s] ❌ No se pudo colocar TP: %s", self.symbol, e)
                 raise
 
-    # ================================================================
-    # ── _ensure_tpsl_on_exchange
-    # Verifica que SL+TP existen. Si no, cancela todo y recoloca UNA vez.
-    # No hay bucle de reintentos: si falla la segunda vez es un error real.
-    # ================================================================
+    # ── _ensure_tpsl_on_exchange ────────────────────────────────────────────────
 
     async def _ensure_tpsl_on_exchange(
         self,
@@ -625,7 +619,6 @@ class FuturesTrader:
     ) -> None:
         loop = asyncio.get_event_loop()
 
-        # ── Paso 1: verificar qué hay en el exchange ──
         try:
             raw_orders = await loop.run_in_executor(None, self._hl_client.get_open_orders)
         except Exception as e:
@@ -637,7 +630,7 @@ class FuturesTrader:
         def _tpsl_type(o: dict) -> str | None:
             ot = o.get("orderType", "")
             if isinstance(ot, dict):
-                return ot.get("trigger", {}).get("tpsl")  # "sl" | "tp" | None
+                return ot.get("trigger", {}).get("tpsl")
             if isinstance(ot, str):
                 ot_l = ot.lower()
                 if "stop" in ot_l or ot_l == "sl":
@@ -658,7 +651,6 @@ class FuturesTrader:
             self._protection_ok = True
             return
 
-        # ── Paso 2: cancelar todo lo existente antes de recolocar ──
         if coin_orders:
             try:
                 await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
@@ -666,7 +658,6 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning("[%s] _ensure_tpsl: error cancelando órdenes previas: %s", self.symbol, e)
 
-        # ── Paso 3: colocar SL+TP limpios (una sola vez) ──
         logger.info(
             "[%s] 📌 Colocando SL=%.5f + TP=%.5f (qty=%.4f)",
             self.symbol, sl, tp1, qty,
@@ -685,16 +676,34 @@ class FuturesTrader:
         self.sl = self.tp1 = self.tp2 = self.tp3 = None
         self.tp2_hit = False
 
-    async def _on_position_closed(self, pnl_pct: float) -> None:
+    async def _on_position_closed(self, pnl_pct: float, reason: str = "") -> None:
+        """
+        Llamado en TODOS los cierres (SL, TP1, TP2-parcial, TP3, cierre externo).
+        Notifica a GlobalRisk, PreTradeRisk y DecisionEngine (cooldown dinámico).
+        """
         if self._global_risk is not None:
             try:
                 await self._global_risk.register_close(pnl_pct)
             except Exception as e:
                 logger.warning("[%s] GlobalRisk.register_close error: %s", self.symbol, e)
+
         try:
             pretrade_risk.register_close(self.symbol, self._open_notional)
         except Exception as e:
             logger.warning("[%s] PreTradeRisk.register_close error: %s", self.symbol, e)
+
+        # ── Conectar DecisionEngine.on_position_closed() ─────────────────────
+        # Actualiza cooldown dinámico (SL → penaliza, TP → resetea) y shadow_mode.
+        if self._decision_engine is not None:
+            try:
+                await self._decision_engine.on_position_closed(
+                    symbol=self.symbol,
+                    margin=self._open_margin,
+                    reason=reason or "UNKNOWN",
+                    entry_mode=self._open_entry_mode,
+                )
+            except Exception as e:
+                logger.warning("[%s] DecisionEngine.on_position_closed error: %s", self.symbol, e)
 
     # ── Loop principal ───────────────────────────────────────────────────────────
 
@@ -748,6 +757,7 @@ class FuturesTrader:
                         logger.info("[%s] Posición detectada: %s @ %s",
                                     self.symbol, self.position, self.entry_price)
             else:
+                # Cierre externo detectado vía polling
                 if self.position is not None:
                     logger.info("[%s] Posición cerrada externamente.", self.symbol)
                     try:
@@ -755,7 +765,7 @@ class FuturesTrader:
                         await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
                     except Exception as e:
                         logger.warning("[%s] No se pudieron cancelar triggers huérfanos: %s", self.symbol, e)
-                    await self._on_position_closed(pnl_pct=0.0)
+                    await self._on_position_closed(pnl_pct=0.0, reason="EXTERNAL")
                     self._clear_position_state()
                     clear_position(self.symbol)
 
@@ -803,18 +813,20 @@ class FuturesTrader:
             return
 
         if signal:
-            entry = signal.entry or price
-            sl    = _nonzero(signal.sl)
-            tp1   = _nonzero(signal.tp1)
-            tp2   = _nonzero(signal.tp2)
-            tp3   = _nonzero(getattr(signal, "tp3", None))
-            lev   = int(signal.suggested_lev or self.leverage)
-            atr   = getattr(signal, "atr", None) or (entry * 0.005)
+            entry      = signal.entry or price
+            sl         = _nonzero(signal.sl)
+            tp1        = _nonzero(signal.tp1)
+            tp2        = _nonzero(signal.tp2)
+            tp3        = _nonzero(getattr(signal, "tp3", None))
+            lev        = int(signal.suggested_lev or self.leverage)
+            atr        = getattr(signal, "atr", None) or (entry * 0.005)
+            entry_mode = getattr(signal, "entry_mode", "") or ""
         else:
             entry = price
             sl = tp1 = tp2 = tp3 = None
             lev = self.leverage
             atr = entry * 0.005
+            entry_mode = ""
 
         exchange_max_lev = self._exchange_max_lev()
         lev = min(lev, self.leverage, exchange_max_lev)
@@ -940,19 +952,21 @@ class FuturesTrader:
                 tp3 = round(tp3 + delta, 6)
             notional = qty * fill_price
 
-        self.position       = pos_side
-        self.entry_price    = fill_price
-        self.sl             = sl
-        self.tp1            = tp1
-        self.tp2            = tp2
-        self.tp3            = tp3
-        self.tp2_hit        = False
-        self._open_notional = notional
-        self._open_leverage = lev
-        self._protection_ok = (
+        self.position         = pos_side
+        self.entry_price      = fill_price
+        self.sl               = sl
+        self.tp1              = tp1
+        self.tp2              = tp2
+        self.tp3              = tp3
+        self.tp2_hit          = False
+        self._open_notional   = notional
+        self._open_leverage   = lev
+        self._open_margin     = notional / lev if lev > 0 else notional
+        self._open_entry_mode = entry_mode
+        self._protection_ok   = (
             confirmed_positions is not None and len(confirmed_positions) > 0
         ) if not self.dry_run else True
-        self.trade_count   += 1
+        self.trade_count += 1
 
         save_position(self.symbol, {
             "side":        self.position,
@@ -964,6 +978,7 @@ class FuturesTrader:
             "tp2_hit":     self.tp2_hit,
             "usdc_amount": notional,
             "leverage":    lev,
+            "entry_mode":  entry_mode,
         })
 
         if global_risk:
@@ -1024,8 +1039,15 @@ class FuturesTrader:
                             symbol=self.symbol, side=self.position,
                             price=price, tp_level=2, ratio=TP2_PARTIAL_RATIO,
                         )
+                        # TP2 parcial: notificar DecisionEngine (cierre parcial = TP)
+                        await self._on_position_closed(
+                            pnl_pct=((price - self.entry_price) / self.entry_price)
+                                    * (1 if is_long else -1) * 100,
+                            reason="TP2",
+                        )
                         remaining_notional = self._open_notional * (1 - TP2_PARTIAL_RATIO)
                         self._open_notional = remaining_notional
+                        self._open_margin   = remaining_notional / self._open_leverage if self._open_leverage > 0 else remaining_notional
                         remaining_qty = self._round_qty(remaining_notional / self.entry_price)
                         if remaining_qty > 0 and (self.tp3 or self.sl):
                             try:
@@ -1090,7 +1112,8 @@ class FuturesTrader:
                 "(probablemente por trigger). Limpiando estado local.",
                 self.symbol, close_reason,
             )
-            await self._on_position_closed(pnl_pct=0.0)
+            pnl_pct_est = 0.0
+            await self._on_position_closed(pnl_pct=pnl_pct_est, reason=close_reason)
             self._clear_position_state()
             clear_position(self.symbol)
             return
@@ -1133,7 +1156,7 @@ class FuturesTrader:
         entry_copy = self.entry_price
         pos_copy   = self.position
 
-        await self._on_position_closed(pnl_pct)
+        await self._on_position_closed(pnl_pct=pnl_pct, reason=close_reason)
         self._clear_position_state()
         clear_position(self.symbol)
 
