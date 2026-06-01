@@ -248,4 +248,18 @@ class PairScanner:
                         # Fallback: firma antigua callback(new_pairs)
                         logger.warning(
                             "[PairScanner] Callback con firma antigua — "
-                            "traders salientes no esperaran
+                            "traders salientes no esperaran al ciclo siguiente"
+                        )
+                        await on_update_callback(new_pairs)
+                else:
+                    logger.info("✅ Sin cambios en pares activos")
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("[PairScanner] Error en run_scanner_loop: %s", e, exc_info=True)
+
+
+class _HLExchangeStub:
+    """Stub mínimo para satisfacer referencias a self.exchange en PairScanner."""
+    pass
