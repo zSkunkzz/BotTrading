@@ -1,20 +1,10 @@
 """
 position_manager.py — Gestión de posición abierta.
 
-MEJORAS v3:
-  #1 Trailing stop escalonado:
-     - Al tocar TP1 → SL sube a breakeven (entry_price)
-     - Al tocar TP2 → SL sube a TP1 (lock-in parcial)
-     - Trailing dinámico por callback_pct si risk.trailing_sl=True
-  #2 Pesos diferenciados por TF → en signal_engine.py
-  #3 Filtro ADX anti-chop → en signal_engine.py
-
-FIX: global_risk.register_close() se llama al cerrar para decrementar
-     el contador de posiciones abiertas. Sin esto el bot queda bloqueado
-     permanentemente tras MAX_CONCURRENT_TRADES cierres.
-
-FIX: pretrade_risk.register_close usa _open_margin (margen real) en vez
-     de _open_notional (notional bruto) para ser consistente con check().
+MEJORAS v4:
+  BUG #1 FIX: Guard managed_by_trader para evitar doble gestión con trader.py
+  BUG #2 FIX: qty post-TP1 actualizada desde exchange antes de _place_tpsl
+  BUG #3 FIX: adopt_orphan() para posiciones huérfanas al rotar PairScanner
 
 Responsabilidades:
   - Detectar TP2 parcial
@@ -29,6 +19,7 @@ Responsabilidades:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -45,12 +36,19 @@ TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 TRAILING_BE       = os.getenv("TRAILING_BE",       "true").lower() != "false"  # SL→BE en TP1
 TRAILING_TP1_LOCK = os.getenv("TRAILING_TP1_LOCK", "true").lower() != "false"  # SL→TP1 en TP2
 
+# SL de emergencia para posiciones huérfanas adoptadas: % desde entry
+_ORPHAN_SL_PCT = float(os.getenv("ORPHAN_SL_PCT", "3.0"))
+
 
 class PositionManager:
     """
     Gestiona el ciclo de vida de una posición abierta para un símbolo.
     No hace llamadas HTTP directas — recibe el trader como contexto
     para poder colocar órdenes de cierre.
+
+    BUG #1 FIX: si el trader ya gestiona la posición internamente (trader.py
+    tiene su propio loop de TP/SL desde v3), el método manage() puede recibir
+    managed_by_trader=True para saltar los bloques que duplicarían acciones.
     """
 
     def __init__(self, symbol: str):
@@ -64,13 +62,19 @@ class PositionManager:
         price: float,
         risk,
         global_risk=None,
+        managed_by_trader: bool = True,  # BUG #1 FIX: default True porque trader.py v3 ya gestiona
     ) -> None:
         """
         Evalúa la posición abierta y actúa según precio actual.
-        Modifica directamente el estado del trader (position, sl, tp*, tp2_hit).
 
-        global_risk: instancia de GlobalRisk para decrementar al cerrar.
-                     Opcional para compatibilidad retroactiva.
+        managed_by_trader=True (default): trader.py ya gestiona SL/TP en su
+        propio _manage_open_position loop — este método solo actualiza el
+        trailing stop en memoria y libera recursos al cerrar externamente.
+        No coloca órdenes ni cierra posiciones para evitar duplicados.
+
+        managed_by_trader=False: modo legacy donde PositionManager es el
+        responsable único de gestionar la posición (compatible con código
+        anterior que no use trader.py v3+).
         """
         if trader.position is None or trader.entry_price is None:
             return
@@ -79,11 +83,10 @@ class PositionManager:
         is_long  = trader.position == "long"
         entry_px = trader.entry_price
 
-        pnl_pct = (
-            (price - entry_px) / entry_px
-        ) * (1 if is_long else -1) * 100
-
         # ── #1 Trailing stop escalonado ───────────────────────────────────────
+        # Se ejecuta siempre (actualiza estado en memoria), pero solo mueve el SL
+        # del exchange cuando managed_by_trader=False para evitar conflicto con
+        # el SL que ya colocó trader.py.
         if TRAILING_BE and trader.tp1 and trader.sl is not None:
             tp1_reached = (
                 (is_long  and price >= trader.tp1)
@@ -91,22 +94,7 @@ class PositionManager:
             )
             if tp1_reached and not self._be_activated.get(sym, False):
                 be_sl = entry_px
-                if is_long and be_sl > trader.sl:
-                    old_sl = trader.sl
-                    trader.sl = be_sl
-                    self._be_activated[sym] = True
-                    logger.info(
-                        "[%s] 🔒 SL → breakeven %.4f (era %.4f, TP1 tocado)",
-                        sym, trader.sl, old_sl,
-                    )
-                    save_position(sym, {
-                        "sl": trader.sl,
-                        "tp1": trader.tp1, "tp2": trader.tp2, "tp3": trader.tp3,
-                        "tp2_hit": trader.tp2_hit,
-                        "entry_price": entry_px,
-                        "position": trader.position,
-                    })
-                elif not is_long and be_sl < trader.sl:
+                if (is_long and be_sl > trader.sl) or (not is_long and be_sl < trader.sl):
                     old_sl = trader.sl
                     trader.sl = be_sl
                     self._be_activated[sym] = True
@@ -129,7 +117,7 @@ class PositionManager:
             )
             if tp2_reached_for_lock and not self._tp1_lock_activated.get(sym, False):
                 lock_sl = trader.tp1
-                if is_long and lock_sl > trader.sl:
+                if (is_long and lock_sl > trader.sl) or (not is_long and lock_sl < trader.sl):
                     old_sl = trader.sl
                     trader.sl = lock_sl
                     self._tp1_lock_activated[sym] = True
@@ -144,21 +132,10 @@ class PositionManager:
                         "entry_price": entry_px,
                         "position": trader.position,
                     })
-                elif not is_long and lock_sl < trader.sl:
-                    old_sl = trader.sl
-                    trader.sl = lock_sl
-                    self._tp1_lock_activated[sym] = True
-                    logger.info(
-                        "[%s] 🔒 SL → TP1 %.4f (era %.4f, TP2 tocado)",
-                        sym, trader.sl, old_sl,
-                    )
-                    save_position(sym, {
-                        "sl": trader.sl,
-                        "tp1": trader.tp1, "tp2": trader.tp2, "tp3": trader.tp3,
-                        "tp2_hit": trader.tp2_hit,
-                        "entry_price": entry_px,
-                        "position": trader.position,
-                    })
+
+        # ── Si trader.py gestiona la posición, no duplicar órdenes ────────────
+        if managed_by_trader:
+            return
 
         # ── TP2 parcial ───────────────────────────────────────────────────────
         if trader.tp2 and not trader.tp2_hit:
@@ -170,16 +147,20 @@ class PositionManager:
                 trader.tp2_hit = True
                 mark_tp2_hit(sym)
 
+                # BUG #2 FIX: obtener qty real restante del exchange
+                remaining_qty = await self._get_remaining_qty(trader)
+
                 open_notional = trader._open_notional or 0.0
-                if entry_px and entry_px > 0 and open_notional > 0:
+                if remaining_qty > 0:
+                    partial_qty = round(remaining_qty * TP2_PARTIAL_RATIO, 6)
+                elif entry_px and entry_px > 0 and open_notional > 0:
                     partial_qty = round(
                         (open_notional / entry_px) * TP2_PARTIAL_RATIO, 6
                     )
                 else:
                     logger.warning(
-                        "[%s] TP2 parcial: entry_price=%.6f o notional=%.2f inválidos — "
-                        "saltando parcial para evitar ZeroDivisionError.",
-                        sym, entry_px or 0.0, open_notional,
+                        "[%s] TP2 parcial: qty=0 y entry_price/notional inválidos — saltando.",
+                        sym,
                     )
                     partial_qty = 0
 
@@ -208,14 +189,21 @@ class PositionManager:
                             sym, trader.position, price, trader.tp2, partial_qty
                         )
 
-                        remaining_notional = open_notional * (1 - TP2_PARTIAL_RATIO)
-                        remaining_qty = round(remaining_notional / entry_px, 6) if entry_px > 0 else 0
-                        if remaining_qty > 0 and (trader.tp3 or trader.sl):
+                        # BUG #2 FIX: actualizar _open_qty con qty real post-parcial
+                        post_qty = await self._get_remaining_qty(trader)
+                        if post_qty > 0:
+                            trader._open_qty = post_qty
+                            logger.info(
+                                "[%s] _open_qty actualizada post-TP2: %.6f (desde exchange)",
+                                sym, post_qty,
+                            )
+
+                        if post_qty > 0 and (trader.tp3 or trader.sl):
                             try:
-                                await trader._place_tpsl(remaining_qty, trader.sl, trader.tp3)
+                                await trader._place_tpsl(post_qty, trader.sl, trader.tp3)
                                 logger.info(
                                     "[%s] TP/SL re-colocados para qty restante=%.6f",
-                                    sym, remaining_qty,
+                                    sym, post_qty,
                                 )
                             except Exception as e:
                                 logger.warning(
@@ -301,9 +289,6 @@ class PositionManager:
             (fill_price - entry_px) / entry_px
         ) * (1 if is_long else -1) * 100
 
-        # FIX: usar _open_margin (margen real) para register_close, consistente
-        # con confirm_order que registró el notional dividido por leverage.
-        # Fallback a _open_notional si _open_margin no existe (versión anterior).
         open_margin = getattr(trader, "_open_margin", None) or trader._open_notional
         pnl_usd = (pnl_pct_final / 100) * (trader._open_notional or open_margin)
 
@@ -315,13 +300,11 @@ class PositionManager:
             sym, close_reason, fill_price, pnl_usd, pnl_pct_final,
         )
 
-        # Liberar exposición en pretrade_risk
         try:
             pretrade_risk.register_close(sym, open_margin)
         except Exception as e:
             logger.warning("[%s] pretrade_risk.register_close error: %s", sym, e)
 
-        # FIX: decrementar global_risk al cerrar
         if global_risk:
             try:
                 await global_risk.register_close(pnl_pct_final, symbol=sym)
@@ -345,6 +328,124 @@ class PositionManager:
             reason=close_reason,
         )
 
+    # ── BUG #2 FIX: obtener qty real restante del exchange ────────────────────
+
+    async def _get_remaining_qty(self, trader) -> float:
+        """
+        Consulta la qty real de la posición en el exchange.
+        Actualiza trader._open_qty si el valor es válido.
+        Devuelve 0.0 si no hay posición o hay error.
+        """
+        try:
+            positions = await trader._get_positions()
+            if positions:
+                qty = abs(float(positions[0].get("szi", 0)))
+                if qty > 0:
+                    trader._open_qty = qty
+                    return qty
+        except Exception as e:
+            logger.warning(
+                "[%s] _get_remaining_qty: error consultando exchange: %s",
+                self.symbol, e,
+            )
+        return trader._open_qty if trader._open_qty > 0 else 0.0
+
+    # ── BUG #3 FIX: adoptar posición huérfana ────────────────────────────────
+
+    async def adopt_orphan(
+        self,
+        trader,
+        pos_data: dict,
+        global_risk=None,
+    ) -> bool:
+        """
+        Adopta una posición abierta en el exchange que no tiene estado local.
+        Se llama cuando _init() detecta posición en exchange pero el fichero
+        de estado fue borrado o corrompido.
+
+        Registra la posición con SL de emergencia a _ORPHAN_SL_PCT% de entry.
+        Devuelve True si la adopción fue exitosa.
+        """
+        sym = self.symbol
+        try:
+            szi        = float(pos_data.get("szi", 0))
+            entry_px   = float(pos_data.get("entryPx") or 0)
+            raw_side   = pos_data.get("side", "")
+        except (TypeError, ValueError) as e:
+            logger.error("[%s] adopt_orphan: datos de posición inválidos: %s", sym, e)
+            return False
+
+        if abs(szi) <= 0 or entry_px <= 0:
+            logger.warning("[%s] adopt_orphan: qty=%.6f o entry=%.6f inválidos — ignorando.",
+                           sym, szi, entry_px)
+            return False
+
+        is_long   = szi > 0
+        qty       = abs(szi)
+        side_str  = "long" if is_long else "short"
+        sl_pct    = _ORPHAN_SL_PCT / 100.0
+        emergency_sl = round(
+            entry_px * (1 - sl_pct) if is_long else entry_px * (1 + sl_pct),
+            6,
+        )
+
+        logger.warning(
+            "[%s] ⚠️ Posición HUÉRFANA detectada: %s %.6f @ %.5f — "
+            "adoptando con SL de emergencia=%.5f (%.1f%% desde entry)",
+            sym, side_str, qty, entry_px, emergency_sl, _ORPHAN_SL_PCT,
+        )
+
+        trader.position       = side_str
+        trader.entry_price    = entry_px
+        trader.sl             = emergency_sl
+        trader.tp1            = None
+        trader.tp2            = None
+        trader.tp3            = None
+        trader.tp2_hit        = False
+        trader._tp1_hit       = False
+        trader._open_qty      = qty
+        trader._open_notional = qty * entry_px
+        trader._open_margin   = trader._open_notional / max(trader.leverage, 1)
+        trader._protection_ok = False
+        trader._last_tpsl_verify_at = 0.0
+
+        save_position(sym, {
+            "side":        side_str,
+            "entry":       entry_px,
+            "sl":          emergency_sl,
+            "tp1":         None,
+            "tp2":         None,
+            "tp3":         None,
+            "tp2_hit":     False,
+            "tp1_hit":     False,
+            "leverage":    trader.leverage,
+            "usdc_amount": trader._open_notional,
+            "margin_usdc": trader._open_margin,
+            "qty":         qty,
+            "entry_mode":  "orphan",
+        })
+
+        # Registrar en pretrade_risk
+        try:
+            pretrade_risk.confirm_order(sym, trader._open_margin)
+        except Exception as e:
+            logger.warning("[%s] adopt_orphan: pretrade_risk.confirm_order error: %s", sym, e)
+
+        # Colocar SL de emergencia en exchange
+        if not trader.dry_run:
+            try:
+                await trader._place_tpsl(qty=qty, sl=emergency_sl, tp=None, entry_px=entry_px)
+                trader._protection_ok = True
+                logger.info("[%s] ✅ SL de emergencia %.5f colocado en exchange.", sym, emergency_sl)
+            except Exception as e:
+                logger.error(
+                    "[%s] ❌ No se pudo colocar SL de emergencia: %s — "
+                    "_ensure_tpsl intentará reponerlo en <120s.",
+                    sym, e,
+                )
+
+        return True
+
     def _reset_trader_state(self, trader) -> None:
         """Limpia el estado en memoria y en disco del trader."""
         trader.position    = None
@@ -355,4 +456,6 @@ class PositionManager:
         trader._open_notional = 0.0
         if hasattr(trader, "_open_margin"):
             trader._open_margin = 0.0
+        if hasattr(trader, "_open_qty"):
+            trader._open_qty = 0.0
         clear_position(self.symbol)

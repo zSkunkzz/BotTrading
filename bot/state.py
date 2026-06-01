@@ -8,7 +8,9 @@ Persistencia en Railway:
   - Puedes sobreescribir con la variable de entorno STATE_FILE.
 
 Fixes:
-  - asyncio.Lock around every read/write to avoid partial-state races
+  - asyncio.Lock around every read/write to avoid partial-state races (coroutines)
+  - threading.Lock around _save_sync() to protect concurrent sync writes from
+    multiple traders running in the same event loop thread (BUG #4 FIX)
   - Atomic write via tempfile + os.replace() – no corrupt JSON on crash
   - Bug: side="" is falsy → now stored/checked with explicit None sentinel
   - Railway warning: only shown when /data is NOT a persistent volume
@@ -23,6 +25,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -31,16 +34,10 @@ log = logging.getLogger(__name__)
 _RAILWAY = os.getenv("RAILWAY_ENVIRONMENT") is not None
 
 # ── Resolver ruta del fichero de estado ───────────────────────────────────────
-# Prioridad:
-#   1. Variable de entorno STATE_FILE  (configuración explícita)
-#   2. /data/bot_state.json            (Railway Volume montado en /data)
-#   3. /tmp/bot_state.json             (fallback local/dev — ephemeral)
-
 def _resolve_state_file() -> Path:
     env_val = os.getenv("STATE_FILE", "").strip()
     if env_val:
         return Path(env_val)
-    # Si /data existe y es escribible → Railway Volume montado correctamente
     data_dir = Path("/data")
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -50,19 +47,14 @@ def _resolve_state_file() -> Path:
         return data_dir / "bot_state.json"
     except OSError:
         pass
-    # Fallback
     return Path("/tmp/bot_state.json")
 
 
 _STATE_FILE = _resolve_state_file()
 
-# ── Avisos de persistencia ─────────────────────────────────────────────────────
 if _RAILWAY:
     if str(_STATE_FILE).startswith("/data"):
-        log.info(
-            "Estado persistente en Railway Volume: %s",
-            _STATE_FILE,
-        )
+        log.info("Estado persistente en Railway Volume: %s", _STATE_FILE)
     else:
         log.warning(
             "Running on Railway: %s es EPHEMERAL y se borrará en cada redeploy. "
@@ -78,7 +70,8 @@ class BotState:
     """Holds one open position (or None) plus cumulative session stats."""
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._lock      = asyncio.Lock()      # para coroutinas
+        self._sync_lock = threading.Lock()    # BUG #4 FIX: para escrituras síncronas concurrentes
         self._position: Optional[Dict[str, Any]] = None
         self._session_pnl: float = 0.0
         self._trades: int = 0
@@ -92,7 +85,6 @@ class BotState:
             if _STATE_FILE.exists():
                 data = json.loads(_STATE_FILE.read_text())
                 pos = data.get("position")
-                # Migrate old side="" → None
                 if pos is not None and pos.get("side") == "":
                     pos["side"] = None
                 self._position = pos
@@ -103,26 +95,34 @@ class BotState:
             log.warning("Could not load state file (%s) – starting fresh.", exc)
 
     def _save_sync(self) -> None:
-        """Atomic write: write to tmp then os.replace() into final path."""
+        """
+        Atomic write: write to tmp then os.replace() into final path.
+        BUG #4 FIX: protected by threading.Lock() para evitar escrituras
+        concurrentes desde múltiples traders en el mismo hilo asyncio.
+        """
         payload = {
             "position":    self._position,
             "session_pnl": self._session_pnl,
             "trades":      self._trades,
         }
-        try:
-            _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=_STATE_FILE.parent, prefix=".bot_state_", suffix=".tmp"
-            )
+        with self._sync_lock:
             try:
-                with os.fdopen(fd, "w") as fh:
-                    json.dump(payload, fh, indent=2)
-                os.replace(tmp_path, _STATE_FILE)
-            except Exception:
-                os.unlink(tmp_path)
-                raise
-        except Exception as exc:  # noqa: BLE001
-            log.error("State save failed: %s", exc)
+                _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=_STATE_FILE.parent, prefix=".bot_state_", suffix=".tmp"
+                )
+                try:
+                    with os.fdopen(fd, "w") as fh:
+                        json.dump(payload, fh, indent=2)
+                    os.replace(tmp_path, _STATE_FILE)
+                except Exception:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
+            except Exception as exc:  # noqa: BLE001
+                log.error("State save failed: %s", exc)
 
     # ── public API (all coroutines) ────────────────────────────────────────────
 
@@ -174,6 +174,10 @@ class BotState:
             }
 
     # ── sync helpers (backward-compat layer) ──────────────────────────────────
+    # BUG #4 FIX: estas funciones son llamadas desde múltiples traders de forma
+    # síncrona (dentro del event loop). El threading.Lock en _save_sync() protege
+    # las escrituras concurrentes. No intentamos adquirir asyncio.Lock aquí
+    # para evitar deadlock (no estamos en una coroutine).
 
     def _save_position_sync(self, symbol: str, data: Dict[str, Any]) -> None:
         pos = dict(data)
