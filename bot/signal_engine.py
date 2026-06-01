@@ -40,18 +40,29 @@ log = logging.getLogger(__name__)
 # ─── Constantes exportadas ────────────────────────────────────────────────────────────────
 
 MIN_SCORE: int   = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
-MIN_RR: float    = float(os.getenv("MIN_RR_REQUIRED", "1.65"))
+# FIX: MIN_RR unificado con strategy.py (era 1.65, strategy usaba 1.8 → inconsistencia)
+MIN_RR: float    = float(os.getenv("MIN_RR_REQUIRED", "1.8"))
 
 # Parámetros de análisis técnico
 _TIMEFRAMES = ["15m", "1h", "4h"]          # se pide en orden: más rápido primero
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))   # mínimo de velas por timeframe
 
 # Parámetros de sizing/SL/TP
-# RR = TP1_ATR_MULT / SL_ATR_MULT = 2.8 / 1.5 = 1.866 → supera MIN_RR=1.65
+# RR = TP1_ATR_MULT / SL_ATR_MULT = 2.8 / 1.5 = 1.866 → supera MIN_RR=1.8
 _SL_ATR_MULT  = float(os.getenv("SL_ATR_MULT",  "1.5"))
-_TP1_ATR_MULT = float(os.getenv("TP1_ATR_MULT", "2.8"))   # era 2.5 → RR=1.67 < 1.8 (bloqueaba)
-_TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "4.5"))   # era 4.0
+_TP1_ATR_MULT = float(os.getenv("TP1_ATR_MULT", "2.8"))
+_TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "4.5"))
 _MAX_LEV      = int(os.getenv("LEVERAGE", "15"))
+
+# FIX: Zona RSI óptima para puntuar (evita entrar en sobrecompra/sobreventa)
+_RSI_LONG_MIN  = float(os.getenv("RSI_SCORE_LONG_MIN",  "40"))  # RSI mínimo para dar punto LONG
+_RSI_LONG_MAX  = float(os.getenv("RSI_SCORE_LONG_MAX",  "60"))  # RSI máximo para dar punto LONG (era 65)
+_RSI_SHORT_MIN = float(os.getenv("RSI_SCORE_SHORT_MIN", "40"))  # RSI mínimo para dar punto SHORT (era 35)
+_RSI_SHORT_MAX = float(os.getenv("RSI_SCORE_SHORT_MAX", "60"))  # RSI máximo para dar punto SHORT
+
+# FIX: Threshold de volumen real para discriminar dirección
+_VOL_DIRECTIONAL_MIN = float(os.getenv("VOL_DIRECTIONAL_MIN", "1.3"))  # vol_ratio mínimo para punto direccional
+_VOL_WEAK_MAX        = float(os.getenv("VOL_WEAK_MAX",        "0.8"))  # vol_ratio por debajo = señal débil
 
 
 # ─── SignalResult ────────────────────────────────────────────────────────────────────
@@ -126,7 +137,15 @@ async def analyze_pair(
         return _hold_result(symbol, f"NEUTRAL (score={score}/{max_score})")
 
     # ── Precio actual y ATR ────────────────────────────────────────────────────
-    entry   = float(bars_15m[-1][4])   # close de la última vela 15m
+    # FIX: usa mid-candle ((high+low)/2) en vez del close para no entrar al techo
+    # de una vela extendida. Si la vela es pequeña, la diferencia es mínima.
+    # El close sigue disponible en indicators para otros usos.
+    last_bar = bars_15m[-1]
+    close_price = float(last_bar[4])
+    high_price  = float(last_bar[2])
+    low_price   = float(last_bar[3])
+    entry = round((high_price + low_price) / 2, 8)
+
     atr_val = float(ind_15m.get("atr", 0) or 0)
 
     if atr_val <= 0:
@@ -160,8 +179,8 @@ async def analyze_pair(
     is_valid = score >= MIN_SCORE and rr >= MIN_RR
 
     log.info(
-        "[signal_engine] %s %s score=%d/%d RR=%.2f entry=%.4f sl=%.4f tp1=%.4f atr=%.4f valid=%s",
-        symbol, signal_str, score, max_score, rr, entry, sl, tp1, atr_val, is_valid,
+        "[signal_engine] %s %s score=%d/%d RR=%.2f entry=%.6f (mid) close=%.6f sl=%.6f tp1=%.6f atr=%.6f valid=%s",
+        symbol, signal_str, score, max_score, rr, entry, close_price, sl, tp1, atr_val, is_valid,
     )
 
     return SignalResult(
@@ -219,6 +238,9 @@ def _compute_indicators(bars: list) -> dict:
     avg_vol = sum(vols[-20:]) / 20 if len(vols) >= 20 else (sum(vols) / len(vols) if vols else 1)
     vol_ratio = round(vols[-1] / avg_vol, 3) if avg_vol > 0 else 1.0
 
+    # FIX: añadir price_dir para que el scoring de volumen pueda discriminar dirección
+    price_dir = "rising" if len(closes) >= 2 and closes[-1] > closes[-2] else "falling"
+
     return {
         "ema21":     ema21[-1] if ema21 else None,
         "ema50":     ema50[-1] if ema50 else None,
@@ -233,6 +255,7 @@ def _compute_indicators(bars: list) -> dict:
         "st_bear":   st_dir == -1,
         "atr":       atr14,
         "vol_ratio": vol_ratio,
+        "price_dir": price_dir,
         "close":     closes[-1],
     }
 
@@ -251,8 +274,12 @@ def _score_signal(
       4h:  EMA(1) + MACD(1)                                    = 2 pts
     Total max = 10
 
-    La dirección (LONG/SHORT) se decide por mayoría ponderada.
-    Si los timeframes mayores (1h/4h) contradicen el 15m → NEUTRAL.
+    Cambios v2:
+      - RSI solo puntúa en zona óptima (40-60), no puntúa en sobrecompra/sobreventa
+      - VOL puntúa de forma DIRECCIONAL: vol fuerte (>=1.3) con precio en la misma
+        dirección da punto a esa dirección. Vol débil (<0.8) penaliza ambas (no suma).
+      - La dirección (LONG/SHORT) se decide por mayoría ponderada.
+      - Si los timeframes mayores (1h/4h) contradicen el 15m → NEUTRAL.
     """
     max_score = 10
     long_pts  = 0
@@ -267,16 +294,44 @@ def _score_signal(
     if i15.get("st_bull"):   long_pts  += 1; reasons.append("ST15m↑")
     if i15.get("st_bear"):   short_pts += 1; reasons.append("ST15m↓")
 
+    # FIX: RSI solo puntúa en zona óptima 40-60 (antes: LONG si <65, SHORT si >35)
+    # Zona 40-60 = momentum presente pero sin sobreextensión
     rsi15 = i15.get("rsi_val")
     if rsi15 is not None:
-        if rsi15 < 65:   long_pts  += 1; reasons.append(f"RSI15m={rsi15:.0f}<65")
-        elif rsi15 > 35: short_pts += 1; reasons.append(f"RSI15m={rsi15:.0f}>35")
+        if _RSI_LONG_MIN <= rsi15 <= _RSI_LONG_MAX:
+            long_pts  += 1
+            reasons.append(f"RSI15m={rsi15:.0f} zona optima LONG")
+        elif _RSI_SHORT_MIN <= rsi15 <= _RSI_SHORT_MAX:
+            # Solo puntúa SHORT si en zona óptima Y no ya contabilizado como LONG
+            # (el rango es el mismo, pero la dirección la decide el contexto global)
+            short_pts += 1
+            reasons.append(f"RSI15m={rsi15:.0f} zona optima SHORT")
+        elif rsi15 > 70:
+            reasons.append(f"RSI15m={rsi15:.0f} sobrecompra — no puntúa")
+        elif rsi15 < 30:
+            reasons.append(f"RSI15m={rsi15:.0f} sobreventa — no puntúa")
+        else:
+            reasons.append(f"RSI15m={rsi15:.0f} zona neutra — no puntúa")
 
-    vol15 = i15.get("vol_ratio", 1.0)
-    if vol15 >= 1.0:
-        long_pts  += 1
-        short_pts += 1
-        reasons.append(f"Vol15m={vol15:.1f}x")
+    # FIX: VOL direccional en lugar de punto gratis a ambas direcciones
+    # - vol_ratio >= 1.3 con precio en tendencia → punto para esa dirección
+    # - vol_ratio < 0.8 → vol débil, no puntúa nadie
+    # - vol_ratio entre 0.8 y 1.3 → volumen normal, no puntúa (neutro)
+    vol15     = i15.get("vol_ratio", 1.0)
+    price_dir = i15.get("price_dir", "unknown")
+    if vol15 >= _VOL_DIRECTIONAL_MIN:
+        if price_dir == "rising":
+            long_pts  += 1
+            reasons.append(f"Vol15m={vol15:.1f}x subiendo ↑")
+        elif price_dir == "falling":
+            short_pts += 1
+            reasons.append(f"Vol15m={vol15:.1f}x bajando ↓")
+        else:
+            reasons.append(f"Vol15m={vol15:.1f}x sin dir clara")
+    elif vol15 < _VOL_WEAK_MAX:
+        reasons.append(f"Vol15m={vol15:.1f}x débil — no puntúa")
+    else:
+        reasons.append(f"Vol15m={vol15:.1f}x normal — no puntúa")
 
     # ── 1h (peso = 3) ────────────────────────────────────────────────────────────────────
     if i1h:
@@ -350,7 +405,7 @@ def format_signal_block(signal: Optional[SignalResult]) -> str:
     ]
     if signal.entry:
         lines.append(
-            f"Entry: `{signal.entry}` | SL: `{signal.sl}` | TP1: `{signal.tp1}` | TP2: `{signal.tp2}`"
+            f"Entry: `{signal.entry}` (mid-candle) | SL: `{signal.sl}` | TP1: `{signal.tp1}` | TP2: `{signal.tp2}`"
         )
     if signal.reason:
         lines.append(f"_{signal.reason}_")

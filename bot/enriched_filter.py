@@ -11,8 +11,8 @@ Variables de entorno:
   EF_FUNDING_LONG_MAX       : funding máximo para entrar LONG (default 0.05 % por 8h)
   EF_FUNDING_SHORT_MIN      : funding mínimo para entrar SHORT (default -0.05 % por 8h)
   EF_OI_DELTA_STRONG        : delta OI a partir del cual se considera movimiento fuerte (default 5.0 %)
-  EF_RSI_OVERBOUGHT         : RSI por encima del cual no se abren LONG (default 70)
-  EF_RSI_OVERSOLD           : RSI por debajo del cual no se abren SHORT (default 30)
+  EF_RSI_OVERBOUGHT         : RSI por encima del cual no se abren LONG (default 65)  ← bajado de 70
+  EF_RSI_OVERSOLD           : RSI por debajo del cual no se abren SHORT (default 35)
   EF_VOL_RATIO_MIN          : vol_ratio mínimo para confirmar señal (default 0.7)
   EF_NEWS_BEARISH_MAX       : máximo de noticias bearish para permitir LONG (default 2)
   EF_NEWS_BULLISH_MAX       : máximo de noticias bullish para permitir SHORT (default 2)
@@ -43,8 +43,10 @@ FG_GREED_THRESHOLD   = int(float(os.getenv("EF_FG_GREED_THRESHOLD",   "80")))
 FUNDING_LONG_MAX     = float(os.getenv("EF_FUNDING_LONG_MAX",  "0.05"))   # % per 8h
 FUNDING_SHORT_MIN    = float(os.getenv("EF_FUNDING_SHORT_MIN", "-0.05"))  # % per 8h
 OI_DELTA_STRONG      = float(os.getenv("EF_OI_DELTA_STRONG",   "5.0"))   # %
-RSI_OVERBOUGHT       = float(os.getenv("EF_RSI_OVERBOUGHT",    "70"))
-RSI_OVERSOLD         = float(os.getenv("EF_RSI_OVERSOLD",      "30"))
+# FIX: RSI_OVERBOUGHT bajado de 70 a 65 — bloquea entradas LONG cuando el mercado
+# ya está caliente. Alineado con la zona óptima del scoring (<=60).
+RSI_OVERBOUGHT       = float(os.getenv("EF_RSI_OVERBOUGHT",    "65"))
+RSI_OVERSOLD         = float(os.getenv("EF_RSI_OVERSOLD",      "35"))
 VOL_RATIO_MIN        = float(os.getenv("EF_VOL_RATIO_MIN",     "0.7"))
 NEWS_BEARISH_MAX     = int(float(os.getenv("EF_NEWS_BEARISH_MAX",  "2")))
 NEWS_BULLISH_MAX     = int(float(os.getenv("EF_NEWS_BULLISH_MAX",  "2")))
