@@ -1,1 +1,241 @@
-"""\ndecision_engine.py — Toma de decisiones de trading.\n\nResponsabilidades:\n  - Obtener precio y OHLCV\n  - Verificar balance y risk pre-trade\n  - Llamar a decide() + ai_decide()\n  - Calcular qty y apalancamiento\n  - Abrir posición y persistir estado\n  - Notificar apertura via Telegram\n\nExtraído de FuturesTrader._iteration en trader.py.\n"""\nfrom __future__ import annotations\n\nimport logging\nimport os\n\nfrom bot.strategy import decide\nfrom bot.ai_trader import ai_decide\nfrom bot.telegram_bot import notify_open\nfrom bot.state import save_position\nfrom bot.balance_service import balance_svc\nfrom bot.pretrade_risk import pretrade_risk\nfrom bot.kill_switch import kill_switch\n\nlogger = logging.getLogger("DecisionEngine")\n\n\nclass DecisionEngine:\n    """\n    Encapsula la lógica de decisión de entrada al mercado.\n    Recibe el trader como contexto para acceder a precio, OHLCV y órdenes.\n    """\n\n    def __init__(self, symbol: str):\n        self.symbol = symbol\n\n    async def evaluate(\n        self,\n        trader,\n        risk,\n        global_risk=None,\n    ) -> None:\n        """\n        Evalúa si se debe abrir una posición. Si la decisión es BUY/SELL,\n        coloca la orden y actualiza el estado del trader.\n        """\n        if kill_switch.is_halted(self.symbol):\n            logger.debug("[%s] Kill switch activo — skip.", self.symbol)\n            return\n\n        # ── Verificaciones previas ────────────────────────────────────────────\n        if global_risk:\n            allowed, reason = await global_risk.can_open()\n            if not allowed:\n                logger.debug("[%s] GlobalRisk: %s", self.symbol, reason)\n                return\n\n        balance = await trader.get_balance()\n        if balance is not None and balance < risk.usdc_per_trade:\n            logger.warning(\n                "[%s] Balance insuficiente (%.2f < %.2f USDC).",\n                self.symbol, balance, risk.usdc_per_trade,\n            )\n            return\n\n        # ── Señal de estrategia ───────────────────────────────────────────────\n        # Necesitamos precio + señal antes del pretrade_risk para pasar los\n        # parámetros correctos (side, notional, price, sl, ask, bid, leverage).\n        try:\n            price = await trader.get_price()\n        except Exception as e:\n            logger.warning("[%s] No se pudo obtener precio: %s", self.symbol, e)\n            return\n\n        try:\n            exch     = await trader._get_ccxt()\n            decision = await decide(\n                exch=exch,\n                symbol=self.symbol,\n                ai_decide_fn=ai_decide,\n                has_open_position=False,\n                current_pnl=None,\n            )\n        except Exception as e:\n            logger.error("[%s] decide() error: %s", self.symbol, e)\n            return\n\n        action = decision.get("action", "HOLD")\n        signal = decision.get("signal")\n        if action not in ("BUY", "SELL"):\n            return\n\n        # ── Calcular parámetros de la orden ───────────────────────────────────\n        if signal:\n            entry = signal.entry or price\n            sl    = signal.sl\n            tp1   = signal.tp1\n            tp2   = signal.tp2\n            tp3   = getattr(signal, "tp3", None)\n            lev   = signal.suggested_lev or trader.leverage\n        else:\n            entry = price\n            sl = tp1 = tp2 = tp3 = None\n            lev = trader.leverage\n\n        lev = min(int(lev), trader.leverage)\n        notional = risk.usdc_per_trade * lev\n        side_str = "buy" if action == "BUY" else "sell"\n\n        # ── Pre-trade risk con parámetros correctos ───────────────────────────\n        # FIX #1: llamada con firma completa (side, notional, price, balance,\n        #         sl, leverage) y desempaquetado de la tupla (ok, reason).\n        try:\n            # Obtener ask/bid del orderbook para el check de spread\n            ask = bid = None\n            try:\n                from bot.ws_feed import ws_feed\n                ob = ws_feed.get_orderbook_metrics(trader.coin)\n                if ob:\n                    ask = ob.get("ask")\n                    bid = ob.get("bid")\n            except Exception:\n                pass\n\n            ok, reason = await pretrade_risk.check(\n                symbol=self.symbol,\n                side=side_str,\n                notional=notional,\n                price=entry,\n                balance=balance,\n                sl=sl,\n                ask=ask,\n                bid=bid,\n                leverage=lev,\n            )\n            if not ok:\n                logger.debug("[%s] pretrade_risk bloqueó la entrada: %s", self.symbol, reason)\n                return\n        except Exception as e:\n            logger.debug("[%s] pretrade_risk error (ignorando): %s", self.symbol, e)\n\n        if lev != trader.leverage:\n            await trader._set_leverage(lev)\n\n        # FIX: respetar szDecimals del coin\n        qty = trader._round_qty(notional / entry)\n        if qty <= 0:\n            logger.warning("[%s] qty calculada <= 0 tras redondeo szDecimals, skip.", self.symbol)\n            return\n\n        logger.info(\n            "[%s] 📈 Abriendo %s · qty=%s · entry=~%s · sl=%s · tp1=%s | %s",\n            self.symbol, action, qty, round(entry, 4),\n            round(sl, 4) if sl else "N/A",\n            round(tp1, 4) if tp1 else "N/A",\n            decision.get("reason", ""),\n        )\n\n        # ── Ejecutar orden ────────────────────────────────────────────────────\n        result = (\n            {"status": "ok", "_fill_price": entry}\n            if trader.dry_run\n            else await trader._place_order(side_str, qty, sl=sl, tp=tp1)\n        )\n\n        if result.get("status") != "ok":\n            return\n\n        try:\n            fill_price = float(\n                result.get("response", {}).get("data", {}).get("statuses", [{}])[0]\n                .get("filled", {}).get("avgPx") or entry\n            )\n        except Exception:\n            fill_price = entry\n\n        if fill_price and fill_price != entry:\n            qty = trader._round_qty(notional / fill_price)\n            logger.debug(\n                "[%s] Fill real: %.4f (estimado: %.4f) — qty ajustada a %s",\n                self.symbol, fill_price, entry, qty,\n            )\n\n        # ── Actualizar estado del trader ──────────────────────────────────────\n        trader.position       = "long" if action == "BUY" else "short"\n        trader.entry_price    = fill_price\n        trader.sl             = sl\n        trader.tp1            = tp1\n        trader.tp2            = tp2\n        trader.tp3            = tp3\n        trader.tp2_hit        = False\n        trader._open_notional = notional\n        trader._open_leverage = lev\n        trader._protection_ok = False\n        trader.trade_count   += 1\n\n        # FIX #2: registrar exposición en pretrade_risk tras fill confirmado\n        try:\n            pretrade_risk.confirm_order(self.symbol, notional)\n        except Exception as e:\n            logger.warning("[%s] pretrade_risk.confirm_order error: %s", self.symbol, e)\n\n        save_position(self.symbol, {\n            "side":        trader.position,\n            "entry":       trader.entry_price,\n            "sl":          trader.sl,\n            "tp1":         trader.tp1,\n            "tp2":         trader.tp2,\n            "tp3":         trader.tp3,\n            "tp2_hit":     trader.tp2_hit,\n            "usdc_amount": notional,\n            "leverage":    lev,\n        })\n\n        if global_risk:\n            await global_risk.register_open()\n\n        await notify_open(\n            symbol=self.symbol,\n            side=trader.position,\n            entry=trader.entry_price,\n            sl=trader.sl,\n            tp1=trader.tp1,\n            tp2=trader.tp2,\n            size_usdc=notional,\n            leverage=lev,\n            signal_block=decision.get("signal_block", ""),\n            ai_used=decision.get("ai_used", False),\n            ai_confidence=decision.get("ai_confidence", 0),\n        )\n
+"""
+decision_engine.py — Toma de decisiones de trading.
+
+Responsabilidades:
+  - Obtener precio y OHLCV
+  - Verificar balance y risk pre-trade
+  - Llamar a decide() + ai_decide()
+  - Calcular qty y apalancamiento
+  - Abrir posición y persistir estado
+  - Notificar apertura via Telegram
+
+Extraído de FuturesTrader._iteration en trader.py.
+"""
+from __future__ import annotations
+
+import logging
+import os
+
+from bot.strategy import decide
+from bot.ai_trader import ai_decide
+from bot.telegram_bot import notify_open
+from bot.state import save_position
+from bot.balance_service import balance_svc
+from bot.pretrade_risk import pretrade_risk
+from bot.kill_switch import kill_switch
+from bot.signal_cooldown import signal_cooldown
+
+logger = logging.getLogger("DecisionEngine")
+
+
+class DecisionEngine:
+    """
+    Encapsula la lógica de decisión de entrada al mercado.
+    Recibe el trader como contexto para acceder a precio, OHLCV y órdenes.
+    """
+
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+
+    async def evaluate(
+        self,
+        trader,
+        risk,
+        global_risk=None,
+    ) -> None:
+        """
+        Evalúa si se debe abrir una posición. Si la decisión es BUY/SELL,
+        coloca la orden y actualiza el estado del trader.
+        """
+        if kill_switch.is_halted(self.symbol):
+            logger.debug("[%s] Kill switch activo — skip.", self.symbol)
+            return
+
+        # FIX cooldown: no reabrir hasta nueva vela 15m tras cierre
+        if signal_cooldown.is_blocked(self.symbol):
+            logger.debug(
+                "[%s] Cooldown activo — %.0fs restantes hasta reapertura.",
+                self.symbol, signal_cooldown.remaining(self.symbol),
+            )
+            return
+
+        # ── Verificaciones previas ────────────────────────────────────────────
+        if global_risk:
+            allowed, reason = await global_risk.can_open()
+            if not allowed:
+                logger.debug("[%s] GlobalRisk: %s", self.symbol, reason)
+                return
+
+        balance = await trader.get_balance()
+        if balance is not None and balance < risk.usdc_per_trade:
+            logger.warning(
+                "[%s] Balance insuficiente (%.2f < %.2f USDC).",
+                self.symbol, balance, risk.usdc_per_trade,
+            )
+            return
+
+        # ── Señal de estrategia ───────────────────────────────────────────────
+        # Necesitamos precio + señal antes del pretrade_risk para pasar los
+        # parámetros correctos (side, notional, price, sl, ask, bid, leverage).
+        try:
+            price = await trader.get_price()
+        except Exception as e:
+            logger.warning("[%s] No se pudo obtener precio: %s", self.symbol, e)
+            return
+
+        try:
+            exch     = await trader._get_ccxt()
+            decision = await decide(
+                exch=exch,
+                symbol=self.symbol,
+                ai_decide_fn=ai_decide,
+                has_open_position=False,
+                current_pnl=None,
+            )
+        except Exception as e:
+            logger.error("[%s] decide() error: %s", self.symbol, e)
+            return
+
+        action = decision.get("action", "HOLD")
+        signal = decision.get("signal")
+        if action not in ("BUY", "SELL"):
+            return
+
+        # ── Calcular parámetros de la orden ───────────────────────────────────
+        if signal:
+            entry = signal.entry or price
+            sl    = signal.sl
+            tp1   = signal.tp1
+            tp2   = signal.tp2
+            tp3   = getattr(signal, "tp3", None)
+            lev   = signal.suggested_lev or trader.leverage
+        else:
+            entry = price
+            sl = tp1 = tp2 = tp3 = None
+            lev = trader.leverage
+
+        lev = min(int(lev), trader.leverage)
+        notional = risk.usdc_per_trade * lev
+        side_str = "buy" if action == "BUY" else "sell"
+
+        # ── Pre-trade risk con parámetros correctos ───────────────────────────
+        # FIX #1: llamada con firma completa (side, notional, price, balance,
+        #         sl, leverage) y desempaquetado de la tupla (ok, reason).
+        try:
+            # Obtener ask/bid del orderbook para el check de spread
+            ask = bid = None
+            try:
+                from bot.ws_feed import ws_feed
+                ob = ws_feed.get_orderbook_metrics(trader.coin)
+                if ob:
+                    ask = ob.get("ask")
+                    bid = ob.get("bid")
+            except Exception:
+                pass
+
+            ok, reason = await pretrade_risk.check(
+                symbol=self.symbol,
+                side=side_str,
+                notional=notional,
+                price=entry,
+                balance=balance,
+                sl=sl,
+                ask=ask,
+                bid=bid,
+                leverage=lev,
+            )
+            if not ok:
+                logger.debug("[%s] pretrade_risk bloqueó la entrada: %s", self.symbol, reason)
+                return
+        except Exception as e:
+            logger.debug("[%s] pretrade_risk error (ignorando): %s", self.symbol, e)
+
+        if lev != trader.leverage:
+            await trader._set_leverage(lev)
+
+        # FIX: respetar szDecimals del coin
+        qty = trader._round_qty(notional / entry)
+        if qty <= 0:
+            logger.warning("[%s] qty calculada <= 0 tras redondeo szDecimals, skip.", self.symbol)
+            return
+
+        logger.info(
+            "[%s] 📈 Abriendo %s · qty=%s · entry=~%s · sl=%s · tp1=%s | %s",
+            self.symbol, action, qty, round(entry, 4),
+            round(sl, 4) if sl else "N/A",
+            round(tp1, 4) if tp1 else "N/A",
+            decision.get("reason", ""),
+        )
+
+        # ── Ejecutar orden ────────────────────────────────────────────────────
+        result = (
+            {"status": "ok", "_fill_price": entry}
+            if trader.dry_run
+            else await trader._place_order(side_str, qty, sl=sl, tp=tp1)
+        )
+
+        if result.get("status") != "ok":
+            return
+
+        try:
+            fill_price = float(
+                result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
+                .get("filled", {}).get("avgPx") or entry
+            )
+        except Exception:
+            fill_price = entry
+
+        if fill_price and fill_price != entry:
+            qty = trader._round_qty(notional / fill_price)
+            logger.debug(
+                "[%s] Fill real: %.4f (estimado: %.4f) — qty ajustada a %s",
+                self.symbol, fill_price, entry, qty,
+            )
+
+        # ── Actualizar estado del trader ──────────────────────────────────────
+        trader.position       = "long" if action == "BUY" else "short"
+        trader.entry_price    = fill_price
+        trader.sl             = sl
+        trader.tp1            = tp1
+        trader.tp2            = tp2
+        trader.tp3            = tp3
+        trader.tp2_hit        = False
+        trader._open_notional = notional
+        trader._open_leverage = lev
+        trader._protection_ok = False
+        trader.trade_count   += 1
+
+        # FIX #2: registrar exposición en pretrade_risk tras fill confirmado
+        try:
+            pretrade_risk.confirm_order(self.symbol, notional)
+        except Exception as e:
+            logger.warning("[%s] pretrade_risk.confirm_order error: %s", self.symbol, e)
+
+        save_position(self.symbol, {
+            "side":        trader.position,
+            "entry":       trader.entry_price,
+            "sl":          trader.sl,
+            "tp1":         trader.tp1,
+            "tp2":         trader.tp2,
+            "tp3":         trader.tp3,
+            "tp2_hit":     trader.tp2_hit,
+            "usdc_amount": notional,
+            "leverage":    lev,
+        })
+
+        if global_risk:
+            await global_risk.register_open()
+
+        await notify_open(
+            symbol=self.symbol,
+            side=trader.position,
+            entry=trader.entry_price,
+            sl=trader.sl,
+            tp1=trader.tp1,
+            tp2=trader.tp2,
+            size_usdc=notional,
+            leverage=lev,
+            signal_block=decision.get("signal_block", ""),
+            ai_used=decision.get("ai_used", False),
+            ai_confidence=decision.get("ai_confidence", 0),
+        )
