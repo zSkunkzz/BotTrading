@@ -14,6 +14,9 @@ MEJORAS v3:
        ADX calculado sobre 1h. Si ADX < ADX_MIN_THRESHOLD (default 20) → NEUTRAL
        Desactivar con ADX_FILTER=false en Railway
   #4 Cooldown diferenciado por entry_mode → signal_cooldown.py
+  #5 Sesión aiohttp persistente a nivel de módulo: evita crear/destruir
+     ClientSession en cada llamada a _fetch_ohlcv_hl (ahorro ~5-10ms/llamada
+     y evita fuga de descriptores de fichero).
 
 Modos de entrada (se exporta entry_mode en SignalResult):
   EARLY   score 5,   1h+15m alineados                         → lev 5-8x, size 50%
@@ -75,6 +78,32 @@ FUNDING_EXTREME_THRESHOLD = 0.0005
 SCORE_MAX = 10
 
 _OHLCV_SEM = asyncio.Semaphore(4)
+
+# ── Sesión HTTP persistente ────────────────────────────────────────────────────
+# Una única ClientSession por proceso: evita el overhead de crear/destruir la
+# sesión en cada llamada a _fetch_ohlcv_hl y reduce el número de file-descriptors
+# abiertos. Se inicializa de forma lazy la primera vez que se necesita.
+_http_session: Optional["aiohttp.ClientSession"] = None
+
+
+def _get_http_session() -> "aiohttp.ClientSession":
+    """Devuelve la sesión aiohttp del módulo, creándola si aún no existe."""
+    global _http_session
+    import aiohttp
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
+
+
+async def close_http_session() -> None:
+    """Cerrar la sesión al apagar el bot (llamar desde main.py en el shutdown)."""
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+        _http_session = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _norm_coin(symbol: str) -> str:
@@ -140,7 +169,6 @@ class SignalResult:
 
 async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
     import time as _time
-    import aiohttp
     import json as _json
 
     _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
@@ -152,22 +180,24 @@ async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
         "coin": coin, "interval": tf, "startTime": start, "endTime": now
     }}
 
+    import aiohttp
+    session = _get_http_session()
+
     for attempt in range(3):
         try:
             async with _OHLCV_SEM:
-                async with aiohttp.ClientSession() as s:
-                    async with s.post(
-                        f"{api_url}/info", json=payload,
-                        headers={"Content-Type": "application/json"},
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as r:
-                        if r.status == 429:
-                            wait = 2 ** attempt
-                            log.debug("[OHLCV] %s %s 429 → reintentando en %ds (intento %d/3)",
-                                      coin, tf, wait, attempt + 1)
-                            await asyncio.sleep(wait)
-                            continue
-                        data = _json.loads(await r.text())
+                async with session.post(
+                    f"{api_url}/info", json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status == 429:
+                        wait = 2 ** attempt
+                        log.debug("[OHLCV] %s %s 429 → reintentando en %ds (intento %d/3)",
+                                  coin, tf, wait, attempt + 1)
+                        await asyncio.sleep(wait)
+                        continue
+                    data = _json.loads(await r.text())
 
             if not isinstance(data, list) or len(data) == 0:
                 log.warning("[OHLCV] %s %s REST HL respuesta vacía: %s", coin, tf, str(data)[:120])
