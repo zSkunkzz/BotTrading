@@ -1,11 +1,17 @@
 """
 bot/state.py  –  Thread-safe, atomically-written position state.
 
+Persistencia en Railway:
+  - Monta un Volume en /data desde el dashboard de Railway.
+  - STATE_FILE por defecto apunta a /data/bot_state.json.
+  - Si /data no existe (local/dev), cae a /tmp automáticamente.
+  - Puedes sobreescribir con la variable de entorno STATE_FILE.
+
 Fixes:
   - asyncio.Lock around every read/write to avoid partial-state races
   - Atomic write via tempfile + os.replace() – no corrupt JSON on crash
   - Bug: side="" is falsy → now stored/checked with explicit None sentinel
-  - Railway warning: ephemeral filesystem; log once at startup
+  - Railway warning: only shown when /data is NOT a persistent volume
   - COMPAT: backward-compatible free functions (save_position, load_position,
     clear_position, mark_tp2_hit) so trader.py / position_manager.py / decision_engine.py
     can import them without changes.
@@ -22,16 +28,50 @@ from typing import Any, Dict, Optional
 
 log = logging.getLogger(__name__)
 
-_STATE_FILE = Path(os.getenv("STATE_FILE", "/tmp/bot_state.json"))
 _RAILWAY = os.getenv("RAILWAY_ENVIRONMENT") is not None
 
-# ── warn once about Railway's ephemeral FS ─────────────────────────────────────────
+# ── Resolver ruta del fichero de estado ───────────────────────────────────────
+# Prioridad:
+#   1. Variable de entorno STATE_FILE  (configuración explícita)
+#   2. /data/bot_state.json            (Railway Volume montado en /data)
+#   3. /tmp/bot_state.json             (fallback local/dev — ephemeral)
+
+def _resolve_state_file() -> Path:
+    env_val = os.getenv("STATE_FILE", "").strip()
+    if env_val:
+        return Path(env_val)
+    # Si /data existe y es escribible → Railway Volume montado correctamente
+    data_dir = Path("/data")
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        test_file = data_dir / ".write_test"
+        test_file.touch()
+        test_file.unlink()
+        return data_dir / "bot_state.json"
+    except OSError:
+        pass
+    # Fallback
+    return Path("/tmp/bot_state.json")
+
+
+_STATE_FILE = _resolve_state_file()
+
+# ── Avisos de persistencia ─────────────────────────────────────────────────────
 if _RAILWAY:
-    log.warning(
-        "Running on Railway: %s is ephemeral and will be wiped on redeploy. "
-        "Set STATE_FILE to a persistent volume path or use an external store.",
-        _STATE_FILE,
-    )
+    if str(_STATE_FILE).startswith("/data"):
+        log.info(
+            "Estado persistente en Railway Volume: %s",
+            _STATE_FILE,
+        )
+    else:
+        log.warning(
+            "Running on Railway: %s es EPHEMERAL y se borrará en cada redeploy. "
+            "Solución: crea un Volume en el dashboard de Railway y móntalo en /data "
+            "(o configura STATE_FILE a una ruta persistente).",
+            _STATE_FILE,
+        )
+else:
+    log.debug("State file: %s", _STATE_FILE)
 
 
 class BotState:
@@ -44,7 +84,7 @@ class BotState:
         self._trades: int = 0
         self._load()
 
-    # ── persistence ───────────────────────────────────────────────────────────────────────────
+    # ── persistence ───────────────────────────────────────────────────────────
 
     def _load(self) -> None:
         """Best-effort load from disk (non-blocking, called once at init)."""
@@ -84,7 +124,7 @@ class BotState:
         except Exception as exc:  # noqa: BLE001
             log.error("State save failed: %s", exc)
 
-    # ── public API (all coroutines) ─────────────────────────────────────────────────────────────────────
+    # ── public API (all coroutines) ────────────────────────────────────────────
 
     async def get_position(self) -> Optional[Dict[str, Any]]:
         async with self._lock:
@@ -133,13 +173,9 @@ class BotState:
                 "trades":      self._trades,
             }
 
-    # ── sync helpers used by backward-compat layer below ───────────────────────────────────────────────
-    # These bypass the asyncio lock intentionally: they are called from sync
-    # context (module-level imports, __init__) where no event loop is running.
-    # The lock is still used for async callers; the sync path is init-time only.
+    # ── sync helpers (backward-compat layer) ──────────────────────────────────
 
     def _save_position_sync(self, symbol: str, data: Dict[str, Any]) -> None:
-        """Write a position dict for *symbol* into self._position (sync)."""
         pos = dict(data)
         pos.setdefault("symbol", symbol)
         if pos.get("side") == "":
@@ -148,18 +184,15 @@ class BotState:
         self._save_sync()
 
     def _load_position_sync(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Return position dict if it belongs to *symbol*, else None."""
         if self._position is None:
             return None
         if self._position.get("symbol") == symbol:
             return dict(self._position)
-        # Legacy files without symbol key – return anyway
         if "symbol" not in self._position:
             return dict(self._position)
         return None
 
     def _clear_position_sync(self, symbol: str) -> None:
-        """Clear position if it belongs to *symbol*."""
         if self._position is None:
             return
         if (
@@ -170,7 +203,6 @@ class BotState:
             self._save_sync()
 
     def _mark_tp2_hit_sync(self, symbol: str) -> None:
-        """Set tp2_hit=True in the stored position for *symbol*."""
         if self._position is None:
             return
         if (
@@ -181,29 +213,23 @@ class BotState:
             self._save_sync()
 
 
-# ── module-level singleton ───────────────────────────────────────────────────────────────────────────────────
+# ── module-level singleton ─────────────────────────────────────────────────────
 bot_state = BotState()
 
 
-# ── BACKWARD-COMPATIBLE FREE FUNCTIONS ──────────────────────────────────────────────────────────────────────────────────
-# trader.py, position_manager.py and decision_engine.py call these at import
-# time and from sync context. They delegate to the singleton's sync helpers.
+# ── BACKWARD-COMPATIBLE FREE FUNCTIONS ────────────────────────────────────────
 
 def save_position(symbol: str, data: Dict[str, Any]) -> None:
-    """Persist *data* as the open position for *symbol*."""
     bot_state._save_position_sync(symbol, data)
 
 
 def load_position(symbol: str) -> Optional[Dict[str, Any]]:
-    """Return the stored position dict for *symbol*, or None."""
     return bot_state._load_position_sync(symbol)
 
 
 def clear_position(symbol: str) -> None:
-    """Erase the stored position for *symbol*."""
     bot_state._clear_position_sync(symbol)
 
 
 def mark_tp2_hit(symbol: str) -> None:
-    """Set tp2_hit=True in the persisted position for *symbol*."""
     bot_state._mark_tp2_hit_sync(symbol)
