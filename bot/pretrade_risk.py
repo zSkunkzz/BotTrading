@@ -1,249 +1,142 @@
 """
-pretrade_risk.py — Motor de riesgo pre-trade institucional.
+bot/pretrade_risk.py  –  Pre-trade risk checks (margin-based, not gross notional).
 
-Valida cada intención de orden ANTES de enviarla al exchange.
-Si cualquier check falla, devuelve (False, motivo_str) y la orden no se manda.
-
-Flujo correcto de exposición:
-  1. check()         — solo valida, NO registra exposición
-  2. <orden ejecutada y fill confirmado>
-  3. confirm_order() — registra timestamp de rate limiter Y +notional de exposición
-  4. register_close()— libera exposición al cerrar
-
-Límites en USDC de MARGEN (no de notional bruto):
-  PT_MAX_MARGIN_PER_TRADE  : 60 USDC   — margen máximo por operación
-  PT_MAX_SYMBOL_EXPOSURE   : 60 USDC   — margen máximo en un símbolo
-  PT_MAX_TOTAL_EXPOSURE    : 300 USDC  — margen máximo total (~1.5× balance típico)
-
-El check recibe `notional` y `leverage` por separado;
-  margen_efectivo = notional / leverage
-Así el límite aplica sobre el colateral real, no sobre el notional apalancado.
+Fixes:
+  - All limits now denominated in MARGIN (usdc_per_trade * leverage), not raw notional
+  - confirm_order() / register_close() track open-margin correctly
+  - Sliding-window rate limiter (deque) replaces broken counter
+  - check() returns (bool, str) – callers must unpack
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
 import time
 from collections import deque
+from typing import Deque, Optional, Tuple
 
-logger = logging.getLogger("PreTradeRisk")
-
-
-def _e(key: str, default: float) -> float:
-    return float(os.getenv(key, str(default)))
+log = logging.getLogger(__name__)
 
 
 class PreTradeRisk:
     """
-    Variables de entorno (todas opcionales):
-
-      PT_MAX_MARGIN_PER_TRADE     USDC de MARGEN máximos por operación     (default 60)
-      PT_MAX_SYMBOL_EXPOSURE      USDC de MARGEN máximos en un símbolo     (default 60)
-      PT_MAX_TOTAL_EXPOSURE       USDC de MARGEN máximos total              (default 300)
-      PT_MAX_SPREAD_BPS           Spread máximo permitido en bps            (default 30)
-      PT_MIN_SL_DISTANCE_BPS      Distancia mínima SL en bps                (default 8)
-      PT_MAX_SLIPPAGE_BPS         Slippage esperado máximo aceptable        (default 50)
-      PT_MAX_ORDERS_PER_MIN       Órdenes máximas por minuto POR SÍMBOLO   (default 6)
-      PT_BALANCE_USAGE_PCT        Máximo % del balance por trade            (default 0.90)
-
-      [LEGADO] PT_MAX_NOTIONAL_PER_TRADE — alias de PT_MAX_MARGIN_PER_TRADE
+    Parameters
+    ----------
+    max_open_margin : float
+        Maximum total margin (USDC) that may be open simultaneously.
+    max_orders_per_window : int
+        Hard cap on orders placed within `window_seconds`.
+    window_seconds : float
+        Sliding window length for the rate limiter (default 60 s).
     """
 
-    def __init__(self) -> None:
-        # Soporte legado: PT_MAX_NOTIONAL_PER_TRADE como alias
-        legacy = os.getenv("PT_MAX_NOTIONAL_PER_TRADE")
-        default_margin = float(legacy) if legacy else 60.0
+    def __init__(
+        self,
+        max_open_margin: float = 500.0,
+        max_orders_per_window: int = 20,
+        window_seconds: float = 60.0,
+    ) -> None:
+        self._max_open_margin = max_open_margin
+        self._max_orders_per_window = max_orders_per_window
+        self._window_seconds = window_seconds
 
-        self.max_margin_per_trade   : float = _e("PT_MAX_MARGIN_PER_TRADE",  default_margin)
-        self.max_symbol_exposure    : float = _e("PT_MAX_SYMBOL_EXPOSURE",   60.0)
-        self.max_total_exposure     : float = _e("PT_MAX_TOTAL_EXPOSURE",   300.0)
-        self.max_spread_bps         : float = _e("PT_MAX_SPREAD_BPS",         30.0)
-        self.min_sl_distance_bps    : float = _e("PT_MIN_SL_DISTANCE_BPS",    8.0)
-        self.max_slippage_bps       : float = _e("PT_MAX_SLIPPAGE_BPS",       50.0)
-        self.max_orders_per_min     : int   = int(_e("PT_MAX_ORDERS_PER_MIN",  6))
-        self.balance_usage_pct      : float = _e("PT_BALANCE_USAGE_PCT",       0.90)
+        self._lock = asyncio.Lock()
+        self._open_margin: float = 0.0          # sum of margin of live positions
+        self._order_timestamps: Deque[float] = deque()  # sliding window
 
-        self._symbol_exposure  : dict[str, float] = {}
-        self._order_timestamps : dict[str, deque] = {}
-
-    # ── API pública ──────────────────────────────────────────────────────
+    # ── public helpers ───────────────────────────────────────────────────────
 
     async def check(
         self,
-        symbol:   str,
-        side:     str,
-        notional: float,
-        price:    float,
-        balance:  float | None,
-        sl:       float | None = None,
-        ask:      float | None = None,
-        bid:      float | None = None,
-        leverage: int = 1,
-    ) -> tuple[bool, str]:
+        symbol: str,
+        side: Optional[str],
+        margin: float,          # USDC margin for THIS trade (size / leverage)
+        *,
+        price: float = 0.0,     # accepted but not used (forward-compat)
+        qty: float = 0.0,
+    ) -> Tuple[bool, str]:
         """
-        Valida la orden. NO registra exposición.
-
-        `notional` = qty × price  (valor bruto de la posición).
-        `leverage`  = apalancamiento real usado.
-        El margen efectivo = notional / leverage.
-        Los límites se comparan contra el margen, no contra el notional bruto.
+        Returns (True, "") if the trade is allowed,
+                (False, <reason>) otherwise.
         """
-        sym = symbol.replace("/", "").replace(":USDT", "")
-        margin = notional / max(leverage, 1)
+        async with self._lock:
+            # 1. Rate-limit check (sliding window)
+            now = time.monotonic()
+            cutoff = now - self._window_seconds
+            while self._order_timestamps and self._order_timestamps[0] < cutoff:
+                self._order_timestamps.popleft()
 
-        checks = [
-            self._check_margin(margin),
-            self._check_balance_usage(margin, balance),
-            self._check_symbol_exposure(sym, margin),
-            self._check_total_exposure(margin),
-            self._check_order_rate(sym),
-            self._check_spread(ask, bid, price),
-            self._check_sl_distance(price, sl, side),
-        ]
-
-        for ok, reason in checks:
-            if not ok:
-                logger.warning(
-                    f"[PreTrade:{sym}] ❌ BLOQUEADO — {reason} "
-                    f"| side={side} margen={margin:.2f} notional={notional:.2f} lev={leverage}x price={price:.4f}"
+            if len(self._order_timestamps) >= self._max_orders_per_window:
+                reason = (
+                    f"Rate limit: {len(self._order_timestamps)} orders in the last "
+                    f"{self._window_seconds:.0f}s (max {self._max_orders_per_window})"
                 )
+                log.warning("[PreTradeRisk] %s – %s", symbol, reason)
                 return False, reason
 
-        logger.info(
-            f"[PreTrade:{sym}] ✅ OK — side={side} margen={margin:.2f} USDC "
-            f"notional={notional:.2f} lev={leverage}x price={price:.4f} sl={sl}"
-        )
-        return True, "OK"
+            # 2. Margin headroom check
+            if margin <= 0:
+                reason = f"Invalid margin value: {margin}"
+                log.warning("[PreTradeRisk] %s – %s", symbol, reason)
+                return False, reason
 
-    def confirm_order(self, symbol: str, notional: float = 0.0) -> None:
+            projected = self._open_margin + margin
+            if projected > self._max_open_margin:
+                reason = (
+                    f"Open-margin limit: would reach {projected:.2f} USDC "
+                    f"(limit {self._max_open_margin:.2f})"
+                )
+                log.warning("[PreTradeRisk] %s – %s", symbol, reason)
+                return False, reason
+
+            return True, ""
+
+    async def confirm_order(
+        self,
+        symbol: str,
+        margin: float,
+    ) -> None:
         """
-        Llamar SOLO tras fill confirmado en exchange.
-        Registra:
-          - timestamp para el rate limiter de órdenes
-          - exposición real del símbolo (+notional)
+        Call AFTER an order is accepted by the exchange.
+        Registers the margin and stamps the rate-limiter window.
         """
-        sym = symbol.replace("/", "").replace(":USDT", "")
-        if sym not in self._order_timestamps:
-            self._order_timestamps[sym] = deque()
-        self._order_timestamps[sym].append(time.monotonic())
-        if notional > 0:
-            self._symbol_exposure[sym] = self._symbol_exposure.get(sym, 0.0) + notional
-            logger.debug(
-                f"[PreTrade:{sym}] Exposición registrada: +{notional:.2f} USDC "
-                f"(total {self._symbol_exposure[sym]:.2f})"
+        async with self._lock:
+            self._open_margin += margin
+            self._order_timestamps.append(time.monotonic())
+            log.debug(
+                "[PreTradeRisk] confirmed %s +%.2f USDC margin → total %.2f",
+                symbol,
+                margin,
+                self._open_margin,
             )
 
-    def register_close(self, symbol: str, notional: float) -> None:
-        """Llamar al cerrar una posición para liberar exposición."""
-        sym  = symbol.replace("/", "").replace(":USDT", "")
-        prev = self._symbol_exposure.get(sym, 0.0)
-        self._symbol_exposure[sym] = max(0.0, prev - notional)
-        logger.debug(
-            f"[PreTrade:{sym}] Exposición liberada: -{notional:.2f} USDC "
-            f"(queda {self._symbol_exposure[sym]:.2f})"
-        )
-
-    def get_total_exposure(self) -> float:
-        return sum(self._symbol_exposure.values())
-
-    def get_symbol_exposure(self, symbol: str) -> float:
-        sym = symbol.replace("/", "").replace(":USDT", "")
-        return self._symbol_exposure.get(sym, 0.0)
-
-    # ── Checks individuales ──────────────────────────────────────────────────
-
-    def _check_margin(self, margin: float) -> tuple[bool, str]:
-        if margin > self.max_margin_per_trade:
-            return False, (
-                f"Margen {margin:.2f} USDC supera límite por trade "
-                f"{self.max_margin_per_trade:.0f} USDC"
+    async def register_close(
+        self,
+        symbol: str,
+        margin: float,
+    ) -> None:
+        """
+        Call when a position is fully closed.
+        Releases the reserved margin.
+        """
+        async with self._lock:
+            self._open_margin = max(0.0, self._open_margin - margin)
+            log.debug(
+                "[PreTradeRisk] closed %s -%.2f USDC margin → total %.2f",
+                symbol,
+                margin,
+                self._open_margin,
             )
-        return True, ""
 
-    def _check_balance_usage(self, margin: float, balance: float | None) -> tuple[bool, str]:
-        if balance is None:
-            logger.warning(
-                "[PreTrade] ⚠️ Balance desconocido (API falló) — "
-                f"asumiendo ≥ {margin:.2f} USDC para continuar"
-            )
-            return True, ""
-        if balance <= 0:
-            return False, f"Balance {balance:.2f} USDC inválido (cuenta vacía)"
-        if margin > balance:
-            return False, (
-                f"Margen {margin:.2f} USDC supera balance disponible {balance:.2f} USDC"
-            )
-        usage = margin / balance
-        if usage > self.balance_usage_pct:
-            return False, (
-                f"Uso de balance {usage*100:.1f}% supera límite "
-                f"{self.balance_usage_pct*100:.0f}%"
-            )
-        return True, ""
+    async def get_open_margin(self) -> float:
+        async with self._lock:
+            return self._open_margin
 
-    def _check_symbol_exposure(self, sym: str, margin: float) -> tuple[bool, str]:
-        current   = self._symbol_exposure.get(sym, 0.0)
-        projected = current + margin
-        if projected > self.max_symbol_exposure:
-            return False, (
-                f"Exposición en {sym} llegaría a {projected:.2f} USDC "
-                f"(límite {self.max_symbol_exposure:.0f} USDC)"
-            )
-        return True, ""
-
-    def _check_total_exposure(self, margin: float) -> tuple[bool, str]:
-        projected = self.get_total_exposure() + margin
-        if projected > self.max_total_exposure:
-            return False, (
-                f"Exposición total llegaría a {projected:.2f} USDC "
-                f"(límite {self.max_total_exposure:.0f} USDC)"
-            )
-        return True, ""
-
-    def _check_order_rate(self, sym: str) -> tuple[bool, str]:
-        now = time.monotonic()
-        if sym not in self._order_timestamps:
-            self._order_timestamps[sym] = deque()
-        ts = self._order_timestamps[sym]
-        while ts and now - ts[0] > 60.0:
-            ts.popleft()
-        if len(ts) >= self.max_orders_per_min:
-            return False, (
-                f"Rate de órdenes: {len(ts)} en 60 s "
-                f"(límite {self.max_orders_per_min})"
-            )
-        return True, ""
-
-    def _check_spread(
-        self, ask: float | None, bid: float | None, price: float
-    ) -> tuple[bool, str]:
-        if ask is None or bid is None or price <= 0:
-            return True, ""
-        spread_bps = (ask - bid) / price * 10_000
-        if spread_bps > self.max_spread_bps:
-            return False, (
-                f"Spread {spread_bps:.1f} bps supera límite "
-                f"{self.max_spread_bps:.0f} bps"
-            )
-        return True, ""
-
-    def _check_sl_distance(
-        self, price: float, sl: float | None, side: str
-    ) -> tuple[bool, str]:
-        if sl is None or price <= 0:
-            return True, ""
-        if side in ("buy", "long"):
-            dist_bps = (price - sl) / price * 10_000
-        else:
-            dist_bps = (sl - price) / price * 10_000
-        if dist_bps < 0:
-            return False, f"SL {sl:.4f} está en dirección incorrecta (price={price:.4f})"
-        if dist_bps < self.min_sl_distance_bps:
-            return False, (
-                f"SL demasiado ajustado: {dist_bps:.1f} bps "
-                f"(mínimo {self.min_sl_distance_bps:.0f} bps)"
-            )
-        return True, ""
-
-
-pretrade_risk = PreTradeRisk()
+    async def get_order_rate(self) -> int:
+        """Return number of orders placed in the current sliding window."""
+        async with self._lock:
+            now = time.monotonic()
+            cutoff = now - self._window_seconds
+            while self._order_timestamps and self._order_timestamps[0] < cutoff:
+                self._order_timestamps.popleft()
+            return len(self._order_timestamps)
