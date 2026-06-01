@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -40,6 +41,7 @@ _CFG = {
     "max_api_reconnects":     int(os.getenv("KS_MAX_API_RECONNECTS",        "10")),
     "max_state_mismatch":     int(os.getenv("KS_MAX_STATE_MISMATCH",        "3")),
     "watchdog_interval_s":    int(os.getenv("KS_WATCHDOG_INTERVAL_S",       "30")),
+    "reject_window_orders":   int(os.getenv("KS_REJECT_WINDOW_ORDERS",      "200")),
 }
 
 
@@ -56,8 +58,10 @@ class KillSwitch:
         self._triggered_at: Optional[float] = None
         self._consec_losses: int = 0
         self._daily_pnl: float   = 0.0
-        self._order_count: int   = 0
-        self._reject_count: int  = 0
+        # FIX #2: ventana deslizante real para reject rate
+        # deque de timestamps de órdenes (todas) y de rechazadas
+        self._order_window: deque = deque()   # timestamps de las últimas N órdenes
+        self._reject_window: deque = deque()  # timestamps sólo de rechazos
         self._api_reconnects: int = 0
         self._state_mismatches: int = 0
         self._slippage_samples: list[float] = []
@@ -158,8 +162,8 @@ class KillSwitch:
             self._daily_pnl     = 0.0
             self._api_reconnects = 0
             self._state_mismatches = 0
-            self._reject_count   = 0
-            self._order_count    = 0
+            self._order_window.clear()
+            self._reject_window.clear()
             self._tpsl_retrying.clear()
             self._slippage_samples.clear()
             self._save_state()
@@ -169,31 +173,65 @@ class KillSwitch:
     # ── Registro de eventos (llamar desde trader / webhook) ───────────────────
 
     async def on_trade_result(self, pnl_pct: float):
-        """Registrar resultado de un trade (positivo = ganancia)."""
+        """
+        Registrar resultado de un trade (positivo = ganancia).
+
+        FIX #1 (TOCTOU): capturar daily y consec dentro del lock en variables
+        locales, evaluar los umbrales con esas copias fuera del lock.
+        Así si otro coroutine modifica los contadores entre el unlock y el if,
+        el check usa siempre el valor coherente de ESTE trade.
+        """
         async with self._lock:
             self._daily_pnl += pnl_pct
             if pnl_pct < 0:
                 self._consec_losses += 1
             else:
                 self._consec_losses = 0
+            # copias locales — coherentes con este update
+            daily  = self._daily_pnl
+            consec = self._consec_losses
 
-        # Evaluamos fuera del lock para poder activar con await
-        if self._daily_pnl <= -_CFG["max_daily_loss_pct"]:
-            await self.activate(3, f"Daily loss {self._daily_pnl:.2f}% ≥ límite {_CFG['max_daily_loss_pct']}%")
-        elif self._consec_losses >= _CFG["max_consec_losses"]:
-            await self.activate(1, f"{self._consec_losses} pérdidas consecutivas")
+        # Evaluamos fuera del lock con valores capturados dentro del lock
+        if daily <= -_CFG["max_daily_loss_pct"]:
+            await self.activate(3, f"Daily loss {daily:.2f}% ≥ límite {_CFG['max_daily_loss_pct']}%")
+        elif consec >= _CFG["max_consec_losses"]:
+            await self.activate(1, f"{consec} pérdidas consecutivas")
 
     async def on_order_result(self, rejected: bool):
-        """Registrar si una orden fue rechazada (para reject-rate)."""
-        async with self._lock:
-            self._order_count  += 1
-            if rejected:
-                self._reject_count += 1
-            window = max(10, self._order_count)
-            rate = self._reject_count / window
+        """
+        Registrar si una orden fue rechazada (para reject-rate).
 
-        if rate >= _CFG["max_reject_rate"] and self._order_count >= 10:
-            await self.activate(2, f"Reject rate {rate:.0%} en {self._order_count} órdenes")
+        FIX #2 (ventana deslizante real): en vez de dividir por un _order_count
+        que crece sin límite, mantenemos dos deques con timestamps de los últimos
+        KS_REJECT_WINDOW_ORDERS (default 200) eventos y calculamos la tasa sobre
+        esa ventana fija. Así el kill switch sigue siendo sensible aunque lleve
+        horas corriendo.
+        """
+        window_size = _CFG["reject_window_orders"]
+        now = time.monotonic()
+
+        async with self._lock:
+            self._order_window.append(now)
+            if rejected:
+                self._reject_window.append(now)
+
+            # Recortar ventana al tamaño máximo configurado
+            while len(self._order_window) > window_size:
+                self._order_window.popleft()
+            while len(self._reject_window) > window_size:
+                self._reject_window.popleft()
+
+            total   = len(self._order_window)
+            rejects = len(self._reject_window)
+            rate    = rejects / total if total > 0 else 0.0
+            enough  = total >= 10   # no activar con menos de 10 órdenes
+
+        if enough and rate >= _CFG["max_reject_rate"]:
+            await self.activate(
+                2,
+                f"Reject rate {rate:.0%} en ventana de {total} órdenes "
+                f"(límite {_CFG['max_reject_rate']:.0%})",
+            )
 
     async def on_slippage(self, slippage_bps: float):
         """Registrar slippage de un fill."""
@@ -266,10 +304,6 @@ class KillSwitch:
         if now_utc.hour == 0 and now_utc.minute < 1:
             self.reset_daily_pnl()
 
-        # FIX: Comprobar posiciones sin protección verificando SIEMPRE contra el exchange.
-        # El estado local (trader.position) puede ser stale por 429 u otros errores de red.
-        # Solo se dispara state_mismatch si el exchange CONFIRMA que hay posición abierta
-        # pero _protection_ok es False — nunca basándose solo en estado local.
         for symbol, trader in list(traders.items()):
             try:
                 if symbol in self._tpsl_retrying:
@@ -277,14 +311,11 @@ class KillSwitch:
                     continue
 
                 if not trader.position or trader._protection_ok:
-                    # Sin posición local o ya protegida → nada que comprobar
                     continue
 
-                # FIX: verificar en el exchange antes de disparar state_mismatch
                 exchange_positions = await trader._get_positions()
 
                 if exchange_positions is None:
-                    # Error de red — no podemos saber el estado real, ignorar este ciclo
                     logger.warning(
                         f"[{symbol}] KS watchdog: no se pudo verificar posición en exchange "
                         f"(error de red) — ignorando este ciclo para evitar falso positivo."
@@ -292,15 +323,12 @@ class KillSwitch:
                     continue
 
                 if len(exchange_positions) == 0:
-                    # No hay posición en el exchange — el estado local está stale
-                    # Limpiar el estado local silenciosamente (el trader lo hará en su propio ciclo)
                     logger.info(
                         f"[{symbol}] KS watchdog: estado local dice 'posición abierta' pero "
                         f"NO hay posición en Hyperliquid — estado local stale, skip state_mismatch."
                     )
                     continue
 
-                # Hay posición real en el exchange Y _protection_ok es False → mismatch real
                 await self.on_state_mismatch(symbol)
                 logger.warning(f"[{symbol}] ⚠️ Watchdog: posición sin protección detectada (confirmado en exchange)")
 

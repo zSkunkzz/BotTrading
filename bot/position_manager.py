@@ -9,6 +9,13 @@ MEJORAS v3:
   #2 Pesos diferenciados por TF → en signal_engine.py
   #3 Filtro ADX anti-chop → en signal_engine.py
 
+FIX: global_risk.register_close() se llama al cerrar para decrementar
+     el contador de posiciones abiertas. Sin esto el bot queda bloqueado
+     permanentemente tras MAX_CONCURRENT_TRADES cierres.
+
+FIX: pretrade_risk.register_close usa _open_margin (margen real) en vez
+     de _open_notional (notional bruto) para ser consistente con check().
+
 Responsabilidades:
   - Detectar TP2 parcial
   - Calcular y actualizar trailing stop
@@ -17,6 +24,7 @@ Responsabilidades:
   - Notificar cierres y TP parciales via Telegram
   - Cancelar trigger orders huérfanos tras cierre/parcial
   - Liberar exposición en pretrade_risk al cerrar (register_close)
+  - Decrementar global_risk al cerrar
   - Bloquear reapertura hasta nueva vela 15m tras cierre
 """
 from __future__ import annotations
@@ -34,7 +42,6 @@ logger = logging.getLogger("PositionManager")
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 
 # Trailing stop escalonado: activar o no cada nivel
-# Por defecto ambos activos. Desactivar con TRAILING_BE=false / TRAILING_TP1_LOCK=false
 TRAILING_BE       = os.getenv("TRAILING_BE",       "true").lower() != "false"  # SL→BE en TP1
 TRAILING_TP1_LOCK = os.getenv("TRAILING_TP1_LOCK", "true").lower() != "false"  # SL→TP1 en TP2
 
@@ -48,8 +55,7 @@ class PositionManager:
 
     def __init__(self, symbol: str):
         self.symbol = symbol
-        # Flags para no repetir los upgrades de SL
-        self._be_activated:      dict[str, bool] = {}
+        self._be_activated:       dict[str, bool] = {}
         self._tp1_lock_activated: dict[str, bool] = {}
 
     async def manage(
@@ -57,10 +63,14 @@ class PositionManager:
         trader,
         price: float,
         risk,
+        global_risk=None,
     ) -> None:
         """
         Evalúa la posición abierta y actúa según precio actual.
         Modifica directamente el estado del trader (position, sl, tp*, tp2_hit).
+
+        global_risk: instancia de GlobalRisk para decrementar al cerrar.
+                     Opcional para compatibilidad retroactiva.
         """
         if trader.position is None or trader.entry_price is None:
             return
@@ -74,20 +84,12 @@ class PositionManager:
         ) * (1 if is_long else -1) * 100
 
         # ── #1 Trailing stop escalonado ───────────────────────────────────────
-        #
-        # Nivel A: al tocar TP1 → SL sube a breakeven (entry_price)
-        # Nivel B: al tocar TP2 → SL sube a TP1 (solo si TP2 configurado)
-        #
-        # Ambos niveles solo se aplican UNA VEZ por posición (flag _be_activated / _tp1_lock_activated)
-        # y nunca mueven el SL hacia atrás.
-
         if TRAILING_BE and trader.tp1 and trader.sl is not None:
             tp1_reached = (
                 (is_long  and price >= trader.tp1)
                 or (not is_long and price <= trader.tp1)
             )
             if tp1_reached and not self._be_activated.get(sym, False):
-                # Mover SL a breakeven (entry_price) si mejora el SL actual
                 be_sl = entry_px
                 if is_long and be_sl > trader.sl:
                     old_sl = trader.sl
@@ -263,6 +265,11 @@ class PositionManager:
             )
             self._reset_trader_state(trader)
             signal_cooldown.mark_closed(sym, close_reason)
+            if global_risk:
+                try:
+                    await global_risk.register_close(0.0, symbol=sym)
+                except Exception as e:
+                    logger.warning("[%s] global_risk.register_close error (pos no encontrada): %s", sym, e)
             return
 
         qty = abs(float(positions[0].get("szi", 0)))
@@ -293,7 +300,12 @@ class PositionManager:
         pnl_pct_final = (
             (fill_price - entry_px) / entry_px
         ) * (1 if is_long else -1) * 100
-        pnl_usd = (pnl_pct_final / 100) * trader._open_notional
+
+        # FIX: usar _open_margin (margen real) para register_close, consistente
+        # con confirm_order que registró el notional dividido por leverage.
+        # Fallback a _open_notional si _open_margin no existe (versión anterior).
+        open_margin = getattr(trader, "_open_margin", None) or trader._open_notional
+        pnl_usd = (pnl_pct_final / 100) * (trader._open_notional or open_margin)
 
         if pnl_usd > 0:
             trader.win_count += 1
@@ -303,15 +315,22 @@ class PositionManager:
             sym, close_reason, fill_price, pnl_usd, pnl_pct_final,
         )
 
+        # Liberar exposición en pretrade_risk
         try:
-            pretrade_risk.register_close(sym, trader._open_notional)
+            pretrade_risk.register_close(sym, open_margin)
         except Exception as e:
             logger.warning("[%s] pretrade_risk.register_close error: %s", sym, e)
+
+        # FIX: decrementar global_risk al cerrar
+        if global_risk:
+            try:
+                await global_risk.register_close(pnl_pct_final, symbol=sym)
+            except Exception as e:
+                logger.warning("[%s] global_risk.register_close error: %s", sym, e)
 
         entry_copy = entry_px
         pos_copy   = trader.position
         self._reset_trader_state(trader)
-        # Limpiar flags de trailing al cerrar
         self._be_activated.pop(sym, None)
         self._tp1_lock_activated.pop(sym, None)
 
@@ -334,4 +353,6 @@ class PositionManager:
         trader.tp1 = trader.tp2 = trader.tp3 = None
         trader.tp2_hit = False
         trader._open_notional = 0.0
+        if hasattr(trader, "_open_margin"):
+            trader._open_margin = 0.0
         clear_position(self.symbol)

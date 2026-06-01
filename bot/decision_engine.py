@@ -9,7 +9,11 @@ Responsabilidades:
   - Abrir posición y persistir estado
   - Notificar apertura via Telegram
 
-Extraído de FuturesTrader._iteration en trader.py.
+FIX: guarda _open_margin = notional / leverage en el trader para que
+     position_manager pueda usar el margen real (no el notional bruto)
+     en pretrade_risk.register_close().
+
+FIX: llama global_risk.register_open() SOLO cuando el fill está confirmado.
 """
 from __future__ import annotations
 
@@ -51,7 +55,6 @@ class DecisionEngine:
             logger.debug("[%s] Kill switch activo — skip.", self.symbol)
             return
 
-        # FIX cooldown: no reabrir hasta nueva vela 15m tras cierre
         if signal_cooldown.is_blocked(self.symbol):
             logger.debug(
                 "[%s] Cooldown activo — %.0fs restantes hasta reapertura.",
@@ -75,8 +78,6 @@ class DecisionEngine:
             return
 
         # ── Señal de estrategia ───────────────────────────────────────────────
-        # Necesitamos precio + señal antes del pretrade_risk para pasar los
-        # parámetros correctos (side, notional, price, sl, ask, bid, leverage).
         try:
             price = await trader.get_price()
         except Exception as e:
@@ -114,15 +115,13 @@ class DecisionEngine:
             sl = tp1 = tp2 = tp3 = None
             lev = trader.leverage
 
-        lev = min(int(lev), trader.leverage)
+        lev      = min(int(lev), trader.leverage)
         notional = risk.usdc_per_trade * lev
+        margin   = notional / max(lev, 1)   # margen real que se reserva
         side_str = "buy" if action == "BUY" else "sell"
 
-        # ── Pre-trade risk con parámetros correctos ───────────────────────────
-        # FIX #1: llamada con firma completa (side, notional, price, balance,
-        #         sl, leverage) y desempaquetado de la tupla (ok, reason).
+        # ── Pre-trade risk ────────────────────────────────────────────────────
         try:
-            # Obtener ask/bid del orderbook para el check de spread
             ask = bid = None
             try:
                 from bot.ws_feed import ws_feed
@@ -153,7 +152,6 @@ class DecisionEngine:
         if lev != trader.leverage:
             await trader._set_leverage(lev)
 
-        # FIX: respetar szDecimals del coin
         qty = trader._round_qty(notional / entry)
         if qty <= 0:
             logger.warning("[%s] qty calculada <= 0 tras redondeo szDecimals, skip.", self.symbol)
@@ -201,13 +199,14 @@ class DecisionEngine:
         trader.tp3            = tp3
         trader.tp2_hit        = False
         trader._open_notional = notional
+        trader._open_margin   = margin   # FIX: guardar margen para register_close consistente
         trader._open_leverage = lev
         trader._protection_ok = False
         trader.trade_count   += 1
 
-        # FIX #2: registrar exposición en pretrade_risk tras fill confirmado
+        # Registrar exposición en pretrade_risk (con margen real, no notional)
         try:
-            pretrade_risk.confirm_order(self.symbol, notional)
+            pretrade_risk.confirm_order(self.symbol, margin)
         except Exception as e:
             logger.warning("[%s] pretrade_risk.confirm_order error: %s", self.symbol, e)
 

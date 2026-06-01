@@ -24,7 +24,7 @@ if str(STATE_FILE).startswith("/tmp"):
         STATE_FILE,
     )
 
-# FIX #3: asyncio.Lock para serializar read→modify→write y evitar corrupción
+# asyncio.Lock para serializar read→modify→write y evitar corrupción
 # de estado cuando dos corrutinas acceden simultáneamente al archivo.
 _state_lock = asyncio.Lock()
 
@@ -41,7 +41,7 @@ def _load_raw() -> dict:
 def _save_raw(data: dict):
     """Escribe de forma atómica: primero a un .tmp y luego rename().
 
-    FIX #3: rename() es atómico en POSIX — evita archivos parcialmente
+    rename() es atómico en POSIX — evita archivos parcialmente
     escritos si el proceso muere o el event loop es interrumpido entre
     write() y flush().
     """
@@ -65,13 +65,14 @@ def save_position(symbol: str, position_or_dict, entry_price=None,
       1. save_position(symbol, dict_con_datos)          <- forma usada en trader.py
       2. save_position(symbol, side, entry, sl, ...)    <- forma posicional legacy
 
-    FIX #3: envuelto en asyncio.Lock para evitar race conditions read->write.
-    FIX #15: detección explícita de string vacío para evitar que side=""
-             caiga silenciosamente en None y la posición se restaure incorrectamente.
+    FIX: envuelto en asyncio.Lock para evitar race conditions read->write.
+    FIX: detección explícita de string vacío para evitar que side=""
+         caiga silenciosamente en None y la posición se restaure incorrectamente.
+    FIX: asyncio.create_task() en vez de ensure_future() (deprecated Python 3.10+).
     """
     if isinstance(position_or_dict, dict):
         d = position_or_dict
-        # FIX #15: side="" es falsy; comparar contra None explícitamente
+        # side="" es falsy; comparar contra None explícitamente
         raw_side = d.get("side")
         raw_pos  = d.get("position")
         side_val = raw_side if raw_side else (raw_pos if raw_pos else None)
@@ -120,7 +121,8 @@ def save_position(symbol: str, position_or_dict, entry_price=None,
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            asyncio.ensure_future(_do())
+            # FIX: create_task en vez de ensure_future (deprecated Python 3.10+)
+            asyncio.create_task(_do())
         else:
             loop.run_until_complete(_do())
     except RuntimeError:
@@ -156,7 +158,7 @@ def clear_position(symbol: str):
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            asyncio.ensure_future(_do())
+            asyncio.create_task(_do())
         else:
             loop.run_until_complete(_do())
     except RuntimeError:
@@ -179,7 +181,7 @@ def mark_tp2_hit(symbol: str):
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            asyncio.ensure_future(_do())
+            asyncio.create_task(_do())
         else:
             loop.run_until_complete(_do())
     except RuntimeError:
