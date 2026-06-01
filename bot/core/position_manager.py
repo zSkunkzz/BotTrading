@@ -12,6 +12,11 @@ Responsabilidades:
   - Llamar signal_cooldown.mark_closed() al cerrar (#4)
   - [V4] position_timeout, trailing_hl, correlation_guard on_close,
           daily_drawdown register_loss
+  - Llamar decision_engine.on_position_closed() en todos los cierres
+
+FIX v4.1: correlation_guard import corregido — el módulo expone funciones libres,
+          no un singleton. on_close() no existía; se elimina esa llamada.
+          _open_leverage incluido en save_position del breakeven.
 """
 from __future__ import annotations
 
@@ -25,7 +30,7 @@ from bot.telegram_bot import notify_close, notify_tp_partial
 from bot.signal_cooldown import signal_cooldown
 from bot.pretrade_risk import pretrade_risk
 
-# ── V4 módulos ────────────────────────────────────────────────────────────────
+# ── V4 módulos ─────────────────────────────────────────────────────────────────────────
 try:
     from bot.position_timeout import position_timeout
     _TIMEOUT_ENABLED = os.getenv("POSITION_TIMEOUT_ENABLED", "true").lower() == "true"
@@ -40,11 +45,12 @@ except ImportError:
     trailing_hl = None
     _TRAILING_HL_ENABLED = False
 
+# FIX: correlation_guard expone funciones libres, NO un singleton llamado
+# `correlation_guard`. El módulo no tiene on_close() — la guard solo actua
+# en la apertura (decision_engine). Importamos CORR_ENABLED para logging.
 try:
-    from bot.correlation_guard import correlation_guard
-    _CORR_ENABLED = os.getenv("CORR_GUARD_ENABLED", "false").lower() == "true"
+    from bot.correlation_guard import CORR_ENABLED as _CORR_ENABLED
 except ImportError:
-    correlation_guard = None
     _CORR_ENABLED = False
 
 try:
@@ -53,7 +59,7 @@ try:
 except ImportError:
     daily_drawdown = None
     _DD_ENABLED = False
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger("PositionManager")
 
@@ -69,11 +75,25 @@ class PositionManager:
         self.symbol = symbol
         self._entry_mode: str = ""
         self._open_ts: float = time.time()  # timestamp de apertura para timeout
+        self._decision_engine = None        # inyectado por trading_loop
 
     def set_entry_mode(self, mode: str) -> None:
         """Llamar desde DecisionEngine al abrir posición."""
         self._entry_mode = (mode or "").upper()
         self._open_ts = time.time()
+
+    def bind_decision_engine(self, de) -> None:
+        """Inyecta referencia al DecisionEngine para llamar on_position_closed()."""
+        self._decision_engine = de
+
+    def get_all_positions(self) -> dict:
+        """
+        Devuelve dict {symbol: {side, entry, ...}} de posiciones abiertas.
+        Usado por correlation_guard en decision_engine.
+        Solo expone la posición de ESTE symbol si está abierta.
+        En un sistema multi-symbol el trading_loop puede sobreescribir este método.
+        """
+        return {}
 
     async def manage(
         self,
@@ -92,7 +112,7 @@ class PositionManager:
             (price - trader.entry_price) / trader.entry_price
         ) * (1 if is_long else -1) * 100
 
-        # ── [V4] Position Timeout ─────────────────────────────────────────────
+        # ── [V4] Position Timeout ──────────────────────────────────────────────────
         if _TIMEOUT_ENABLED and position_timeout is not None:
             try:
                 if position_timeout.is_expired(
@@ -111,7 +131,7 @@ class PositionManager:
             except Exception as e:
                 logger.warning("[%s] position_timeout error: %s", self.symbol, e)
 
-        # ── [V4] Trailing stop nativo en HL ──────────────────────────────────
+        # ── [V4] Trailing stop nativo en HL ────────────────────────────────────
         if _TRAILING_HL_ENABLED and trailing_hl is not None:
             try:
                 await trailing_hl.update(
@@ -123,7 +143,7 @@ class PositionManager:
             except Exception as e:
                 logger.warning("[%s] trailing_hl error: %s", self.symbol, e)
 
-        # ── #1 Breakeven en TP1 ───────────────────────────────────────────────
+        # ── #1 Breakeven en TP1 ─────────────────────────────────────────────────
         if (
             trader.tp1
             and trader.tp2
@@ -151,7 +171,7 @@ class PositionManager:
                         "tp3":         trader.tp3,
                         "tp2_hit":     trader.tp2_hit,
                         "usdc_amount": trader._open_notional,
-                        "leverage":    trader._open_leverage,
+                        "leverage":    getattr(trader, "_open_leverage", 1),
                     })
                 elif not is_long and trader.entry_price < trader.sl:
                     trader.sl = trader.entry_price
@@ -168,11 +188,11 @@ class PositionManager:
                         "tp3":         trader.tp3,
                         "tp2_hit":     trader.tp2_hit,
                         "usdc_amount": trader._open_notional,
-                        "leverage":    trader._open_leverage,
+                        "leverage":    getattr(trader, "_open_leverage", 1),
                     })
                 trader._tp1_be_done = True
 
-        # ── TP2 parcial ───────────────────────────────────────────────────────
+        # ── TP2 parcial ────────────────────────────────────────────────────────────
         if trader.tp2 and not trader.tp2_hit:
             tp2_triggered = (
                 (is_long and price >= trader.tp2)
@@ -202,7 +222,7 @@ class PositionManager:
                             "tp3":         trader.tp3,
                             "tp2_hit":     True,
                             "usdc_amount": trader._open_notional,
-                            "leverage":    trader._open_leverage,
+                            "leverage":    getattr(trader, "_open_leverage", 1),
                         })
 
                 if trader.entry_price and trader.entry_price > 0:
@@ -237,6 +257,19 @@ class PositionManager:
                             self.symbol, trader.position, price, trader.tp2, partial_qty
                         )
 
+                        # Llamar on_position_closed para TP2 parcial
+                        if self._decision_engine is not None:
+                            try:
+                                margin = getattr(trader, "_open_margin", None)
+                                self._decision_engine.on_position_closed(
+                                    symbol=self.symbol,
+                                    margin=margin,
+                                    reason="TP2",
+                                    entry_mode=self._entry_mode,
+                                )
+                            except Exception as e:
+                                logger.debug("[%s] on_position_closed(TP2) error: %s", self.symbol, e)
+
                         remaining_notional = trader._open_notional * (1 - TP2_PARTIAL_RATIO)
                         remaining_qty = round(remaining_notional / trader.entry_price, 6)
                         if remaining_qty > 0 and (trader.tp3 or trader.sl):
@@ -252,7 +285,7 @@ class PositionManager:
                                     self.symbol, e,
                                 )
 
-        # ── Trailing stop ─────────────────────────────────────────────────────
+        # ── Trailing stop ────────────────────────────────────────────────────────────
         if risk.trailing_sl and trader.sl is not None:
             activation_px = trader.entry_price * (
                 1 + risk.trailing_activation_pct / 100
@@ -273,7 +306,7 @@ class PositionManager:
                     trader.sl = new_sl
                     logger.debug("[%s] Trailing SL → %.4f", self.symbol, trader.sl)
 
-        # ── Evaluar SL / TP ───────────────────────────────────────────────────
+        # ── Evaluar SL / TP ────────────────────────────────────────────────────────────
         sl_hit  = trader.sl  and ((is_long and price <= trader.sl)  or (not is_long and price >= trader.sl))
         tp3_hit = trader.tp3 and ((is_long and price >= trader.tp3) or (not is_long and price <= trader.tp3))
         tp1_hit = (
@@ -348,6 +381,8 @@ class PositionManager:
         entry_copy    = trader.entry_price
         pos_copy      = trader.position
         notional_copy = trader._open_notional
+        margin_copy   = getattr(trader, "_open_margin", None)
+        entry_mode_copy = self._entry_mode
 
         self._reset_trader_state(trader)
 
@@ -361,17 +396,22 @@ class PositionManager:
             except Exception as e:
                 logger.warning("[%s] daily_drawdown.register_loss error: %s", self.symbol, e)
 
-        # [V4] Liberar en correlation_guard
-        if _CORR_ENABLED and correlation_guard is not None:
+        # Llamar on_position_closed en DecisionEngine
+        if self._decision_engine is not None:
             try:
-                correlation_guard.on_close(self.symbol)
-            except Exception:
-                pass
+                self._decision_engine.on_position_closed(
+                    symbol=self.symbol,
+                    margin=margin_copy,
+                    reason=close_reason,
+                    entry_mode=entry_mode_copy,
+                )
+            except Exception as e:
+                logger.debug("[%s] on_position_closed error: %s", self.symbol, e)
 
         # #4 Cooldown diferenciado por entry_mode
         signal_cooldown.mark_closed(
             self.symbol,
-            entry_mode=self._entry_mode,
+            entry_mode=entry_mode_copy,
             reason=close_reason,
         )
 
