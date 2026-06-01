@@ -18,6 +18,12 @@ ARQUITECTURA:
 
 IMPORTANTE: Este módulo NO importa nada de bot.strategy.
   Hacerlo causa un ciclo de importación circular que devuelve score=0 en cada ciclo.
+
+OHLCV:
+  analyze_pair() acepta un parámetro opcional `ohlcv_fn` (callable async).
+  Si se pasa, se usa en lugar de exch.fetch_ohlcv() para aprovechar la ruta
+  WS→caché→REST del trader (trader.get_ohlcv). Si no se pasa, se usa ccxt directamente.
+  Esto evita 3 llamadas REST extra por ciclo cuando el trader ya tiene los datos.
 """
 from __future__ import annotations
 
@@ -25,13 +31,13 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr
 
 log = logging.getLogger(__name__)
 
-# ─── Constantes exportadas ────────────────────────────────────────────────────
+# ─── Constantes exportadas ────────────────────────────────────────────────────────────────
 
 MIN_SCORE: int   = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
 MIN_RR: float    = float(os.getenv("MIN_RR_REQUIRED", "1.8"))
@@ -47,7 +53,7 @@ _TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "4.0"))   # TP2 = entry ± TP2_A
 _MAX_LEV      = int(os.getenv("LEVERAGE", "15"))
 
 
-# ─── SignalResult ─────────────────────────────────────────────────────────────
+# ─── SignalResult ────────────────────────────────────────────────────────────────────
 
 @dataclass
 class SignalResult:
@@ -71,20 +77,32 @@ class SignalResult:
     extra:        Dict = field(default_factory=dict)
 
 
-# ─── analyze_pair ─────────────────────────────────────────────────────────────
+# ─── analyze_pair ──────────────────────────────────────────────────────────────────
 
-async def analyze_pair(exch, symbol: str) -> SignalResult:
+async def analyze_pair(
+    exch,
+    symbol: str,
+    ohlcv_fn: Optional[Callable] = None,
+) -> SignalResult:
     """
-    Descarga OHLCV de Hyperliquid para 15m, 1h y 4h,
-    calcula indicadores (EMA21/50, RSI14, MACD, SuperTrend, ATR14, volumen)
-    y devuelve un SignalResult con entry/SL/TP calculados con ATR.
+    Descarga OHLCV para 15m, 1h y 4h, calcula indicadores y devuelve SignalResult.
 
-    No importa ni llama a bot.strategy — es lógica técnica pura.
+    ohlcv_fn: callable async opcional con firma `(tf: str) -> list`.
+      Si se pasa, se usa en lugar de exch.fetch_ohlcv() para aprovechar
+      la ruta WS→caché→REST del trader (trader.get_ohlcv).
+      Si no se pasa, se usa ccxt directamente (comportamiento anterior).
     """
     try:
-        bars_15m = await _fetch_bars(exch, symbol, "15m", _BARS_NEEDED)
-        bars_1h  = await _fetch_bars(exch, symbol, "1h",  _BARS_NEEDED)
-        bars_4h  = await _fetch_bars(exch, symbol, "4h",  max(50, _BARS_NEEDED // 2))
+        if ohlcv_fn is not None:
+            # Ruta óptima: usa la caché WS/REST del trader
+            bars_15m = await ohlcv_fn("15m") or []
+            bars_1h  = await ohlcv_fn("1h")  or []
+            bars_4h  = await ohlcv_fn("4h")  or []
+        else:
+            # Fallback: ccxt directo (sin caché)
+            bars_15m = await _fetch_bars(exch, symbol, "15m", _BARS_NEEDED)
+            bars_1h  = await _fetch_bars(exch, symbol, "1h",  _BARS_NEEDED)
+            bars_4h  = await _fetch_bars(exch, symbol, "4h",  max(50, _BARS_NEEDED // 2))
     except Exception as e:
         log.error("[signal_engine] OHLCV fetch error %s: %s", symbol, e)
         return _hold_result(symbol, f"OHLCV error: {e}")
@@ -92,7 +110,7 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
     if len(bars_15m) < 30:
         return _hold_result(symbol, f"Insuficientes velas 15m ({len(bars_15m)})")
 
-    # ── Indicadores por timeframe ─────────────────────────────────────────────
+    # ── Indicadores por timeframe ────────────────────────────────────────────────────────
     ind_15m = _compute_indicators(bars_15m)
     ind_1h  = _compute_indicators(bars_1h)  if len(bars_1h)  >= 30 else {}
     ind_4h  = _compute_indicators(bars_4h)  if len(bars_4h)  >= 20 else {}
@@ -100,20 +118,20 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
     indicators = {"15m": ind_15m, "1h": ind_1h, "4h": ind_4h,
                   "_closes_15m": [b[4] for b in bars_15m[-5:]]}
 
-    # ── Scoring multi-timeframe ───────────────────────────────────────────────
+    # ── Scoring multi-timeframe ───────────────────────────────────────────────────
     score, max_score, signal_str, reasons = _score_signal(ind_15m, ind_1h, ind_4h)
 
     if signal_str == "NEUTRAL":
         return _hold_result(symbol, f"NEUTRAL (score={score}/{max_score})")
 
-    # ── Precio actual y ATR ───────────────────────────────────────────────────
+    # ── Precio actual y ATR ────────────────────────────────────────────────────
     entry   = float(bars_15m[-1][4])   # close de la última vela 15m
     atr_val = float(ind_15m.get("atr", 0) or 0)
 
     if atr_val <= 0:
         return _hold_result(symbol, "ATR=0 — no se puede calcular SL/TP")
 
-    # ── SL / TP basados en ATR ────────────────────────────────────────────────
+    # ── SL / TP basados en ATR ────────────────────────────────────────────────────
     if signal_str == "LONG":
         sl   = round(entry - _SL_ATR_MULT  * atr_val, 6)
         tp1  = round(entry + _TP1_ATR_MULT * atr_val, 6)
@@ -127,7 +145,7 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
     reward = abs(tp1 - entry)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
 
-    # ── Entry mode ────────────────────────────────────────────────────────────
+    # ── Entry mode ────────────────────────────────────────────────────────────────────
     if score >= max_score - 1:
         entry_mode = "STRONG"
     elif score >= MIN_SCORE + 2:
@@ -135,8 +153,8 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
     else:
         entry_mode = "EARLY"
 
-    # ── Leverage sugerido (capped al máximo del exchange) ────────────────────
-    suggested_lev = min(_MAX_LEV, 15)   # trader lo capará al max del par
+    # ── Leverage sugerido ──────────────────────────────────────────────────────────────
+    suggested_lev = min(_MAX_LEV, 15)   # trader lo capá al max del par
 
     is_valid = score >= MIN_SCORE and rr >= MIN_RR
 
@@ -164,12 +182,12 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
     )
 
 
-# ─── OHLCV fetch ──────────────────────────────────────────────────────────────
+# ─── OHLCV fetch (fallback sin caché) ───────────────────────────────────────────────────
 
 async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
     """
-    Descarga velas OHLCV desde Hyperliquid usando el exchange de ccxt.
-    Retorna lista de [ts, open, high, low, close, vol].
+    Descarga velas OHLCV desde Hyperliquid usando ccxt directamente.
+    Solo se usa cuando ohlcv_fn no se pasa a analyze_pair().
     """
     try:
         bars = await exch.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -179,7 +197,7 @@ async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
         return []
 
 
-# ─── Indicadores ──────────────────────────────────────────────────────────────
+# ─── Indicadores ──────────────────────────────────────────────────────────────────────
 
 def _compute_indicators(bars: list) -> dict:
     """Calcula EMA21/50, RSI14, MACD, SuperTrend, ATR14 y vol_ratio."""
@@ -218,7 +236,7 @@ def _compute_indicators(bars: list) -> dict:
     }
 
 
-# ─── Scoring ──────────────────────────────────────────────────────────────────
+# ─── Scoring ────────────────────────────────────────────────────────────────────────
 
 def _score_signal(
     i15: dict, i1h: dict, i4h: dict
@@ -240,7 +258,7 @@ def _score_signal(
     short_pts = 0
     reasons   = []
 
-    # ── 15m (peso = 5) ────────────────────────────────────────────────────────
+    # ── 15m (peso = 5) ───────────────────────────────────────────────────────────────────
     if i15.get("ema_bull"):  long_pts  += 1; reasons.append("EMA15m↑")
     if i15.get("ema_bear"):  short_pts += 1; reasons.append("EMA15m↓")
     if i15.get("macd_bull"): long_pts  += 1; reasons.append("MACD15m↑")
@@ -259,7 +277,7 @@ def _score_signal(
         short_pts += 1
         reasons.append(f"Vol15m={vol15:.1f}x")
 
-    # ── 1h (peso = 3) ─────────────────────────────────────────────────────────
+    # ── 1h (peso = 3) ────────────────────────────────────────────────────────────────────
     if i1h:
         if i1h.get("ema_bull"):  long_pts  += 1; reasons.append("EMA1h↑")
         if i1h.get("ema_bear"):  short_pts += 1; reasons.append("EMA1h↓")
@@ -268,14 +286,14 @@ def _score_signal(
         if i1h.get("st_bull"):   long_pts  += 1; reasons.append("ST1h↑")
         if i1h.get("st_bear"):   short_pts += 1; reasons.append("ST1h↓")
 
-    # ── 4h (peso = 2) ─────────────────────────────────────────────────────────
+    # ── 4h (peso = 2) ────────────────────────────────────────────────────────────────────
     if i4h:
         if i4h.get("ema_bull"):  long_pts  += 1; reasons.append("EMA4h↑")
         if i4h.get("ema_bear"):  short_pts += 1; reasons.append("EMA4h↓")
         if i4h.get("macd_bull"): long_pts  += 1; reasons.append("MACD4h↑")
         if i4h.get("macd_bear"): short_pts += 1; reasons.append("MACD4h↓")
 
-    # ── Decisión ──────────────────────────────────────────────────────────────
+    # ── Decisión ──────────────────────────────────────────────────────────────────────────
     if long_pts > short_pts:
         # Requiere alineación de al menos el 1h con el 15m para no ser NEUTRAL
         tf1h_ok = (not i1h) or i1h.get("ema_bull") or i1h.get("st_bull")
@@ -293,7 +311,7 @@ def _score_signal(
     return 0, max_score, "NEUTRAL", reasons
 
 
-# ─── _hold_result ─────────────────────────────────────────────────────────────
+# ─── _hold_result ─────────────────────────────────────────────────────────────────────
 
 def _hold_result(symbol: str, reason: str) -> SignalResult:
     return SignalResult(
@@ -315,7 +333,7 @@ def _hold_result(symbol: str, reason: str) -> SignalResult:
     )
 
 
-# ─── format_signal_block ──────────────────────────────────────────────────────
+# ─── format_signal_block ────────────────────────────────────────────────────────────────
 
 def format_signal_block(signal: Optional[SignalResult]) -> str:
     if signal is None:
@@ -339,7 +357,7 @@ def format_signal_block(signal: Optional[SignalResult]) -> str:
     return "\n".join(lines)
 
 
-# ─── SignalFlipGuard ──────────────────────────────────────────────────────────
+# ─── SignalFlipGuard ───────────────────────────────────────────────────────────────────
 
 _FLIP_COOLDOWN_S = float(os.getenv("SIGNAL_FLIP_COOLDOWN_S", "120"))
 
