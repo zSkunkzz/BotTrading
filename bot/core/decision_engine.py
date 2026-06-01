@@ -54,17 +54,18 @@ except ImportError:
     _KELLY_ENABLED = False
 
 try:
-    from bot.structure_analyzer import structure_analyzer
+    from bot.structure_analyzer import analyze_structure   # función libre, síncrona
     _STRUCTURE_ENABLED = os.getenv("STRUCTURE_ENABLED", "false").lower() == "true"
 except ImportError:
-    structure_analyzer = None
+    analyze_structure = None
     _STRUCTURE_ENABLED = False
 
 try:
-    from bot.correlation_guard import correlation_guard
+    from bot.correlation_guard import check_correlation, size_penalty_btc  # funciones libres, síncronas
     _CORR_ENABLED = os.getenv("CORR_GUARD_ENABLED", "false").lower() == "true"
 except ImportError:
-    correlation_guard = None
+    check_correlation = None
+    size_penalty_btc = None
     _CORR_ENABLED = False
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -125,9 +126,14 @@ class DecisionEngine:
                 return
 
         # ── [V4] Market Regime filter ─────────────────────────────────────────
+        # FIX Bug 1: market_regime NO tiene get_regime().
+        #   API real: await market_regime.refresh(exch)  → actualiza caché
+        #             market_regime.regime()              → str síncrono
         if _REGIME_ENABLED and market_regime is not None:
             try:
-                regime = await market_regime.get_regime()
+                exch_for_regime = await trader._get_ccxt()
+                await market_regime.refresh(exch=exch_for_regime)
+                regime = market_regime.regime()          # síncrono, devuelve "GREEN"/"YELLOW"/"RED"
                 if regime == "RED":
                     logger.info("[%s] Market regime RED — skip entrada.", self.symbol)
                     return
@@ -180,19 +186,25 @@ class DecisionEngine:
             return
 
         # ── [V4] Structure Analyzer — boost de score ──────────────────────────
-        if _STRUCTURE_ENABLED and structure_analyzer is not None:
+        # FIX Bug 3: analyze_structure() es función libre y SÍNCRONA.
+        #   Firma: analyze_structure(df: DataFrame, direction: int) -> dict
+        #   No existe structure_analyzer.score(symbol=, side=) ni se puede await.
+        if _STRUCTURE_ENABLED and analyze_structure is not None:
             try:
-                struct_score = await structure_analyzer.score(
-                    symbol=self.symbol,
-                    side="long" if action == "BUY" else "short",
-                )
-                if struct_score < 0:
-                    logger.info(
-                        "[%s] StructureAnalyzer score negativo (%d) — skip entrada.",
-                        self.symbol, struct_score,
-                    )
-                    return
-                logger.debug("[%s] StructureAnalyzer score: %d", self.symbol, struct_score)
+                direction_int = 1 if action == "BUY" else -1
+                df_struct = ws_feed.get_ohlcv(self.symbol, "1h")  # DataFrame del caché WS
+                if df_struct is not None and not df_struct.empty:
+                    struct_result = analyze_structure(df_struct, direction=direction_int)
+                    struct_score = struct_result.get("score", 0)
+                    if struct_score < 0:
+                        logger.info(
+                            "[%s] StructureAnalyzer score negativo (%d) — skip entrada.",
+                            self.symbol, struct_score,
+                        )
+                        return
+                    logger.debug("[%s] StructureAnalyzer score: %d", self.symbol, struct_score)
+                else:
+                    logger.debug("[%s] StructureAnalyzer sin datos OHLCV 1h — skip filtro.", self.symbol)
             except Exception as e:
                 logger.warning("[%s] structure_analyzer error: %s — skip filtro.", self.symbol, e)
 
@@ -248,15 +260,32 @@ class DecisionEngine:
         side = "buy" if action == "BUY" else "sell"
 
         # ── [V4] Correlation Guard ────────────────────────────────────────────
-        if _CORR_ENABLED and correlation_guard is not None:
+        # FIX Bug 2: check_correlation() es función LIBRE y SÍNCRONA.
+        #   Firma: check_correlation(proposed_direction: str, open_positions: dict) -> (bool, str)
+        #   proposed_direction debe ser "LONG" o "SHORT" (mayúsculas).
+        #   open_positions se obtiene del position_mgr o del trader.
+        if _CORR_ENABLED and check_correlation is not None:
             try:
-                corr_ok, corr_reason = await correlation_guard.check(
-                    symbol=self.symbol,
-                    side=side,
-                )
+                proposed_dir = "LONG" if action == "BUY" else "SHORT"
+                open_pos = {}
+                if self._position_mgr is not None and hasattr(self._position_mgr, "get_all_positions"):
+                    open_pos = self._position_mgr.get_all_positions() or {}
+                elif hasattr(trader, "_all_positions"):
+                    open_pos = trader._all_positions or {}
+                corr_ok, corr_reason = check_correlation(proposed_dir, open_pos)  # síncrono, sin await
                 if not corr_ok:
                     logger.info("[%s] CorrelationGuard bloqueó: %s", self.symbol, corr_reason)
                     return
+                # Aplicar penalización de size si BTC va en contra
+                if size_penalty_btc is not None and market_regime is not None:
+                    btc_trend = market_regime.btc_trend()
+                    size_mult = size_penalty_btc(proposed_dir, btc_trend)
+                    if size_mult != 1.0:
+                        notional = notional * size_mult
+                        logger.info(
+                            "[%s] BTC trend penaliza size %.0f%% → notional=%.2f USDC",
+                            self.symbol, size_mult * 100, notional,
+                        )
             except Exception as e:
                 logger.warning("[%s] correlation_guard error: %s — skip filtro.", self.symbol, e)
 
@@ -303,13 +332,6 @@ class DecisionEngine:
 
         # Registrar exposición en pretrade_risk tras fill confirmado
         pretrade_risk.confirm_order(self.symbol, notional)
-
-        # [V4] Registrar apertura en correlation_guard
-        if _CORR_ENABLED and correlation_guard is not None:
-            try:
-                correlation_guard.on_open(self.symbol, side)
-            except Exception:
-                pass
 
         try:
             fill_price = float(
