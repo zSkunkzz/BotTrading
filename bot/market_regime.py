@@ -1,152 +1,104 @@
 #!/usr/bin/env python3
 """
-market_regime.py — Filtro de régimen de mercado basado en BTC
+market_regime.py — Detección de régimen de mercado (TRENDING / RANGING / VOLATILE)
 
-Semáforo global:
-  GREEN  → BTC en tendencia clara (ADX >= threshold, EMA alineadas)
-  YELLOW → BTC en zona gris (ADX moderado o divergencia)
-  RED    → BTC en chop / reversión → pausar todos los pares
+MEJORAS v2:
+  - verify_regime_gate(): función de gate bloqueante para decision_engine.
+    Si MARKET_REGIME_GATE=true (default) y el régimen es RANGING → bloquea entrada.
+  - El régimen se calcula sobre 1h OHLCV (más estable que 15m).
 
-Activar con REGIME_FILTER=true (default: true)
-Umbral ADX BTC: REGIME_ADX_MIN (default: 18)
+Config Railway:
+  MARKET_REGIME_GATE     → default true  (false = solo informativo, no bloquea)
+  REGIME_ADX_TREND       → ADX mínimo para TRENDING (default 25)
+  REGIME_ADX_RANGING     → ADX máximo para RANGING (default 20)
+  REGIME_BB_WIDTH_FACTOR → factor ancho BB para VOLATILE (default 2.0)
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-import time
 from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+try:
+    import ta as ta_lib
+except ImportError:
+    ta_lib = None
 
 log = logging.getLogger(__name__)
 
-REGIME_FILTER      = os.getenv("REGIME_FILTER", "true").lower() != "false"
-REGIME_ADX_MIN     = float(os.getenv("REGIME_ADX_MIN", "18"))
-REGIME_CACHE_TTL   = int(os.getenv("REGIME_CACHE_TTL", "300"))  # 5 min
+MARKET_REGIME_GATE     = os.getenv("MARKET_REGIME_GATE",     "true").lower() != "false"
+REGIME_ADX_TREND       = float(os.getenv("REGIME_ADX_TREND",       "25"))
+REGIME_ADX_RANGING     = float(os.getenv("REGIME_ADX_RANGING",     "20"))
+REGIME_BB_WIDTH_FACTOR = float(os.getenv("REGIME_BB_WIDTH_FACTOR", "2.0"))
 
 
-class MarketRegime:
+def detect_regime(df: pd.DataFrame) -> str:
     """
-    Evalúa el régimen de BTC cada REGIME_CACHE_TTL segundos.
-    Expone `is_tradeable() -> bool` para que decision_engine lo consulte.
+    Detecta el régimen de mercado actual.
+
+    Returns:
+        'TRENDING' | 'RANGING' | 'VOLATILE' | 'UNKNOWN'
     """
+    if ta_lib is None or df.empty or len(df) < 30:
+        return "UNKNOWN"
 
-    def __init__(self) -> None:
-        self._regime: str = "GREEN"     # GREEN / YELLOW / RED
-        self._btc_adx: float = 0.0
-        self._btc_trend: int = 0        # 1 long, -1 short, 0 neutral
-        self._last_update: float = 0.0
-        self._lock = asyncio.Lock()
+    try:
+        # ADX
+        adx_ind = ta_lib.trend.ADXIndicator(
+            df["high"], df["low"], df["close"], window=14
+        )
+        adx = float(adx_ind.adx().iloc[-1])
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        # Bollinger Band Width (BBW) normalizado
+        bb = ta_lib.volatility.BollingerBands(df["close"], window=20, window_dev=2)
+        bbw     = float((bb.bollinger_hband().iloc[-1] - bb.bollinger_lband().iloc[-1])
+                        / bb.bollinger_mavg().iloc[-1])
+        bbw_ma  = float((bb.bollinger_hband() - bb.bollinger_lband())
+                        / bb.bollinger_mavg()).rolling(50).mean().iloc[-1]
 
-    def is_tradeable(self) -> bool:
-        """True si el régimen permite abrir nuevas posiciones."""
-        if not REGIME_FILTER:
-            return True
-        return self._regime in ("GREEN", "YELLOW")
+        if np.isnan(adx):
+            return "UNKNOWN"
 
-    def regime(self) -> str:
-        return self._regime
+        # VOLATILE: BB muy expandido respecto a su media histórica
+        if not np.isnan(bbw_ma) and bbw > bbw_ma * REGIME_BB_WIDTH_FACTOR:
+            return "VOLATILE"
 
-    def btc_adx(self) -> float:
-        return self._btc_adx
+        # TRENDING: ADX alto
+        if adx >= REGIME_ADX_TREND:
+            return "TRENDING"
 
-    def btc_trend(self) -> int:
-        return self._btc_trend
+        # RANGING: ADX bajo
+        if adx < REGIME_ADX_RANGING:
+            return "RANGING"
 
-    def summary(self) -> str:
-        icon = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴"}.get(self._regime, "⚪")
-        return f"{icon} Régimen BTC: {self._regime} · ADX {self._btc_adx:.1f} · Trend {self._btc_trend:+d}"
+        return "TRENDING"  # zona intermedia: tratar como tendencia débil
 
-    async def refresh(self, exch=None) -> None:
-        """Actualiza el régimen si el caché expiró."""
-        now = time.monotonic()
-        if now - self._last_update < REGIME_CACHE_TTL:
-            return
-        async with self._lock:
-            if now - self._last_update < REGIME_CACHE_TTL:
-                return
-            await self._compute(exch)
-            self._last_update = time.monotonic()
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    async def _compute(self, exch=None) -> None:
-        try:
-            import numpy as np
-            import pandas as pd
-
-            # Intentar desde ws_feed primero
-            df1h: Optional[pd.DataFrame] = None
-            try:
-                from bot.ws_feed import ws_feed
-                df1h = ws_feed.get_ohlcv("BTC", "1h")
-                if df1h is not None and len(df1h) < 50:
-                    df1h = None
-            except Exception:
-                pass
-
-            if df1h is None or df1h.empty:
-                # Fallback: REST HL
-                from bot.signal_engine import _fetch_ohlcv_hl
-                df1h = await _fetch_ohlcv_hl("BTC", "1h", 200)
-
-            if df1h is None or df1h.empty or len(df1h) < 50:
-                log.warning("[regime] Sin datos BTC 1h — régimen GREEN por defecto")
-                return
-
-            adx_val = self._calc_adx(df1h)
-            trend   = self._calc_ema_trend(df1h)
-
-            self._btc_adx   = adx_val
-            self._btc_trend = trend
-
-            if adx_val < REGIME_ADX_MIN:
-                self._regime = "RED"
-            elif adx_val < REGIME_ADX_MIN + 5:
-                self._regime = "YELLOW"
-            else:
-                self._regime = "GREEN"
-
-            log.info("[regime] %s", self.summary())
-
-        except Exception as e:
-            log.warning("[regime] Error calculando régimen BTC: %s", e)
-
-    @staticmethod
-    def _calc_adx(df, period: int = 14) -> float:
-        try:
-            import ta
-            val = ta.trend.ADXIndicator(
-                df["high"], df["low"], df["close"], window=period
-            ).adx().iloc[-1]
-            import numpy as np
-            return round(float(val), 1) if not np.isnan(val) else 0.0
-        except Exception:
-            return 0.0
-
-    @staticmethod
-    def _calc_ema_trend(df) -> int:
-        try:
-            import ta
-            c   = df["close"]
-            e9  = ta.trend.ema_indicator(c, window=9).iloc[-1]
-            e21 = ta.trend.ema_indicator(c, window=21).iloc[-1]
-            e50 = ta.trend.ema_indicator(c, window=50).iloc[-1]
-            cl  = c.iloc[-1]
-            if e9 > e21 > e50 and cl > e50:
-                return 1
-            if e9 < e21 < e50 and cl < e50:
-                return -1
-            return 0
-        except Exception:
-            return 0
+    except Exception as e:
+        log.debug("[regime] detect_regime error: %s", e)
+        return "UNKNOWN"
 
 
-# Singleton
-market_regime = MarketRegime()
+def verify_regime_gate(df: pd.DataFrame, symbol: str = "") -> tuple[bool, str]:
+    """
+    Gate bloqueante para decision_engine.
+
+    Returns:
+        (allowed, reason)
+        allowed=True  → se puede abrir posición
+        allowed=False → régimen desfavorable, bloquear entrada
+    """
+    if not MARKET_REGIME_GATE:
+        return True, ""
+
+    regime = detect_regime(df)
+
+    if regime == "RANGING":
+        reason = f"market_regime=RANGING (ADX bajo) — entrada bloqueada"
+        log.info("[regime] %s %s", symbol, reason)
+        return False, reason
+
+    log.debug("[regime] %s regime=%s → permitido", symbol, regime)
+    return True, ""
