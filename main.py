@@ -11,7 +11,7 @@ from bot.global_risk import GlobalRisk
 from bot.pair_scanner import PairScanner
 from bot.ai_filter import ai_rank_pairs
 from bot.logger import setup_logger
-from bot.telegram_bot import notify_startup, notify_scanner_update
+from bot.telegram_bot import notify_startup, notify_scanner_update, setup_telegram_commands
 from bot.ws_feed import ws_feed
 from bot.balance_service import balance_svc
 from bot.kill_switch import kill_switch
@@ -25,7 +25,7 @@ active_traders: dict = {}
 global_risk: GlobalRisk = None
 _trader_instances: dict = {}
 
-# ── Límite de traders simultáneos activos ──────────────────────────────────
+# ── Límite de traders simultáneos activos ──────────────────────────────
 # Con 15 traders HL devuelve 429 continuos. Máximo recomendado: 5.
 MAX_ACTIVE_TRADERS = int(os.getenv("MAX_ACTIVE_TRADERS", "5"))
 
@@ -184,7 +184,7 @@ async def main():
     logger.info("  HyperliquidBot v1.0 — IA + Scanner + Telegram + KS")
     logger.info("=" * 60)
 
-    # ── Balance service ──────────────────────────────────────────────
+    # ── Balance service ──────────────────────────────────
     hl_addr = _resolve_hl_address()
     if not hl_addr:
         logger.warning("⚠️ No se pudo resolver dirección HL. Configura HL_API_WALLET_ADDRESS o HL_ACCOUNT_ADDR.")
@@ -223,7 +223,7 @@ async def main():
             for sym in initial_pairs
         ]
 
-    # ── Poblar mapa de leverage desde el scan inicial ────────────────
+    # ── Poblar mapa de leverage desde el scan inicial ─────────────────
     _update_leverage_map(scored_data)
 
     if scored_data:
@@ -242,7 +242,7 @@ async def main():
         final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
 
     if not final_pairs:
-        logger.error("❌ Scanner devolvió 0 pares. Revisa MIN_VOLUME_USDT y MIN_CHANGE_PCT.")
+        logger.error("❌ Scanner devolvio 0 pares. Revisa MIN_VOLUME_USDT y MIN_CHANGE_PCT.")
 
     logger.info("✅ Pares finales (%d): %s", len(final_pairs), ", ".join(final_pairs))
 
@@ -263,6 +263,13 @@ async def main():
     )
     logger.info("🐕 Kill Switch Watchdog arrancado")
 
+    # ── Telegram command polling (long-poll ligero, task independiente) ──
+    tg_task = setup_telegram_commands()
+    if tg_task:
+        logger.info("📲 Telegram comandos activos (/resetks, /ksstatus)")
+    else:
+        logger.info("📲 Telegram comandos desactivados (sin TELEGRAM_TOKEN)")
+
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     await notify_startup(pairs_to_trade, dry_run, top_n)
 
@@ -270,6 +277,8 @@ async def main():
         await scanner.run_scanner_loop(on_pairs_updated)
     finally:
         watchdog_task.cancel()
+        if tg_task:
+            tg_task.cancel()
         ws_feed.stop()
         await webhook_runner.cleanup()
 
