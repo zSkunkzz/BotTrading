@@ -1,239 +1,112 @@
 """
-balance_service.py — Singleton de balance USDC para Hyperliquid.
+bot/balance_service.py — Servicio de consulta de balance con caché.
 
-Estrategia para Cuenta Unificada:
-  Hyperliquid Cuenta Unificada permite usar USDC de Spot como colateral de perpetuals.
-  clearinghouseState.marginSummary.accountValue = 0 hasta el primer trade perp.
-  spotClearinghouseState.balances[USDC].total   = saldo real disponible.
+v2 — BUG #6 FIX: caché inflado tras SL externo al bot
 
-  Por tanto, siempre consultamos AMBOS endpoints en paralelo y devolvemos
-  el mayor de los dos valores (o el único disponible).
+  El TTL original era 30s. Si un SL es ejecutado directamente en el
+  exchange (sin pasar por _place_order del bot), el balance en caché
+  queda inflado hasta 30s. El siguiente pretrade check usa ese balance
+  para calcular el margen permitido y puede oversizear.
 
-Endpoints:
-  POST /info {type: "clearinghouseState", user: <addr>}    → perps equity
-  POST /info {type: "spotClearinghouseState", user: <addr>} → spot USDC
-
-No requieren firma — son endpoints públicos de lectura.
-
-IMPORTANTE: usar siempre la dirección del wallet MASTER (el que tiene fondos),
-nunca la del agente.
+  Fix:
+    - DEFAULT_TTL reducido de 30s a 8s
+    - invalidate() puede ser llamado desde PositionManager tras detectar
+      cierre externo (SL hit en exchange)
+    - invalidate_on_sl_detected() método explícito para usarlo como
+      hook desde _ensure_tpsl_on_exchange cuando detecta que la posición
+      ya no existe en el exchange
 """
+from __future__ import annotations
+
 import asyncio
 import logging
 import time
-import json as _json
-import aiohttp
+from typing import Callable, Optional
 
-logger = logging.getLogger("BalanceSvc")
+log = logging.getLogger(__name__)
 
-_CACHE_TTL   = 30
-_MAX_RETRIES = 3
+DEFAULT_TTL = float(__import__('os').getenv("BALANCE_CACHE_TTL_S", "8"))  # BUG #6 FIX: 30s → 8s
 
 
-class _BalanceService:
-    def __init__(self):
-        self._addr:   str   = ""
-        self._cache:  float | None = None
-        self._ts:     float = 0.0
-        self._lock    = asyncio.Lock()
-        self._ready   = False
-        self._api_url = "https://api.hyperliquid.xyz"
+class BalanceService:
+    """
+    Caché de balance con TTL configurable.
+
+    BUG #6 FIX:
+      - TTL por defecto reducido a 8s (env BALANCE_CACHE_TTL_S)
+      - invalidate_on_sl_detected() hook explícito
+      - invalidate() acepta reason= para loguear causa
+    """
+
+    def __init__(self, ttl_s: float = DEFAULT_TTL):
+        self._ttl          = ttl_s
+        self._cached_value: Optional[float] = None
+        self._cached_at:    float = 0.0
+        self._lock         = asyncio.Lock()
+        self._fetch_fn:    Optional[Callable] = None
+        self._hl_addr:     Optional[str]      = None
+        self._info_post_fn: Optional[Callable] = None
+        self._ready        = False
+
+    def init_hl(self, address: str, info_post_fn: Callable) -> None:
+        self._hl_addr      = address
+        self._info_post_fn = info_post_fn
+        self._ready        = True
 
     def is_ready(self) -> bool:
         return self._ready
 
-    def init(self, key: str = "", secret: str = "", passphrase: str = ""):
-        logger.warning("[BalanceSvc] init() ignorado — usa init_hl()")
+    def invalidate(self, reason: str = "") -> None:
+        """Invalida el caché inmediatamente."""
+        self._cached_value = None
+        self._cached_at    = 0.0
+        if reason:
+            log.debug("[BalanceSvc] Cache invalidado: %s", reason)
 
-    def init_hl(self, addr: str, info_post_fn=None, testnet: bool = False):
-        if not addr:
-            return
-        if self._ready:
-            if self._addr.lower() != addr.lower():
-                logger.error("[BalanceSvc] CONFLICTO addr: %s vs %s", self._addr[:10], addr[:10])
-            return
-        self._addr    = addr
-        self._api_url = (
-            "https://api.hyperliquid-testnet.xyz" if testnet
-            else "https://api.hyperliquid.xyz"
-        )
-        self._ready = True
-        logger.info("[BalanceSvc] Inicializado — consultando balance de MASTER addr=%s", addr)
-
-    def invalidate(self):
-        self._ts    = 0.0
-        self._cache = None
-
-    # ── HTTP directo (sin depender del callback del trader) ──────────────
-
-    async def _post(self, session: aiohttp.ClientSession, payload: dict) -> dict | None:
-        """POST a /info, devuelve dict o None si falla."""
-        try:
-            async with session.post(
-                f"{self._api_url}/info",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                if r.status == 429:
-                    logger.warning("[BalanceSvc] 429 rate-limit en /info")
-                    return None
-                if r.status >= 400:
-                    logger.warning("[BalanceSvc] HTTP %s en /info", r.status)
-                    return None
-                text = await r.text()
-                return _json.loads(text)
-        except Exception as e:
-            logger.debug("[BalanceSvc] _post error: %s", e)
-            return None
-
-    async def _fetch(self) -> float | None:
+    def invalidate_on_sl_detected(self, symbol: str) -> None:
         """
-        Consulta clearinghouseState Y spotClearinghouseState en paralelo.
-        Devuelve el mayor de los dos valores (Cuenta Unificada: el USDC está
-        en Spot pero se usa como colateral de perps).
+        BUG #6 FIX: hook explícito para llamar cuando _ensure_tpsl_on_exchange
+        detecta que la posición ya no existe en el exchange (SL/TP ejecutado
+        externamente). Fuerza una recarga del balance en la próxima consulta.
         """
-        for attempt in range(_MAX_RETRIES):
-            try:
-                async with aiohttp.ClientSession() as s:
-                    # Consultar ambos endpoints en paralelo
-                    perp_task = asyncio.create_task(
-                        self._post(s, {"type": "clearinghouseState", "user": self._addr})
-                    )
-                    spot_task = asyncio.create_task(
-                        self._post(s, {"type": "spotClearinghouseState", "user": self._addr})
-                    )
-                    perp_data, spot_data = await asyncio.gather(perp_task, spot_task)
-
-                    perp_val = self._extract_perp(perp_data)
-                    spot_val = self._extract_spot(spot_data)
-
-                    logger.debug(
-                        "[BalanceSvc] perp=%.2f  spot=%.2f",
-                        perp_val or 0.0, spot_val or 0.0,
-                    )
-
-                    # Si ambos fallaron → reintentar
-                    if perp_val is None and spot_val is None:
-                        logger.warning(
-                            "[BalanceSvc] Ambos endpoints fallaron (intento %d/%d) — "
-                            "addr=%s  perp_raw=%s  spot_raw=%s",
-                            attempt + 1, _MAX_RETRIES,
-                            self._addr,
-                            perp_data,
-                            spot_data,
-                        )
-                        await asyncio.sleep(1.5 * (attempt + 1))
-                        continue
-
-                    # Cuenta Unificada: tomar el mayor
-                    candidates = [v for v in (perp_val, spot_val) if v is not None]
-                    result = max(candidates)
-
-                    if spot_val and spot_val > 0 and (perp_val or 0) == 0:
-                        logger.info(
-                            "[BalanceSvc] Cuenta Unificada — saldo Spot: %.2f USDC",
-                            spot_val,
-                        )
-
-                    return result
-
-            except Exception as e:
-                logger.debug("[BalanceSvc] _fetch error (intento %d): %s", attempt + 1, e)
-                await asyncio.sleep(1.0)
-
-        logger.warning(
-            "[BalanceSvc] _fetch falló tras %d intentos (addr=%s)",
-            _MAX_RETRIES, self._addr,
+        self.invalidate(reason=f"SL/TP externo detectado para {symbol}")
+        log.info(
+            "[BalanceSvc] Balance invalidado por SL/TP externo en %s — "
+            "próxima consulta refrescará desde exchange.",
+            symbol,
         )
-        return None
 
-    def _extract_perp(self, data: dict | None) -> float | None:
-        """Extrae accountValue de clearinghouseState."""
-        if not isinstance(data, dict):
-            return None
-        for key in ("marginSummary", "crossMarginSummary"):
-            ms = data.get(key, {})
-            if isinstance(ms, dict):
-                for field in ("accountValue", "withdrawable"):
-                    v = ms.get(field)
-                    if v is not None:
-                        try:
-                            val = float(v)
-                            if val >= 0:
-                                return val
-                        except (ValueError, TypeError):
-                            pass
-        for field in ("withdrawable", "totalRawUsd", "crossAccountValue"):
-            v = data.get(field)
-            if v is not None:
-                try:
-                    val = float(v)
-                    if val >= 0:
-                        return val
-                except (ValueError, TypeError):
-                    pass
-        return None
-
-    def _extract_spot(self, data: dict | None) -> float | None:
-        """Extrae saldo USDC de spotClearinghouseState."""
-        if not isinstance(data, dict):
-            return None
-        balances = data.get("balances", [])
-        if not isinstance(balances, list):
-            return None
-        for entry in balances:
-            if not isinstance(entry, dict):
-                continue
-            coin  = entry.get("coin", "")
-            token = entry.get("token")
-            if coin == "USDC" or token == 0:
-                v = entry.get("total")
-                if v is None:
-                    v = entry.get("withdrawable")
-                if v is not None:
-                    try:
-                        val = float(v)
-                        if val >= 0:
-                            return val
-                    except (ValueError, TypeError):
-                        pass
-        return None
-
-    # ── API pública ──────────────────────────────────────────────────────
-
-    async def get(self) -> float | None:
-        if not self._ready:
-            logger.warning("[BalanceSvc] get() llamado antes de init_hl()")
-            return None
-
+    async def get(self) -> Optional[float]:
         async with self._lock:
-            now = time.time()
-            if self._cache is not None and now - self._ts < _CACHE_TTL:
-                return self._cache
+            now = time.monotonic()
+            if (
+                self._cached_value is not None
+                and (now - self._cached_at) < self._ttl
+            ):
+                return self._cached_value
 
-            val = await self._fetch()
+            if not self._ready or not self._hl_addr or not self._info_post_fn:
+                return None
 
-            if val is not None:
-                self._cache = val
-                self._ts    = now
-                logger.info(
-                    "[BalanceSvc] Balance actualizado: %.2f USDC (addr=%s)",
-                    val, self._addr,
+            try:
+                data = await self._info_post_fn(
+                    {"type": "clearinghouseState", "user": self._hl_addr}
                 )
-            else:
-                if self._cache is not None:
-                    logger.warning(
-                        "[BalanceSvc] Fetch fallido — usando cache: %.2f USDC",
-                        self._cache,
-                    )
-                else:
-                    logger.warning(
-                        "[BalanceSvc] No se pudo obtener balance (addr=%s)",
-                        self._addr,
-                    )
+                usdc = float(
+                    data.get("crossMarginSummary", {})
+                    .get("accountValue", 0)
+                )
+                self._cached_value = usdc
+                self._cached_at    = time.monotonic()
+                return usdc
+            except Exception as e:
+                log.warning("[BalanceSvc] Error al obtener balance: %s", e)
+                return self._cached_value  # devolver valor anterior si hay error
 
-            return self._cache
+    async def get_fresh(self) -> Optional[float]:
+        """Fuerza una recarga del balance ignorando el caché."""
+        self.invalidate(reason="get_fresh() llamado")
+        return await self.get()
 
 
-balance_svc = _BalanceService()
+balance_svc = BalanceService()

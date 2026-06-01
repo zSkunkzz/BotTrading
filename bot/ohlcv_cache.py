@@ -1,119 +1,116 @@
 """
-ohlcv_cache.py — Cache OHLCV compartido entre todos los traders.
+bot/ohlcv_cache.py — Caché de OHLCV con TTL y LRU eviction.
 
-Problema que resuelve:
-  Con 15 traders corriendo en paralelo, cada uno pidiendo velas en 3
-  timeframes (15m, 1h, 4h), se generan ~45 requests simultáneos a
-  api.hyperliquid.xyz/info, disparando 429s.
+v2 — BUG #9 FIX: sin límite de entradas → OOM tras días de rotación de pares
 
-Solución:
-  Un único OHLCVCache singleton con TTL de 60 segundos por (coin, tf).
-  Si BTC/1h ya fue pedido hace 30s, los demás traders reciben el valor
-  cacheado sin hacer una nueva request REST.
+  El _cache original era un dict que crecía indefinidamente.
+  Con 7+ pares rotando cada 30 min y 200 velas por par, podía acumular
+  cientos de MB hasta que Railway matara el proceso por OOM.
 
-  Además, usa un lock por clave para evitar el problema de "thundering herd":
-  si 10 traders piden el mismo (BTC, 1h) al mismo tiempo y el caché está
-  vacío, solo 1 hace la request real — los otros 9 esperan y usan el resultado.
+  Fix: MAX_OHLCV_CACHE_SYMBOLS (default 20) limita las entradas.
+  LRU eviction: al superar el límite se elimina la entrada con
+  último acceso más antiguo.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
-from typing import Awaitable, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
-logger = logging.getLogger("OHLCVCache")
+log = logging.getLogger(__name__)
 
-# TTL aumentado a 60s para reducir requests REST con 15 traders activos.
-# Las velas de 15m se actualizan cada 15min, por lo que 60s de caché no
-# afecta la calidad de las señales pero reduce los 429s significativamente.
-_DEFAULT_TTL = 60.0  # segundos
+_OHLCV_TTL_S          = float(os.getenv("OHLCV_CACHE_TTL_S", "12"))
+_MAX_CACHE_SYMBOLS    = int(os.getenv("MAX_OHLCV_CACHE_SYMBOLS", "20"))
 
 
-class _OHLCVCache:
-    def __init__(self, ttl: float = _DEFAULT_TTL):
-        self._ttl    = ttl
-        self._cache: dict[tuple, tuple] = {}   # (coin, tf) → (data, timestamp)
-        self._locks: dict[tuple, asyncio.Lock] = {}
-        self._meta_lock = asyncio.Lock()  # protege creación de locks individuales
+class OHLCVCache:
+    """
+    Caché OHLCV con TTL + LRU eviction por número de símbolos.
 
-    async def _key_lock(self, key: tuple) -> asyncio.Lock:
-        async with self._meta_lock:
-            if key not in self._locks:
-                self._locks[key] = asyncio.Lock()
-            return self._locks[key]
+    BUG #9 FIX: al superar _MAX_CACHE_SYMBOLS entradas, se elimina
+    la entrada con timestamp de último acceso más antiguo.
+    """
+
+    def __init__(self, ttl_s: float = _OHLCV_TTL_S, max_symbols: int = _MAX_CACHE_SYMBOLS):
+        self._ttl       = ttl_s
+        self._max       = max_symbols
+        self._cache:    Dict[str, Dict[str, Any]] = {}   # key -> {data, ts, last_access}
+        self._lock      = asyncio.Lock()
 
     async def get(
         self,
         coin: str,
-        tf:   str,
-        fetch_fn: Callable[..., Awaitable[list]],
+        tf: str,
+        fetch_fn: Callable[[str], Any],
     ) -> list:
         """
-        Devuelve velas OHLCV para (coin, tf).
-
-        Si el caché tiene datos frescos, los devuelve directamente.
-        Si no, llama fetch_fn() exactamente una vez aunque haya múltiples
-        traders esperando la misma clave (thundering-herd prevention).
-
-        Args:
-            coin:     nombre normalizado, e.g. "BTC"
-            tf:       timeframe, e.g. "15m", "1h", "4h"
-            fetch_fn: corrutina que recibe (tf) y devuelve list[candle]
+        Devuelve OHLCV desde caché si está fresco, si no llama fetch_fn.
+        BUG #9: aplica eviction LRU antes de insertar entrada nueva.
         """
-        key = (coin, tf)
-        now = time.monotonic()
-
-        # Fast path: hit de caché sin lock
-        entry = self._cache.get(key)
-        if entry is not None:
-            data, ts = entry
-            if now - ts < self._ttl:
-                logger.debug("[OHLCVCache] HIT %s/%s (age=%.1fs)", coin, tf, now - ts)
-                return data
-
-        # Slow path: adquirir lock por clave
-        klock = await self._key_lock(key)
-        async with klock:
-            # Doble check tras adquirir el lock (otro trader pudo haberlo llenado)
+        key = f"{coin}:{tf}"
+        async with self._lock:
             entry = self._cache.get(key)
-            if entry is not None:
-                data, ts = entry
-                if time.monotonic() - ts < self._ttl:
-                    logger.debug("[OHLCVCache] HIT(2) %s/%s", coin, tf)
-                    return data
+            now   = time.monotonic()
+            if entry and (now - entry["ts"]) < self._ttl:
+                entry["last_access"] = now
+                return entry["data"]
 
-            # Fetch real
-            try:
-                data = await fetch_fn(tf)
-            except Exception as e:
-                logger.warning("[OHLCVCache] fetch error %s/%s: %s", coin, tf, e)
-                # Devolver datos viejos si los hay, mejor que vacío
-                if entry is not None:
-                    return entry[0]
-                return []
+        # Fetch fuera del lock para no bloquear otros lectores
+        try:
+            data = await fetch_fn(tf)
+        except Exception as e:
+            log.error("[OHLCVCache] fetch error %s/%s: %s", coin, tf, e)
+            # Devolver datos expirados si los hay
+            async with self._lock:
+                entry = self._cache.get(key)
+                if entry:
+                    log.warning(
+                        "[OHLCVCache] Devolviendo datos expirados para %s/%s (fetch falló)",
+                        coin, tf,
+                    )
+                    return entry["data"]
+            return []
 
-            if data:
-                self._cache[key] = (data, time.monotonic())
-                logger.debug("[OHLCVCache] MISS→stored %s/%s (%d candles)",
-                             coin, tf, len(data))
-            return data or []
+        if not data:
+            return []
 
-    def invalidate(self, coin: Optional[str] = None, tf: Optional[str] = None):
-        """Invalida entradas. Sin args = limpia todo el caché."""
-        if coin is None:
-            self._cache.clear()
-            logger.debug("[OHLCVCache] caché completo invalidado")
-        else:
-            key = (coin, tf) if tf else None
-            if key:
-                self._cache.pop(key, None)
+        async with self._lock:
+            now = time.monotonic()
+            # BUG #9 FIX: eviction LRU si superamos el límite
+            if key not in self._cache and len(self._cache) >= self._max:
+                # Eliminar la entrada con last_access más antiguo
+                oldest_key = min(
+                    self._cache,
+                    key=lambda k: self._cache[k].get("last_access", self._cache[k]["ts"]),
+                )
+                del self._cache[oldest_key]
+                log.debug(
+                    "[OHLCVCache] LRU eviction: eliminado %s (cache lleno, max=%d)",
+                    oldest_key, self._max,
+                )
+            self._cache[key] = {"data": data, "ts": now, "last_access": now}
+
+        return data
+
+    async def invalidate(self, coin: str, tf: Optional[str] = None) -> None:
+        """Invalidar una entrada o todas las del coin."""
+        async with self._lock:
+            if tf:
+                self._cache.pop(f"{coin}:{tf}", None)
             else:
-                # Invalida todas las TFs de este coin
-                for k in list(self._cache.keys()):
-                    if k[0] == coin:
-                        self._cache.pop(k, None)
+                keys_to_del = [k for k in self._cache if k.startswith(f"{coin}:")]
+                for k in keys_to_del:
+                    del self._cache[k]
+
+    async def stats(self) -> dict:
+        async with self._lock:
+            return {
+                "entries": len(self._cache),
+                "max":     self._max,
+                "keys":    list(self._cache.keys()),
+            }
 
 
-# Singleton compartido
-ohlcv_cache = _OHLCVCache()
+ohlcv_cache = OHLCVCache()

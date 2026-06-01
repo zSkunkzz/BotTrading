@@ -1,22 +1,13 @@
 """
 bot/state.py  –  Thread-safe, atomically-written position state.
 
-Persistencia en Railway:
-  - Monta un Volume en /data desde el dashboard de Railway.
-  - STATE_FILE por defecto apunta a /data/bot_state.json.
-  - Si /data no existe (local/dev), cae a /tmp automáticamente.
-  - Puedes sobreescribir con la variable de entorno STATE_FILE.
-
-Fixes:
-  - asyncio.Lock around every read/write to avoid partial-state races (coroutines)
-  - threading.Lock around _save_sync() to protect concurrent sync writes from
-    multiple traders running in the same event loop thread (BUG #4 FIX)
-  - Atomic write via tempfile + os.replace() – no corrupt JSON on crash
-  - Bug: side="" is falsy → now stored/checked with explicit None sentinel
-  - Railway warning: only shown when /data is NOT a persistent volume
-  - COMPAT: backward-compatible free functions (save_position, load_position,
-    clear_position, mark_tp2_hit) so trader.py / position_manager.py / decision_engine.py
-    can import them without changes.
+v5 — MULTI-SYMBOL FIX (BUG #1)
+  - _position ahora es dict[symbol -> dict] en lugar de Optional[dict]
+  - save/load/clear/mark_tp2_hit indexan por symbol
+  - Migración automática desde formato antiguo de fichero plano
+  - threading.Lock en _save_sync() (BUG #4 del commit anterior)
+  - asyncio.Lock en todas las coroutinas
+  - Atomic write via tempfile + os.replace()
 """
 from __future__ import annotations
 
@@ -33,7 +24,7 @@ log = logging.getLogger(__name__)
 
 _RAILWAY = os.getenv("RAILWAY_ENVIRONMENT") is not None
 
-# ── Resolver ruta del fichero de estado ───────────────────────────────────────
+
 def _resolve_state_file() -> Path:
     env_val = os.getenv("STATE_FILE", "").strip()
     if env_val:
@@ -57,9 +48,8 @@ if _RAILWAY:
         log.info("Estado persistente en Railway Volume: %s", _STATE_FILE)
     else:
         log.warning(
-            "Running on Railway: %s es EPHEMERAL y se borrará en cada redeploy. "
-            "Solución: crea un Volume en el dashboard de Railway y móntalo en /data "
-            "(o configura STATE_FILE a una ruta persistente).",
+            "Running on Railway: %s es EPHEMERAL. "
+            "Crea un Volume en el dashboard de Railway montado en /data.",
             _STATE_FILE,
         )
 else:
@@ -67,41 +57,56 @@ else:
 
 
 class BotState:
-    """Holds one open position (or None) plus cumulative session stats."""
+    """
+    Holds open positions keyed by symbol.
+
+    BUG #1 FIX: _positions es dict[str, dict] en lugar de Optional[dict].
+    Múltiples traders (BTC, ETH, SOL, ...) pueden tener posiciones abiertas
+    simultáneamente sin sobreescribirse entre sí.
+    """
 
     def __init__(self) -> None:
-        self._lock      = asyncio.Lock()      # para coroutinas
-        self._sync_lock = threading.Lock()    # BUG #4 FIX: para escrituras síncronas concurrentes
-        self._position: Optional[Dict[str, Any]] = None
+        self._lock      = asyncio.Lock()
+        self._sync_lock = threading.Lock()
+        self._positions: Dict[str, Dict[str, Any]] = {}  # symbol -> position dict
         self._session_pnl: float = 0.0
         self._trades: int = 0
         self._load()
 
-    # ── persistence ───────────────────────────────────────────────────────────
-
     def _load(self) -> None:
-        """Best-effort load from disk (non-blocking, called once at init)."""
         try:
             if _STATE_FILE.exists():
                 data = json.loads(_STATE_FILE.read_text())
-                pos = data.get("position")
-                if pos is not None and pos.get("side") == "":
-                    pos["side"] = None
-                self._position = pos
+                raw = data.get("positions")
+                if isinstance(raw, dict):
+                    # Nuevo formato multi-symbol
+                    self._positions = raw
+                else:
+                    # Migración automática desde formato antiguo (single-slot)
+                    old_pos = data.get("position")
+                    if old_pos and isinstance(old_pos, dict):
+                        sym = old_pos.get("symbol") or old_pos.get("coin", "UNKNOWN")
+                        if old_pos.get("side") == "":
+                            old_pos["side"] = None
+                        self._positions = {sym: old_pos}
+                        log.warning(
+                            "State migrado desde formato antiguo: %d posición(es) restauradas.",
+                            len(self._positions),
+                        )
+                    else:
+                        self._positions = {}
                 self._session_pnl = float(data.get("session_pnl", 0.0))
                 self._trades = int(data.get("trades", 0))
-                log.info("State loaded from %s", _STATE_FILE)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Could not load state file (%s) – starting fresh.", exc)
+                log.info(
+                    "State loaded: %d posicion(es) abiertas.",
+                    len(self._positions),
+                )
+        except Exception as exc:
+            log.warning("No se pudo cargar state file (%s) — empezando limpio.", exc)
 
     def _save_sync(self) -> None:
-        """
-        Atomic write: write to tmp then os.replace() into final path.
-        BUG #4 FIX: protected by threading.Lock() para evitar escrituras
-        concurrentes desde múltiples traders en el mismo hilo asyncio.
-        """
         payload = {
-            "position":    self._position,
+            "positions":   self._positions,
             "session_pnl": self._session_pnl,
             "trades":      self._trades,
         }
@@ -121,43 +126,50 @@ class BotState:
                     except OSError:
                         pass
                     raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 log.error("State save failed: %s", exc)
 
-    # ── public API (all coroutines) ────────────────────────────────────────────
+    # ── public async API ──────────────────────────────────────────────────
 
-    async def get_position(self) -> Optional[Dict[str, Any]]:
+    async def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         async with self._lock:
-            return dict(self._position) if self._position else None
+            pos = self._positions.get(symbol)
+            return dict(pos) if pos else None
 
-    async def has_position(self) -> bool:
+    async def get_all_positions(self) -> Dict[str, Dict[str, Any]]:
         async with self._lock:
-            return self._position is not None
+            return {k: dict(v) for k, v in self._positions.items()}
 
-    async def set_position(self, pos: Optional[Dict[str, Any]]) -> None:
-        """Store a position dict.  Pass None to clear."""
+    async def has_position(self, symbol: str) -> bool:
+        async with self._lock:
+            return symbol in self._positions
+
+    async def set_position(self, symbol: str, pos: Optional[Dict[str, Any]]) -> None:
         if pos is not None:
             if pos.get("side") == "":
                 pos = {**pos, "side": None}
+            pos["symbol"] = symbol
         async with self._lock:
-            self._position = pos
+            if pos is None:
+                self._positions.pop(symbol, None)
+            else:
+                self._positions[symbol] = pos
             self._save_sync()
 
-    async def update_position(self, **kwargs: Any) -> None:
-        """Patch individual fields of the current position."""
+    async def update_position(self, symbol: str, **kwargs: Any) -> None:
         async with self._lock:
-            if self._position is None:
-                log.warning("update_position called with no open position – ignored")
+            if symbol not in self._positions:
+                log.warning("update_position(%s): no hay posición abierta — ignorado", symbol)
                 return
             for k, v in kwargs.items():
                 if k == "side" and v == "":
                     v = None
-                self._position[k] = v
+                self._positions[symbol][k] = v
             self._save_sync()
 
-    async def clear_position(self) -> None:
+    async def clear_position(self, symbol: str) -> None:
         async with self._lock:
-            self._position = None
+            self._positions.pop(symbol, None)
             self._save_sync()
 
     async def record_trade(self, pnl: float) -> None:
@@ -168,60 +180,39 @@ class BotState:
 
     async def get_stats(self) -> Dict[str, Any]:
         async with self._lock:
-            return {
-                "session_pnl": self._session_pnl,
-                "trades":      self._trades,
-            }
+            return {"session_pnl": self._session_pnl, "trades": self._trades}
 
-    # ── sync helpers (backward-compat layer) ──────────────────────────────────
-    # BUG #4 FIX: estas funciones son llamadas desde múltiples traders de forma
-    # síncrona (dentro del event loop). El threading.Lock en _save_sync() protege
-    # las escrituras concurrentes. No intentamos adquirir asyncio.Lock aquí
-    # para evitar deadlock (no estamos en una coroutine).
+    # ── sync helpers (backward-compat layer) ──────────────────────────────
+    # BUG #1 FIX + BUG #4 FIX: indexados por symbol, protegidos por threading.Lock
 
     def _save_position_sync(self, symbol: str, data: Dict[str, Any]) -> None:
         pos = dict(data)
-        pos.setdefault("symbol", symbol)
+        pos["symbol"] = symbol
         if pos.get("side") == "":
             pos["side"] = None
-        self._position = pos
+        self._positions[symbol] = pos
         self._save_sync()
 
     def _load_position_sync(self, symbol: str) -> Optional[Dict[str, Any]]:
-        if self._position is None:
-            return None
-        if self._position.get("symbol") == symbol:
-            return dict(self._position)
-        if "symbol" not in self._position:
-            return dict(self._position)
-        return None
+        pos = self._positions.get(symbol)
+        return dict(pos) if pos else None
 
     def _clear_position_sync(self, symbol: str) -> None:
-        if self._position is None:
-            return
-        if (
-            self._position.get("symbol") == symbol
-            or "symbol" not in self._position
-        ):
-            self._position = None
+        if symbol in self._positions:
+            self._positions.pop(symbol)
             self._save_sync()
 
     def _mark_tp2_hit_sync(self, symbol: str) -> None:
-        if self._position is None:
-            return
-        if (
-            self._position.get("symbol") == symbol
-            or "symbol" not in self._position
-        ):
-            self._position["tp2_hit"] = True
+        if symbol in self._positions:
+            self._positions[symbol]["tp2_hit"] = True
             self._save_sync()
 
 
-# ── module-level singleton ─────────────────────────────────────────────────────
+# ── module-level singleton ────────────────────────────────────────────────
 bot_state = BotState()
 
 
-# ── BACKWARD-COMPATIBLE FREE FUNCTIONS ────────────────────────────────────────
+# ── BACKWARD-COMPATIBLE FREE FUNCTIONS ───────────────────────────────────
 
 def save_position(symbol: str, data: Dict[str, Any]) -> None:
     bot_state._save_position_sync(symbol, data)
