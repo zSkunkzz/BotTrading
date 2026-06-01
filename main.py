@@ -36,6 +36,11 @@ _LEVERAGE_BASE = int(os.getenv("LEVERAGE", "5"))
 # Se rellena desde el snapshot y se consulta al arrancar cada trader.
 _max_leverage_map: dict[str, int] = {}
 
+# ── USDC por operación — fuente ÚNICA: variable de entorno USDC_PER_TRADE ──
+# NOTA: el antiguo fallback "USBC_PER_TRADE" era un typo (B en vez de D).
+#       Se elimina para evitar confusión. El default es 20 USDC.
+_USDC_PER_TRADE = float(os.getenv("USDC_PER_TRADE", "20"))
+
 
 def _resolve_hl_address() -> str:
     """
@@ -60,8 +65,13 @@ def _resolve_hl_address() -> str:
 
 
 def make_risk():
+    """
+    Crea el objeto RiskManager para cada trader.
+    usdc_per_trade = _USDC_PER_TRADE (leído una vez al arranque desde USDC_PER_TRADE).
+    Por defecto: 20 USDC por operación.
+    """
     return RiskManager(
-        usdc_per_trade=float(os.getenv("USDC_PER_TRADE", os.getenv("USBC_PER_TRADE", "10"))),
+        usdc_per_trade=_USDC_PER_TRADE,
         tp_pct=float(os.getenv("TP_PCT", "4.0")),
         sl_pct=float(os.getenv("SL_PCT", "2.0")),
         trailing_sl=os.getenv("TRAILING_SL", "true").lower() == "true",
@@ -103,7 +113,10 @@ async def _start_single_pair(symbol: str):
             symbol, len(active_traders), MAX_ACTIVE_TRADERS,
         )
         return
-    logger.info("🚀 Iniciando trader: %s (leverage=%dx)", symbol, _effective_leverage(symbol))
+    logger.info(
+        "🚀 Iniciando trader: %s (leverage=%dx | usdc_per_trade=%.2f)",
+        symbol, _effective_leverage(symbol), _USDC_PER_TRADE,
+    )
 
     private_key = (
         os.getenv("HL_API_PRIVATE_KEY", "").strip()
@@ -183,6 +196,12 @@ async def main():
     logger.info("=" * 60)
     logger.info("  HyperliquidBot v1.0 — IA + Scanner + Telegram + KS")
     logger.info("=" * 60)
+
+    # ── Confirmar sizing al arranque ──────────────────────────────────────
+    logger.info(
+        "💰 Sizing: USDC_PER_TRADE=%.2f USDC | LEVERAGE=%dx",
+        _USDC_PER_TRADE, _LEVERAGE_BASE,
+    )
 
     # ── Balance service ──────────────────────────────────
     hl_addr = _resolve_hl_address()
