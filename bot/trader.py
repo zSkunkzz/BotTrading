@@ -187,6 +187,7 @@ class FuturesTrader:
         self.sl             = None
         self.tp1 = self.tp2 = self.tp3 = None
         self.tp2_hit        = False
+        self._tp1_hit       = False   # FIX #1: guard para evitar re-trigger de TP1
         self.trade_count    = 0
         self.win_count      = 0
         self.total_pnl      = 0.0
@@ -297,6 +298,7 @@ class FuturesTrader:
                 self.tp2              = saved.get("tp2")
                 self.tp3              = saved.get("tp3")
                 self.tp2_hit          = saved.get("tp2_hit", False)
+                self._tp1_hit         = saved.get("tp1_hit", False)
                 self._open_notional   = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
                 self._open_leverage   = saved.get("leverage", self.leverage)
                 saved_margin = saved.get("margin_usdc")
@@ -335,6 +337,7 @@ class FuturesTrader:
                 self.tp2              = saved.get("tp2")
                 self.tp3              = saved.get("tp3")
                 self.tp2_hit          = saved.get("tp2_hit", False)
+                self._tp1_hit         = saved.get("tp1_hit", False)
                 self._open_notional   = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
                 self._open_leverage   = saved.get("leverage", self.leverage)
                 saved_margin = saved.get("margin_usdc")
@@ -777,6 +780,7 @@ class FuturesTrader:
         self.entry_price = None
         self.sl = self.tp1 = self.tp2 = self.tp3 = None
         self.tp2_hit = False
+        self._tp1_hit = False
         self._opening_position = False
         self._open_qty = 0.0
 
@@ -1046,6 +1050,25 @@ class FuturesTrader:
             fill_entry = float(pos_data.get("entryPx") or entry)
             confirmed_qty = qty
 
+            # FIX #3: recalcular SL/TP sobre fill_entry real para eliminar
+            # desajuste por slippage entre signal.entry y el precio de fill.
+            if fill_entry != entry and entry > 0:
+                fill_ratio = fill_entry / entry
+                sl_recalc  = round(sl  * fill_ratio, 6)
+                tp1_recalc = round(tp1 * fill_ratio, 6)
+                tp2_recalc = round(tp2 * fill_ratio, 6) if tp2 else tp2
+                tp3_recalc = round(tp3 * fill_ratio, 6) if tp3 else tp3
+                logger.info(
+                    "[%s] Fill slippage: signal_entry=%.5f fill=%.5f (ratio=%.6f) "
+                    "— SL: %.5f→%.5f | TP1: %.5f→%.5f",
+                    self.symbol, entry, fill_entry, fill_ratio,
+                    sl, sl_recalc, tp1, tp1_recalc,
+                )
+                sl  = sl_recalc
+                tp1 = tp1_recalc
+                tp2 = tp2_recalc
+                tp3 = tp3_recalc
+
             self.position         = pos_side
             self.entry_price      = fill_entry
             self.sl               = sl
@@ -1053,6 +1076,7 @@ class FuturesTrader:
             self.tp2              = tp2
             self.tp3              = tp3
             self.tp2_hit          = False
+            self._tp1_hit         = False
             self._open_margin     = margin_usdc
             self._open_notional   = confirmed_qty * fill_entry
             self._open_leverage   = lev
@@ -1068,6 +1092,7 @@ class FuturesTrader:
                 "tp2":         tp2,
                 "tp3":         tp3,
                 "tp2_hit":     False,
+                "tp1_hit":     False,
                 "leverage":    lev,
                 "usdc_amount": self._open_notional,
                 "margin_usdc": margin_usdc,
@@ -1158,11 +1183,15 @@ class FuturesTrader:
                 return
 
         # ── TP1 hit — cierre parcial + mover SL a break-even ──────────────
-        if tp1 and not self.tp2_hit:
+        # FIX #1 + #2: después de detectar TP1, se limpia self.tp1 y se activa
+        # self._tp1_hit para que el loop no redetecte TP1 en ticks sucesivos,
+        # permitiendo que TP2 se evalúe correctamente en la siguiente iteración.
+        if tp1 and not self._tp1_hit:
             tp1_hit = (is_long and price >= tp1) or (not is_long and price <= tp1)
             if tp1_hit:
                 logger.info("[%s] 🟡 TP1 alcanzado @ %.5f — cierre parcial", self.symbol, price)
                 positions = await self._get_positions()
+                remaining_qty = 0.0
                 if positions:
                     pos_data    = positions[0]
                     current_qty = abs(float(pos_data.get("szi", 0)))
@@ -1170,25 +1199,39 @@ class FuturesTrader:
                     if partial_qty > 0:
                         close_side = "sell" if is_long else "buy"
                         await self._place_order(close_side, partial_qty, reduce_only=True)
+                    remaining_qty = max(0.0, current_qty - partial_qty)
+
+                # FIX #1: limpiar tp1 y marcar _tp1_hit para desbloquear TP2
+                self._tp1_hit = True
+                self.tp1      = None
+                # Actualizar SL a break-even
                 self.sl = entry * (1 + _SL_SW_MARGIN) if is_long else entry * (1 - _SL_SW_MARGIN)
+                # Actualizar qty restante en estado interno
+                if remaining_qty > 0:
+                    self._open_qty = remaining_qty
+
                 save_position(self.symbol, {
                     "side":        self.position,
                     "entry":       entry,
                     "sl":          self.sl,
-                    "tp1":         tp1,
+                    "tp1":         None,
                     "tp2":         tp2,
                     "tp3":         tp3,
                     "tp2_hit":     False,
+                    "tp1_hit":     True,
                     "leverage":    self._open_leverage,
                     "usdc_amount": self._open_notional,
                     "margin_usdc": self._open_margin,
                     "qty":         self._open_qty,
                     "entry_mode":  self._open_entry_mode,
                 })
+                # Forzar re-verificación de SL en exchange con nuevo nivel break-even
+                self._protection_ok = False
                 await notify_tp_partial(self.symbol, self.position, price, tp_level=1)
                 return
 
         # ── TP2 partial close ──────────────────────────────────────────────
+        # FIX #2: ahora se evalúa cuando _tp1_hit=True (tp1 ya procesado) o tp1 es None
         if tp2 and not self.tp2_hit:
             tp2_hit = (is_long and price >= tp2) or (not is_long and price <= tp2)
             if tp2_hit:
@@ -1207,10 +1250,11 @@ class FuturesTrader:
                     "side":        self.position,
                     "entry":       entry,
                     "sl":          self.sl,
-                    "tp1":         tp1,
+                    "tp1":         self.tp1,
                     "tp2":         tp2,
                     "tp3":         tp3,
                     "tp2_hit":     True,
+                    "tp1_hit":     self._tp1_hit,
                     "leverage":    self._open_leverage,
                     "usdc_amount": self._open_notional,
                     "margin_usdc": self._open_margin,
