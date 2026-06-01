@@ -11,6 +11,7 @@ Uso desde signal_engine.py (API idéntica a la versión Bitget):
     price   = ws_feed.get_price("BTC")       # sin USDT
     df15    = ws_feed.get_ohlcv("BTC", "15m")
     ob      = ws_feed.get_orderbook_metrics("BTC")
+    closed  = ws_feed.is_candle_closed("BTC", "15m")  # #7
 
 Nota: Hyperliquid usa nombres cortos de coin ("BTC", "ETH", "SOL"), sin "USDT".
       El módulo acepta "BTCUSDT" y lo normaliza internamente.
@@ -39,6 +40,21 @@ TF_MAP = {
     "15m": "15m",
     "1h":  "1h",
     "4h":  "4h",
+}
+
+# Duración en segundos de cada timeframe (para cálculo de vela cerrada #7)
+_TF_SECS: dict[str, float] = {
+    "1m":  60,
+    "3m":  180,
+    "5m":  300,
+    "15m": 900,
+    "30m": 1800,
+    "1h":  3600,
+    "2h":  7200,
+    "4h":  14400,
+    "6h":  21600,
+    "12h": 43200,
+    "1d":  86400,
 }
 
 OB_DEPTH = 20
@@ -96,6 +112,8 @@ class _SymbolCache:
         self.price_ts:  float = 0.0
         self.candles:   Dict[str, deque] = {tf: deque(maxlen=OHLCV_LIMIT) for tf in TF_MAP}
         self.candle_ts: Dict[str, float] = {tf: 0.0 for tf in TF_MAP}
+        # timestamp de apertura de la última vela recibida por TF (en ms epoch)
+        self.candle_open_ts_ms: Dict[str, int] = {tf: 0 for tf in TF_MAP}
         self.ob:        _OrderBookCache  = _OrderBookCache()
 
     def update_price(self, last: float):
@@ -116,7 +134,8 @@ class _SymbolCache:
             dq[-1] = row
         else:
             dq.append(row)
-        self.candle_ts[tf] = time.monotonic()
+        self.candle_ts[tf]         = time.monotonic()
+        self.candle_open_ts_ms[tf] = ts  # guardar ts apertura (ms epoch)
 
     def get_ohlcv_df(self, tf: str) -> pd.DataFrame:
         dq = self.candles.get(tf)
@@ -134,7 +153,7 @@ class WSFeed:
         self._running  = False
         self._task:    Optional[asyncio.Task] = None
 
-    # ── API pública (compatible con versión Bitget) ───────────────────────────
+    # ── API pública (compatible con versión Bitget) ─────────────────────────────
 
     def _key(self, symbol: str) -> str:
         return _norm(symbol)
@@ -176,7 +195,70 @@ class WSFeed:
             return False
         return (time.monotonic() - c.ob.ts) < max_age
 
-    # ── Control ───────────────────────────────────────────────────────────────
+    # ── #7 Confirmación de vela cerrada ─────────────────────────────────────
+
+    def is_candle_closed(
+        self,
+        symbol:    str,
+        tf:        str = "15m",
+        threshold: float = 0.80,
+    ) -> bool:
+        """
+        Devuelve True si la vela actual del TF dado ha consumido al menos
+        `threshold` (default 80%) de su duración total.
+
+        Lógica:
+          - Toma el timestamp de apertura de la última vela conocida (ms epoch).
+          - Calcula el tiempo transcurrido desde esa apertura.
+          - Divide por la duración total del TF.
+          - Si >= threshold → True (vela prácticamente cerrada, señal fiable).
+
+        Si no hay datos (cache vacío), devuelve True para no bloquear
+        el bot en arranque sin historial.
+        """
+        tf_secs = _TF_SECS.get(tf)
+        if not tf_secs:
+            return True  # TF desconocido → no bloquear
+
+        c = self._cache.get(self._key(symbol))
+        if not c:
+            return True  # sin cache → no bloquear
+
+        open_ms = c.candle_open_ts_ms.get(tf, 0)
+        if not open_ms:
+            return True  # sin datos → no bloquear
+
+        now_ms   = time.time() * 1000
+        elapsed  = (now_ms - open_ms) / 1000.0  # segundos transcurridos
+        progress = elapsed / tf_secs
+
+        closed = progress >= threshold
+        if not closed:
+            log.debug(
+                "[%s] Vela %s al %.0f%% (≤%.0f%%) — esperando cierre.",
+                symbol, tf, progress * 100, threshold * 100,
+            )
+        return closed
+
+    def candle_progress(self, symbol: str, tf: str = "15m") -> float:
+        """
+        Devuelve el progreso de la vela actual entre 0.0 y 1.0.
+        0.0 = recién abierta, 1.0 = cerrada.
+        Devuelve 1.0 si no hay datos (no bloquea).
+        """
+        tf_secs = _TF_SECS.get(tf)
+        if not tf_secs:
+            return 1.0
+        c = self._cache.get(self._key(symbol))
+        if not c:
+            return 1.0
+        open_ms = c.candle_open_ts_ms.get(tf, 0)
+        if not open_ms:
+            return 1.0
+        elapsed = (time.time() * 1000 - open_ms) / 1000.0
+        return min(elapsed / tf_secs, 1.0)
+
+    # ── Control ─────────────────────────────────────────────────────────────
 
     def start(self, symbols: List[str]):
         self._symbols = [_norm(s) for s in symbols]
@@ -201,7 +283,7 @@ class WSFeed:
             self._task.cancel()
         log.info("[WSFeed] Detenido")
 
-    # ── Loop de reconexión ────────────────────────────────────────────────────
+    # ── Loop de reconexión ─────────────────────────────────────────────────
 
     async def _run_loop(self):
         attempt = 0
@@ -282,7 +364,7 @@ class WSFeed:
         elif channel == "l2Book" and isinstance(data, dict):
             coin = data.get("coin", "")
             if coin in self._cache:
-                levels = data.get("levels", [[], []])
+                levels   = data.get("levels", [[], []])
                 bids_raw = levels[0] if len(levels) > 0 else []
                 asks_raw = levels[1] if len(levels) > 1 else []
                 bids = [[e["px"], e["sz"]] for e in bids_raw if isinstance(e, dict)]

@@ -2,13 +2,15 @@
 decision_engine.py — Toma de decisiones de trading.
 
 Responsabilidades:
-  - Obtener precio y OHLCV
   - Verificar cooldown de reapertura (signal_cooldown)
+  - Verificar confirmación de vela cerrada antes de entrar (#7)
   - Verificar balance y risk pre-trade (pretrade_risk con firma correcta)
   - Llamar a decide() + ai_decide()
   - Calcular qty y apalancamiento
+  - Aplicar sizing dinámico según win-rate histórico del modo (#8)
   - Abrir posición y persistir estado
   - Registrar exposición en pretrade_risk tras fill confirmado
+  - Registrar señal en shadow_mode con entry_mode (#8)
   - Notificar apertura via Telegram
 
 Extraído de FuturesTrader._iteration en trader.py.
@@ -26,8 +28,15 @@ from bot.balance_service import balance_svc
 from bot.pretrade_risk import pretrade_risk
 from bot.kill_switch import kill_switch
 from bot.signal_cooldown import signal_cooldown
+from bot.shadow_mode import shadow_mode
+from bot.ws_feed import ws_feed
 
 logger = logging.getLogger("DecisionEngine")
+
+# Timeframe de referencia para la guardia de vela cerrada (#7)
+_CANDLE_CONFIRM_TF        = os.getenv("CANDLE_CONFIRM_TF", "15m")
+_CANDLE_CONFIRM_THRESHOLD = float(os.getenv("CANDLE_CONFIRM_THRESHOLD", "0.80"))
+_CANDLE_CONFIRM_ENABLED   = os.getenv("CANDLE_CONFIRM_ENABLED", "true").lower() == "true"
 
 
 class DecisionEngine:
@@ -67,6 +76,18 @@ class DecisionEngine:
             )
             return
 
+        # ── #7 Confirmación de vela cerrada ────────────────────────────────
+        if _CANDLE_CONFIRM_ENABLED:
+            if not ws_feed.is_candle_closed(
+                self.symbol, _CANDLE_CONFIRM_TF, _CANDLE_CONFIRM_THRESHOLD
+            ):
+                logger.debug(
+                    "[%s] Vela %s sin confirmar (progreso<%.0f%%) — skip.",
+                    self.symbol, _CANDLE_CONFIRM_TF,
+                    _CANDLE_CONFIRM_THRESHOLD * 100,
+                )
+                return
+
         # ── Verificaciones previas ────────────────────────────────────────────
         if global_risk:
             allowed, reason = await global_risk.can_open()
@@ -82,7 +103,7 @@ class DecisionEngine:
             )
             return
 
-        # ── Señal de estrategia (necesitamos precio y señal antes del check) ──
+        # ── Señal de estrategia ───────────────────────────────────────────────
         try:
             exch     = await trader._get_ccxt()
             decision = await decide(
@@ -101,7 +122,7 @@ class DecisionEngine:
         if action not in ("BUY", "SELL"):
             return
 
-        # ── Calcular parámetros de la orden ───────────────────────────────────
+        # ── Parámetros de la orden ───────────────────────────────────────────────
         try:
             price = await trader.get_price()
         except Exception as e:
@@ -126,12 +147,20 @@ class DecisionEngine:
         if lev != trader.leverage:
             await trader._set_leverage(lev)
 
-        notional = risk.usdc_per_trade * lev
-        side     = "buy" if action == "BUY" else "sell"
+        # ── #8 Sizing dinámico según win-rate histórico del modo ──────────────
+        sizing_mult = shadow_mode.sizing_multiplier(entry_mode)
+        base_usdc   = risk.usdc_per_trade * sizing_mult
+        notional    = base_usdc * lev
+
+        if sizing_mult != 1.0:
+            logger.info(
+                "[%s] Sizing dinámico: %.2f× (modo=%s) → %.2f USDC base",
+                self.symbol, sizing_mult, entry_mode or "?", base_usdc,
+            )
+
+        side = "buy" if action == "BUY" else "sell"
 
         # ── pretrade_risk.check() con firma correcta ──────────────────────────
-        # La firma es: check(symbol, side, notional, price, balance, sl, leverage)
-        # Devuelve tuple (ok: bool, reason: str) — NO es un bool directo.
         try:
             ok, reason = await pretrade_risk.check(
                 symbol=self.symbol,
@@ -143,22 +172,22 @@ class DecisionEngine:
                 leverage=lev,
             )
             if not ok:
-                logger.debug("[%s] pretrade_risk bloqueó la entrada: %s", self.symbol, reason)
+                logger.debug("[%s] pretrade_risk bloqueó: %s", self.symbol, reason)
                 return
         except Exception as e:
             logger.warning("[%s] pretrade_risk.check() error: %s — continuando", self.symbol, e)
 
-        # FIX: respetar szDecimals del coin — usar _round_qty del trader
         qty = trader._round_qty(notional / entry)
         if qty <= 0:
             logger.warning("[%s] qty <= 0 tras redondeo szDecimals, skip.", self.symbol)
             return
 
         logger.info(
-            "[%s] 📈 Abriendo %s · qty=%s · entry=~%s · sl=%s · tp1=%s | %s",
+            "[%s] 📈 Abriendo %s · qty=%s · entry=~%s · sl=%s · tp1=%s · modo=%s | %s",
             self.symbol, action, qty, round(entry, 4),
             round(sl, 4) if sl else "N/A",
             round(tp1, 4) if tp1 else "N/A",
+            entry_mode or "?",
             decision.get("reason", ""),
         )
 
@@ -172,7 +201,7 @@ class DecisionEngine:
         if result.get("status") != "ok":
             return
 
-        # ── pretrade_risk: registrar exposición tras fill confirmado ──────────
+        # Registrar exposición en pretrade_risk tras fill confirmado
         pretrade_risk.confirm_order(self.symbol, notional)
 
         try:
@@ -184,7 +213,6 @@ class DecisionEngine:
             fill_price = entry
 
         if fill_price and fill_price != entry:
-            # FIX: también szDecimals al recalcular con fill real
             qty = trader._round_qty(notional / fill_price)
             logger.debug(
                 "[%s] Fill real: %.4f (estimado: %.4f) — qty ajustada a %s",
@@ -219,7 +247,19 @@ class DecisionEngine:
             "tp2_hit":     trader.tp2_hit,
             "usdc_amount": notional,
             "leverage":    lev,
+            "entry_mode":  entry_mode,   # guardado para restauración en restart
         })
+
+        # ── #8 Registrar señal en shadow_mode con entry_mode ────────────────
+        shadow_mode.record_signal(
+            symbol=self.symbol,
+            side=trader.position,
+            price=fill_price,
+            sl=sl,
+            tp=tp3 or tp1,
+            entry_mode=entry_mode,
+        )
+        shadow_mode.record_real_open(self.symbol, fill_price)
 
         if global_risk:
             await global_risk.register_open()
