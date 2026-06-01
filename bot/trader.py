@@ -944,10 +944,16 @@ class FuturesTrader:
         await self._place_tpsl(qty=fill_qty, sl=sl, tp=tp1, entry_px=fill_entry)
         self._protection_ok = True
 
+        # ── FIX: usar 'price' en lugar de 'entry' (nombre correcto del parámetro) ──
         await notify_open(
-            symbol=self.symbol, side=pos_side, entry=fill_entry,
-            sl=sl, tp1=tp1, tp2=tp2,
-            qty=fill_qty, usdc=margin_usdc, leverage=lev,
+            symbol=self.symbol,
+            side=pos_side,
+            price=fill_entry,      # ← antes era entry=fill_entry → TypeError
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
+            usdt=margin_usdc,
+            leverage=lev,
         )
 
         logger.info(
