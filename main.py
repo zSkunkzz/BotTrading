@@ -268,15 +268,43 @@ async def main():
     )
 
     # ── Balance service ──────────────────────────────────
+    # FIX: init_hl(address, info_post_fn) — firma real de BalanceService.
+    # La llamada anterior usaba addr= y testnet= que no existen en la clase.
+    # info_post_fn se inyecta desde trader.py via _hl_info_post cuando está
+    # disponible; aquí se inicializa con None y se sobreescribe al arrancar
+    # el primer trader (balance_svc.init_hl se puede llamar de nuevo).
     hl_addr = _resolve_hl_address()
     if not hl_addr:
-        logger.warning("⚠️ No se pudo resolver dirección HL. Configura HL_API_WALLET_ADDRESS o HL_ACCOUNT_ADDR.")
-    balance_svc.init_hl(
-        addr=hl_addr,
-        testnet=os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes"),
+        logger.warning(
+            "⚠️ No se pudo resolver dirección HL. "
+            "Configura HL_API_WALLET_ADDRESS o HL_ACCOUNT_ADDR."
+        )
+
+    # info_post_fn: función async que hace POST al endpoint de info de HL.
+    # Se construye aquí con httpx para no depender de que un trader esté activo.
+    import httpx
+
+    _HL_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
+    _HL_INFO_URL = (
+        "https://api.hyperliquid-testnet.xyz/info"
+        if _HL_TESTNET
+        else "https://api.hyperliquid.xyz/info"
     )
-    logger.info("✅ Balance service inicializado (addr=%s)",
-                hl_addr[:12] + "..." if hl_addr else "N/A")
+
+    async def _info_post(payload: dict) -> dict:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(_HL_INFO_URL, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    balance_svc.init_hl(
+        address=hl_addr,
+        info_post_fn=_info_post,
+    )
+    logger.info(
+        "✅ Balance service inicializado (addr=%s)",
+        hl_addr[:12] + "..." if hl_addr else "N/A",
+    )
 
     global_risk = GlobalRisk(
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", str(MAX_ACTIVE_TRADERS))),
