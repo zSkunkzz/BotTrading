@@ -1,20 +1,22 @@
 """
 bot/balance_service.py — Servicio de consulta de balance con caché.
 
-v2 — BUG #6 FIX: caché inflado tras SL externo al bot
+v3 — BUG #8 FIX: balance devolvía 0.00 con fondos reales en la cuenta
 
-  El TTL original era 30s. Si un SL es ejecutado directamente en el
-  exchange (sin pasar por _place_order del bot), el balance en caché
-  queda inflado hasta 30s. El siguiente pretrade check usa ese balance
-  para calcular el margen permitido y puede oversizear.
+  accountValue (crossMarginSummary) incluye PnL no realizado y en modo
+  isolated puede devolver 0 aunque haya fondos disponibles.
+
+  El campo correcto para saber cuánto USDC tienes disponible para abrir
+  nuevas posiciones es `withdrawable` dentro de crossMarginSummary.
+
+  Si withdrawable no está o es 0, se hace fallback a:
+    1. marginSummary.accountValue  (total incluyendo isolated margins)
+    2. crossMarginSummary.accountValue  (último recurso)
 
   Fix:
-    - DEFAULT_TTL reducido de 30s a 8s
-    - invalidate() puede ser llamado desde PositionManager tras detectar
-      cierre externo (SL hit en exchange)
-    - invalidate_on_sl_detected() método explícito para usarlo como
-      hook desde _ensure_tpsl_on_exchange cuando detecta que la posición
-      ya no existe en el exchange
+    - get() usa withdrawable como valor primario
+    - fallback encadenado para robustez
+    - log de debug muestra los tres valores para diagnóstico
 """
 from __future__ import annotations
 
@@ -25,28 +27,19 @@ from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
-DEFAULT_TTL = float(__import__('os').getenv("BALANCE_CACHE_TTL_S", "8"))  # BUG #6 FIX: 30s → 8s
+DEFAULT_TTL = float(__import__('os').getenv("BALANCE_CACHE_TTL_S", "8"))
 
 
 class BalanceService:
-    """
-    Caché de balance con TTL configurable.
-
-    BUG #6 FIX:
-      - TTL por defecto reducido a 8s (env BALANCE_CACHE_TTL_S)
-      - invalidate_on_sl_detected() hook explícito
-      - invalidate() acepta reason= para loguear causa
-    """
 
     def __init__(self, ttl_s: float = DEFAULT_TTL):
-        self._ttl          = ttl_s
+        self._ttl           = ttl_s
         self._cached_value: Optional[float] = None
         self._cached_at:    float = 0.0
-        self._lock         = asyncio.Lock()
-        self._fetch_fn:    Optional[Callable] = None
-        self._hl_addr:     Optional[str]      = None
+        self._lock          = asyncio.Lock()
+        self._hl_addr:      Optional[str]      = None
         self._info_post_fn: Optional[Callable] = None
-        self._ready        = False
+        self._ready         = False
 
     def init_hl(self, address: str, info_post_fn: Callable) -> None:
         self._hl_addr      = address
@@ -57,18 +50,12 @@ class BalanceService:
         return self._ready
 
     def invalidate(self, reason: str = "") -> None:
-        """Invalida el caché inmediatamente."""
         self._cached_value = None
         self._cached_at    = 0.0
         if reason:
             log.debug("[BalanceSvc] Cache invalidado: %s", reason)
 
     def invalidate_on_sl_detected(self, symbol: str) -> None:
-        """
-        BUG #6 FIX: hook explícito para llamar cuando _ensure_tpsl_on_exchange
-        detecta que la posición ya no existe en el exchange (SL/TP ejecutado
-        externamente). Fuerza una recarga del balance en la próxima consulta.
-        """
         self.invalidate(reason=f"SL/TP externo detectado para {symbol}")
         log.info(
             "[BalanceSvc] Balance invalidado por SL/TP externo en %s — "
@@ -92,16 +79,39 @@ class BalanceService:
                 data = await self._info_post_fn(
                     {"type": "clearinghouseState", "user": self._hl_addr}
                 )
-                usdc = float(
-                    data.get("crossMarginSummary", {})
-                    .get("accountValue", 0)
+
+                cross  = data.get("crossMarginSummary", {})
+                margin = data.get("marginSummary", {})
+
+                # BUG #8 FIX: usar withdrawable como fuente primaria.
+                # withdrawable = USDC libre para abrir posiciones nuevas.
+                # accountValue incluye PnL no realizado y puede ser 0 en isolated.
+                withdrawable    = float(cross.get("withdrawable", 0) or 0)
+                margin_total    = float(margin.get("accountValue", 0) or 0)
+                cross_acct_val  = float(cross.get("accountValue", 0) or 0)
+
+                log.debug(
+                    "[BalanceSvc] withdrawable=%.2f | marginSummary.accountValue=%.2f"
+                    " | crossMarginSummary.accountValue=%.2f",
+                    withdrawable, margin_total, cross_acct_val,
                 )
+
+                # Elegir el mejor valor disponible
+                if withdrawable > 0:
+                    usdc = withdrawable
+                elif margin_total > 0:
+                    usdc = margin_total
+                else:
+                    usdc = cross_acct_val
+
                 self._cached_value = usdc
                 self._cached_at    = time.monotonic()
+                log.debug("[BalanceSvc] Balance actualizado: %.2f USDC", usdc)
                 return usdc
+
             except Exception as e:
                 log.warning("[BalanceSvc] Error al obtener balance: %s", e)
-                return self._cached_value  # devolver valor anterior si hay error
+                return self._cached_value
 
     async def get_fresh(self) -> Optional[float]:
         """Fuerza una recarga del balance ignorando el caché."""
