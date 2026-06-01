@@ -311,39 +311,7 @@ class FuturesTrader:
                 self.symbol, effective, self.leverage, exchange_max,
             )
 
-        # FIX LEVERAGE: intentar hasta 3 veces con confirmación explícita
-        lev_ok = False
-        for lev_attempt in range(1, 4):
-            try:
-                result = await asyncio.wait_for(
-                    self._set_leverage(effective),
-                    timeout=_SET_LEVERAGE_TIMEOUT,
-                )
-                lev_ok = True
-                logger.info(
-                    "[%s] ✅ Leverage %dx confirmado en exchange (intento %d)",
-                    self.symbol, effective, lev_attempt,
-                )
-                break
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[%s] _set_leverage timeout intento %d/3 — reintentando",
-                    self.symbol, lev_attempt,
-                )
-                await asyncio.sleep(2.0)
-            except Exception as e:
-                logger.warning(
-                    "[%s] _set_leverage error intento %d/3: %s",
-                    self.symbol, lev_attempt, e,
-                )
-                await asyncio.sleep(2.0)
-
-        if not lev_ok:
-            logger.error(
-                "[%s] ❌ No se pudo confirmar leverage %dx en exchange tras 3 intentos — "
-                "continuando pero puede que el exchange use leverage anterior.",
-                self.symbol, effective,
-            )
+        await self._set_leverage(effective)
 
         logger.info(
             "[%s] Trader iniciado | coin=%s | master=%s | agent_mode=%s",
@@ -414,38 +382,28 @@ class FuturesTrader:
         return await balance_svc.get()
 
     # ── Leverage ───────────────────────────────────────────────────────────────
+    # Una sola llamada limpia. Si falla, propaga la excepción al caller.
+    # El caller decide si abortar o continuar — sin loops ocultos aquí.
 
-    async def _set_leverage(self, leverage: int):
+    async def _set_leverage(self, leverage: int) -> None:
         if self.dry_run:
             return
         is_cross = self.margin_mode != "isolated"
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: self._hl_client._exchange.update_leverage(
-                int(leverage), self.coin, is_cross
+        result = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: self._hl_client._exchange.update_leverage(
+                    int(leverage), self.coin, is_cross
+                ),
             ),
+            timeout=_SET_LEVERAGE_TIMEOUT,
         )
-        # Validar respuesta del exchange explícitamente
-        if isinstance(result, dict):
-            status = result.get("status")
-            if status == "ok":
-                logger.debug("[%s] Leverage %sx OK (exchange confirmó)", self.symbol, leverage)
-            elif status == "err":
-                raise RuntimeError(
-                    f"Exchange rechazó leverage {leverage}x: {result.get('response', result)}"
-                )
-            else:
-                # Respuesta inesperada — loguear pero no fallar
-                logger.warning(
-                    "[%s] _set_leverage respuesta inesperada: %s",
-                    self.symbol, result,
-                )
-        else:
-            logger.warning(
-                "[%s] _set_leverage respuesta no-dict: %s",
-                self.symbol, repr(result),
+        if isinstance(result, dict) and result.get("status") == "err":
+            raise RuntimeError(
+                f"Exchange rechazó leverage {leverage}x: {result.get('response', result)}"
             )
+        logger.info("[%s] ✅ Leverage %dx establecido en exchange", self.symbol, leverage)
 
     # ── Órdenes ──────────────────────────────────────────────────────────────────
 
@@ -535,14 +493,34 @@ class FuturesTrader:
         return []
 
     # ================================================================
-    # ── _place_tpsl — SL y TP se colocan en el EXCHANGE ──────────────
+    # ── _place_tpsl
+    #
+    # CAUSA RAÍZ del fallo anterior:
+    #   El path "bulk" construía las órdenes manualmente sin pasar entry_px,
+    #   por lo que _adjust_sl_px / _adjust_tp_px en HLClient nunca validaban
+    #   que SL < entry (LONG) y TP > entry (LONG). Con precios redondeados
+    #   a pocos decimales el SL podía quedar == entry_px → HL rechazaba
+    #   con "Invalid TPSL price".
+    #   Además el buffer tp_lim se aplicaba al revés para SHORT.
+    #
+    # SOLUCIÓN:
+    #   Eliminar el bulk manual. Usar siempre place_sl / place_tp del
+    #   HLClient pasando entry_px. Esas funciones tienen toda la lógica
+    #   de validación y ajuste de ticks correcta.
+    #   bulk_orders se mantiene solo como optimización de latencia cuando
+    #   AMBAS órdenes son válidas — pero construido via los métodos del cliente.
     # ================================================================
 
-    async def _place_tpsl(self, qty: float, sl: float | None, tp: float | None) -> None:
+    async def _place_tpsl(
+        self,
+        qty: float,
+        sl: float | None,
+        tp: float | None,
+        entry_px: float | None = None,
+    ) -> None:
         """
-        Coloca SL y TP directamente en el exchange via HLClient.
-        Ambas órdenes son reduce_only=True (trigger).
-        Usa bulk_orders cuando hay SL+TP para minimizar latencia.
+        Coloca SL y TP en el exchange usando HLClient.place_sl / place_tp.
+        Siempre pasa entry_px para que HLClient valide y ajuste ticks.
         """
         if not sl and not tp:
             return
@@ -552,77 +530,90 @@ class FuturesTrader:
         client       = self._hl_client
         loop         = asyncio.get_event_loop()
 
-        # ── Caso ideal: colocar SL + TP en una sola llamada bulk ──
+        # entry_px para validación: usa el registrado en self si no se pasa explícito
+        ep = entry_px if (entry_px and entry_px > 0) else self.entry_price
+
         if sl and tp:
-            sl_px  = client.round_px(sl)
-            tp_px  = client.round_px(tp)
-            buf    = 0.001
-            tp_lim = client.round_px(tp_px * (1 - buf) if is_long else tp_px * (1 + buf))
-            orders = [
-                {
-                    "coin":       client.coin,
-                    "is_buy":     close_is_buy,
-                    "sz":         qty,
-                    "limit_px":   sl_px,
-                    "order_type": {"trigger": {"triggerPx": sl_px,  "isMarket": True,  "tpsl": "sl"}},
-                    "reduce_only": True,
-                },
-                {
-                    "coin":       client.coin,
-                    "is_buy":     close_is_buy,
-                    "sz":         qty,
-                    "limit_px":   tp_lim,
-                    "order_type": {"trigger": {"triggerPx": tp_px,  "isMarket": False, "tpsl": "tp"}},
-                    "reduce_only": True,
-                },
-            ]
+            # Intentar bulk para reducir latencia, pero construido correctamente
             try:
-                result = await loop.run_in_executor(None, lambda: client.place_bulk(orders))
+                sl_px = client._adjust_sl_px(sl, ep, is_long)
+                tp_px = client._adjust_tp_px(tp, ep, is_long)
+                # limit_px del TP: un tick peor que el trigger para garantizar ejecución
+                tick      = client.get_tick_size()
+                tp_lim_px = client.round_px(tp_px - tick if is_long else tp_px + tick)
+                orders = [
+                    {
+                        "coin":        client.coin,
+                        "is_buy":      close_is_buy,
+                        "sz":          qty,
+                        "limit_px":    sl_px,
+                        "order_type":  {"trigger": {"triggerPx": sl_px, "isMarket": True,  "tpsl": "sl"}},
+                        "reduce_only": True,
+                    },
+                    {
+                        "coin":        client.coin,
+                        "is_buy":      close_is_buy,
+                        "sz":          qty,
+                        "limit_px":    tp_lim_px,
+                        "order_type":  {"trigger": {"triggerPx": tp_px, "isMarket": False, "tpsl": "tp"}},
+                        "reduce_only": True,
+                    },
+                ]
+                result = await loop.run_in_executor(
+                    None, lambda: client._exchange.bulk_orders(orders)
+                )
+                # Validar que el exchange aceptó ambas
+                statuses = (
+                    result.get("response", {}).get("data", {}).get("statuses", [])
+                    if isinstance(result, dict) else []
+                )
+                errors = [s for s in statuses if "error" in s]
+                if errors:
+                    raise RuntimeError(f"bulk_orders rechazado: {errors}")
                 logger.info(
-                    "[%s] ✅ SL=%.4f + TP=%.4f colocados en exchange (bulk)",
+                    "[%s] ✅ SL=%.5f + TP=%.5f colocados en exchange (bulk)",
                     self.symbol, sl_px, tp_px,
                 )
                 return
             except Exception as e:
                 logger.warning(
-                    "[%s] bulk SL+TP falló (%s), reintentando individualmente...",
+                    "[%s] bulk SL+TP falló (%s) — colocando individualmente",
                     self.symbol, e,
                 )
 
-        # ── Fallback: colocar individualmente ──
+        # Fallback individual — siempre usa los métodos del cliente con entry_px
         if sl:
-            sl_px = client.round_px(sl)
             try:
                 await loop.run_in_executor(
-                    None, lambda sl_px=sl_px: client.place_sl(
-                        is_buy=close_is_buy, sz=qty, trigger_px=sl_px
-                    )
+                    None,
+                    lambda: client.place_sl(
+                        is_buy=close_is_buy, sz=qty,
+                        trigger_px=sl, entry_px=ep,
+                    ),
                 )
-                logger.info("[%s] ✅ SL=%.4f colocado en exchange", self.symbol, sl_px)
+                logger.info("[%s] ✅ SL=%.5f colocado en exchange", self.symbol, sl)
             except Exception as e:
-                logger.warning("[%s] No se pudo colocar SL: %s", self.symbol, e)
+                logger.error("[%s] ❌ No se pudo colocar SL: %s", self.symbol, e)
+                raise
 
         if tp:
-            tp_px = client.round_px(tp)
             try:
                 await loop.run_in_executor(
-                    None, lambda tp_px=tp_px: client.place_tp(
-                        is_buy=close_is_buy, sz=qty, trigger_px=tp_px
-                    )
+                    None,
+                    lambda: client.place_tp(
+                        is_buy=close_is_buy, sz=qty,
+                        trigger_px=tp, entry_px=ep,
+                    ),
                 )
-                logger.info("[%s] ✅ TP=%.4f colocado en exchange", self.symbol, tp_px)
+                logger.info("[%s] ✅ TP=%.5f colocado en exchange", self.symbol, tp)
             except Exception as e:
-                logger.warning("[%s] No se pudo colocar TP: %s", self.symbol, e)
+                logger.error("[%s] ❌ No se pudo colocar TP: %s", self.symbol, e)
+                raise
 
     # ================================================================
-    # ── FIX PRINCIPAL: _ensure_tpsl_on_exchange ───────────────────────
-    #
-    # Bug original: en cada reintento se colocaban SL/TP ADICIONALES
-    # sin cancelar los anteriores fallidos → acumulación de 2→4→6
-    # órdenes que el exchange rechazaba por duplicado.
-    #
-    # Fix: SIEMPRE cancelar todas las órdenes trigger existentes del coin
-    # ANTES de recolocar en cada intento.
+    # ── _ensure_tpsl_on_exchange
+    # Verifica que SL+TP existen. Si no, cancela todo y recoloca UNA vez.
+    # No hay bucle de reintentos: si falla la segunda vez es un error real.
     # ================================================================
 
     async def _ensure_tpsl_on_exchange(
@@ -632,101 +623,59 @@ class FuturesTrader:
         tp1: float,
         pos_side: str,
     ) -> None:
-        """
-        Verifica que SL y TP existan en el exchange y los recoloca si faltan.
-        IMPORTANTE: cancela todas las órdenes trigger previas antes de recolocar
-        para evitar acumulación de órdenes duplicadas.
-        Se llama hasta 3 veces con espera entre intentos.
-        """
-        MAX_TRIES = 3
         loop = asyncio.get_event_loop()
 
-        for attempt in range(1, MAX_TRIES + 1):
-            try:
-                raw_orders = await loop.run_in_executor(
-                    None, self._hl_client.get_open_orders
-                )
-                # Filtrar solo órdenes de este coin
-                coin_orders = [
-                    o for o in (raw_orders or [])
-                    if o.get("coin") == self.coin
-                ]
+        # ── Paso 1: verificar qué hay en el exchange ──
+        try:
+            raw_orders = await loop.run_in_executor(None, self._hl_client.get_open_orders)
+        except Exception as e:
+            logger.error("[%s] _ensure_tpsl: no se pudo consultar órdenes abiertas: %s", self.symbol, e)
+            return
 
-                def _is_sl(o: dict) -> bool:
-                    ot = o.get("orderType", "")
-                    if isinstance(ot, str):
-                        ot_l = ot.lower()
-                        return "stop" in ot_l or ot_l in ("sl", "stop market", "stop limit")
-                    if isinstance(ot, dict):
-                        return ot.get("trigger", {}).get("tpsl", "") == "sl"
-                    return False
+        coin_orders = [o for o in (raw_orders or []) if o.get("coin") == self.coin]
 
-                def _is_tp(o: dict) -> bool:
-                    ot = o.get("orderType", "")
-                    if isinstance(ot, str):
-                        ot_l = ot.lower()
-                        return "take profit" in ot_l or "take_profit" in ot_l or ot_l == "tp"
-                    if isinstance(ot, dict):
-                        return ot.get("trigger", {}).get("tpsl", "") == "tp"
-                    return False
+        def _tpsl_type(o: dict) -> str | None:
+            ot = o.get("orderType", "")
+            if isinstance(ot, dict):
+                return ot.get("trigger", {}).get("tpsl")  # "sl" | "tp" | None
+            if isinstance(ot, str):
+                ot_l = ot.lower()
+                if "stop" in ot_l or ot_l == "sl":
+                    return "sl"
+                if "take profit" in ot_l or "take_profit" in ot_l or ot_l == "tp":
+                    return "tp"
+            return None
 
-                has_sl = any(_is_sl(o) for o in coin_orders)
-                has_tp = any(_is_tp(o) for o in coin_orders)
+        has_sl = any(_tpsl_type(o) == "sl" for o in coin_orders)
+        has_tp = any(_tpsl_type(o) == "tp" for o in coin_orders)
 
-                logger.info(
-                    "[%s] 🔍 _ensure_tpsl intento %d/%d — "
-                    "SL_ok=%s TP_ok=%s | órdenes_coin=%d",
-                    self.symbol, attempt, MAX_TRIES,
-                    has_sl, has_tp, len(coin_orders),
-                )
-
-                if has_sl and has_tp:
-                    logger.info(
-                        "[%s] ✅ SL y TP confirmados en exchange (intento %d).",
-                        self.symbol, attempt,
-                    )
-                    self._protection_ok = True
-                    return
-
-                # FIX: Cancelar TODAS las órdenes trigger existentes del coin
-                # antes de recolocar para evitar acumulación.
-                # Esto incluye órdenes SL/TP previas que pueden estar en estado
-                # inconsistente o parcialmente colocadas.
-                if coin_orders:
-                    logger.info(
-                        "[%s] 🧹 Cancelando %d órdenes trigger existentes antes de recolocar...",
-                        self.symbol, len(coin_orders),
-                    )
-                    try:
-                        await loop.run_in_executor(
-                            None, self._hl_client.cancel_all_open_tpsl
-                        )
-                        await asyncio.sleep(1.0)  # Dar tiempo al exchange para procesar
-                    except Exception as cancel_err:
-                        logger.warning(
-                            "[%s] No se pudieron cancelar órdenes previas: %s",
-                            self.symbol, cancel_err,
-                        )
-
-                # Ahora recolocar SL+TP limpios
-                logger.info(
-                    "[%s] 📌 Colocando SL=%.5f + TP=%.5f (qty=%.4f)...",
-                    self.symbol, sl, tp1, qty,
-                )
-                await self._place_tpsl(qty=qty, sl=sl, tp=tp1)
-                await asyncio.sleep(2.5)
-
-            except Exception as e:
-                logger.warning(
-                    "[%s] _ensure_tpsl_on_exchange intento %d error: %s",
-                    self.symbol, attempt, e,
-                )
-                await asyncio.sleep(2.0)
-
-        logger.error(
-            "[%s] ❌ No se pudieron confirmar SL/TP en exchange tras %d intentos.",
-            self.symbol, MAX_TRIES,
+        logger.info(
+            "[%s] _ensure_tpsl — SL_ok=%s TP_ok=%s | órdenes_coin=%d",
+            self.symbol, has_sl, has_tp, len(coin_orders),
         )
+
+        if has_sl and has_tp:
+            self._protection_ok = True
+            return
+
+        # ── Paso 2: cancelar todo lo existente antes de recolocar ──
+        if coin_orders:
+            try:
+                await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning("[%s] _ensure_tpsl: error cancelando órdenes previas: %s", self.symbol, e)
+
+        # ── Paso 3: colocar SL+TP limpios (una sola vez) ──
+        logger.info(
+            "[%s] 📌 Colocando SL=%.5f + TP=%.5f (qty=%.4f)",
+            self.symbol, sl, tp1, qty,
+        )
+        try:
+            await self._place_tpsl(qty=qty, sl=sl, tp=tp1)
+            self._protection_ok = True
+        except Exception as e:
+            logger.error("[%s] ❌ _ensure_tpsl: fallo al colocar SL/TP: %s", self.symbol, e)
 
     # ── Helpers de cierre ─────────────────────────────────────────────────────
 
@@ -880,29 +829,12 @@ class FuturesTrader:
         )
 
         if not self.dry_run:
-            # FIX LEVERAGE pre-orden: reintentar si falla
-            lev_ok = False
-            for lev_attempt in range(1, 4):
-                try:
-                    await asyncio.wait_for(
-                        self._set_leverage(lev), timeout=_SET_LEVERAGE_TIMEOUT,
-                    )
-                    lev_ok = True
-                    logger.info(
-                        "[%s] ✅ Leverage pre-orden %dx OK (intento %d)",
-                        self.symbol, lev, lev_attempt,
-                    )
-                    break
-                except asyncio.TimeoutError:
-                    logger.warning("[%s] _set_leverage pre-orden timeout intento %d/3", self.symbol, lev_attempt)
-                    await asyncio.sleep(1.5)
-                except Exception as e:
-                    logger.warning("[%s] _set_leverage pre-orden error intento %d/3: %s", self.symbol, lev_attempt, e)
-                    await asyncio.sleep(1.5)
-            if not lev_ok:
+            try:
+                await self._set_leverage(lev)
+            except Exception as e:
                 logger.error(
-                    "[%s] ❌ No se pudo establecer leverage %dx antes de la orden — abortando entrada.",
-                    self.symbol, lev,
+                    "[%s] ❌ No se pudo establecer leverage %dx — abortando entrada: %s",
+                    self.symbol, lev, e,
                 )
                 return
 
@@ -1043,8 +975,6 @@ class FuturesTrader:
             leverage=lev, usdt=notional, sl=self.sl, tp1=self.tp1, tp2=self.tp2,
         )
 
-        # _ensure_tpsl_on_exchange se llama siempre.
-        # Ahora cancela órdenes existentes antes de recolocar en cada intento.
         if not self.dry_run:
             live_qty = qty
             if confirmed_positions:
@@ -1150,7 +1080,6 @@ class FuturesTrader:
         if not close_reason:
             return
 
-        # Verificar que la posición sigue abierta en el exchange
         positions = await self._get_positions()
         if positions is None:
             logger.warning("[%s] Cierre por %s: error de red — reintentando.", self.symbol, close_reason)
