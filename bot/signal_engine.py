@@ -1,19 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-signal_engine.py — Motor de señales de trading.
+signal_engine.py — Motor de señales técnicas puras.
 
 Exporta:
   - SignalResult          : dataclass con el resultado de analyze_pair()
-  - analyze_pair()        : analiza un par y devuelve SignalResult
+  - analyze_pair()        : analiza un par con OHLCV real → SignalResult
   - format_signal_block() : formatea SignalResult como bloque Markdown
   - MIN_SCORE             : puntuación mínima para señal válida (env: MIN_SIGNAL_SCORE)
   - MIN_RR                : ratio R/R mínimo (env: MIN_RR_REQUIRED)
-  - SignalFlipGuard       : previene flip-flop de señales opuestas (BUG #7 fix)
+  - SignalFlipGuard       : previene flip-flop de señales opuestas
   - signal_flip_guard     : singleton exportado de SignalFlipGuard
 
-BUG #10 FIX: analyze_pair importaba build_snapshot y compute_indicators que
-nunca existieron en market_snapshot.py / indicators.py. Se reemplaza por
-bot.strategy.decide() que es la función real que ya usa trader.py.
+ARQUITECTURA:
+  signal_engine  →  lógica técnica pura (OHLCV + indicadores, SIN imports de strategy)
+  strategy       →  orquesta: llama analyze_pair + enriched_filter + IA
+  trader         →  ejecuta órdenes usando strategy.decide()
+
+IMPORTANTE: Este módulo NO importa nada de bot.strategy.
+  Hacerlo causa un ciclo de importación circular que devuelve score=0 en cada ciclo.
 """
 from __future__ import annotations
 
@@ -23,92 +27,123 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr
+
 log = logging.getLogger(__name__)
 
-# ─── Constantes exportadas ───────────────────────────────────────────────────────────────────────────────
+# ─── Constantes exportadas ────────────────────────────────────────────────────
 
-MIN_SCORE: int = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
-MIN_RR: float = float(os.getenv("MIN_RR_REQUIRED", "1.8"))
+MIN_SCORE: int   = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
+MIN_RR: float    = float(os.getenv("MIN_RR_REQUIRED", "1.8"))
 
-# ─── SignalResult ─────────────────────────────────────────────────────────────────────────────────────
+# Parámetros de análisis técnico
+_TIMEFRAMES = ["15m", "1h", "4h"]          # se pide en orden: más rápido primero
+_BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))   # mínimo de velas por timeframe
+
+# Parámetros de sizing/SL/TP
+_SL_ATR_MULT  = float(os.getenv("SL_ATR_MULT",  "1.5"))   # SL = entry ± SL_ATR_MULT * ATR
+_TP1_ATR_MULT = float(os.getenv("TP1_ATR_MULT", "2.5"))   # TP1 = entry ± TP1_ATR_MULT * ATR
+_TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "4.0"))   # TP2 = entry ± TP2_ATR_MULT * ATR
+_MAX_LEV      = int(os.getenv("LEVERAGE", "15"))
+
+
+# ─── SignalResult ─────────────────────────────────────────────────────────────
 
 @dataclass
 class SignalResult:
     """Resultado completo de analyze_pair()."""
-    symbol: str
-    signal: str                          # "LONG" | "SHORT" | "NEUTRAL"
-    entry_mode: str                      # "STRONG" | "NORMAL" | "EARLY" | "HOLD"
-    score: int
-    max_score: int
-    entry: float
-    sl: float
-    tp1: float
-    tp2: float
-    atr: float
-    rr: float
+    symbol:       str
+    signal:       str           # "LONG" | "SHORT" | "NEUTRAL"
+    entry_mode:   str           # "STRONG" | "NORMAL" | "EARLY" | "HOLD"
+    score:        int
+    max_score:    int
+    entry:        float
+    sl:           float
+    tp1:          float
+    tp2:          float
+    atr:          float
+    rr:           float
     suggested_lev: int
-    indicators: Dict                     # indicadores por timeframe
-    is_valid: bool = True
-    reason: str = ""
-    # campos opcionales para compatibilidad
-    signal_block: str = ""
-    extra: Dict = field(default_factory=dict)
+    indicators:   Dict          # indicadores por timeframe
+    is_valid:     bool = True
+    reason:       str  = ""
+    signal_block: str  = ""
+    extra:        Dict = field(default_factory=dict)
 
 
-# ─── analyze_pair ───────────────────────────────────────────────────────────────────────────────────
+# ─── analyze_pair ─────────────────────────────────────────────────────────────
 
 async def analyze_pair(exch, symbol: str) -> SignalResult:
     """
-    Analiza un par y devuelve un SignalResult.
+    Descarga OHLCV de Hyperliquid para 15m, 1h y 4h,
+    calcula indicadores (EMA21/50, RSI14, MACD, SuperTrend, ATR14, volumen)
+    y devuelve un SignalResult con entry/SL/TP calculados con ATR.
 
-    BUG #10 FIX: usa bot.strategy.decide() — la misma función que trader.py —
-    en vez de build_snapshot/compute_indicators que no existían.
+    No importa ni llama a bot.strategy — es lógica técnica pura.
     """
     try:
-        from bot.strategy import decide
-        from bot.ai_trader import ai_decide
-    except ImportError as e:
-        log.error("[signal_engine] import error en analyze_pair: %s", e)
-        return _hold_result(symbol, f"ImportError: {e}")
-
-    try:
-        decision = await decide(
-            exch=exch,
-            symbol=symbol,
-            ai_decide_fn=ai_decide,
-            has_open_position=False,
-            current_pnl=None,
-        )
+        bars_15m = await _fetch_bars(exch, symbol, "15m", _BARS_NEEDED)
+        bars_1h  = await _fetch_bars(exch, symbol, "1h",  _BARS_NEEDED)
+        bars_4h  = await _fetch_bars(exch, symbol, "4h",  max(50, _BARS_NEEDED // 2))
     except Exception as e:
-        log.error("[signal_engine] decide(%s) falló: %s", symbol, e)
-        return _hold_result(symbol, f"decide error: {e}")
+        log.error("[signal_engine] OHLCV fetch error %s: %s", symbol, e)
+        return _hold_result(symbol, f"OHLCV error: {e}")
 
-    action = decision.get("action", "HOLD")
-    sig    = decision.get("signal")
+    if len(bars_15m) < 30:
+        return _hold_result(symbol, f"Insuficientes velas 15m ({len(bars_15m)})")
 
-    if action not in ("BUY", "SELL") or sig is None:
-        return _hold_result(symbol, "HOLD")
+    # ── Indicadores por timeframe ─────────────────────────────────────────────
+    ind_15m = _compute_indicators(bars_15m)
+    ind_1h  = _compute_indicators(bars_1h)  if len(bars_1h)  >= 30 else {}
+    ind_4h  = _compute_indicators(bars_4h)  if len(bars_4h)  >= 20 else {}
 
-    signal_str = "LONG" if action == "BUY" else "SHORT"
-    score      = int(getattr(sig, "score", 0))
-    max_score  = int(getattr(sig, "max_score", 10))
-    entry      = float(getattr(sig, "entry", 0) or 0)
-    sl         = float(getattr(sig, "sl", 0) or 0)
-    tp1        = float(getattr(sig, "tp1", 0) or 0)
-    tp2        = float(getattr(sig, "tp2", 0) or 0)
-    atr_val    = float(getattr(sig, "atr", 0) or 0)
-    lev        = int(getattr(sig, "suggested_lev", 1) or 1)
-    entry_mode = str(getattr(sig, "entry_mode", "") or "NORMAL")
+    indicators = {"15m": ind_15m, "1h": ind_1h, "4h": ind_4h,
+                  "_closes_15m": [b[4] for b in bars_15m[-5:]]}
 
-    # R/R estimado
-    if entry > 0 and sl > 0 and tp1 > 0:
-        risk   = abs(entry - sl)
-        reward = abs(tp1 - entry)
-        rr     = round(reward / risk, 2) if risk > 0 else 0.0
+    # ── Scoring multi-timeframe ───────────────────────────────────────────────
+    score, max_score, signal_str, reasons = _score_signal(ind_15m, ind_1h, ind_4h)
+
+    if signal_str == "NEUTRAL":
+        return _hold_result(symbol, f"NEUTRAL (score={score}/{max_score})")
+
+    # ── Precio actual y ATR ───────────────────────────────────────────────────
+    entry   = float(bars_15m[-1][4])   # close de la última vela 15m
+    atr_val = float(ind_15m.get("atr", 0) or 0)
+
+    if atr_val <= 0:
+        return _hold_result(symbol, "ATR=0 — no se puede calcular SL/TP")
+
+    # ── SL / TP basados en ATR ────────────────────────────────────────────────
+    if signal_str == "LONG":
+        sl   = round(entry - _SL_ATR_MULT  * atr_val, 6)
+        tp1  = round(entry + _TP1_ATR_MULT * atr_val, 6)
+        tp2  = round(entry + _TP2_ATR_MULT * atr_val, 6)
+    else:  # SHORT
+        sl   = round(entry + _SL_ATR_MULT  * atr_val, 6)
+        tp1  = round(entry - _TP1_ATR_MULT * atr_val, 6)
+        tp2  = round(entry - _TP2_ATR_MULT * atr_val, 6)
+
+    risk   = abs(entry - sl)
+    reward = abs(tp1 - entry)
+    rr     = round(reward / risk, 2) if risk > 0 else 0.0
+
+    # ── Entry mode ────────────────────────────────────────────────────────────
+    if score >= max_score - 1:
+        entry_mode = "STRONG"
+    elif score >= MIN_SCORE + 2:
+        entry_mode = "NORMAL"
     else:
-        rr = 0.0
+        entry_mode = "EARLY"
+
+    # ── Leverage sugerido (capped al máximo del exchange) ────────────────────
+    suggested_lev = min(_MAX_LEV, 15)   # trader lo capará al max del par
 
     is_valid = score >= MIN_SCORE and rr >= MIN_RR
+
+    log.debug(
+        "[signal_engine] %s %s score=%d/%d RR=%.2f entry=%.4f sl=%.4f tp1=%.4f atr=%.4f",
+        symbol, signal_str, score, max_score, rr, entry, sl, tp1, atr_val,
+    )
 
     return SignalResult(
         symbol=symbol,
@@ -122,15 +157,145 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         tp2=tp2,
         atr=atr_val,
         rr=rr,
-        suggested_lev=lev,
-        indicators={},
+        suggested_lev=suggested_lev,
+        indicators=indicators,
         is_valid=is_valid,
-        reason="" if is_valid else f"score={score} rr={rr:.2f}",
+        reason="" if is_valid else f"score={score}/{max_score} rr={rr:.2f}",
     )
 
 
+# ─── OHLCV fetch ──────────────────────────────────────────────────────────────
+
+async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
+    """
+    Descarga velas OHLCV desde Hyperliquid usando el exchange de ccxt.
+    Retorna lista de [ts, open, high, low, close, vol].
+    """
+    try:
+        bars = await exch.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        return bars or []
+    except Exception as e:
+        log.warning("[signal_engine] fetch_ohlcv(%s, %s) error: %s", symbol, timeframe, e)
+        return []
+
+
+# ─── Indicadores ──────────────────────────────────────────────────────────────
+
+def _compute_indicators(bars: list) -> dict:
+    """Calcula EMA21/50, RSI14, MACD, SuperTrend, ATR14 y vol_ratio."""
+    if not bars or len(bars) < 10:
+        return {}
+
+    closes = [b[4] for b in bars]
+    highs  = [b[2] for b in bars]
+    lows   = [b[3] for b in bars]
+    vols   = [b[5] for b in bars]
+
+    ema21 = ema(closes, 21)
+    ema50 = ema(closes, 50)
+    rsi14 = rsi(closes, 14)
+    m_line, s_line, hist = macd(closes, 12, 26, 9)
+    st_dir, st_val = supertrend(highs, lows, closes, 10, 3.0)
+    atr14  = calc_atr(highs, lows, closes, 14)
+    avg_vol = sum(vols[-20:]) / 20 if len(vols) >= 20 else (sum(vols) / len(vols) if vols else 1)
+    vol_ratio = round(vols[-1] / avg_vol, 3) if avg_vol > 0 else 1.0
+
+    return {
+        "ema21":     ema21[-1] if ema21 else None,
+        "ema50":     ema50[-1] if ema50 else None,
+        "ema_bull":  bool(ema21 and ema50 and ema21[-1] > ema50[-1]),
+        "ema_bear":  bool(ema21 and ema50 and ema21[-1] < ema50[-1]),
+        "rsi_val":   rsi14,
+        "macd_hist": hist,
+        "macd_bull": hist > 0,
+        "macd_bear": hist < 0,
+        "st_dir":    st_dir,
+        "st_bull":   st_dir == 1,
+        "st_bear":   st_dir == -1,
+        "atr":       atr14,
+        "vol_ratio": vol_ratio,
+        "close":     closes[-1],
+    }
+
+
+# ─── Scoring ──────────────────────────────────────────────────────────────────
+
+def _score_signal(
+    i15: dict, i1h: dict, i4h: dict
+) -> Tuple[int, int, str, List[str]]:
+    """
+    Sistema de puntuación multi-timeframe.
+
+    Puntos disponibles (max_score = 10):
+      15m: EMA(1) + MACD(1) + SuperTrend(1) + RSI(1) + VOL(1) = 5 pts
+      1h:  EMA(1) + MACD(1) + SuperTrend(1)                    = 3 pts
+      4h:  EMA(1) + MACD(1)                                    = 2 pts
+    Total max = 10
+
+    La dirección (LONG/SHORT) se decide por mayoría ponderada.
+    Si los timeframes mayores (1h/4h) contradicen el 15m → NEUTRAL.
+    """
+    max_score = 10
+    long_pts  = 0
+    short_pts = 0
+    reasons   = []
+
+    # ── 15m (peso = 5) ────────────────────────────────────────────────────────
+    if i15.get("ema_bull"):  long_pts  += 1; reasons.append("EMA15m↑")
+    if i15.get("ema_bear"):  short_pts += 1; reasons.append("EMA15m↓")
+    if i15.get("macd_bull"): long_pts  += 1; reasons.append("MACD15m↑")
+    if i15.get("macd_bear"): short_pts += 1; reasons.append("MACD15m↓")
+    if i15.get("st_bull"):   long_pts  += 1; reasons.append("ST15m↑")
+    if i15.get("st_bear"):   short_pts += 1; reasons.append("ST15m↓")
+
+    rsi15 = i15.get("rsi_val")
+    if rsi15 is not None:
+        if rsi15 < 65:   long_pts  += 1; reasons.append(f"RSI15m={rsi15:.0f}<65")
+        elif rsi15 > 35: short_pts += 1; reasons.append(f"RSI15m={rsi15:.0f}>35")
+
+    vol15 = i15.get("vol_ratio", 1.0)
+    if vol15 >= 1.0:
+        long_pts  += 1
+        short_pts += 1
+        reasons.append(f"Vol15m={vol15:.1f}x")
+
+    # ── 1h (peso = 3) ─────────────────────────────────────────────────────────
+    if i1h:
+        if i1h.get("ema_bull"):  long_pts  += 1; reasons.append("EMA1h↑")
+        if i1h.get("ema_bear"):  short_pts += 1; reasons.append("EMA1h↓")
+        if i1h.get("macd_bull"): long_pts  += 1; reasons.append("MACD1h↑")
+        if i1h.get("macd_bear"): short_pts += 1; reasons.append("MACD1h↓")
+        if i1h.get("st_bull"):   long_pts  += 1; reasons.append("ST1h↑")
+        if i1h.get("st_bear"):   short_pts += 1; reasons.append("ST1h↓")
+
+    # ── 4h (peso = 2) ─────────────────────────────────────────────────────────
+    if i4h:
+        if i4h.get("ema_bull"):  long_pts  += 1; reasons.append("EMA4h↑")
+        if i4h.get("ema_bear"):  short_pts += 1; reasons.append("EMA4h↓")
+        if i4h.get("macd_bull"): long_pts  += 1; reasons.append("MACD4h↑")
+        if i4h.get("macd_bear"): short_pts += 1; reasons.append("MACD4h↓")
+
+    # ── Decisión ──────────────────────────────────────────────────────────────
+    if long_pts > short_pts:
+        # Requiere alineación de al menos el 1h con el 15m para no ser NEUTRAL
+        tf1h_ok = (not i1h) or i1h.get("ema_bull") or i1h.get("st_bull")
+        if tf1h_ok:
+            return long_pts, max_score, "LONG", reasons
+        return long_pts, max_score, "NEUTRAL", reasons + ["1h_no_confirma"]
+
+    if short_pts > long_pts:
+        tf1h_ok = (not i1h) or i1h.get("ema_bear") or i1h.get("st_bear")
+        if tf1h_ok:
+            return short_pts, max_score, "SHORT", reasons
+        return short_pts, max_score, "NEUTRAL", reasons + ["1h_no_confirma"]
+
+    # Empate
+    return 0, max_score, "NEUTRAL", reasons
+
+
+# ─── _hold_result ─────────────────────────────────────────────────────────────
+
 def _hold_result(symbol: str, reason: str) -> SignalResult:
-    """Devuelve un SignalResult de HOLD seguro cuando hay error."""
     return SignalResult(
         symbol=symbol,
         signal="NEUTRAL",
@@ -150,58 +315,45 @@ def _hold_result(symbol: str, reason: str) -> SignalResult:
     )
 
 
-# ─── format_signal_block ─────────────────────────────────────────────────────────────────────────────────
+# ─── format_signal_block ──────────────────────────────────────────────────────
 
 def format_signal_block(signal: Optional[SignalResult]) -> str:
-    """Formatea un SignalResult como bloque Markdown para Telegram/logs."""
     if signal is None:
         return ""
 
     arrow = "🟢 LONG" if signal.signal == "LONG" else "🔴 SHORT" if signal.signal == "SHORT" else "⚪ NEUTRAL"
-    lev = f"{signal.suggested_lev}x" if signal.suggested_lev else "—"
-    rr = f"{signal.rr:.2f}" if signal.rr else "—"
+    lev   = f"{signal.suggested_lev}x" if signal.suggested_lev else "—"
+    rr    = f"{signal.rr:.2f}" if signal.rr else "—"
 
     lines = [
         f"**{signal.symbol}** · {arrow}",
         f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
     ]
-
     if signal.entry:
-        lines.append(f"Entry: `{signal.entry}` | SL: `{signal.sl}` | TP1: `{signal.tp1}` | TP2: `{signal.tp2}`")
-
+        lines.append(
+            f"Entry: `{signal.entry}` | SL: `{signal.sl}` | TP1: `{signal.tp1}` | TP2: `{signal.tp2}`"
+        )
     if signal.reason:
         lines.append(f"_{signal.reason}_")
 
     return "\n".join(lines)
 
 
-# ─── SignalFlipGuard (BUG #7 FIX) ────────────────────────────────────────────────────────────────────────
+# ─── SignalFlipGuard ──────────────────────────────────────────────────────────
 
 _FLIP_COOLDOWN_S = float(os.getenv("SIGNAL_FLIP_COOLDOWN_S", "120"))
 
 
 class SignalFlipGuard:
     """
-    BUG #7 FIX: Previene flip-flop de señales opuestas en ventana corta.
-
-    Uso:
-        guard = SignalFlipGuard()
-        signal = decide(...)   # devuelve objeto con .side o None
-        if guard.allow(symbol, signal):
-            # procesar señal
-        else:
-            # señal bloqueada por cooldown
+    Previene flip-flop de señales opuestas en ventana corta.
     """
 
     def __init__(self, cooldown_s: float = _FLIP_COOLDOWN_S):
         self._cooldown = cooldown_s
-        # symbol -> (side: str, ts: float)
         self._last: Dict[str, Tuple[str, float]] = {}
 
     def allow(self, symbol: str, signal) -> bool:
-        """
-        Devuelve True si la señal debe procesarse, False si debe bloquearse.
-        """
         if self._cooldown <= 0:
             return True
         if signal is None:
@@ -223,9 +375,8 @@ class SignalFlipGuard:
             if last_side != side_norm and elapsed < self._cooldown:
                 log.warning(
                     "[SignalFlipGuard] %s: señal %s BLOQUEADA — inversión de %s a %s "
-                    "en %.1fs (cooldown=%.0fs). Evitando flip-flop.",
-                    symbol, side_norm, last_side, side_norm,
-                    elapsed, self._cooldown,
+                    "en %.1fs (cooldown=%.0fs).",
+                    symbol, side_norm, last_side, side_norm, elapsed, self._cooldown,
                 )
                 return False
 
@@ -233,14 +384,11 @@ class SignalFlipGuard:
         return True
 
     def reset(self, symbol: str) -> None:
-        """Limpiar el registro de un símbolo (llamar tras cierre de posición)."""
         self._last.pop(symbol, None)
 
     def update(self, symbol: str, side: str) -> None:
-        """Actualizar manualmente el último side sin pasar por allow()."""
         side_norm = "long" if side in ("long", "buy") else "short"
         self._last[symbol] = (side_norm, time.monotonic())
 
 
-# Singleton exportado
 signal_flip_guard = SignalFlipGuard()
