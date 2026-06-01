@@ -2,28 +2,23 @@
 """
 signal_engine.py — Motor de análisis técnico multi-timeframe (ASYNC)
 
+MEJORAS v3:
+  #1 Trailing stop → position_manager.py
+  #2 Pesos diferenciados por TF/indicador:
+       4h: ema_trend=2, macd=1, ema200=1        (total max=4)
+       1h: ema_trend=2, rsi=1, supertrend=1     (total max=4)
+       15m: ema_trend=1, macd=1, stoch=1, vol=1 (total max=4)
+       BB bonus (1h+15m)                        (+1)
+       Total máximo                             =13 → capeado a 10
+  #3 Filtro ADX anti-chop:
+       ADX calculado sobre 1h. Si ADX < ADX_MIN_THRESHOLD (default 20) → NEUTRAL
+       Desactivar con ADX_FILTER=false en Railway
+  #4 Cooldown diferenciado por entry_mode → signal_cooldown.py
+
 Modos de entrada (se exporta entry_mode en SignalResult):
   EARLY   score 5,   1h+15m alineados                         → lev 5-8x, size 50%
   NORMAL  score 6-7, todos los TF alineados                   → lev 8-14x
   STRONG  score 8+,  confluencia máxima                       → lev 14-15x
-
-Score real máximo:
-  4h: ema_trend, macd, ema200                                  = 3
-  1h: ema_trend, rsi, supertrend                               = 3
-  15m: ema_trend, macd, stoch, volume                          = 4
-  BB bonus (1h+15m alineados)                                  = 1
-  Total                                                        = 11 (capeado a 10)
-
-Compatible con Hyperliquid:
-  - ws_feed.get_ohlcv(coin, tf)         coin = "BTC" (sin USDT)
-  - ws_feed.get_orderbook_metrics(coin)
-  - ws_feed.get_funding_rate(coin)      → None (no disponible en WS; ver REST)
-  - Fallback REST usa candleSnapshot
-
-CAMBIOS v2:
-  - ATR para SL/TP calculado sobre velas 1h (más estable que 15m)
-  - _classify_entry_mode exige 4h alineado como gate obligatorio
-  - MIN_SCORE default subido a 6 (antes 5)
 """
 
 from __future__ import annotations
@@ -44,7 +39,7 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-MIN_SCORE       = int(os.getenv("MIN_SCORE",      "6"))   # subido de 5 a 6
+MIN_SCORE       = int(os.getenv("MIN_SCORE",      "6"))
 MIN_SCORE_FULL  = int(os.getenv("MIN_SCORE_FULL", "6"))
 MIN_RR          = float(os.getenv("MIN_RR",       "1.8"))
 ATR_MULT_SL     = float(os.getenv("ATR_MULT_SL",  "1.8"))
@@ -52,9 +47,18 @@ TP1_MULT        = float(os.getenv("TP1_MULT",     "3.5"))
 TP2_MULT        = float(os.getenv("TP2_MULT",     "5.0"))
 TP3_MULT        = float(os.getenv("TP3_MULT",     "8.0"))
 
-# Gate 4h: si True (default), NO se permite entrada si 4h va contra la dirección
-# Desactivar con REQUIRE_4H_ALIGNMENT=false en Railway si quieres volver al comportamiento anterior
 REQUIRE_4H_ALIGNMENT = os.getenv("REQUIRE_4H_ALIGNMENT", "true").lower() != "false"
+
+# #3 Filtro ADX
+ADX_FILTER        = os.getenv("ADX_FILTER",         "true").lower() != "false"
+ADX_MIN_THRESHOLD = float(os.getenv("ADX_MIN_THRESHOLD", "20"))  # < 20 → mercado en chop
+
+# TP dinámicos: multiplicadores ajustados por ADX (mercado en tendencia fuerte → TPs más ambiciosos)
+# ADX >= ADX_STRONG_THRESHOLD → usar TP_STRONG_MULT_* en vez de los defaults
+ADX_STRONG_THRESHOLD = float(os.getenv("ADX_STRONG_THRESHOLD", "30"))
+TP1_STRONG_MULT      = float(os.getenv("TP1_STRONG_MULT", "4.5"))
+TP2_STRONG_MULT      = float(os.getenv("TP2_STRONG_MULT", "7.0"))
+TP3_STRONG_MULT      = float(os.getenv("TP3_STRONG_MULT", "11.0"))
 
 LEV_EARLY_MIN   = 5
 LEV_EARLY_MAX   = 8
@@ -68,14 +72,12 @@ EARLY_SIZE_RATIO = 0.5
 OB_IMBALANCE_THRESHOLD    = 0.15
 FUNDING_EXTREME_THRESHOLD = 0.0005
 
-SCORE_MAX = 10  # Cap real de _compute_score
+SCORE_MAX = 10
 
-# Semáforo global: máximo 4 requests REST simultáneos a Hyperliquid.
 _OHLCV_SEM = asyncio.Semaphore(4)
 
 
 def _norm_coin(symbol: str) -> str:
-    """BTC/USDT:USDT  BTCUSDT  BTC  → BTC"""
     s = symbol.replace("/", "").replace(":USDT", "").upper()
     if s.endswith("USDTUSDT"):
         s = s[:-4]
@@ -98,6 +100,7 @@ class SignalResult:
     tp3: float       = 0.0
     rr: float        = 0.0
     atr: float       = 0.0
+    adx: float       = 0.0
     suggested_lev: int  = 1
     size_ratio: float   = 1.0
     pct_tp3: float      = 0.0
@@ -121,6 +124,8 @@ class SignalResult:
         em   = f"[{self.entry_mode}]"
         icon = "🟢" if self.signal == "LONG" else "🔴"
         extras = []
+        if self.adx:
+            extras.append(f"ADX {self.adx:.0f}")
         if self.ob_imbalance is not None:
             extras.append(f"OB {self.ob_imbalance:+.2f}")
         if self.funding_rate is not None:
@@ -134,7 +139,6 @@ class SignalResult:
 
 
 async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
-    """Obtiene OHLCV vía REST Hyperliquid (candleSnapshot)."""
     import time as _time
     import aiohttp
     import json as _json
@@ -166,8 +170,7 @@ async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
                         data = _json.loads(await r.text())
 
             if not isinstance(data, list) or len(data) == 0:
-                log.warning("[OHLCV] %s %s REST HL respuesta vacía o inesperada: %s",
-                            coin, tf, str(data)[:120])
+                log.warning("[OHLCV] %s %s REST HL respuesta vacía: %s", coin, tf, str(data)[:120])
                 return pd.DataFrame()
 
             bars = [
@@ -183,7 +186,7 @@ async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
             log.warning("[OHLCV] %s %s REST HL error: %s", coin, tf, e)
             return pd.DataFrame()
 
-    log.warning("[OHLCV] %s %s REST HL: 3 intentos fallidos (429 persistente)", coin, tf)
+    log.warning("[OHLCV] %s %s REST HL: 3 intentos fallidos", coin, tf)
     return pd.DataFrame()
 
 
@@ -194,15 +197,12 @@ async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataF
         from bot.ws_feed import ws_feed
         df = ws_feed.get_ohlcv(coin, tf)
         if not df.empty and len(df) >= 55:
-            log.debug("[OHLCV] %s %s ← WS (%d velas)", coin, tf, len(df))
             return df
-        log.debug("[OHLCV] %s %s WS insuficiente (%d velas)", coin, tf, len(df))
     except Exception as e:
         log.debug("[OHLCV] %s %s WS error: %s", coin, tf, e)
 
     df = await _fetch_ohlcv_hl(coin, tf, limit)
     if not df.empty and len(df) >= 55:
-        log.debug("[OHLCV] %s %s ← REST HL (%d velas)", coin, tf, len(df))
         return df
 
     if exch is not None:
@@ -210,7 +210,6 @@ async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataF
             raw = await exch.fetch_ohlcv(coin, tf, limit=limit)
             df  = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-            log.debug("[OHLCV] %s %s ← ccxt (%d velas)", coin, tf, len(df))
             return df.set_index("ts").astype(float)
         except Exception as e:
             log.warning("[OHLCV] %s %s ccxt: %s", coin, tf, e)
@@ -237,7 +236,7 @@ def _supertrend_dir(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> in
         for i in range(period + 1, len(c)):
             atr[i] = (atr[i - 1] * (period - 1) + tr_full[i]) / period
 
-        hl2 = (h + l) / 2.0
+        hl2  = (h + l) / 2.0
         ub   = hl2 + mult * atr
         lb   = hl2 - mult * atr
 
@@ -256,6 +255,26 @@ def _supertrend_dir(df: pd.DataFrame, period: int = 10, mult: float = 3.0) -> in
         return int(trend_arr[-1])
     except Exception:
         return 0
+
+
+def _calc_adx(df: pd.DataFrame, period: int = 14) -> float:
+    """
+    Calcula ADX sobre un DataFrame OHLCV.
+    Retorna el valor ADX actual (última vela) o 0.0 si falla.
+    ADX < 20 → mercado en rango/chop → no tendencia.
+    ADX 20-30 → tendencia moderada.
+    ADX > 30 → tendencia fuerte.
+    """
+    try:
+        if ta_lib is None or len(df) < period * 2:
+            return 0.0
+        adx_ind = ta_lib.trend.ADXIndicator(
+            df["high"], df["low"], df["close"], window=period
+        )
+        val = adx_ind.adx().iloc[-1]
+        return round(float(val), 1) if not np.isnan(val) else 0.0
+    except Exception:
+        return 0.0
 
 
 def _analyze_tf(df: pd.DataFrame) -> dict:
@@ -347,20 +366,36 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
 
 
 def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, str]:
+    """
+    #2 Pesos diferenciados por TF:
+      4h: ema_trend×2, macd×1, ema200×1  → max 4
+      1h: ema_trend×2, rsi×1, supertrend×1 → max 4
+      15m: ema_trend×1, macd×1, stoch×1, volume×1 → max 4
+      BB bonus (1h+15m) → +1
+      Total → capeado a 10
+    """
     sl = ss = 0
 
-    for key in ("ema_trend", "macd", "ema200"):
+    # 4h — ema_trend pesa doble
+    sl += max(0,  s4h.get("ema_trend", 0)) * 2
+    ss += max(0, -s4h.get("ema_trend", 0)) * 2
+    for key in ("macd", "ema200"):
         sl += max(0,  s4h.get(key, 0))
         ss += max(0, -s4h.get(key, 0))
 
-    for key in ("ema_trend", "rsi", "supertrend"):
+    # 1h — ema_trend pesa doble
+    sl += max(0,  s1h.get("ema_trend", 0)) * 2
+    ss += max(0, -s1h.get("ema_trend", 0)) * 2
+    for key in ("rsi", "supertrend"):
         sl += max(0,  s1h.get(key, 0))
         ss += max(0, -s1h.get(key, 0))
 
+    # 15m — todos pesan 1 (ruidosos, no merecen más)
     for key in ("ema_trend", "macd", "stoch", "volume"):
         sl += max(0,  s15.get(key, 0))
         ss += max(0, -s15.get(key, 0))
 
+    # BB bonus
     if s15.get("bb", 0) == 1  and s1h.get("bb", 0) == 1:  sl += 1
     if s15.get("bb", 0) == -1 and s1h.get("bb", 0) == -1: ss += 1
 
@@ -402,20 +437,12 @@ def _apply_microstructure(
 
 
 def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction: str) -> tuple[str, int, float]:
-    """
-    Clasifica el modo de entrada.
-
-    CAMBIO v2: gate obligatorio de 4h.
-    Si REQUIRE_4H_ALIGNMENT=true (default), la dirección de 4h debe estar
-    alineada con la señal. Un 4h neutral (0) se permite; un 4h contrario
-    (-1 para LONG o +1 para SHORT) rechaza la entrada independientemente del score.
-    """
     sign = 1 if direction == "LONG" else -1
 
     # Gate 4h obligatorio
     if REQUIRE_4H_ALIGNMENT:
         tf4h_trend = s4h.get("ema_trend", 0)
-        if tf4h_trend * sign < 0:   # 4h va en contra
+        if tf4h_trend * sign < 0:
             log.info(
                 "[signal] RECHAZADO por gate 4h — 4h ema_trend=%d contrario a %s",
                 tf4h_trend, direction,
@@ -426,35 +453,24 @@ def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction:
     tf15_aligned = s15.get("ema_trend", 0) * sign
 
     extra_1h  = sum(1 for k in ("rsi", "supertrend", "macd") if s1h.get(k, 0) * sign > 0)
-    extra_15m = sum(1 for k in ("macd", "stoch", "volume") if s15.get(k, 0) * sign > 0)
+    extra_15m = sum(1 for k in ("macd", "stoch", "volume")   if s15.get(k, 0) * sign > 0)
 
     if score >= 8:
-        mode  = "STRONG"
         ratio = min((score - 8) / 2.0, 1.0)
         lev   = round(LEV_STRONG_MIN + ratio * (LEV_STRONG_MAX - LEV_STRONG_MIN))
-        return mode, lev, 1.0
+        return "STRONG", lev, 1.0
 
     if score >= MIN_SCORE_FULL:
-        mode  = "NORMAL"
         ratio = min((score - MIN_SCORE_FULL) / 2.0, 1.0)
         lev   = round(LEV_NORMAL_MIN + ratio * (LEV_NORMAL_MAX - LEV_NORMAL_MIN))
-        return mode, lev, 1.0
+        return "NORMAL", lev, 1.0
 
-    # EARLY: score en el rango [MIN_SCORE, MIN_SCORE_FULL) con alineación 1h+15m
     if MIN_SCORE <= score < MIN_SCORE_FULL and tf1h_aligned > 0 and tf15_aligned > 0:
         quality = extra_1h + extra_15m
         ratio   = min(quality / 6.0, 1.0)
         lev     = round(LEV_EARLY_MIN + ratio * (LEV_EARLY_MAX - LEV_EARLY_MIN))
-        log.debug(
-            "[signal] EARLY — score=%d, 1h=%d, 15m=%d, quality=%d, lev=%dx",
-            score, tf1h_aligned, tf15_aligned, quality, lev,
-        )
         return "EARLY", lev, EARLY_SIZE_RATIO
 
-    log.debug(
-        "[signal] NONE — score=%d, 1h_aligned=%d, 15m_aligned=%d (descartado)",
-        score, tf1h_aligned, tf15_aligned,
-    )
     return "NONE", 1, 0.0
 
 
@@ -475,13 +491,26 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         s1h = _analyze_tf(df1h) if not df1h.empty else {}
         s4h = _analyze_tf(df4h) if not df4h.empty else {}
 
-        # Guardar closes para uso externo (strategy.py, enriched_filter)
+        # #3 Filtro ADX anti-chop (calculado en 1h, más estable que 15m)
+        adx_df  = df1h if (not df1h.empty and len(df1h) >= 28) else df15
+        adx_val = _calc_adx(adx_df)
+        result.adx = adx_val
+
+        if ADX_FILTER and adx_val > 0 and adx_val < ADX_MIN_THRESHOLD:
+            log.info(
+                "[signal_engine] %s RECHAZADO por ADX=%.1f < %.0f (mercado en rango)",
+                coin, adx_val, ADX_MIN_THRESHOLD,
+            )
+            result.error = f"ADX={adx_val:.1f} < {ADX_MIN_THRESHOLD} (chop)"
+            return result
+
         result.indicators = {
             "15m": s15,
             "1h":  s1h,
             "4h":  s4h,
             "_closes_15m": df15["close"].tolist() if not df15.empty else [],
             "_closes_1h":  df1h["close"].tolist() if not df1h.empty else [],
+            "adx": adx_val,
         }
 
         score_base, direction = _compute_score(s4h, s1h, s15)
@@ -511,8 +540,7 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
             )
             return result
 
-        # ATR calculado sobre 1h (más estable que 15m para definir SL/TP)
-        # Fallback a 15m si df1h insuficiente
+        # ATR sobre 1h (más estable)
         atr_df = df1h if (not df1h.empty and len(df1h) >= 20) else df15
         try:
             atr_s = ta_lib.volatility.AverageTrueRange(
@@ -523,19 +551,26 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
             atr = float(df15["close"].iloc[-1]) * 0.005
 
         result.atr = round(atr, 8)
-        entry = float(df15["close"].iloc[-1])  # entrada en precio de mercado actual (15m)
+        entry = float(df15["close"].iloc[-1])
         risk  = atr * ATR_MULT_SL
+
+        # #6 TP dinámicos: si ADX fuerte → TPs más ambiciosos
+        if adx_val >= ADX_STRONG_THRESHOLD:
+            tp1_m, tp2_m, tp3_m = TP1_STRONG_MULT, TP2_STRONG_MULT, TP3_STRONG_MULT
+            log.debug("[signal_engine] %s ADX=%.1f ≥ %.0f → TPs ampliados", coin, adx_val, ADX_STRONG_THRESHOLD)
+        else:
+            tp1_m, tp2_m, tp3_m = TP1_MULT, TP2_MULT, TP3_MULT
 
         if direction == "LONG":
             sl  = entry - risk
-            tp1 = entry + risk * TP1_MULT
-            tp2 = entry + risk * TP2_MULT
-            tp3 = entry + risk * TP3_MULT
+            tp1 = entry + risk * tp1_m
+            tp2 = entry + risk * tp2_m
+            tp3 = entry + risk * tp3_m
         else:
             sl  = entry + risk
-            tp1 = entry - risk * TP1_MULT
-            tp2 = entry - risk * TP2_MULT
-            tp3 = entry - risk * TP3_MULT
+            tp1 = entry - risk * tp1_m
+            tp2 = entry - risk * tp2_m
+            tp3 = entry - risk * tp3_m
 
         dist_entry_sl = abs(entry - sl)
         rr = round(abs(tp1 - entry) / dist_entry_sl, 2) if dist_entry_sl > 0 else 0
@@ -578,7 +613,8 @@ def _mode_emoji(mode: str) -> str:
 
 def format_signal_block(r: SignalResult) -> str:
     if not r.is_valid:
-        return f"📊 Score técnico: `{r.score}/{r.max_score}` — sin señal clara"
+        adx_txt = f" · ADX `{r.adx:.0f}`" if r.adx else ""
+        return f"📊 Score técnico: `{r.score}/{r.max_score}`{adx_txt} — sin señal clara"
 
     i15 = r.indicators.get("15m", {})
     i1h = r.indicators.get("1h",  {})
@@ -587,6 +623,8 @@ def format_signal_block(r: SignalResult) -> str:
     me  = _mode_emoji(r.entry_mode)
 
     size_txt = f" · Size `{int(r.size_ratio*100)}%`" if r.size_ratio < 1.0 else ""
+    adx_icon = "🔥" if r.adx >= ADX_STRONG_THRESHOLD else ("📉" if r.adx < ADX_MIN_THRESHOLD else "📊")
+    adx_txt  = f" · {adx_icon} ADX `{r.adx:.0f}`" if r.adx else ""
 
     ob_txt = ""
     if r.ob_imbalance is not None:
@@ -600,8 +638,8 @@ def format_signal_block(r: SignalResult) -> str:
         fr_txt = f"\n  Funding {emoji} `{fr_pct:+.4f}%`"
 
     lines = [
-        f"📊 *Análisis técnico* · Score `{r.score}/{r.max_score}` · R/R `{r.rr}:1`",
-        f"{'\U0001f7e2 LONG' if d == 'LONG' else '\U0001f534 SHORT'} · Modo {me}`{r.entry_mode}` · Lev `{r.suggested_lev}x`{size_txt}",
+        f"📊 *Análisis técnico* · Score `{r.score}/{r.max_score}` · R/R `{r.rr}:1`{adx_txt}",
+        f"{'🟢 LONG' if d == 'LONG' else '🔴 SHORT'} · Modo {me}`{r.entry_mode}` · Lev `{r.suggested_lev}x`{size_txt}",
         f"",
         f"  Entry `{r.entry}` · SL `{r.sl}` · TP1 `{r.tp1}`",
         f"",
