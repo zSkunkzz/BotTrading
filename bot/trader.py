@@ -514,10 +514,21 @@ class FuturesTrader:
             positions = []
             for p in data.get("assetPositions", []):
                 pos = p.get("position", {})
-                if pos.get("coin") == self.coin:
-                    szi = float(pos.get("szi", 0))
-                    if abs(szi) > 0:
-                        positions.append(pos)
+                if pos.get("coin") != self.coin:
+                    continue
+                # Hyperliquid puede devolver szi como string vacío "" en posiciones
+                # residuales — protegemos el cast con try/except para no propagar
+                # datos corruptos al resto del flujo.
+                try:
+                    szi = float(pos.get("szi", 0) or 0)
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "[%s] _get_positions: szi no numérico (%r) — ignorando posición residual.",
+                        self.symbol, pos.get("szi"),
+                    )
+                    continue
+                if abs(szi) > 0:
+                    positions.append(pos)
             return positions
         except Exception as e:
             logger.error("[%s] _get_positions error: %s", self.symbol, e)
@@ -847,7 +858,7 @@ class FuturesTrader:
                         self.entry_price = float(ep.get("entryPx") or 0)
                         logger.info("[%s] Posición detectada: %s @ %s",
                                     self.symbol, self.position, self.entry_price)
-                    elif raw_side == "":
+                    else:
                         logger.debug("[%s] Posición con side vacío ignorada (residuo del exchange).", self.symbol)
             else:
                 if self.position is not None:
@@ -899,7 +910,7 @@ class FuturesTrader:
                         self.symbol, parsed_side, self.entry_price,
                     )
                     await self._manage_open_position(price, risk)
-                elif raw_side == "":
+                else:
                     logger.debug("[%s] Posición con side vacío ignorada (residuo del exchange).", self.symbol)
                 return
 
