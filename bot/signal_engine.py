@@ -10,6 +10,10 @@ Exporta:
   - MIN_RR                : ratio R/R mínimo (env: MIN_RR_REQUIRED)
   - SignalFlipGuard       : previene flip-flop de señales opuestas (BUG #7 fix)
   - signal_flip_guard     : singleton exportado de SignalFlipGuard
+
+BUG #10 FIX: analyze_pair importaba build_snapshot y compute_indicators que
+nunca existieron en market_snapshot.py / indicators.py. Se reemplaza por
+bot.strategy.decide() que es la función real que ya usa trader.py.
 """
 from __future__ import annotations
 
@@ -21,12 +25,12 @@ from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-# ─── Constantes exportadas ────────────────────────────────────────────────────
+# ─── Constantes exportadas ───────────────────────────────────────────────────────────────────────────────
 
 MIN_SCORE: int = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
 MIN_RR: float = float(os.getenv("MIN_RR_REQUIRED", "1.8"))
 
-# ─── SignalResult ─────────────────────────────────────────────────────────────
+# ─── SignalResult ─────────────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class SignalResult:
@@ -51,34 +55,78 @@ class SignalResult:
     extra: Dict = field(default_factory=dict)
 
 
-# ─── analyze_pair ─────────────────────────────────────────────────────────────
+# ─── analyze_pair ───────────────────────────────────────────────────────────────────────────────────
 
 async def analyze_pair(exch, symbol: str) -> SignalResult:
     """
     Analiza un par y devuelve un SignalResult.
 
-    Importa la lógica real desde bot.market_snapshot + bot.indicators
-    para evitar duplicar código. Si algún import falla, devuelve HOLD seguro.
+    BUG #10 FIX: usa bot.strategy.decide() — la misma función que trader.py —
+    en vez de build_snapshot/compute_indicators que no existían.
     """
     try:
-        from bot.market_snapshot import build_snapshot
-        from bot.indicators import compute_indicators as _ci
+        from bot.strategy import decide
+        from bot.ai_trader import ai_decide
     except ImportError as e:
-        log.error(f"[signal_engine] import error en analyze_pair: {e}")
+        log.error("[signal_engine] import error en analyze_pair: %s", e)
         return _hold_result(symbol, f"ImportError: {e}")
 
     try:
-        snapshot = await build_snapshot(exch, symbol)
+        decision = await decide(
+            exch=exch,
+            symbol=symbol,
+            ai_decide_fn=ai_decide,
+            has_open_position=False,
+            current_pnl=None,
+        )
     except Exception as e:
-        log.error(f"[signal_engine] build_snapshot({symbol}) falló: {e}")
-        return _hold_result(symbol, f"snapshot error: {e}")
+        log.error("[signal_engine] decide(%s) falló: %s", symbol, e)
+        return _hold_result(symbol, f"decide error: {e}")
 
-    try:
-        result: SignalResult = _ci(snapshot)
-        return result
-    except Exception as e:
-        log.error(f"[signal_engine] compute_indicators({symbol}) falló: {e}")
-        return _hold_result(symbol, f"indicators error: {e}")
+    action = decision.get("action", "HOLD")
+    sig    = decision.get("signal")
+
+    if action not in ("BUY", "SELL") or sig is None:
+        return _hold_result(symbol, "HOLD")
+
+    signal_str = "LONG" if action == "BUY" else "SHORT"
+    score      = int(getattr(sig, "score", 0))
+    max_score  = int(getattr(sig, "max_score", 10))
+    entry      = float(getattr(sig, "entry", 0) or 0)
+    sl         = float(getattr(sig, "sl", 0) or 0)
+    tp1        = float(getattr(sig, "tp1", 0) or 0)
+    tp2        = float(getattr(sig, "tp2", 0) or 0)
+    atr_val    = float(getattr(sig, "atr", 0) or 0)
+    lev        = int(getattr(sig, "suggested_lev", 1) or 1)
+    entry_mode = str(getattr(sig, "entry_mode", "") or "NORMAL")
+
+    # R/R estimado
+    if entry > 0 and sl > 0 and tp1 > 0:
+        risk   = abs(entry - sl)
+        reward = abs(tp1 - entry)
+        rr     = round(reward / risk, 2) if risk > 0 else 0.0
+    else:
+        rr = 0.0
+
+    is_valid = score >= MIN_SCORE and rr >= MIN_RR
+
+    return SignalResult(
+        symbol=symbol,
+        signal=signal_str,
+        entry_mode=entry_mode,
+        score=score,
+        max_score=max_score,
+        entry=entry,
+        sl=sl,
+        tp1=tp1,
+        tp2=tp2,
+        atr=atr_val,
+        rr=rr,
+        suggested_lev=lev,
+        indicators={},
+        is_valid=is_valid,
+        reason="" if is_valid else f"score={score} rr={rr:.2f}",
+    )
 
 
 def _hold_result(symbol: str, reason: str) -> SignalResult:
@@ -102,7 +150,7 @@ def _hold_result(symbol: str, reason: str) -> SignalResult:
     )
 
 
-# ─── format_signal_block ──────────────────────────────────────────────────────
+# ─── format_signal_block ─────────────────────────────────────────────────────────────────────────────────
 
 def format_signal_block(signal: Optional[SignalResult]) -> str:
     """Formatea un SignalResult como bloque Markdown para Telegram/logs."""
@@ -127,7 +175,7 @@ def format_signal_block(signal: Optional[SignalResult]) -> str:
     return "\n".join(lines)
 
 
-# ─── SignalFlipGuard (BUG #7 FIX) ─────────────────────────────────────────────
+# ─── SignalFlipGuard (BUG #7 FIX) ────────────────────────────────────────────────────────────────────────
 
 _FLIP_COOLDOWN_S = float(os.getenv("SIGNAL_FLIP_COOLDOWN_S", "120"))
 
