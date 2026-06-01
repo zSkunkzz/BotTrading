@@ -12,8 +12,8 @@ Responsabilidades:
   - Registrar exposición en pretrade_risk tras fill confirmado
   - Registrar señal en shadow_mode con entry_mode (#8)
   - Notificar apertura via Telegram
-
-Extraído de FuturesTrader._iteration en trader.py.
+  - [V4] market_regime, daily_drawdown, kelly_sizer,
+          structure_analyzer, correlation_guard
 """
 from __future__ import annotations
 
@@ -31,6 +31,43 @@ from bot.signal_cooldown import signal_cooldown
 from bot.shadow_mode import shadow_mode
 from bot.ws_feed import ws_feed
 
+# ── V4 módulos ────────────────────────────────────────────────────────────────
+try:
+    from bot.market_regime import market_regime
+    _REGIME_ENABLED = os.getenv("REGIME_FILTER", "false").lower() == "true"
+except ImportError:
+    market_regime = None
+    _REGIME_ENABLED = False
+
+try:
+    from bot.daily_drawdown import daily_drawdown
+    _DD_ENABLED = True
+except ImportError:
+    daily_drawdown = None
+    _DD_ENABLED = False
+
+try:
+    from bot.kelly_sizer import kelly_sizer
+    _KELLY_ENABLED = os.getenv("KELLY_ENABLED", "false").lower() == "true"
+except ImportError:
+    kelly_sizer = None
+    _KELLY_ENABLED = False
+
+try:
+    from bot.structure_analyzer import structure_analyzer
+    _STRUCTURE_ENABLED = os.getenv("STRUCTURE_ENABLED", "false").lower() == "true"
+except ImportError:
+    structure_analyzer = None
+    _STRUCTURE_ENABLED = False
+
+try:
+    from bot.correlation_guard import correlation_guard
+    _CORR_ENABLED = os.getenv("CORR_GUARD_ENABLED", "false").lower() == "true"
+except ImportError:
+    correlation_guard = None
+    _CORR_ENABLED = False
+# ─────────────────────────────────────────────────────────────────────────────
+
 logger = logging.getLogger("DecisionEngine")
 
 # Timeframe de referencia para la guardia de vela cerrada (#7)
@@ -47,7 +84,6 @@ class DecisionEngine:
 
     def __init__(self, symbol: str, position_mgr=None):
         self.symbol = symbol
-        # Referencia al PositionManager para comunicar entry_mode al cooldown
         self._position_mgr = position_mgr
 
     def bind_position_manager(self, pm) -> None:
@@ -88,6 +124,27 @@ class DecisionEngine:
                 )
                 return
 
+        # ── [V4] Market Regime filter ─────────────────────────────────────────
+        if _REGIME_ENABLED and market_regime is not None:
+            try:
+                regime = await market_regime.get_regime()
+                if regime == "RED":
+                    logger.info("[%s] Market regime RED — skip entrada.", self.symbol)
+                    return
+                if regime == "YELLOW":
+                    logger.debug("[%s] Market regime YELLOW — procediendo con cautela.", self.symbol)
+            except Exception as e:
+                logger.warning("[%s] market_regime error: %s — skip filtro.", self.symbol, e)
+
+        # ── [V4] Daily Drawdown check ─────────────────────────────────────────
+        if _DD_ENABLED and daily_drawdown is not None:
+            try:
+                if daily_drawdown.is_blocked():
+                    logger.info("[%s] Daily drawdown alcanzado — skip entrada.", self.symbol)
+                    return
+            except Exception as e:
+                logger.warning("[%s] daily_drawdown error: %s — skip filtro.", self.symbol, e)
+
         # ── Verificaciones previas ────────────────────────────────────────────
         if global_risk:
             allowed, reason = await global_risk.can_open()
@@ -122,7 +179,24 @@ class DecisionEngine:
         if action not in ("BUY", "SELL"):
             return
 
-        # ── Parámetros de la orden ───────────────────────────────────────────────
+        # ── [V4] Structure Analyzer — boost de score ──────────────────────────
+        if _STRUCTURE_ENABLED and structure_analyzer is not None:
+            try:
+                struct_score = await structure_analyzer.score(
+                    symbol=self.symbol,
+                    side="long" if action == "BUY" else "short",
+                )
+                if struct_score < 0:
+                    logger.info(
+                        "[%s] StructureAnalyzer score negativo (%d) — skip entrada.",
+                        self.symbol, struct_score,
+                    )
+                    return
+                logger.debug("[%s] StructureAnalyzer score: %d", self.symbol, struct_score)
+            except Exception as e:
+                logger.warning("[%s] structure_analyzer error: %s — skip filtro.", self.symbol, e)
+
+        # ── Parámetros de la orden ────────────────────────────────────────────
         try:
             price = await trader.get_price()
         except Exception as e:
@@ -158,7 +232,33 @@ class DecisionEngine:
                 self.symbol, sizing_mult, entry_mode or "?", base_usdc,
             )
 
+        # ── [V4] Kelly Sizer ──────────────────────────────────────────────────
+        if _KELLY_ENABLED and kelly_sizer is not None:
+            try:
+                kelly_mult = kelly_sizer.multiplier(symbol=self.symbol)
+                if kelly_mult != 1.0:
+                    notional = notional * kelly_mult
+                    logger.info(
+                        "[%s] Kelly sizing: %.2f× → notional=%.2f USDC",
+                        self.symbol, kelly_mult, notional,
+                    )
+            except Exception as e:
+                logger.warning("[%s] kelly_sizer error: %s — usando notional base.", self.symbol, e)
+
         side = "buy" if action == "BUY" else "sell"
+
+        # ── [V4] Correlation Guard ────────────────────────────────────────────
+        if _CORR_ENABLED and correlation_guard is not None:
+            try:
+                corr_ok, corr_reason = await correlation_guard.check(
+                    symbol=self.symbol,
+                    side=side,
+                )
+                if not corr_ok:
+                    logger.info("[%s] CorrelationGuard bloqueó: %s", self.symbol, corr_reason)
+                    return
+            except Exception as e:
+                logger.warning("[%s] correlation_guard error: %s — skip filtro.", self.symbol, e)
 
         # ── pretrade_risk.check() con firma correcta ──────────────────────────
         try:
@@ -204,6 +304,13 @@ class DecisionEngine:
         # Registrar exposición en pretrade_risk tras fill confirmado
         pretrade_risk.confirm_order(self.symbol, notional)
 
+        # [V4] Registrar apertura en correlation_guard
+        if _CORR_ENABLED and correlation_guard is not None:
+            try:
+                correlation_guard.on_open(self.symbol, side)
+            except Exception:
+                pass
+
         try:
             fill_price = float(
                 result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
@@ -247,10 +354,10 @@ class DecisionEngine:
             "tp2_hit":     trader.tp2_hit,
             "usdc_amount": notional,
             "leverage":    lev,
-            "entry_mode":  entry_mode,   # guardado para restauración en restart
+            "entry_mode":  entry_mode,
         })
 
-        # ── #8 Registrar señal en shadow_mode con entry_mode ────────────────
+        # ── #8 Registrar señal en shadow_mode con entry_mode ─────────────────
         shadow_mode.record_signal(
             symbol=self.symbol,
             side=trader.position,

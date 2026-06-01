@@ -10,8 +10,8 @@ Responsabilidades:
   - Notificar cierres y TP parciales via Telegram
   - Cancelar trigger orders huérfanos tras cierre/parcial
   - Llamar signal_cooldown.mark_closed() al cerrar (#4)
-
-Extraído de FuturesTrader._manage_open_position en trader.py.
+  - [V4] position_timeout, trailing_hl, correlation_guard on_close,
+          daily_drawdown register_loss
 """
 from __future__ import annotations
 
@@ -25,6 +25,36 @@ from bot.telegram_bot import notify_close, notify_tp_partial
 from bot.signal_cooldown import signal_cooldown
 from bot.pretrade_risk import pretrade_risk
 
+# ── V4 módulos ────────────────────────────────────────────────────────────────
+try:
+    from bot.position_timeout import position_timeout
+    _TIMEOUT_ENABLED = os.getenv("POSITION_TIMEOUT_ENABLED", "true").lower() == "true"
+except ImportError:
+    position_timeout = None
+    _TIMEOUT_ENABLED = False
+
+try:
+    from bot.trailing_hl import trailing_hl
+    _TRAILING_HL_ENABLED = os.getenv("TRAILING_HL_ENABLED", "false").lower() == "true"
+except ImportError:
+    trailing_hl = None
+    _TRAILING_HL_ENABLED = False
+
+try:
+    from bot.correlation_guard import correlation_guard
+    _CORR_ENABLED = os.getenv("CORR_GUARD_ENABLED", "false").lower() == "true"
+except ImportError:
+    correlation_guard = None
+    _CORR_ENABLED = False
+
+try:
+    from bot.daily_drawdown import daily_drawdown
+    _DD_ENABLED = True
+except ImportError:
+    daily_drawdown = None
+    _DD_ENABLED = False
+# ─────────────────────────────────────────────────────────────────────────────
+
 logger = logging.getLogger("PositionManager")
 
 TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
@@ -33,28 +63,26 @@ TP2_PARTIAL_RATIO = float(os.getenv("TP2_PARTIAL_RATIO", "0.5"))
 class PositionManager:
     """
     Gestiona el ciclo de vida de una posición abierta para un símbolo.
-    No hace llamadas HTTP directas — recibe el trader como contexto
-    para poder colocar órdenes de cierre.
     """
 
     def __init__(self, symbol: str):
         self.symbol = symbol
-        # entry_mode de la posición activa (guardado al abrir, usado en cooldown)
         self._entry_mode: str = ""
+        self._open_ts: float = time.time()  # timestamp de apertura para timeout
 
     def set_entry_mode(self, mode: str) -> None:
         """Llamar desde DecisionEngine al abrir posición."""
         self._entry_mode = (mode or "").upper()
+        self._open_ts = time.time()
 
     async def manage(
         self,
-        trader,       # FuturesTrader — contexto con _place_order y estado
+        trader,
         price: float,
         risk,
     ) -> None:
         """
         Evalúa la posición abierta y actúa según precio actual.
-        Modifica directamente el estado del trader (position, sl, tp*, tp2_hit).
         """
         if trader.position is None or trader.entry_price is None:
             return
@@ -64,9 +92,38 @@ class PositionManager:
             (price - trader.entry_price) / trader.entry_price
         ) * (1 if is_long else -1) * 100
 
+        # ── [V4] Position Timeout ─────────────────────────────────────────────
+        if _TIMEOUT_ENABLED and position_timeout is not None:
+            try:
+                if position_timeout.is_expired(
+                    symbol=self.symbol,
+                    open_ts=self._open_ts,
+                    tp1=trader.tp1,
+                    price=price,
+                    is_long=is_long,
+                ):
+                    logger.info(
+                        "[%s] ⏱ Position timeout — cerrando posición estancada.",
+                        self.symbol,
+                    )
+                    await self._close_position(trader, price, "TIMEOUT", risk)
+                    return
+            except Exception as e:
+                logger.warning("[%s] position_timeout error: %s", self.symbol, e)
+
+        # ── [V4] Trailing stop nativo en HL ──────────────────────────────────
+        if _TRAILING_HL_ENABLED and trailing_hl is not None:
+            try:
+                await trailing_hl.update(
+                    trader=trader,
+                    symbol=self.symbol,
+                    price=price,
+                    is_long=is_long,
+                )
+            except Exception as e:
+                logger.warning("[%s] trailing_hl error: %s", self.symbol, e)
+
         # ── #1 Breakeven en TP1 ───────────────────────────────────────────────
-        # Cuando el precio toca TP1 por primera vez, el SL sube a entry_price
-        # (breakeven). Solo si TP2 existe (hay recorrido mayor al que apuntar).
         if (
             trader.tp1
             and trader.tp2
@@ -79,7 +136,6 @@ class PositionManager:
                 or (not is_long and price <= trader.tp1)
             )
             if tp1_hit_be:
-                # Solo mover SL a breakeven si mejora la protección
                 if is_long and trader.entry_price > trader.sl:
                     trader.sl = trader.entry_price
                     logger.info(
@@ -126,7 +182,6 @@ class PositionManager:
                 trader.tp2_hit = True
                 mark_tp2_hit(self.symbol)
 
-                # #1 SL → TP1 al tocar TP2
                 if trader.tp1 and trader.sl is not None:
                     move_sl = (
                         (is_long  and trader.tp1 > trader.sl)
@@ -150,9 +205,13 @@ class PositionManager:
                             "leverage":    trader._open_leverage,
                         })
 
-                partial_qty = round(
-                    (trader._open_notional / trader.entry_price) * TP2_PARTIAL_RATIO, 6
-                )
+                if trader.entry_price and trader.entry_price > 0:
+                    partial_qty = round(
+                        (trader._open_notional / trader.entry_price) * TP2_PARTIAL_RATIO, 6
+                    )
+                else:
+                    partial_qty = 0
+
                 if partial_qty > 0 and not trader.dry_run:
                     close_side = "sell" if is_long else "buy"
 
@@ -227,7 +286,18 @@ class PositionManager:
         if not close_reason:
             return
 
-        # Verificar posición en exchange antes de enviar cierre
+        await self._close_position(trader, price, close_reason, risk)
+
+    async def _close_position(
+        self,
+        trader,
+        price: float,
+        close_reason: str,
+        risk=None,
+    ) -> None:
+        """Cierra la posición en el exchange y limpia el estado."""
+        is_long = trader.position == "long"
+
         positions = await trader._get_positions()
         if not positions:
             logger.warning(
@@ -275,14 +345,28 @@ class PositionManager:
             self.symbol, close_reason, fill_price, pnl_usd, pnl_pct_final,
         )
 
-        entry_copy = trader.entry_price
-        pos_copy   = trader.position
+        entry_copy    = trader.entry_price
+        pos_copy      = trader.position
         notional_copy = trader._open_notional
 
         self._reset_trader_state(trader)
 
         # Liberar exposición en pretrade_risk
         pretrade_risk.register_close(self.symbol, notional_copy)
+
+        # [V4] Registrar pérdida en daily_drawdown
+        if _DD_ENABLED and daily_drawdown is not None and pnl_usd < 0:
+            try:
+                daily_drawdown.register_loss(abs(pnl_usd))
+            except Exception as e:
+                logger.warning("[%s] daily_drawdown.register_loss error: %s", self.symbol, e)
+
+        # [V4] Liberar en correlation_guard
+        if _CORR_ENABLED and correlation_guard is not None:
+            try:
+                correlation_guard.on_close(self.symbol)
+            except Exception:
+                pass
 
         # #4 Cooldown diferenciado por entry_mode
         signal_cooldown.mark_closed(
@@ -309,4 +393,5 @@ class PositionManager:
         trader.tp2_hit = False
         trader._tp1_be_done = False
         self._entry_mode = ""
+        self._open_ts = time.time()
         clear_position(self.symbol)
