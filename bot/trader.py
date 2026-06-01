@@ -20,6 +20,9 @@ BUG #7 FIX: signal_flip_guard integrado en _try_open_position
 BUG #8 FIX: cierre de emergencia reduce-only en sl_hit cuando _protection_ok=False
   - Si el SL del exchange no fue confirmado (_protection_ok=False) y el precio
     cruza el SL local, se envia orden de mercado reduce-only antes de limpiar estado.
+
+OHLCV FIX: decide() recibe ohlcv_fn=self.get_ohlcv para usar WS→caché→REST
+  - Evita 3 REST hits extra por ciclo (antes analyze_pair llamaba exch.fetch_ohlcv directamente)
 """
 from __future__ import annotations
 
@@ -949,6 +952,9 @@ class FuturesTrader:
         No necesita ningun guard adicional (_opening_position eliminado).
 
         BUG #7 FIX: signal_flip_guard filtra inversiones de direccion rapidas.
+
+        OHLCV FIX: pasa self.get_ohlcv como ohlcv_fn a decide() para que
+        analyze_pair use la ruta WS→caché→REST en lugar de exch.fetch_ohlcv.
         """
         if global_risk:
             allowed, reason = await global_risk.can_open()
@@ -978,8 +984,12 @@ class FuturesTrader:
         try:
             exch = await self._get_ccxt()
             decision = await decide(
-                exch=exch, symbol=self.symbol, ai_decide_fn=ai_decide,
-                has_open_position=False, current_pnl=None,
+                exch=exch,
+                symbol=self.symbol,
+                ai_decide_fn=ai_decide,
+                has_open_position=False,
+                current_pnl=None,
+                ohlcv_fn=self.get_ohlcv,  # OHLCV FIX: usa WS→caché→REST del trader
             )
         except Exception as e:
             logger.error("[%s] decide() error: %s", self.symbol, e)

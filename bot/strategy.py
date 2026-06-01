@@ -27,7 +27,7 @@ Variables de entorno:
 import logging
 import os
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from bot.signal_engine import (
     SignalResult,
@@ -58,6 +58,7 @@ async def decide(
     ai_decide_fn,
     has_open_position: bool = False,
     current_pnl: Optional[float] = None,
+    ohlcv_fn: Optional[Callable] = None,
 ) -> dict:
     """
     Retorna:
@@ -68,13 +69,17 @@ async def decide(
         signal_block : str (Markdown)
         ai_confidence: int (0 if IA not used)
         ai_reason    : str
+
+    ohlcv_fn: callable async con firma `(tf: str) -> list`.
+      Si se pasa, analyze_pair lo usará en lugar de exch.fetch_ohlcv(),
+      aprovechando la ruta WS→caché→REST del trader y evitando REST hits duplicados.
     """
 
     if has_open_position:
         return _result("HOLD", None, False, "Posición ya abierta — esperando cierre")
 
     try:
-        signal: SignalResult = await analyze_pair(exch, symbol)
+        signal: SignalResult = await analyze_pair(exch, symbol, ohlcv_fn=ohlcv_fn)
     except Exception as e:
         log.error(f"[strategy] analyze_pair error: {e}")
         return _result("HOLD", None, False, f"Error en análisis técnico: {e}")
