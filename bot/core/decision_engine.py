@@ -14,6 +14,11 @@ Responsabilidades:
   - Notificar apertura via Telegram
   - [V4] market_regime, daily_drawdown, kelly_sizer,
           structure_analyzer, correlation_guard
+
+FIX v4.1:
+  - kelly_sizer: la función real es kelly_multiplier(entry_mode, rr), no .multiplier(symbol=)
+  - market_regime: ahora tiene singleton MarketRegimeSingleton con .refresh()/.regime()/.btc_trend()
+  - REGIME_FILTER env var alineada con market_regime (MARKET_REGIME_GATE también funciona)
 """
 from __future__ import annotations
 
@@ -31,10 +36,13 @@ from bot.signal_cooldown import signal_cooldown
 from bot.shadow_mode import shadow_mode
 from bot.ws_feed import ws_feed
 
-# ── V4 módulos ────────────────────────────────────────────────────────────────
+# ── V4 módulos ─────────────────────────────────────────────────────────────────────────
 try:
-    from bot.market_regime import market_regime
-    _REGIME_ENABLED = os.getenv("REGIME_FILTER", "false").lower() == "true"
+    from bot.market_regime import market_regime   # singleton MarketRegimeSingleton
+    _REGIME_ENABLED = (
+        os.getenv("REGIME_FILTER", "false").lower() == "true"
+        or os.getenv("MARKET_REGIME_GATE", "false").lower() == "true"
+    )
 except ImportError:
     market_regime = None
     _REGIME_ENABLED = False
@@ -47,31 +55,31 @@ except ImportError:
     _DD_ENABLED = False
 
 try:
-    from bot.kelly_sizer import kelly_sizer
-    _KELLY_ENABLED = os.getenv("KELLY_ENABLED", "false").lower() == "true"
+    # FIX: la función real es kelly_multiplier(entry_mode, rr), no un método .multiplier(symbol=)
+    from bot.kelly_sizer import kelly_multiplier as _kelly_multiplier
+    _KELLY_ENABLED = os.getenv("KELLY_ENABLED", "true").lower() != "false"
 except ImportError:
-    kelly_sizer = None
+    _kelly_multiplier = None
     _KELLY_ENABLED = False
 
 try:
-    from bot.structure_analyzer import analyze_structure   # función libre, síncrona
+    from bot.structure_analyzer import analyze_structure
     _STRUCTURE_ENABLED = os.getenv("STRUCTURE_ENABLED", "false").lower() == "true"
 except ImportError:
     analyze_structure = None
     _STRUCTURE_ENABLED = False
 
 try:
-    from bot.correlation_guard import check_correlation, size_penalty_btc  # funciones libres, síncronas
+    from bot.correlation_guard import check_correlation, size_penalty_btc
     _CORR_ENABLED = os.getenv("CORR_GUARD_ENABLED", "false").lower() == "true"
 except ImportError:
     check_correlation = None
     size_penalty_btc = None
     _CORR_ENABLED = False
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger("DecisionEngine")
 
-# Timeframe de referencia para la guardia de vela cerrada (#7)
 _CANDLE_CONFIRM_TF        = os.getenv("CANDLE_CONFIRM_TF", "15m")
 _CANDLE_CONFIRM_THRESHOLD = float(os.getenv("CANDLE_CONFIRM_THRESHOLD", "0.80"))
 _CANDLE_CONFIRM_ENABLED   = os.getenv("CANDLE_CONFIRM_ENABLED", "true").lower() == "true"
@@ -91,6 +99,35 @@ class DecisionEngine:
         """Conecta el PositionManager para que reciba entry_mode al abrir."""
         self._position_mgr = pm
 
+    def on_position_closed(
+        self,
+        symbol: str,
+        margin: float | None,
+        reason: str,
+        entry_mode: str,
+    ) -> None:
+        """
+        Callback invocado desde PositionManager al cerrar cualquier posición.
+        Actualiza cooldown dinámico y registra resultado en shadow_mode.
+        """
+        is_win = reason in ("TP1", "TP2", "TP3")
+        logger.debug(
+            "[%s] on_position_closed: reason=%s mode=%s win=%s",
+            symbol, reason, entry_mode, is_win,
+        )
+        try:
+            shadow_mode.record_real_close(symbol, won=is_win, entry_mode=entry_mode)
+        except Exception as e:
+            logger.debug("[%s] shadow_mode.record_real_close error: %s", symbol, e)
+        try:
+            signal_cooldown.on_trade_result(
+                symbol=symbol,
+                won=is_win,
+                entry_mode=entry_mode,
+            )
+        except Exception as e:
+            logger.debug("[%s] signal_cooldown.on_trade_result error: %s", symbol, e)
+
     async def evaluate(
         self,
         trader,
@@ -105,7 +142,7 @@ class DecisionEngine:
             logger.debug("[%s] Kill switch activo — skip.", self.symbol)
             return
 
-        # ── #4 Cooldown de reapertura ─────────────────────────────────────────
+        # ── #4 Cooldown de reapertura ───────────────────────────────────────────────
         if signal_cooldown.is_blocked(self.symbol):
             remaining = signal_cooldown.remaining(self.symbol)
             logger.debug(
@@ -113,7 +150,7 @@ class DecisionEngine:
             )
             return
 
-        # ── #7 Confirmación de vela cerrada ────────────────────────────────
+        # ── #7 Confirmación de vela cerrada ────────────────────────────────────
         if _CANDLE_CONFIRM_ENABLED:
             if not ws_feed.is_candle_closed(
                 self.symbol, _CANDLE_CONFIRM_TF, _CANDLE_CONFIRM_THRESHOLD
@@ -125,15 +162,13 @@ class DecisionEngine:
                 )
                 return
 
-        # ── [V4] Market Regime filter ─────────────────────────────────────────
-        # FIX Bug 1: market_regime NO tiene get_regime().
-        #   API real: await market_regime.refresh(exch)  → actualiza caché
-        #             market_regime.regime()              → str síncrono
+        # ── [V4] Market Regime filter ─────────────────────────────────────────────
+        # market_regime es ahora MarketRegimeSingleton con .refresh() y .regime() reales.
         if _REGIME_ENABLED and market_regime is not None:
             try:
                 exch_for_regime = await trader._get_ccxt()
                 await market_regime.refresh(exch=exch_for_regime)
-                regime = market_regime.regime()          # síncrono, devuelve "GREEN"/"YELLOW"/"RED"
+                regime = market_regime.regime()   # "GREEN" | "YELLOW" | "RED"
                 if regime == "RED":
                     logger.info("[%s] Market regime RED — skip entrada.", self.symbol)
                     return
@@ -142,7 +177,7 @@ class DecisionEngine:
             except Exception as e:
                 logger.warning("[%s] market_regime error: %s — skip filtro.", self.symbol, e)
 
-        # ── [V4] Daily Drawdown check ─────────────────────────────────────────
+        # ── [V4] Daily Drawdown check ─────────────────────────────────────────────
         if _DD_ENABLED and daily_drawdown is not None:
             try:
                 if daily_drawdown.is_blocked():
@@ -151,7 +186,7 @@ class DecisionEngine:
             except Exception as e:
                 logger.warning("[%s] daily_drawdown error: %s — skip filtro.", self.symbol, e)
 
-        # ── Verificaciones previas ────────────────────────────────────────────
+        # ── Verificaciones previas ─────────────────────────────────────────────────
         if global_risk:
             allowed, reason = await global_risk.can_open()
             if not allowed:
@@ -166,7 +201,7 @@ class DecisionEngine:
             )
             return
 
-        # ── Señal de estrategia ───────────────────────────────────────────────
+        # ── Señal de estrategia ───────────────────────────────────────────────────────
         try:
             exch     = await trader._get_ccxt()
             decision = await decide(
@@ -185,14 +220,11 @@ class DecisionEngine:
         if action not in ("BUY", "SELL"):
             return
 
-        # ── [V4] Structure Analyzer — boost de score ──────────────────────────
-        # FIX Bug 3: analyze_structure() es función libre y SÍNCRONA.
-        #   Firma: analyze_structure(df: DataFrame, direction: int) -> dict
-        #   No existe structure_analyzer.score(symbol=, side=) ni se puede await.
+        # ── [V4] Structure Analyzer ────────────────────────────────────────────────
         if _STRUCTURE_ENABLED and analyze_structure is not None:
             try:
                 direction_int = 1 if action == "BUY" else -1
-                df_struct = ws_feed.get_ohlcv(self.symbol, "1h")  # DataFrame del caché WS
+                df_struct = ws_feed.get_ohlcv(self.symbol, "1h")
                 if df_struct is not None and not df_struct.empty:
                     struct_result = analyze_structure(df_struct, direction=direction_int)
                     struct_score = struct_result.get("score", 0)
@@ -208,7 +240,7 @@ class DecisionEngine:
             except Exception as e:
                 logger.warning("[%s] structure_analyzer error: %s — skip filtro.", self.symbol, e)
 
-        # ── Parámetros de la orden ────────────────────────────────────────────
+        # ── Parámetros de la orden ──────────────────────────────────────────────────
         try:
             price = await trader.get_price()
         except Exception as e:
@@ -233,7 +265,7 @@ class DecisionEngine:
         if lev != trader.leverage:
             await trader._set_leverage(lev)
 
-        # ── #8 Sizing dinámico según win-rate histórico del modo ──────────────
+        # ── #8 Sizing dinámico según win-rate histórico del modo ─────────────────
         sizing_mult = shadow_mode.sizing_multiplier(entry_mode)
         base_usdc   = risk.usdc_per_trade * sizing_mult
         notional    = base_usdc * lev
@@ -244,26 +276,27 @@ class DecisionEngine:
                 self.symbol, sizing_mult, entry_mode or "?", base_usdc,
             )
 
-        # ── [V4] Kelly Sizer ──────────────────────────────────────────────────
-        if _KELLY_ENABLED and kelly_sizer is not None:
+        # ── [V4] Kelly Sizer ─────────────────────────────────────────────────────
+        # FIX: la función es kelly_multiplier(entry_mode, rr), NO .multiplier(symbol=)
+        # rr se calcula como (tp1 - entry) / (entry - sl) para LONG
+        if _KELLY_ENABLED and _kelly_multiplier is not None and sl and tp1 and entry:
             try:
-                kelly_mult = kelly_sizer.multiplier(symbol=self.symbol)
+                sl_dist = abs(entry - sl)
+                tp_dist = abs(tp1 - entry)
+                rr = tp_dist / sl_dist if sl_dist > 0 else 1.5
+                kelly_mult = _kelly_multiplier(entry_mode=entry_mode, rr=rr)
                 if kelly_mult != 1.0:
                     notional = notional * kelly_mult
                     logger.info(
-                        "[%s] Kelly sizing: %.2f× → notional=%.2f USDC",
-                        self.symbol, kelly_mult, notional,
+                        "[%s] Kelly sizing: rr=%.2f → %.2f× → notional=%.2f USDC",
+                        self.symbol, rr, kelly_mult, notional,
                     )
             except Exception as e:
                 logger.warning("[%s] kelly_sizer error: %s — usando notional base.", self.symbol, e)
 
         side = "buy" if action == "BUY" else "sell"
 
-        # ── [V4] Correlation Guard ────────────────────────────────────────────
-        # FIX Bug 2: check_correlation() es función LIBRE y SÍNCRONA.
-        #   Firma: check_correlation(proposed_direction: str, open_positions: dict) -> (bool, str)
-        #   proposed_direction debe ser "LONG" o "SHORT" (mayúsculas).
-        #   open_positions se obtiene del position_mgr o del trader.
+        # ── [V4] Correlation Guard ──────────────────────────────────────────────
         if _CORR_ENABLED and check_correlation is not None:
             try:
                 proposed_dir = "LONG" if action == "BUY" else "SHORT"
@@ -272,11 +305,10 @@ class DecisionEngine:
                     open_pos = self._position_mgr.get_all_positions() or {}
                 elif hasattr(trader, "_all_positions"):
                     open_pos = trader._all_positions or {}
-                corr_ok, corr_reason = check_correlation(proposed_dir, open_pos)  # síncrono, sin await
+                corr_ok, corr_reason = check_correlation(proposed_dir, open_pos)
                 if not corr_ok:
-                    logger.info("[%s] CorrelationGuard bloqueó: %s", self.symbol, corr_reason)
+                    logger.info("[%s] CorrelationGuard bloqueado: %s", self.symbol, corr_reason)
                     return
-                # Aplicar penalización de size si BTC va en contra
                 if size_penalty_btc is not None and market_regime is not None:
                     btc_trend = market_regime.btc_trend()
                     size_mult = size_penalty_btc(proposed_dir, btc_trend)
@@ -289,7 +321,7 @@ class DecisionEngine:
             except Exception as e:
                 logger.warning("[%s] correlation_guard error: %s — skip filtro.", self.symbol, e)
 
-        # ── pretrade_risk.check() con firma correcta ──────────────────────────
+        # ── pretrade_risk.check() ───────────────────────────────────────────────────
         try:
             ok, reason = await pretrade_risk.check(
                 symbol=self.symbol,
@@ -301,7 +333,7 @@ class DecisionEngine:
                 leverage=lev,
             )
             if not ok:
-                logger.debug("[%s] pretrade_risk bloqueó: %s", self.symbol, reason)
+                logger.debug("[%s] pretrade_risk bloqueado: %s", self.symbol, reason)
                 return
         except Exception as e:
             logger.warning("[%s] pretrade_risk.check() error: %s — continuando", self.symbol, e)
@@ -320,7 +352,7 @@ class DecisionEngine:
             decision.get("reason", ""),
         )
 
-        # ── Ejecutar orden ────────────────────────────────────────────────────
+        # ── Ejecutar orden ───────────────────────────────────────────────────────────────
         result = (
             {"status": "ok", "_fill_price": entry}
             if trader.dry_run
@@ -330,7 +362,6 @@ class DecisionEngine:
         if result.get("status") != "ok":
             return
 
-        # Registrar exposición en pretrade_risk tras fill confirmado
         pretrade_risk.confirm_order(self.symbol, notional)
 
         try:
@@ -348,7 +379,7 @@ class DecisionEngine:
                 self.symbol, fill_price, entry, qty,
             )
 
-        # ── Actualizar estado del trader ──────────────────────────────────────
+        # ── Actualizar estado del trader ──────────────────────────────────────────
         trader.position       = "long" if action == "BUY" else "short"
         trader.entry_price    = fill_price
         trader.sl             = sl
@@ -359,12 +390,15 @@ class DecisionEngine:
         trader._tp1_be_done   = False
         trader._open_notional = notional
         trader._open_leverage = lev
+        trader._open_margin   = notional / lev if lev else notional
         trader._protection_ok = False
         trader.trade_count   += 1
 
-        # Comunicar entry_mode al PositionManager para cooldown correcto al cerrar
         if self._position_mgr is not None:
             self._position_mgr.set_entry_mode(entry_mode)
+            # Inyectar referencia de este DecisionEngine en el PositionManager
+            if hasattr(self._position_mgr, "bind_decision_engine"):
+                self._position_mgr.bind_decision_engine(self)
 
         save_position(self.symbol, {
             "side":        trader.position,
@@ -379,7 +413,6 @@ class DecisionEngine:
             "entry_mode":  entry_mode,
         })
 
-        # ── #8 Registrar señal en shadow_mode con entry_mode ─────────────────
         shadow_mode.record_signal(
             symbol=self.symbol,
             side=trader.position,
