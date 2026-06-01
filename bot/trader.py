@@ -200,6 +200,12 @@ class FuturesTrader:
         # aún está siendo confirmada con el exchange.
         self._opening_position: bool = False
 
+        # ── Lock de apertura: garantía adicional para asyncio ─────────────
+        # Aunque _opening_position ya bloquea el loop del mismo trader,
+        # este lock previene race conditions si en el futuro se usa
+        # concurrencia dentro del mismo trader.
+        self._open_lock: asyncio.Lock = asyncio.Lock()
+
         if _DE_AVAILABLE:
             self._decision_engine = _DecisionEngine(symbol)
         else:
@@ -792,6 +798,60 @@ class FuturesTrader:
             await self._manage_open_position(price, risk)
             return
 
+        # ══════════════════════════════════════════════════════════════════════
+        # CERROJO ANTI-DUPLICADO — VERIFICACIÓN OBLIGATORIA EN EXCHANGE
+        # Antes de cualquier apertura, consultamos el exchange directamente.
+        # Esto previene duplicados cuando:
+        #   1. El trader se recrea por rotación de pares (estado en memoria = None)
+        #   2. El estado local no se restauró correctamente en _init
+        #   3. Otro trader del mismo símbolo abrió mientras este estaba en sleep
+        # ══════════════════════════════════════════════════════════════════════
+        if self._open_lock.locked():
+            logger.debug("[%s] _open_lock ocupado — skip para evitar duplicado.", self.symbol)
+            return
+
+        async with self._open_lock:
+            # Re-verificar inmediatamente después de adquirir el lock
+            # (otro coroutine pudo haber abierto mientras esperábamos)
+            if self.position is not None:
+                await self._manage_open_position(price, risk)
+                return
+
+            # ── Consulta definitiva al exchange antes de abrir ────────────────
+            live_positions = await self._get_positions()
+            if live_positions is None:
+                logger.warning(
+                    "[%s] 🚫 No se pudo verificar posición en exchange — "
+                    "abortando apertura por seguridad.",
+                    self.symbol,
+                )
+                return
+            if len(live_positions) > 0:
+                # Ya hay posición abierta en el exchange que no teníamos en memoria
+                ep = live_positions[0]
+                raw_side = ep.get("side", "")
+                try:
+                    parsed_side = _hl_side_to_str(raw_side)
+                except ValueError:
+                    parsed_side = None
+                if parsed_side:
+                    self.position    = parsed_side
+                    self.entry_price = float(ep.get("entryPx") or 0)
+                    self._last_pos_check_at = time.monotonic()
+                    logger.warning(
+                        "[%s] 🚫 Posición ya abierta en exchange (%s @ %.5f) — "
+                        "abortando apertura duplicada.",
+                        self.symbol, parsed_side, self.entry_price,
+                    )
+                    await self._manage_open_position(price, risk)
+                return
+
+            # ── A partir de aquí sabemos con certeza que NO hay posición ──────
+            await self._try_open_position(price, risk, global_risk)
+
+    async def _try_open_position(self, price: float, risk, global_risk) -> None:
+        """Lógica de apertura. Solo se llama cuando se ha verificado que no hay posición."""
+
         if global_risk:
             allowed, reason = await global_risk.can_open()
             if not allowed:
@@ -810,7 +870,7 @@ class FuturesTrader:
             ok, pt_reason = await pretrade_risk.check(
                 symbol=self.symbol,
                 side="buy",
-                margin=usdc_per_trade,   # ← MARGEN REAL, no notional
+                margin=usdc_per_trade,
             )
             if not ok:
                 logger.debug("[%s] pretrade_risk bloqueó la entrada: %s", self.symbol, pt_reason)
@@ -877,8 +937,8 @@ class FuturesTrader:
         #   notional  = margin × lev            ← tamaño de la posición en el exchange
         #   qty       = notional / entry_price  ← contratos a comprar/vender
         # ──────────────────────────────────────────────────────────────────────
-        margin_usdc     = usdc_per_trade                  # e.g. 20 USDC
-        notional_target = margin_usdc * lev               # e.g. 20 × 5 = 100 USDC
+        margin_usdc     = usdc_per_trade
+        notional_target = margin_usdc * lev
         qty             = self._round_qty(notional_target / entry)
         notional        = qty * entry
 
@@ -910,8 +970,6 @@ class FuturesTrader:
         assert tp1 and tp1 > 0, f"[{self.symbol}] TP1 inválido: {tp1}"
 
         # ── Activar guard ANTES de enviar la orden ────────────────────────
-        # Impide que el siguiente tick del loop abra una segunda orden
-        # mientras esta está siendo confirmada con el exchange.
         self._opening_position = True
         logger.debug("[%s] Guard _opening_position=True", self.symbol)
 
@@ -939,11 +997,11 @@ class FuturesTrader:
             self.tp2            = tp2
             self.tp3            = tp3
             self.tp2_hit        = False
-            # ── Guardar margen real y notional por separado ────────────────────
-            self._open_margin   = margin_usdc          # ← MARGEN REAL (usdc_per_trade)
-            self._open_notional = fill_qty * fill_entry # ← notional real post-fill
+            self._open_margin   = margin_usdc
+            self._open_notional = fill_qty * fill_entry
             self._open_leverage = lev
             self._open_entry_mode = entry_mode
+            self._last_pos_check_at = time.monotonic()  # evita re-check inmediato
 
             save_position(self.symbol, {
                 "side":        pos_side,
@@ -954,12 +1012,11 @@ class FuturesTrader:
                 "tp3":         tp3,
                 "tp2_hit":     False,
                 "leverage":    lev,
-                "usdc_amount": self._open_notional,   # notional (retrocompatibilidad)
-                "margin_usdc": margin_usdc,            # ← NUEVO: margen real
+                "usdc_amount": self._open_notional,
+                "margin_usdc": margin_usdc,
                 "entry_mode":  entry_mode,
             })
 
-            # ── pretrade_risk: confirmar con el MARGEN real ────────────────
             pretrade_risk.confirm_order(self.symbol, margin_usdc)
 
             await self._place_tpsl(qty=fill_qty, sl=sl, tp=tp1, entry_px=fill_entry)
@@ -984,9 +1041,6 @@ class FuturesTrader:
             )
 
         finally:
-            # El guard se libera en _clear_position_state() al cerrar,
-            # pero si la apertura falla antes de setear self.position,
-            # lo liberamos aquí para no bloquear el loop indefinidamente.
             if self.position is None:
                 self._opening_position = False
                 logger.debug("[%s] Guard _opening_position liberado (no se abrió posición).", self.symbol)
