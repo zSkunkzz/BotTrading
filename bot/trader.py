@@ -1032,18 +1032,19 @@ class FuturesTrader:
             order_result = await self._place_order(trade_side_str, qty, sl=sl, tp=tp1)
             if order_result.get("status") != "ok":
                 logger.error("[%s] ❌ Orden rechazada: %s", self.symbol, order_result)
-                self._opening_position = False
                 return
 
             positions = await self._confirm_position_with_retry()
             if positions is None or len(positions) == 0:
                 logger.warning("[%s] Orden ejecutada pero posición no confirmada.", self.symbol)
-                self._opening_position = False
                 return
 
-            pos_data    = positions[0]
-            fill_entry  = float(pos_data.get("entryPx") or entry)
-            fill_qty    = abs(float(pos_data.get("szi", qty)))
+            pos_data   = positions[0]
+            fill_entry = float(pos_data.get("entryPx") or entry)
+            # ── FIX: usar qty calculada localmente como fuente de verdad ──
+            # fill_qty del exchange (szi) puede incluir residuos de posiciones
+            # anteriores y duplicar el tamaño. qty es lo que ordenamos ahora.
+            confirmed_qty = qty
 
             self.position       = pos_side
             self.entry_price    = fill_entry
@@ -1053,7 +1054,7 @@ class FuturesTrader:
             self.tp3            = tp3
             self.tp2_hit        = False
             self._open_margin   = margin_usdc
-            self._open_notional = fill_qty * fill_entry
+            self._open_notional = confirmed_qty * fill_entry   # ← notional correcto
             self._open_leverage = lev
             self._open_entry_mode = entry_mode
             self._last_pos_check_at = time.monotonic()
@@ -1077,7 +1078,7 @@ class FuturesTrader:
             # _place_tpsl ahora hace re-raise si falla → _protection_ok
             # se queda en False y el verificador periódico (120s) reintentará
             try:
-                await self._place_tpsl(qty=fill_qty, sl=sl, tp=tp1, entry_px=fill_entry)
+                await self._place_tpsl(qty=confirmed_qty, sl=sl, tp=tp1, entry_px=fill_entry)
                 self._protection_ok = True
             except Exception as e:
                 logger.error(
@@ -1102,13 +1103,16 @@ class FuturesTrader:
                 "[%s] ✅ Posición abierta | %s @ %.5f | margen=%.2f USDC | "
                 "notional=%.2f USDC | qty=%s | lev=%dx | SL=%.5f | TP1=%.5f",
                 self.symbol, pos_side, fill_entry, margin_usdc,
-                self._open_notional, fill_qty, lev, sl, tp1,
+                self._open_notional, confirmed_qty, lev, sl, tp1,
             )
 
         finally:
-            if self.position is None:
-                self._opening_position = False
-                logger.debug("[%s] Guard _opening_position liberado (no se abrió posición).", self.symbol)
+            # ── FIX CRÍTICO: liberar el guard SIEMPRE, no solo si falló ──
+            # Antes: "if self.position is None" → si la posición se abría
+            # correctamente, self.position tenía valor y el guard quedaba
+            # True para siempre, bloqueando todas las operaciones futuras.
+            self._opening_position = False
+            logger.debug("[%s] Guard _opening_position liberado.", self.symbol)
 
     async def _manage_open_position(self, price: float, risk) -> None:
         if not self.position or not self.entry_price:
