@@ -194,16 +194,9 @@ class FuturesTrader:
         self._global_risk   = None
 
         # ── Guard para evitar órdenes duplicadas ──────────────────────────
-        # Se activa justo ANTES de enviar la orden y se libera al confirmar
-        # la posición (o si la orden falla). Impide que una segunda iteración
-        # del loop entre en el path de apertura mientras la primera orden
-        # aún está siendo confirmada con el exchange.
         self._opening_position: bool = False
 
         # ── Lock de apertura: garantía adicional para asyncio ─────────────
-        # Aunque _opening_position ya bloquea el loop del mismo trader,
-        # este lock previene race conditions si en el futuro se usa
-        # concurrencia dentro del mismo trader.
         self._open_lock: asyncio.Lock = asyncio.Lock()
 
         if _DE_AVAILABLE:
@@ -298,8 +291,6 @@ class FuturesTrader:
                 self.tp2_hit          = saved.get("tp2_hit", False)
                 self._open_notional   = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
                 self._open_leverage   = saved.get("leverage", self.leverage)
-                # ── MARGEN REAL: usdc_amount guardado ya es el margen (usdc_per_trade)
-                #    Si el estado viejo tiene el notional, lo recalculamos.
                 saved_margin = saved.get("margin_usdc")
                 if saved_margin and saved_margin > 0:
                     self._open_margin = saved_margin
@@ -308,8 +299,12 @@ class FuturesTrader:
                 else:
                     self._open_margin = self._open_notional
                 self._open_entry_mode = saved.get("entry_mode", "")
-                self._protection_ok   = True
-                logger.info("[%s] Posición restaurada: %s @ %s", self.symbol, self.position, self.entry_price)
+                # Al restaurar, forzar verificación en el primer ciclo
+                # para detectar SL/TP huérfanos (como el bug de HYPE)
+                self._protection_ok   = False
+                self._last_tpsl_verify_at = 0.0
+                logger.info("[%s] Posición restaurada: %s @ %s — verificando SL/TP en exchange...",
+                            self.symbol, self.position, self.entry_price)
             elif exchange_pos is not None and len(exchange_pos) == 0:
                 logger.warning(
                     "[%s] Posición guardada localmente pero NO existe en exchange — limpiando estado.",
@@ -537,6 +532,17 @@ class FuturesTrader:
         return []
 
     # ── _place_tpsl ─────────────────────────────────────────────────────────────
+    # Coloca SL y/o TP en el exchange.
+    #
+    # Estrategia:
+    #   1. Si hay AMBOS → intenta bulk_orders (una sola llamada al exchange).
+    #      Si el bulk falla, cae al fallback individual para CADA uno por separado.
+    #   2. Si solo hay uno (sl=None o tp=None) → coloca directamente el que existe.
+    #
+    # IMPORTANTE: cualquier fallo al colocar SL → re-raise (es crítico).
+    #             cualquier fallo al colocar TP  → re-raise también, para que
+    #             el caller pueda dejar _protection_ok=False y el verificador
+    #             periódico lo reintente en 120s.
 
     async def _place_tpsl(
         self,
@@ -556,6 +562,8 @@ class FuturesTrader:
         ep = entry_px if (entry_px and entry_px > 0) else self.entry_price
 
         if sl and tp:
+            # ── Intento bulk ──────────────────────────────────────────────
+            bulk_ok = False
             try:
                 sl_px = client._adjust_sl_px(sl, ep, is_long)
                 tp_px = client._adjust_tp_px(tp, ep, is_long)
@@ -593,13 +601,48 @@ class FuturesTrader:
                     "[%s] ✅ SL=%.5f + TP=%.5f colocados en exchange (bulk)",
                     self.symbol, sl_px, tp_px,
                 )
-                return
+                bulk_ok = True
             except Exception as e:
                 logger.warning(
                     "[%s] bulk SL+TP falló (%s) — colocando individualmente",
                     self.symbol, e,
                 )
 
+            if bulk_ok:
+                return
+
+            # ── Fallback individual: SL primero, luego TP ─────────────────
+            # Ambos re-raise: si cualquiera falla el caller deja
+            # _protection_ok=False y el verificador periódico lo reintenta.
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda: client.place_sl(
+                        is_buy=close_is_buy, sz=qty,
+                        trigger_px=sl, entry_px=ep,
+                    ),
+                )
+                logger.info("[%s] ✅ SL=%.5f colocado en exchange (fallback)", self.symbol, sl)
+            except Exception as e:
+                logger.error("[%s] ❌ No se pudo colocar SL (fallback): %s", self.symbol, e)
+                raise
+
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda: client.place_tp(
+                        is_buy=close_is_buy, sz=qty,
+                        trigger_px=tp, entry_px=ep,
+                    ),
+                )
+                logger.info("[%s] ✅ TP=%.5f colocado en exchange (fallback)", self.symbol, tp)
+            except Exception as e:
+                logger.error("[%s] ❌ No se pudo colocar TP (fallback): %s", self.symbol, e)
+                raise
+
+            return
+
+        # ── Solo SL ───────────────────────────────────────────────────────
         if sl:
             try:
                 await loop.run_in_executor(
@@ -614,6 +657,7 @@ class FuturesTrader:
                 logger.error("[%s] ❌ No se pudo colocar SL: %s", self.symbol, e)
                 raise
 
+        # ── Solo TP ───────────────────────────────────────────────────────
         if tp:
             try:
                 await loop.run_in_executor(
@@ -629,6 +673,16 @@ class FuturesTrader:
                 raise
 
     # ── _ensure_tpsl_on_exchange ────────────────────────────────────────────────
+    #
+    # LÓGICA CORREGIDA — repone SL y TP de forma INDEPENDIENTE:
+    #
+    #   • has_sl=True,  has_tp=True  → todo OK, nada que hacer
+    #   • has_sl=True,  has_tp=False → coloca SOLO el TP (SL intacto)
+    #   • has_sl=False, has_tp=True  → coloca SOLO el SL (TP intacto)
+    #   • has_sl=False, has_tp=False → cancela todo y rehace bulk
+    #
+    # Antes el código cancelaba TODAS las órdenes (incluido el SL) antes de
+    # recolocar. Si el TP volvía a fallar, la posición quedaba sin SL ni TP.
 
     async def _ensure_tpsl_on_exchange(
         self,
@@ -667,10 +721,38 @@ class FuturesTrader:
             self.symbol, has_sl, has_tp, len(coin_orders),
         )
 
+        # ── Caso 1: todo OK ───────────────────────────────────────────────
         if has_sl and has_tp:
             self._protection_ok = True
             return
 
+        # ── Caso 2: solo falta TP (SL ya existe — NO cancelar) ───────────
+        if has_sl and not has_tp:
+            logger.warning("[%s] ⚠️ Falta TP en exchange — colocando TP=%.5f (SL intacto)", self.symbol, tp1)
+            try:
+                await self._place_tpsl(qty=qty, sl=None, tp=tp1)
+                self._protection_ok = True
+                logger.info("[%s] ✅ TP repuesto sin tocar SL", self.symbol)
+            except Exception as e:
+                logger.error("[%s] ❌ No se pudo reponer TP: %s", self.symbol, e)
+            return
+
+        # ── Caso 3: solo falta SL (TP ya existe — NO cancelar) ───────────
+        if not has_sl and has_tp:
+            logger.warning("[%s] ⚠️ Falta SL en exchange — colocando SL=%.5f (TP intacto)", self.symbol, sl)
+            try:
+                await self._place_tpsl(qty=qty, sl=sl, tp=None)
+                self._protection_ok = True
+                logger.info("[%s] ✅ SL repuesto sin tocar TP", self.symbol)
+            except Exception as e:
+                logger.error("[%s] ❌ No se pudo reponer SL: %s", self.symbol, e)
+            return
+
+        # ── Caso 4: faltan AMBOS → cancelar todo y rehacer bulk ──────────
+        logger.warning(
+            "[%s] ⚠️ Faltan SL y TP en exchange — cancelando órdenes y recolocando bulk (SL=%.5f TP=%.5f qty=%.4f)",
+            self.symbol, sl, tp1, qty,
+        )
         if coin_orders:
             try:
                 await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
@@ -678,10 +760,6 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning("[%s] _ensure_tpsl: error cancelando órdenes previas: %s", self.symbol, e)
 
-        logger.info(
-            "[%s] 📌 Colocando SL=%.5f + TP=%.5f (qty=%.4f)",
-            self.symbol, sl, tp1, qty,
-        )
         try:
             await self._place_tpsl(qty=qty, sl=sl, tp=tp1)
             self._protection_ok = True
@@ -709,7 +787,6 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning("[%s] GlobalRisk.register_close error: %s", self.symbol, e)
 
-        # ── pretrade_risk: liberar el MARGEN real, no el notional ──────────
         try:
             pretrade_risk.register_close(self.symbol, self._open_margin)
         except Exception as e:
@@ -746,7 +823,6 @@ class FuturesTrader:
             logger.debug("[%s] Kill switch activo — skip.", self.symbol)
             return
 
-        # ── Guard anti-duplicado: si ya hay una apertura en curso, skip ──
         if self._opening_position:
             logger.debug("[%s] Apertura en curso — skip para evitar orden duplicada.", self.symbol)
             return
@@ -798,26 +874,15 @@ class FuturesTrader:
             await self._manage_open_position(price, risk)
             return
 
-        # ══════════════════════════════════════════════════════════════════════
-        # CERROJO ANTI-DUPLICADO — VERIFICACIÓN OBLIGATORIA EN EXCHANGE
-        # Antes de cualquier apertura, consultamos el exchange directamente.
-        # Esto previene duplicados cuando:
-        #   1. El trader se recrea por rotación de pares (estado en memoria = None)
-        #   2. El estado local no se restauró correctamente en _init
-        #   3. Otro trader del mismo símbolo abrió mientras este estaba en sleep
-        # ══════════════════════════════════════════════════════════════════════
         if self._open_lock.locked():
             logger.debug("[%s] _open_lock ocupado — skip para evitar duplicado.", self.symbol)
             return
 
         async with self._open_lock:
-            # Re-verificar inmediatamente después de adquirir el lock
-            # (otro coroutine pudo haber abierto mientras esperábamos)
             if self.position is not None:
                 await self._manage_open_position(price, risk)
                 return
 
-            # ── Consulta definitiva al exchange antes de abrir ────────────────
             live_positions = await self._get_positions()
             if live_positions is None:
                 logger.warning(
@@ -827,7 +892,6 @@ class FuturesTrader:
                 )
                 return
             if len(live_positions) > 0:
-                # Ya hay posición abierta en el exchange que no teníamos en memoria
                 ep = live_positions[0]
                 raw_side = ep.get("side", "")
                 try:
@@ -846,7 +910,6 @@ class FuturesTrader:
                     await self._manage_open_position(price, risk)
                 return
 
-            # ── A partir de aquí sabemos con certeza que NO hay posición ──────
             await self._try_open_position(price, risk, global_risk)
 
     async def _try_open_position(self, price: float, risk, global_risk) -> None:
@@ -864,7 +927,6 @@ class FuturesTrader:
                            self.symbol, balance, risk.usdc_per_trade)
             return
 
-        # ── pretrade_risk: pasar el MARGEN real (usdc_per_trade), no notional ──
         usdc_per_trade = risk.usdc_per_trade
         try:
             ok, pt_reason = await pretrade_risk.check(
@@ -931,12 +993,6 @@ class FuturesTrader:
                 )
                 return
 
-        # ──────────────────────────────────────────────────────────────────────
-        # SIZING CORRECTO:
-        #   margin    = usdc_per_trade          ← lo que arriesgas (fijo, siempre)
-        #   notional  = margin × lev            ← tamaño de la posición en el exchange
-        #   qty       = notional / entry_price  ← contratos a comprar/vender
-        # ──────────────────────────────────────────────────────────────────────
         margin_usdc     = usdc_per_trade
         notional_target = margin_usdc * lev
         qty             = self._round_qty(notional_target / entry)
@@ -969,7 +1025,6 @@ class FuturesTrader:
         assert sl  and sl  > 0, f"[{self.symbol}] SL inválido: {sl}"
         assert tp1 and tp1 > 0, f"[{self.symbol}] TP1 inválido: {tp1}"
 
-        # ── Activar guard ANTES de enviar la orden ────────────────────────
         self._opening_position = True
         logger.debug("[%s] Guard _opening_position=True", self.symbol)
 
@@ -1001,7 +1056,7 @@ class FuturesTrader:
             self._open_notional = fill_qty * fill_entry
             self._open_leverage = lev
             self._open_entry_mode = entry_mode
-            self._last_pos_check_at = time.monotonic()  # evita re-check inmediato
+            self._last_pos_check_at = time.monotonic()
 
             save_position(self.symbol, {
                 "side":        pos_side,
@@ -1019,8 +1074,18 @@ class FuturesTrader:
 
             pretrade_risk.confirm_order(self.symbol, margin_usdc)
 
-            await self._place_tpsl(qty=fill_qty, sl=sl, tp=tp1, entry_px=fill_entry)
-            self._protection_ok = True
+            # _place_tpsl ahora hace re-raise si falla → _protection_ok
+            # se queda en False y el verificador periódico (120s) reintentará
+            try:
+                await self._place_tpsl(qty=fill_qty, sl=sl, tp=tp1, entry_px=fill_entry)
+                self._protection_ok = True
+            except Exception as e:
+                logger.error(
+                    "[%s] ❌ _place_tpsl falló al abrir — _protection_ok=False, "
+                    "_ensure_tpsl lo repondrá en <120s: %s",
+                    self.symbol, e,
+                )
+                self._protection_ok = False
 
             await notify_open(
                 symbol=self.symbol,
@@ -1091,7 +1156,6 @@ class FuturesTrader:
             tp1_hit = (is_long and price >= tp1) or (not is_long and price <= tp1)
             if tp1_hit:
                 logger.info("[%s] 🟡 TP1 alcanzado @ %.5f", self.symbol, price)
-                # Move SL to breakeven
                 self.sl = entry * (1 + _SL_SW_MARGIN) if is_long else entry * (1 - _SL_SW_MARGIN)
                 save_position(self.symbol, {
                     "side":        self.position,
