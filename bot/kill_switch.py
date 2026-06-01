@@ -11,6 +11,7 @@ L4  cierre forzado de todo + hard kill  (requiere re-arm manual)
 Re-arm
 ------
 - L1/L2 → se pueden resetear automáticamente o llamando a .reset().
+  L2 además tiene un cooldown de auto-reset configurable (KS_L2_COOLDOWN_SECONDS).
 - L3/L4 → sólo se resetean con .manual_reset() + clave de seguridad.
 
 Persistencia
@@ -41,7 +42,10 @@ _CFG = {
     "max_api_reconnects":     int(os.getenv("KS_MAX_API_RECONNECTS",        "10")),
     "max_state_mismatch":     int(os.getenv("KS_MAX_STATE_MISMATCH",        "3")),
     "watchdog_interval_s":    int(os.getenv("KS_WATCHDOG_INTERVAL_S",       "30")),
+    # FIX #2 — ventana ampliada 10 → 200 para evitar falsos positivos por spikes
     "reject_window_orders":   int(os.getenv("KS_REJECT_WINDOW_ORDERS",      "200")),
+    # FIX #1 — cooldown de auto-reset para L2 (segundos; 0 = desactivado)
+    "l2_cooldown_seconds":    int(os.getenv("KS_L2_COOLDOWN_SECONDS",       "3600")),
 }
 
 
@@ -58,8 +62,7 @@ class KillSwitch:
         self._triggered_at: Optional[float] = None
         self._consec_losses: int = 0
         self._daily_pnl: float   = 0.0
-        # FIX #2: ventana deslizante real para reject rate
-        # deque de timestamps de órdenes (todas) y de rechazadas
+        # Ventana deslizante real para reject rate (FIX #2)
         self._order_window: deque = deque()   # timestamps de las últimas N órdenes
         self._reject_window: deque = deque()  # timestamps sólo de rechazos
         self._api_reconnects: int = 0
@@ -69,6 +72,8 @@ class KillSwitch:
         self._hard_killed: bool = False
         # Símbolos con TPSL retry activo — el watchdog los ignora para state_mismatch
         self._tpsl_retrying: set[str] = set()
+        # FIX #1 — timestamp de activación de L2 para auto-reset por cooldown
+        self._ks2_activated_at: Optional[float] = None
         self._load_state()
 
     # ── Estado ────────────────────────────────────────────────────────────────
@@ -107,6 +112,9 @@ class KillSwitch:
             self._level        = level
             self._trigger      = trigger
             self._triggered_at = time.time()
+            # FIX #1 — registrar cuándo se activa L2 para el cooldown de auto-reset
+            if level == 2:
+                self._ks2_activated_at = time.monotonic()
             self._save_state()
             logger.critical(
                 f"🛑 KILL SWITCH L{level} activado — trigger: {trigger}"
@@ -133,6 +141,57 @@ class KillSwitch:
             self._save_state()
             logger.critical("💀 HARD KILL L4 — bot parado completamente")
 
+    # ── Auto-reset de L2 por cooldown ─────────────────────────────────────────
+
+    async def _maybe_autoreset_l2(self) -> bool:
+        """
+        Comprueba si el nivel 2 ha expirado su cooldown y, si es así, lo resetea.
+        Retorna True si se hizo el reset.
+        Solo actúa cuando _level == 2 y KS_L2_COOLDOWN_SECONDS > 0.
+        """
+        cooldown = _CFG["l2_cooldown_seconds"]
+        if cooldown <= 0 or self._level != 2:
+            return False
+        if self._ks2_activated_at is None:
+            # Activado antes del fix — tomar ahora como punto de partida
+            async with self._lock:
+                self._ks2_activated_at = time.monotonic()
+            return False
+
+        elapsed = time.monotonic() - self._ks2_activated_at
+        if elapsed < cooldown:
+            return False
+
+        async with self._lock:
+            # Re-verificar dentro del lock (evitar race condition)
+            if self._level != 2:
+                return False
+            self._level            = 0
+            self._trigger          = ""
+            self._triggered_at     = None
+            self._ks2_activated_at = None
+            self._order_window.clear()   # limpiar ventana para evitar re-trigger inmediato
+            self._reject_window.clear()
+            self._halted_symbols.clear()
+            self._save_state()
+
+        logger.info(
+            "✅ KS L2 auto-reseteado tras cooldown de %ds — bot vuelve a operar",
+            cooldown,
+        )
+        try:
+            from bot.telegram_bot import send_message
+            asyncio.create_task(
+                send_message(
+                    f"🔓 <b>Kill Switch L2 auto-reseteado</b>\n"
+                    f"Cooldown de {cooldown//60} min completado.\n"
+                    f"Bot vuelve a aceptar nuevas órdenes."
+                )
+            )
+        except Exception:
+            pass
+        return True
+
     # ── Reset ─────────────────────────────────────────────────────────────────
 
     async def reset(self, level: int = 1):
@@ -141,8 +200,9 @@ class KillSwitch:
             if self._level >= 3:
                 logger.error("KS L3/L4 activo — usar manual_reset() con clave de seguridad")
                 return
-            self._level    = 0
-            self._trigger  = ""
+            self._level            = 0
+            self._trigger          = ""
+            self._ks2_activated_at = None
             self._halted_symbols.clear()
             self._save_state()
             logger.info("✅ Kill switch reseteado (L1/L2)")
@@ -153,15 +213,16 @@ class KillSwitch:
             logger.error("KS manual_reset: clave incorrecta")
             return False
         async with self._lock:
-            self._level        = 0
-            self._trigger      = ""
-            self._triggered_at = None
-            self._hard_killed  = False
+            self._level            = 0
+            self._trigger          = ""
+            self._triggered_at     = None
+            self._hard_killed      = False
             self._halted_symbols.clear()
-            self._consec_losses = 0
-            self._daily_pnl     = 0.0
-            self._api_reconnects = 0
+            self._consec_losses    = 0
+            self._daily_pnl        = 0.0
+            self._api_reconnects   = 0
             self._state_mismatches = 0
+            self._ks2_activated_at = None
             self._order_window.clear()
             self._reject_window.clear()
             self._tpsl_retrying.clear()
@@ -178,8 +239,6 @@ class KillSwitch:
 
         FIX #1 (TOCTOU): capturar daily y consec dentro del lock en variables
         locales, evaluar los umbrales con esas copias fuera del lock.
-        Así si otro coroutine modifica los contadores entre el unlock y el if,
-        el check usa siempre el valor coherente de ESTE trade.
         """
         async with self._lock:
             self._daily_pnl += pnl_pct
@@ -187,11 +246,9 @@ class KillSwitch:
                 self._consec_losses += 1
             else:
                 self._consec_losses = 0
-            # copias locales — coherentes con este update
             daily  = self._daily_pnl
             consec = self._consec_losses
 
-        # Evaluamos fuera del lock con valores capturados dentro del lock
         if daily <= -_CFG["max_daily_loss_pct"]:
             await self.activate(3, f"Daily loss {daily:.2f}% ≥ límite {_CFG['max_daily_loss_pct']}%")
         elif consec >= _CFG["max_consec_losses"]:
@@ -201,11 +258,10 @@ class KillSwitch:
         """
         Registrar si una orden fue rechazada (para reject-rate).
 
-        FIX #2 (ventana deslizante real): en vez de dividir por un _order_count
-        que crece sin límite, mantenemos dos deques con timestamps de los últimos
-        KS_REJECT_WINDOW_ORDERS (default 200) eventos y calculamos la tasa sobre
-        esa ventana fija. Así el kill switch sigue siendo sensible aunque lleve
-        horas corriendo.
+        FIX #2 — ventana deslizante de KS_REJECT_WINDOW_ORDERS (default 200).
+        En vez de dividir por un contador que crece sin límite, mantenemos dos
+        deques y calculamos la tasa sobre la ventana fija. Así el KS es sensible
+        a spikes reales pero no se congela de forma permanente.
         """
         window_size = _CFG["reject_window_orders"]
         now = time.monotonic()
@@ -255,7 +311,6 @@ class KillSwitch:
 
     async def on_state_mismatch(self, symbol: str):
         """Mismatch entre estado local y exchange."""
-        # Ignorar si el símbolo tiene TPSL retry activo (code 31008 lag de API)
         if symbol in self._tpsl_retrying:
             logger.debug(f"[{symbol}] KS: state_mismatch ignorado — TPSL retry activo")
             return
@@ -270,8 +325,8 @@ class KillSwitch:
 
     def reset_daily_pnl(self):
         """Llamar al inicio de cada día UTC."""
-        self._daily_pnl     = 0.0
-        self._consec_losses = 0
+        self._daily_pnl      = 0.0
+        self._consec_losses  = 0
         self._api_reconnects = 0
         logger.info("KS: contadores diarios reseteados")
 
@@ -298,6 +353,12 @@ class KillSwitch:
         """Una iteración del watchdog."""
         if self._level >= 4:
             return  # ya está parado todo
+
+        # FIX #1 — intentar auto-reset de L2 por cooldown ANTES de evaluar traders
+        if self._level == 2:
+            reset_done = await self._maybe_autoreset_l2()
+            if reset_done:
+                return  # este tick ya no necesita procesar nada más
 
         # Reset diario a las 00:00 UTC
         now_utc = datetime.now(timezone.utc)
@@ -336,23 +397,33 @@ class KillSwitch:
                 logger.debug(f"KS watchdog tick error [{symbol}]: {e}")
 
         if self._level > 0:
+            # FIX #1 — mostrar tiempo restante hasta auto-reset si es L2
+            extra = ""
+            if self._level == 2 and self._ks2_activated_at is not None:
+                cooldown = _CFG["l2_cooldown_seconds"]
+                if cooldown > 0:
+                    remaining = max(0, cooldown - (time.monotonic() - self._ks2_activated_at))
+                    extra = f" | auto-reset en {remaining/60:.1f} min"
             logger.warning(
                 f"🛑 KS nivel {self._level} activo — trigger: {self._trigger} "
                 f"(activado {time.strftime('%H:%M:%S', time.localtime(self._triggered_at or 0))})"
+                f"{extra}"
             )
 
     # ── Persistencia ──────────────────────────────────────────────────────────
 
     def _save_state(self):
         state = {
-            "level":           self._level,
-            "trigger":         self._trigger,
-            "triggered_at":    self._triggered_at,
-            "hard_killed":     self._hard_killed,
-            "halted_symbols":  list(self._halted_symbols),
-            "daily_pnl":       self._daily_pnl,
-            "consec_losses":   self._consec_losses,
-            "saved_at":        time.time(),
+            "level":              self._level,
+            "trigger":            self._trigger,
+            "triggered_at":       self._triggered_at,
+            "hard_killed":        self._hard_killed,
+            "halted_symbols":     list(self._halted_symbols),
+            "daily_pnl":          self._daily_pnl,
+            "consec_losses":      self._consec_losses,
+            # FIX #1 — persistir timestamp L2 para sobrevivir reinicios
+            "ks2_activated_at_mono": self._ks2_activated_at,
+            "saved_at":           time.time(),
         }
         try:
             with open(_STATE_PATH, "w") as f:
@@ -364,13 +435,19 @@ class KillSwitch:
         try:
             with open(_STATE_PATH) as f:
                 state = json.load(f)
-            self._level           = state.get("level", 0)
-            self._trigger         = state.get("trigger", "")
-            self._triggered_at    = state.get("triggered_at")
-            self._hard_killed     = state.get("hard_killed", False)
-            self._halted_symbols  = set(state.get("halted_symbols", []))
-            self._daily_pnl       = state.get("daily_pnl", 0.0)
-            self._consec_losses   = state.get("consec_losses", 0)
+            self._level             = state.get("level", 0)
+            self._trigger           = state.get("trigger", "")
+            self._triggered_at      = state.get("triggered_at")
+            self._hard_killed       = state.get("hard_killed", False)
+            self._halted_symbols    = set(state.get("halted_symbols", []))
+            self._daily_pnl         = state.get("daily_pnl", 0.0)
+            self._consec_losses     = state.get("consec_losses", 0)
+            # FIX #1 — restaurar timestamp de activación L2
+            # NOTA: monotonic() no persiste entre procesos; si hay un L2 guardado
+            # sin timestamp, usamos monotonic() ahora (el cooldown empezará de 0).
+            saved_mono = state.get("ks2_activated_at_mono")
+            if self._level == 2:
+                self._ks2_activated_at = saved_mono if saved_mono else time.monotonic()
             if self._level > 0:
                 logger.warning(
                     f"⚠️ KS arrancado con estado L{self._level} previo — trigger: {self._trigger}"
