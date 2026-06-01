@@ -17,6 +17,14 @@ FIX CRÍTICO (2026-06-01):
   Solución: usar client.place_sl() + client.place_tp() directamente, que son los
   métodos que YA FUNCIONABAN en las primeras operaciones del bot.
 
+FIX CRÍTICO (2026-06-02) — CAUSA RAÍZ DE DUPLICACIONES:
+  Cuando una limit agresiva se llena al instante, Hyperliquid devuelve
+  status[0] = {"filled": {...}} en lugar de {"resting": {...}}.
+  El código anterior solo leía "resting.oid" → order_id = None →
+  entraba al bucle de polling de 4s → no encontraba la orden en open_orders
+  (ya estaba en historial) → asumía no-fill → fallback MARKET → DUPLICADO.
+  Solución: detectar fill inmediato mirando si status[0] tiene clave "filled".
+
 Variables de entorno (todas opcionales):
   EE_LIMIT_TIMEOUT_S          default 4
   EE_MAX_SPREAD_BPS_LIMIT     default 15
@@ -253,17 +261,7 @@ class ExecutionEngine:
         self._finalize_rec(rec, result, side, arrival_price)
         return result
 
-    # ── SL + TP — MÉTODO CORREGIDO ─────────────────────────────────────────
-    #
-    # BUG ANTERIOR: _place_tpsl_bulk construía dicts con "order_type" (snake_case)
-    # y los pasaba a exchange.bulk_orders() que espera "orderType" (camelCase).
-    # El SDK ignoraba las órdenes o devolvía error que se tragaba → sin SL/TP.
-    #
-    # SOLUCIÓN: usar client.place_sl() y client.place_tp() directamente.
-    # Estas funciones llaman a exchange.order() con los parámetros correctos
-    # y son exactamente lo que funcionaba en las primeras operaciones del bot.
-    # Se colocan secuencialmente SL primero, luego TP (el más crítico primero).
-    # ──────────────────────────────────────────────────────────────────────────
+    # ── SL + TP ─────────────────────────────────────────────────────────────
 
     async def _place_tpsl(
         self,
@@ -274,12 +272,6 @@ class ExecutionEngine:
         tp: Optional[float],
         sym: str,
     ) -> None:
-        """
-        Coloca SL y TP en el exchange usando place_sl() y place_tp() del HLClient.
-        SL primero (más crítico), luego TP.
-        Reintenta cada uno independientemente si hay rate-limit.
-        Funciona para TODOS los símbolos.
-        """
         close_is_buy = not is_buy  # cerrar LONG = SELL (False) | cerrar SHORT = BUY (True)
 
         # ── SL ────────────────────────────────────────────────────────
@@ -302,7 +294,6 @@ class ExecutionEngine:
                             trigger_px=float(sl),
                         ),
                     )
-                    # Verificar respuesta del SDK
                     statuses = result.get("response", {}).get("data", {}).get("statuses", [{}])
                     st = statuses[0] if statuses else {}
                     if "error" in st:
@@ -333,7 +324,7 @@ class ExecutionEngine:
         # ── TP ────────────────────────────────────────────────────────
         if tp is not None and tp > 0:
             tp_placed = False
-            tp_limit  = None if not self.tp_as_limit else tp  # place_tp lo gestiona internamente
+            tp_limit  = None if not self.tp_as_limit else tp
 
             for attempt in range(self.tpsl_retry_attempts):
                 if attempt > 0:
@@ -381,6 +372,18 @@ class ExecutionEngine:
                 )
 
     # ── LIMIT INTERNO + TELEMETRÍA ─────────────────────────────────────────
+    #
+    # FIX DUPLICACIONES (2026-06-02):
+    #   Hyperliquid devuelve status[0] = {"filled": {...}} cuando una limit
+    #   se llena al instante (fill inmediato). El campo "resting" NO aparece
+    #   en ese caso → order_id = None → el bucle de polling no encontraba
+    #   la orden en open_orders (ya estaba en historial) → asumía no-fill
+    #   → fallback market → SEGUNDA APERTURA (duplicado).
+    #
+    #   Fix: detectar fill inmediato comprobando si status[0] tiene "filled".
+    #   Si order_id es None y no hay fill inmediato → asumir filled (seguro:
+    #   mejor no abrir que duplicar).
+    # ──────────────────────────────────────────────────────────────────────────
 
     async def _try_limit_sdk(
         self,
@@ -405,29 +408,54 @@ class ExecutionEngine:
                 rec.cancel_reason = f"agent_not_found:{err_str}"
             return result, False
 
+        # ── FIX: detectar fill inmediato ANTES de buscar order_id ──────────
+        # Hyperliquid devuelve {"filled": {...}} cuando la limit se ejecuta
+        # al instante. En ese caso NO hay "resting" y NO hay order_id.
         try:
-            order_id = result["response"]["data"]["statuses"][0].get("resting", {}).get("oid")
+            status_0 = result["response"]["data"]["statuses"][0]
         except (KeyError, IndexError, TypeError):
-            order_id = None
+            status_0 = {}
 
+        if "filled" in status_0:
+            # Fill inmediato confirmado por el exchange
+            logger.info(
+                "[%s] ✅ Limit llenada al instante (fill inmediato detectado)",
+                rec.symbol,
+            )
+            return result, True
+
+        # Orden descansando en el libro → obtener order_id para polling
+        order_id = status_0.get("resting", {}).get("oid") if isinstance(status_0.get("resting"), dict) else None
+
+        if order_id is None:
+            # Sin fill inmediato y sin order_id — estado ambiguo.
+            # Asumir filled para NO caer en fallback market (evitar duplicado).
+            # _confirm_position_with_retry en trader.py verificará la posición real.
+            logger.warning(
+                "[%s] Limit: sin 'filled' ni 'resting.oid' en respuesta — "
+                "asumiendo filled para evitar duplicado. Response: %s",
+                rec.symbol, status_0,
+            )
+            return result, True
+
+        # ── Polling: esperar a que la orden desaparezca de open_orders ──────
         deadline = time.monotonic() + self.limit_timeout_s
         filled   = False
 
         while time.monotonic() < deadline:
             await asyncio.sleep(0.5)
-            if order_id:
-                try:
-                    open_orders = await asyncio.get_event_loop().run_in_executor(
-                        None, client.get_open_orders
-                    )
-                    still_open = any(o.get("oid") == order_id for o in open_orders)
-                    if not still_open:
-                        filled = True
-                        break
-                except Exception:
-                    pass
+            try:
+                open_orders = await asyncio.get_event_loop().run_in_executor(
+                    None, client.get_open_orders
+                )
+                still_open = any(o.get("oid") == order_id for o in open_orders)
+                if not still_open:
+                    filled = True
+                    break
+            except Exception:
+                pass
 
-        if not filled and order_id:
+        if not filled:
             try:
                 await asyncio.get_event_loop().run_in_executor(
                     None, client.cancel_order, order_id
