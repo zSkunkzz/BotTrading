@@ -1159,11 +1159,21 @@ class FuturesTrader:
                 await notify_close(self.symbol, "SL", price, pnl_pct)
                 return
 
-        # ── TP1 hit ────────────────────────────────────────────────────────
+        # ── TP1 hit — cierre parcial + mover SL a break-even ──────────────
         if tp1 and not self.tp2_hit:
             tp1_hit = (is_long and price >= tp1) or (not is_long and price <= tp1)
             if tp1_hit:
-                logger.info("[%s] 🟡 TP1 alcanzado @ %.5f", self.symbol, price)
+                logger.info("[%s] 🟡 TP1 alcanzado @ %.5f — cierre parcial", self.symbol, price)
+                # FIX: ejecutar cierre parcial (mismo ratio que TP2)
+                positions = await self._get_positions()
+                if positions:
+                    pos_data    = positions[0]
+                    current_qty = abs(float(pos_data.get("szi", 0)))
+                    partial_qty = self._round_qty(current_qty * TP2_PARTIAL_RATIO)
+                    if partial_qty > 0:
+                        close_side = "sell" if is_long else "buy"
+                        await self._place_order(close_side, partial_qty, reduce_only=True)
+                # Mover SL a break-even
                 self.sl = entry * (1 + _SL_SW_MARGIN) if is_long else entry * (1 - _SL_SW_MARGIN)
                 save_position(self.symbol, {
                     "side":        self.position,
@@ -1179,7 +1189,8 @@ class FuturesTrader:
                     "qty":         self._open_qty,
                     "entry_mode":  self._open_entry_mode,
                 })
-                await notify_tp_partial(self.symbol, 1, price)
+                # FIX: firma correcta — notify_tp_partial(symbol, side, price, tp_level)
+                await notify_tp_partial(self.symbol, self.position, price, tp_level=1)
                 return
 
         # ── TP2 partial close ──────────────────────────────────────────────
@@ -1211,7 +1222,8 @@ class FuturesTrader:
                     "qty":         self._open_qty,
                     "entry_mode":  self._open_entry_mode,
                 })
-                await notify_tp_partial(self.symbol, 2, price)
+                # FIX: firma correcta — notify_tp_partial(symbol, side, price, tp_level)
+                await notify_tp_partial(self.symbol, self.position, price, tp_level=2)
                 return
 
         # ── TP3 / full close ───────────────────────────────────────────────
