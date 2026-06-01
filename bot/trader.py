@@ -88,7 +88,14 @@ def _norm_coin(symbol: str) -> str:
     return s
 
 
-def _hl_side_to_str(raw_side: str) -> str:
+def _hl_side_to_str(raw_side: str) -> Optional[str]:
+    """
+    Convierte el campo 'side' de Hyperliquid a 'long'/'short'.
+    Devuelve None si raw_side está vacío (posición residual / sin side todavía).
+    Lanza ValueError solo si el valor es no-vacío pero desconocido.
+    """
+    if not raw_side:
+        return None
     if raw_side == "B":
         return "long"
     if raw_side == "A":
@@ -666,24 +673,14 @@ class FuturesTrader:
                 raise
 
     # ── _ensure_tpsl_on_exchange ────────────────────────────────────────────────
-    #
-    # FIX CRÍTICO: usa self._open_qty (qty calculada al abrir) como fuente de verdad.
-    # Hyperliquid reporta en szi la qty NETA de la cuenta, que puede incluir residuos
-    # de posiciones anteriores y duplicar el tamaño real de la posición actual.
-    #
-    # _tpsl_type FIX: Hyperliquid devuelve orderType como dict con clave "trigger"
-    # que contiene {"tpsl": "sl"} o {"tpsl": "tp"}. El código anterior esperaba
-    # una string, causando que has_sl y has_tp fueran siempre False → bucle infinito
-    # de cancel + recolocación cada 120s acumulando órdenes huérfanas.
 
     async def _ensure_tpsl_on_exchange(
         self,
-        qty: float,          # ignorado — se usa self._open_qty como fuente de verdad
+        qty: float,
         sl: float,
         tp1: float,
         pos_side: str,
     ) -> None:
-        # ── FIX: usar qty guardada al abrir, no szi del exchange ──────────
         safe_qty = self._open_qty if self._open_qty > 0 else qty
         loop = asyncio.get_event_loop()
 
@@ -696,23 +693,15 @@ class FuturesTrader:
         coin_orders = [o for o in (raw_orders or []) if o.get("coin") == self.coin]
 
         def _tpsl_type(o: dict) -> str | None:
-            """
-            Hyperliquid devuelve orderType como:
-              {"trigger": {"triggerPx": ..., "isMarket": True/False, "tpsl": "sl"/"tp"}}
-            También puede llegar como string legacy ("Stop Market", "Take Profit Limit").
-            """
             ot = o.get("orderType", "")
-            # ── Formato dict (nativo Hyperliquid) ─────────────────────────
             if isinstance(ot, dict):
                 tpsl = ot.get("trigger", {}).get("tpsl", "")
                 if tpsl in ("sl", "tp"):
                     return tpsl
-                # Algunos clientes envuelven en "limit" con tpsl dentro
                 tpsl2 = ot.get("limit", {}).get("tpsl", "")
                 if tpsl2 in ("sl", "tp"):
                     return tpsl2
                 return None
-            # ── Formato string legacy ─────────────────────────────────────
             if isinstance(ot, str):
                 ot_l = ot.lower()
                 if "stop" in ot_l or ot_l == "sl":
@@ -753,7 +742,6 @@ class FuturesTrader:
                 logger.error("[%s] ❌ No se pudo reponer SL: %s", self.symbol, e)
             return
 
-        # Faltan ambos → cancelar todo y rehacer bulk
         logger.warning(
             "[%s] ⚠️ Faltan SL y TP en exchange — cancelando órdenes y recolocando bulk (SL=%.5f TP=%.5f qty=%.4f)",
             self.symbol, sl, tp1, safe_qty,
@@ -779,7 +767,7 @@ class FuturesTrader:
         self.sl = self.tp1 = self.tp2 = self.tp3 = None
         self.tp2_hit = False
         self._opening_position = False
-        self._open_qty = 0.0   # ← limpiar qty también al cerrar
+        self._open_qty = 0.0
 
     async def _on_position_closed(self, pnl_pct: float, reason: str = "") -> None:
         if self._global_risk is not None:
@@ -852,13 +840,15 @@ class FuturesTrader:
                     try:
                         parsed_side = _hl_side_to_str(raw_side)
                     except ValueError:
-                        logger.warning("[%s] Side desconocido: %r", self.symbol, raw_side)
+                        logger.warning("[%s] Side inesperado del exchange: %r — ignorando entrada.", self.symbol, raw_side)
                         parsed_side = None
                     if parsed_side:
                         self.position    = parsed_side
                         self.entry_price = float(ep.get("entryPx") or 0)
                         logger.info("[%s] Posición detectada: %s @ %s",
                                     self.symbol, self.position, self.entry_price)
+                    elif raw_side == "":
+                        logger.debug("[%s] Posición con side vacío ignorada (residuo del exchange).", self.symbol)
             else:
                 if self.position is not None:
                     logger.info("[%s] Posición cerrada externamente.", self.symbol)
@@ -909,6 +899,8 @@ class FuturesTrader:
                         self.symbol, parsed_side, self.entry_price,
                     )
                     await self._manage_open_position(price, risk)
+                elif raw_side == "":
+                    logger.debug("[%s] Posición con side vacío ignorada (residuo del exchange).", self.symbol)
                 return
 
             await self._try_open_position(price, risk, global_risk)
@@ -1041,7 +1033,6 @@ class FuturesTrader:
 
             pos_data   = positions[0]
             fill_entry = float(pos_data.get("entryPx") or entry)
-            # FIX: qty calculada localmente = fuente de verdad (no szi del exchange)
             confirmed_qty = qty
 
             self.position         = pos_side
@@ -1054,7 +1045,7 @@ class FuturesTrader:
             self._open_margin     = margin_usdc
             self._open_notional   = confirmed_qty * fill_entry
             self._open_leverage   = lev
-            self._open_qty        = confirmed_qty   # ← guardar qty como fuente de verdad
+            self._open_qty        = confirmed_qty
             self._open_entry_mode = entry_mode
             self._last_pos_check_at = time.monotonic()
 
@@ -1069,7 +1060,7 @@ class FuturesTrader:
                 "leverage":    lev,
                 "usdc_amount": self._open_notional,
                 "margin_usdc": margin_usdc,
-                "qty":         confirmed_qty,   # ← persistir qty para restauración
+                "qty":         confirmed_qty,
                 "entry_mode":  entry_mode,
             })
 
@@ -1127,20 +1118,16 @@ class FuturesTrader:
         ):
             self._last_tpsl_verify_at = now
             if sl and tp1 and self._open_qty > 0:
-                # FIX: pasar self._open_qty directamente; _ensure_tpsl usará
-                # safe_qty = self._open_qty internamente como fuente de verdad.
                 await self._ensure_tpsl_on_exchange(
                     qty=self._open_qty, sl=sl, tp1=tp1, pos_side=self.position
                 )
             elif sl and tp1:
-                # _open_qty no disponible (posición restaurada sin qty guardada)
-                # → consultar exchange como fallback puntual
                 positions = await self._get_positions()
                 if positions:
                     pos_data = positions[0]
                     exchange_qty = abs(float(pos_data.get("szi", 0)))
                     if exchange_qty > 0:
-                        self._open_qty = exchange_qty   # sincronizar para ciclos futuros
+                        self._open_qty = exchange_qty
                         await self._ensure_tpsl_on_exchange(
                             qty=exchange_qty, sl=sl, tp1=tp1, pos_side=self.position
                         )
@@ -1164,7 +1151,6 @@ class FuturesTrader:
             tp1_hit = (is_long and price >= tp1) or (not is_long and price <= tp1)
             if tp1_hit:
                 logger.info("[%s] 🟡 TP1 alcanzado @ %.5f — cierre parcial", self.symbol, price)
-                # FIX: ejecutar cierre parcial (mismo ratio que TP2)
                 positions = await self._get_positions()
                 if positions:
                     pos_data    = positions[0]
@@ -1173,7 +1159,6 @@ class FuturesTrader:
                     if partial_qty > 0:
                         close_side = "sell" if is_long else "buy"
                         await self._place_order(close_side, partial_qty, reduce_only=True)
-                # Mover SL a break-even
                 self.sl = entry * (1 + _SL_SW_MARGIN) if is_long else entry * (1 - _SL_SW_MARGIN)
                 save_position(self.symbol, {
                     "side":        self.position,
@@ -1189,7 +1174,6 @@ class FuturesTrader:
                     "qty":         self._open_qty,
                     "entry_mode":  self._open_entry_mode,
                 })
-                # FIX: firma correcta — notify_tp_partial(symbol, side, price, tp_level)
                 await notify_tp_partial(self.symbol, self.position, price, tp_level=1)
                 return
 
@@ -1222,7 +1206,6 @@ class FuturesTrader:
                     "qty":         self._open_qty,
                     "entry_mode":  self._open_entry_mode,
                 })
-                # FIX: firma correcta — notify_tp_partial(symbol, side, price, tp_level)
                 await notify_tp_partial(self.symbol, self.position, price, tp_level=2)
                 return
 
