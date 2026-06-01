@@ -40,16 +40,17 @@ log = logging.getLogger(__name__)
 # ─── Constantes exportadas ────────────────────────────────────────────────────────────────
 
 MIN_SCORE: int   = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
-MIN_RR: float    = float(os.getenv("MIN_RR_REQUIRED", "1.8"))
+MIN_RR: float    = float(os.getenv("MIN_RR_REQUIRED", "1.65"))
 
 # Parámetros de análisis técnico
 _TIMEFRAMES = ["15m", "1h", "4h"]          # se pide en orden: más rápido primero
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))   # mínimo de velas por timeframe
 
 # Parámetros de sizing/SL/TP
-_SL_ATR_MULT  = float(os.getenv("SL_ATR_MULT",  "1.5"))   # SL = entry ± SL_ATR_MULT * ATR
-_TP1_ATR_MULT = float(os.getenv("TP1_ATR_MULT", "2.5"))   # TP1 = entry ± TP1_ATR_MULT * ATR
-_TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "4.0"))   # TP2 = entry ± TP2_ATR_MULT * ATR
+# RR = TP1_ATR_MULT / SL_ATR_MULT = 2.8 / 1.5 = 1.866 → supera MIN_RR=1.65
+_SL_ATR_MULT  = float(os.getenv("SL_ATR_MULT",  "1.5"))
+_TP1_ATR_MULT = float(os.getenv("TP1_ATR_MULT", "2.8"))   # era 2.5 → RR=1.67 < 1.8 (bloqueaba)
+_TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "4.5"))   # era 4.0
 _MAX_LEV      = int(os.getenv("LEVERAGE", "15"))
 
 
@@ -158,9 +159,9 @@ async def analyze_pair(
 
     is_valid = score >= MIN_SCORE and rr >= MIN_RR
 
-    log.debug(
-        "[signal_engine] %s %s score=%d/%d RR=%.2f entry=%.4f sl=%.4f tp1=%.4f atr=%.4f",
-        symbol, signal_str, score, max_score, rr, entry, sl, tp1, atr_val,
+    log.info(
+        "[signal_engine] %s %s score=%d/%d RR=%.2f entry=%.4f sl=%.4f tp1=%.4f atr=%.4f valid=%s",
+        symbol, signal_str, score, max_score, rr, entry, sl, tp1, atr_val, is_valid,
     )
 
     return SignalResult(
