@@ -16,6 +16,10 @@ BUG #2 FIX: race condition en _open_lock
 BUG #7 FIX: signal_flip_guard integrado en _try_open_position
   - Importa signal_flip_guard de bot.signal_engine
   - Si la senal invierte direccion en < SIGNAL_FLIP_COOLDOWN_S, se descarta
+
+BUG #8 FIX: cierre de emergencia reduce-only en sl_hit cuando _protection_ok=False
+  - Si el SL del exchange no fue confirmado (_protection_ok=False) y el precio
+    cruza el SL local, se envia orden de mercado reduce-only antes de limpiar estado.
 """
 from __future__ import annotations
 
@@ -1190,6 +1194,18 @@ class FuturesTrader:
             sl_hit = (is_long and price <= sl) or (not is_long and price >= sl)
             if sl_hit:
                 logger.info("[%s] SL alcanzado @ %.5f", self.symbol, price)
+                # BUG #8 FIX: si el SL del exchange no fue confirmado y hay qty abierta,
+                # enviar cierre de emergencia reduce-only antes de limpiar estado.
+                if not self._protection_ok and self._open_qty > 0:
+                    logger.warning(
+                        "[%s] SL local sin _protection_ok — enviando cierre de emergencia reduce-only",
+                        self.symbol,
+                    )
+                    close_side = "sell" if is_long else "buy"
+                    try:
+                        await self._place_order(close_side, self._open_qty, reduce_only=True)
+                    except Exception as e:
+                        logger.error("[%s] Cierre de emergencia SL fallido: %s", self.symbol, e)
                 pnl_pct = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
                 self.trade_count += 1
                 self.total_pnl   += pnl_pct
