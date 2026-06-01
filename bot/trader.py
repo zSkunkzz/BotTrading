@@ -896,7 +896,8 @@ class FuturesTrader:
         assert sl  and sl  > 0, f"[{self.symbol}] SL inválido: {sl}"
         assert tp1 and tp1 > 0, f"[{self.symbol}] TP1 inválido: {tp1}"
 
-        order_result = await self._place_order(trade_side_str, qty)
+        # ── FIX: pasar sl y tp1 para que ExecutionEngine no bloquee la apertura ──
+        order_result = await self._place_order(trade_side_str, qty, sl=sl, tp=tp1)
         if order_result.get("status") != "ok":
             logger.error("[%s] ❌ Orden rechazada: %s", self.symbol, order_result)
             return
