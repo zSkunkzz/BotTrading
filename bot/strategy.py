@@ -6,7 +6,7 @@ Flujo (sin IA para el caso normal):
   score < MIN_SIGNAL_SCORE  → HOLD directo
   RR < MIN_RR_REQUIRED      → HOLD directo
   NEUTRAL                   → HOLD directo
-  STRONG (score >=9)        → entra directo (máxima confluencia técnica)
+  STRONG (score >=9)        → pasa por enriched_filter (CAMBIO v2: ya no salta filtros)
   EARLY/NORMAL (score >= AI_CALL_MIN_SCORE):
     1. Aplica enriched_filter (F&G, funding, OI, RSI, vol) — sin IA, instantáneo
     2. Si el filtro bloquea → HOLD (motivo detallado)
@@ -15,13 +15,13 @@ Flujo (sin IA para el caso normal):
     5. Si no hay noticias relevantes o la IA confirma → entra
 
 Variables de entorno:
-  MIN_SIGNAL_SCORE             (default: 5)
+  MIN_SIGNAL_SCORE             (default: 6)
   MIN_RR_REQUIRED              (default: 1.8)
-  SKIP_AI_ON_STRONG            (default: true)
+  SKIP_AI_ON_STRONG            (default: false)  CAMBIO v2: ahora false por defecto
   AI_CALL_MIN_SCORE            (default: 6)
   AI_HOLD_OVERRIDE_SCORE       (default: 8)
   AI_HIGH_CONFIDENCE_THRESHOLD (default: 8)
-  USE_AI_FOR_NEWS              (default: true)  — false = desactiva IA incluso para noticias
+  USE_AI_FOR_NEWS              (default: true)
 """
 
 import logging
@@ -39,17 +39,17 @@ from bot.signal_engine import (
 
 log = logging.getLogger(__name__)
 
-MIN_SIGNAL_SCORE             = int(os.getenv("MIN_SIGNAL_SCORE",             "5"))
+MIN_SIGNAL_SCORE             = int(os.getenv("MIN_SIGNAL_SCORE",             "6"))
 MIN_RR_REQUIRED              = float(os.getenv("MIN_RR_REQUIRED",            "1.8"))
-SKIP_AI_ON_STRONG            = os.getenv("SKIP_AI_ON_STRONG",                "true").lower() != "false"
+# CAMBIO v2: STRONG ya no salta el enriched_filter (default cambiado a false)
+SKIP_AI_ON_STRONG            = os.getenv("SKIP_AI_ON_STRONG",                "false").lower() != "false"
 AI_CALL_MIN_SCORE            = int(os.getenv("AI_CALL_MIN_SCORE",            "6"))
 AI_HOLD_OVERRIDE_SCORE       = int(os.getenv("AI_HOLD_OVERRIDE_SCORE",       "8"))
 AI_HIGH_CONFIDENCE_THRESHOLD = int(os.getenv("AI_HIGH_CONFIDENCE_THRESHOLD", "8"))
 USE_AI_FOR_NEWS              = os.getenv("USE_AI_FOR_NEWS", "true").lower() != "false"
 
-# Cooldown por símbolo para evitar spam de llamadas IA incluso en el path de noticias
 _AI_NEWS_COOLDOWN_S = int(os.getenv("AI_NEWS_COOLDOWN_S", "300"))  # 5 min
-_last_ai_news_call: dict[str, float] = {}  # symbol → monotonic timestamp
+_last_ai_news_call: dict[str, float] = {}
 
 
 async def decide(
@@ -99,7 +99,8 @@ async def decide(
     if signal.signal == "NEUTRAL":
         return _result("HOLD", signal, False, "Señal técnica neutral")
 
-    # STRONG: confluencia máxima → entra directo sin filtros externos
+    # STRONG: entra directo SIN enriched_filter solo si SKIP_AI_ON_STRONG=true explicitamente
+    # Por defecto (false) STRONG también pasa por enriched_filter
     if signal.entry_mode == "STRONG" and SKIP_AI_ON_STRONG:
         action = "BUY" if signal.signal == "LONG" else "SELL"
         return _result(
@@ -107,14 +108,13 @@ async def decide(
             f"💥 STRONG entry directo · score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x"
         )
 
-    # score demasiado bajo para continuar
     if signal.score < AI_CALL_MIN_SCORE:
         return _result(
             "HOLD", signal, False,
             f"⏭️ score={signal.score}/{signal.max_score} < {AI_CALL_MIN_SCORE} → HOLD"
         )
 
-    # ── Paso 1: enriquecer contexto externo ──────────────────────────────────
+    # ── Paso 1: enriquecer contexto externo ──────────────────────────────────────────
     from bot.data_enricher import fetch_enriched_context
     from bot.enriched_filter import apply as ef_apply
 
@@ -124,7 +124,7 @@ async def decide(
         log.warning(f"[strategy] fetch_enriched_context error: {e} — continuando sin datos externos")
         enriched = None
 
-    # ── Paso 2: filtro determinista (reemplaza las reglas numéricas de la IA) ─
+    # ── Paso 2: filtro determinista ───────────────────────────────────────────────────
     action_if_pass = "BUY" if signal.signal == "LONG" else "SELL"
 
     if enriched is not None:
@@ -132,7 +132,6 @@ async def decide(
         rsi_val   = i15.get("rsi_val")
         vol_ratio = i15.get("vol_ratio")
 
-        # Determinar dirección de precio en la vela actual (proxy)
         price_dir = None
         try:
             closes = signal.indicators.get("_closes_15m") or []
@@ -155,10 +154,9 @@ async def decide(
                 f"🚫 EnrichedFilter bloqueó: {ef_result.reason}"
             )
 
-        # Ajustar confidence base con penalización del filtro
         base_confidence = max(5, signal.score - ef_result.penalty)
 
-        # ── Paso 3: IA solo si hay noticias relevantes ──────────────────────
+        # ── Paso 3: IA solo si hay noticias relevantes ────────────────────────────
         if USE_AI_FOR_NEWS and ef_result.news_ai_needed:
             now = time.monotonic()
             cooldown_remaining = _AI_NEWS_COOLDOWN_S - (now - _last_ai_news_call.get(symbol, 0))
@@ -173,7 +171,6 @@ async def decide(
                 )
                 _last_ai_news_call[symbol] = now
 
-                # Construir contexto reducido para la IA: solo noticias + señal
                 news_context = {
                     "symbol":     symbol,
                     "signal":     signal.signal,
@@ -186,7 +183,7 @@ async def decide(
                     "tp2":        signal.tp2,
                     "atr":        signal.atr,
                     "suggested_lev": signal.suggested_lev,
-                    "task":       "news_sentiment_only",  # hint para que el LLM se centre en noticias
+                    "task":       "news_sentiment_only",
                     "external":   _format_news_only(enriched),
                 }
 
@@ -202,7 +199,6 @@ async def decide(
                     if ai_action not in ("BUY", "SELL"):
                         ai_action = "HOLD"
 
-                    # Solo respetar el HOLD de la IA si tiene alta confianza
                     if ai_action == "HOLD" and ai_confidence >= AI_HIGH_CONFIDENCE_THRESHOLD:
                         return _result(
                             "HOLD", signal, True,
@@ -212,7 +208,6 @@ async def decide(
                         )
 
                     if ai_action == "HOLD" and signal.score >= AI_HOLD_OVERRIDE_SCORE:
-                        # Override técnico: score alto + IA dudó sobre noticias
                         log.info(
                             f"[strategy] {symbol} 🔁 IA news→HOLD (conf={ai_confidence}) "
                             f"pero score={signal.score}>={AI_HOLD_OVERRIDE_SCORE} → override"
@@ -227,14 +222,14 @@ async def decide(
                 except Exception as e:
                     log.warning(f"[strategy] IA noticias falló: {e} — ignorando")
 
-        # ── Paso 4: entrada sin IA (filtro determinista pasado) ───────────────
+        # ── Paso 4: entrada (filtro determinista pasado) ───────────────────────────
         return _result(
             action_if_pass, signal, False,
             f"✅ EnrichedFilter OK · {ef_result.reason} · "
             f"score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x"
         )
 
-    # Si no hay datos externos → decisión puramente técnica
+    # Sin datos externos → decisión puramente técnica
     log.info(f"[strategy] {symbol} Sin datos externos — decisión técnica pura")
     return _result(
         action_if_pass, signal, False,
@@ -243,7 +238,6 @@ async def decide(
 
 
 def _format_news_only(enriched) -> str:
-    """Serializa solo las noticias del EnrichedContext para el prompt IA."""
     lines = []
     if enriched.news:
         lines.append("Recent news (your only job is to evaluate these):")

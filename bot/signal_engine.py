@@ -19,6 +19,11 @@ Compatible con Hyperliquid:
   - ws_feed.get_orderbook_metrics(coin)
   - ws_feed.get_funding_rate(coin)      → None (no disponible en WS; ver REST)
   - Fallback REST usa candleSnapshot
+
+CAMBIOS v2:
+  - ATR para SL/TP calculado sobre velas 1h (más estable que 15m)
+  - _classify_entry_mode exige 4h alineado como gate obligatorio
+  - MIN_SCORE default subido a 6 (antes 5)
 """
 
 from __future__ import annotations
@@ -39,15 +44,17 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-MIN_SCORE       = int(os.getenv("MIN_SCORE",      "5"))
+MIN_SCORE       = int(os.getenv("MIN_SCORE",      "6"))   # subido de 5 a 6
 MIN_SCORE_FULL  = int(os.getenv("MIN_SCORE_FULL", "6"))
 MIN_RR          = float(os.getenv("MIN_RR",       "1.8"))
 ATR_MULT_SL     = float(os.getenv("ATR_MULT_SL",  "1.8"))
-# TP1_MULT debe ser > ATR_MULT_SL * MIN_RR para que el check de R/R pase.
-# Con ATR_MULT_SL=1.8 y MIN_RR=1.8 necesitamos > 3.24 → default 3.5
-TP1_MULT        = float(os.getenv("TP1_MULT",     "3.5"))   # era 2.5 → RR=1.38 nunca pasaba
-TP2_MULT        = float(os.getenv("TP2_MULT",     "5.0"))   # era 4.0
-TP3_MULT        = float(os.getenv("TP3_MULT",     "8.0"))   # era 7.0
+TP1_MULT        = float(os.getenv("TP1_MULT",     "3.5"))
+TP2_MULT        = float(os.getenv("TP2_MULT",     "5.0"))
+TP3_MULT        = float(os.getenv("TP3_MULT",     "8.0"))
+
+# Gate 4h: si True (default), NO se permite entrada si 4h va contra la dirección
+# Desactivar con REQUIRE_4H_ALIGNMENT=false en Railway si quieres volver al comportamiento anterior
+REQUIRE_4H_ALIGNMENT = os.getenv("REQUIRE_4H_ALIGNMENT", "true").lower() != "false"
 
 LEV_EARLY_MIN   = 5
 LEV_EARLY_MAX   = 8
@@ -64,8 +71,6 @@ FUNDING_EXTREME_THRESHOLD = 0.0005
 SCORE_MAX = 10  # Cap real de _compute_score
 
 # Semáforo global: máximo 4 requests REST simultáneos a Hyperliquid.
-# Con 14 traders corriendo en paralelo cada uno pide 3 TF × 2 fuentes
-# (REST + ccxt) = hasta 84 requests concurrentes sin esto → flood de 429.
 _OHLCV_SEM = asyncio.Semaphore(4)
 
 
@@ -84,7 +89,7 @@ class SignalResult:
     symbol: str
     signal: str      = "NEUTRAL"
     score: int       = 0
-    max_score: int   = SCORE_MAX   # 10 (consistente con _compute_score)
+    max_score: int   = SCORE_MAX
     entry_mode: str  = "NONE"
     entry: float     = 0.0
     sl: float        = 0.0
@@ -129,11 +134,7 @@ class SignalResult:
 
 
 async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
-    """Obtiene OHLCV vía REST Hyperliquid (candleSnapshot).
-
-    Limita la concurrencia con _OHLCV_SEM (máx 4 simultáneos) y reintenta
-    hasta 3 veces con backoff exponencial ante respuestas 429.
-    """
+    """Obtiene OHLCV vía REST Hyperliquid (candleSnapshot)."""
     import time as _time
     import aiohttp
     import json as _json
@@ -157,14 +158,13 @@ async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as r:
                         if r.status == 429:
-                            wait = 2 ** attempt  # 1s, 2s, 4s
+                            wait = 2 ** attempt
                             log.debug("[OHLCV] %s %s 429 → reintentando en %ds (intento %d/3)",
                                       coin, tf, wait, attempt + 1)
                             await asyncio.sleep(wait)
                             continue
                         data = _json.loads(await r.text())
 
-            # Guard: la API puede devolver null, un dict de error, etc.
             if not isinstance(data, list) or len(data) == 0:
                 log.warning("[OHLCV] %s %s REST HL respuesta vacía o inesperada: %s",
                             coin, tf, str(data)[:120])
@@ -183,18 +183,11 @@ async def _fetch_ohlcv_hl(coin: str, tf: str, limit: int = 200) -> pd.DataFrame:
             log.warning("[OHLCV] %s %s REST HL error: %s", coin, tf, e)
             return pd.DataFrame()
 
-    # Agotados los reintentos
     log.warning("[OHLCV] %s %s REST HL: 3 intentos fallidos (429 persistente)", coin, tf)
     return pd.DataFrame()
 
 
 async def _fetch_ohlcv(exch, symbol: str, tf: str, limit: int = 200) -> pd.DataFrame:
-    """
-    Obtiene OHLCV en orden:
-      1. ws_feed (datos ya cacheados en memoria)
-      2. REST Hyperliquid candleSnapshot  ← throttleado con _OHLCV_SEM
-      3. ccxt exchange (fallback)
-    """
     coin = _norm_coin(symbol)
 
     try:
@@ -354,14 +347,6 @@ def _analyze_tf(df: pd.DataFrame) -> dict:
 
 
 def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, str]:
-    """
-    Score máximo teórico: 11 (capeado a SCORE_MAX=10).
-
-    FIX BUG 3: la firma anterior era tuple[int, int, str] y devolvía
-    (score, sl_parcial_sin_capear, direction). El segundo valor era
-    inconsistente (score de LONGs sin capear) y confundía al caller.
-    Ahora devuelve (score, direction) — 2 valores claros.
-    """
     sl = ss = 0
 
     for key in ("ema_trend", "macd", "ema200"):
@@ -380,8 +365,7 @@ def _compute_score(s4h: dict, s1h: dict, s15: dict) -> tuple[int, str]:
     if s15.get("bb", 0) == -1 and s1h.get("bb", 0) == -1: ss += 1
 
     best      = max(sl, ss)
-    score     = min(best, SCORE_MAX)          # cap consistente con max_score
-    # FIX: empate → SHORT (más conservador; antes siempre daba LONG en empate)
+    score     = min(best, SCORE_MAX)
     direction = "LONG" if sl > ss else "SHORT"
     return score, direction
 
@@ -418,7 +402,25 @@ def _apply_microstructure(
 
 
 def _classify_entry_mode(score: int, s4h: dict, s1h: dict, s15: dict, direction: str) -> tuple[str, int, float]:
+    """
+    Clasifica el modo de entrada.
+
+    CAMBIO v2: gate obligatorio de 4h.
+    Si REQUIRE_4H_ALIGNMENT=true (default), la dirección de 4h debe estar
+    alineada con la señal. Un 4h neutral (0) se permite; un 4h contrario
+    (-1 para LONG o +1 para SHORT) rechaza la entrada independientemente del score.
+    """
     sign = 1 if direction == "LONG" else -1
+
+    # Gate 4h obligatorio
+    if REQUIRE_4H_ALIGNMENT:
+        tf4h_trend = s4h.get("ema_trend", 0)
+        if tf4h_trend * sign < 0:   # 4h va en contra
+            log.info(
+                "[signal] RECHAZADO por gate 4h — 4h ema_trend=%d contrario a %s",
+                tf4h_trend, direction,
+            )
+            return "NONE", 1, 0.0
 
     tf1h_aligned = s1h.get("ema_trend", 0) * sign
     tf15_aligned = s15.get("ema_trend", 0) * sign
@@ -472,9 +474,16 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
         s15 = _analyze_tf(df15)
         s1h = _analyze_tf(df1h) if not df1h.empty else {}
         s4h = _analyze_tf(df4h) if not df4h.empty else {}
-        result.indicators = {"15m": s15, "1h": s1h, "4h": s4h}
 
-        # FIX BUG 3: _compute_score ahora devuelve (score, direction) — 2 valores
+        # Guardar closes para uso externo (strategy.py, enriched_filter)
+        result.indicators = {
+            "15m": s15,
+            "1h":  s1h,
+            "4h":  s4h,
+            "_closes_15m": df15["close"].tolist() if not df15.empty else [],
+            "_closes_1h":  df1h["close"].tolist() if not df1h.empty else [],
+        }
+
         score_base, direction = _compute_score(s4h, s1h, s15)
 
         ob_metrics   = None
@@ -502,16 +511,19 @@ async def analyze_pair(exch, symbol: str) -> SignalResult:
             )
             return result
 
+        # ATR calculado sobre 1h (más estable que 15m para definir SL/TP)
+        # Fallback a 15m si df1h insuficiente
+        atr_df = df1h if (not df1h.empty and len(df1h) >= 20) else df15
         try:
             atr_s = ta_lib.volatility.AverageTrueRange(
-                df15["high"], df15["low"], df15["close"], window=14
+                atr_df["high"], atr_df["low"], atr_df["close"], window=14
             ).average_true_range()
             atr = float(atr_s.iloc[-1])
         except Exception:
             atr = float(df15["close"].iloc[-1]) * 0.005
 
         result.atr = round(atr, 8)
-        entry = float(df15["close"].iloc[-1])
+        entry = float(df15["close"].iloc[-1])  # entrada en precio de mercado actual (15m)
         risk  = atr * ATR_MULT_SL
 
         if direction == "LONG":
