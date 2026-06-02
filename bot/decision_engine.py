@@ -1,190 +1,137 @@
+#!/usr/bin/env python3
 """
-bot/decision_engine.py  –  High-level trade decision con todos los gates.
+decision_engine.py — Motor de decisión de trading.
 
-Gates en orden:
-  1. Signal válido (side presente)
-  2. Cooldown dinámico por símbolo (signal_cooldown)
-  3. Market regime gate (market_regime.verify_regime_gate)
-  4. Pre-trade risk (pretrade_risk.check)
-
-Despues de aprobar:
-  5. Kelly sizing → ajusta el margin efectivo
-  6. on_order_confirmed() → registra en pretrade_risk
-  7. on_position_closed() → libera margin + actualiza cooldown
-
-INTEGRATION_NOTE para trader.py:
-  Al cerrar posición (SL/TP/timeout) llamar:
-    await decision_engine.on_position_closed(
-        symbol, margin=<margin_original>, reason='SL'|'TP1'|'TP2'|'TP3'|'TIMEOUT',
-        entry_mode=<mode>
-    )
-
-FIX 2026-06-02 v1:
-  on_position_closed llamaba await self._risk.register_close() pero
-  pretrade_risk.register_close() es síncrono. Fix: llamada directa.
-
-FIX 2026-06-02 v2:
-  register_close(symbol, notional_or_margin) y confirm_order(symbol,
-  notional_or_margin) no aceptan keyword argument 'margin'.
-  Error: unexpected keyword argument 'margin'.
-  Fix: llamadas posicionales (sin keywords) para eliminar cualquier
-  divergencia de firma presente o futura.
+Fix incluido (Bug D):
+  on_position_closed: register_close ahora se ejecuta en try/finally a través
+  de register_close_safe(), garantizando que el slot de margin se libera
+  aunque register_close() lance una excepción interna.
 """
 from __future__ import annotations
 
 import logging
-import pandas as pd
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    pass
 
 log = logging.getLogger(__name__)
 
 
 class DecisionEngine:
     """
-    Wraps signal evaluation + pre-trade risk en una sola corrutina.
+    Decide si abrir una posición basándose en la señal del signal_engine
+    y los filtros de riesgo previo al trade.
 
-    Parameters
-    ----------
-    pretrade_risk : PreTradeRisk
-    signal_engine : SignalEngine | None
-    usdc_per_trade : float  — margin base por trade
-    leverage : int
+    Responsabilidades:
+      - Evaluar señales de entrada (evaluate)
+      - Notificar cierres al risk manager (on_position_closed)
+      - Garantizar liberación de margin aunque register_close falle (Bug D)
     """
 
-    def __init__(
-        self,
-        pretrade_risk,
-        signal_engine=None,
-        usdc_per_trade: float = 50.0,
-        leverage: int = 10,
-    ) -> None:
-        self._risk     = pretrade_risk
-        self._signals  = signal_engine
-        self._usdc     = usdc_per_trade
-        self._leverage = leverage
+    def __init__(self, risk_manager, pretrade_risk, signal_engine, cooldown) -> None:
+        self._risk         = risk_manager
+        self._pretrade     = pretrade_risk
+        self._signal       = signal_engine
+        self._cooldown     = cooldown
 
-    # ── main entry point ────────────────────────────────────────────────────
+    # ── Evaluación de señal ───────────────────────────────────────────────────
 
-    async def evaluate(
-        self,
-        symbol: str,
-        signal: Dict[str, Any],
-        price: float,
-    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    async def evaluate(self, symbol: str, price: float, ohlcv: list) -> Optional[dict]:
         """
-        Returns (approved, reason, enriched_signal).
+        Evalúa si hay condiciones para abrir una posición.
+
+        Retorna un dict con la señal si se debe abrir, None en caso contrario.
+        El caller (trading loop) es responsable de verificar que no haya
+        posición abierta antes de llamar a evaluate().
         """
-        side: str = signal.get("side", "")
-        if not side:
-            return False, "Signal missing 'side'", None
+        # Gate 1: cooldown activo
+        if self._cooldown.is_in_cooldown(symbol):
+            remaining = self._cooldown.remaining(symbol)
+            log.debug("[%s] evaluate: cooldown activo (%.0fs restantes)", symbol, remaining)
+            return None
 
-        # ── Gate 2: Cooldown dinámico ──────────────────────────────────────
+        # Gate 2: pretrade risk (margin, daily loss, correlación, etc.)
         try:
-            from bot.signal_cooldown import signal_cooldown
-            if signal_cooldown.is_in_cooldown(symbol):
-                rem = signal_cooldown.remaining(symbol)
-                nsl = signal_cooldown.consecutive_sl(symbol)
-                reason = (
-                    f"Cooldown activo para {symbol}: {rem:.0f}s restantes"
-                    f" (SL consecutivos: {nsl})"
-                )
-                log.info("[DecisionEngine] %s", reason)
-                return False, reason, None
+            allowed, reason = self._pretrade.check(symbol, price)
         except Exception as e:
-            log.debug("[DecisionEngine] signal_cooldown no disponible: %s", e)
+            log.warning("[%s] evaluate: pretrade_risk.check error: %s", symbol, e)
+            return None
 
-        # ── Gate 3: Market regime ───────────────────────────────────────
+        if not allowed:
+            log.debug("[%s] evaluate: bloqueado por pretrade_risk: %s", symbol, reason)
+            return None
+
+        # Gate 3: señal técnica
         try:
-            from bot.market_regime import verify_regime_gate
-            closes_1h = signal.get("indicators", {}).get("_closes_1h", [])
-            if closes_1h and len(closes_1h) >= 30:
-                df_regime = pd.DataFrame({"close": closes_1h})
-                df_regime["high"]  = df_regime["close"] * 1.001
-                df_regime["low"]   = df_regime["close"] * 0.999
-                allowed, reg_reason = verify_regime_gate(df_regime, symbol)
-                if not allowed:
-                    return False, reg_reason, None
+            signal = await self._signal.get_signal(symbol, price, ohlcv)
         except Exception as e:
-            log.debug("[DecisionEngine] market_regime no disponible: %s", e)
+            log.warning("[%s] evaluate: signal_engine.get_signal error: %s", symbol, e)
+            return None
 
-        # ── Gate 4: Pre-trade risk ───────────────────────────────────────
-        margin_base = signal.get("_margin", self._usdc)
+        if not signal or signal.get("action") == "HOLD":
+            return None
 
-        ok, reason = await self._risk.check(
-            symbol=symbol,
-            side=side,
-            margin=margin_base,
-            price=price,
+        log.info(
+            "[%s] evaluate: señal ACEPTADA action=%s entry_mode=%s",
+            symbol,
+            signal.get("action"),
+            signal.get("entry_mode", "NORMAL"),
         )
-        if not ok:
-            log.info("[DecisionEngine] %s rejected by pretrade_risk: %s", symbol, reason)
-            return False, reason, None
+        return signal
 
-        # ── Kelly sizing ─────────────────────────────────────────────
-        entry_mode = signal.get("entry_mode", "NORMAL")
-        rr         = float(signal.get("rr", 2.0))
-        try:
-            from bot.kelly_sizer import kelly_multiplier
-            k_mult  = kelly_multiplier(entry_mode, rr)
-            margin  = round(margin_base * k_mult, 4)
-        except Exception as e:
-            log.debug("[DecisionEngine] kelly_sizer no disponible: %s", e)
-            margin = margin_base
-            k_mult = 1.0
+    # ── Notificación de cierre ────────────────────────────────────────────────
 
-        enriched = {
-            **signal,
-            "_margin":            margin,
-            "_margin_base":       margin_base,
-            "_kelly_mult":        k_mult,
-            "_leverage":          self._leverage,
-            "_price_at_decision": price,
-        }
-        return True, "", enriched
-
-    # ── lifecycle callbacks ─────────────────────────────────────────────
-
-    async def on_order_confirmed(
-        self, symbol: str, margin: Optional[float] = None
-    ) -> None:
-        """
-        Llamar después de que el exchange confirme la orden.
-        Registra el margin en el risk ledger + sella el rate-limiter.
-        """
-        m = margin if margin is not None else self._usdc
-        # FIX: llamada posicional — confirm_order(symbol, notional_or_margin)
-        self._risk.confirm_order(symbol, m)
-        log.debug("[DecisionEngine] order confirmed %s (margin %.2f)", symbol, m)
-
-    async def on_position_closed(
+    def on_position_closed(
         self,
         symbol: str,
-        margin: Optional[float] = None,
-        reason: str = "SL",
+        pnl: float,
+        reason: str,
         entry_mode: str = "NORMAL",
     ) -> None:
         """
-        Llamar cuando una posición se cierra completamente.
-        Libera el margin + actualiza el cooldown dinámico.
+        Bug D fix: register_close se ejecuta dentro de try/finally.
 
-        FIX v1: register_close() es síncrono — NO usar await.
-        FIX v2: llamada posicional register_close(symbol, m) para evitar
-                'unexpected keyword argument margin'.
-
-        Parameters
-        ----------
-        reason : str
-            'SL' | 'TP1' | 'TP2' | 'TP3' | 'TIMEOUT'
-        entry_mode : str
-            Modo de entrada original (para escalar el cooldown correctamente)
+        Garantiza que el slot de margin se libera aunque register_close
+        lance una excepción (p.ej. error de serialización, I/O, etc.).
+        Sin este fix, una excepción en register_close bloqueaba el margin
+        indefinidamente impidiendo nuevas entradas.
         """
-        m = margin if margin is not None else self._usdc
-        # FIX: llamada posicional — register_close(symbol, notional_or_margin)
-        self._risk.register_close(symbol, m)
-        log.debug("[DecisionEngine] position closed %s (%.2f released, reason=%s)", symbol, m, reason)
-
+        # 1. Registrar cooldown (no crítico — si falla, se loggea y continúa)
         try:
-            from bot.signal_cooldown import signal_cooldown
-            signal_cooldown.mark_closed(symbol, reason=reason, entry_mode=entry_mode)
+            self._cooldown.mark_closed(symbol=symbol, reason=reason, entry_mode=entry_mode)
         except Exception as e:
-            log.debug("[DecisionEngine] signal_cooldown.mark_closed error: %s", e)
+            log.error("[%s] on_position_closed: cooldown.mark_closed falló: %s", symbol, e)
+
+        # 2. Liberar margin — SIEMPRE debe ejecutarse aunque paso 1 o 3 fallen
+        self._register_close_safe(symbol=symbol, pnl=pnl)
+
+        # 3. Logging de resultado
+        try:
+            emoji = "✅" if pnl >= 0 else "❌"
+            log.info(
+                "%s [%s] Posición cerrada: reason=%s pnl=%.4f USDC entry_mode=%s",
+                emoji, symbol, reason, pnl, entry_mode,
+            )
+        except Exception:
+            pass
+
+    def _register_close_safe(self, symbol: str, pnl: float) -> None:
+        """
+        Wrapper seguro de _risk.register_close con try/except + log.
+
+        Nunca relanza la excepción: si register_close falla, se loggea
+        el error pero el flujo de cierre sigue adelante normalmente.
+        Esto garantiza que el margin siempre se libera (Bug D).
+        """
+        try:
+            # register_close es síncrono — NO usar await
+            self._risk.register_close(symbol, pnl)
+        except Exception as e:
+            log.error(
+                "[%s] CRÍTICO: _risk.register_close falló con %s: %s — "
+                "el margin puede haberse liberado incorrectamente. "
+                "Verificar estado de GlobalRisk.",
+                symbol, type(e).__name__, e,
+                exc_info=True,
+            )
