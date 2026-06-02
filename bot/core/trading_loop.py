@@ -17,6 +17,12 @@ FIX v4 (2026-06-02):
 FIX v5 Bug Q (2026-06-02):
   _build_decision_engine usaba GlobalRisk como fallback para pretrade_risk.
   Fix: importar el singleton pretrade_risk directamente.
+
+FIX v6 (2026-06-02): adapt to real PositionManager interface
+  - PositionManager(trader) not PositionManager(symbol)
+  - manage() takes no args (trader bound in __init__)
+  - open_position() does not exist → use trader.open_order() directly
+  - detect_external_close() and set_entry_mode() do not exist → removed
 """
 from __future__ import annotations
 
@@ -29,7 +35,7 @@ from bot.state import load_position, clear_position
 from bot.balance_service import balance_svc
 from bot.kill_switch import kill_switch
 from bot.core.decision_engine import DecisionEngine
-from bot.core.position_manager import PositionManager
+from bot.position_manager import PositionManager
 
 logger = logging.getLogger("TradingLoop")
 
@@ -42,7 +48,8 @@ class TradingLoop:
 
     def __init__(self, symbol: str):
         self.symbol           = symbol
-        self._position_mgr    = PositionManager(symbol)
+        # PositionManager se crea lazy en run() una vez que tenemos el trader
+        self._position_mgr    = None
         self._decision_engine = None
         self._last_pos_check_at: float = 0.0
 
@@ -61,6 +68,10 @@ class TradingLoop:
     async def run(self, trader, risk, *, global_risk=None) -> None:
         if self._decision_engine is None:
             self._decision_engine = self._build_decision_engine(global_risk or risk)
+
+        # PositionManager necesita el trader; crearlo aquí la primera vez
+        if self._position_mgr is None:
+            self._position_mgr = PositionManager(trader)
 
         await self._init(trader, risk.usdc_per_trade)
         while True:
@@ -88,9 +99,6 @@ class TradingLoop:
             trader._open_leverage = saved.get("leverage", trader.leverage)
             trader._protection_ok = True
             trader._tp1_be_done   = False
-            entry_mode = saved.get("entry_mode", "")
-            if entry_mode:
-                self._position_mgr.set_entry_mode(entry_mode)
             logger.info(
                 "[%s] Posición restaurada: %s @ %s",
                 self.symbol, trader.position, trader.entry_price,
@@ -136,7 +144,7 @@ class TradingLoop:
             else:
                 if trader.position is not None:
                     logger.info(
-                        "[%s] Posición cerrada externamente — delegando a detect_external_close().",
+                        "[%s] Posición cerrada externamente — limpiando estado local.",
                         self.symbol,
                     )
                     try:
@@ -147,11 +155,21 @@ class TradingLoop:
                             "[%s] No se pudieron cancelar triggers huérfanos: %s",
                             self.symbol, e,
                         )
-                    self._position_mgr.detect_external_close(trader)
+                    # Limpiar estado local — PositionManager no tiene detect_external_close
+                    trader.position    = None
+                    trader.entry_price = None
+                    trader.sl          = None
+                    trader.tp1         = None
+                    trader.tp2         = None
+                    trader.tp3         = None
+                    clear_position(self.symbol)
 
         # ── Gestionar posición abierta o evaluar nueva entrada ────────────────
         if trader.position is not None:
-            await self._position_mgr.manage(trader, price, risk)
+            # manage() no recibe argumentos — trader está bound en __init__
+            # Actualizar _last_price para que _check_sl_software funcione
+            trader._last_price = price
+            await self._position_mgr.manage()
         else:
             # FIX ohlcv_fn: pasar trader.get_ohlcv_fn() para que analyze_pair
             # descargue velas reales. Antes se pasaba [] → siempre HOLD.
@@ -164,4 +182,6 @@ class TradingLoop:
                     "[%s] Señal aceptada por DecisionEngine: action=%s side=%s",
                     self.symbol, signal.get("action"), signal.get("side"),
                 )
-                await self._position_mgr.open_position(trader, signal, risk)
+                # open_position() no existe en PositionManager.
+                # La apertura es responsabilidad del trader directamente.
+                await trader.open_order(signal, risk)
