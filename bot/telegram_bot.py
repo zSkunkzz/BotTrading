@@ -56,20 +56,23 @@ async def notify_startup(pairs: list, dry_run: bool, top_n: int):
 async def notify_open(
     symbol,
     side,
-    price,
-    leverage,
+    price=None,
+    leverage=None,
     usdt=None,
     sl=None,
     tp1=None,
     tp2=None,
     tp3=None,
     dry_run=False,
+    entry=None,       # alias de price — decision_engine lo pasa como 'entry'
 ):
+    # Acepta tanto price= como entry= para compatibilidad con decision_engine
+    actual_price = price if price is not None else entry
     emoji = "\U0001f4c8" if side == "long" else "\U0001f4c9"
     mode  = " [DRY]" if dry_run else ""
     lines = [
         f"{emoji} <b>OPEN {_esc(side.upper())}</b>{mode} <code>{_esc(symbol)}</code>",
-        f"Entry: <code>{_esc(price)}</code> | Lev: <code>{_esc(leverage)}x</code>"
+        f"Entry: <code>{_esc(actual_price)}</code> | Lev: <code>{_esc(leverage)}x</code>"
         + (f" | Size: <code>{_esc(usdt)}$</code>" if usdt is not None else ""),
     ]
     if sl:
@@ -144,11 +147,11 @@ async def notify_kill_switch(level: int, trigger: str):
         f"\U0001f6d1 <b>KILL SWITCH ACTIVADO</b>\n"
         f"Nivel: <b>{label}</b>\n"
         f"Trigger: <code>{_esc(trigger[:300])}</code>\n"
-        f"{'⚠️ RE-ARM MANUAL requerido' if level >= 3 else '✅ Se puede resetear automáticamente'}"
+        f"{'\u26a0\ufe0f RE-ARM MANUAL requerido' if level >= 3 else '\u2705 Se puede resetear autom\u00e1ticamente'}"
     )
 
 
-# ── Comandos Telegram (polling ligero, sin Application) ───────────────────────
+# ── Comandos Telegram (polling ligero, sin Application) ───────────────────────────────────────
 
 _ALLOWED_CHAT: str = ""   # se rellena en setup_telegram_commands()
 
@@ -202,8 +205,8 @@ async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
         daily   = kill_switch._daily_pnl
         consec  = kill_switch._consec_losses
         await reply(
-            f"🛑 <b>Kill Switch — Estado actual</b>\n"
-            f"Nivel: <b>L{lvl}</b> {'✅ OK' if lvl == 0 else '⚠️ ACTIVO'}\n"
+            f"\U0001f6d1 <b>Kill Switch — Estado actual</b>\n"
+            f"Nivel: <b>L{lvl}</b> {'\u2705 OK' if lvl == 0 else '\u26a0\ufe0f ACTIVO'}\n"
             f"Trigger: <code>{_esc(trigger[:200])}</code>\n"
             f"Hard killed: {hard}\n"
             f"Símbolos pausados: <code>{_esc(halted)}</code>\n"
@@ -215,46 +218,40 @@ async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
     key        = args[0]
     daily_only = len(args) >= 2 and args[1].lower() == "daily"
 
-    # ── /resetks <clave> daily ───────────────────────────────────────
+    # ── /resetks <clave> daily ──────────────────────────────────────
     if daily_only:
         if key != os.getenv("KILL_SWITCH_REARM_KEY", "REARM-BOTTRADING"):
-            await reply("🚫 <b>Clave incorrecta.</b> Kill switch sin cambios.")
+            await reply("\U0001f6ab <b>Clave incorrecta.</b> Kill switch sin cambios.")
             return
         kill_switch.reset_daily_pnl()
         await reply(
-            "✅ <b>Contadores diarios reseteados</b>\n"
-            "PnL diario, pérdidas consecutivas y reconexiones API → 0\n"
+            "\u2705 <b>Contadores diarios reseteados</b>\n"
+            "PnL diario, pérdidas consecutivas y reconexiones API \u2192 0\n"
             "El <b>nivel del KS no ha cambiado</b>."
         )
         return
 
-    # ── /resetks <clave>  →  re-arm completo ────────────────────────
+    # ── /resetks <clave>  →  re-arm completo ────────────────────────────
     ok = await kill_switch.manual_reset(key)
     if ok:
         await reply(
-            "✅ <b>Kill Switch RE-ARMADO</b>\n"
+            "\u2705 <b>Kill Switch RE-ARMADO</b>\n"
             "Nivel: <b>L0 — OK</b>\n"
             "Todos los contadores y flags reseteados.\n"
             "El bot puede volver a abrir posiciones."
         )
-        # Notificar también en el canal de alertas
         await _send(
-            "🔓 <b>Kill Switch re-armado manualmente</b> vía Telegram.\n"
+            "\U0001f513 <b>Kill Switch re-armado manualmente</b> vía Telegram.\n"
             "Bot vuelve a estar operativo."
         )
     else:
         await reply(
-            "🚫 <b>Clave incorrecta.</b>\n"
+            "\U0001f6ab <b>Clave incorrecta.</b>\n"
             "El kill switch sigue activo."
         )
 
 
 async def _polling_loop() -> None:
-    """
-    Loop de long-polling ligero usando Bot.get_updates directamente.
-    Corre como asyncio.Task; se cancela con el resto del programa.
-    Compatible con el Bot directo ya existente — no necesita Application.
-    """
     bot = _get_bot()
     if not bot:
         logger.info("[Telegram polling] Sin token — comandos desactivados.")
@@ -288,12 +285,6 @@ async def _polling_loop() -> None:
 
 
 def setup_telegram_commands() -> asyncio.Task | None:
-    """
-    Lanza el loop de polling como asyncio.Task.
-    Llamar desde main() DESPUÉS de que el event loop esté corriendo.
-
-    Retorna la Task (para cancelarla al shutdown) o None si no hay token.
-    """
     global _ALLOWED_CHAT
     _ALLOWED_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
