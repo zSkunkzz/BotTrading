@@ -456,7 +456,6 @@ class FuturesTrader:
         # ── Colocar SL ────────────────────────────────────────────
         if sl_px and sl_px > 0:
             try:
-            try:
                 sl_result = self._hl_client.place_sl(
                     is_buy=not is_buy,   # opuesto: cierra la posición
                     sz=qty,
