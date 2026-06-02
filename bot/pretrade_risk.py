@@ -1,6 +1,20 @@
 """
 bot/pretrade_risk.py  –  Pre-trade risk checks (margin-based, not gross notional).
 
+v4 — FIX #6 (2026-06-02): tipo/async claridad
+  check()  es ASYNC  — llamar con `await pretrade_risk.check(...)`
+  confirm_order()  es SYNC  — NO usar await
+  register_close() es SYNC  — NO usar await
+  register_close_safe() es SYNC  — NO usar await
+  get_open_margin() es ASYNC — llamar con `await`
+  get_open_margin_by_symbol() es ASYNC — llamar con `await`
+  get_order_rate() es ASYNC — llamar con `await`
+
+La convención mixta sync/async existe porque confirm_order y register_close
+se llaman en finally-blocks donde no siempre hay un event loop activo, y
+además no tienen I/O. Solo check() necesita el lock async porque puede hacer
+operaciones lentas de validación en el futuro.
+
 v3 — BUG #5 FIX: margin bloqueado si cierre falla a mitad
   - _open_margin_by_symbol: dict[symbol -> float] para tracking exacto
   - register_close() libera EXACTAMENTE el margen reservado por symbol,
@@ -38,8 +52,9 @@ class PreTradeRisk:
         self._open_margin_by_symbol: Dict[str, float] = {}
         self._order_timestamps: Deque[float] = deque()
 
-    # ── public API ───────────────────────────────────────────────────────
+    # ── public API ────────────────────────────────────────────────────────────────────
 
+    # ASYNC — llamar con `await pretrade_risk.check(...)`
     async def check(
         self,
         symbol: str,
@@ -86,12 +101,14 @@ class PreTradeRisk:
 
             return True, ""
 
-    def confirm_order(self, symbol: str, notional_or_margin: float) -> None:
+    # SYNC — NO usar await. Llamar directamente: pretrade_risk.confirm_order(...)
+    def confirm_order(self, symbol: str, notional_or_margin: float) -> None:  # sync
         """
         BUG #5 FIX: registra margin por symbol para poder liberarlo exactamente.
+
+        IMPORTANTE: método SÍNCRONO. No envolver con await.
         """
         margin = notional_or_margin
-        # Acumular al margen existente del símbolo (puede haber parciales)
         prev = self._open_margin_by_symbol.get(symbol, 0.0)
         self._open_margin_by_symbol[symbol] = prev + margin
         self._open_margin += margin
@@ -102,18 +119,18 @@ class PreTradeRisk:
             self._open_margin_by_symbol[symbol],
         )
 
-    def register_close(self, symbol: str, notional_or_margin: float) -> None:
+    # SYNC — NO usar await. Llamar directamente: pretrade_risk.register_close(...)
+    def register_close(self, symbol: str, notional_or_margin: float) -> None:  # sync
         """
         BUG #5 FIX: libera EXACTAMENTE el margen reservado para este symbol.
         Si el caller pasa un valor diferente al reservado, usamos el reservado.
-        Esto evita que un fallo parcial en el cierre deje el margen bloqueado.
+
+        IMPORTANTE: método SÍNCRONO. No envolver con await.
         """
         reserved = self._open_margin_by_symbol.pop(symbol, None)
         if reserved is not None:
-            # Liberar exactamente lo que se reservó
             release = reserved
         else:
-            # Fallback: usar el valor que pasa el caller (compatibilidad)
             release = notional_or_margin
 
         self._open_margin = max(0.0, self._open_margin - release)
@@ -122,10 +139,15 @@ class PreTradeRisk:
             symbol, release, self._open_margin,
         )
 
-    def register_close_safe(self, symbol: str, notional_or_margin: float = 0.0) -> None:
+    # SYNC — NO usar await. Llamar directamente: pretrade_risk.register_close_safe(...)
+    def register_close_safe(
+        self, symbol: str, notional_or_margin: float = 0.0
+    ) -> None:  # sync
         """
         BUG #5 FIX: wrapper seguro que SIEMPRE libera el margen.
         Llamar en finally-blocks o cuando el cierre puede haber fallado.
+
+        IMPORTANTE: método SÍNCRONO. No envolver con await.
         """
         try:
             self.register_close(symbol, notional_or_margin)
@@ -134,18 +156,20 @@ class PreTradeRisk:
                 "[PreTradeRisk] register_close_safe(%s) error: %s — forzando liberación.",
                 symbol, e,
             )
-            # Forzar liberación aunque falle
             self._open_margin_by_symbol.pop(symbol, None)
             self._open_margin = max(0.0, self._open_margin - notional_or_margin)
 
+    # ASYNC — llamar con `await pretrade_risk.get_open_margin()`
     async def get_open_margin(self) -> float:
         async with self._lock:
             return self._open_margin
 
+    # ASYNC — llamar con `await pretrade_risk.get_open_margin_by_symbol()`
     async def get_open_margin_by_symbol(self) -> Dict[str, float]:
         async with self._lock:
             return dict(self._open_margin_by_symbol)
 
+    # ASYNC — llamar con `await pretrade_risk.get_order_rate()`
     async def get_order_rate(self) -> int:
         async with self._lock:
             now = time.monotonic()
@@ -155,7 +179,7 @@ class PreTradeRisk:
             return len(self._order_timestamps)
 
 
-# ── singleton ─────────────────────────────────────────────────────────────
+# ── singleton ─────────────────────────────────────────────────────────────────────────────
 pretrade_risk = PreTradeRisk(
     max_open_margin=float(os.getenv("MAX_OPEN_MARGIN_USDC", "500")),
     max_orders_per_window=int(os.getenv("MAX_ORDERS_PER_WINDOW", "20")),
