@@ -30,6 +30,26 @@ FIX symbol_format:
   Si se pasa solo el coin corto ("SOL", "BTC") el exchange lanza
   'hyperliquid does not have market symbol SOL'.
   _to_ccxt_symbol() normaliza cualquier formato al completo antes de llamar al exchange.
+
+FIX ST4h:
+  SuperTrend 4h añadido al scoring (+1 LONG / +1 SHORT).
+  max_score sube de 10 a 12. Los umbrales de entry_mode se ajustan proporcionalmente:
+    STRONG : score >= max_score - 2  (antes -1)
+    NORMAL : score >= MIN_SCORE + 2  (sin cambio)
+    EARLY  : resto válido
+
+FIX entry=close:
+  entry usa close_price en lugar del mid de vela (high+low)/2.
+  El mid puede diferir significativamente del precio real si la vela está incompleta.
+
+FIX FlipGuard .signal:
+  SignalFlipGuard.allow() ahora lee .signal de SignalResult además de .side,
+  lo que antes hacía que el guard siempre devolviera True con objetos SignalResult.
+
+FIX manual_close_cooldown:
+  ManualCloseCooldown registra cierres manuales (sin SL/TP hit) y bloquea
+  reentradas al mismo símbolo durante MANUAL_CLOSE_COOLDOWN_S segundos.
+  Exportado como manual_close_cooldown (singleton).
 """
 from __future__ import annotations
 
@@ -163,10 +183,11 @@ async def analyze_pair(
         return _hold_result(symbol, f"NEUTRAL (score={score}/{max_score})")
 
     last_bar    = bars_15m[-1]
+    # FIX entry=close: usar close_price en lugar de mid de vela incompleta
     close_price = float(last_bar[4])
     high_price  = float(last_bar[2])
     low_price   = float(last_bar[3])
-    entry = round((high_price + low_price) / 2, 8)
+    entry = close_price  # precio real de ejecución, no (high+low)/2
 
     atr_val = float(ind_15m.get("atr", 0) or 0)
     if atr_val <= 0:
@@ -190,7 +211,8 @@ async def analyze_pair(
     reward = abs(tp1 - entry)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
 
-    if score >= max_score - 1:
+    # FIX ST4h: max_score ahora es 12, ajustar umbrales de entry_mode
+    if score >= max_score - 2:
         entry_mode = "STRONG"
     elif score >= MIN_SCORE + 2:
         entry_mode = "NORMAL"
@@ -294,7 +316,8 @@ def _compute_indicators(bars: list) -> dict:
 def _score_signal(
     i15: dict, i1h: dict, i4h: dict
 ) -> Tuple[int, int, str, List[str]]:
-    max_score = 10
+    # FIX ST4h: max_score sube a 12 (+1 ST4h LONG, +1 ST4h SHORT)
+    max_score = 12
     long_pts  = 0
     short_pts = 0
     reasons   = []
@@ -352,6 +375,9 @@ def _score_signal(
         if i4h.get("ema_bear"):  short_pts += 1; reasons.append("EMA4h↓")
         if i4h.get("macd_bull"): long_pts  += 1; reasons.append("MACD4h↑")
         if i4h.get("macd_bear"): short_pts += 1; reasons.append("MACD4h↓")
+        # FIX ST4h: SuperTrend 4h añadido al scoring
+        if i4h.get("st_bull"):   long_pts  += 1; reasons.append("ST4h↑")
+        if i4h.get("st_bear"):   short_pts += 1; reasons.append("ST4h↓")
 
     if long_pts > short_pts:
         tf1h_ok = (not i1h) or i1h.get("ema_bull") or i1h.get("st_bull")
@@ -376,7 +402,7 @@ def _hold_result(symbol: str, reason: str) -> SignalResult:
         signal="NEUTRAL",
         entry_mode="HOLD",
         score=0,
-        max_score=10,
+        max_score=12,
         entry=0.0,
         sl=0.0,
         tp1=0.0,
@@ -434,14 +460,17 @@ class SignalFlipGuard:
         if signal is None:
             return True
 
-        side = getattr(signal, "side", None)
+        # FIX FlipGuard .signal: leer .signal de SignalResult además de .side
+        # Antes solo buscaba .side (que no existe en SignalResult) → siempre True
+        side = getattr(signal, "side", None) or getattr(signal, "signal", None)
         if not side:
-            if isinstance(signal, str) and signal in ("long", "short", "buy", "sell"):
+            if isinstance(signal, str) and signal in ("long", "short", "buy", "sell",
+                                                       "LONG", "SHORT", "BUY", "SELL"):
                 side = signal
             else:
                 return True
 
-        side_norm = "long" if side in ("long", "buy") else "short"
+        side_norm = "long" if str(side).upper() in ("LONG", "BUY") else "short"
 
         last = self._last.get(symbol)
         if last is not None:
@@ -462,8 +491,64 @@ class SignalFlipGuard:
         self._last.pop(symbol, None)
 
     def update(self, symbol: str, side: str) -> None:
-        side_norm = "long" if side in ("long", "buy") else "short"
+        side_norm = "long" if str(side).upper() in ("LONG", "BUY") else "short"
         self._last[symbol] = (side_norm, time.monotonic())
 
 
 signal_flip_guard = SignalFlipGuard()
+
+
+# ─── ManualCloseCooldown ──────────────────────────────────────────────────────────────────
+
+_MANUAL_CLOSE_COOLDOWN_S = int(os.getenv("MANUAL_CLOSE_COOLDOWN_S", "600"))  # 10 min default
+
+
+class ManualCloseCooldown:
+    """
+    FIX manual_close_cooldown: registra cierres manuales (sin SL/TP hit) y bloquea
+    reentradas al mismo símbolo durante MANUAL_CLOSE_COOLDOWN_S segundos.
+
+    Uso en trader:
+        # Al detectar posición=0 sin SL/TP hit:
+        manual_close_cooldown.register(symbol)
+
+    Uso en strategy.decide() o trader antes de llamar a decide():
+        if manual_close_cooldown.is_blocked(symbol):
+            return  # no entrar
+    """
+
+    def __init__(self, cooldown_s: int = _MANUAL_CLOSE_COOLDOWN_S):
+        self._cooldown = cooldown_s
+        self._closed: Dict[str, float] = {}
+
+    def register(self, symbol: str) -> None:
+        """Registra un cierre manual para el símbolo."""
+        self._closed[symbol] = time.monotonic()
+        log.info(
+            "[ManualCloseCooldown] %s: cooldown manual activado (%ds)",
+            symbol, self._cooldown,
+        )
+
+    def is_blocked(self, symbol: str) -> bool:
+        """Devuelve True si el símbolo está en cooldown por cierre manual."""
+        ts = self._closed.get(symbol)
+        if ts is None:
+            return False
+        elapsed = time.monotonic() - ts
+        if elapsed < self._cooldown:
+            remaining = int(self._cooldown - elapsed)
+            log.debug(
+                "[ManualCloseCooldown] %s: bloqueado — %ds restantes de cooldown manual",
+                symbol, remaining,
+            )
+            return True
+        # Expirado: limpiar
+        del self._closed[symbol]
+        return False
+
+    def clear(self, symbol: str) -> None:
+        """Elimina el cooldown manual de un símbolo (ej: si el trader cambia de estado)."""
+        self._closed.pop(symbol, None)
+
+
+manual_close_cooldown = ManualCloseCooldown()
