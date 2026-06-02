@@ -9,6 +9,22 @@ FIX v8 (2026-06-02): notificaciones Telegram + cooldown post-cierre externo
     y recrea cada 15 ciclos sin posición — perdiendo el cooldown y causando
     que la posición se volviera a abrir inmediatamente.
     Ahora: save_cooldown() / get_cooldown_remaining() en bot/state.py.
+
+FIX v9 (2026-06-03): on_position_closed + global_risk en cierre externo
+  BUG CRÍTICO A: al cerrar posición externamente, no se llamaba a
+  decision_engine.on_position_closed() → pretrade_risk._open_margin nunca
+  se liberaba → Gate 2 bloqueaba TODAS las señales para siempre.
+  Fix: llamar _decision_engine.on_position_closed() en cierre externo.
+
+  BUG CRÍTICO B: global_risk.register_open() se llama en open_order pero
+  global_risk.register_close() NUNCA se invocaba en cierre externo →
+  global_risk._open crecía indefinidamente → can_open() siempre False.
+  Fix: llamar global_risk.register_close(pnl_pct=0.0) en cierre externo.
+
+  BUG C (idle rotation): _idle_cycles usaba bot_state._positions como
+  fuente de verdad para saber si hay posición. En dry_run esto puede estar
+  desincronizado. Fix: usar trader.position (estado en memoria) como
+  fuente de verdad primaria.
 """
 from __future__ import annotations
 
@@ -39,6 +55,8 @@ class TradingLoop:
         self._position_mgr    = None
         self._decision_engine = None
         self._last_pos_check_at: float = 0.0
+        # Guardamos referencia al global_risk para poder llamar register_close
+        self._global_risk = None
 
     def _build_decision_engine(self, risk):
         from bot import signal_engine
@@ -55,6 +73,10 @@ class TradingLoop:
     async def run(self, trader, risk, *, global_risk=None) -> None:
         if self._decision_engine is None:
             self._decision_engine = self._build_decision_engine(global_risk or risk)
+
+        # FIX CRÍTICO B: guardar referencia al global_risk para cierre externo
+        if global_risk is not None:
+            self._global_risk = global_risk
 
         if self._position_mgr is None:
             self._position_mgr = PositionManager(trader)
@@ -171,6 +193,7 @@ class TradingLoop:
                     )
             else:
                 if trader.position is not None:
+                    closed_side = trader.position
                     logger.info(
                         "[%s] Posición cerrada externamente — limpiando estado local.",
                         self.symbol,
@@ -180,7 +203,7 @@ class TradingLoop:
                         from bot.telegram_bot import notify_close
                         await notify_close(
                             symbol   = self.symbol,
-                            side     = trader.position,
+                            side     = closed_side,
                             exit_p   = round(price, 6),
                             pnl      = 0.0,
                             entry    = trader.entry_price,
@@ -198,6 +221,44 @@ class TradingLoop:
                             "[%s] No se pudieron cancelar triggers huérfanos: %s",
                             self.symbol, e,
                         )
+
+                    # ── FIX CRÍTICO A: liberar pretrade_risk._open_margin ──
+                    # Sin esto, el margen reservado nunca se libera y Gate 2
+                    # bloquea TODAS las señales futuras para siempre.
+                    try:
+                        if self._decision_engine is not None:
+                            await self._decision_engine.on_position_closed(
+                                symbol     = self.symbol,
+                                pnl        = 0.0,
+                                reason     = "MANUAL_CLOSE",
+                                entry_mode = "NORMAL",
+                            )
+                            logger.info(
+                                "[%s] on_position_closed() llamado — pretrade_risk liberado.",
+                                self.symbol,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] on_position_closed() error en cierre externo: %s",
+                            self.symbol, e,
+                        )
+
+                    # ── FIX CRÍTICO B: decrementar global_risk._open ───────
+                    # Sin esto, global_risk._open nunca baja y can_open()
+                    # devuelve False para siempre tras el primer trade.
+                    _gr = self._global_risk or global_risk
+                    if _gr is not None:
+                        try:
+                            await _gr.register_close(pnl_pct=0.0, symbol=self.symbol)
+                            logger.info(
+                                "[%s] global_risk.register_close() llamado — slot liberado.",
+                                self.symbol,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "[%s] global_risk.register_close() error en cierre externo: %s",
+                                self.symbol, e,
+                            )
 
                     # ── Activar cooldown PERSISTENTE (sobrevive a rotación) ─
                     save_cooldown(self.symbol, _EXTERNAL_CLOSE_COOLDOWN_S)
