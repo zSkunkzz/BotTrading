@@ -17,6 +17,7 @@ Variables de entorno:
   EF_NEWS_BEARISH_MAX       : máximo de noticias bearish para permitir LONG (default 2)
   EF_NEWS_BULLISH_MAX       : máximo de noticias bullish para permitir SHORT (default 2)
   EF_NEWS_AI_THRESHOLD      : si hay >= N noticias relevantes, llamar IA para análisis (default 2)
+  EF_RSI_MOMENTUM_BLOCK     : RSI por debajo del cual se bloquea LONG si precio cae (default 50)
 
 Retorna:
   FilterResult:
@@ -51,6 +52,9 @@ VOL_RATIO_MIN        = float(os.getenv("EF_VOL_RATIO_MIN",     "0.7"))
 NEWS_BEARISH_MAX     = int(float(os.getenv("EF_NEWS_BEARISH_MAX",  "2")))
 NEWS_BULLISH_MAX     = int(float(os.getenv("EF_NEWS_BULLISH_MAX",  "2")))
 NEWS_AI_THRESHOLD    = int(float(os.getenv("EF_NEWS_AI_THRESHOLD", "2")))
+# FIX: umbral RSI para bloqueo duro anti caída libre
+# Si precio cae Y RSI < este valor (sin sobreventa extrema), no hay reversión confirmada
+RSI_MOMENTUM_BLOCK   = float(os.getenv("EF_RSI_MOMENTUM_BLOCK", "50"))
 
 
 @dataclass
@@ -76,7 +80,7 @@ def apply(
         enriched      : contexto externo obtenido por data_enricher
         rsi           : RSI actual (opcional, para filtro RSI)
         vol_ratio     : relación volumen actual / media (opcional)
-        price_direction: tendencia de precio en la vela actual (opcional, para filtro OI)
+        price_direction: tendencia de precio en la vela actual (opcional, para filtro OI y momentum)
 
     Returns:
         FilterResult — ver docstring del módulo
@@ -145,6 +149,40 @@ def apply(
         if is_short and oi_delta < 0:
             reasons_warn.append(
                 f"OI_delta={oi_delta:+.1f}% — liquidación de longs, confirma SHORT ✓"
+            )
+
+    # ── 5b. Momentum de precio — anti caída libre ────────────────────────────
+    # Solo aplica cuando price_direction viene informado (no None).
+    # Lógica:
+    #   - Precio cayendo + RSI < RSI_MOMENTUM_BLOCK (50): no hay señal de reversión
+    #     confirmada → bloqueo duro. El bot solo entraría LONG si el precio ya sube
+    #     o si el RSI está en sobreventa extrema (<= RSI_OVERSOLD), que ya se gestiona
+    #     en el bloque 1 como zona de rebote técnico.
+    #   - Precio cayendo + RSI >= RSI_MOMENTUM_BLOCK: momentum débil pero RSI neutro,
+    #     se añade penalización suave sin bloquear.
+    if is_long and price_direction == "falling":
+        if rsi is not None and rsi < RSI_MOMENTUM_BLOCK:
+            reasons_block.append(
+                f"precio cayendo + RSI={rsi:.1f} < {RSI_MOMENTUM_BLOCK} — "
+                f"sin reversión confirmada, LONG bloqueado (anti caída libre)"
+            )
+        else:
+            penalty += 1
+            reasons_warn.append(
+                f"precio cayendo — momentum bajista, cautela en LONG (+1 penalty)"
+            )
+
+    # Simétrico para SHORT: si el precio sube y RSI > umbral de momentum
+    if is_short and price_direction == "rising":
+        if rsi is not None and rsi > (100 - RSI_MOMENTUM_BLOCK):
+            reasons_block.append(
+                f"precio subiendo + RSI={rsi:.1f} > {100 - RSI_MOMENTUM_BLOCK} — "
+                f"sin reversión confirmada, SHORT bloqueado (anti pump)"
+            )
+        else:
+            penalty += 1
+            reasons_warn.append(
+                f"precio subiendo — momentum alcista, cautela en SHORT (+1 penalty)"
             )
 
     # ── 6. Noticias (keyword, sin IA) ────────────────────────────────────────
