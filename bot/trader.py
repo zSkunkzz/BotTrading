@@ -18,30 +18,29 @@ ROORDERS FIX: al restaurar posición, cancelar ro_orders acumuladas si > 2
 FIX cancel_order:
   _exchange.cancel_order(oid, coin) no existe en el SDK de Hyperliquid.
   El método real es _exchange.cancel(coin, oid_int).
-  Afectaba a _cancel_all_orders_reduce_only (limpieza ROORDERS) y al
-  bloque de actualización del trailing SL en _manage_open_position.
 
 FIX pretrade_risk restart:
   Al reiniciarse el bot (Railway/cualquier plataforma), el singleton
   pretrade_risk._open_margin se reseteaba a 0 aunque hubiera una posición
-  abierta en el exchange. Esto permitía al bot abrir otra posición sobre
-  la existente → posiciones duplicadas acumuladas.
-  Ahora _init() reconstruye pretrade_risk.confirm_order(symbol, margin)
-  desde el state persistido si la posición se confirma en el exchange.
+  abierta en el exchange.
 
 FIX bulk sz rounding (2026-06-02):
   _place_tpsl construía los dicts de bulk_orders con qty crudo (sin redondear).
-  Aunque hl_client.place_sl/place_tp ya redondean, el path bulk llama
-  directamente a client._exchange.bulk_orders() saltándose ese redondeo.
   Fix: rounded_qty = client.round_sz(qty) antes de construir los dicts.
 
-FIX DecisionEngine init + evaluate (2026-06-02):
-  1. _DecisionEngine se instanciaba como _DecisionEngine(symbol) pasando
-     symbol como pretrade_risk → AttributeError en evaluate().
-     Fix: se pasa pretrade_risk + usdc_per_trade + leverage correctamente.
-  2. evaluate() se llamaba con (self, risk, global_risk) en lugar de
-     (symbol, signal, price) → nunca se abrían posiciones nuevas con DE activo.
-     Fix: evaluate() solo se invoca desde _try_open_position con firma correcta.
+FIX DecisionEngine (2026-06-02 v2):
+  Firma real de decision_engine.py:
+    __init__(self, symbol: str, position_mgr=None)
+    evaluate(self, trader, risk, global_risk=None)  <- maneja todo internamente
+    on_position_closed(self, symbol, margin, reason, entry_mode)  <- ya es async def
+
+  Correcciones en trader.py:
+  1. _DecisionEngine se instancia como _DecisionEngine(symbol),
+     NO con pretrade_risk=/usdc_per_trade=/leverage= (kwargs inexistentes).
+  2. evaluate() se llama con (trader=self, risk=risk, global_risk=global_risk).
+     El DE maneja la apertura completa internamente; no devuelve (approved, reason, enriched).
+  3. _try_open_position delega COMPLETAMENTE en el DE si está disponible.
+     Sin DE, usa el path de decide() propio (sin abrir posición, solo placeholder).
 """
 from __future__ import annotations
 
@@ -65,8 +64,8 @@ from bot.pretrade_risk import pretrade_risk
 from bot.kill_switch import kill_switch
 from bot.execution.execution_engine import execution_engine
 from bot.ohlcv_cache import ohlcv_cache
-from bot.signal_engine import signal_flip_guard  # BUG #7 FIX
-from bot.trailing_sl import compute_trailing_sl, is_trailing_sl_hit  # TRAILING SL FIX
+from bot.signal_engine import signal_flip_guard
+from bot.trailing_sl import compute_trailing_sl, is_trailing_sl_hit
 
 # ── DecisionEngine (opcional) ───────────────────────────────────────────────
 try:
@@ -100,7 +99,6 @@ _FALLBACK_ATR_SL_MULT  = float(os.getenv("FALLBACK_ATR_SL_MULT",  "1.8"))
 _FALLBACK_ATR_TP1_MULT = float(os.getenv("FALLBACK_ATR_TP1_MULT", "3.5"))
 _FALLBACK_ATR_TP2_MULT = float(os.getenv("FALLBACK_ATR_TP2_MULT", "5.0"))
 
-# Máximo de órdenes reduce_only esperadas para una posición normal (SL + TP = 2)
 _MAX_EXPECTED_RO_ORDERS = int(os.getenv("MAX_EXPECTED_RO_ORDERS", "2"))
 
 # ── Rate limiter global para /info ────────────────────────────────────────
@@ -170,7 +168,6 @@ def _compute_fallback_tpsl(
     return round(sl, 6), round(tp1, 6), round(tp2, 6)
 
 
-# BUG #9 FIX: helper que no depende del formato de orderType
 def _is_reduce_only_order(o: dict) -> bool:
     if o.get("reduceOnly") is True:
         return True
@@ -188,11 +185,6 @@ def _is_reduce_only_order(o: dict) -> bool:
 
 
 def _hl_cancel_order(exchange, coin: str, oid) -> None:
-    """
-    FIX cancel_order: el SDK de Hyperliquid NO tiene cancel_order(oid, coin).
-    El método real es exchange.cancel(coin, oid_int).
-    Wrapper centralizado para evitar repetir el mismo error.
-    """
     exchange.cancel(coin, int(oid))
 
 
@@ -264,25 +256,15 @@ class FuturesTrader:
         self._ccxt_exchange = None
         self._global_risk   = None
 
-        # TRAILING SL FIX
         self._trailing_sl_activated: bool  = False
         self._trail_peak:            float = 0.0
-
-        # BUG #2 FIX
         self._open_lock: asyncio.Lock = asyncio.Lock()
-
-        # BUG #4 FIX
         self._stopped_event: asyncio.Event = asyncio.Event()
 
-        # FIX DecisionEngine init: se pasa pretrade_risk + parámetros correctos,
-        # NO el symbol. El symbol se lo pasa evaluate() en cada llamada.
+        # FIX: firma real es _DecisionEngine(symbol, position_mgr=None)
+        # NO kwargs pretrade_risk=/usdc_per_trade=/leverage=
         if _DE_AVAILABLE:
-            usdc_per_trade = float(os.getenv("USDC_PER_TRADE", "50"))
-            self._decision_engine = _DecisionEngine(
-                pretrade_risk=pretrade_risk,
-                usdc_per_trade=usdc_per_trade,
-                leverage=leverage,
-            )
+            self._decision_engine = _DecisionEngine(symbol)
         else:
             self._decision_engine = None
 
@@ -359,12 +341,6 @@ class FuturesTrader:
     # ── Init / cleanup ───────────────────────────────────────────────────────────────
 
     async def _cleanup_excess_ro_orders(self) -> None:
-        """
-        ROORDERS FIX: al restaurar una posición, si hay más de
-        _MAX_EXPECTED_RO_ORDERS (2) órdenes reduce_only acumuladas,
-        cancela todas y fuerza recolocación limpia de SL+TP.
-        Evita el problema de ZEC con 50 órdenes acumuladas.
-        """
         try:
             loop = asyncio.get_event_loop()
             raw_orders = await loop.run_in_executor(None, self._hl_client.get_open_orders)
@@ -375,28 +351,18 @@ class FuturesTrader:
                 return
 
             logger.warning(
-                "[%s] ROORDERS FIX: %d órdenes reduce_only acumuladas (esperadas ≤%d) — "
-                "cancelando todo y recolocando SL/TP limpios.",
+                "[%s] ROORDERS FIX: %d órdenes reduce_only acumuladas (≤%d esperadas) — "
+                "cancelando y recolocando SL/TP limpios.",
                 self.symbol, len(ro_orders), _MAX_EXPECTED_RO_ORDERS,
             )
             cancelled = await self._cancel_all_orders_reduce_only(coin_orders)
-            logger.info(
-                "[%s] ROORDERS FIX: %d órdenes canceladas — SL/TP se recolocarán "
-                "en el primer ciclo de _ensure_tpsl.",
-                self.symbol, cancelled,
-            )
-            # Forzar recolocación inmediata en el próximo ciclo
+            logger.info("[%s] ROORDERS FIX: %d órdenes canceladas.", self.symbol, cancelled)
             self._last_tpsl_verify_at = 0.0
             self._protection_ok = False
         except Exception as e:
             logger.warning("[%s] _cleanup_excess_ro_orders error: %s", self.symbol, e)
 
     def _restore_position_fields(self, saved: dict) -> None:
-        """
-        Extrae campos comunes al restaurar una posición guardada.
-        Centraliza la lógica repetida en _init() para el caso exchange_ok
-        y el caso fallback (exchange no verificable).
-        """
         self.position         = saved["side"]
         self.entry_price      = saved["entry"]
         self.sl               = saved.get("sl")
@@ -435,36 +401,29 @@ class FuturesTrader:
             if exchange_pos is not None and len(exchange_pos) > 0:
                 self._restore_position_fields(saved)
                 self._last_tpsl_verify_at = 0.0
-                logger.info("[%s] Posicion restaurada: %s @ %s — verificando SL/TP en exchange...",
+                logger.info("[%s] Posicion restaurada: %s @ %s",
                             self.symbol, self.position, self.entry_price)
 
-                # FIX pretrade_risk restart:
-                # El singleton se resetea en cada reinicio. Si hay posición activa
-                # confirmada en el exchange, reconstruimos el estado registrando
-                # el margen que estaba comprometido antes del restart.
                 if self._open_margin > 0:
-                    # Evitar doble-registro si ya existe una entrada para este symbol
-                    # (p.ej. restart muy rápido o test). register_close libera primero.
                     existing = pretrade_risk._open_margin_by_symbol.get(self.symbol, 0.0)
                     if existing == 0.0:
                         pretrade_risk.confirm_order(self.symbol, self._open_margin)
                         logger.info(
-                            "[%s] pretrade_risk reconstruido desde state: margin=%.2f USDC",
+                            "[%s] pretrade_risk reconstruido: margin=%.2f USDC",
                             self.symbol, self._open_margin,
                         )
 
-                # ROORDERS FIX: limpiar órdenes acumuladas al restaurar
                 await self._cleanup_excess_ro_orders()
 
             elif exchange_pos is not None and len(exchange_pos) == 0:
                 logger.warning(
-                    "[%s] Posicion guardada localmente pero NO existe en exchange — limpiando estado.",
+                    "[%s] Posicion guardada localmente pero NO existe en exchange — limpiando.",
                     self.symbol,
                 )
                 clear_position(self.symbol)
             else:
                 logger.warning(
-                    "[%s] No se pudo verificar posicion en exchange al arrancar — restaurando sin proteccion OK.",
+                    "[%s] No se pudo verificar posicion en exchange — restaurando sin proteccion OK.",
                     self.symbol,
                 )
                 self._restore_position_fields(saved)
@@ -486,7 +445,6 @@ class FuturesTrader:
             )
 
         await self._set_leverage(effective)
-
         logger.info(
             "[%s] Trader iniciado | coin=%s | master=%s | agent_mode=%s",
             self.symbol, self.coin,
@@ -495,7 +453,6 @@ class FuturesTrader:
         )
 
     async def cleanup(self):
-        """BUG #4 FIX: setea _stopped_event para que pair_scanner pueda esperar."""
         await self._close_ccxt()
         self._stopped_event.set()
         logger.info("[%s] Trader cleanup completado.", self.symbol)
@@ -638,10 +595,6 @@ class FuturesTrader:
                 try:
                     szi = float(pos.get("szi", 0) or 0)
                 except (TypeError, ValueError):
-                    logger.debug(
-                        "[%s] _get_positions: szi no numerico (%r) — ignorando posicion residual.",
-                        self.symbol, pos.get("szi"),
-                    )
                     continue
                 if abs(szi) > 0:
                     positions.append(pos)
@@ -655,13 +608,8 @@ class FuturesTrader:
             delay = _POST_FILL_CONFIRM_DELAY_S
             if attempt > 0:
                 logger.debug(
-                    "[%s] Post-fill confirm: intento %d/%d (esperando %.1fs)...",
+                    "[%s] Post-fill confirm: intento %d/%d (%.1fs)...",
                     self.symbol, attempt + 1, _POST_FILL_CONFIRM_RETRIES, delay,
-                )
-            else:
-                logger.debug(
-                    "[%s] Post-fill confirm: esperando %.1fs para propagacion...",
-                    self.symbol, delay,
                 )
             await asyncio.sleep(delay)
             positions = await self._get_positions()
@@ -694,8 +642,7 @@ class FuturesTrader:
 
         ep = entry_px if (entry_px and entry_px > 0) else self.entry_price
 
-        # FIX bulk sz rounding: redondear qty ANTES de construir los dicts,
-        # ya que bulk_orders llama al SDK directamente sin pasar por place_sl/place_tp.
+        # FIX bulk sz rounding
         rounded_qty = client.round_sz(qty)
 
         if sl and tp:
@@ -739,10 +686,7 @@ class FuturesTrader:
                 )
                 bulk_ok = True
             except Exception as e:
-                logger.warning(
-                    "[%s] bulk SL+TP fallo (%s) — colocando individualmente",
-                    self.symbol, e,
-                )
+                logger.warning("[%s] bulk SL+TP fallo (%s) — colocando individualmente", self.symbol, e)
 
             if bulk_ok:
                 return
@@ -750,12 +694,9 @@ class FuturesTrader:
             try:
                 await loop.run_in_executor(
                     None,
-                    lambda: client.place_sl(
-                        is_buy=close_is_buy, sz=qty,
-                        trigger_px=sl, entry_px=ep,
-                    ),
+                    lambda: client.place_sl(is_buy=close_is_buy, sz=qty, trigger_px=sl, entry_px=ep),
                 )
-                logger.info("[%s] SL=%.5f colocado en exchange (fallback)", self.symbol, sl)
+                logger.info("[%s] SL=%.5f colocado (fallback)", self.symbol, sl)
             except Exception as e:
                 logger.error("[%s] No se pudo colocar SL (fallback): %s", self.symbol, e)
                 raise
@@ -763,28 +704,21 @@ class FuturesTrader:
             try:
                 await loop.run_in_executor(
                     None,
-                    lambda: client.place_tp(
-                        is_buy=close_is_buy, sz=qty,
-                        trigger_px=tp, entry_px=ep,
-                    ),
+                    lambda: client.place_tp(is_buy=close_is_buy, sz=qty, trigger_px=tp, entry_px=ep),
                 )
-                logger.info("[%s] TP=%.5f colocado en exchange (fallback)", self.symbol, tp)
+                logger.info("[%s] TP=%.5f colocado (fallback)", self.symbol, tp)
             except Exception as e:
                 logger.error("[%s] No se pudo colocar TP (fallback): %s", self.symbol, e)
                 raise
-
             return
 
         if sl:
             try:
                 await loop.run_in_executor(
                     None,
-                    lambda: client.place_sl(
-                        is_buy=close_is_buy, sz=qty,
-                        trigger_px=sl, entry_px=ep,
-                    ),
+                    lambda: client.place_sl(is_buy=close_is_buy, sz=qty, trigger_px=sl, entry_px=ep),
                 )
-                logger.info("[%s] SL=%.5f colocado en exchange", self.symbol, sl)
+                logger.info("[%s] SL=%.5f colocado", self.symbol, sl)
             except Exception as e:
                 logger.error("[%s] No se pudo colocar SL: %s", self.symbol, e)
                 raise
@@ -793,17 +727,14 @@ class FuturesTrader:
             try:
                 await loop.run_in_executor(
                     None,
-                    lambda: client.place_tp(
-                        is_buy=close_is_buy, sz=qty,
-                        trigger_px=tp, entry_px=ep,
-                    ),
+                    lambda: client.place_tp(is_buy=close_is_buy, sz=qty, trigger_px=tp, entry_px=ep),
                 )
-                logger.info("[%s] TP=%.5f colocado en exchange", self.symbol, tp)
+                logger.info("[%s] TP=%.5f colocado", self.symbol, tp)
             except Exception as e:
-                logger.error("[%s] No se pudo colocar TP (fallback): %s", self.symbol, e)
+                logger.error("[%s] No se pudo colocar TP: %s", self.symbol, e)
                 raise
 
-    # ── _cancel_all_orders_reduce_only (BUG #9 FIX) ────────────────────────────────────
+    # ── _cancel_all_orders_reduce_only ────────────────────────────────────────────────
 
     async def _cancel_all_orders_reduce_only(self, coin_orders: list) -> int:
         ro_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
@@ -815,31 +746,22 @@ class FuturesTrader:
         for o in ro_orders:
             oid = o.get("oid") or o.get("id") or o.get("orderId")
             if not oid:
-                logger.warning("[%s] Orden reduce_only sin oid — skip: %s", self.symbol, o)
                 continue
             try:
-                # FIX cancel_order: SDK de Hyperliquid usa cancel(coin, oid_int),
-                # NO cancel_order(oid_str, coin)
                 await loop.run_in_executor(
                     None,
-                    lambda _oid=oid: _hl_cancel_order(
-                        self._hl_client._exchange, self.coin, _oid
-                    ),
+                    lambda _oid=oid: _hl_cancel_order(self._hl_client._exchange, self.coin, _oid),
                 )
-                logger.debug("[%s] Orden reduce_only cancelada: oid=%s", self.symbol, oid)
                 cancelled += 1
             except Exception as e:
-                logger.warning(
-                    "[%s] No se pudo cancelar orden reduce_only oid=%s: %s",
-                    self.symbol, oid, e,
-                )
+                logger.warning("[%s] No se pudo cancelar orden oid=%s: %s", self.symbol, oid, e)
         logger.info(
-            "[%s] _cancel_all_orders_reduce_only: %d/%d órdenes canceladas",
+            "[%s] _cancel_all_orders_reduce_only: %d/%d canceladas",
             self.symbol, cancelled, len(ro_orders),
         )
         return cancelled
 
-    # ── _ensure_tpsl_on_exchange (BUG #9 FIX) ──────────────────────────────────────────
+    # ── _ensure_tpsl_on_exchange ─────────────────────────────────────────────────────
 
     async def _ensure_tpsl_on_exchange(
         self,
@@ -854,24 +776,17 @@ class FuturesTrader:
         try:
             raw_orders = await loop.run_in_executor(None, self._hl_client.get_open_orders)
         except Exception as e:
-            logger.error("[%s] _ensure_tpsl: no se pudo consultar ordenes abiertas: %s", self.symbol, e)
+            logger.error("[%s] _ensure_tpsl: no se pudo consultar ordenes: %s", self.symbol, e)
             return
 
         coin_orders = [o for o in (raw_orders or []) if o.get("coin") == self.coin]
-        ro_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
-        if coin_orders:
-            sample_types = [o.get("orderType", "?") for o in coin_orders[:5]]
-            logger.debug(
-                "[%s] _ensure_tpsl — orderTypes (muestra): %s",
-                self.symbol, sample_types,
-            )
-
+        ro_orders   = [o for o in coin_orders if _is_reduce_only_order(o)]
         has_sl = len(ro_orders) >= 1
         has_tp = len(ro_orders) >= 2
 
         logger.info(
-            "[%s] _ensure_tpsl — SL_ok=%s TP_ok=%s | ro_orders=%d | total_coin=%d | qty=%.4f",
-            self.symbol, has_sl, has_tp, len(ro_orders), len(coin_orders), safe_qty,
+            "[%s] _ensure_tpsl — SL_ok=%s TP_ok=%s | ro=%d | qty=%.4f",
+            self.symbol, has_sl, has_tp, len(ro_orders), safe_qty,
         )
 
         if has_sl and has_tp:
@@ -879,7 +794,7 @@ class FuturesTrader:
             return
 
         if has_sl and not has_tp:
-            logger.warning("[%s] Falta TP en exchange — colocando TP=%.5f (SL intacto)", self.symbol, tp1)
+            logger.warning("[%s] Falta TP — colocando TP=%.5f", self.symbol, tp1)
             try:
                 await self._place_tpsl(qty=safe_qty, sl=None, tp=tp1)
                 self._protection_ok = True
@@ -888,17 +803,16 @@ class FuturesTrader:
             return
 
         logger.warning(
-            "[%s] Faltan SL y TP — cancelando reduce_only acumulados y recolocando bulk (SL=%.5f TP=%.5f qty=%.4f)",
+            "[%s] Faltan SL y TP — recolocando bulk (SL=%.5f TP=%.5f qty=%.4f)",
             self.symbol, sl, tp1, safe_qty,
         )
-
         if coin_orders:
             try:
                 cancelled = await self._cancel_all_orders_reduce_only(coin_orders)
                 if cancelled > 0:
                     await asyncio.sleep(0.5)
             except Exception as e:
-                logger.warning("[%s] _ensure_tpsl: error cancelando ordenes previas: %s", self.symbol, e)
+                logger.warning("[%s] Error cancelando previas: %s", self.symbol, e)
 
         try:
             await self._place_tpsl(qty=safe_qty, sl=sl, tp=tp1)
@@ -935,6 +849,7 @@ class FuturesTrader:
 
         if self._decision_engine is not None:
             try:
+                # on_position_closed es async def en decision_engine.py
                 await self._decision_engine.on_position_closed(
                     symbol=self.symbol,
                     margin=self._open_margin,
@@ -958,7 +873,7 @@ class FuturesTrader:
                     close_side = "sell" if is_long else "buy"
                     try:
                         await self._place_order(close_side, self._open_qty, reduce_only=True)
-                        logger.info("[%s] Cierre emergencia reduce-only enviado (SL local).", self.symbol)
+                        logger.info("[%s] Cierre emergencia reduce-only enviado.", self.symbol)
                     except Exception as e:
                         logger.error("[%s] Cierre emergencia fallo: %s", self.symbol, e)
                 pnl_pct = ((price - self.entry_price) / self.entry_price) * (1 if is_long else -1)
@@ -987,42 +902,31 @@ class FuturesTrader:
                     self._trailing_sl_activated = True
                     self._trail_peak = price
                     logger.info(
-                        "[%s] Trailing SL activado tras TP1 | peak=%.5f | SL_base=%.5f",
-                        self.symbol, self._trail_peak, self.sl or 0.0,
+                        "[%s] Trailing SL activado tras TP1 | peak=%.5f",
+                        self.symbol, self._trail_peak,
                     )
 
                 save_position(self.symbol, {
-                    "side":  self.position,
-                    "entry": self.entry_price,
-                    "sl":    self.sl,
-                    "tp1":   self.tp1,
-                    "tp2":   self.tp2,
-                    "tp3":   self.tp3,
-                    "tp1_hit": True,
-                    "tp2_hit": self.tp2_hit,
-                    "usdc_amount": self._open_notional,
-                    "leverage":    self._open_leverage,
-                    "margin_usdc": self._open_margin,
-                    "qty":         self._open_qty,
-                    "entry_mode":  self._open_entry_mode,
+                    "side":  self.position, "entry": self.entry_price,
+                    "sl":    self.sl,       "tp1":   self.tp1,
+                    "tp2":   self.tp2,      "tp3":   self.tp3,
+                    "tp1_hit": True,        "tp2_hit": self.tp2_hit,
+                    "usdc_amount": self._open_notional, "leverage": self._open_leverage,
+                    "margin_usdc": self._open_margin,   "qty":      self._open_qty,
+                    "entry_mode": self._open_entry_mode,
                     "trailing_sl_activated": self._trailing_sl_activated,
-                    "trail_peak":            self._trail_peak,
+                    "trail_peak": self._trail_peak,
                 })
 
-        # ── Trailing SL update (post-TP1) ────────────────────────────────────────
+        # ── Trailing SL ────────────────────────────────────────────────────────────────────
         if self._trailing_sl_activated and self.sl and self.sl > 0:
             new_sl, new_peak = compute_trailing_sl(
-                is_long=is_long,
-                current_price=price,
-                peak_price=self._trail_peak,
-                current_sl=self.sl,
+                is_long=is_long, current_price=price,
+                peak_price=self._trail_peak, current_sl=self.sl,
             )
 
             if is_trailing_sl_hit(is_long=is_long, current_price=price, trailing_sl=new_sl):
-                logger.info(
-                    "[%s] Trailing SL hit | precio=%.5f trailing_sl=%.5f",
-                    self.symbol, price, new_sl,
-                )
+                logger.info("[%s] Trailing SL hit | precio=%.5f sl=%.5f", self.symbol, price, new_sl)
                 close_side = "sell" if is_long else "buy"
                 try:
                     await self._place_order(close_side, self._open_qty, reduce_only=True)
@@ -1042,7 +946,7 @@ class FuturesTrader:
             sl_improved = (is_long and new_sl > self.sl) or (not is_long and new_sl < self.sl)
             if sl_improved:
                 logger.info(
-                    "[%s] Trailing SL mejorado: %.5f → %.5f (peak=%.5f)",
+                    "[%s] Trailing SL: %.5f → %.5f (peak=%.5f)",
                     self.symbol, self.sl, new_sl, new_peak,
                 )
                 try:
@@ -1055,22 +959,18 @@ class FuturesTrader:
                             isinstance(o.get("orderType"), dict) and
                             o["orderType"].get("trigger", {}).get("tpsl") == "sl"
                         )
-                    ]
-                    if not sl_orders:
-                        sl_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
+                    ] or [o for o in coin_orders if _is_reduce_only_order(o)]
 
                     for o in sl_orders:
                         oid = o.get("oid") or o.get("id") or o.get("orderId")
                         if oid:
                             try:
-                                # FIX cancel_order: SDK de Hyperliquid usa cancel(coin, oid_int)
                                 await loop.run_in_executor(
                                     None,
                                     lambda _oid=oid: _hl_cancel_order(
                                         self._hl_client._exchange, self.coin, _oid
                                     ),
                                 )
-                                logger.debug("[%s] SL reduce-only cancelado: oid=%s", self.symbol, oid)
                             except Exception as ce:
                                 logger.warning("[%s] Error cancelando SL oid=%s: %s", self.symbol, oid, ce)
 
@@ -1079,30 +979,24 @@ class FuturesTrader:
                     self.sl = new_sl
                     self._trail_peak = new_peak
                     save_position(self.symbol, {
-                        "side":  self.position,
-                        "entry": self.entry_price,
-                        "sl":    self.sl,
-                        "tp1":   self.tp1,
-                        "tp2":   self.tp2,
-                        "tp3":   self.tp3,
-                        "tp1_hit": self._tp1_hit,
-                        "tp2_hit": self.tp2_hit,
-                        "usdc_amount": self._open_notional,
-                        "leverage":    self._open_leverage,
-                        "margin_usdc": self._open_margin,
-                        "qty":         self._open_qty,
-                        "entry_mode":  self._open_entry_mode,
+                        "side":  self.position, "entry": self.entry_price,
+                        "sl":    self.sl,       "tp1":   self.tp1,
+                        "tp2":   self.tp2,      "tp3":   self.tp3,
+                        "tp1_hit": self._tp1_hit, "tp2_hit": self.tp2_hit,
+                        "usdc_amount": self._open_notional, "leverage": self._open_leverage,
+                        "margin_usdc": self._open_margin,   "qty":      self._open_qty,
+                        "entry_mode": self._open_entry_mode,
                         "trailing_sl_activated": self._trailing_sl_activated,
-                        "trail_peak":            self._trail_peak,
+                        "trail_peak": self._trail_peak,
                     })
                 except Exception as e:
-                    logger.error("[%s] Error actualizando trailing SL en exchange: %s", self.symbol, e)
+                    logger.error("[%s] Error actualizando trailing SL: %s", self.symbol, e)
 
         # ── TP2 hit check ─────────────────────────────────────────────────────────────
         if self._tp1_hit and not self.tp2_hit and self.tp2 and self.tp2 > 0:
             tp2_triggered = (is_long and price >= self.tp2) or (not is_long and price <= self.tp2)
             if tp2_triggered:
-                logger.info("[%s] TP2 alcanzado (precio=%.5f TP2=%.5f)", self.symbol, price, self.tp2)
+                logger.info("[%s] TP2 alcanzado (precio=%.5f)", self.symbol, price)
                 self.tp2_hit = True
                 mark_tp2_hit(self.symbol)
                 partial_qty = self._round_qty(self._open_qty * TP2_PARTIAL_RATIO)
@@ -1117,7 +1011,7 @@ class FuturesTrader:
                 except Exception:
                     pass
 
-        # ── Verificacion periodica SL/TP en exchange ─────────────────────────────────
+        # ── Verificacion periodica SL/TP ─────────────────────────────────────────────
         now = time.monotonic()
         if (
             not self._trailing_sl_activated
@@ -1127,10 +1021,7 @@ class FuturesTrader:
             self._last_tpsl_verify_at = now
             try:
                 await self._ensure_tpsl_on_exchange(
-                    qty=self._open_qty,
-                    sl=self.sl,
-                    tp1=self.tp1,
-                    pos_side=self.position,
+                    qty=self._open_qty, sl=self.sl, tp1=self.tp1, pos_side=self.position,
                 )
             except Exception as e:
                 logger.error("[%s] _ensure_tpsl error: %s", self.symbol, e)
@@ -1139,43 +1030,23 @@ class FuturesTrader:
 
     async def _try_open_position(self, price: float, risk, global_risk) -> None:
         """
-        Evalúa señales y abre posición si corresponde.
-        Si DecisionEngine está disponible, lo usa como gate adicional.
-        La lógica de señal (decide/ai_decide) siempre corre primero.
+        Si DecisionEngine está disponible, delega en él completamente:
+          evaluate(trader=self, risk=risk, global_risk=global_risk)
+          El DE evalua señal, filtros, sizing y abre la posición internamente.
+
+        Sin DE, no hace nada (path legacy no implementado aquí).
         """
-        try:
-            ohlcv = await self.get_ohlcv()
-            if len(ohlcv) < OHLCV_MIN_BARS:
-                logger.debug("[%s] OHLCV insuficiente (%d bars) — skip", self.symbol, len(ohlcv))
-                return
-
-            signal = await decide(
-                symbol=self.symbol,
-                ohlcv=ohlcv,
-                price=price,
-                ohlcv_fn=self.get_ohlcv,
-            )
-
-            if not signal or not signal.get("side"):
-                logger.debug("[%s] Sin señal — skip", self.symbol)
-                return
-
-            # FIX DecisionEngine evaluate: se llama con (symbol, signal, price)
-            # NO con (self, risk, global_risk)
-            if self._decision_engine is not None:
-                approved, reason, enriched = await self._decision_engine.evaluate(
-                    symbol=self.symbol,
-                    signal=signal,
-                    price=price,
+        if self._decision_engine is not None:
+            try:
+                await self._decision_engine.evaluate(
+                    trader=self,
+                    risk=risk,
+                    global_risk=global_risk,
                 )
-                if not approved:
-                    logger.info("[%s] DecisionEngine rechazó la señal: %s", self.symbol, reason)
-                    return
-                if enriched:
-                    signal = enriched
-
-        except Exception as e:
-            logger.error("[%s] _try_open_position error: %s", self.symbol, e, exc_info=True)
+            except Exception as e:
+                logger.error("[%s] DecisionEngine.evaluate error: %s", self.symbol, e, exc_info=True)
+        else:
+            logger.debug("[%s] DecisionEngine no disponible — sin entradas automáticas.", self.symbol)
 
     # ── Loop principal ──────────────────────────────────────────────────────────────────────────────
 
@@ -1214,10 +1085,7 @@ class FuturesTrader:
         if self.position is not None:
             if did_check_exchange and exchange_positions is not None:
                 if len(exchange_positions) == 0:
-                    logger.warning(
-                        "[%s] Posicion local pero NO en exchange — limpiando estado.",
-                        self.symbol,
-                    )
+                    logger.warning("[%s] Posicion local pero NO en exchange — limpiando.", self.symbol)
                     pnl_pct = 0.0
                     if self.entry_price and self.entry_price > 0:
                         pnl_pct = ((price - self.entry_price) / self.entry_price) * (
