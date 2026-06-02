@@ -187,7 +187,7 @@ class PairScanner:
         # el ciclo de scan con N llamadas secuenciales.
         if _AI_NEWS_FILTER and scored:
             try:
-                from ai_filter import news_score_adjustment
+                from bot.ai_filter import news_score_adjustment
 
                 async def _fetch_delta(pair: dict) -> float:
                     try:
