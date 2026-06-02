@@ -51,12 +51,15 @@ SISTEMA DE SCORING (max_score = 10):
     - Vol 15m < 0.6x: mercado dormido, no entrar
 
   MIN_SCORE  = 6 / 10  (60% de confluencia)
-  MIN_RR     = 1.6
+  MIN_RR     = 2.5     ← sólo trades con RR mínimo real
 
-SL/TP (multiplicadores ATR equilibrados — cubre comisiones y sigue siendo alcanzable):
-  Modo tendencia : SL bajo low vela + buffer ATR | TP=2.0*ATR
-  Modo breakout  : SL bajo vela de ruptura       | TP=1.8*ATR
-  Modo reversal  : SL ajustado (1.2*ATR)         | TP=1.6*ATR
+SL/TP (multiplicadores ATR para garantizar RR >= 2.5):
+  SL ATR mult = 1.5 (base)
+  Para RR=2.5 necesitamos TP >= SL_dist * 2.5, es decir TP_mult >= SL_mult * 2.5 = 3.75
+
+  Modo tendencia : SL=1.5×ATR | TP=3.8×ATR  → RR ~2.53
+  Modo breakout  : SL=1.5×ATR | TP=3.8×ATR  → RR ~2.53
+  Modo reversal  : SL=1.2×ATR | TP=3.1×ATR  → RR ~2.58
 
   TP2 mantenido como referencia interna (no se usa en órdenes).
   Trailing TP eliminado.
@@ -75,15 +78,15 @@ log = logging.getLogger(__name__)
 
 # ─── Constantes ──────────────────────────────────────────────────────────────────────────────
 MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
-MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.6"))
+MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "2.5"))
 
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
 _SL_ATR_MULT       = float(os.getenv("SL_ATR_MULT",  "1.5"))
-# TP equilibrado: 2.0x ATR tendencia, 1.8x breakout, 1.6x reversal
-# Suficiente para cubrir comisiones con apalancamiento, y estadisticamente alcanzable
-_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "2.0"))
-_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.0"))
+# TP calibrado para garantizar RR >= 2.5 con SL de 1.5x ATR:
+#   TP_mult >= SL_mult * MIN_RR  → 1.5 * 2.5 = 3.75 → usamos 3.8 con margen
+_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "3.8"))
+_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "5.5"))
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 
@@ -194,17 +197,17 @@ async def analyze_pair(
 
     if setup_type == "REVERSAL":
         sl_mult  = float(os.getenv("SL_ATR_MULT_REVERSAL",  "1.2"))
-        # Reversal: el primer impulso tras el extremo suele recorrer ~1.6 ATR
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.6"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "2.5"))
+        # Reversal con SL=1.2×ATR: TP_mult >= 1.2 * 2.5 = 3.0 → usamos 3.1 con margen
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "3.1"))
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "5.0"))
     elif setup_type == "BREAKOUT":
         sl_mult  = _SL_ATR_MULT
-        # Breakout: 1.8 ATR — mas conservador que tendencia pero cubre comisiones
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "1.8"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "2.8"))
+        # Breakout con SL=1.5×ATR: TP_mult >= 1.5 * 2.5 = 3.75 → usamos 3.8
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "3.8"))
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "5.5"))
     else:  # TENDENCIA
         sl_mult  = _SL_ATR_MULT
-        # Tendencia: 2.0 ATR — equilibrio entre ser alcanzable y cubrir costes
+        # Tendencia con SL=1.5×ATR: TP_mult >= 3.75 → usamos 3.8
         tp1_mult = _TP1_ATR_MULT
         tp2_mult = _TP2_ATR_MULT
 
@@ -228,7 +231,8 @@ async def analyze_pair(
     else:
         entry_mode = "EARLY"
 
-    if entry_mode == "STRONG" and rr >= 2.0:
+    # STRONG necesita RR >= 2.5 para apalancamiento máximo
+    if entry_mode == "STRONG" and rr >= 2.5:
         suggested_lev = _MAX_LEV
     elif entry_mode == "NORMAL":
         suggested_lev = max(1, int(_MAX_LEV * 0.6))
