@@ -8,6 +8,10 @@ Fixes incluidos en esta versión:
   Bug B — check_sl_software añade margen configurable SL_SW_MARGIN_PCT
            para evitar doble cierre cuando el exchange ya ejecutó el SL.
   Bug C — _place_emergency_sl_tp redondea qty antes de enviar la orden.
+  Bug H — _update_trailing_sl ahora invoca trailing_hl.update() para
+           que el trailing stop nativo de HL esté activo en producción.
+           Anteriormente solo delegaba en trader._do_trailing_sl_update()
+           que no existe en ai_trader.py, dejando el trailing inactivo.
 """
 from __future__ import annotations
 
@@ -19,6 +23,8 @@ from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     pass
+
+from bot.trailing_hl import trailing_hl  # Bug H fix
 
 log = logging.getLogger(__name__)
 
@@ -78,7 +84,7 @@ class PositionManager:
       - Verificación periódica de órdenes SL/TP en el exchange
       - Colocación de emergencia si faltan SL/TP
       - Check de SL por software (con margen anti-doble-cierre)
-      - Trailing SL
+      - Trailing SL nativo en HL (Bug H fix)
     """
 
     def __init__(self, trader) -> None:
@@ -268,17 +274,50 @@ class PositionManager:
     # ── Trailing SL ───────────────────────────────────────────────────────────
 
     async def _update_trailing_sl(self) -> None:
-        """Delega en el trader si tiene lógica de trailing SL."""
+        """
+        Bug H fix: invoca trailing_hl.update() para que el trailing stop
+        nativo de Hyperliquid se coloque/actualice en el exchange.
+
+        Antes solo delegaba en trader._do_trailing_sl_update() que no existe
+        en ai_trader.py, dejando el trailing completamente inactivo.
+
+        Prioridad:
+          1. trailing_hl.update() — trailing nativo en HL (supervive crashes)
+          2. trader._do_trailing_sl_update() — fallback legacy si existe
+        """
         trader = self._trader
+        symbol = getattr(trader, "symbol", "?")
+        price  = getattr(trader, "_last_price", None)
+
+        # 1. Trailing nativo HL (Bug H fix)
+        if price:
+            position = getattr(trader, "position", {}) or {}
+            side_raw = position.get("side", "long").lower()
+            side = "long" if "long" in side_raw else "short"
+            size = getattr(trader, "_open_qty", 0.0) or 0.0
+            exch = getattr(trader, "_exch", None) or getattr(trader, "exchange", None)
+            try:
+                trail_px = await trailing_hl.update(
+                    symbol=symbol,
+                    current_price=price,
+                    exch=exch,
+                    size=size,
+                )
+                if trail_px is not None:
+                    log.debug(
+                        "[%s] trailing_hl activo → trail_px=%.4f",
+                        symbol, trail_px,
+                    )
+            except Exception as e:
+                log.debug("[%s] trailing_hl.update error: %s", symbol, e)
+
+        # 2. Fallback legacy (compatibilidad)
         update_fn = getattr(trader, "_do_trailing_sl_update", None)
         if callable(update_fn):
             try:
                 await update_fn()
             except Exception as e:
-                log.debug(
-                    "[%s] trailing SL update error: %s",
-                    getattr(trader, "symbol", "?"), e,
-                )
+                log.debug("[%s] trailing SL legacy update error: %s", symbol, e)
 
     # ── Cierre de emergencia ──────────────────────────────────────────────────
 
