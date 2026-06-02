@@ -6,9 +6,16 @@ MEJORAS v4:
   BUG #2 FIX: qty post-TP1 actualizada desde exchange antes de _place_tpsl
   BUG #3 FIX: adopt_orphan() para posiciones huérfanas al rotar PairScanner
 
+MEJORAS v5:
+  FIX #4: position_timeout registra TIMEOUT en signal_cooldown.mark_closed()
+          para evitar reentrada inmediata tras timeout.
+  FIX #5: trailing SL documentado claramente — TRAILING_BE y TRAILING_TP1_LOCK
+          activan SL→breakeven en TP1 y SL→TP1 en TP2, respectivamente.
+          El trailing dinámico (callback) solo se activa cuando managed_by_trader=False.
+
 Responsabilidades:
   - Detectar TP2 parcial
-  - Calcular y actualizar trailing stop
+  - Calcular y actualizar trailing stop (SL→BE en TP1, SL→TP1 en TP2)
   - Evaluar SL / TP1 / TP3 y emitir señal de cierre
   - Persistir y limpiar estado de posición
   - Notificar cierres y TP parciales via Telegram
@@ -16,6 +23,7 @@ Responsabilidades:
   - Liberar exposición en pretrade_risk al cerrar (register_close)
   - Decrementar global_risk al cerrar
   - Bloquear reapertura hasta nueva vela 15m tras cierre
+  - Registrar cooldown en signal_cooldown en TODOS los cierres (SL/TP/TIMEOUT/MANUAL)
 """
 from __future__ import annotations
 
@@ -38,6 +46,10 @@ TRAILING_TP1_LOCK = os.getenv("TRAILING_TP1_LOCK", "true").lower() != "false"  #
 
 # SL de emergencia para posiciones huérfanas adoptadas: % desde entry
 _ORPHAN_SL_PCT = float(os.getenv("ORPHAN_SL_PCT", "3.0"))
+
+# FIX #4: timeout max antes de registrar cooldown TIMEOUT
+# Leemos la misma env que position_timeout.py para consistencia
+_POSITION_TIMEOUT_ENABLED = os.getenv("POSITION_TIMEOUT_ENABLED", "true").lower() == "true"
 
 
 class PositionManager:
@@ -83,10 +95,33 @@ class PositionManager:
         is_long  = trader.position == "long"
         entry_px = trader.entry_price
 
-        # ── #1 Trailing stop escalonado ───────────────────────────────────────
-        # Se ejecuta siempre (actualiza estado en memoria), pero solo mueve el SL
-        # del exchange cuando managed_by_trader=False para evitar conflicto con
-        # el SL que ya colocó trader.py.
+        # ── FIX #4: Position Timeout → registrar cooldown TIMEOUT ────────────
+        # position_timeout.py puede llamar a _close_position directamente, pero
+        # si lo detectamos aquí antes de que lo haga trader.py, registramos el
+        # cooldown. La llamada es idempotente (mark_closed no duplica).
+        if _POSITION_TIMEOUT_ENABLED:
+            try:
+                from bot.position_timeout import position_timeout
+                open_ts = getattr(trader, "_open_ts", None) or getattr(trader, "_position_open_ts", None)
+                if open_ts and position_timeout.is_expired(
+                    symbol=sym,
+                    open_ts=open_ts,
+                    tp1=trader.tp1,
+                    price=price,
+                    is_long=is_long,
+                ):
+                    entry_mode = getattr(trader, "_entry_mode", "NORMAL") or "NORMAL"
+                    if not signal_cooldown.is_in_cooldown(sym):
+                        signal_cooldown.mark_closed(sym, "TIMEOUT", entry_mode)
+                        logger.info(
+                            "[%s] ⏱ Position timeout detectado → cooldown TIMEOUT registrado",
+                            sym,
+                        )
+            except Exception as e:
+                logger.debug("[%s] position_timeout check en manage() error: %s", sym, e)
+
+        # ── FIX #5: Trailing stop escalonado (documentado claramente) ─────────
+        # Nivel 1: SL → breakeven cuando TP1 es tocado
         if TRAILING_BE and trader.tp1 and trader.sl is not None:
             tp1_reached = (
                 (is_long  and price >= trader.tp1)
@@ -110,6 +145,7 @@ class PositionManager:
                         "position": trader.position,
                     })
 
+        # Nivel 2: SL → TP1 cuando TP2 es tocado (lock profit)
         if TRAILING_TP1_LOCK and trader.tp2 and trader.tp1 and trader.sl is not None:
             tp2_reached_for_lock = (
                 (is_long  and price >= trader.tp2)
@@ -122,7 +158,7 @@ class PositionManager:
                     trader.sl = lock_sl
                     self._tp1_lock_activated[sym] = True
                     logger.info(
-                        "[%s] 🔒 SL → TP1 %.4f (era %.4f, TP2 tocado)",
+                        "[%s] 🔒 SL → TP1 %.4f (era %.4f, TP2 tocado) — profit bloqueado",
                         sym, trader.sl, old_sl,
                     )
                     save_position(sym, {
@@ -211,7 +247,10 @@ class PositionManager:
                                     sym, e,
                                 )
 
-        # ── Trailing stop dinámico (callback) ────────────────────────────────
+        # ── Trailing stop dinámico (callback) — solo en modo legacy ──────────
+        # NOTA: este trailing dinámico solo se ejecuta cuando managed_by_trader=False.
+        # En modo normal (managed_by_trader=True), trader.py gestiona su propio SL
+        # directamente con las órdenes trigger del exchange.
         if risk.trailing_sl and trader.sl is not None:
             activation_px = entry_px * (
                 1 + risk.trailing_activation_pct / 100
@@ -317,7 +356,9 @@ class PositionManager:
         self._be_activated.pop(sym, None)
         self._tp1_lock_activated.pop(sym, None)
 
-        signal_cooldown.mark_closed(sym, close_reason)
+        # FIX #4: mark_closed con entry_mode para cooldown correcto
+        entry_mode = getattr(trader, "_entry_mode", "NORMAL") or "NORMAL"
+        signal_cooldown.mark_closed(sym, close_reason, entry_mode)
 
         await notify_close(
             symbol=sym,
@@ -425,13 +466,11 @@ class PositionManager:
             "entry_mode":  "orphan",
         })
 
-        # Registrar en pretrade_risk
         try:
             pretrade_risk.confirm_order(sym, trader._open_margin)
         except Exception as e:
             logger.warning("[%s] adopt_orphan: pretrade_risk.confirm_order error: %s", sym, e)
 
-        # Colocar SL de emergencia en exchange
         if not trader.dry_run:
             try:
                 await trader._place_tpsl(qty=qty, sl=emergency_sl, tp=None, entry_px=entry_px)

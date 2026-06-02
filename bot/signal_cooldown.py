@@ -17,15 +17,24 @@ MEJORAS v3:
   - Cooldown TP_HIT reducido: tras TP, cooldown = base × 0.5 (ya existía como
       "timeout") ahora con reason='TP' explícito para claridad en logs.
 
+MEJORAS v4 (PERSISTENCE):
+  - Persistencia en JSON: _cooldown_until, _consecutive_sl y _manual_close_until
+    se guardan en COOLDOWN_PERSIST_PATH tras cada write.
+  - Al iniciar, se cargan del fichero. Las entradas expiradas se descartan.
+  - Esto evita que un redeploy/crash en Railway resetee cooldowns activos.
+
 Config Railway:
   COOLDOWN_EARLY          → cooldown base modo EARLY  (default 300s = 5min)
   COOLDOWN_NORMAL         → cooldown base modo NORMAL (default 180s = 3min)
   COOLDOWN_STRONG         → cooldown base modo STRONG (default 120s = 2min)
   COOLDOWN_SL_MULT        → multiplicador por SL (default 2.0 para 2º SL, 4.0 para 3º+)
   COOLDOWN_MANUAL_CLOSE   → cooldown tras cierre manual (default 600s = 10min)
+  COOLDOWN_PERSIST_PATH   → ruta del fichero JSON de persistencia
+                            (default /tmp/cooldown_state.json en Railway)
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -41,12 +50,14 @@ COOLDOWN_BY_MODE: Dict[str, float] = {
 }
 COOLDOWN_SL_MULT    = float(os.getenv("COOLDOWN_SL_MULT",      "2.0"))
 COOLDOWN_MANUAL_SEC = float(os.getenv("COOLDOWN_MANUAL_CLOSE", "600"))
+_PERSIST_PATH       = os.getenv("COOLDOWN_PERSIST_PATH", "/tmp/cooldown_state.json")
 
 
 class SignalCooldown:
     """
     Rastrea el cooldown por símbolo con escalado dinámico por SL consecutivos.
     Incluye cooldown separado para cierres manuales (MANUAL_CLOSE).
+    Estado persistido en JSON para sobrevivir reinicios de Railway.
     """
 
     def __init__(self) -> None:
@@ -56,6 +67,44 @@ class SignalCooldown:
         self._consecutive_sl: Dict[str, int] = {}
         # {symbol: timestamp de cierre manual}
         self._manual_close_until: Dict[str, float] = {}
+        self._load()
+
+    # ── Persistencia ──────────────────────────────────────────────────────────
+
+    def _load(self) -> None:
+        """Carga estado desde JSON. Descarta entradas expiradas."""
+        try:
+            with open(_PERSIST_PATH, "r") as f:
+                data = json.load(f)
+            now = time.time()
+            self._cooldown_until = {
+                k: v for k, v in data.get("cooldown_until", {}).items() if v > now
+            }
+            self._consecutive_sl = data.get("consecutive_sl", {})
+            self._manual_close_until = {
+                k: v for k, v in data.get("manual_close_until", {}).items() if v > now
+            }
+            active = len(self._cooldown_until) + len(self._manual_close_until)
+            if active:
+                log.info("[cooldown] Estado restaurado: %d cooldowns activos", active)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log.warning("[cooldown] No se pudo cargar estado persistido: %s", e)
+
+    def _save(self) -> None:
+        """Persiste estado actual en JSON."""
+        try:
+            data = {
+                "cooldown_until":      self._cooldown_until,
+                "consecutive_sl":      self._consecutive_sl,
+                "manual_close_until":  self._manual_close_until,
+                "saved_at":            time.time(),
+            }
+            with open(_PERSIST_PATH, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            log.warning("[cooldown] No se pudo persistir estado: %s", e)
 
     # ── Consultas ─────────────────────────────────────────────────────────────
 
@@ -78,7 +127,6 @@ class SignalCooldown:
         until = self._manual_close_until.get(symbol, 0.0)
         if time.time() < until:
             return True
-        # Limpiar entrada expirada
         self._manual_close_until.pop(symbol, None)
         return False
 
@@ -96,6 +144,7 @@ class SignalCooldown:
             symbol, COOLDOWN_MANUAL_SEC,
             time.strftime("%H:%M:%S", time.localtime(until)),
         )
+        self._save()
 
     def mark_closed(self, symbol: str, reason: str, entry_mode: str = "NORMAL") -> None:
         """
@@ -107,7 +156,6 @@ class SignalCooldown:
         self._manual_close_until.pop(symbol, None)
 
         if reason == "SL":
-            # Incrementar contador de SL consecutivos
             self._consecutive_sl[symbol] = self._consecutive_sl.get(symbol, 0) + 1
             n_sl = self._consecutive_sl[symbol]
 
@@ -137,12 +185,14 @@ class SignalCooldown:
             )
 
         self._cooldown_until[symbol] = time.time() + cooldown
+        self._save()
 
     def reset(self, symbol: str) -> None:
         """Forzar reset completo (para tests o admin manual)."""
         self._cooldown_until.pop(symbol, None)
         self._consecutive_sl.pop(symbol, None)
         self._manual_close_until.pop(symbol, None)
+        self._save()
 
     def consecutive_sl(self, symbol: str) -> int:
         """Número de SL consecutivos actuales para el símbolo."""

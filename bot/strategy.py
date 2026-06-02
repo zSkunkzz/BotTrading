@@ -26,6 +26,12 @@ FIX 6: Propagar ef_penalty al decision_engine (v4.4):
   - decision_engine.evaluate() ya lee decision.get('ef_penalty', 0)
     y aplica sizing reducido según calidad de señal
 
+FIX 7: market_regime gate en RANGING:
+  - Si market_regime global está en RANGING, se eleva MIN_SIGNAL_SCORE a
+    RANGING_MIN_SCORE (default: 9) y se bloquean entradas EARLY.
+  - Si market_regime está en VOLATILE, se eleva a VOLATILE_MIN_SCORE (default: 8).
+  - Si MARKET_REGIME_GATE=false en Railway, este bloque se salta completamente.
+
 Variables de entorno:
   MIN_SIGNAL_SCORE             (default: 6)
   MIN_RR_REQUIRED              (default: 1.8)
@@ -35,6 +41,9 @@ Variables de entorno:
   AI_HIGH_CONFIDENCE_THRESHOLD (default: 8)
   USE_AI_FOR_NEWS              (default: true)
   ENRICHED_FALLBACK_MIN_SCORE  (default: 8)  — score mínimo para entrar sin datos externos
+  RANGING_MIN_SCORE            (default: 9)  — score mínimo en régimen RANGING
+  VOLATILE_MIN_SCORE           (default: 8)  — score mínimo en régimen VOLATILE
+  RANGING_BLOCK_EARLY          (default: true) — bloquear modo EARLY en RANGING
 """
 
 import logging
@@ -61,11 +70,60 @@ AI_HIGH_CONFIDENCE_THRESHOLD = int(os.getenv("AI_HIGH_CONFIDENCE_THRESHOLD", "8"
 USE_AI_FOR_NEWS              = os.getenv("USE_AI_FOR_NEWS", "true").lower() != "false"
 
 # FIX 5: score mínimo para entrar cuando fetch_enriched_context ha fallado
-# Por debajo de este valor → HOLD (señal marginal + sin validación externa = riesgo alto)
 _ENRICHED_FALLBACK_MIN_SCORE = int(os.getenv("ENRICHED_FALLBACK_MIN_SCORE", "8"))
+
+# FIX 7: market_regime gate
+_RANGING_MIN_SCORE    = int(os.getenv("RANGING_MIN_SCORE",   "9"))
+_VOLATILE_MIN_SCORE   = int(os.getenv("VOLATILE_MIN_SCORE",  "8"))
+_RANGING_BLOCK_EARLY  = os.getenv("RANGING_BLOCK_EARLY", "true").lower() != "false"
 
 _AI_NEWS_COOLDOWN_S = int(os.getenv("AI_NEWS_COOLDOWN_S", "300"))  # 5 min
 _last_ai_news_call: dict[str, float] = {}
+
+
+def _apply_regime_gate(signal: SignalResult, symbol: str) -> Optional[dict]:
+    """
+    FIX 7: Comprueba el régimen de mercado global (BTC) y eleva el umbral
+    de score o bloquea la entrada según el régimen.
+
+    Returns None si la señal pasa el gate, o un dict HOLD si queda bloqueada.
+    """
+    try:
+        from bot.market_regime import market_regime, MARKET_REGIME_GATE
+        if not MARKET_REGIME_GATE:
+            return None
+
+        regime_raw = market_regime.regime_raw()  # TRENDING / RANGING / VOLATILE / UNKNOWN
+
+        if regime_raw == "RANGING":
+            # Bloquear EARLY directamente en RANGING
+            if _RANGING_BLOCK_EARLY and signal.entry_mode == "EARLY":
+                return _result(
+                    "HOLD", signal, False,
+                    f"🔴 market_regime=RANGING → modo EARLY bloqueado (false breakout risk)",
+                )
+            # Exigir score mínimo más alto
+            if signal.score < _RANGING_MIN_SCORE:
+                return _result(
+                    "HOLD", signal, False,
+                    f"🔴 market_regime=RANGING → score={signal.score} < {_RANGING_MIN_SCORE} requerido",
+                )
+            log.info(
+                "[strategy] %s market_regime=RANGING pero score=%d >= %d — permitiendo",
+                symbol, signal.score, _RANGING_MIN_SCORE,
+            )
+
+        elif regime_raw == "VOLATILE":
+            if signal.score < _VOLATILE_MIN_SCORE:
+                return _result(
+                    "HOLD", signal, False,
+                    f"🟡 market_regime=VOLATILE → score={signal.score} < {_VOLATILE_MIN_SCORE} requerido",
+                )
+
+    except Exception as e:
+        log.debug("[strategy] _apply_regime_gate error (ignorado): %s", e)
+
+    return None  # gate pasado
 
 
 async def decide(
@@ -116,6 +174,11 @@ async def decide(
 
     if signal.signal == "NEUTRAL":
         return _result("HOLD", signal, False, "Señal técnica neutral")
+
+    # FIX 7: gate de régimen de mercado (RANGING/VOLATILE)
+    regime_block = _apply_regime_gate(signal, symbol)
+    if regime_block is not None:
+        return regime_block
 
     if signal.entry_mode == "STRONG" and SKIP_AI_ON_STRONG:
         action = "BUY" if signal.signal == "LONG" else "SELL"
@@ -242,7 +305,6 @@ async def decide(
                     log.warning(f"[strategy] IA noticias falló: {e} — ignorando")
 
         # ── Paso 4: entrada (filtro determinista pasado) ──────────────────────
-        # FIX 6: propagar ef_result.penalty para que decision_engine ajuste sizing
         return _result(
             action_if_pass, signal, False,
             f"✅ EnrichedFilter OK · {ef_result.reason} · "
@@ -251,8 +313,6 @@ async def decide(
         )
 
     # FIX 5: Fallback seguro — sin datos externos
-    # Si el enriquecimiento falló Y la señal es marginal → HOLD
-    # Si el enriquecimiento falló Y la señal es fuerte → entra con WARNING
     if enriched_failed:
         if signal.score < _ENRICHED_FALLBACK_MIN_SCORE:
             return _result(
@@ -269,7 +329,6 @@ async def decide(
             f"score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x"
         )
 
-    # Sin datos externos por ausencia (no por error) → decisión puramente técnica
     log.info(f"[strategy] {symbol} Sin datos externos — decisión técnica pura")
     return _result(
         action_if_pass, signal, False,
@@ -291,14 +350,13 @@ def _format_news_only(enriched) -> str:
 
 def _result(
     action: str,
-    signal: Optional[SignalResult],
+    signal,
     ai_used: bool,
     reason: str,
     ai_confidence: int = 0,
     ai_reason: str = "",
     ef_penalty: int = 0,
 ) -> dict:
-    # FIX 6: incluir ef_penalty en el dict para que decision_engine pueda leerlo
     return {
         "action":        action,
         "signal":        signal,
