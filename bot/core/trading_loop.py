@@ -13,6 +13,11 @@ FIX v3 (2026-06-02):
   trading_loop.py pasaba (symbol, position_mgr=...) causando TypeError en cada arranque.
   Fix: DecisionEngine se construye lazy en run() cuando ya tenemos todos los objetos,
   y evaluate() se llama con la firma correcta (symbol, price, ohlcv).
+
+FIX v4 (2026-06-02):
+  `from bot.cooldown import signal_cooldown` → módulo incorrecto.
+  El archivo real es bot/signal_cooldown.py.
+  Fix: `from bot.signal_cooldown import signal_cooldown`.
 """
 from __future__ import annotations
 
@@ -51,7 +56,8 @@ class TradingLoop:
     def _build_decision_engine(self, risk):
         """Construye DecisionEngine con los objetos correctos del risk manager."""
         from bot import signal_engine
-        from bot.cooldown import signal_cooldown
+        # FIX v4: el módulo se llama signal_cooldown.py, no cooldown.py
+        from bot.signal_cooldown import signal_cooldown
 
         # risk es el objeto TradeRisk / GlobalRisk que llega desde main.py
         # Intentamos obtener pretrade_risk desde risk; si no existe, usamos risk mismo.

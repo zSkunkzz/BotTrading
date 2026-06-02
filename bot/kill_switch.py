@@ -45,6 +45,12 @@ FIX re-arm sin clave (2026-06-02):
   manual_reset() ya no valida ninguna clave. El acceso está protegido
   exclusivamente por TELEGRAM_CHAT_ID (solo el chat autorizado puede enviar
   comandos al bot). Eliminada dependencia de KILL_SWITCH_REARM_KEY.
+
+FIX run_watchdog (2026-06-02):
+  main.py llama kill_switch.run_watchdog(trader_instances) pero el método
+  no existía (sólo existía _watchdog_tick interno).
+  Fix: añadir método público async run_watchdog(traders) que ejecuta
+  _watchdog_tick() en loop cada KS_WATCHDOG_INTERVAL_S segundos.
 """
 
 import asyncio
@@ -343,6 +349,27 @@ class KillSwitch:
     async def _watchdog_tick(self):
         """Llamar periódicamente desde el loop principal."""
         await self._maybe_autoreset_l2()
+
+    async def run_watchdog(self, traders=None) -> None:
+        """
+        Loop público del watchdog. Llamado desde main.py como:
+            asyncio.create_task(kill_switch.run_watchdog(trader_instances))
+
+        Ejecuta _watchdog_tick() cada KS_WATCHDOG_INTERVAL_S segundos.
+        `traders` se acepta por compatibilidad con la firma de main.py pero
+        no se usa directamente — el watchdog opera sobre el estado interno del KS.
+        """
+        interval = _CFG["watchdog_interval_s"]
+        logger.info("KillSwitch watchdog arrancado (intervalo=%ds)", interval)
+        while True:
+            try:
+                await self._watchdog_tick()
+            except asyncio.CancelledError:
+                logger.info("KillSwitch watchdog cancelado.")
+                raise
+            except Exception as e:
+                logger.warning("KillSwitch watchdog error: %s", e)
+            await asyncio.sleep(interval)
 
     # ── Persistencia ────────────────────────────────────────────────────────────────────
 
