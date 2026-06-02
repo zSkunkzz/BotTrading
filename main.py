@@ -339,6 +339,11 @@ async def main():
         max_global_daily_loss_pct=float(os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")),
     )
 
+    # FIX: sincronizar GlobalRisk._open con las posiciones REALES del exchange.
+    # Sin esto, si el archivo en disco dice _open=1 pero no hay posición real,
+    # can_open() bloquea todos los traders y el bot no abre ningún trade.
+    await global_risk.sync_open_count(len(real_open_symbols))
+
     webhook_runner = await start_webhook_server()
 
     top_n = int(os.getenv("TOP_PAIRS", str(MAX_ACTIVE_TRADERS * 2)))

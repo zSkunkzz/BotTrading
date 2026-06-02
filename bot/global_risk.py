@@ -6,6 +6,8 @@ MEJORAS:
     para sobrevivir reinicios/deploys. Sin esto, tras un crash el bot
     cree que tiene 0 posiciones abiertas y puede abrir más de las permitidas.
   - register_close() ahora acepta symbol opcional para logging.
+  - sync_open_count(n): sincroniza _open con el número real de posiciones
+    abiertas en el exchange tras arranque (evita bloqueos por stale state).
 """
 import asyncio
 import json
@@ -65,6 +67,23 @@ class GlobalRisk:
         self._daily_pnl = 0.0
         self._save_state()
         logger.info("Global daily PnL reseteado")
+
+    async def sync_open_count(self, real_count: int) -> None:
+        """
+        Sincroniza _open con el número real de posiciones abiertas en el exchange.
+        Llamar después de _purge_stale_state() en el arranque para evitar que
+        un contador obsoleto en disco bloquee can_open() para todos los traders.
+        """
+        async with self._lock:
+            if self._open != real_count:
+                logger.info(
+                    "[GlobalRisk] Corrigiendo contador: disco=%d → real=%d",
+                    self._open, real_count,
+                )
+                self._open = real_count
+                self._save_state()
+            else:
+                logger.debug("[GlobalRisk] Contador ya sincronizado: %d", self._open)
 
     # ── Persistencia ──────────────────────────────────────────────────────────
 
