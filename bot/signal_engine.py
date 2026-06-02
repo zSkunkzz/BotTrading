@@ -24,6 +24,12 @@ OHLCV:
   Si se pasa, se usa en lugar de exch.fetch_ohlcv() para aprovechar la ruta
   WS→caché→REST del trader (trader.get_ohlcv). Si no se pasa, se usa ccxt directamente.
   Esto evita 3 llamadas REST extra por ciclo cuando el trader ya tiene los datos.
+
+FIX symbol_format:
+  ccxt-Hyperliquid requiere el formato completo "SOL/USDC:USDC" para fetch_ohlcv.
+  Si se pasa solo el coin corto ("SOL", "BTC") el exchange lanza
+  'hyperliquid does not have market symbol SOL'.
+  _to_ccxt_symbol() normaliza cualquier formato al completo antes de llamar al exchange.
 """
 from __future__ import annotations
 
@@ -52,9 +58,6 @@ _TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "4.5"))
 _MAX_LEV      = int(os.getenv("LEVERAGE", "15"))
 
 # FIX 1: Zonas RSI asimétricas y no solapadas
-# LONG: zona 45-65 (momentum alcista, sin sobrecompra)
-# SHORT: zona 35-55 (momentum bajista, sin sobreventa)
-# Solapamiento 45-55 → zona neutra, no puntúa nadie
 _RSI_LONG_MIN  = float(os.getenv("RSI_SCORE_LONG_MIN",  "45"))
 _RSI_LONG_MAX  = float(os.getenv("RSI_SCORE_LONG_MAX",  "65"))
 _RSI_SHORT_MIN = float(os.getenv("RSI_SCORE_SHORT_MIN", "35"))
@@ -63,11 +66,41 @@ _RSI_SHORT_MAX = float(os.getenv("RSI_SCORE_SHORT_MAX", "55"))
 _VOL_DIRECTIONAL_MIN = float(os.getenv("VOL_DIRECTIONAL_MIN", "1.3"))
 _VOL_WEAK_MAX        = float(os.getenv("VOL_WEAK_MAX",        "0.8"))
 
-# FIX 3: Margen adicional al anclar SL a high/low de vela
-_SL_CANDLE_BUFFER = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))  # ATR multiplicador buffer
+_SL_CANDLE_BUFFER = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 
 
-# ─── SignalResult ─────────────────────────────────────────────────────────────
+# ─── _to_ccxt_symbol ────────────────────────────────────────────────────────────────────
+
+def _to_ccxt_symbol(symbol: str) -> str:
+    """
+    FIX symbol_format: normaliza cualquier variante al formato ccxt-Hyperliquid.
+
+    Ejemplos:
+      "SOL"            -> "SOL/USDC:USDC"
+      "SOL/USDT"       -> "SOL/USDC:USDC"
+      "SOL/USDC:USDC"  -> "SOL/USDC:USDC"  (ya correcto, no tocamos)
+      "SOL/USD:USDC"   -> "SOL/USDC:USDC"
+      "SOLUSDT"        -> "SOL/USDC:USDC"
+    """
+    if "/USDC:USDC" in symbol:
+        return symbol
+
+    # Quitar sufijos comunes
+    coin = (
+        symbol
+        .replace(":USDT", "")
+        .replace(":USDC", "")
+        .replace("/USDT", "")
+        .replace("/USDC", "")
+        .replace("/USD",  "")
+        .replace("USDT",  "")
+        .upper()
+        .strip()
+    )
+    return f"{coin}/USDC:USDC"
+
+
+# ─── SignalResult ───────────────────────────────────────────────────────────────────────
 
 @dataclass
 class SignalResult:
@@ -91,7 +124,7 @@ class SignalResult:
     extra:        Dict = field(default_factory=dict)
 
 
-# ─── analyze_pair ─────────────────────────────────────────────────────────────
+# ─── analyze_pair ──────────────────────────────────────────────────────────────────────
 
 async def analyze_pair(
     exch,
@@ -129,7 +162,6 @@ async def analyze_pair(
     if signal_str == "NEUTRAL":
         return _hold_result(symbol, f"NEUTRAL (score={score}/{max_score})")
 
-    # ── Precio y ATR ──────────────────────────────────────────────────────────
     last_bar    = bars_15m[-1]
     close_price = float(last_bar[4])
     high_price  = float(last_bar[2])
@@ -140,10 +172,6 @@ async def analyze_pair(
     if atr_val <= 0:
         return _hold_result(symbol, "ATR=0 — no se puede calcular SL/TP")
 
-    # FIX 3: SL anclado al extremo de la vela + buffer ATR
-    # LONG: sl = min(low - buffer, entry - 1.5*atr)  → siempre fuera del range de la vela
-    # SHORT: sl = max(high + buffer, entry + 1.5*atr)
-    # Así el SL nunca queda dentro del body de la vela actual aunque sea grande.
     _atr_sl   = _SL_ATR_MULT  * atr_val
     _atr_buf  = _SL_CANDLE_BUFFER * atr_val
     _atr_tp1  = _TP1_ATR_MULT * atr_val
@@ -153,7 +181,7 @@ async def analyze_pair(
         sl  = round(min(low_price - _atr_buf, entry - _atr_sl), 6)
         tp1 = round(entry + _atr_tp1, 6)
         tp2 = round(entry + _atr_tp2, 6)
-    else:  # SHORT
+    else:
         sl  = round(max(high_price + _atr_buf, entry + _atr_sl), 6)
         tp1 = round(entry - _atr_tp1, 6)
         tp2 = round(entry - _atr_tp2, 6)
@@ -162,7 +190,6 @@ async def analyze_pair(
     reward = abs(tp1 - entry)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
 
-    # ── Entry mode ────────────────────────────────────────────────────────────
     if score >= max_score - 1:
         entry_mode = "STRONG"
     elif score >= MIN_SCORE + 2:
@@ -170,17 +197,12 @@ async def analyze_pair(
     else:
         entry_mode = "EARLY"
 
-    # FIX 2: Leverage dinámico basado en calidad de señal
-    # STRONG + RR >= 2.5 → leverage máximo configurado
-    # NORMAL          → 60% del máximo
-    # EARLY           → 40% del máximo
     if entry_mode == "STRONG" and rr >= 2.5:
         suggested_lev = _MAX_LEV
     elif entry_mode == "NORMAL":
         suggested_lev = max(1, int(_MAX_LEV * 0.6))
-    else:  # EARLY
+    else:
         suggested_lev = max(1, int(_MAX_LEV * 0.4))
-    # El trader lo capará al máximo del par en el exchange
 
     is_valid = score >= MIN_SCORE and rr >= MIN_RR
 
@@ -210,18 +232,23 @@ async def analyze_pair(
     )
 
 
-# ─── OHLCV fetch (fallback sin caché) ─────────────────────────────────────────
+# ─── OHLCV fetch (fallback sin caché) ────────────────────────────────────────────────────
 
 async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
+    """
+    FIX symbol_format: ccxt-Hyperliquid necesita "SOL/USDC:USDC", no "SOL".
+    _to_ccxt_symbol() normaliza antes de llamar a fetch_ohlcv().
+    """
+    ccxt_sym = _to_ccxt_symbol(symbol)
     try:
-        bars = await exch.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        bars = await exch.fetch_ohlcv(ccxt_sym, timeframe=timeframe, limit=limit)
         return bars or []
     except Exception as e:
-        log.warning("[signal_engine] fetch_ohlcv(%s, %s) error: %s", symbol, timeframe, e)
+        log.warning("[signal_engine] fetch_ohlcv(%s, %s) error: %s", ccxt_sym, timeframe, e)
         return []
 
 
-# ─── Indicadores ──────────────────────────────────────────────────────────────
+# ─── Indicadores ────────────────────────────────────────────────────────────────────────
 
 def _compute_indicators(bars: list) -> dict:
     """Calcula EMA21/50, RSI14, MACD, SuperTrend, ATR14 y vol_ratio."""
@@ -262,34 +289,16 @@ def _compute_indicators(bars: list) -> dict:
     }
 
 
-# ─── Scoring ──────────────────────────────────────────────────────────────────
+# ─── Scoring ──────────────────────────────────────────────────────────────────────────────
 
 def _score_signal(
     i15: dict, i1h: dict, i4h: dict
 ) -> Tuple[int, int, str, List[str]]:
-    """
-    Sistema de puntuación multi-timeframe. max_score = 10.
-
-    15m: EMA(1) + MACD(1) + SuperTrend(1) + RSI(1) + VOL(1) = 5 pts
-    1h:  EMA(1) + MACD(1) + SuperTrend(1)                    = 3 pts
-    4h:  EMA(1) + MACD(1)                                    = 2 pts
-
-    FIX 1: RSI con zonas asimétricas y NO solapadas:
-      LONG  puntúa si 45 <= RSI <= 65  (momentum alcista, sin sobrecompra)
-      SHORT puntúa si 35 <= RSI <= 55  (momentum bajista, sin sobreventa)
-      Zona 45-55 neutral: ambas condiciones podrían cumplirse, pero se evalúan
-      de forma excluyente: si RSI >= 45 y <= 65 entra por LONG; SHORT solo
-      si RSI < 45 (no hay solapamiento en la práctica para la misma vela).
-
-    FIX 4: Score en empate devuelve long_pts (total) no 0, para que el caller
-      pueda distinguir mercado-partido (5L/5S) de sin-datos (0/0).
-    """
     max_score = 10
     long_pts  = 0
     short_pts = 0
     reasons   = []
 
-    # ── 15m ───────────────────────────────────────────────────────────────────
     if i15.get("ema_bull"):  long_pts  += 1; reasons.append("EMA15m↑")
     if i15.get("ema_bear"):  short_pts += 1; reasons.append("EMA15m↓")
     if i15.get("macd_bull"): long_pts  += 1; reasons.append("MACD15m↑")
@@ -297,20 +306,15 @@ def _score_signal(
     if i15.get("st_bull"):   long_pts  += 1; reasons.append("ST15m↑")
     if i15.get("st_bear"):   short_pts += 1; reasons.append("ST15m↓")
 
-    # FIX 1: RSI zonas asimétricas no solapadas
-    # LONG:  45-65  (momentum alcista sin sobrecompra)
-    # SHORT: 35-55  (momentum bajista sin sobreventa)
-    # Zona 45-55: primero se evalúa LONG; SHORT solo aplica si RSI < 45
-    # (en la práctica nunca hay solapamiento real en la misma dirección)
     rsi15 = i15.get("rsi_val")
     if rsi15 is not None:
-        if _RSI_LONG_MIN <= rsi15 <= _RSI_LONG_MAX:           # 45-65
+        if _RSI_LONG_MIN <= rsi15 <= _RSI_LONG_MAX:
             long_pts += 1
             reasons.append(f"RSI15m={rsi15:.0f} zona LONG (45-65)")
-        elif _RSI_SHORT_MIN <= rsi15 < _RSI_LONG_MIN:         # 35-44
+        elif _RSI_SHORT_MIN <= rsi15 < _RSI_LONG_MIN:
             short_pts += 1
             reasons.append(f"RSI15m={rsi15:.0f} zona SHORT (35-44)")
-        elif _RSI_SHORT_MAX < rsi15 < _RSI_LONG_MIN:          # 55-44 → dead zone
+        elif _RSI_SHORT_MAX < rsi15 < _RSI_LONG_MIN:
             reasons.append(f"RSI15m={rsi15:.0f} zona neutra — no puntúa")
         elif rsi15 > 70:
             reasons.append(f"RSI15m={rsi15:.0f} sobrecompra — no puntúa")
@@ -319,7 +323,6 @@ def _score_signal(
         else:
             reasons.append(f"RSI15m={rsi15:.0f} zona neutra — no puntúa")
 
-    # Volumen direccional
     vol15     = i15.get("vol_ratio", 1.0)
     price_dir = i15.get("price_dir", "unknown")
     if vol15 >= _VOL_DIRECTIONAL_MIN:
@@ -336,7 +339,6 @@ def _score_signal(
     else:
         reasons.append(f"Vol15m={vol15:.1f}x normal — no puntúa")
 
-    # ── 1h ────────────────────────────────────────────────────────────────────
     if i1h:
         if i1h.get("ema_bull"):  long_pts  += 1; reasons.append("EMA1h↑")
         if i1h.get("ema_bear"):  short_pts += 1; reasons.append("EMA1h↓")
@@ -345,14 +347,12 @@ def _score_signal(
         if i1h.get("st_bull"):   long_pts  += 1; reasons.append("ST1h↑")
         if i1h.get("st_bear"):   short_pts += 1; reasons.append("ST1h↓")
 
-    # ── 4h ────────────────────────────────────────────────────────────────────
     if i4h:
         if i4h.get("ema_bull"):  long_pts  += 1; reasons.append("EMA4h↑")
         if i4h.get("ema_bear"):  short_pts += 1; reasons.append("EMA4h↓")
         if i4h.get("macd_bull"): long_pts  += 1; reasons.append("MACD4h↑")
         if i4h.get("macd_bear"): short_pts += 1; reasons.append("MACD4h↓")
 
-    # ── Decisión ──────────────────────────────────────────────────────────────
     if long_pts > short_pts:
         tf1h_ok = (not i1h) or i1h.get("ema_bull") or i1h.get("st_bull")
         if tf1h_ok:
@@ -365,12 +365,10 @@ def _score_signal(
             return short_pts, max_score, "SHORT", reasons
         return short_pts, max_score, "NEUTRAL", reasons + ["1h_no_confirma"]
 
-    # FIX 4: Empate — devuelve long_pts (total puntos acumulados) en lugar de 0
-    # El caller ve score>0 con NEUTRAL → mercado partido (no sin datos)
     return long_pts, max_score, "NEUTRAL", reasons + ["empate"]
 
 
-# ─── _hold_result ─────────────────────────────────────────────────────────────
+# ─── _hold_result ──────────────────────────────────────────────────────────────────────────
 
 def _hold_result(symbol: str, reason: str) -> SignalResult:
     return SignalResult(
@@ -392,7 +390,7 @@ def _hold_result(symbol: str, reason: str) -> SignalResult:
     )
 
 
-# ─── format_signal_block ──────────────────────────────────────────────────────
+# ─── format_signal_block ───────────────────────────────────────────────────────────────────
 
 def format_signal_block(signal: Optional[SignalResult]) -> str:
     if signal is None:
@@ -416,7 +414,7 @@ def format_signal_block(signal: Optional[SignalResult]) -> str:
     return "\n".join(lines)
 
 
-# ─── SignalFlipGuard ───────────────────────────────────────────────────────────
+# ─── SignalFlipGuard ───────────────────────────────────────────────────────────────────────
 
 _FLIP_COOLDOWN_S = float(os.getenv("SIGNAL_FLIP_COOLDOWN_S", "120"))
 
