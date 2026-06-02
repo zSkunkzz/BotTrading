@@ -25,6 +25,16 @@ FIX CRÍTICO (2026-06-02) — CAUSA RAÍZ DE DUPLICACIONES:
   (ya estaba en historial) → asumía no-fill → fallback MARKET → DUPLICADO.
   Solución: detectar fill inmediato mirando si status[0] tiene clave "filled".
 
+FIX entry_px en place_sl/place_tp (2026-06-02):
+  execute() y _place_tpsl() no propagaban entry_px a place_sl()/place_tp().
+  Sin entry_px, _adjust_sl_px/_adjust_tp_px en hl_client.py no podían
+  validar ni corregir precios inválidos (ej. SL de LONG >= entry por
+  redondeo del signal_engine), causando que Hyperliquid rechazara con
+  'Invalid TPSL price' → sl_placed=False → _protection_ok=False →
+  KillSwitch L3 en 30s.
+  Solución: execute() acepta entry_px opcional (fallback a arrival_price)
+  y lo propaga a _place_tpsl(), que lo pasa a place_sl()/place_tp().
+
 Variables de entorno (todas opcionales):
   EE_LIMIT_TIMEOUT_S          default 4
   EE_MAX_SPREAD_BPS_LIMIT     default 15
@@ -161,6 +171,7 @@ class ExecutionEngine:
         reduce_only:   bool = False,
         sl:            Optional[float] = None,
         tp:            Optional[float] = None,
+        entry_px:      Optional[float] = None,  # FIX entry_px: precio real de entrada para validar SL/TP
     ) -> dict:
         sym    = trader.symbol
         client = self._get_client(sym)
@@ -256,7 +267,10 @@ class ExecutionEngine:
 
         # ── Colocar SL + TP tras entrada confirmada ──────────────────
         if entry_ok and not reduce_only and trade_side == "open":
-            await self._place_tpsl(client, is_buy, qty, sl, tp, sym)
+            # FIX entry_px: usar entry_px si se proporcionó, si no usar arrival_price
+            # para que place_sl/place_tp puedan validar y corregir precios inválidos
+            effective_entry_px = entry_px if (entry_px and entry_px > 0) else arrival_price
+            await self._place_tpsl(client, is_buy, qty, sl, tp, sym, effective_entry_px)
 
         self._finalize_rec(rec, result, side, arrival_price)
         return result
@@ -271,6 +285,7 @@ class ExecutionEngine:
         sl: Optional[float],
         tp: Optional[float],
         sym: str,
+        entry_px: Optional[float] = None,  # FIX: propagado desde execute()
     ) -> None:
         close_is_buy = not is_buy  # cerrar LONG = SELL (False) | cerrar SHORT = BUY (True)
 
@@ -292,6 +307,7 @@ class ExecutionEngine:
                             is_buy=close_is_buy,
                             sz=qty,
                             trigger_px=float(sl),
+                            entry_px=entry_px,  # FIX: permite validar SL < entry (LONG) / SL > entry (SHORT)
                         ),
                     )
                     statuses = result.get("response", {}).get("data", {}).get("statuses", [{}])
@@ -342,6 +358,7 @@ class ExecutionEngine:
                             sz=qty,
                             trigger_px=float(tp),
                             limit_px=tp_limit,
+                            entry_px=entry_px,  # FIX: permite validar TP > entry (LONG) / TP < entry (SHORT)
                         ),
                     )
                     statuses = result.get("response", {}).get("data", {}).get("statuses", [{}])
