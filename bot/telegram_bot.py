@@ -53,11 +53,9 @@ async def notify_startup(pairs: list, dry_run: bool, top_n: int):
 async def notify_open(
     symbol,
     side,
-    # precio de entrada — acepta price= o entry= (decision_engine usa entry=)
     price=None,
     entry=None,
     leverage=None,
-    # tamaño — acepta usdt=, usdc=, size_usdc=, notional= indistintamente
     usdt=None,
     usdc=None,
     size_usdc=None,
@@ -67,12 +65,11 @@ async def notify_open(
     tp2=None,
     tp3=None,
     dry_run=False,
-    # kwargs extra que decision_engine puede pasar — los mostramos si tienen valor
     signal_block=None,
     ai_used=False,
     ai_confidence=0,
     entry_mode=None,
-    **kwargs,  # absorbe cualquier kwarg futuro sin crashear
+    **kwargs,
 ):
     actual_price = price if price is not None else entry
     actual_size  = size_usdc if size_usdc is not None else (
@@ -151,15 +148,15 @@ async def notify_kill_switch(level: int, trigger: str):
     level_labels = {
         1: "\u26a0\ufe0f L1 \u2014 Nuevas entradas pausadas",
         2: "\U0001f6d1 L2 \u2014 S\u00edmbolo/estrategia halted",
-        3: "\U0001f6a8 L3 \u2014 \u00d3rdenes bloqueadas (re-arm manual)",
-        4: "\U0001f480 L4 \u2014 HARD KILL (re-arm manual)",
+        3: "\U0001f6a8 L3 \u2014 \u00d3rdenes bloqueadas",
+        4: "\U0001f480 L4 \u2014 HARD KILL",
     }
     label = level_labels.get(level, f"L{level}")
     await _send(
         f"\U0001f6d1 <b>KILL SWITCH ACTIVADO</b>\n"
         f"Nivel: <b>{label}</b>\n"
         f"Trigger: <code>{_esc(trigger[:300])}</code>\n"
-        f"{'\u26a0\ufe0f RE-ARM MANUAL requerido' if level >= 3 else '\u2705 Se puede resetear autom\u00e1ticamente'}"
+        f"Usa /resetks para re-armar el bot."
     )
 
 
@@ -178,10 +175,48 @@ async def _handle_update(update: Update) -> None:
         parts = text.split()
         await _cmd_resetks(msg.chat_id, parts[1:])
     elif text.startswith("/ksstatus"):
-        await _cmd_resetks(msg.chat_id, ["status"])
+        await _cmd_ksstatus(msg.chat_id)
+
+
+async def _cmd_ksstatus(chat_id: int | str) -> None:
+    """Muestra el estado actual del Kill Switch sin hacer nada."""
+    from bot.kill_switch import kill_switch
+    bot = _get_bot()
+    if not bot:
+        return
+
+    async def reply(text: str):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        except TelegramError as e:
+            logger.warning("[Telegram cmd_ksstatus] %s", e)
+
+    lvl     = kill_switch.level()
+    trigger = kill_switch._trigger or "\u2014"
+    halted  = ", ".join(kill_switch._halted_symbols) or "ninguno"
+    hard    = "S\u00cd \U0001f480" if kill_switch.is_hard_killed() else "no"
+    daily   = kill_switch._daily_pnl
+    consec  = kill_switch._consec_losses
+    await reply(
+        f"\U0001f6d1 <b>Kill Switch \u2014 Estado actual</b>\n"
+        f"Nivel: <b>L{lvl}</b> {'\u2705 OK' if lvl == 0 else '\u26a0\ufe0f ACTIVO'}\n"
+        f"Trigger: <code>{_esc(trigger[:200])}</code>\n"
+        f"Hard killed: {hard}\n"
+        f"S\u00edmbolos pausados: <code>{_esc(halted)}</code>\n"
+        f"PnL diario acum: <code>{daily:+.2f}%</code>\n"
+        f"P\u00e9rdidas consecutivas: <code>{consec}</code>"
+    )
 
 
 async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
+    """
+    /resetks          — re-arma el Kill Switch completamente (sin clave)
+    /resetks daily    — resetea solo contadores diarios (sin clave)
+    /ksstatus         — muestra estado sin modificar nada
+
+    El acceso está protegido únicamente por TELEGRAM_CHAT_ID: solo el chat
+    autorizado puede enviar comandos. No se requiere clave adicional.
+    """
     from bot.kill_switch import kill_switch
     bot = _get_bot()
     if not bot:
@@ -193,32 +228,9 @@ async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
         except TelegramError as e:
             logger.warning("[Telegram cmd_resetks] %s", e)
 
-    if not args or args[0].lower() == "status":
-        lvl     = kill_switch.level()
-        trigger = kill_switch._trigger or "\u2014"
-        halted  = ", ".join(kill_switch._halted_symbols) or "ninguno"
-        hard    = "S\u00cd \U0001f480" if kill_switch.is_hard_killed() else "no"
-        daily   = kill_switch._daily_pnl
-        consec  = kill_switch._consec_losses
-        await reply(
-            f"\U0001f6d1 <b>Kill Switch \u2014 Estado actual</b>\n"
-            f"Nivel: <b>L{lvl}</b> {'\u2705 OK' if lvl == 0 else '\u26a0\ufe0f ACTIVO'}\n"
-            f"Trigger: <code>{_esc(trigger[:200])}</code>\n"
-            f"Hard killed: {hard}\n"
-            f"S\u00edmbolos pausados: <code>{_esc(halted)}</code>\n"
-            f"PnL diario acum: <code>{daily:+.2f}%</code>\n"
-            f"P\u00e9rdidas consecutivas: <code>{consec}</code>"
-        )
-        return
-
-    key        = args[0]
-    daily_only = len(args) >= 2 and args[1].lower() == "daily"
-
-    if daily_only:
-        if key != os.getenv("KILL_SWITCH_REARM_KEY", "REARM-BOTTRADING"):
-            await reply("\U0001f6ab <b>Clave incorrecta.</b> Kill switch sin cambios.")
-            return
-        kill_switch.reset_daily_pnl()
+    # /resetks daily — resetea solo contadores diarios sin tocar el nivel del KS
+    if args and args[0].lower() == "daily":
+        await kill_switch.reset_daily_pnl()
         await reply(
             "\u2705 <b>Contadores diarios reseteados</b>\n"
             "PnL diario, p\u00e9rdidas consecutivas y reconexiones API \u2192 0\n"
@@ -226,23 +238,18 @@ async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
         )
         return
 
-    ok = await kill_switch.manual_reset(key)
-    if ok:
-        await reply(
-            "\u2705 <b>Kill Switch RE-ARMADO</b>\n"
-            "Nivel: <b>L0 \u2014 OK</b>\n"
-            "Todos los contadores y flags reseteados.\n"
-            "El bot puede volver a abrir posiciones."
-        )
-        await _send(
-            "\U0001f513 <b>Kill Switch re-armado manualmente</b> v\u00eda Telegram.\n"
-            "Bot vuelve a estar operativo."
-        )
-    else:
-        await reply(
-            "\U0001f6ab <b>Clave incorrecta.</b>\n"
-            "El kill switch sigue activo."
-        )
+    # /resetks — re-arm completo sin clave
+    await kill_switch.manual_reset()
+    await reply(
+        "\u2705 <b>Kill Switch RE-ARMADO</b>\n"
+        "Nivel: <b>L0 \u2014 OK</b>\n"
+        "Todos los contadores y flags reseteados.\n"
+        "El bot puede volver a abrir posiciones."
+    )
+    await _send(
+        "\U0001f513 <b>Kill Switch re-armado manualmente</b> v\u00eda Telegram.\n"
+        "Bot vuelve a estar operativo."
+    )
 
 
 async def _polling_loop() -> None:
