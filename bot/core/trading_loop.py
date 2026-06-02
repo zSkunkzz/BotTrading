@@ -14,6 +14,11 @@ FIX v10 (2026-06-03): timeout en evaluate() + logs de diagnóstico
     3. asyncio.wait_for(_get_positions(), timeout=15s).
     4. Logs de diagnóstico al inicio de cada _iteration() y en puntos
        clave para saber exactamente dónde se cuelga.
+
+FIX v11 (2026-06-03): logs INFO visibles en cada scan
+  - Cada iteración sin posición loguea precio + score en INFO.
+  - Con posición abierta loguea precio actual + PnL% en INFO.
+  - Cada 6 iteraciones (~60s) muestra un heartbeat de todos los traders.
 """
 from __future__ import annotations
 
@@ -39,6 +44,9 @@ _EXTERNAL_CLOSE_COOLDOWN_S = int(os.getenv("EXTERNAL_CLOSE_COOLDOWN_S", "600"))
 _GET_PRICE_TIMEOUT_S    = float(os.getenv("GET_PRICE_TIMEOUT_S",    "10"))
 _GET_POS_TIMEOUT_S      = float(os.getenv("GET_POS_TIMEOUT_S",      "15"))
 _EVALUATE_TIMEOUT_S     = float(os.getenv("EVALUATE_TIMEOUT_S",     "60"))
+
+# Cada cuántas iteraciones mostrar el log de scan visible (default: cada 1 = siempre)
+_SCAN_LOG_EVERY         = int(os.getenv("SCAN_LOG_EVERY", "1"))
 
 
 class TradingLoop:
@@ -286,17 +294,40 @@ class TradingLoop:
         # ── Gestionar posición abierta o evaluar nueva entrada ───────────────
         if trader.position is not None:
             trader._last_price = price
+
+            # Log visible de posición activa con PnL en tiempo real
+            if n % max(1, _SCAN_LOG_EVERY) == 0:
+                entry = trader.entry_price or price
+                pnl_pct = ((price - entry) / entry * 100) if trader.position == "long" \
+                          else ((entry - price) / entry * 100)
+                sl_dist = abs(price - trader.sl) / price * 100 if trader.sl else 0
+                tp_dist = abs(trader.tp1 - price) / price * 100 if trader.tp1 else 0
+                logger.info(
+                    "[%s] 📊 %s @ %.4f | entry=%.4f | PnL=%+.2f%% | "
+                    "SL=%.4f (%.2f%%) | TP1=%.4f (%.2f%%)",
+                    self.symbol, trader.position.upper(), price,
+                    entry, pnl_pct,
+                    trader.sl or 0, sl_dist,
+                    trader.tp1 or 0, tp_dist,
+                )
+
             await self._position_mgr.manage()
         else:
             remaining = get_cooldown_remaining(self.symbol)
             if remaining > 0:
-                logger.debug(
-                    "[%s] En cooldown post-cierre externo — %.0f s restantes.",
-                    self.symbol, remaining,
-                )
+                if n % max(1, _SCAN_LOG_EVERY) == 0:
+                    logger.info(
+                        "[%s] ⏳ Cooldown activo — %.0f s restantes.",
+                        self.symbol, remaining,
+                    )
                 return
 
-            logger.debug("[%s] #%d evaluando señal (precio=%.4f)...", self.symbol, n, price)
+            # Log visible de scan activo
+            if n % max(1, _SCAN_LOG_EVERY) == 0:
+                logger.info(
+                    "[%s] 🔍 Scan #%d | precio=%.4f | buscando señal...",
+                    self.symbol, n, price,
+                )
 
             ohlcv_fn = trader.get_ohlcv_fn()
             try:
@@ -318,9 +349,17 @@ class TradingLoop:
                 return
 
             if signal:
+                score = signal.get("score", signal.get("strength", "?"))
+                mode  = signal.get("mode", signal.get("entry_mode", "?"))
                 logger.info(
-                    "[%s] Señal aceptada por DecisionEngine: action=%s side=%s",
-                    self.symbol, signal.get("action"), signal.get("side"),
+                    "[%s] ✅ Señal aceptada por DecisionEngine: action=%s side=%s "
+                    "score=%s mode=%s entry=%.4f sl=%.4f tp1=%.4f",
+                    self.symbol,
+                    signal.get("action"), signal.get("side"),
+                    score, mode,
+                    float(signal.get("entry") or price),
+                    float(signal.get("sl") or 0),
+                    float(signal.get("tp1") or 0),
                 )
                 pos_before = trader.position
                 await trader.open_order(signal, risk)
@@ -343,3 +382,10 @@ class TradingLoop:
                         )
                     except Exception as _te:
                         logger.debug("[%s] notify_open error: %s", self.symbol, _te)
+            else:
+                # Sin señal — log del resultado del scan
+                if n % max(1, _SCAN_LOG_EVERY) == 0:
+                    logger.info(
+                        "[%s] ⬜ Sin señal | precio=%.4f",
+                        self.symbol, price,
+                    )
