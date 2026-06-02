@@ -55,7 +55,7 @@ FIX DecisionEngine/pretrade_risk interface (2026-06-02):
 FIX _get_signal → strategy.decide() (2026-06-02):
   _get_signal llamaba ai_decide() directamente, devolviendo solo
   {"action","confidence","reasoning"} sin sl/tp1/tp2.
-  _execute_signal recibía sl=None, tp1=None → nunca colocaba SL/TP
+  _execute_signal recíbia sl=None, tp1=None → nunca colocaba SL/TP
   → _protection_ok=False → KillSwitch disparaba KS L3 en 30s.
   Además todo el pipeline técnico (signal_engine, enriched_filter,
   F&G, funding, OI) era ignorado completamente.
@@ -66,6 +66,13 @@ FIX _execute_signal risk.usdc_per_trade (2026-06-02):
   _execute_signal usaba `risk.usdc_per_trade` como fallback de margin, pero
   `risk` es RiskManager (no tiene ese atributo) → AttributeError silencioso.
   Fix: usar float(os.getenv("USDC_PER_TRADE", "20")) como fallback.
+
+FIX MANUAL_CLOSE cooldown (2026-06-02):
+  Al detectar CLOSED_EXTERNALLY (posición en estado local pero ausente en
+  exchange), se registra un cooldown de COOLDOWN_MANUAL_CLOSE segundos
+  (por defecto 600s = 10 min) para evitar reentrar inmediatamente en el
+  mismo símbolo tras un cierre manual. El cooldown se comprueba al inicio
+  de _try_open_position y bloquea nuevas entradas hasta que expire.
 """
 from __future__ import annotations
 
@@ -91,8 +98,9 @@ from bot.execution.execution_engine import execution_engine
 from bot.ohlcv_cache import ohlcv_cache
 from bot.signal_engine import signal_flip_guard
 from bot.trailing_sl import compute_trailing_sl, is_trailing_sl_hit
+from bot.signal_cooldown import signal_cooldown
 
-# ── DecisionEngine (opcional) ───────────────────────────────────────────────
+# ── DecisionEngine (opcional) ────────────────────────────────────────────
 try:
     from bot.decision_engine import DecisionEngine as _DecisionEngine  # FIX: era bot.core.decision_engine
     _DE_AVAILABLE = True
@@ -128,7 +136,7 @@ _MAX_EXPECTED_RO_ORDERS = int(os.getenv("MAX_EXPECTED_RO_ORDERS", "2"))
 
 _USDC_PER_TRADE = float(os.getenv("USDC_PER_TRADE", "20"))
 
-# ── Rate limiter global para /info ────────────────────────────────────────
+# ── Rate limiter global para /info ─────────────────────────────────────────
 GL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
 _HL_MIN_INTERVAL = 0.6
@@ -143,7 +151,7 @@ async def _hl_throttle():
         _HL_LAST_CALL = time.monotonic()
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────────
 
 def _norm_coin(symbol: str) -> str:
     s = symbol.replace("/", "").replace(":USDT", "").upper()
@@ -215,7 +223,7 @@ def _hl_cancel_order(exchange, coin: str, oid) -> None:
     exchange.cancel(coin, int(oid))
 
 
-# ──────────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────────
 class FuturesTrader:
     def __init__(self, api_key, api_secret, symbol,
                  leverage, margin_mode, dry_run,
@@ -307,7 +315,7 @@ class FuturesTrader:
             logger.warning("[%s] No se pudo obtener maxLeverage — usando 20: %s", self.symbol, e)
             return 20
 
-    # ── Qty rounding ───────────────────────────────────────────────────────────
+    # ── Qty rounding ─────────────────────────────────────────────────────
 
     def _round_qty(self, qty: float) -> float:
         try:
@@ -317,7 +325,7 @@ class FuturesTrader:
         factor = 10 ** sz_dec
         return math.floor(qty * factor) / factor
 
-    # ── ccxt ─────────────────────────────────────────────────────────────────────────
+    # ── ccxt ─────────────────────────────────────────────────────────────────────────────
 
     async def _get_ccxt(self):
         if self._ccxt_exchange is None:
@@ -345,7 +353,7 @@ class FuturesTrader:
                 pass
             self._ccxt_exchange = None
 
-    # ── HTTP helpers ─────────────────────────────────────────────────────────────
+    # ── HTTP helpers ─────────────────────────────────────────────────────────────────
 
     async def _info_post(self, payload: dict) -> dict:
         await _hl_throttle()
@@ -368,7 +376,7 @@ class FuturesTrader:
                             return _json.loads(await r2.text())
                 return _json.loads(await r.text())
 
-    # ── Init / cleanup ───────────────────────────────────────────────────────────────
+    # ── Init / cleanup ───────────────────────────────────────────────────────────────────
 
     async def _cleanup_excess_ro_orders(self) -> None:
         try:
@@ -431,7 +439,6 @@ class FuturesTrader:
         símbolo durante la verificación y evite falsos state_mismatch.
         """
         if not self.position or not self.sl or not self.tp1:
-            # Sin datos suficientes para reponer — el loop normal lo manejará
             return
 
         kill_switch.mark_tpsl_retrying(self.symbol)
@@ -442,8 +449,6 @@ class FuturesTrader:
                 tp1=self.tp1,
                 pos_side=self.position,
             )
-            # Marcar como verificado para que _manage_open_position no repita
-            # la verificación inmediatamente
             self._last_tpsl_verify_at = time.monotonic()
             if self._protection_ok:
                 logger.info(
@@ -467,10 +472,6 @@ class FuturesTrader:
             exchange_pos = await self._get_positions()
             if exchange_pos is not None and len(exchange_pos) > 0:
                 self._restore_position_fields(saved)
-                # FIX: NO asignar _last_tpsl_verify_at = 0.0 aquí.
-                # _verify_protection_on_restore() lo setea a time.monotonic()
-                # si tiene éxito. Si se asigna 0.0 antes y _verify falla,
-                # el watchdog ve 0.0 y dispara on_state_mismatch inmediatamente.
                 logger.info("[%s] Posicion restaurada: %s @ %s",
                             self.symbol, self.position, self.entry_price)
 
@@ -484,10 +485,6 @@ class FuturesTrader:
                         )
 
                 await self._cleanup_excess_ro_orders()
-
-                # FIX KS L3: verificar/reponer SL/TP antes de que el watchdog
-                # empiece a comprobar _protection_ok (el watchdog actúa cada 30s,
-                # pero _manage_open_position verifica cada 120s — llegaba tarde).
                 await self._verify_protection_on_restore()
 
             elif exchange_pos is not None and len(exchange_pos) == 0:
@@ -532,7 +529,7 @@ class FuturesTrader:
         self._stopped_event.set()
         logger.info("[%s] Trader cleanup completado.", self.symbol)
 
-    # ── Precio y OHLCV ──────────────────────────────────────────────────────────────
+    # ── Precio y OHLCV ───────────────────────────────────────────────────────────────────
 
     async def get_price(self) -> float:
         try:
@@ -590,7 +587,7 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage ────────────────────────────────────────────────────────────────────────
+    # ── Leverage ───────────────────────────────────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int) -> None:
         if self.dry_run:
@@ -612,7 +609,7 @@ class FuturesTrader:
             )
         logger.info("[%s] Leverage %dx establecido en exchange", self.symbol, leverage)
 
-    # ── Ordenes ─────────────────────────────────────────────────────────────────────────────────────
+    # ── Ordenes ──────────────────────────────────────────────────────────────────────────────────────────────
 
     async def _get_order_status(self, order_id) -> dict:
         try:
@@ -655,7 +652,7 @@ class FuturesTrader:
             await kill_switch.on_order_result(rejected=True)
         return r
 
-    # ── Posiciones ──────────────────────────────────────────────────────────────────────────────
+    # ── Posiciones ──────────────────────────────────────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list | None:
         try:
@@ -698,7 +695,7 @@ class FuturesTrader:
         )
         return []
 
-    # ── _place_tpsl ─────────────────────────────────────────────────────────────────────────
+    # ── _place_tpsl ───────────────────────────────────────────────────────────────────────────────────
 
     async def _place_tpsl(
         self,
@@ -809,7 +806,7 @@ class FuturesTrader:
                 logger.error("[%s] No se pudo colocar TP: %s", self.symbol, e)
                 raise
 
-    # ── _cancel_all_orders_reduce_only ────────────────────────────────────────────────
+    # ── _cancel_all_orders_reduce_only ────────────────────────────────────────────────────
 
     async def _cancel_all_orders_reduce_only(self, coin_orders: list) -> int:
         ro_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
@@ -836,7 +833,7 @@ class FuturesTrader:
         )
         return cancelled
 
-    # ── _ensure_tpsl_on_exchange ─────────────────────────────────────────────────────
+    # ── _ensure_tpsl_on_exchange ─────────────────────────────────────────────────────────────────────
 
     async def _ensure_tpsl_on_exchange(
         self,
@@ -895,7 +892,7 @@ class FuturesTrader:
         except Exception as e:
             logger.error("[%s] _ensure_tpsl: fallo al colocar SL/TP: %s", self.symbol, e)
 
-    # ── Helpers de cierre ────────────────────────────────────────────────────────────────────
+    # ── Helpers de cierre ──────────────────────────────────────────────────────────────────────────────
 
     def _clear_position_state(self) -> None:
         self.position    = None
@@ -933,12 +930,12 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning("[%s] DecisionEngine.on_position_closed error: %s", self.symbol, e)
 
-    # ── _manage_open_position ─────────────────────────────────────────────────────────────
+    # ── _manage_open_position ──────────────────────────────────────────────────────────────────────
 
     async def _manage_open_position(self, price: float, risk) -> None:
         is_long = self.position == "long"
 
-        # ── SL hit check ──────────────────────────────────────────────────────────────
+        # ── SL hit check ───────────────────────────────────────────────────────────────────────
         if self.sl and self.sl > 0:
             sl_triggered = (is_long and price <= self.sl) or (not is_long and price >= self.sl)
             if sl_triggered:
@@ -956,12 +953,13 @@ class FuturesTrader:
                                        pnl_pct * 100, reason="SL")
                 except Exception:
                     pass
+                signal_cooldown.mark_closed(self.symbol, reason="SL", entry_mode=self._open_entry_mode)
                 await self._on_position_closed(pnl_pct, reason="SL")
                 self._clear_position_state()
                 clear_position(self.symbol)
                 return
 
-        # ── TP1 hit check ─────────────────────────────────────────────────────────────
+        # ── TP1 hit check ─────────────────────────────────────────────────────────────────────
         if not self._tp1_hit and self.tp1 and self.tp1 > 0:
             tp1_triggered = (is_long and price >= self.tp1) or (not is_long and price <= self.tp1)
             if tp1_triggered:
@@ -992,7 +990,7 @@ class FuturesTrader:
                     "trail_peak": self._trail_peak,
                 })
 
-        # ── Trailing SL ────────────────────────────────────────────────────────────────────
+        # ── Trailing SL ───────────────────────────────────────────────────────────────────────────────
         if self._trailing_sl_activated and self.sl and self.sl > 0:
             new_sl, new_peak = compute_trailing_sl(
                 is_long=is_long, current_price=price,
@@ -1012,6 +1010,7 @@ class FuturesTrader:
                                        pnl_pct * 100, reason="TRAILING_SL")
                 except Exception:
                     pass
+                signal_cooldown.mark_closed(self.symbol, reason="SL", entry_mode=self._open_entry_mode)
                 await self._on_position_closed(pnl_pct, reason="TRAILING_SL")
                 self._clear_position_state()
                 clear_position(self.symbol)
@@ -1066,7 +1065,7 @@ class FuturesTrader:
                 except Exception as e:
                     logger.error("[%s] Error actualizando trailing SL: %s", self.symbol, e)
 
-        # ── TP2 hit check ─────────────────────────────────────────────────────────────
+        # ── TP2 hit check ─────────────────────────────────────────────────────────────────────
         if self._tp1_hit and not self.tp2_hit and self.tp2 and self.tp2 > 0:
             tp2_triggered = (is_long and price >= self.tp2) or (not is_long and price <= self.tp2)
             if tp2_triggered:
@@ -1085,7 +1084,7 @@ class FuturesTrader:
                 except Exception:
                     pass
 
-        # ── Verificacion periodica SL/TP ─────────────────────────────────────────────
+        # ── Verificacion periodica SL/TP ─────────────────────────────────────────────────────
         now = time.monotonic()
         if (
             not self._trailing_sl_activated
@@ -1100,9 +1099,18 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] _ensure_tpsl error: %s", self.symbol, e)
 
-    # ── _try_open_position ───────────────────────────────────────────────────────────
+    # ── _try_open_position ──────────────────────────────────────────────────────────────────────
 
     async def _try_open_position(self, price: float, risk, global_risk) -> None:
+        # ── BLOQUEO MANUAL_CLOSE ───────────────────────────────────────────────────
+        if signal_cooldown.is_manual_close_cooldown(self.symbol):
+            rem = signal_cooldown.remaining(self.symbol)
+            logger.debug(
+                "[%s] MANUAL_CLOSE cooldown activo — bloqueando entrada (%.0fs restantes)",
+                self.symbol, rem,
+            )
+            return
+
         if self._decision_engine is not None:
             try:
                 signal = await self._get_signal(price)
@@ -1128,7 +1136,7 @@ class FuturesTrader:
         FIX 2026-06-02:
           Antes se llamaba ai_decide() directamente, que solo devuelve
           {"action","confidence","reasoning"} sin sl/tp1/tp2.
-          _execute_signal recibía sl=None, tp1=None → nunca colocaba SL/TP
+          _execute_signal recíbia sl=None, tp1=None → nunca colocaba SL/TP
           → _protection_ok=False → KillSwitch disparaba KS L3 en 30s.
           Además todo el pipeline técnico (signal_engine, enriched_filter,
           F&G, funding, OI) era ignorado completamente.
@@ -1147,7 +1155,7 @@ class FuturesTrader:
             result = await decide(
                 exch,
                 self.symbol,
-                ai_decide,               # ai_decide_fn — usado solo si hay noticias relevantes
+                ai_decide,
                 has_open_position=False,
                 current_pnl=None,
                 ohlcv_fn=self.get_ohlcv,
@@ -1161,7 +1169,7 @@ class FuturesTrader:
                 )
                 return None
 
-            sig = result.get("signal")   # SignalResult con .sl, .tp1, .tp2, etc.
+            sig = result.get("signal")
             if sig is None:
                 logger.warning("[%s] strategy.decide devolvió action=%s pero signal=None", self.symbol, action)
                 return None
@@ -1196,8 +1204,6 @@ class FuturesTrader:
     async def _execute_signal(self, enriched: dict, price: float, risk) -> None:
         """Abre posición basada en señal enriquecida por DecisionEngine."""
         side = enriched.get("side")
-        # FIX: usar _USDC_PER_TRADE como fallback — risk es RiskManager y no
-        # tiene atributo usdc_per_trade.
         margin = enriched.get("_margin", _USDC_PER_TRADE)
         leverage = enriched.get("_leverage", self.leverage)
         sl = enriched.get("sl")
@@ -1261,8 +1267,6 @@ class FuturesTrader:
                 "trailing_sl_activated": False, "trail_peak": 0.0,
             })
 
-            # FIX: on_order_confirmed envuelto en try/except para que un fallo
-            # no deje el risk ledger sin confirmar ni interrumpa _execute_signal.
             try:
                 await self._decision_engine.on_order_confirmed(symbol=self.symbol, margin=margin)
             except Exception as e:
@@ -1273,7 +1277,7 @@ class FuturesTrader:
             except Exception:
                 pass
 
-    # ── Loop principal ──────────────────────────────────────────────────────────────────────────────
+    # ── Loop principal ────────────────────────────────────────────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None):
         self._global_risk = global_risk
@@ -1325,6 +1329,9 @@ class FuturesTrader:
                         )
                     except Exception:
                         pass
+                    # FIX MANUAL_CLOSE: registrar cooldown para evitar reentrar
+                    # inmediatamente tras un cierre manual o externo
+                    signal_cooldown.mark_manual_close(self.symbol)
                     await self._on_position_closed(pnl_pct, reason="CLOSED_EXTERNALLY")
                     self._clear_position_state()
                     clear_position(self.symbol)
