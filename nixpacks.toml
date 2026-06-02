@@ -1,5 +1,0 @@
-[phases.setup]
-cmds = ["pip3 install --upgrade setuptools"]
-
-[phases.install]
-cmds = ["pip3 install -r requirements.txt"]
