@@ -12,6 +12,10 @@ Fixes incluidos en esta versión:
            que el trailing stop nativo de HL esté activo en producción.
            Anteriormente solo delegaba en trader._do_trailing_sl_update()
            que no existe en ai_trader.py, dejando el trailing inactivo.
+  Bug I — _check_sl_software y _place_emergency_sl_tp ahora toleran que
+           trader.position sea un str ("long"/"short") además de un dict
+           {"side": "long"/"short"}, evitando AttributeError: 'str' object
+           has no attribute 'get'.
 """
 from __future__ import annotations
 
@@ -78,6 +82,19 @@ def _round_qty_safe(trader, qty: float) -> float:
     return round(qty, 4)
 
 
+def _resolve_is_long(position) -> bool:
+    """
+    Bug I fix: extrae el lado de la posición tanto si position es un dict
+    {"side": "long"/"short"} como si es directamente un str "long"/"short".
+    Devuelve True para LONG, False para SHORT.
+    """
+    if isinstance(position, dict):
+        return position.get("side", "").upper() == "LONG"
+    if isinstance(position, str):
+        return position.upper() == "LONG"
+    return False
+
+
 class PositionManager:
     """
     Gestiona el ciclo de vida de una posición abierta:
@@ -119,6 +136,8 @@ class PositionManager:
         aplicando un margen configurable (_SL_SW_MARGIN) para evitar
         disparar un cierre cuando el exchange ya ejecutó el SL.
 
+        Bug I fix: tolera position como str o dict.
+
         Retorna True si se ha disparado el cierre, False en caso contrario.
         """
         trader = self._trader
@@ -131,7 +150,8 @@ class PositionManager:
         if not price:
             return False
 
-        is_long = position.get("side", "").upper() == "LONG"
+        # Bug I: usar helper que acepta str o dict
+        is_long = _resolve_is_long(position)
 
         if is_long:
             # Long: SL se activa si el precio cae por debajo de sl × (1 - margen)
@@ -221,6 +241,7 @@ class PositionManager:
     async def _place_emergency_sl_tp(self, place_sl: bool = True, place_tp: bool = True) -> None:
         """
         Bug C fix: redondea qty antes de enviar la orden al exchange.
+        Bug I fix: tolera position como str o dict.
         """
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
@@ -236,8 +257,9 @@ class PositionManager:
             log.error("[%s] _place_emergency_sl_tp: qty=0 — no se puede colocar orden", symbol)
             return
 
-        position = getattr(trader, "position", {})
-        is_long = (position or {}).get("side", "").upper() == "LONG"
+        position = getattr(trader, "position", None)
+        # Bug I: usar helper que acepta str o dict
+        is_long = _resolve_is_long(position)
 
         for attempt in range(1, _EMERGENCY_TPSL_RETRIES + 1):
             try:
@@ -292,7 +314,11 @@ class PositionManager:
         # 1. Trailing nativo HL (Bug H fix)
         if price:
             position = getattr(trader, "position", {}) or {}
-            side_raw = position.get("side", "long").lower()
+            # Bug I: tolerar position como str
+            if isinstance(position, str):
+                side_raw = position.lower()
+            else:
+                side_raw = position.get("side", "long").lower()
             side = "long" if "long" in side_raw else "short"
             size = getattr(trader, "_open_qty", 0.0) or 0.0
             exch = getattr(trader, "_exch", None) or getattr(trader, "exchange", None)
