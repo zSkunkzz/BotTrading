@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
 """
 bot/trader.py — FuturesTrader: punto de entrada público para main.py.
+
+FIX DEADLOCK (2026-06-03):
+  Causa raíz del freeze «se queda pillado»:
+  El SDK de Hyperliquid (Exchange + Info) usa `requests` internamente, que es
+  síncrono y bloqueante. Llamar self._hl_client._exchange.order() / update_leverage()
+  / _info._session.post() directamente desde una corrutina async bloquea el event
+  loop entero. Con 7+ traders en paralelo, el primer bloqueo congela todos los demás.
+
+  Fix: todas las llamadas al SDK síncrono se envuelven en asyncio.to_thread() para
+  que se ejecuten en un hilo del ThreadPoolExecutor sin bloquear el event loop.
+
+  Funciones corregidas:
+    - _info_post        → ahora async, usa asyncio.to_thread
+    - _set_leverage     → asyncio.to_thread para update_leverage
+    - _place_tpsl       → asyncio.to_thread para place_sl / place_tp
+    - open_order (real) → asyncio.to_thread para place_market, place_sl, place_tp
 """
 from __future__ import annotations
 
@@ -41,14 +57,10 @@ _TF_MINUTES = {
 }
 
 # Intentos de confirmación de fill tras orden de mercado
-# Reducido a 3 intentos x 2s = 6s máx (antes era 6x3s=18s)
 _FILL_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "3"))
 _FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "2.0"))
 
 # Desfase máximo permitido entre ref_price y signal.entry antes de cancelar.
-# Aumentado de 1.5% a 3.0% — en cryptos volátiles el precio puede moverse
-# 1-2% entre generación del signal y ejecución de la orden.
-# Configurable vía variable de entorno MAX_ENTRY_DRIFT_PCT (default: 3.0)
 _MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "3.0")) / 100.0
 
 
@@ -64,25 +76,15 @@ def _check_price_staleness(
     Retorna:
       None        → precio aceptable, puede continuar
       str (motivo) → desfase excesivo, abortar la entrada
-
-    Lógica:
-      - Si entry del signal es 0 (no calculado), se omite el check.
-      - drift = (ref_price - entry) / entry
-      - Para LONG: drift > +threshold  → precio subió demasiado (entrada cara)
-                   drift < -threshold  → precio cayó demasiado (setup roto)
-      - Para SHORT: drift < -threshold → precio bajó demasiado (entrada cara)
-                    drift > +threshold → precio subió demasiado (setup roto)
-      - |drift| > 2*threshold          → cancelar siempre (mercado volátil)
     """
     entry_signal = float(signal.get("entry") or 0)
     if entry_signal <= 0:
-        return None  # sin referencia, no podemos hacer el check
+        return None
 
     drift = (ref_price - entry_signal) / entry_signal
     abs_drift = abs(drift)
     threshold = _MAX_ENTRY_DRIFT_PCT
 
-    # Siempre cancelar si el desfase absoluto es enorme (> 2x threshold)
     if abs_drift > threshold * 2:
         return (
             f"⚠️ Precio actual ({ref_price:.4f}) se alejó {drift*100:+.2f}% del entry del signal "
@@ -90,9 +92,8 @@ def _check_price_staleness(
         )
 
     if abs_drift <= threshold:
-        return None  # dentro del margen aceptable
+        return None
 
-    # Desfase entre threshold y 2*threshold: revisar dirección
     if is_long:
         if drift > 0:
             return (
@@ -106,7 +107,7 @@ def _check_price_staleness(
                 f"({entry_signal:.4f}) — setup roto (precio en caída), cancelado "
                 f"(límite: -{threshold*100:.1f}%)"
             )
-    else:  # SHORT
+    else:
         if drift < 0:
             return (
                 f"⏪ [SHORT] Precio actual ({ref_price:.4f}) bajó {drift*100:+.2f}% bajo entry del signal "
@@ -138,7 +139,6 @@ def _adjust_levels_to_fill(
     if base <= 0:
         base = ref_price
 
-    # Si no hay desfase relevante (< 0.05%) no tocar nada
     if abs(filled_price - base) / base < 0.0005:
         return sl_px, tp1_px, tp2_px
 
@@ -382,22 +382,30 @@ class FuturesTrader:
             return
 
         if sl_price and sl_price > 0:
-            result = self._hl_client.place_sl(
-                is_buy=not is_long,
-                sz=qty,
-                trigger_px=sl_price,
-                entry_px=self.entry_price or sl_price,
-            )
-            logger.info("[%s] _place_tpsl SL=%.4f: %s", self.symbol, sl_price, result)
+            try:
+                result = await asyncio.to_thread(
+                    self._hl_client.place_sl,
+                    is_buy=not is_long,
+                    sz=qty,
+                    trigger_px=sl_price,
+                    entry_px=self.entry_price or sl_price,
+                )
+                logger.info("[%s] _place_tpsl SL=%.4f: %s", self.symbol, sl_price, result)
+            except Exception as e:
+                logger.error("[%s] _place_tpsl SL error: %s", self.symbol, e)
 
         if tp_price and tp_price > 0:
-            result = self._hl_client.place_tp(
-                is_buy=not is_long,
-                sz=qty,
-                trigger_px=tp_price,
-                entry_px=self.entry_price or tp_price,
-            )
-            logger.info("[%s] _place_tpsl TP=%.4f: %s", self.symbol, tp_price, result)
+            try:
+                result = await asyncio.to_thread(
+                    self._hl_client.place_tp,
+                    is_buy=not is_long,
+                    sz=qty,
+                    trigger_px=tp_price,
+                    entry_px=self.entry_price or tp_price,
+                )
+                logger.info("[%s] _place_tpsl TP=%.4f: %s", self.symbol, tp_price, result)
+            except Exception as e:
+                logger.error("[%s] _place_tpsl TP error: %s", self.symbol, e)
 
     def _round_qty(self, qty: float) -> float:
         return self._hl_client.round_sz(qty)
@@ -407,17 +415,28 @@ class FuturesTrader:
             logger.info("[%s] DRY_RUN: _set_leverage(%d) omitido.", self.symbol, leverage)
             return
         try:
-            result = self._hl_client._exchange.update_leverage(
-                leverage, self.coin, is_cross=False
+            # FIX DEADLOCK: update_leverage es síncrono (requests) — usar to_thread
+            result = await asyncio.to_thread(
+                self._hl_client._exchange.update_leverage,
+                leverage, self.coin, False,
             )
             logger.info("[%s] Leverage configurado a %dx: %s", self.symbol, leverage, result)
         except Exception as e:
             logger.warning("[%s] No se pudo configurar leverage: %s", self.symbol, e)
 
-    def _info_post(self, payload: dict) -> dict:
-        return self._hl_client._info._session.post(
-            f"{_API_URL}/info", json=payload
-        ).json()
+    async def _info_post(self, payload: dict) -> dict:
+        """
+        FIX DEADLOCK: _info._session.post() es síncrono (requests).
+        Se envuelve en asyncio.to_thread para no bloquear el event loop.
+        balance_service hace await sobre esta función — antes devolvía un
+        dict (no corrutina) y el await bloqueaba silenciosamente el loop.
+        """
+        def _sync_call() -> dict:
+            return self._hl_client._info._session.post(
+                f"{_API_URL}/info", json=payload
+            ).json()
+
+        return await asyncio.to_thread(_sync_call)
 
     # ── open_order: entrada al mercado + SL + TP ────────────────────
 
@@ -425,14 +444,9 @@ class FuturesTrader:
         """
         Abre una posición en el mercado con SL y TP1 opcionales.
 
-        PROTECCIÓN DE ENTRADA:
-          Antes de enviar la orden, comprueba que el precio actual (ref_price)
-          no se haya alejado más de MAX_ENTRY_DRIFT_PCT (default 3.0%) del
-          entry calculado por el signal_engine. Si se superó ese umbral, la
-          entrada se cancela completamente — el setup ya no es válido.
-
-          Tras el fill, SL/TP se re-escalan automáticamente al precio real
-          de fill para preservar los offsets porcentuales correctos.
+        FIX DEADLOCK: place_market, place_sl, place_tp son síncronos
+        (usan requests internamente via el SDK). Se envuelven en
+        asyncio.to_thread() para no bloquear el event loop.
         """
         if self.position is not None:
             logger.info("[%s] open_order ignorado — ya hay posición abierta (%s).", self.symbol, self.position)
@@ -447,7 +461,6 @@ class FuturesTrader:
         usdc_per_trade = float(getattr(risk, "usdc_per_trade", 20.0))
         notional       = usdc_per_trade * self.leverage
 
-        # Obtener precio actual
         try:
             ref_price = await self.get_price()
         except Exception as e:
@@ -458,7 +471,6 @@ class FuturesTrader:
             logger.error("[%s] open_order: precio inválido (%s) — abortando.", self.symbol, ref_price)
             return
 
-        # ── CHECK DE DESFASE: cancelar si precio actual se alejó demasiado ───
         stale_reason = _check_price_staleness(signal, ref_price, is_long)
         if stale_reason:
             logger.warning("[%s] open_order: ENTRADA CANCELADA — %s", self.symbol, stale_reason)
@@ -500,13 +512,14 @@ class FuturesTrader:
             self._protection_ok = (sl_px > 0)
             return
 
-        # ── Orden de mercado ────────────────────────────────────────────
+        # ── Orden de mercado (FIX: asyncio.to_thread) ──────────────────
         try:
-            result = self._hl_client.place_market(
-                is_buy=is_buy,
-                sz=qty,
-                reduce_only=False,
-                ref_price=ref_price,
+            result = await asyncio.to_thread(
+                self._hl_client.place_market,
+                is_buy,
+                qty,
+                False,
+                ref_price,
             )
             logger.info("[%s] Orden de mercado enviada: %s", self.symbol, result)
         except Exception as e:
@@ -540,7 +553,6 @@ class FuturesTrader:
         # ── Re-escalar SL/TP al precio real de fill ────────────────────
         sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, filled_price, ref_price)
 
-        # Fix: re-escalar tp3 usando su propio key, no sobreescribiendo tp2
         tp3_raw = float(signal.get("tp3") or 0)
         tp3_px = 0.0
         if tp3_raw > 0:
@@ -564,28 +576,31 @@ class FuturesTrader:
         self._protection_ok = False
         self._tp1_be_done   = False
 
-        # ── Colocar SL ────────────────────────────────────────────
+        # ── Colocar SL (FIX: asyncio.to_thread) ────────────────────────
         if sl_px and sl_px > 0:
             try:
-                sl_result = self._hl_client.place_sl(
-                    is_buy=not is_buy,
-                    sz=qty,
-                    trigger_px=sl_px,
-                    entry_px=filled_price,
+                sl_result = await asyncio.to_thread(
+                    self._hl_client.place_sl,
+                    not is_buy,
+                    qty,
+                    sl_px,
+                    filled_price,
                 )
                 logger.info("[%s] SL colocado en %.4f: %s", self.symbol, sl_px, sl_result)
                 self._protection_ok = True
             except Exception as e:
                 logger.error("[%s] open_order: error colocando SL: %s", self.symbol, e)
 
-        # ── Colocar TP1 ────────────────────────────────────────────
+        # ── Colocar TP1 (FIX: asyncio.to_thread) ───────────────────────
         if tp1_px and tp1_px > 0:
             try:
-                tp_result = self._hl_client.place_tp(
-                    is_buy=not is_buy,
-                    sz=qty,
-                    trigger_px=tp1_px,
-                    entry_px=filled_price,
+                tp_result = await asyncio.to_thread(
+                    self._hl_client.place_tp,
+                    not is_buy,
+                    qty,
+                    tp1_px,
+                    None,
+                    filled_price,
                 )
                 logger.info("[%s] TP1 colocado en %.4f: %s", self.symbol, tp1_px, tp_result)
             except Exception as e:
