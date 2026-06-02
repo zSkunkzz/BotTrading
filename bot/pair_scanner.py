@@ -9,6 +9,10 @@ BUG #4 FIX: rotacion de par sin esperar cleanup del trader
        y await trader._stopped_event.wait() con timeout.
     2. Arrancar traders para pares en 'added'.
   Si el callback solo acepta (new_pairs,), se hace fallback seguro.
+
+FIX #2 (2026-06-02): run_scanner_loop arrancaba con sleep(refresh_interval)
+  → el primer re-scan ocurría 30 minutos después del arranque.
+  Fix: mover el sleep AL FINAL del ciclo para que el primer scan sea inmediato.
 """
 import logging
 import asyncio
@@ -188,6 +192,9 @@ class PairScanner:
         BUG #4 FIX: el callback recibe (new_pairs, added, removed) para
         que main.py pueda hacer cleanup SELECTIVO antes de arrancar nuevos.
 
+        FIX #2: sleep movido AL FINAL del ciclo → primer re-scan inmediato
+        al arrancar (antes dormía 30 min antes del primer scan).
+
         Protocolo del callback en main.py:
           async def _on_pairs_updated(new_pairs, added, removed):
               # 1. Cleanup traders salientes
@@ -215,49 +222,51 @@ class PairScanner:
         cb_params = len(inspect.signature(on_update_callback).parameters)
 
         while True:
-            await asyncio.sleep(self.refresh_interval)
+            # FIX #2: scan ejecuta PRIMERO, sleep va al FINAL del ciclo
             try:
                 logger.info("🔍 Re-escaneando mercado Hyperliquid...")
                 new_pairs = await self.scan()
                 if not new_pairs:
                     logger.warning("⚠️ Scanner devolvio 0 pares — manteniendo pares actuales")
-                    continue
-
-                added   = set(new_pairs) - set(self.active_pairs)
-                removed = set(self.active_pairs) - set(new_pairs)
-
-                try:
-                    import main as _main
-                    _main._update_leverage_map(self._last_scored)
-                except Exception:
-                    pass
-
-                self.active_pairs = new_pairs
-
-                if added:
-                    logger.info("➕ Nuevos pares: %s", ", ".join(added))
-                if removed:
-                    logger.info("➖ Pares eliminados: %s", ", ".join(removed))
-
-                if added or removed:
-                    # BUG #4 FIX: pasar added y removed al callback
-                    if cb_params >= 3:
-                        # Nueva firma: callback(new_pairs, added, removed)
-                        await on_update_callback(new_pairs, added, removed)
-                    else:
-                        # Fallback: firma antigua callback(new_pairs)
-                        logger.warning(
-                            "[PairScanner] Callback con firma antigua — "
-                            "traders salientes no esperaran al ciclo siguiente"
-                        )
-                        await on_update_callback(new_pairs)
                 else:
-                    logger.info("✅ Sin cambios en pares activos")
+                    added   = set(new_pairs) - set(self.active_pairs)
+                    removed = set(self.active_pairs) - set(new_pairs)
+
+                    try:
+                        import main as _main
+                        _main._update_leverage_map(self._last_scored)
+                    except Exception:
+                        pass
+
+                    self.active_pairs = new_pairs
+
+                    if added:
+                        logger.info("➕ Nuevos pares: %s", ", ".join(added))
+                    if removed:
+                        logger.info("➖ Pares eliminados: %s", ", ".join(removed))
+
+                    if added or removed:
+                        # BUG #4 FIX: pasar added y removed al callback
+                        if cb_params >= 3:
+                            # Nueva firma: callback(new_pairs, added, removed)
+                            await on_update_callback(new_pairs, added, removed)
+                        else:
+                            # Fallback: firma antigua callback(new_pairs)
+                            logger.warning(
+                                "[PairScanner] Callback con firma antigua — "
+                                "traders salientes no esperaran al ciclo siguiente"
+                            )
+                            await on_update_callback(new_pairs)
+                    else:
+                        logger.info("✅ Sin cambios en pares activos")
 
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.error("[PairScanner] Error en run_scanner_loop: %s", e, exc_info=True)
+
+            # FIX #2: sleep AL FINAL → próximo ciclo en refresh_interval
+            await asyncio.sleep(self.refresh_interval)
 
 
 class _HLExchangeStub:
