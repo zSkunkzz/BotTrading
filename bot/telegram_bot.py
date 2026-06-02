@@ -23,7 +23,6 @@ def _chat() -> str:
 
 
 def _esc(text: str) -> str:
-    """Escapa caracteres especiales HTML para mensajes de Telegram."""
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
@@ -39,47 +38,63 @@ async def _send(text: str):
 
 
 async def send_message(text: str):
-    """Alias publico para enviar mensajes directos."""
     await _send(text)
 
 
 async def notify_startup(pairs: list, dry_run: bool, top_n: int):
     mode = "\U0001f9ea DRY RUN" if dry_run else "\U0001f4b0 REAL MONEY"
     pairs_str = _esc(", ".join(pairs[:10])) + (" ..." if len(pairs) > 10 else "")
-    text = (
-        f"\U0001f916 <b>HyperliquidBot arrancado</b> — {mode}\n"
+    await _send(
+        f"\U0001f916 <b>HyperliquidBot arrancado</b> \u2014 {mode}\n"
         f"Pares activos ({top_n}): <code>{pairs_str}</code>"
     )
-    await _send(text)
 
 
 async def notify_open(
     symbol,
     side,
+    # precio de entrada — acepta price= o entry= (decision_engine usa entry=)
     price=None,
+    entry=None,
     leverage=None,
+    # tamaño — acepta usdt=, usdc=, size_usdc=, notional= indistintamente
     usdt=None,
+    usdc=None,
+    size_usdc=None,
+    notional=None,
     sl=None,
     tp1=None,
     tp2=None,
     tp3=None,
     dry_run=False,
-    entry=None,       # alias de price — decision_engine lo pasa como 'entry'
+    # kwargs extra que decision_engine puede pasar — los mostramos si tienen valor
+    signal_block=None,
+    ai_used=False,
+    ai_confidence=0,
+    entry_mode=None,
+    **kwargs,  # absorbe cualquier kwarg futuro sin crashear
 ):
-    # Acepta tanto price= como entry= para compatibilidad con decision_engine
     actual_price = price if price is not None else entry
+    actual_size  = size_usdc if size_usdc is not None else (
+                   usdc if usdc is not None else (
+                   usdt if usdt is not None else notional))
+
     emoji = "\U0001f4c8" if side == "long" else "\U0001f4c9"
     mode  = " [DRY]" if dry_run else ""
     lines = [
         f"{emoji} <b>OPEN {_esc(side.upper())}</b>{mode} <code>{_esc(symbol)}</code>",
         f"Entry: <code>{_esc(actual_price)}</code> | Lev: <code>{_esc(leverage)}x</code>"
-        + (f" | Size: <code>{_esc(usdt)}$</code>" if usdt is not None else ""),
+        + (f" | Size: <code>{_esc(actual_size)}$</code>" if actual_size is not None else ""),
     ]
     if sl:
         lines.append(f"SL: <code>{_esc(sl)}</code>")
     tps = [tp for tp in (tp1, tp2, tp3) if tp is not None]
     if tps:
         lines.append("TP: " + " / ".join(f"<code>{_esc(t)}</code>" for t in tps))
+    if entry_mode:
+        lines.append(f"Modo: <code>{_esc(entry_mode)}</code>")
+    if ai_used and ai_confidence:
+        lines.append(f"IA: <code>{_esc(ai_confidence)}/10</code>")
     await _send("\n".join(lines))
 
 
@@ -95,21 +110,19 @@ async def notify_close(symbol, side, exit_p, pnl, entry=None, reason="", dry_run
 
 
 async def notify_close_failed(symbol, reason, error):
-    """Alerta urgente cuando un cierre falla en Hyperliquid — posición sigue abierta."""
     await _send(
         f"\u26a0\ufe0f <b>\u274c CIERRE FALLIDO</b> <code>{_esc(symbol)}</code>\n"
-        f"Razón: {_esc(reason)}\n"
+        f"Raz\u00f3n: {_esc(reason)}\n"
         f"Error: <code>{_esc(error[:200])}</code>\n"
-        f"<b>\u26a0\ufe0f POSICIÓN SIGUE ABIERTA — revisar manualmente</b>"
+        f"<b>\u26a0\ufe0f POSICI\u00d3N SIGUE ABIERTA \u2014 revisar manualmente</b>"
     )
 
 
 async def notify_tp_partial(symbol, side, price, tp_level: int = 2, ratio: float = 0.5, dry_run: bool = False):
-    """Notifica un cierre parcial de TP."""
     mode = " [DRY]" if dry_run else ""
     await _send(
         f"\u2702\ufe0f <b>TP{tp_level} PARCIAL</b>{mode} <code>{_esc(symbol)}</code>\n"
-        f"Cerrado <code>{ratio*100:.0f}%</code> de la posición {_esc(side.upper())} @ <code>{_esc(price)}</code>\n"
+        f"Cerrado <code>{ratio*100:.0f}%</code> de la posici\u00f3n {_esc(side.upper())} @ <code>{_esc(price)}</code>\n"
         f"SL movido a <b>break-even</b>"
     )
 
@@ -135,12 +148,11 @@ async def notify_scanner_update(added: set, removed: set, total: int):
 
 
 async def notify_kill_switch(level: int, trigger: str):
-    """Alerta de kill switch activado."""
     level_labels = {
-        1: "\u26a0\ufe0f L1 — Nuevas entradas pausadas",
-        2: "\U0001f6d1 L2 — Símbolo/estrategia halted",
-        3: "\U0001f6a8 L3 — Órdenes bloqueadas (re-arm manual)",
-        4: "\U0001f480 L4 — HARD KILL (re-arm manual)",
+        1: "\u26a0\ufe0f L1 \u2014 Nuevas entradas pausadas",
+        2: "\U0001f6d1 L2 \u2014 S\u00edmbolo/estrategia halted",
+        3: "\U0001f6a8 L3 \u2014 \u00d3rdenes bloqueadas (re-arm manual)",
+        4: "\U0001f480 L4 \u2014 HARD KILL (re-arm manual)",
     }
     label = level_labels.get(level, f"L{level}")
     await _send(
@@ -151,41 +163,26 @@ async def notify_kill_switch(level: int, trigger: str):
     )
 
 
-# ── Comandos Telegram (polling ligero, sin Application) ───────────────────────────────────────
-
-_ALLOWED_CHAT: str = ""   # se rellena en setup_telegram_commands()
+_ALLOWED_CHAT: str = ""
 
 
 async def _handle_update(update: Update) -> None:
-    """Despacha un update entrante al handler correcto."""
     msg = update.message
     if not msg or not msg.text:
         return
-
-    # Seguridad: solo responder al chat autorizado
     if _ALLOWED_CHAT and str(msg.chat_id) != _ALLOWED_CHAT:
         logger.warning("[Telegram] Mensaje ignorado de chat no autorizado: %s", msg.chat_id)
         return
-
     text = msg.text.strip()
     if text.startswith("/resetks"):
         parts = text.split()
-        args  = parts[1:]
-        await _cmd_resetks(msg.chat_id, args)
+        await _cmd_resetks(msg.chat_id, parts[1:])
     elif text.startswith("/ksstatus"):
         await _cmd_resetks(msg.chat_id, ["status"])
 
 
 async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
-    """
-    Lógica del comando /resetks.
-
-    /resetks status           → estado actual del KS
-    /resetks <clave>          → re-arm completo (cualquier nivel)
-    /resetks <clave> daily    → solo resetear contadores diarios
-    """
-    from bot.kill_switch import kill_switch  # diferida para evitar circular
-
+    from bot.kill_switch import kill_switch
     bot = _get_bot()
     if not bot:
         return
@@ -196,29 +193,27 @@ async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
         except TelegramError as e:
             logger.warning("[Telegram cmd_resetks] %s", e)
 
-    # ── /resetks  o  /resetks status ────────────────────────────────
     if not args or args[0].lower() == "status":
         lvl     = kill_switch.level()
-        trigger = kill_switch._trigger or "—"
+        trigger = kill_switch._trigger or "\u2014"
         halted  = ", ".join(kill_switch._halted_symbols) or "ninguno"
-        hard    = "SÍ 💀" if kill_switch.is_hard_killed() else "no"
+        hard    = "S\u00cd \U0001f480" if kill_switch.is_hard_killed() else "no"
         daily   = kill_switch._daily_pnl
         consec  = kill_switch._consec_losses
         await reply(
-            f"\U0001f6d1 <b>Kill Switch — Estado actual</b>\n"
+            f"\U0001f6d1 <b>Kill Switch \u2014 Estado actual</b>\n"
             f"Nivel: <b>L{lvl}</b> {'\u2705 OK' if lvl == 0 else '\u26a0\ufe0f ACTIVO'}\n"
             f"Trigger: <code>{_esc(trigger[:200])}</code>\n"
             f"Hard killed: {hard}\n"
-            f"Símbolos pausados: <code>{_esc(halted)}</code>\n"
+            f"S\u00edmbolos pausados: <code>{_esc(halted)}</code>\n"
             f"PnL diario acum: <code>{daily:+.2f}%</code>\n"
-            f"Pérdidas consecutivas: <code>{consec}</code>"
+            f"P\u00e9rdidas consecutivas: <code>{consec}</code>"
         )
         return
 
     key        = args[0]
     daily_only = len(args) >= 2 and args[1].lower() == "daily"
 
-    # ── /resetks <clave> daily ──────────────────────────────────────
     if daily_only:
         if key != os.getenv("KILL_SWITCH_REARM_KEY", "REARM-BOTTRADING"):
             await reply("\U0001f6ab <b>Clave incorrecta.</b> Kill switch sin cambios.")
@@ -226,22 +221,21 @@ async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
         kill_switch.reset_daily_pnl()
         await reply(
             "\u2705 <b>Contadores diarios reseteados</b>\n"
-            "PnL diario, pérdidas consecutivas y reconexiones API \u2192 0\n"
+            "PnL diario, p\u00e9rdidas consecutivas y reconexiones API \u2192 0\n"
             "El <b>nivel del KS no ha cambiado</b>."
         )
         return
 
-    # ── /resetks <clave>  →  re-arm completo ────────────────────────────
     ok = await kill_switch.manual_reset(key)
     if ok:
         await reply(
             "\u2705 <b>Kill Switch RE-ARMADO</b>\n"
-            "Nivel: <b>L0 — OK</b>\n"
+            "Nivel: <b>L0 \u2014 OK</b>\n"
             "Todos los contadores y flags reseteados.\n"
             "El bot puede volver a abrir posiciones."
         )
         await _send(
-            "\U0001f513 <b>Kill Switch re-armado manualmente</b> vía Telegram.\n"
+            "\U0001f513 <b>Kill Switch re-armado manualmente</b> v\u00eda Telegram.\n"
             "Bot vuelve a estar operativo."
         )
     else:
@@ -254,19 +248,13 @@ async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
 async def _polling_loop() -> None:
     bot = _get_bot()
     if not bot:
-        logger.info("[Telegram polling] Sin token — comandos desactivados.")
+        logger.info("[Telegram polling] Sin token \u2014 comandos desactivados.")
         return
-
     offset: int | None = None
-    logger.info("[Telegram polling] Iniciado — escuchando /resetks y /ksstatus")
-
+    logger.info("[Telegram polling] Iniciado \u2014 escuchando /resetks y /ksstatus")
     while True:
         try:
-            updates = await bot.get_updates(
-                offset=offset,
-                timeout=30,
-                allowed_updates=["message"],
-            )
+            updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message"])
             for upd in updates:
                 offset = upd.update_id + 1
                 try:
@@ -277,7 +265,7 @@ async def _polling_loop() -> None:
             logger.info("[Telegram polling] Cancelado.")
             break
         except TelegramError as e:
-            logger.warning("[Telegram polling] %s — reintentando en 10 s", e)
+            logger.warning("[Telegram polling] %s \u2014 reintentando en 10 s", e)
             await asyncio.sleep(10)
         except Exception as e:
             logger.error("[Telegram polling] Error inesperado: %s", e)
@@ -287,10 +275,8 @@ async def _polling_loop() -> None:
 def setup_telegram_commands() -> asyncio.Task | None:
     global _ALLOWED_CHAT
     _ALLOWED_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-
     token = os.getenv("TELEGRAM_TOKEN", "")
     if not token:
-        logger.info("[Telegram] Sin TELEGRAM_TOKEN — comandos no disponibles.")
+        logger.info("[Telegram] Sin TELEGRAM_TOKEN \u2014 comandos no disponibles.")
         return None
-
     return asyncio.create_task(_polling_loop(), name="telegram_polling")
