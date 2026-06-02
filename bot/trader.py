@@ -14,6 +14,12 @@ BUG #9 FIX: _ensure_tpsl usa reduce_only=True como fuente de verdad
 OHLCV FIX: decide() recibe ohlcv_fn=self.get_ohlcv
 TRAILING SL FIX: trailing_sl.py integrado en _manage_open_position
 ROORDERS FIX: al restaurar posición, cancelar ro_orders acumuladas si > 2
+
+FIX cancel_order:
+  _exchange.cancel_order(oid, coin) no existe en el SDK de Hyperliquid.
+  El método real es _exchange.cancel(coin, oid_int).
+  Afectaba a _cancel_all_orders_reduce_only (limpieza ROORDERS) y al
+  bloque de actualización del trailing SL en _manage_open_position.
 """
 from __future__ import annotations
 
@@ -40,7 +46,7 @@ from bot.ohlcv_cache import ohlcv_cache
 from bot.signal_engine import signal_flip_guard  # BUG #7 FIX
 from bot.trailing_sl import compute_trailing_sl, is_trailing_sl_hit  # TRAILING SL FIX
 
-# ── DecisionEngine (opcional) ──────────────────────────────────────────────────
+# ── DecisionEngine (opcional) ───────────────────────────────────────────────
 try:
     from bot.core.decision_engine import DecisionEngine as _DecisionEngine
     _DE_AVAILABLE = True
@@ -75,7 +81,7 @@ _FALLBACK_ATR_TP2_MULT = float(os.getenv("FALLBACK_ATR_TP2_MULT", "5.0"))
 # Máximo de órdenes reduce_only esperadas para una posición normal (SL + TP = 2)
 _MAX_EXPECTED_RO_ORDERS = int(os.getenv("MAX_EXPECTED_RO_ORDERS", "2"))
 
-# ── Rate limiter global para /info ───────────────────────────────────────────
+# ── Rate limiter global para /info ────────────────────────────────────────
 GL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
 _HL_MIN_INTERVAL = 0.6
@@ -90,7 +96,7 @@ async def _hl_throttle():
         _HL_LAST_CALL = time.monotonic()
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _norm_coin(symbol: str) -> str:
     s = symbol.replace("/", "").replace(":USDT", "").upper()
@@ -159,7 +165,16 @@ def _is_reduce_only_order(o: dict) -> bool:
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────────
+def _hl_cancel_order(exchange, coin: str, oid) -> None:
+    """
+    FIX cancel_order: el SDK de Hyperliquid NO tiene cancel_order(oid, coin).
+    El método real es exchange.cancel(coin, oid_int).
+    Wrapper centralizado para evitar repetir el mismo error.
+    """
+    exchange.cancel(coin, int(oid))
+
+
+# ──────────────────────────────────────────────────────────────────────────────────
 class FuturesTrader:
     def __init__(self, api_key, api_secret, symbol,
                  leverage, margin_mode, dry_run,
@@ -242,7 +257,7 @@ class FuturesTrader:
         else:
             self._decision_engine = None
 
-    # ── Max leverage efectivo del exchange ──────────────────────────────────────
+    # ── Max leverage efectivo del exchange ────────────────────────────────────
 
     def _exchange_max_lev(self) -> int:
         try:
@@ -251,7 +266,7 @@ class FuturesTrader:
             logger.warning("[%s] No se pudo obtener maxLeverage — usando 20: %s", self.symbol, e)
             return 20
 
-    # ── Qty rounding ────────────────────────────────────────────────────
+    # ── Qty rounding ───────────────────────────────────────────────────────────
 
     def _round_qty(self, qty: float) -> float:
         try:
@@ -261,7 +276,7 @@ class FuturesTrader:
         factor = 10 ** sz_dec
         return math.floor(qty * factor) / factor
 
-    # ── ccxt ──────────────────────────────────────────────────────────────────────
+    # ── ccxt ─────────────────────────────────────────────────────────────────────────
 
     async def _get_ccxt(self):
         if self._ccxt_exchange is None:
@@ -289,7 +304,7 @@ class FuturesTrader:
                 pass
             self._ccxt_exchange = None
 
-    # ── HTTP helpers ─────────────────────────────────────────────────────────
+    # ── HTTP helpers ─────────────────────────────────────────────────────────────
 
     async def _info_post(self, payload: dict) -> dict:
         await _hl_throttle()
@@ -312,7 +327,7 @@ class FuturesTrader:
                             return _json.loads(await r2.text())
                 return _json.loads(await r.text())
 
-    # ── Init / cleanup ─────────────────────────────────────────────────────────────
+    # ── Init / cleanup ───────────────────────────────────────────────────────────────
 
     async def _cleanup_excess_ro_orders(self) -> None:
         """
@@ -453,7 +468,7 @@ class FuturesTrader:
         self._stopped_event.set()
         logger.info("[%s] Trader cleanup completado.", self.symbol)
 
-    # ── Precio y OHLCV ─────────────────────────────────────────────────────────────
+    # ── Precio y OHLCV ──────────────────────────────────────────────────────────────
 
     async def get_price(self) -> float:
         try:
@@ -511,7 +526,7 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage ───────────────────────────────────────────────────────────────────
+    # ── Leverage ────────────────────────────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int) -> None:
         if self.dry_run:
@@ -533,7 +548,7 @@ class FuturesTrader:
             )
         logger.info("[%s] Leverage %dx establecido en exchange", self.symbol, leverage)
 
-    # ── Ordenes ─────────────────────────────────────────────────────────────────────────
+    # ── Ordenes ─────────────────────────────────────────────────────────────────────────────────────
 
     async def _get_order_status(self, order_id) -> dict:
         try:
@@ -576,7 +591,7 @@ class FuturesTrader:
             await kill_switch.on_order_result(rejected=True)
         return r
 
-    # ── Posiciones ────────────────────────────────────────────────────────────────────
+    # ── Posiciones ──────────────────────────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list | None:
         try:
@@ -628,7 +643,7 @@ class FuturesTrader:
         )
         return []
 
-    # ── _place_tpsl ────────────────────────────────────────────────────────────────────
+    # ── _place_tpsl ─────────────────────────────────────────────────────────────────────────
 
     async def _place_tpsl(
         self,
@@ -752,7 +767,7 @@ class FuturesTrader:
                 logger.error("[%s] No se pudo colocar TP (fallback): %s", self.symbol, e)
                 raise
 
-    # ── _cancel_all_orders_reduce_only (BUG #9 FIX) ──────────────────────────────────
+    # ── _cancel_all_orders_reduce_only (BUG #9 FIX) ────────────────────────────────────
 
     async def _cancel_all_orders_reduce_only(self, coin_orders: list) -> int:
         ro_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
@@ -767,10 +782,12 @@ class FuturesTrader:
                 logger.warning("[%s] Orden reduce_only sin oid — skip: %s", self.symbol, o)
                 continue
             try:
+                # FIX cancel_order: SDK de Hyperliquid usa cancel(coin, oid_int),
+                # NO cancel_order(oid_str, coin)
                 await loop.run_in_executor(
                     None,
-                    lambda _oid=oid: self._hl_client._exchange.cancel_order(
-                        str(_oid), self.coin
+                    lambda _oid=oid: _hl_cancel_order(
+                        self._hl_client._exchange, self.coin, _oid
                     ),
                 )
                 logger.debug("[%s] Orden reduce_only cancelada: oid=%s", self.symbol, oid)
@@ -853,7 +870,7 @@ class FuturesTrader:
         except Exception as e:
             logger.error("[%s] _ensure_tpsl: fallo al colocar SL/TP: %s", self.symbol, e)
 
-    # ── Helpers de cierre ────────────────────────────────────────────────────────────────
+    # ── Helpers de cierre ────────────────────────────────────────────────────────────────────
 
     def _clear_position_state(self) -> None:
         self.position    = None
@@ -891,12 +908,12 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning("[%s] DecisionEngine.on_position_closed error: %s", self.symbol, e)
 
-    # ── _manage_open_position ───────────────────────────────────────────────────────────
+    # ── _manage_open_position ─────────────────────────────────────────────────────────────
 
     async def _manage_open_position(self, price: float, risk) -> None:
         is_long = self.position == "long"
 
-        # ── SL hit check ────────────────────────────────────────────────────
+        # ── SL hit check ──────────────────────────────────────────────────────────────
         if self.sl and self.sl > 0:
             sl_triggered = (is_long and price <= self.sl) or (not is_long and price >= self.sl)
             if sl_triggered:
@@ -919,7 +936,7 @@ class FuturesTrader:
                 clear_position(self.symbol)
                 return
 
-        # ── TP1 hit check ───────────────────────────────────────────────────
+        # ── TP1 hit check ─────────────────────────────────────────────────────────────
         if not self._tp1_hit and self.tp1 and self.tp1 > 0:
             tp1_triggered = (is_long and price >= self.tp1) or (not is_long and price <= self.tp1)
             if tp1_triggered:
@@ -956,7 +973,7 @@ class FuturesTrader:
                     "trail_peak":            self._trail_peak,
                 })
 
-        # ── Trailing SL update (post-TP1) ──────────────────────────────────
+        # ── Trailing SL update (post-TP1) ────────────────────────────────────────
         if self._trailing_sl_activated and self.sl and self.sl > 0:
             new_sl, new_peak = compute_trailing_sl(
                 is_long=is_long,
@@ -1010,10 +1027,11 @@ class FuturesTrader:
                         oid = o.get("oid") or o.get("id") or o.get("orderId")
                         if oid:
                             try:
+                                # FIX cancel_order: SDK de Hyperliquid usa cancel(coin, oid_int)
                                 await loop.run_in_executor(
                                     None,
-                                    lambda _oid=oid: self._hl_client._exchange.cancel_order(
-                                        str(_oid), self.coin
+                                    lambda _oid=oid: _hl_cancel_order(
+                                        self._hl_client._exchange, self.coin, _oid
                                     ),
                                 )
                                 logger.debug("[%s] SL reduce-only cancelado: oid=%s", self.symbol, oid)
@@ -1044,7 +1062,7 @@ class FuturesTrader:
                 except Exception as e:
                     logger.error("[%s] Error actualizando trailing SL en exchange: %s", self.symbol, e)
 
-        # ── TP2 hit check ───────────────────────────────────────────────────
+        # ── TP2 hit check ─────────────────────────────────────────────────────────────
         if self._tp1_hit and not self.tp2_hit and self.tp2 and self.tp2 > 0:
             tp2_triggered = (is_long and price >= self.tp2) or (not is_long and price <= self.tp2)
             if tp2_triggered:
@@ -1063,7 +1081,7 @@ class FuturesTrader:
                 except Exception:
                     pass
 
-        # ── Verificacion periodica SL/TP en exchange ────────────────────────
+        # ── Verificacion periodica SL/TP en exchange ─────────────────────────────────
         now = time.monotonic()
         if (
             not self._trailing_sl_activated
@@ -1081,7 +1099,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] _ensure_tpsl error: %s", self.symbol, e)
 
-    # ── Loop principal ─────────────────────────────────────────────────────────────────────
+    # ── Loop principal ──────────────────────────────────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None):
         self._global_risk = global_risk
