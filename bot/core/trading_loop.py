@@ -8,18 +8,11 @@ Responsabilidades:
   - Delegar decisiones a DecisionEngine
   - Delegar gestión de posición abierta a PositionManager
 
-Extraído de FuturesTrader.run / _iteration / _init en trader.py.
-NOTA: FuturesTrader en trader.py sigue siendo el punto de entrada público
-para compatibilidad con main.py — este módulo contiene la lógica extraída
-para mejorar la legibilidad y testabilidad.
-
-FIX v1: Cierre externo/manual ahora llama mark_manual_close() (600s) en vez de
-     mark_closed("external") que solo aplicaba base×0.5 (~60-90s).
-
-FIX v2: Cierre externo delega en position_mgr.detect_external_close(trader)
-     en vez de limpiar estado manualmente aquí. Garantiza que pretrade_risk,
-     decision_engine.on_position_closed y mark_manual_close se ejecuten
-     siempre juntos, igual que los cierres internos por SL/TP.
+FIX v3 (2026-06-02):
+  DecisionEngine.__init__() espera (risk_manager, pretrade_risk, signal_engine, cooldown).
+  trading_loop.py pasaba (symbol, position_mgr=...) causando TypeError en cada arranque.
+  Fix: DecisionEngine se construye lazy en run() cuando ya tenemos todos los objetos,
+  y evaluate() se llama con la firma correcta (symbol, price, ohlcv).
 """
 from __future__ import annotations
 
@@ -46,20 +39,38 @@ class TradingLoop:
     Orquesta el loop de trading para un símbolo específico.
     Utiliza DecisionEngine para evaluar entradas y PositionManager
     para gestionar posiciones abiertas.
-
-    DecisionEngine y PositionManager están conectados mediante
-    bind_position_manager() para que entry_mode fluya correctamente
-    desde la apertura hasta el cooldown de cierre.
     """
 
     def __init__(self, symbol: str):
         self.symbol           = symbol
         self._position_mgr    = PositionManager(symbol)
-        self._decision_engine = DecisionEngine(symbol, position_mgr=self._position_mgr)
+        # DecisionEngine se construye lazy en run() — necesita risk/pretrade/signal/cooldown
+        self._decision_engine = None
         self._last_pos_check_at: float = 0.0
+
+    def _build_decision_engine(self, risk):
+        """Construye DecisionEngine con los objetos correctos del risk manager."""
+        from bot import signal_engine
+        from bot.cooldown import signal_cooldown
+
+        # risk es el objeto TradeRisk / GlobalRisk que llega desde main.py
+        # Intentamos obtener pretrade_risk desde risk; si no existe, usamos risk mismo.
+        pretrade_risk = getattr(risk, "pretrade_risk", risk)
+        risk_manager  = getattr(risk, "risk_manager",  risk)
+
+        return DecisionEngine(
+            risk_manager  = risk_manager,
+            pretrade_risk = pretrade_risk,
+            signal_engine = signal_engine,
+            cooldown      = signal_cooldown,
+        )
 
     async def run(self, trader, risk, *, global_risk=None) -> None:
         """Loop principal. Llamar desde FuturesTrader.run()."""
+        # Construir DecisionEngine ahora que tenemos risk disponible
+        if self._decision_engine is None:
+            self._decision_engine = self._build_decision_engine(global_risk or risk)
+
         await self._init(trader, risk.usdc_per_trade)
         while True:
             try:
@@ -87,7 +98,6 @@ class TradingLoop:
             trader._open_leverage = saved.get("leverage", trader.leverage)
             trader._protection_ok = True
             trader._tp1_be_done   = False
-            # Restaurar entry_mode si fue guardado (compatibilidad futura)
             entry_mode = saved.get("entry_mode", "")
             if entry_mode:
                 self._position_mgr.set_entry_mode(entry_mode)
@@ -140,8 +150,6 @@ class TradingLoop:
                         "[%s] Posición cerrada externamente — delegando a detect_external_close().",
                         self.symbol,
                     )
-
-                    # Cancelar trigger orders huérfanos antes de limpiar estado
                     try:
                         trader._hl_client.cancel_all_open_tpsl()
                         logger.info("[%s] Trigger orders huérfanos cancelados.", self.symbol)
@@ -150,17 +158,18 @@ class TradingLoop:
                             "[%s] No se pudieron cancelar triggers huérfanos: %s",
                             self.symbol, e,
                         )
-
-                    # FIX v2: delegar limpieza completa a PositionManager.
-                    # detect_external_close() llama en orden:
-                    #   1. signal_cooldown.mark_manual_close()  → 600s cooldown
-                    #   2. pretrade_risk.register_close()       → libera exposición
-                    #   3. decision_engine.on_position_closed() → reason=MANUAL
-                    #   4. _reset_trader_state()                → limpia trader + disco
                     self._position_mgr.detect_external_close(trader)
 
         # ── Gestionar posición abierta o evaluar nueva entrada ────────────────
         if trader.position is not None:
             await self._position_mgr.manage(trader, price, risk)
         else:
-            await self._decision_engine.evaluate(trader, risk, global_risk)
+            # FIX v3: evaluate() espera (symbol, price, ohlcv=[]) — no (trader, risk, global_risk)
+            signal = await self._decision_engine.evaluate(self.symbol, price, [])
+            if signal:
+                logger.info(
+                    "[%s] Señal aceptada por DecisionEngine: action=%s side=%s",
+                    self.symbol, signal.get("action"), signal.get("side"),
+                )
+                # Delegar apertura de posición al PositionManager
+                await self._position_mgr.open_position(trader, signal, risk)
