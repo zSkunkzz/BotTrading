@@ -7,10 +7,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Callable, Optional
 
 from bot.core.hl_client import HLClient, _norm_coin
 from bot.core.trading_loop import TradingLoop
+from bot.state import save_position
 
 logger = logging.getLogger("FuturesTrader")
 
@@ -37,6 +39,10 @@ _TF_MINUTES = {
     "8h":  480,
     "1d":  1440,
 }
+
+# Intentos de confirmación de fill tras orden de mercado
+_FILL_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
+_FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
 
 
 class FuturesTrader:
@@ -71,6 +77,7 @@ class FuturesTrader:
         self._open_leverage:  int             = leverage
         self._protection_ok:  bool            = False
         self._tp1_be_done:    bool            = False
+        self._last_price:     float           = 0.0
 
         self._api_key    = api_key or ""
         self._api_secret = api_secret or ""
@@ -130,18 +137,13 @@ class FuturesTrader:
         Descarga velas OHLCV desde Hyperliquid /info candle_snapshot.
         Devuelve lista de [timestamp, open, high, low, close, volume] compatible
         con signal_engine._compute_indicators().
-
-        Este método es el ohlcv_fn que se pasa a analyze_pair() — reemplaza
-        la lista vacía [] que antes causaba que el bot nunca escaneara señales.
         """
         import aiohttp
         import json as _json
         import time as _time
 
         interval = _TF_MINUTES.get(timeframe, 15)
-        # Pedir un poco más de barras para tener margen de indicadores
         n = _OHLCV_BARS + 20
-        # end = ahora (ms), start = n velas atrás
         end_ms   = int(_time.time() * 1000)
         start_ms = end_ms - (n * interval * 60 * 1000)
 
@@ -172,9 +174,6 @@ class FuturesTrader:
             logger.warning("[%s] get_ohlcv(%s) respuesta inesperada: %s", self.symbol, timeframe, raw)
             return []
 
-        # Hyperliquid candle_snapshot devuelve lista de dicts:
-        # {t, T, s, i, o, h, l, c, v, n}
-        # Convertir a formato OHLCV estándar: [ts, open, high, low, close, volume]
         bars = []
         for candle in raw:
             try:
@@ -252,6 +251,183 @@ class FuturesTrader:
         return self._hl_client._info._session.post(
             f"{_API_URL}/info", json=payload
         ).json()
+
+    # ── open_order: entrada al mercado + SL + TP ───────────────────
+
+    async def open_order(self, signal: dict, risk) -> None:
+        """
+        Abre una posición en el mercado con SL y TP1 opcionales.
+
+        signal keys esperados (producidos por signal_engine / decision_engine):
+          action      : "BUY" | "SELL"
+          side        : "long" | "short"
+          entry       : float  — precio de referencia (puede ser 0 → usar precio actual)
+          sl          : float  — precio de stop loss  (0 → sin SL)
+          tp1         : float  — precio de take profit 1 (0 → sin TP)
+          tp2, tp3    : float  — TPs adicionales (opcionales)
+          entry_mode  : str    — "EARLY" | "CONFIRMED" (informativo)
+          score       : int    — score de la señal (informativo)
+
+        risk keys esperados:
+          usdc_per_trade : float — capital por operación en USDC
+        """
+        if self.position is not None:
+            logger.info("[%s] open_order ignorado — ya hay posición abierta (%s).", self.symbol, self.position)
+            return
+
+        action = signal.get("action", "").upper()
+        side   = signal.get("side", "").lower()
+        sl_px  = float(signal.get("sl")  or 0)
+        tp1_px = float(signal.get("tp1") or 0)
+        tp2_px = float(signal.get("tp2") or 0)
+        tp3_px = float(signal.get("tp3") or 0)
+
+        is_long = (action == "BUY" or side == "long")
+        is_buy  = is_long
+
+        usdc_per_trade = float(getattr(risk, "usdc_per_trade", 20.0))
+        notional       = usdc_per_trade * self.leverage
+
+        # Obtener precio actual para calcular qty
+        try:
+            ref_price = await self.get_price()
+        except Exception as e:
+            logger.error("[%s] open_order: no se pudo obtener precio — abortando. %s", self.symbol, e)
+            return
+
+        if ref_price <= 0:
+            logger.error("[%s] open_order: precio inválido (%s) — abortando.", self.symbol, ref_price)
+            return
+
+        qty = notional / ref_price
+        qty = self._hl_client.round_sz(qty)
+
+        if qty <= 0:
+            logger.error("[%s] open_order: qty calculada = 0 (notional=%.2f ref_price=%.4f) — abortando.",
+                         self.symbol, notional, ref_price)
+            return
+
+        logger.info(
+            "[%s] open_order: %s | qty=%.6f | ref_price=%.4f | notional=%.2f USDC | lev=%dx | sl=%.4f | tp1=%.4f",
+            self.symbol, "LONG" if is_long else "SHORT",
+            qty, ref_price, notional, self.leverage,
+            sl_px, tp1_px,
+        )
+
+        if self.dry_run:
+            logger.info("[%s] DRY_RUN: open_order simulado — sin orden real.", self.symbol)
+            self.position    = "long" if is_long else "short"
+            self.entry_price = ref_price
+            self.sl          = sl_px if sl_px > 0 else None
+            self.tp1         = tp1_px if tp1_px > 0 else None
+            self.tp2         = tp2_px if tp2_px > 0 else None
+            self.tp3         = tp3_px if tp3_px > 0 else None
+            self._open_notional = notional
+            self._open_leverage = self.leverage
+            self._protection_ok = (sl_px > 0)
+            return
+
+        # ── Orden de mercado ──────────────────────────────────────────
+        try:
+            result = self._hl_client.place_market(
+                is_buy=is_buy,
+                sz=qty,
+                reduce_only=False,
+                ref_price=ref_price,
+            )
+            logger.info("[%s] Orden de mercado enviada: %s", self.symbol, result)
+        except Exception as e:
+            logger.error("[%s] open_order: error al enviar orden de mercado: %s", self.symbol, e)
+            return
+
+        # Verificar éxito básico del resultado
+        status = (result or {}).get("status", "")
+        if status not in ("ok", ""):
+            logger.error("[%s] open_order: orden rechazada por exchange: %s", self.symbol, result)
+            return
+
+        # ── Esperar fill y obtener precio real de entrada ─────────────
+        filled_price = ref_price  # fallback
+        for attempt in range(_FILL_RETRIES):
+            await asyncio.sleep(_FILL_DELAY)
+            try:
+                positions = await self._get_positions()
+                if positions:
+                    filled_price = positions[0].get("entryPx", ref_price)
+                    logger.info(
+                        "[%s] Fill confirmado (intento %d/%d): entryPx=%.4f",
+                        self.symbol, attempt + 1, _FILL_RETRIES, filled_price,
+                    )
+                    break
+            except Exception as e:
+                logger.warning("[%s] open_order: error confirmando fill: %s", self.symbol, e)
+        else:
+            logger.warning("[%s] open_order: fill no confirmado tras %d intentos — usando ref_price=%.4f",
+                           self.symbol, _FILL_RETRIES, ref_price)
+
+        # ── Actualizar estado interno ──────────────────────────────────
+        self.position    = "long" if is_long else "short"
+        self.entry_price = filled_price
+        self.sl          = sl_px if sl_px > 0 else None
+        self.tp1         = tp1_px if tp1_px > 0 else None
+        self.tp2         = tp2_px if tp2_px > 0 else None
+        self.tp3         = tp3_px if tp3_px > 0 else None
+        self._open_notional = notional
+        self._open_leverage = self.leverage
+        self._protection_ok = False
+        self._tp1_be_done   = False
+
+        # ── Colocar SL ────────────────────────────────────────────────
+        if sl_px and sl_px > 0:
+            try:
+                sl_result = self._hl_client.place_sl(
+                    is_buy=not is_buy,   # opuesto: cierra la posición
+                    sz=qty,
+                    trigger_px=sl_px,
+                    entry_px=filled_price,
+                )
+                logger.info("[%s] SL colocado en %.4f: %s", self.symbol, sl_px, sl_result)
+                self._protection_ok = True
+            except Exception as e:
+                logger.error("[%s] open_order: error colocando SL: %s", self.symbol, e)
+
+        # ── Colocar TP1 ───────────────────────────────────────────────
+        if tp1_px and tp1_px > 0:
+            try:
+                tp_result = self._hl_client.place_tp(
+                    is_buy=not is_buy,
+                    sz=qty,
+                    trigger_px=tp1_px,
+                    entry_px=filled_price,
+                )
+                logger.info("[%s] TP1 colocado en %.4f: %s", self.symbol, tp1_px, tp_result)
+            except Exception as e:
+                logger.error("[%s] open_order: error colocando TP1: %s", self.symbol, e)
+
+        # ── Persistir estado ──────────────────────────────────────────
+        try:
+            save_position(self.symbol, {
+                "side":        self.position,
+                "entry":       self.entry_price,
+                "sl":          self.sl,
+                "tp1":         self.tp1,
+                "tp2":         self.tp2,
+                "tp3":         self.tp3,
+                "tp2_hit":     self.tp2_hit,
+                "usdc_amount": usdc_per_trade,
+                "leverage":    self.leverage,
+            })
+        except Exception as e:
+            logger.warning("[%s] open_order: no se pudo persistir estado: %s", self.symbol, e)
+
+        logger.info(
+            "[%s] ✅ Posición abierta: %s @ %.4f | SL=%.4f | TP1=%.4f",
+            self.symbol,
+            self.position.upper(),
+            self.entry_price,
+            self.sl or 0,
+            self.tp1 or 0,
+        )
 
 
 __all__ = ["FuturesTrader"]
