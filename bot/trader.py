@@ -75,6 +75,7 @@ class FuturesTrader:
         self.tp2_hit:         bool            = False
         self._open_notional:  float           = 0.0
         self._open_leverage:  int             = leverage
+        self._open_qty:       float           = 0.0   # qty en unidades del activo
         self._protection_ok:  bool            = False
         self._tp1_be_done:    bool            = False
         self._last_price:     float           = 0.0
@@ -109,7 +110,7 @@ class FuturesTrader:
             logger.debug("[%s] cleanup ai_trader sessions: %s", self.symbol, e)
         self._stopped_event.set()
 
-    # ── Métodos que TradingLoop llama sobre el objeto trader ────────
+    # ── Métodos que TradingLoop llama sobre el objeto trader ──────────
 
     async def _get_ccxt(self) -> None:
         pass
@@ -235,6 +236,79 @@ class FuturesTrader:
             })
         return result
 
+    async def _get_open_orders_raw(self) -> list[dict]:
+        """
+        Obtiene las órdenes abiertas del exchange para esta cuenta.
+        Devuelve lista de dicts con la estructura nativa de Hyperliquid.
+        Requerido por position_manager._ensure_tpsl.
+        """
+        import aiohttp
+        import json as _json
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{_API_URL}/info",
+                    json={"type": "openOrders", "user": self._master_addr},
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = _json.loads(await resp.text())
+        except Exception as e:
+            logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e)
+            return []
+
+        if not isinstance(data, list):
+            logger.warning("[%s] _get_open_orders_raw respuesta inesperada: %s", self.symbol, type(data))
+            return []
+
+        return data
+
+    async def _place_tpsl(
+        self,
+        qty: float,
+        sl_price: Optional[float],
+        tp_price: Optional[float],
+        is_long: bool,
+        reduce_only: bool = True,
+    ) -> None:
+        """
+        Coloca una orden de SL o TP en el exchange.
+        Requerido por position_manager._place_emergency_sl_tp.
+        Si sl_price es None se coloca solo TP, y viceversa.
+        """
+        if self.dry_run:
+            logger.info(
+                "[%s] DRY_RUN: _place_tpsl sl=%.4f tp=%.4f omitido.",
+                self.symbol, sl_price or 0, tp_price or 0,
+            )
+            return
+
+        if sl_price and sl_price > 0:
+            result = self._hl_client.place_sl(
+                is_buy=not is_long,
+                sz=qty,
+                trigger_px=sl_price,
+                entry_px=self.entry_price or sl_price,
+            )
+            logger.info("[%s] _place_tpsl SL=%.4f: %s", self.symbol, sl_price, result)
+
+        if tp_price and tp_price > 0:
+            result = self._hl_client.place_tp(
+                is_buy=not is_long,
+                sz=qty,
+                trigger_px=tp_price,
+                entry_px=self.entry_price or tp_price,
+            )
+            logger.info("[%s] _place_tpsl TP=%.4f: %s", self.symbol, tp_price, result)
+
+    def _round_qty(self, qty: float) -> float:
+        """
+        Redondea qty al número de decimales que acepta el exchange.
+        Requerido por position_manager._round_qty_safe.
+        """
+        return self._hl_client.round_sz(qty)
+
     async def _set_leverage(self, leverage: int) -> None:
         if self.dry_run:
             logger.info("[%s] DRY_RUN: _set_leverage(%d) omitido.", self.symbol, leverage)
@@ -252,7 +326,7 @@ class FuturesTrader:
             f"{_API_URL}/info", json=payload
         ).json()
 
-    # ── open_order: entrada al mercado + SL + TP ───────────────────
+    # ── open_order: entrada al mercado + SL + TP ────────────────────
 
     async def open_order(self, signal: dict, risk) -> None:
         """
@@ -324,10 +398,11 @@ class FuturesTrader:
             self.tp3         = tp3_px if tp3_px > 0 else None
             self._open_notional = notional
             self._open_leverage = self.leverage
+            self._open_qty      = qty
             self._protection_ok = (sl_px > 0)
             return
 
-        # ── Orden de mercado ──────────────────────────────────────────
+        # ── Orden de mercado ────────────────────────────────────────────
         try:
             result = self._hl_client.place_market(
                 is_buy=is_buy,
@@ -346,7 +421,7 @@ class FuturesTrader:
             logger.error("[%s] open_order: orden rechazada por exchange: %s", self.symbol, result)
             return
 
-        # ── Esperar fill y obtener precio real de entrada ─────────────
+        # ── Esperar fill y obtener precio real de entrada ──────────────
         filled_price = ref_price  # fallback
         for attempt in range(_FILL_RETRIES):
             await asyncio.sleep(_FILL_DELAY)
@@ -365,7 +440,7 @@ class FuturesTrader:
             logger.warning("[%s] open_order: fill no confirmado tras %d intentos — usando ref_price=%.4f",
                            self.symbol, _FILL_RETRIES, ref_price)
 
-        # ── Actualizar estado interno ──────────────────────────────────
+        # ── Actualizar estado interno ───────────────────────────────
         self.position    = "long" if is_long else "short"
         self.entry_price = filled_price
         self.sl          = sl_px if sl_px > 0 else None
@@ -374,10 +449,11 @@ class FuturesTrader:
         self.tp3         = tp3_px if tp3_px > 0 else None
         self._open_notional = notional
         self._open_leverage = self.leverage
+        self._open_qty      = qty
         self._protection_ok = False
         self._tp1_be_done   = False
 
-        # ── Colocar SL ────────────────────────────────────────────────
+        # ── Colocar SL ────────────────────────────────────────────
         if sl_px and sl_px > 0:
             try:
                 sl_result = self._hl_client.place_sl(
@@ -391,7 +467,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: error colocando SL: %s", self.symbol, e)
 
-        # ── Colocar TP1 ───────────────────────────────────────────────
+        # ── Colocar TP1 ────────────────────────────────────────────
         if tp1_px and tp1_px > 0:
             try:
                 tp_result = self._hl_client.place_tp(
@@ -404,7 +480,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: error colocando TP1: %s", self.symbol, e)
 
-        # ── Persistir estado ──────────────────────────────────────────
+        # ── Persistir estado ───────────────────────────────────────
         try:
             save_position(self.symbol, {
                 "side":        self.position,
