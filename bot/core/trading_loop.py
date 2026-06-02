@@ -28,6 +28,13 @@ FIX v7 (2026-06-02): restaurar _open_qty al cargar posición desde disco
   - Al restaurar desde disco _open_qty quedaba 0 → _place_emergency_sl_tp abortaba.
   - Fix: calcular qty = (notional * leverage) / entry_price al restaurar.
     Si entry_price == 0 se deja 0 y se loguea warning para no silenciar el problema.
+
+FIX v8 (2026-06-02): notificaciones Telegram + cooldown post-cierre externo
+  - Llamar notify_open() justo después de open_order() exitoso.
+  - Llamar notify_close() al detectar cierre externo en _iteration().
+  - Añadir _external_close_cooldown_until: tras un cierre manual, el bot
+    no re-entra en el mismo par durante EXTERNAL_CLOSE_COOLDOWN_S segundos
+    (por defecto 600 s = 10 min), evitando que la posición se reabra sola.
 """
 from __future__ import annotations
 
@@ -47,16 +54,19 @@ logger = logging.getLogger("TradingLoop")
 LOOP_SLEEP              = float(os.getenv("LOOP_SLEEP", "10"))
 _POS_CHECK_INTERVAL_S   = int(os.getenv("POS_CHECK_INTERVAL_S", "30"))
 _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
+# Segundos que el bot espera para re-entrar tras un cierre externo/manual
+_EXTERNAL_CLOSE_COOLDOWN_S = int(os.getenv("EXTERNAL_CLOSE_COOLDOWN_S", "600"))
 
 
 class TradingLoop:
 
     def __init__(self, symbol: str):
         self.symbol           = symbol
-        # PositionManager se crea lazy en run() una vez que tenemos el trader
         self._position_mgr    = None
         self._decision_engine = None
         self._last_pos_check_at: float = 0.0
+        # Timestamp hasta el cual no se permite re-entrar tras cierre externo
+        self._external_close_cooldown_until: float = 0.0
 
     def _build_decision_engine(self, risk):
         from bot import signal_engine
@@ -74,7 +84,6 @@ class TradingLoop:
         if self._decision_engine is None:
             self._decision_engine = self._build_decision_engine(global_risk or risk)
 
-        # PositionManager necesita el trader; crearlo aquí la primera vez
         if self._position_mgr is None:
             self._position_mgr = PositionManager(trader)
 
@@ -105,12 +114,9 @@ class TradingLoop:
             trader._protection_ok = True
             trader._tp1_be_done   = False
 
-            # ── Restaurar _open_qty ──────────────────────────────────────
-            # Prioridad 1: valor guardado explícitamente en disco (versiones nuevas)
             if saved.get("qty") and float(saved["qty"]) > 0:
                 trader._open_qty = float(saved["qty"])
             else:
-                # Prioridad 2: recalcular a partir de notional * leverage / entry_price
                 entry_px = float(trader.entry_price or 0)
                 notional_usdc = float(trader._open_notional or 0)
                 lev = int(trader._open_leverage or trader.leverage or 1)
@@ -160,7 +166,7 @@ class TradingLoop:
             logger.warning("[%s] No se pudo obtener precio: %s", self.symbol, e)
             return
 
-        # ── Sincronización periódica con exchange ─────────────────────────────
+        # ── Sincronización periódica con exchange ──────────────────────────────────────────────────
         now = time.monotonic()
         if now - self._last_pos_check_at >= _POS_CHECK_INTERVAL_S:
             exchange_positions      = await trader._get_positions()
@@ -175,8 +181,6 @@ class TradingLoop:
                         "[%s] Posición detectada en exchange: %s @ %s",
                         self.symbol, trader.position, trader.entry_price,
                     )
-                # Si _open_qty sigue en 0 pero el exchange confirma la posición,
-                # recalcular qty desde el tamaño real reportado por el exchange.
                 if trader._open_qty == 0.0 and ep.get("size", 0) > 0:
                     try:
                         trader._open_qty = trader._hl_client.round_sz(float(ep["size"]))
@@ -192,6 +196,21 @@ class TradingLoop:
                         "[%s] Posición cerrada externamente — limpiando estado local.",
                         self.symbol,
                     )
+                    # ── Notificar cierre por Telegram ──────────────────────────────────
+                    try:
+                        from bot.telegram_bot import notify_close
+                        await notify_close(
+                            symbol   = self.symbol,
+                            side     = trader.position,
+                            exit_p   = round(price, 6),
+                            pnl      = 0.0,   # PnL desconocido en cierre externo
+                            entry    = trader.entry_price,
+                            reason   = "Cierre manual / externo",
+                            dry_run  = trader.dry_run,
+                        )
+                    except Exception as _te:
+                        logger.debug("[%s] notify_close error: %s", self.symbol, _te)
+
                     try:
                         trader._hl_client.cancel_all_open_tpsl()
                         logger.info("[%s] Trigger orders huérfanos cancelados.", self.symbol)
@@ -200,7 +219,21 @@ class TradingLoop:
                             "[%s] No se pudieron cancelar triggers huérfanos: %s",
                             self.symbol, e,
                         )
-                    # Limpiar estado local — PositionManager no tiene detect_external_close
+
+                    # ── Activar cooldown para no re-entrar inmediatamente ────────────
+                    self._external_close_cooldown_until = (
+                        time.monotonic() + _EXTERNAL_CLOSE_COOLDOWN_S
+                    )
+                    logger.info(
+                        "[%s] Cooldown post-cierre externo activado: %d s (hasta en %s)",
+                        self.symbol,
+                        _EXTERNAL_CLOSE_COOLDOWN_S,
+                        time.strftime(
+                            "%H:%M:%S",
+                            time.localtime(time.time() + _EXTERNAL_CLOSE_COOLDOWN_S),
+                        ),
+                    )
+
                     trader.position    = None
                     trader.entry_price = None
                     trader.sl          = None
@@ -210,15 +243,20 @@ class TradingLoop:
                     trader._open_qty   = 0.0
                     clear_position(self.symbol)
 
-        # ── Gestionar posición abierta o evaluar nueva entrada ────────────────
+        # ── Gestionar posición abierta o evaluar nueva entrada ────────────────────────
         if trader.position is not None:
-            # manage() no recibe argumentos — trader está bound en __init__
-            # Actualizar _last_price para que _check_sl_software funcione
             trader._last_price = price
             await self._position_mgr.manage()
         else:
-            # FIX ohlcv_fn: pasar trader.get_ohlcv_fn() para que analyze_pair
-            # descargue velas reales. Antes se pasaba [] → siempre HOLD.
+            # Respetar cooldown post-cierre externo antes de buscar nueva entrada
+            remaining = self._external_close_cooldown_until - time.monotonic()
+            if remaining > 0:
+                logger.debug(
+                    "[%s] En cooldown post-cierre externo — %.0f s restantes.",
+                    self.symbol, remaining,
+                )
+                return
+
             ohlcv_fn = trader.get_ohlcv_fn()
             signal = await self._decision_engine.evaluate(
                 self.symbol, price, ohlcv_fn
@@ -228,6 +266,26 @@ class TradingLoop:
                     "[%s] Señal aceptada por DecisionEngine: action=%s side=%s",
                     self.symbol, signal.get("action"), signal.get("side"),
                 )
-                # open_position() no existe en PositionManager.
-                # La apertura es responsabilidad del trader directamente.
+                # Guardar estado antes de abrir para detectar si open_order tuvo éxito
+                pos_before = trader.position
                 await trader.open_order(signal, risk)
+
+                # Si la posición se abrió correctamente, notificar por Telegram
+                if trader.position is not None and pos_before is None:
+                    try:
+                        from bot.telegram_bot import notify_open
+                        await notify_open(
+                            symbol     = self.symbol,
+                            side       = trader.position,
+                            price      = trader.entry_price,
+                            leverage   = trader.leverage,
+                            size_usdc  = trader._open_notional,
+                            sl         = trader.sl,
+                            tp1        = trader.tp1,
+                            tp2        = trader.tp2,
+                            tp3        = trader.tp3,
+                            dry_run    = trader.dry_run,
+                            entry_mode = signal.get("entry_mode"),
+                        )
+                    except Exception as _te:
+                        logger.debug("[%s] notify_open error: %s", self.symbol, _te)
