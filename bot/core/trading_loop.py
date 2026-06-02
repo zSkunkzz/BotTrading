@@ -2,29 +2,18 @@
 trading_loop.py — Loop principal de trading para un símbolo.
 
 FIX v8 (2026-06-02): notificaciones Telegram + cooldown post-cierre externo
-  - Llamar notify_open() justo después de open_order() exitoso.
-  - Llamar notify_close() al detectar cierre externo en _iteration().
-  - Cooldown post-cierre PERSISTIDO en bot_state (JSON en disco):
-    antes vivía solo en la instancia de TradingLoop, que BitgetBot destruye
-    y recrea cada 15 ciclos sin posición — perdiendo el cooldown y causando
-    que la posición se volviera a abrir inmediatamente.
-    Ahora: save_cooldown() / get_cooldown_remaining() en bot/state.py.
-
 FIX v9 (2026-06-03): on_position_closed + global_risk en cierre externo
-  BUG CRÍTICO A: al cerrar posición externamente, no se llamaba a
-  decision_engine.on_position_closed() → pretrade_risk._open_margin nunca
-  se liberaba → Gate 2 bloqueaba TODAS las señales para siempre.
-  Fix: llamar _decision_engine.on_position_closed() en cierre externo.
-
-  BUG CRÍTICO B: global_risk.register_open() se llama en open_order pero
-  global_risk.register_close() NUNCA se invocaba en cierre externo →
-  global_risk._open crecía indefinidamente → can_open() siempre False.
-  Fix: llamar global_risk.register_close(pnl_pct=0.0) en cierre externo.
-
-  BUG C (idle rotation): _idle_cycles usaba bot_state._positions como
-  fuente de verdad para saber si hay posición. En dry_run esto puede estar
-  desincronizado. Fix: usar trader.position (estado en memoria) como
-  fuente de verdad primaria.
+FIX v10 (2026-06-03): timeout en evaluate() + logs de diagnóstico
+  BUG: el loop se pillaba silenciosamente tras «TradingLoop iniciado».
+  Ningún log de _iteration() aparecía tras el init — la primera llamada
+  a evaluate() o get_price() bloqueaba el event loop sin ningún log.
+  Fixes:
+    1. asyncio.wait_for(evaluate(), timeout=60s): si analyze_pair se
+       cuelga, lanza TimeoutError en vez de congelar para siempre.
+    2. asyncio.wait_for(get_price(), timeout=10s).
+    3. asyncio.wait_for(_get_positions(), timeout=15s).
+    4. Logs de diagnóstico al inicio de cada _iteration() y en puntos
+       clave para saber exactamente dónde se cuelga.
 """
 from __future__ import annotations
 
@@ -44,8 +33,12 @@ logger = logging.getLogger("TradingLoop")
 LOOP_SLEEP              = float(os.getenv("LOOP_SLEEP", "10"))
 _POS_CHECK_INTERVAL_S   = int(os.getenv("POS_CHECK_INTERVAL_S", "30"))
 _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
-# Segundos que el bot espera para re-entrar tras un cierre externo/manual
 _EXTERNAL_CLOSE_COOLDOWN_S = int(os.getenv("EXTERNAL_CLOSE_COOLDOWN_S", "600"))
+
+# Timeouts para operaciones que pueden bloquearse
+_GET_PRICE_TIMEOUT_S    = float(os.getenv("GET_PRICE_TIMEOUT_S",    "10"))
+_GET_POS_TIMEOUT_S      = float(os.getenv("GET_POS_TIMEOUT_S",      "15"))
+_EVALUATE_TIMEOUT_S     = float(os.getenv("EVALUATE_TIMEOUT_S",     "60"))
 
 
 class TradingLoop:
@@ -55,7 +48,7 @@ class TradingLoop:
         self._position_mgr    = None
         self._decision_engine = None
         self._last_pos_check_at: float = 0.0
-        # Guardamos referencia al global_risk para poder llamar register_close
+        self._iteration_count: int = 0
         self._global_risk = None
 
     def _build_decision_engine(self, risk):
@@ -74,7 +67,6 @@ class TradingLoop:
         if self._decision_engine is None:
             self._decision_engine = self._build_decision_engine(global_risk or risk)
 
-        # FIX CRÍTICO B: guardar referencia al global_risk para cierre externo
         if global_risk is not None:
             self._global_risk = global_risk
 
@@ -137,7 +129,6 @@ class TradingLoop:
                 self.symbol, trader.position, trader.entry_price,
             )
 
-        # Informar si hay cooldown activo al iniciar (sobrevive a rotación)
         remaining = get_cooldown_remaining(self.symbol)
         if remaining > 0:
             logger.info(
@@ -157,127 +148,146 @@ class TradingLoop:
         )
 
     async def _iteration(self, trader, risk, global_risk) -> None:
+        self._iteration_count += 1
+        n = self._iteration_count
+
+        logger.debug("[%s] _iteration #%d iniciada", self.symbol, n)
+
         if kill_switch.is_halted(self.symbol):
             logger.debug("[%s] Kill switch activo — skip.", self.symbol)
             return
 
+        # ── Precio ──────────────────────────────────────────────────────────
         try:
-            price = await trader.get_price()
+            price = await asyncio.wait_for(
+                trader.get_price(),
+                timeout=_GET_PRICE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[%s] get_price() timeout (%ss) — skip iteración.",
+                           self.symbol, _GET_PRICE_TIMEOUT_S)
+            return
         except Exception as e:
             logger.warning("[%s] No se pudo obtener precio: %s", self.symbol, e)
             return
 
-        # ── Sincronización periódica con exchange ──────────────────────────
+        logger.debug("[%s] #%d precio=%.4f", self.symbol, n, price)
+
+        # ── Sincronización periódica con exchange ────────────────────────────
         now = time.monotonic()
         if now - self._last_pos_check_at >= _POS_CHECK_INTERVAL_S:
-            exchange_positions      = await trader._get_positions()
+            try:
+                exchange_positions = await asyncio.wait_for(
+                    trader._get_positions(),
+                    timeout=_GET_POS_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[%s] _get_positions() timeout (%ss) — skip sync.",
+                               self.symbol, _GET_POS_TIMEOUT_S)
+                exchange_positions = None
+            except Exception as e:
+                logger.warning("[%s] _get_positions() error: %s", self.symbol, e)
+                exchange_positions = None
+
             self._last_pos_check_at = now
 
-            if exchange_positions:
-                ep = exchange_positions[0]
-                if trader.position is None:
-                    trader.position    = ep["side"]
-                    trader.entry_price = ep["entryPx"]
-                    logger.info(
-                        "[%s] Posición detectada en exchange: %s @ %s",
-                        self.symbol, trader.position, trader.entry_price,
-                    )
-                if trader._open_qty == 0.0 and ep.get("size", 0) > 0:
-                    try:
-                        trader._open_qty = trader._hl_client.round_sz(float(ep["size"]))
-                    except Exception:
-                        trader._open_qty = float(ep["size"])
-                    logger.info(
-                        "[%s] _open_qty sincronizado desde exchange: %.6f",
-                        self.symbol, trader._open_qty,
-                    )
-            else:
-                if trader.position is not None:
-                    closed_side = trader.position
-                    logger.info(
-                        "[%s] Posición cerrada externamente — limpiando estado local.",
-                        self.symbol,
-                    )
-                    # ── Notificar cierre por Telegram ──────────────────────
-                    try:
-                        from bot.telegram_bot import notify_close
-                        await notify_close(
-                            symbol   = self.symbol,
-                            side     = closed_side,
-                            exit_p   = round(price, 6),
-                            pnl      = 0.0,
-                            entry    = trader.entry_price,
-                            reason   = "Cierre manual / externo",
-                            dry_run  = trader.dry_run,
+            if exchange_positions is not None:
+                if exchange_positions:
+                    ep = exchange_positions[0]
+                    if trader.position is None:
+                        trader.position    = ep["side"]
+                        trader.entry_price = ep["entryPx"]
+                        logger.info(
+                            "[%s] Posición detectada en exchange: %s @ %s",
+                            self.symbol, trader.position, trader.entry_price,
                         )
-                    except Exception as _te:
-                        logger.debug("[%s] notify_close error: %s", self.symbol, _te)
-
-                    try:
-                        trader._hl_client.cancel_all_open_tpsl()
-                        logger.info("[%s] Trigger orders huérfanos cancelados.", self.symbol)
-                    except Exception as e:
-                        logger.warning(
-                            "[%s] No se pudieron cancelar triggers huérfanos: %s",
-                            self.symbol, e,
-                        )
-
-                    # ── FIX CRÍTICO A: liberar pretrade_risk._open_margin ──
-                    # Sin esto, el margen reservado nunca se libera y Gate 2
-                    # bloquea TODAS las señales futuras para siempre.
-                    try:
-                        if self._decision_engine is not None:
-                            await self._decision_engine.on_position_closed(
-                                symbol     = self.symbol,
-                                pnl        = 0.0,
-                                reason     = "MANUAL_CLOSE",
-                                entry_mode = "NORMAL",
-                            )
-                            logger.info(
-                                "[%s] on_position_closed() llamado — pretrade_risk liberado.",
-                                self.symbol,
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            "[%s] on_position_closed() error en cierre externo: %s",
-                            self.symbol, e,
-                        )
-
-                    # ── FIX CRÍTICO B: decrementar global_risk._open ───────
-                    # Sin esto, global_risk._open nunca baja y can_open()
-                    # devuelve False para siempre tras el primer trade.
-                    _gr = self._global_risk or global_risk
-                    if _gr is not None:
+                    if trader._open_qty == 0.0 and ep.get("size", 0) > 0:
                         try:
-                            await _gr.register_close(pnl_pct=0.0, symbol=self.symbol)
-                            logger.info(
-                                "[%s] global_risk.register_close() llamado — slot liberado.",
-                                self.symbol,
+                            trader._open_qty = trader._hl_client.round_sz(float(ep["size"]))
+                        except Exception:
+                            trader._open_qty = float(ep["size"])
+                        logger.info(
+                            "[%s] _open_qty sincronizado desde exchange: %.6f",
+                            self.symbol, trader._open_qty,
+                        )
+                else:
+                    if trader.position is not None:
+                        closed_side = trader.position
+                        logger.info(
+                            "[%s] Posición cerrada externamente — limpiando estado local.",
+                            self.symbol,
+                        )
+                        try:
+                            from bot.telegram_bot import notify_close
+                            await notify_close(
+                                symbol   = self.symbol,
+                                side     = closed_side,
+                                exit_p   = round(price, 6),
+                                pnl      = 0.0,
+                                entry    = trader.entry_price,
+                                reason   = "Cierre manual / externo",
+                                dry_run  = trader.dry_run,
                             )
+                        except Exception as _te:
+                            logger.debug("[%s] notify_close error: %s", self.symbol, _te)
+
+                        try:
+                            trader._hl_client.cancel_all_open_tpsl()
+                            logger.info("[%s] Trigger orders huérfanos cancelados.", self.symbol)
                         except Exception as e:
                             logger.warning(
-                                "[%s] global_risk.register_close() error en cierre externo: %s",
+                                "[%s] No se pudieron cancelar triggers huérfanos: %s",
                                 self.symbol, e,
                             )
 
-                    # ── Activar cooldown PERSISTENTE (sobrevive a rotación) ─
-                    save_cooldown(self.symbol, _EXTERNAL_CLOSE_COOLDOWN_S)
+                        try:
+                            if self._decision_engine is not None:
+                                await self._decision_engine.on_position_closed(
+                                    symbol     = self.symbol,
+                                    pnl        = 0.0,
+                                    reason     = "MANUAL_CLOSE",
+                                    entry_mode = "NORMAL",
+                                )
+                                logger.info(
+                                    "[%s] on_position_closed() llamado — pretrade_risk liberado.",
+                                    self.symbol,
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "[%s] on_position_closed() error en cierre externo: %s",
+                                self.symbol, e,
+                            )
 
-                    trader.position    = None
-                    trader.entry_price = None
-                    trader.sl          = None
-                    trader.tp1         = None
-                    trader.tp2         = None
-                    trader.tp3         = None
-                    trader._open_qty   = 0.0
-                    clear_position(self.symbol)
+                        _gr = self._global_risk or global_risk
+                        if _gr is not None:
+                            try:
+                                await _gr.register_close(pnl_pct=0.0, symbol=self.symbol)
+                                logger.info(
+                                    "[%s] global_risk.register_close() llamado — slot liberado.",
+                                    self.symbol,
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "[%s] global_risk.register_close() error en cierre externo: %s",
+                                    self.symbol, e,
+                                )
 
-        # ── Gestionar posición abierta o evaluar nueva entrada ─────────────
+                        save_cooldown(self.symbol, _EXTERNAL_CLOSE_COOLDOWN_S)
+
+                        trader.position    = None
+                        trader.entry_price = None
+                        trader.sl          = None
+                        trader.tp1         = None
+                        trader.tp2         = None
+                        trader.tp3         = None
+                        trader._open_qty   = 0.0
+                        clear_position(self.symbol)
+
+        # ── Gestionar posición abierta o evaluar nueva entrada ───────────────
         if trader.position is not None:
             trader._last_price = price
             await self._position_mgr.manage()
         else:
-            # Consultar cooldown desde disco (persiste entre rotaciones)
             remaining = get_cooldown_remaining(self.symbol)
             if remaining > 0:
                 logger.debug(
@@ -286,10 +296,27 @@ class TradingLoop:
                 )
                 return
 
+            logger.debug("[%s] #%d evaluando señal (precio=%.4f)...", self.symbol, n, price)
+
             ohlcv_fn = trader.get_ohlcv_fn()
-            signal = await self._decision_engine.evaluate(
-                self.symbol, price, ohlcv_fn
-            )
+            try:
+                signal = await asyncio.wait_for(
+                    self._decision_engine.evaluate(
+                        self.symbol, price, ohlcv_fn
+                    ),
+                    timeout=_EVALUATE_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] #%d evaluate() timeout (%ss) — posiblemente OHLCV fetch colgado. "
+                    "Verifica conexión a HL API.",
+                    self.symbol, n, _EVALUATE_TIMEOUT_S,
+                )
+                return
+            except Exception as e:
+                logger.error("[%s] #%d evaluate() error: %s", self.symbol, n, e, exc_info=True)
+                return
+
             if signal:
                 logger.info(
                     "[%s] Señal aceptada por DecisionEngine: action=%s side=%s",
@@ -298,7 +325,6 @@ class TradingLoop:
                 pos_before = trader.position
                 await trader.open_order(signal, risk)
 
-                # Si la posición se abrió correctamente, notificar por Telegram
                 if trader.position is not None and pos_before is None:
                     try:
                         from bot.telegram_bot import notify_open
