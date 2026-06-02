@@ -19,6 +19,14 @@ FIX v4.1:
   - kelly_sizer: la función real es kelly_multiplier(entry_mode, rr), no .multiplier(symbol=)
   - market_regime: ahora tiene singleton MarketRegimeSingleton con .refresh()/.regime()/.btc_trend()
   - REGIME_FILTER env var alineada con market_regime (MARKET_REGIME_GATE también funciona)
+
+FIX v4.2:
+  - BUG A: on_position_closed llamaba signal_cooldown.on_trade_result() que no existe.
+           Método real: mark_closed(symbol, reason, entry_mode).
+  - BUG B: confirm_order() recibía `notional` (base_usdc × lev) en vez de `margin` (base_usdc / lev).
+           Esto inflaba el contador de open_margin × leverage, bloqueando nuevas entradas incorrectamente.
+           Al reiniciarse el bot (Railway), el pretrade_risk se reseteaba a 0 y el bot abría otra
+           posición sin detectar que ya existía una en el exchange → acumulación de posiciones duplicadas.
 """
 from __future__ import annotations
 
@@ -110,8 +118,11 @@ class DecisionEngine:
         Callback invocado desde PositionManager al cerrar cualquier posición.
         Actualiza cooldown dinámico y registra resultado en shadow_mode.
 
-        FIX: convertido a async def para que trader.py pueda llamarlo con await
+        FIX v4.1: convertido a async def para que trader.py pueda llamarlo con await
         sin lanzar 'object NoneType can't be used in await expression'.
+
+        FIX v4.2 BUG A: signal_cooldown.on_trade_result() no existe.
+        El método real es mark_closed(symbol, reason, entry_mode).
         """
         is_win = reason in ("TP1", "TP2", "TP3")
         logger.debug(
@@ -123,13 +134,15 @@ class DecisionEngine:
         except Exception as e:
             logger.debug("[%s] shadow_mode.record_real_close error: %s", symbol, e)
         try:
-            signal_cooldown.on_trade_result(
+            # FIX v4.2 BUG A: usar mark_closed(symbol, reason, entry_mode)
+            # en vez del inexistente on_trade_result(symbol, won, entry_mode)
+            signal_cooldown.mark_closed(
                 symbol=symbol,
-                won=is_win,
-                entry_mode=entry_mode,
+                reason=reason,                        # "SL" | "TP1" | "TP2" | "TP3" | "TIMEOUT"
+                entry_mode=entry_mode or "NORMAL",
             )
         except Exception as e:
-            logger.debug("[%s] signal_cooldown.on_trade_result error: %s", symbol, e)
+            logger.debug("[%s] signal_cooldown.mark_closed error: %s", symbol, e)
 
     async def evaluate(
         self,
@@ -365,7 +378,13 @@ class DecisionEngine:
         if result.get("status") != "ok":
             return
 
-        pretrade_risk.confirm_order(self.symbol, notional)
+        # FIX v4.2 BUG B: confirm_order debe recibir MARGIN (base_usdc), no notional.
+        # notional = base_usdc × lev → pasar notional infla el contador × leverage,
+        # lo que hace que pretrade_risk crea que hay mucho más margen abierto del real.
+        # Tras un restart de Railway el estado se resetea a 0 y el bot abre otra posición
+        # sin detectar la existente en el exchange → posiciones duplicadas acumuladas.
+        margin_used = notional / lev if lev > 0 else notional
+        pretrade_risk.confirm_order(self.symbol, margin_used)
 
         try:
             fill_price = float(
@@ -393,7 +412,7 @@ class DecisionEngine:
         trader._tp1_be_done   = False
         trader._open_notional = notional
         trader._open_leverage = lev
-        trader._open_margin   = notional / lev if lev else notional
+        trader._open_margin   = margin_used
         trader._protection_ok = False
         trader.trade_count   += 1
 
