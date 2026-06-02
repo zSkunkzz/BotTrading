@@ -13,8 +13,13 @@ NOTA: FuturesTrader en trader.py sigue siendo el punto de entrada público
 para compatibilidad con main.py — este módulo contiene la lógica extraída
 para mejorar la legibilidad y testabilidad.
 
-FIX: Cierre externo/manual ahora llama mark_manual_close() (600s) en vez de
+FIX v1: Cierre externo/manual ahora llama mark_manual_close() (600s) en vez de
      mark_closed("external") que solo aplicaba base×0.5 (~60-90s).
+
+FIX v2: Cierre externo delega en position_mgr.detect_external_close(trader)
+     en vez de limpiar estado manualmente aquí. Garantiza que pretrade_risk,
+     decision_engine.on_position_closed y mark_manual_close se ejecuten
+     siempre juntos, igual que los cierres internos por SL/TP.
 """
 from __future__ import annotations
 
@@ -26,7 +31,6 @@ import time
 from bot.state import load_position, clear_position
 from bot.balance_service import balance_svc
 from bot.kill_switch import kill_switch
-from bot.signal_cooldown import signal_cooldown
 from bot.core.decision_engine import DecisionEngine
 from bot.core.position_manager import PositionManager
 
@@ -132,9 +136,12 @@ class TradingLoop:
                     )
             else:
                 if trader.position is not None:
-                    logger.info("[%s] Posición cerrada externamente.", self.symbol)
+                    logger.info(
+                        "[%s] Posición cerrada externamente — delegando a detect_external_close().",
+                        self.symbol,
+                    )
 
-                    # Cancelar trigger orders huérfanos
+                    # Cancelar trigger orders huérfanos antes de limpiar estado
                     try:
                         trader._hl_client.cancel_all_open_tpsl()
                         logger.info("[%s] Trigger orders huérfanos cancelados.", self.symbol)
@@ -144,19 +151,13 @@ class TradingLoop:
                             self.symbol, e,
                         )
 
-                    # FIX: cierre manual/externo → cooldown completo (COOLDOWN_MANUAL_CLOSE, default 600s)
-                    # Antes usaba mark_closed("external") que aplicaba solo base×0.5 (~60-90s),
-                    # permitiendo reentrar al mismo par recién cerrado a mano.
-                    # mark_manual_close() preserva además el contador de SL consecutivos intacto.
-                    signal_cooldown.mark_manual_close(self.symbol)
-
-                    trader.position    = None
-                    trader.entry_price = None
-                    trader.sl = trader.tp1 = trader.tp2 = trader.tp3 = None
-                    trader.tp2_hit     = False
-                    trader._tp1_be_done = False
-                    self._position_mgr.set_entry_mode("")
-                    clear_position(self.symbol)
+                    # FIX v2: delegar limpieza completa a PositionManager.
+                    # detect_external_close() llama en orden:
+                    #   1. signal_cooldown.mark_manual_close()  → 600s cooldown
+                    #   2. pretrade_risk.register_close()       → libera exposición
+                    #   3. decision_engine.on_position_closed() → reason=MANUAL
+                    #   4. _reset_trader_state()                → limpia trader + disco
+                    self._position_mgr.detect_external_close(trader)
 
         # ── Gestionar posición abierta o evaluar nueva entrada ────────────────
         if trader.position is not None:
