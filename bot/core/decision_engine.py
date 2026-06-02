@@ -27,6 +27,11 @@ FIX v4.2:
            Esto inflaba el contador de open_margin × leverage, bloqueando nuevas entradas incorrectamente.
            Al reiniciarse el bot (Railway), el pretrade_risk se reseteaba a 0 y el bot abría otra
            posición sin detectar que ya existía una en el exchange → acumulación de posiciones duplicadas.
+
+FIX v4.3:
+  - BUG C: signal_cooldown.is_blocked() no existe — método real es is_in_cooldown().
+           Causaba AttributeError en cada iteración de todos los traders, dejando el bot
+           incapaz de evaluar ninguna entrada.
 """
 from __future__ import annotations
 
@@ -159,7 +164,8 @@ class DecisionEngine:
             return
 
         # ── #4 Cooldown de reapertura ───────────────────────────────────────────────
-        if signal_cooldown.is_blocked(self.symbol):
+        # FIX v4.3 BUG C: is_blocked() no existe → método real es is_in_cooldown()
+        if signal_cooldown.is_in_cooldown(self.symbol):
             remaining = signal_cooldown.remaining(self.symbol)
             logger.debug(
                 "[%s] Cooldown activo — %.0fs restantes.", self.symbol, remaining
