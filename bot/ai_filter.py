@@ -8,11 +8,17 @@ Fuentes RSS (100% gratuitas, sin API key, sin registro):
 
 Flujo:
   1. Check cache  → si vigente, devuelve sin ninguna llamada externa.
-  2. Fetch RSS de las 3 fuentes en paralelo.
+  2. Fetch RSS de las 3 fuentes en paralelo (una sola ClientSession).
   3. Filtra titulares que mencionen el simbolo o su nombre completo.
   4. Sin titulares relevantes → 0.0 SIN llamar a Groq.
-  5. Con titulares → llama a Groq para evaluar el sentimiento.
+  5. Con titulares → llama a Groq (misma sesion reutilizada).
   6. Cachea el resultado.
+
+Fix 2026-06-02: se eliminaron las ClientSession anidadas dentro de helpers.
+Ahora news_score_adjustment() crea UNA sola sesion aiohttp con
+connector_owner=True y la pasa a todos los helpers. Esto evita el warning
+"Unclosed connection" que aparecia cuando una excepcion interrumpia el flujo
+antes de que el context manager interno pudiera cerrar la sesion.
 
 Variables de entorno:
   GROQ_API_KEY            — clave Groq
@@ -49,28 +55,27 @@ RSS_FEEDS = [
     "https://decrypt.co/feed",
 ]
 
-# Mapa de simbolo -> palabras clave adicionales para el filtro
 _SYMBOL_KEYWORDS: dict[str, list[str]] = {
-    "BTC":  ["bitcoin"],
-    "ETH":  ["ethereum", "ether"],
-    "SOL":  ["solana"],
-    "BNB":  ["binance"],
-    "XRP":  ["ripple"],
-    "ADA":  ["cardano"],
-    "DOGE": ["dogecoin"],
-    "AVAX": ["avalanche"],
-    "DOT":  ["polkadot"],
+    "BTC":   ["bitcoin"],
+    "ETH":   ["ethereum", "ether"],
+    "SOL":   ["solana"],
+    "BNB":   ["binance"],
+    "XRP":   ["ripple"],
+    "ADA":   ["cardano"],
+    "DOGE":  ["dogecoin"],
+    "AVAX":  ["avalanche"],
+    "DOT":   ["polkadot"],
     "MATIC": ["polygon"],
-    "LINK": ["chainlink"],
-    "UNI":  ["uniswap"],
-    "ATOM": ["cosmos"],
-    "LTC":  ["litecoin"],
-    "NEAR": ["near protocol"],
-    "ARB":  ["arbitrum"],
-    "OP":   ["optimism"],
-    "SUI":  ["sui network"],
-    "APT":  ["aptos"],
-    "INJ":  ["injective"],
+    "LINK":  ["chainlink"],
+    "UNI":   ["uniswap"],
+    "ATOM":  ["cosmos"],
+    "LTC":   ["litecoin"],
+    "NEAR":  ["near protocol"],
+    "ARB":   ["arbitrum"],
+    "OP":    ["optimism"],
+    "SUI":   ["sui network"],
+    "APT":   ["aptos"],
+    "INJ":   ["injective"],
 }
 
 # Cache en memoria: {symbol: (score_delta, timestamp_monotonic)}
@@ -97,11 +102,10 @@ def _set_cached(symbol: str, delta: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RSS fetch
+# RSS fetch — recibe session ya abierta, NO crea una nueva
 # ---------------------------------------------------------------------------
 
 def _matches_symbol(text: str, symbol: str) -> bool:
-    """True si el texto menciona el simbolo o sus nombres conocidos."""
     text_lower = text.lower()
     if symbol.lower() in text_lower:
         return True
@@ -111,8 +115,14 @@ def _matches_symbol(text: str, symbol: str) -> bool:
     return False
 
 
-async def _fetch_feed(session: aiohttp.ClientSession, url: str, symbol: str, cutoff: datetime) -> list[str]:
-    """Descarga un feed RSS y devuelve titulares relevantes para el simbolo."""
+async def _fetch_feed(
+    session: aiohttp.ClientSession,
+    url: str,
+    symbol: str,
+    cutoff: datetime,
+) -> list[str]:
+    """Descarga un feed RSS y devuelve titulares relevantes para el simbolo.
+    Recibe la sesion del caller — no la cierra."""
     try:
         async with session.get(
             url,
@@ -124,15 +134,15 @@ async def _fetch_feed(session: aiohttp.ClientSession, url: str, symbol: str, cut
             text = await resp.text(errors="replace")
 
         headlines = []
-        items = re.findall(r"<item>(.*?)</item>", text, re.DOTALL)
-        for item in items:
-            title_m = re.search(r"<title>(?:<\!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", item, re.DOTALL)
+        for item in re.findall(r"<item>(.*?)</item>", text, re.DOTALL):
+            title_m = re.search(
+                r"<title>(?:<\!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", item, re.DOTALL
+            )
             if not title_m:
                 continue
             title = re.sub(r"<[^>]+>", "", title_m.group(1)).strip()
             if not title or not _matches_symbol(title, symbol):
                 continue
-            # Filtro de fecha
             date_m = re.search(r"<pubDate>(.*?)</pubDate>", item)
             if date_m:
                 try:
@@ -151,27 +161,32 @@ async def _fetch_feed(session: aiohttp.ClientSession, url: str, symbol: str, cut
         return []
 
 
-async def _fetch_recent_headlines(symbol: str, hours: float) -> list[str]:
-    """Busca titulares recientes sobre el simbolo en todos los feeds RSS en paralelo."""
+async def _fetch_recent_headlines(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    hours: float,
+) -> list[str]:
+    """Busca titulares en todos los feeds en paralelo usando la sesion compartida."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(
-            *[_fetch_feed(session, url, symbol, cutoff) for url in RSS_FEEDS],
-            return_exceptions=True,
-        )
+    results = await asyncio.gather(
+        *[_fetch_feed(session, url, symbol, cutoff) for url in RSS_FEEDS],
+        return_exceptions=True,
+    )
     headlines: list[str] = []
     for r in results:
         if isinstance(r, list):
             headlines.extend(r)
-    # Deduplicar por texto exacto
     seen: set[str] = set()
-    unique = [h for h in headlines if not (h in seen or seen.add(h))]
-    logger.debug("[AIFilter] %s — %d titulares relevantes en ultimas %.0fh", symbol, len(unique), hours)
+    unique = [h for h in headlines if not (h in seen or seen.add(h))]  # type: ignore[func-returns-value]
+    logger.debug(
+        "[AIFilter] %s — %d titulares relevantes en ultimas %.0fh",
+        symbol, len(unique), hours,
+    )
     return unique[:10]
 
 
 # ---------------------------------------------------------------------------
-# Groq analysis
+# Groq analysis — recibe session ya abierta, NO crea una nueva
 # ---------------------------------------------------------------------------
 
 def _clean_json(content: str) -> str:
@@ -185,7 +200,12 @@ def _clean_json(content: str) -> str:
     return content
 
 
-async def _groq_analyze(symbol: str, headlines: list[str]) -> float:
+async def _groq_analyze(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    headlines: list[str],
+) -> float:
+    """Llama a Groq con los titulares. Usa la sesion compartida del caller."""
     groq_key = os.getenv("GROQ_API_KEY", "")
     if not groq_key:
         return 0.0
@@ -208,32 +228,33 @@ async def _groq_analyze(symbol: str, headlines: list[str]) -> float:
     try:
         async with budget.groq_semaphore:
             await budget.register_groq_call()
-            async with aiohttp.ClientSession() as session:
-                resp = await session.post(
-                    GROQ_API_URL,
-                    headers={
-                        "Authorization": f"Bearer {groq_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": GROQ_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 60,
-                        "temperature": 0.1,
-                    },
-                    timeout=aiohttp.ClientTimeout(total=12),
-                )
+            async with session.post(
+                GROQ_API_URL,
+                headers={
+                    "Authorization": f"Bearer {groq_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 60,
+                    "temperature": 0.1,
+                },
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
                 if resp.status != 200:
                     logger.warning("[AIFilter] Groq HTTP %d para %s", resp.status, symbol)
                     return 0.0
-                data   = await resp.json()
-                parsed = json.loads(_clean_json(data["choices"][0]["message"]["content"]))
-                delta  = max(_SCORE_MIN, min(_SCORE_MAX, float(parsed.get("score_delta", 0.0))))
-                logger.info(
-                    "[AIFilter] %s — 📰 %d titulares → score_delta=%+.1f | %s",
-                    symbol, len(headlines), delta, parsed.get("reason", "")[:120],
-                )
-                return delta
+                data = await resp.json()
+
+        parsed = json.loads(_clean_json(data["choices"][0]["message"]["content"]))
+        delta  = max(_SCORE_MIN, min(_SCORE_MAX, float(parsed.get("score_delta", 0.0))))
+        logger.info(
+            "[AIFilter] %s — 📰 %d titulares → score_delta=%+.1f | %s",
+            symbol, len(headlines), delta, parsed.get("reason", "")[:120],
+        )
+        return delta
+
     except (RateLimitExhausted, asyncio.TimeoutError, json.JSONDecodeError, Exception) as e:
         logger.debug("[AIFilter] Groq error para %s: %s", symbol, e)
         return 0.0
@@ -247,9 +268,12 @@ async def news_score_adjustment(symbol: str) -> float:
     """
     Devuelve un delta de score en [-2.0, +2.0] basado en noticias reales.
 
+    Crea UNA sola ClientSession para toda la operacion (RSS + Groq si aplica)
+    y la cierra correctamente al terminar, evitando 'Unclosed connection'.
+
     Flujo:
-      1. Cache   → devuelve sin llamadas si vigente.
-      2. RSS     → busca titulares que mencionen el simbolo (gratis, paralelo).
+      1. Cache       → devuelve sin llamadas si vigente.
+      2. RSS (gratis)→ busca titulares que mencionen el simbolo.
       3. Sin titulares → 0.0 SIN llamar a Groq.
       4. Con titulares → llama a Groq para analizar sentimiento.
     """
@@ -260,14 +284,17 @@ async def news_score_adjustment(symbol: str) -> float:
         logger.debug("[AIFilter] %s — cache hit, score_delta=%+.1f", base, cached)
         return cached
 
-    headlines = await _fetch_recent_headlines(base, _HOURS_LOOKBACK)
+    # Una sola sesion para toda la operacion
+    async with aiohttp.ClientSession() as session:
+        headlines = await _fetch_recent_headlines(session, base, _HOURS_LOOKBACK)
 
-    if not headlines:
-        logger.debug("[AIFilter] %s — sin noticias, score_delta=0", base)
-        _set_cached(base, 0.0)
-        return 0.0
+        if not headlines:
+            logger.debug("[AIFilter] %s — sin noticias, score_delta=0", base)
+            _set_cached(base, 0.0)
+            return 0.0
 
-    delta = await _groq_analyze(base, headlines)
+        delta = await _groq_analyze(session, base, headlines)
+
     _set_cached(base, delta)
     return delta
 
