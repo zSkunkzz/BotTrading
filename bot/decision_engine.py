@@ -18,6 +18,14 @@ INTEGRATION_NOTE para trader.py:
         symbol, margin=<margin_original>, reason='SL'|'TP1'|'TP2'|'TP3'|'TIMEOUT',
         entry_mode=<mode>
     )
+
+FIX 2026-06-02:
+  on_position_closed llamaba await self._risk.register_close() pero
+  pretrade_risk.register_close() es síncrono (no corrutina). Llamar
+  await sobre un método síncrono devuelve None y lanza:
+    TypeError: object NoneType can't be used in 'await' expression
+  Fix: llamada directa sin await (es thread-safe ya que no usa asyncio.Lock
+  en el path de escritura, sólo en check()).
 """
 from __future__ import annotations
 
@@ -88,8 +96,6 @@ class DecisionEngine:
             closes_1h = signal.get("indicators", {}).get("_closes_1h", [])
             if closes_1h and len(closes_1h) >= 30:
                 df_regime = pd.DataFrame({"close": closes_1h})
-                # Construir high/low aproximados a partir de close (regime usa ADX+BB)
-                # Si el signal tuviera OHLCV real, usaría ese; por ahora aproximamos
                 df_regime["high"]  = df_regime["close"] * 1.001
                 df_regime["low"]   = df_regime["close"] * 0.999
                 allowed, reg_reason = verify_regime_gate(df_regime, symbol)
@@ -143,7 +149,8 @@ class DecisionEngine:
         Registra el margin en el risk ledger + sella el rate-limiter.
         """
         m = margin if margin is not None else self._usdc
-        await self._risk.confirm_order(symbol=symbol, margin=m)
+        # confirm_order es síncrono — llamada directa
+        self._risk.confirm_order(symbol=symbol, notional_or_margin=m)
         log.debug("[DecisionEngine] order confirmed %s (margin %.2f)", symbol, m)
 
     async def on_position_closed(
@@ -157,6 +164,11 @@ class DecisionEngine:
         Llamar cuando una posición se cierra completamente.
         Libera el margin + actualiza el cooldown dinámico.
 
+        FIX 2026-06-02: register_close() es síncrono en PreTradeRisk.
+        Llamar con await generaba:
+          TypeError: object NoneType can't be used in 'await' expression
+        Fix: llamada directa (síncrona).
+
         Parameters
         ----------
         reason : str
@@ -165,7 +177,8 @@ class DecisionEngine:
             Modo de entrada original (para escalar el cooldown correctamente)
         """
         m = margin if margin is not None else self._usdc
-        await self._risk.register_close(symbol=symbol, margin=m)
+        # FIX: register_close es síncrono — NO usar await
+        self._risk.register_close(symbol=symbol, notional_or_margin=m)
         log.debug("[DecisionEngine] position closed %s (%.2f released, reason=%s)", symbol, m, reason)
 
         try:

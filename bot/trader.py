@@ -38,6 +38,19 @@ FIX KS L3 falso positivo tras restart (2026-06-02):
   la protección (cada 120s). Fix: llamar _ensure_tpsl_on_exchange() en _init()
   envuelto con mark_tpsl_retrying()/clear_tpsl_retrying() para inhibir el
   watchdog durante la verificación/reposición.
+
+FIX DecisionEngine/pretrade_risk interface (2026-06-02):
+  1. on_position_closed en decision_engine.py llamaba
+     `await self._risk.register_close()` pero ese método es síncrono.
+     Resultado: TypeError: object NoneType can't be used in 'await' expression.
+     Fix aplicado en decision_engine.py (llamada directa sin await).
+  2. on_order_confirmed en _execute_signal no tenía try/except — si fallaba
+     propagaba sin capturar y dejaba el risk ledger sin confirmar.
+     Fix: envuelto en try/except con log.warning.
+  3. _last_tpsl_verify_at = 0.0 antes de _verify_protection_on_restore()
+     era redundante y exponía race condition si _verify fallaba:
+     el watchdog veía 0.0 y disparaba inmediatamente.
+     Fix: eliminada la asignación explícita (ya vale 0.0 en __init__).
 """
 from __future__ import annotations
 
@@ -437,7 +450,10 @@ class FuturesTrader:
             exchange_pos = await self._get_positions()
             if exchange_pos is not None and len(exchange_pos) > 0:
                 self._restore_position_fields(saved)
-                self._last_tpsl_verify_at = 0.0
+                # FIX: NO asignar _last_tpsl_verify_at = 0.0 aquí.
+                # _verify_protection_on_restore() lo setea a time.monotonic()
+                # si tiene éxito. Si se asigna 0.0 antes y _verify falla,
+                # el watchdog ve 0.0 y dispara on_state_mismatch inmediatamente.
                 logger.info("[%s] Posicion restaurada: %s @ %s",
                             self.symbol, self.position, self.entry_price)
 
@@ -1166,7 +1182,12 @@ class FuturesTrader:
                 "trailing_sl_activated": False, "trail_peak": 0.0,
             })
 
-            await self._decision_engine.on_order_confirmed(symbol=self.symbol, margin=margin)
+            # FIX: on_order_confirmed envuelto en try/except para que un fallo
+            # no deje el risk ledger sin confirmar ni interrumpa _execute_signal.
+            try:
+                await self._decision_engine.on_order_confirmed(symbol=self.symbol, margin=margin)
+            except Exception as e:
+                logger.warning("[%s] DecisionEngine.on_order_confirmed error: %s", self.symbol, e)
 
             try:
                 await notify_open(self.symbol, side, price, qty, sl=sl, tp=tp1)
