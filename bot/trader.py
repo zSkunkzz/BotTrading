@@ -37,7 +37,7 @@ FIX KS L3 falso positivo tras restart (2026-06-02):
   on_state_mismatch cada 30s antes de que _manage_open_position verificara
   la protección (cada 120s). Fix: llamar _ensure_tpsl_on_exchange() en _init()
   envuelto con mark_tpsl_retrying()/clear_tpsl_retrying() para inhibir el
-  watchdog durante la verificación/reposición.
+  watchdog durante la verificación y reposición.
 
 FIX DecisionEngine/pretrade_risk interface (2026-06-02):
   1. on_position_closed en decision_engine.py llamaba
@@ -51,6 +51,21 @@ FIX DecisionEngine/pretrade_risk interface (2026-06-02):
      era redundante y exponía race condition si _verify fallaba:
      el watchdog veía 0.0 y disparaba inmediatamente.
      Fix: eliminada la asignación explícita (ya vale 0.0 en __init__).
+
+FIX _get_signal ai_decide args (2026-06-02):
+  _get_signal llamaba ai_decide(self.symbol, ohlcv, price) pasando `price`
+  como tercer argumento posicional. La firma real es:
+    ai_decide(symbol, bars, position, entry_price, leverage, context_override)
+  Resultado: position=price (float truthy) → ai_decide entraba en el path
+  de posición abierta y devolvía {"action":"HOLD"} sin "side" → Gate 1 del
+  DecisionEngine rechazaba TODAS las señales → el bot nunca abría trades.
+  Fix: pasar position=None, entry_price=0.0, leverage=self.leverage cuando
+  no hay posición abierta (path de búsqueda de nuevas entradas).
+
+FIX _execute_signal risk.usdc_per_trade (2026-06-02):
+  _execute_signal usaba `risk.usdc_per_trade` como fallback de margin, pero
+  `risk` es RiskManager (no tiene ese atributo) → AttributeError silencioso.
+  Fix: usar float(os.getenv("USDC_PER_TRADE", "20")) como fallback.
 """
 from __future__ import annotations
 
@@ -110,6 +125,8 @@ _FALLBACK_ATR_TP1_MULT = float(os.getenv("FALLBACK_ATR_TP1_MULT", "3.5"))
 _FALLBACK_ATR_TP2_MULT = float(os.getenv("FALLBACK_ATR_TP2_MULT", "5.0"))
 
 _MAX_EXPECTED_RO_ORDERS = int(os.getenv("MAX_EXPECTED_RO_ORDERS", "2"))
+
+_USDC_PER_TRADE = float(os.getenv("USDC_PER_TRADE", "20"))
 
 # ── Rate limiter global para /info ────────────────────────────────────────
 GL_REST_LOCK    = asyncio.Lock()
@@ -275,7 +292,7 @@ class FuturesTrader:
         if _DE_AVAILABLE:
             self._decision_engine = _DecisionEngine(
                 pretrade_risk=pretrade_risk,
-                usdc_per_trade=float(os.getenv("USDC_PER_TRADE", "20")),
+                usdc_per_trade=_USDC_PER_TRADE,
                 leverage=leverage,
             )
         else:
@@ -1105,13 +1122,39 @@ class FuturesTrader:
             logger.debug("[%s] DecisionEngine no disponible — sin entradas automáticas.", self.symbol)
 
     async def _get_signal(self, price: float) -> dict | None:
-        """Obtiene señal de la estrategia para este símbolo."""
+        """
+        Obtiene señal de la estrategia para este símbolo.
+
+        FIX: ai_decide(symbol, bars, position, entry_price, leverage, context_override)
+        Antes se llamaba como ai_decide(self.symbol, ohlcv, price), lo que
+        hacía que `price` fuera interpretado como `position` (float truthy) y
+        ai_decide entraba en el path de gestión de posición abierta, devolviendo
+        HOLD sin "side" → DecisionEngine rechazaba todas las señales en Gate 1.
+        Fix: pasar los argumentos correctos con position=None cuando no hay
+        posición abierta (path de búsqueda de nuevas entradas).
+        """
         try:
             ohlcv = await self.get_ohlcv()
             if not ohlcv or len(ohlcv) < OHLCV_MIN_BARS:
                 return None
-            signal = await ai_decide(self.symbol, ohlcv, price)
-            return signal
+            # FIX: pasar position=None, entry_price=0.0, leverage correctos
+            result = await ai_decide(
+                self.symbol,
+                ohlcv,
+                None,           # position — no hay posición abierta
+                0.0,            # entry_price — no aplica sin posición
+                self.leverage,  # leverage — necesario para sizing interno
+            )
+            # ai_decide devuelve {"action": ..., "confidence": ..., "reasoning": ...}
+            # DecisionEngine.evaluate() espera {"side": "long"|"short", ...}
+            # Mapear action → side
+            action = result.get("action", "HOLD") if result else "HOLD"
+            if action == "BUY":
+                return {**result, "side": "long"}
+            if action == "SELL":
+                return {**result, "side": "short"}
+            # HOLD / CLOSE / cualquier otro → sin señal accionable
+            return None
         except Exception as e:
             logger.debug("[%s] _get_signal error: %s", self.symbol, e)
             return None
@@ -1119,7 +1162,9 @@ class FuturesTrader:
     async def _execute_signal(self, enriched: dict, price: float, risk) -> None:
         """Abre posición basada en señal enriquecida por DecisionEngine."""
         side = enriched.get("side")
-        margin = enriched.get("_margin", risk.usdc_per_trade)
+        # FIX: usar _USDC_PER_TRADE como fallback — risk es RiskManager y no
+        # tiene atributo usdc_per_trade.
+        margin = enriched.get("_margin", _USDC_PER_TRADE)
         leverage = enriched.get("_leverage", self.leverage)
         sl = enriched.get("sl")
         tp1 = enriched.get("tp1")
@@ -1199,15 +1244,17 @@ class FuturesTrader:
     async def run(self, risk, *, global_risk=None):
         self._global_risk = global_risk
         await self._init(risk.usdc_per_trade)
-        while True:
-            try:
-                await self._iteration(risk, global_risk)
-            except asyncio.CancelledError:
-                logger.info("[%s] Trader cancelado.", self.symbol)
-                raise
-            except Exception as e:
-                logger.error("[%s] Error en iteracion: %s", self.symbol, e, exc_info=True)
-            await asyncio.sleep(LOOP_SLEEP)
+        async def _iteration_loop():
+            while True:
+                try:
+                    await self._iteration(risk, global_risk)
+                except asyncio.CancelledError:
+                    logger.info("[%s] Trader cancelado.", self.symbol)
+                    raise
+                except Exception as e:
+                    logger.error("[%s] Error en iteracion: %s", self.symbol, e, exc_info=True)
+                await asyncio.sleep(LOOP_SLEEP)
+        await _iteration_loop()
 
     async def _iteration(self, risk, global_risk):
         if kill_switch.is_halted(self.symbol):
