@@ -8,6 +8,7 @@ Responsabilidades:
   - Llamar a decide() + ai_decide()
   - Calcular qty y apalancamiento
   - Aplicar sizing dinámico según win-rate histórico del modo (#8)
+  - Aplicar penalización de enriched_filter al notional (penalty 0-3 → mult 1.0-0.55)
   - Abrir posición y persistir estado
   - Registrar exposición en pretrade_risk tras fill confirmado
   - Registrar señal en shadow_mode con entry_mode (#8)
@@ -32,6 +33,16 @@ FIX v4.3:
   - BUG C: signal_cooldown.is_blocked() no existe — método real es is_in_cooldown().
            Causaba AttributeError en cada iteración de todos los traders, dejando el bot
            incapaz de evaluar ninguna entrada.
+
+FIX v4.4:
+  - BUG D: enriched_filter.apply() devuelve .penalty (0-3) que se descartaba silenciosamente.
+           Ahora se aplica al notional como multiplicador antes de Kelly:
+             penalty=0 → ×1.00 (sin cambio)
+             penalty=1 → ×0.85 (señal algo dudosa)
+             penalty=2 → ×0.70 (señal débil)
+             penalty=3 → ×0.55 (señal muy débil)
+           Configurable vía EF_PENALTY_FACTOR (default 0.15 = reducción del 15% por punto).
+           Si enriched_filter no está disponible en el contexto de decide(), penalty=0 y no hay efecto.
 """
 from __future__ import annotations
 
@@ -96,6 +107,10 @@ logger = logging.getLogger("DecisionEngine")
 _CANDLE_CONFIRM_TF        = os.getenv("CANDLE_CONFIRM_TF", "15m")
 _CANDLE_CONFIRM_THRESHOLD = float(os.getenv("CANDLE_CONFIRM_THRESHOLD", "0.80"))
 _CANDLE_CONFIRM_ENABLED   = os.getenv("CANDLE_CONFIRM_ENABLED", "true").lower() == "true"
+
+# FIX v4.4: reducción de notional por punto de penalización del enriched_filter
+# penalty=0 → ×1.00, penalty=1 → ×0.85, penalty=2 → ×0.70, penalty=3 → ×0.55
+_EF_PENALTY_FACTOR = float(os.getenv("EF_PENALTY_FACTOR", "0.15"))
 
 
 class DecisionEngine:
@@ -296,6 +311,23 @@ class DecisionEngine:
             logger.info(
                 "[%s] Sizing dinámico: %.2f× (modo=%s) → %.2f USDC base",
                 self.symbol, sizing_mult, entry_mode or "?", base_usdc,
+            )
+
+        # ── FIX v4.4: Penalización enriched_filter ────────────────────────────────
+        # enriched_filter.apply() devuelve penalty (0-3). Antes se descartaba.
+        # Ahora se usa para reducir el notional proporcionalmente:
+        #   penalty=0 → ×1.00 (sin reducción)
+        #   penalty=1 → ×0.85 (señal algo dudosa)
+        #   penalty=2 → ×0.70 (señal débil)
+        #   penalty=3 → ×0.55 (señal muy débil)
+        # EF_PENALTY_FACTOR controla la reducción por punto (default 0.15 = 15%).
+        ef_penalty = decision.get("ef_penalty", 0)  # decide() debe propagar este campo
+        if isinstance(ef_penalty, int) and ef_penalty > 0:
+            ef_mult = max(0.3, 1.0 - ef_penalty * _EF_PENALTY_FACTOR)
+            notional = notional * ef_mult
+            logger.info(
+                "[%s] EnrichedFilter penalty=%d → sizing ×%.2f → notional=%.2f USDC",
+                self.symbol, ef_penalty, ef_mult, notional,
             )
 
         # ── [V4] Kelly Sizer ─────────────────────────────────────────────────────

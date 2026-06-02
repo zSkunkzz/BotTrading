@@ -12,6 +12,9 @@ Extraído de FuturesTrader.run / _iteration / _init en trader.py.
 NOTA: FuturesTrader en trader.py sigue siendo el punto de entrada público
 para compatibilidad con main.py — este módulo contiene la lógica extraída
 para mejorar la legibilidad y testabilidad.
+
+FIX: Cierre externo/manual ahora llama mark_manual_close() (600s) en vez de
+     mark_closed("external") que solo aplicaba base×0.5 (~60-90s).
 """
 from __future__ import annotations
 
@@ -141,12 +144,11 @@ class TradingLoop:
                             self.symbol, e,
                         )
 
-                    # Cooldown de reapertura tras cierre externo (sin entry_mode conocido)
-                    signal_cooldown.mark_closed(
-                        self.symbol,
-                        entry_mode=self._position_mgr._entry_mode or "NORMAL",
-                        reason="external",
-                    )
+                    # FIX: cierre manual/externo → cooldown completo (COOLDOWN_MANUAL_CLOSE, default 600s)
+                    # Antes usaba mark_closed("external") que aplicaba solo base×0.5 (~60-90s),
+                    # permitiendo reentrar al mismo par recién cerrado a mano.
+                    # mark_manual_close() preserva además el contador de SL consecutivos intacto.
+                    signal_cooldown.mark_manual_close(self.symbol)
 
                     trader.position    = None
                     trader.entry_price = None
