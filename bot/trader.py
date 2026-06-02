@@ -20,6 +20,14 @@ FIX cancel_order:
   El método real es _exchange.cancel(coin, oid_int).
   Afectaba a _cancel_all_orders_reduce_only (limpieza ROORDERS) y al
   bloque de actualización del trailing SL en _manage_open_position.
+
+FIX pretrade_risk restart:
+  Al reiniciarse el bot (Railway/cualquier plataforma), el singleton
+  pretrade_risk._open_margin se reseteaba a 0 aunque hubiera una posición
+  abierta en el exchange. Esto permitía al bot abrir otra posición sobre
+  la existente → posiciones duplicadas acumuladas.
+  Ahora _init() reconstruye pretrade_risk.confirm_order(symbol, margin)
+  desde el state persistido si la posición se confirma en el exchange.
 """
 from __future__ import annotations
 
@@ -362,43 +370,71 @@ class FuturesTrader:
         except Exception as e:
             logger.warning("[%s] _cleanup_excess_ro_orders error: %s", self.symbol, e)
 
+    def _restore_position_fields(self, saved: dict) -> None:
+        """
+        Extrae campos comunes al restaurar una posición guardada.
+        Centraliza la lógica repetida en _init() para el caso exchange_ok
+        y el caso fallback (exchange no verificable).
+        """
+        self.position         = saved["side"]
+        self.entry_price      = saved["entry"]
+        self.sl               = saved.get("sl")
+        self.tp1              = saved.get("tp1")
+        self.tp2              = saved.get("tp2")
+        self.tp3              = saved.get("tp3")
+        self.tp2_hit          = saved.get("tp2_hit", False)
+        self._tp1_hit         = saved.get("tp1_hit", False)
+        self._open_notional   = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
+        self._open_leverage   = saved.get("leverage", self.leverage)
+
+        saved_margin = saved.get("margin_usdc")
+        if saved_margin and saved_margin > 0:
+            self._open_margin = saved_margin
+        elif self._open_leverage > 0:
+            self._open_margin = self._open_notional / self._open_leverage
+        else:
+            self._open_margin = self._open_notional
+
+        saved_qty = saved.get("qty")
+        if saved_qty and float(saved_qty) > 0:
+            self._open_qty = float(saved_qty)
+        elif self._open_notional > 0 and self.entry_price and self.entry_price > 0:
+            self._open_qty = self._open_notional / self.entry_price
+
+        self._open_entry_mode           = saved.get("entry_mode", "")
+        self._protection_ok             = False
+        self._trailing_sl_activated     = saved.get("trailing_sl_activated", False)
+        self._trail_peak                = saved.get("trail_peak", 0.0)
+
     async def _init(self, usdc_per_trade: float):
         await self._get_ccxt()
         saved = load_position(self.symbol)
         if saved:
             exchange_pos = await self._get_positions()
             if exchange_pos is not None and len(exchange_pos) > 0:
-                self.position         = saved["side"]
-                self.entry_price      = saved["entry"]
-                self.sl               = saved.get("sl")
-                self.tp1              = saved.get("tp1")
-                self.tp2              = saved.get("tp2")
-                self.tp3              = saved.get("tp3")
-                self.tp2_hit          = saved.get("tp2_hit", False)
-                self._tp1_hit         = saved.get("tp1_hit", False)
-                self._open_notional   = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
-                self._open_leverage   = saved.get("leverage", self.leverage)
-                saved_margin = saved.get("margin_usdc")
-                if saved_margin and saved_margin > 0:
-                    self._open_margin = saved_margin
-                elif self._open_leverage > 0:
-                    self._open_margin = self._open_notional / self._open_leverage
-                else:
-                    self._open_margin = self._open_notional
-                saved_qty = saved.get("qty")
-                if saved_qty and float(saved_qty) > 0:
-                    self._open_qty = float(saved_qty)
-                elif self._open_notional > 0 and self.entry_price and self.entry_price > 0:
-                    self._open_qty = self._open_notional / self.entry_price
-                self._open_entry_mode = saved.get("entry_mode", "")
-                self._protection_ok   = False
+                self._restore_position_fields(saved)
                 self._last_tpsl_verify_at = 0.0
-                self._trailing_sl_activated = saved.get("trailing_sl_activated", False)
-                self._trail_peak            = saved.get("trail_peak", 0.0)
                 logger.info("[%s] Posicion restaurada: %s @ %s — verificando SL/TP en exchange...",
                             self.symbol, self.position, self.entry_price)
+
+                # FIX pretrade_risk restart:
+                # El singleton se resetea en cada reinicio. Si hay posición activa
+                # confirmada en el exchange, reconstruimos el estado registrando
+                # el margen que estaba comprometido antes del restart.
+                if self._open_margin > 0:
+                    # Evitar doble-registro si ya existe una entrada para este symbol
+                    # (p.ej. restart muy rápido o test). register_close libera primero.
+                    existing = pretrade_risk._open_margin_by_symbol.get(self.symbol, 0.0)
+                    if existing == 0.0:
+                        pretrade_risk.confirm_order(self.symbol, self._open_margin)
+                        logger.info(
+                            "[%s] pretrade_risk reconstruido desde state: margin=%.2f USDC",
+                            self.symbol, self._open_margin,
+                        )
+
                 # ROORDERS FIX: limpiar órdenes acumuladas al restaurar
                 await self._cleanup_excess_ro_orders()
+
             elif exchange_pos is not None and len(exchange_pos) == 0:
                 logger.warning(
                     "[%s] Posicion guardada localmente pero NO existe en exchange — limpiando estado.",
@@ -410,32 +446,7 @@ class FuturesTrader:
                     "[%s] No se pudo verificar posicion en exchange al arrancar — restaurando sin proteccion OK.",
                     self.symbol,
                 )
-                self.position         = saved["side"]
-                self.entry_price      = saved["entry"]
-                self.sl               = saved.get("sl")
-                self.tp1              = saved.get("tp1")
-                self.tp2              = saved.get("tp2")
-                self.tp3              = saved.get("tp3")
-                self.tp2_hit          = saved.get("tp2_hit", False)
-                self._tp1_hit         = saved.get("tp1_hit", False)
-                self._open_notional   = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
-                self._open_leverage   = saved.get("leverage", self.leverage)
-                saved_margin = saved.get("margin_usdc")
-                if saved_margin and saved_margin > 0:
-                    self._open_margin = saved_margin
-                elif self._open_leverage > 0:
-                    self._open_margin = self._open_notional / self._open_leverage
-                else:
-                    self._open_margin = self._open_notional
-                saved_qty = saved.get("qty")
-                if saved_qty and float(saved_qty) > 0:
-                    self._open_qty = float(saved_qty)
-                elif self._open_notional > 0 and self.entry_price and self.entry_price > 0:
-                    self._open_qty = self._open_notional / self.entry_price
-                self._open_entry_mode = saved.get("entry_mode", "")
-                self._protection_ok   = False
-                self._trailing_sl_activated = saved.get("trailing_sl_activated", False)
-                self._trail_peak            = saved.get("trail_peak", 0.0)
+                self._restore_position_fields(saved)
 
         if not balance_svc.is_ready():
             balance_svc.init_hl(self._master_addr, self._info_post)
