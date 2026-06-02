@@ -6,20 +6,21 @@ y devolver un score_delta en el rango [-2.0, +2.0] para sumar al score técnico
 del pair_scanner.
 
 Comportamiento:
-  - score_delta > 0: noticias positivas/alcistas → aumenta prioridad del par
-  - score_delta < 0: noticias negativas/bajistas → reduce prioridad del par
-  - score_delta = 0: sin noticias relevantes o Groq no disponible (fallback seguro)
+  - score_delta > 0  : noticias positivas/alcistas → aumenta prioridad del par
+  - score_delta < 0  : noticias negativas/bajistas  → reduce prioridad del par
+  - score_delta = 0  : sin noticias relevantes, Groq no disponible, o cualquier fallo
 
-Integración:
-  Llamar a news_score_adjustment(symbol) desde pair_scanner.py al calcular
-  el score final de cada par. El resultado se suma al score técnico antes
-  de ordenar los pares candidatos.
+Flujo de ahorro de budget (2026-06-02):
+  El prompt pide has_news: bool. Si Groq responde has_news=false, se devuelve
+  0.0 inmediatamente sin consumir mas tokens en analisis. Solo se procesa
+  score_delta cuando hay noticias reales que impacten el precio.
 
 Variables de entorno:
-  GROQ_API_KEY   — clave de API de Groq (si no está definida, siempre devuelve 0.0)
+  GROQ_API_KEY   — clave de API de Groq (si no esta definida, siempre devuelve 0.0)
   GROQ_MODEL     — modelo a usar (default: llama-3.1-8b-instant)
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -52,18 +53,21 @@ def _clean_json_response(content: str) -> str:
 
 async def news_score_adjustment(symbol: str) -> float:
     """
-    Consulta a Groq sobre noticias recientes del símbolo y devuelve un delta
+    Consulta a Groq sobre noticias recientes del simbolo y devuelve un delta
     de score en [-2.0, +2.0].
 
-    - Devuelve 0.0 si Groq no está disponible, el budget está agotado,
-      la respuesta es inválida, o se produce cualquier error.
-    - Nunca lanza excepciones: fallo silencioso con fallback a 0.0.
+    Protocolo de ahorro de budget:
+      1. Groq responde con has_news: bool en el mismo JSON.
+      2. Si has_news=false  -> devuelve 0.0 inmediatamente (min tokens usados).
+      3. Si has_news=true   -> lee score_delta y reason del mismo JSON.
+
+    Nunca lanza excepciones: fallo silencioso con fallback a 0.0.
 
     Args:
-        symbol: símbolo de trading, ej. "BTC", "ETH", "SOL"
+        symbol: simbolo de trading, ej. "BTC", "ETH", "SOL"
 
     Returns:
-        float en [-2.0, +2.0] — delta a sumar al score técnico
+        float en [-2.0, +2.0] — delta a sumar al score tecnico
     """
     groq_key = os.getenv("GROQ_API_KEY", "")
     if not groq_key:
@@ -80,19 +84,19 @@ async def news_score_adjustment(symbol: str) -> float:
     base = symbol.replace("USDT", "").replace("USDC", "").replace("-PERP", "").upper()
 
     prompt = (
-        f"Eres un analista de criptomonedas. Tu tarea es evaluar el impacto de noticias "
-        f"recientes sobre {base} en su precio a corto plazo (próximas 4-24 horas).\n\n"
+        f"Eres un analista de criptomonedas. Evalua si existen noticias recientes "
+        f"relevantes sobre {base} que puedan impactar su precio en las proximas 4-24h.\n\n"
         f"Considera: anuncios de proyecto, regulaciones, hacks, listings/delistings, "
-        f"partnerships, cambios macroeconómicos relevantes para crypto, o cualquier "
-        f"noticia que pueda afectar el precio de {base}.\n\n"
-        f"Responde ÚNICAMENTE con un JSON con esta estructura exacta:\n"
-        f'{{"score_delta": <número entre -2.0 y 2.0>, "reason": "<resumen en 1 frase>"}}'\n\n"
-        f"Escala del score_delta:\n"
+        f"partnerships, cambios macro relevantes para crypto, o eventos que afecten "
+        f"directamente a {base}.\n\n"
+        f"Responde UNICAMENTE con este JSON:\n"
+        f'{{"has_news": <true|false>, "score_delta": <-2.0 a 2.0, o 0 si has_news=false>, "reason": "<1 frase o vacio si has_news=false>"}}\n\n'
+        f"Escala score_delta (solo si has_news=true):\n"
         f"  +2.0 = noticias muy positivas/alcistas\n"
         f"  +1.0 = noticias moderadamente positivas\n"
-        f"   0.0 = sin noticias relevantes o noticias neutras\n"
         f"  -1.0 = noticias moderadamente negativas\n"
         f"  -2.0 = noticias muy negativas/bajistas\n"
+        f"Si no hay noticias relevantes: has_news=false, score_delta=0, reason vacio."
     )
 
     try:
@@ -108,7 +112,7 @@ async def news_score_adjustment(symbol: str) -> float:
                     json={
                         "model": GROQ_MODEL,
                         "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 120,
+                        "max_tokens": 80,
                         "temperature": 0.1,
                     },
                     timeout=aiohttp.ClientTimeout(total=12),
@@ -127,8 +131,19 @@ async def news_score_adjustment(symbol: str) -> float:
                 content = _clean_json_response(content)
                 parsed  = json.loads(content)
 
-                if not isinstance(parsed, dict) or "score_delta" not in parsed:
+                if not isinstance(parsed, dict):
                     logger.warning("[AIFilter] Respuesta inesperada de Groq para %s: %r", symbol, parsed)
+                    return 0.0
+
+                # Si no hay noticias relevantes -> 0.0 sin mas procesamiento
+                has_news = parsed.get("has_news", False)
+                if not has_news:
+                    logger.debug("[AIFilter] %s — [sin noticias] score_delta=0", symbol)
+                    return 0.0
+
+                # Hay noticias -> leer y validar score_delta
+                if "score_delta" not in parsed:
+                    logger.warning("[AIFilter] has_news=true pero sin score_delta para %s", symbol)
                     return 0.0
 
                 delta  = float(parsed["score_delta"])
@@ -137,13 +152,10 @@ async def news_score_adjustment(symbol: str) -> float:
                 # Clampear al rango permitido
                 delta = max(_SCORE_MIN, min(_SCORE_MAX, delta))
 
-                if abs(delta) >= 0.5:
-                    logger.info(
-                        "[AIFilter] %s — score_delta=%+.1f | %s",
-                        symbol, delta, reason[:120]
-                    )
-                else:
-                    logger.debug("[AIFilter] %s — score_delta=%+.1f (neutro)", symbol, delta)
+                logger.info(
+                    "[AIFilter] %s — \U0001f4f0 NOTICIAS score_delta=%+.1f | %s",
+                    symbol, delta, reason[:120]
+                )
 
                 return delta
 
@@ -151,7 +163,7 @@ async def news_score_adjustment(symbol: str) -> float:
         logger.debug("[AIFilter] RateLimitExhausted para %s — score_delta=0", symbol)
         return 0.0
     except json.JSONDecodeError as e:
-        logger.warning("[AIFilter] JSON inválido de Groq para %s: %s", symbol, e)
+        logger.warning("[AIFilter] JSON invalido de Groq para %s: %s", symbol, e)
         return 0.0
     except asyncio.TimeoutError:
         logger.warning("[AIFilter] Timeout Groq para %s — score_delta=0", symbol)
@@ -162,13 +174,13 @@ async def news_score_adjustment(symbol: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# LEGACY — mantenido por compatibilidad pero NO se llama desde ningún módulo activo
+# LEGACY — mantenido por compatibilidad pero NO se llama desde ningun modulo activo
 # ---------------------------------------------------------------------------
 
 async def ai_rank_pairs(pairs_data: list) -> list:
     """
     DEPRECADO. Devuelve los pares ordenados por score sin llamar a Groq.
-    Usar news_score_adjustment() por símbolo en pair_scanner.py en su lugar.
+    Usar news_score_adjustment() por simbolo en pair_scanner.py en su lugar.
     """
     logger.debug("[AIFilter] ai_rank_pairs() llamado (legacy) — devolviendo orden por score sin IA")
     return [p["symbol"] for p in sorted(pairs_data, key=lambda x: x.get("score", 0), reverse=True)]
