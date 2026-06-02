@@ -1,25 +1,13 @@
 #!/usr/bin/env python3
 """
 bot/trader.py — FuturesTrader: punto de entrada público para main.py.
-
-Historia:
-  Durante la refactorización a bot/core/, este fichero quedó como un
-  placeholder que importaba 'AiTrader' desde ai_trader.py. Dicha clase
-  nunca existió (ai_trader.py solo tiene funciones de módulo), causando
-  un ImportError fatal en cada arranque.
-
-  Esta versión restaura FuturesTrader como una clase concreta que:
-    - Acepta la firma completa que main.py espera
-    - Delega el loop principal a TradingLoop (bot/core/trading_loop.py)
-    - Expone los atributos que main.py necesita: _stopped_event, position,
-      cleanup(), run(risk, global_risk=...)
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-from typing import Optional
+from typing import Callable, Optional
 
 from bot.core.hl_client import HLClient, _norm_coin
 from bot.core.trading_loop import TradingLoop
@@ -33,20 +21,27 @@ _API_URL = (
     else "https://api.hyperliquid.xyz"
 )
 
+# Cuántas velas pedir por timeframe
+_OHLCV_BARS = int(os.getenv("BARS_NEEDED", "100"))
+
+# Mapeo timeframe → intervalo en minutos para candle_snapshot
+_TF_MINUTES = {
+    "1m":  1,
+    "3m":  3,
+    "5m":  5,
+    "15m": 15,
+    "30m": 30,
+    "1h":  60,
+    "2h":  120,
+    "4h":  240,
+    "8h":  480,
+    "1d":  1440,
+}
+
 
 class FuturesTrader:
     """
     Orquestador principal de un par de trading en Hyperliquid.
-
-    Parámetros
-    ----------
-    api_key      : dirección del wallet principal (HL_API_WALLET_ADDRESS)
-    api_secret   : private key del agente o del wallet principal
-    passphrase   : no usado (compatibilidad con firma ccxt-like)
-    symbol       : e.g. "BTC", "ETH", "SOL"
-    leverage     : apalancamiento deseado (ej. 5)
-    margin_mode  : "isolated" | "cross"  (informativo — HL siempre cross perp)
-    dry_run      : si True, las órdenes se loggean pero no se envían
     """
 
     def __init__(
@@ -65,8 +60,7 @@ class FuturesTrader:
         self.margin_mode = margin_mode
         self.dry_run     = dry_run
 
-        # Estado de posición — gestionado por TradingLoop / PositionManager
-        self.position:        Optional[str]   = None   # "long" | "short" | None
+        self.position:        Optional[str]   = None
         self.entry_price:     Optional[float] = None
         self.sl:              Optional[float] = None
         self.tp1:             Optional[float] = None
@@ -78,30 +72,21 @@ class FuturesTrader:
         self._protection_ok:  bool            = False
         self._tp1_be_done:    bool            = False
 
-        # Credenciales (usadas por _get_ccxt y _set_leverage)
         self._api_key    = api_key or ""
         self._api_secret = api_secret or ""
 
-        # Cliente HL sincrónico (órdenes, posiciones, metadatos)
         self._hl_client = HLClient(symbol)
 
-        # Alias de atributos que trading_loop.py y otros módulos esperan
         self._master_addr = self._hl_client._account_addr
         self._agent_mode  = self._hl_client._agent_mode
 
-        # Event para parada limpia — main.py espera _stopped_event.wait()
         self._stopped_event = asyncio.Event()
+        self._trading_loop  = TradingLoop(symbol)
+        self._ccxt_exchange  = None
 
-        # Loop delegado
-        self._trading_loop = TradingLoop(symbol)
-
-        # ccxt exchange (lazy-init en _get_ccxt)
-        self._ccxt_exchange = None
-
-    # ── Interfaz pública requerida por main.py ─────────────────────
+    # ── Interfaz pública requerida por main.py ──────────────────────
 
     async def run(self, risk, *, global_risk=None) -> None:
-        """Arranca el loop principal. Se cancela desde fuera vía task.cancel()."""
         try:
             await self._trading_loop.run(self, risk, global_risk=global_risk)
         except asyncio.CancelledError:
@@ -110,7 +95,6 @@ class FuturesTrader:
             self._stopped_event.set()
 
     async def cleanup(self) -> None:
-        """Limpieza post-stop (cerrar sesiones HTTP, etc.)."""
         try:
             from bot.ai_trader import close_sessions
             await close_sessions()
@@ -121,17 +105,9 @@ class FuturesTrader:
     # ── Métodos que TradingLoop llama sobre el objeto trader ────────
 
     async def _get_ccxt(self) -> None:
-        """
-        Inicialización lazy del cliente ccxt / SDK.
-        TradingLoop llama esto en _init() antes del loop.
-        En esta arquitectura el SDK ya está listo en HLClient,
-        así que solo nos aseguramos de que el cliente HL esté inicializado.
-        """
-        # _HLCore ya está inicializado al crear HLClient — noop aquí.
         pass
 
     async def get_price(self) -> float:
-        """Obtiene el precio mid actual del par."""
         import aiohttp
         import json as _json
 
@@ -149,8 +125,86 @@ class FuturesTrader:
             raise ValueError(f"[{self.symbol}] Precio no encontrado en allMids")
         return float(price)
 
+    async def get_ohlcv(self, timeframe: str) -> list:
+        """
+        Descarga velas OHLCV desde Hyperliquid /info candle_snapshot.
+        Devuelve lista de [timestamp, open, high, low, close, volume] compatible
+        con signal_engine._compute_indicators().
+
+        Este método es el ohlcv_fn que se pasa a analyze_pair() — reemplaza
+        la lista vacía [] que antes causaba que el bot nunca escaneara señales.
+        """
+        import aiohttp
+        import json as _json
+        import time as _time
+
+        interval = _TF_MINUTES.get(timeframe, 15)
+        # Pedir un poco más de barras para tener margen de indicadores
+        n = _OHLCV_BARS + 20
+        # end = ahora (ms), start = n velas atrás
+        end_ms   = int(_time.time() * 1000)
+        start_ms = end_ms - (n * interval * 60 * 1000)
+
+        payload = {
+            "type":      "candleSnapshot",
+            "req": {
+                "coin":       self.coin,
+                "interval":   timeframe,
+                "startTime":  start_ms,
+                "endTime":    end_ms,
+            },
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{_API_URL}/info",
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    raw = _json.loads(await resp.text())
+        except Exception as e:
+            logger.warning("[%s] get_ohlcv(%s) error: %s", self.symbol, timeframe, e)
+            return []
+
+        if not isinstance(raw, list):
+            logger.warning("[%s] get_ohlcv(%s) respuesta inesperada: %s", self.symbol, timeframe, raw)
+            return []
+
+        # Hyperliquid candle_snapshot devuelve lista de dicts:
+        # {t, T, s, i, o, h, l, c, v, n}
+        # Convertir a formato OHLCV estándar: [ts, open, high, low, close, volume]
+        bars = []
+        for candle in raw:
+            try:
+                bars.append([
+                    int(candle["t"]),
+                    float(candle["o"]),
+                    float(candle["h"]),
+                    float(candle["l"]),
+                    float(candle["c"]),
+                    float(candle["v"]),
+                ])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        logger.debug(
+            "[%s] get_ohlcv(%s): %d velas descargadas",
+            self.symbol, timeframe, len(bars),
+        )
+        return bars
+
+    def get_ohlcv_fn(self) -> Callable:
+        """
+        Devuelve un callable async compatible con analyze_pair(ohlcv_fn=...).
+        El signal_engine llama a ohlcv_fn(timeframe) para cada TF.
+        """
+        async def _fn(tf: str) -> list:
+            return await self.get_ohlcv(tf)
+        return _fn
+
     async def _get_positions(self) -> list[dict]:
-        """Devuelve lista de posiciones abiertas en el exchange para este coin."""
         import aiohttp
         import json as _json
 
@@ -183,7 +237,6 @@ class FuturesTrader:
         return result
 
     async def _set_leverage(self, leverage: int) -> None:
-        """Configura el apalancamiento en el exchange."""
         if self.dry_run:
             logger.info("[%s] DRY_RUN: _set_leverage(%d) omitido.", self.symbol, leverage)
             return
@@ -196,7 +249,6 @@ class FuturesTrader:
             logger.warning("[%s] No se pudo configurar leverage: %s", self.symbol, e)
 
     def _info_post(self, payload: dict) -> dict:
-        """Wrapper síncrono para llamadas /info (balance_svc lo usa)."""
         return self._hl_client._info._session.post(
             f"{_API_URL}/info", json=payload
         ).json()

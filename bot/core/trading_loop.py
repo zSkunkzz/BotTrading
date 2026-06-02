@@ -1,30 +1,22 @@
 """
 trading_loop.py — Loop principal de trading para un símbolo.
 
-Responsabilidades:
-  - Inicialización del trader (leverage, restaurar posición, balance svc)
-  - Loop principal: _iteration()
-  - Sincronización periódica con el exchange (_get_positions)
-  - Delegar decisiones a DecisionEngine
-  - Delegar gestión de posición abierta a PositionManager
+FIX ohlcv_fn (2026-06-02):
+  trading_loop pasaba ohlcv=[] hardcodeado a evaluate(), causando que
+  analyze_pair nunca tuviera velas reales y siempre devolviera HOLD.
+  Fix: pasar trader.get_ohlcv_fn() como ohlcv_fn a evaluate().
 
 FIX v3 (2026-06-02):
   DecisionEngine.__init__() espera (risk_manager, pretrade_risk, signal_engine, cooldown).
-  trading_loop.py pasaba (symbol, position_mgr=...) causando TypeError en cada arranque.
-  Fix: DecisionEngine se construye lazy en run() cuando ya tenemos todos los objetos,
-  y evaluate() se llama con la firma correcta (symbol, price, ohlcv).
+  Fix: DecisionEngine se construye lazy en run().
 
 FIX v4 (2026-06-02):
   `from bot.cooldown import signal_cooldown` → módulo incorrecto.
-  El archivo real es bot/signal_cooldown.py.
   Fix: `from bot.signal_cooldown import signal_cooldown`
 
-FIX v5 (Bug Q) (2026-06-02):
-  _build_decision_engine usaba `getattr(risk, "pretrade_risk", risk)` que
-  devuelve GlobalRisk como fallback cuando el atributo no existe.
-  GlobalRisk no tiene .check() → warning en cada evaluate() y el bot
-  nunca aprueba entradas.
-  Fix: importar el singleton pretrade_risk directamente desde bot.pretrade_risk.
+FIX v5 Bug Q (2026-06-02):
+  _build_decision_engine usaba GlobalRisk como fallback para pretrade_risk.
+  Fix: importar el singleton pretrade_risk directamente.
 """
 from __future__ import annotations
 
@@ -47,50 +39,26 @@ _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
 
 
 class TradingLoop:
-    """
-    Orquesta el loop de trading para un símbolo específico.
-    Utiliza DecisionEngine para evaluar entradas y PositionManager
-    para gestionar posiciones abiertas.
-    """
 
     def __init__(self, symbol: str):
         self.symbol           = symbol
         self._position_mgr    = PositionManager(symbol)
-        # DecisionEngine se construye lazy en run() — necesita risk/pretrade/signal/cooldown
         self._decision_engine = None
         self._last_pos_check_at: float = 0.0
 
     def _build_decision_engine(self, risk):
-        """
-        Construye DecisionEngine con los objetos correctos del risk manager.
-
-        Bug Q fix: NO usar getattr(risk, "pretrade_risk", risk) como fallback
-        porque risk es GlobalRisk y no tiene .check().
-        Importamos el singleton pretrade_risk directamente desde su módulo.
-        """
         from bot import signal_engine
-        # FIX v4: el módulo se llama signal_cooldown.py, no cooldown.py
         from bot.signal_cooldown import signal_cooldown
-        # FIX v5 (Bug Q): importar pretrade_risk singleton directamente —
-        # nunca usar GlobalRisk como fallback para pretrade_risk.
         from bot.pretrade_risk import pretrade_risk as _pretrade_singleton
 
-        # risk_manager es GlobalRisk (gestiona límites globales, dailydrawdown, etc.)
-        risk_manager = risk
-
-        # pretrade_risk es el singleton PreTradeRisk (tiene .check(), .register_close())
-        pretrade_risk = _pretrade_singleton
-
         return DecisionEngine(
-            risk_manager  = risk_manager,
-            pretrade_risk = pretrade_risk,
+            risk_manager  = risk,
+            pretrade_risk = _pretrade_singleton,
             signal_engine = signal_engine,
             cooldown      = signal_cooldown,
         )
 
     async def run(self, trader, risk, *, global_risk=None) -> None:
-        """Loop principal. Llamar desde FuturesTrader.run()."""
-        # Construir DecisionEngine ahora que tenemos risk disponible
         if self._decision_engine is None:
             self._decision_engine = self._build_decision_engine(global_risk or risk)
 
@@ -106,7 +74,6 @@ class TradingLoop:
             await asyncio.sleep(LOOP_SLEEP)
 
     async def _init(self, trader, usdc_per_trade: float) -> None:
-        """Inicialización: restaura posición guardada y configura apalancamiento."""
         await trader._get_ccxt()
         saved = load_position(self.symbol)
         if saved:
@@ -141,7 +108,6 @@ class TradingLoop:
         )
 
     async def _iteration(self, trader, risk, global_risk) -> None:
-        """Una iteración del loop de trading."""
         if kill_switch.is_halted(self.symbol):
             logger.debug("[%s] Kill switch activo — skip.", self.symbol)
             return
@@ -187,12 +153,15 @@ class TradingLoop:
         if trader.position is not None:
             await self._position_mgr.manage(trader, price, risk)
         else:
-            # FIX v3: evaluate() espera (symbol, price, ohlcv=[]) — no (trader, risk, global_risk)
-            signal = await self._decision_engine.evaluate(self.symbol, price, [])
+            # FIX ohlcv_fn: pasar trader.get_ohlcv_fn() para que analyze_pair
+            # descargue velas reales. Antes se pasaba [] → siempre HOLD.
+            ohlcv_fn = trader.get_ohlcv_fn()
+            signal = await self._decision_engine.evaluate(
+                self.symbol, price, ohlcv_fn
+            )
             if signal:
                 logger.info(
                     "[%s] Señal aceptada por DecisionEngine: action=%s side=%s",
                     self.symbol, signal.get("action"), signal.get("side"),
                 )
-                # Delegar apertura de posición al PositionManager
                 await self._position_mgr.open_position(trader, signal, risk)
