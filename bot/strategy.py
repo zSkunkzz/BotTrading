@@ -14,14 +14,19 @@ Flujo (sin IA para el caso normal):
     4. Si la IA de noticias dice HOLD con alta confianza → respeta
     5. Si no hay noticias relevantes o la IA confirma → entra
 
+FIX 5: Fallback seguro cuando fetch_enriched_context falla:
+  - enriched=None y score < MIN_SCORE+2 → HOLD (no entrar a ciegas en señal marginal)
+  - enriched=None y score >= MIN_SCORE+2 → entra con WARNING explícito en el log
+
 Variables de entorno:
   MIN_SIGNAL_SCORE             (default: 6)
   MIN_RR_REQUIRED              (default: 1.8)
-  SKIP_AI_ON_STRONG            (default: false)  CAMBIO v2: ahora false por defecto
+  SKIP_AI_ON_STRONG            (default: false)
   AI_CALL_MIN_SCORE            (default: 6)
   AI_HOLD_OVERRIDE_SCORE       (default: 8)
   AI_HIGH_CONFIDENCE_THRESHOLD (default: 8)
   USE_AI_FOR_NEWS              (default: true)
+  ENRICHED_FALLBACK_MIN_SCORE  (default: 8)  — score mínimo para entrar sin datos externos
 """
 
 import logging
@@ -41,12 +46,15 @@ log = logging.getLogger(__name__)
 
 MIN_SIGNAL_SCORE             = int(os.getenv("MIN_SIGNAL_SCORE",             "6"))
 MIN_RR_REQUIRED              = float(os.getenv("MIN_RR_REQUIRED",            "1.8"))
-# CAMBIO v2: STRONG ya no salta el enriched_filter (default cambiado a false)
 SKIP_AI_ON_STRONG            = os.getenv("SKIP_AI_ON_STRONG",                "false").lower() != "false"
 AI_CALL_MIN_SCORE            = int(os.getenv("AI_CALL_MIN_SCORE",            "6"))
 AI_HOLD_OVERRIDE_SCORE       = int(os.getenv("AI_HOLD_OVERRIDE_SCORE",       "8"))
 AI_HIGH_CONFIDENCE_THRESHOLD = int(os.getenv("AI_HIGH_CONFIDENCE_THRESHOLD", "8"))
 USE_AI_FOR_NEWS              = os.getenv("USE_AI_FOR_NEWS", "true").lower() != "false"
+
+# FIX 5: score mínimo para entrar cuando fetch_enriched_context ha fallado
+# Por debajo de este valor → HOLD (señal marginal + sin validación externa = riesgo alto)
+_ENRICHED_FALLBACK_MIN_SCORE = int(os.getenv("ENRICHED_FALLBACK_MIN_SCORE", "8"))
 
 _AI_NEWS_COOLDOWN_S = int(os.getenv("AI_NEWS_COOLDOWN_S", "300"))  # 5 min
 _last_ai_news_call: dict[str, float] = {}
@@ -69,10 +77,6 @@ async def decide(
         signal_block : str (Markdown)
         ai_confidence: int (0 if IA not used)
         ai_reason    : str
-
-    ohlcv_fn: callable async con firma `(tf: str) -> list`.
-      Si se pasa, analyze_pair lo usará en lugar de exch.fetch_ohlcv(),
-      aprovechando la ruta WS→caché→REST del trader y evitando REST hits duplicados.
     """
 
     if has_open_position:
@@ -104,8 +108,6 @@ async def decide(
     if signal.signal == "NEUTRAL":
         return _result("HOLD", signal, False, "Señal técnica neutral")
 
-    # STRONG: entra directo SIN enriched_filter solo si SKIP_AI_ON_STRONG=true explicitamente
-    # Por defecto (false) STRONG también pasa por enriched_filter
     if signal.entry_mode == "STRONG" and SKIP_AI_ON_STRONG:
         action = "BUY" if signal.signal == "LONG" else "SELL"
         return _result(
@@ -119,17 +121,19 @@ async def decide(
             f"⏭️ score={signal.score}/{signal.max_score} < {AI_CALL_MIN_SCORE} → HOLD"
         )
 
-    # ── Paso 1: enriquecer contexto externo ──────────────────────────────────────────
+    # ── Paso 1: enriquecer contexto externo ──────────────────────────────────
     from bot.data_enricher import fetch_enriched_context
     from bot.enriched_filter import apply as ef_apply
 
+    enriched = None
+    enriched_failed = False
     try:
         enriched = await fetch_enriched_context(symbol)
     except Exception as e:
-        log.warning(f"[strategy] fetch_enriched_context error: {e} — continuando sin datos externos")
-        enriched = None
+        log.warning(f"[strategy] fetch_enriched_context error: {e} — activando fallback seguro")
+        enriched_failed = True
 
-    # ── Paso 2: filtro determinista ───────────────────────────────────────────────────
+    # ── Paso 2: filtro determinista ───────────────────────────────────────────
     action_if_pass = "BUY" if signal.signal == "LONG" else "SELL"
 
     if enriched is not None:
@@ -161,7 +165,7 @@ async def decide(
 
         base_confidence = max(5, signal.score - ef_result.penalty)
 
-        # ── Paso 3: IA solo si hay noticias relevantes ────────────────────────────
+        # ── Paso 3: IA solo si hay noticias relevantes ────────────────────────
         if USE_AI_FOR_NEWS and ef_result.news_ai_needed:
             now = time.monotonic()
             cooldown_remaining = _AI_NEWS_COOLDOWN_S - (now - _last_ai_news_call.get(symbol, 0))
@@ -227,14 +231,33 @@ async def decide(
                 except Exception as e:
                     log.warning(f"[strategy] IA noticias falló: {e} — ignorando")
 
-        # ── Paso 4: entrada (filtro determinista pasado) ───────────────────────────
+        # ── Paso 4: entrada (filtro determinista pasado) ──────────────────────
         return _result(
             action_if_pass, signal, False,
             f"✅ EnrichedFilter OK · {ef_result.reason} · "
             f"score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x"
         )
 
-    # Sin datos externos → decisión puramente técnica
+    # FIX 5: Fallback seguro — sin datos externos
+    # Si el enriquecimiento falló Y la señal es marginal → HOLD
+    # Si el enriquecimiento falló Y la señal es fuerte → entra con WARNING
+    if enriched_failed:
+        if signal.score < _ENRICHED_FALLBACK_MIN_SCORE:
+            return _result(
+                "HOLD", signal, False,
+                f"⚠️ Sin datos externos (error) + score={signal.score} < {_ENRICHED_FALLBACK_MIN_SCORE} → HOLD seguro"
+            )
+        log.warning(
+            f"[strategy] {symbol} ⚠️ ENTRANDO SIN DATOS EXTERNOS (enriquecimiento falló) "
+            f"— score={signal.score}/{signal.max_score} supera umbral {_ENRICHED_FALLBACK_MIN_SCORE}"
+        )
+        return _result(
+            action_if_pass, signal, False,
+            f"⚡ Técnico fuerte SIN validación externa (enriched falló) · "
+            f"score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x"
+        )
+
+    # Sin datos externos por ausencia (no por error) → decisión puramente técnica
     log.info(f"[strategy] {symbol} Sin datos externos — decisión técnica pura")
     return _result(
         action_if_pass, signal, False,
