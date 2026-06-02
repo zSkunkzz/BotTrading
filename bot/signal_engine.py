@@ -51,15 +51,15 @@ SISTEMA DE SCORING (max_score = 10):
     - Vol 15m < 0.6x: mercado dormido, no entrar
 
   MIN_SCORE  = 6 / 10  (60% de confluencia)
-  MIN_RR     = 1.5 (ajustado para TPs más conservadores)
+  MIN_RR     = 1.6
 
-SL/TP (multiplicadores ATR conservadores — mayor probabilidad de hit):
-  Modo tendencia : SL bajo low vela + buffer ATR | TP=1.5*ATR
-  Modo breakout  : SL bajo vela de ruptura       | TP=1.4*ATR
-  Modo reversal  : SL ajustado (1.2*ATR)         | TP=1.3*ATR
+SL/TP (multiplicadores ATR equilibrados — cubre comisiones y sigue siendo alcanzable):
+  Modo tendencia : SL bajo low vela + buffer ATR | TP=2.0*ATR
+  Modo breakout  : SL bajo vela de ruptura       | TP=1.8*ATR
+  Modo reversal  : SL ajustado (1.2*ATR)         | TP=1.6*ATR
 
-  TP2 eliminado — se usa un único TP fijo y conservador.
-  Trailing TP eliminado — no funcionaba correctamente.
+  TP2 mantenido como referencia interna (no se usa en órdenes).
+  Trailing TP eliminado.
 """
 from __future__ import annotations
 
@@ -75,29 +75,29 @@ log = logging.getLogger(__name__)
 
 # ─── Constantes ──────────────────────────────────────────────────────────────────────────────
 MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
-MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
+MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.6"))
 
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
 _SL_ATR_MULT       = float(os.getenv("SL_ATR_MULT",  "1.5"))
-# TP conservador: 1.5x ATR — más probabilidad de ser alcanzado que el 2.8x anterior
-_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "1.5"))
-# TP2 mantenido como referencia interna pero no se usa en órdenes
-_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "2.2"))
+# TP equilibrado: 2.0x ATR tendencia, 1.8x breakout, 1.6x reversal
+# Suficiente para cubrir comisiones con apalancamiento, y estadisticamente alcanzable
+_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "2.0"))
+_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.0"))
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 
 # Umbrales de setup
 _EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.003"))  # 0.30%
 _EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.0015")) # 0.15% → rango
-_BREAKOUT_WINDOW       = int(os.getenv("BREAKOUT_WINDOW", "20"))  # velas para detectar ruptura
-_BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.8"))  # vol mínimo en ruptura
-_REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "28"))   # RSI extremo LONG
-_REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "72"))   # RSI extremo SHORT
-_VOL_MIN_GLOBAL        = float(os.getenv("VOL_MIN_GLOBAL",    "0.6"))   # vol mínimo siempre
-_VOL_CONFIRM_MIN       = float(os.getenv("VOL_CONFIRM_MIN",   "1.2"))   # vol normal de confirmación
-_PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "3"))       # velas para detectar pullback
-_PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.003"))# 0.3% de tolerancia al tocar EMA
+_BREAKOUT_WINDOW       = int(os.getenv("BREAKOUT_WINDOW", "20"))
+_BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.8"))
+_REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "28"))
+_REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "72"))
+_VOL_MIN_GLOBAL        = float(os.getenv("VOL_MIN_GLOBAL",    "0.6"))
+_VOL_CONFIRM_MIN       = float(os.getenv("VOL_CONFIRM_MIN",   "1.2"))
+_PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "3"))
+_PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.003"))
 
 
 # ─── _to_ccxt_symbol ──────────────────────────────────────────────────────────────────────────────
@@ -119,8 +119,8 @@ def _to_ccxt_symbol(symbol: str) -> str:
 @dataclass
 class SignalResult:
     symbol:        str
-    signal:        str           # "LONG" | "SHORT" | "NEUTRAL"
-    entry_mode:    str           # "STRONG" | "NORMAL" | "EARLY" | "HOLD"
+    signal:        str
+    entry_mode:    str
     score:         int
     max_score:     int
     entry:         float
@@ -169,12 +169,10 @@ async def analyze_pair(
         "_closes_15m": [b[4] for b in bars_15m[-5:]],
     }
 
-    # ── Filtro duro global: volumen mínimo ────────────────────────────────────────────
     vol_ratio_15m = ind_15m.get("vol_ratio", 1.0)
     if vol_ratio_15m < _VOL_MIN_GLOBAL:
         return _hold_result(symbol, f"Vol={vol_ratio_15m:.2f}x — mercado dormido (min {_VOL_MIN_GLOBAL}x)")
 
-    # ── Detectar tipo de setup ──────────────────────────────────────────────────────────────────
     setup_type, signal_str, score, max_score, reasons = _detect_setup(
         ind_15m, ind_1h, ind_4h, bars_15m
     )
@@ -182,7 +180,6 @@ async def analyze_pair(
     if signal_str == "NEUTRAL" or setup_type is None:
         return _hold_result(symbol, f"NEUTRAL ({', '.join(reasons[-3:])})")
 
-    # ── SL / TP según modo (multiplicadores conservadores para mayor hit rate) ─────────
     last_bar    = bars_15m[-1]
     close_price = float(last_bar[4])
     high_price  = float(last_bar[2])
@@ -197,17 +194,17 @@ async def analyze_pair(
 
     if setup_type == "REVERSAL":
         sl_mult  = float(os.getenv("SL_ATR_MULT_REVERSAL",  "1.2"))
-        # Reversal: TP conservador 1.3x ATR (el movimiento de reversión inicial suele ser corto)
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.3"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "2.0"))
+        # Reversal: el primer impulso tras el extremo suele recorrer ~1.6 ATR
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.6"))
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "2.5"))
     elif setup_type == "BREAKOUT":
         sl_mult  = _SL_ATR_MULT
-        # Breakout: TP 1.4x ATR (breakouts suelen tener continuación pero es mejor asegurar)
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "1.4"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "2.2"))
+        # Breakout: 1.8 ATR — mas conservador que tendencia pero cubre comisiones
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "1.8"))
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "2.8"))
     else:  # TENDENCIA
         sl_mult  = _SL_ATR_MULT
-        # Tendencia: TP 1.5x ATR (pullbacks a EMA suelen recorrer al menos 1.5 ATR)
+        # Tendencia: 2.0 ATR — equilibrio entre ser alcanzable y cubrir costes
         tp1_mult = _TP1_ATR_MULT
         tp2_mult = _TP2_ATR_MULT
 
@@ -224,8 +221,7 @@ async def analyze_pair(
     reward = abs(tp1 - entry)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
 
-    # ── Entry mode ───────────────────────────────────────────────────────────────────────
-    if score >= max_score - 1:     # casi perfecto
+    if score >= max_score - 1:
         entry_mode = "STRONG"
     elif score >= MIN_SCORE + 1:
         entry_mode = "NORMAL"
@@ -274,16 +270,6 @@ async def analyze_pair(
 def _detect_setup(
     i15: dict, i1h: dict, i4h: dict, bars_15m: list
 ) -> Tuple[Optional[str], str, int, int, List[str]]:
-    """
-    Detecta el tipo de setup y devuelve:
-      (setup_type, signal_str, score, max_score, reasons)
-
-    Prueba los tres modos en orden de prioridad:
-      1. REVERSAL (extremo RSI 1h — alta probabilidad si se confirma)
-      2. BREAKOUT (rotura de rango con volumen)
-      3. TENDENCIA (pullback a EMA en tendencia clara)
-    El primero que supere MIN_SCORE gana.
-    """
     for mode_fn in (_score_reversal, _score_breakout, _score_tendencia):
         setup_type, signal_str, score, max_score, reasons = mode_fn(i15, i1h, i4h, bars_15m)
         if signal_str != "NEUTRAL" and score >= MIN_SCORE:
@@ -297,10 +283,6 @@ def _detect_setup(
 def _score_reversal(
     i15: dict, i1h: dict, i4h: dict, bars_15m: list
 ) -> Tuple[str, str, int, int, List[str]]:
-    """
-    Detecta reversals en extremos de RSI del 1h.
-    Requiere RSI 1h en extremo real (<= 28 o >= 72) como condicion base.
-    """
     MAX = 8
     reasons: List[str] = []
 
@@ -317,20 +299,15 @@ def _score_reversal(
     direction = "LONG" if is_long else "SHORT"
     score = 0
 
-    # +2: RSI 1h extremo (condición base)
     score += 2
     reasons.append(f"RSI1h={rsi_1h:.0f} extremo {'sobreventa' if is_long else 'sobrecompra'} +2")
 
-    # +2: Divergencia MACD 15m (histograma cambiando de signo — impulso revirtiendo)
     hist_15m = i15.get("macd_hist")
     if hist_15m is not None:
         closes = [b[4] for b in bars_15m]
-        highs  = [b[2] for b in bars_15m]
-        lows   = [b[3] for b in bars_15m]
         try:
             from bot.indicators import macd as _macd
             _, _, hists = _macd(closes, 12, 26, 9)
-            prev_hist = hists if isinstance(hists, (int, float)) else None
             if is_long and hist_15m > 0:
                 score += 2
                 reasons.append(f"MACD15m hist={hist_15m:.4f} gira alcista +2")
@@ -342,7 +319,6 @@ def _score_reversal(
         except Exception:
             reasons.append("MACD calc error")
 
-    # +1: Vol 15m alto (capitulación)
     vol_ratio = i15.get("vol_ratio", 1.0)
     if vol_ratio >= 1.5:
         score += 1
@@ -350,7 +326,6 @@ def _score_reversal(
     else:
         reasons.append(f"Vol15m={vol_ratio:.1f}x sin capitulación")
 
-    # +1: ST 4h en contra (agotamiento)
     if i4h:
         st4h_against = (is_long and i4h.get("st_bear")) or (is_short and i4h.get("st_bull"))
         if st4h_against:
@@ -359,20 +334,18 @@ def _score_reversal(
         else:
             reasons.append("ST4h no confirma agotamiento")
 
-    # +1: RSI 4h en zona neutra (45-55)
     rsi_4h = i4h.get("rsi_val") if i4h else None
     if rsi_4h is not None and 40 <= rsi_4h <= 60:
         score += 1
         reasons.append(f"RSI4h={rsi_4h:.0f} neutro — reversión posible +1")
     else:
-        reasons.append(f"RSI4h={rsi_4h:.0f if rsi_4h else 'N/A'} no neutro")
+        reasons.append(f"RSI4h no neutro")
 
-    # +1: Precio toca EMA21 del 1h (punto de inflexión)
     close_15m = i15.get("close", 0)
     ema21_1h  = i1h.get("ema21") if i1h else None
     if ema21_1h and close_15m:
         dist_pct = abs(close_15m - ema21_1h) / ema21_1h
-        if dist_pct <= 0.005:  # dentro del 0.5% de la EMA21 1h
+        if dist_pct <= 0.005:
             score += 1
             reasons.append(f"Precio toca EMA21_1h (dist={dist_pct*100:.2f}%) +1")
         else:
@@ -386,23 +359,17 @@ def _score_reversal(
 def _score_breakout(
     i15: dict, i1h: dict, i4h: dict, bars_15m: list
 ) -> Tuple[str, str, int, int, List[str]]:
-    """
-    Detecta breakouts: precio rompe el rango de las últimas N velas con volumen.
-    Sin volumen alto, no es breakout (es fakeout).
-    """
     MAX = 8
     reasons: List[str] = []
 
     if len(bars_15m) < _BREAKOUT_WINDOW + 2:
         return "BREAKOUT", "NEUTRAL", 0, MAX, ["Velas insuficientes para breakout"]
 
-    window = bars_15m[-(  _BREAKOUT_WINDOW + 1):-1]
+    window = bars_15m[-(_BREAKOUT_WINDOW + 1):-1]
     range_high = max(b[2] for b in window)
     range_low  = min(b[3] for b in window)
 
     current_close = float(bars_15m[-1][4])
-    current_high  = float(bars_15m[-1][2])
-    current_low   = float(bars_15m[-1][3])
     vol_ratio     = i15.get("vol_ratio", 1.0)
 
     broke_up   = current_close > range_high
@@ -416,14 +383,12 @@ def _score_breakout(
     direction = "LONG" if broke_up else "SHORT"
     score = 0
 
-    # +2: Rotura confirmada
     score += 2
     reasons.append(
         f"Ruptura {'alcista' if broke_up else 'bajista'}: close={current_close:.4f} "
-        f"{'>' if broke_up else '<'} rango {range_high:.4f if broke_up else range_low:.4f} +2"
+        f"{'>' if broke_up else '<'} {'rango ' + str(round(range_high, 4)) if broke_up else 'rango ' + str(round(range_low, 4))} +2"
     )
 
-    # +2: Volumen alto en vela de ruptura
     if vol_ratio >= _BREAKOUT_VOL_MIN:
         score += 2
         reasons.append(f"Vol={vol_ratio:.1f}x breakout confirmado +2")
@@ -431,9 +396,8 @@ def _score_breakout(
         score += 1
         reasons.append(f"Vol={vol_ratio:.1f}x moderado +1")
     else:
-        reasons.append(f"Vol={vol_ratio:.1f}x BAJO — posible fakeout (sin puntos)")
+        reasons.append(f"Vol={vol_ratio:.1f}x BAJO — posible fakeout")
 
-    # +1: ST 1h en favor
     if i1h:
         st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or \
                   (direction == "SHORT" and i1h.get("st_bear"))
@@ -443,7 +407,6 @@ def _score_breakout(
         else:
             reasons.append("ST1h no confirma")
 
-    # +1: ST 4h en favor
     if i4h:
         st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or \
                   (direction == "SHORT" and i4h.get("st_bear"))
@@ -453,18 +416,16 @@ def _score_breakout(
         else:
             reasons.append("ST4h no confirma")
 
-    # +1: RSI 15m en zona razonable
     rsi_15m = i15.get("rsi_val")
     if rsi_15m is not None:
         rsi_ok = (direction == "LONG" and 45 <= rsi_15m <= 70) or \
                  (direction == "SHORT" and 30 <= rsi_15m <= 55)
         if rsi_ok:
             score += 1
-            reasons.append(f"RSI15m={rsi_15m:.0f} zona razonable para {direction} +1")
+            reasons.append(f"RSI15m={rsi_15m:.0f} zona razonable +1")
         else:
-            reasons.append(f"RSI15m={rsi_15m:.0f} sobreextendido en rotura")
+            reasons.append(f"RSI15m={rsi_15m:.0f} sobreextendido")
 
-    # +1: MACD 1h en favor
     if i1h:
         macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or \
                   (direction == "SHORT" and i1h.get("macd_bear"))
@@ -477,15 +438,11 @@ def _score_breakout(
     return "BREAKOUT", direction, score, MAX, reasons
 
 
-# ─── MODO TENDENCIA (pullback a EMA) ───────────────────────────────────────────────────────
+# ─── MODO TENDENCIA ────────────────────────────────────────────────────────────────────────────
 
 def _score_tendencia(
     i15: dict, i1h: dict, i4h: dict, bars_15m: list
 ) -> Tuple[str, str, int, int, List[str]]:
-    """
-    Detecta pullbacks a EMA21 en tendencia clara.
-    Requiere EMA spread >= 0.3% en 1h para confirmar que hay tendencia real.
-    """
     MAX = 9
     reasons: List[str] = []
 
@@ -500,7 +457,7 @@ def _score_tendencia(
     ema_spread_1h = abs(ema21_1h - ema50_1h) / ema50_1h
     if ema_spread_1h < _EMA_SPREAD_RANGE_MAX:
         return "TENDENCIA", "NEUTRAL", 0, MAX, [
-            f"Mercado en rango (spread EMA 1h={ema_spread_1h*100:.2f}% < {_EMA_SPREAD_RANGE_MAX*100:.1f}%)"
+            f"Mercado en rango (spread EMA 1h={ema_spread_1h*100:.2f}%)"
         ]
 
     trend_1h_up   = i1h.get("ema_bull", False)
@@ -512,7 +469,6 @@ def _score_tendencia(
     direction = "LONG" if trend_1h_up else "SHORT"
     score = 0
 
-    # +2: EMA tendencia en 15m Y 1h alineados
     ema_15m_ok = (direction == "LONG" and i15.get("ema_bull")) or \
                  (direction == "SHORT" and i15.get("ema_bear"))
     if ema_15m_ok:
@@ -520,18 +476,16 @@ def _score_tendencia(
         reasons.append(f"EMA15m+1h alineados {direction} (spread={ema_spread_1h*100:.2f}%) +2")
     else:
         score += 1
-        reasons.append(f"EMA1h en {direction} pero 15m aún no (spread={ema_spread_1h*100:.2f}%) +1")
+        reasons.append(f"EMA1h en {direction} pero 15m aun no (spread={ema_spread_1h*100:.2f}%) +1")
 
-    # +1: SuperTrend 1h en favor
     st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or \
               (direction == "SHORT" and i1h.get("st_bear"))
     if st1h_ok:
         score += 1
         reasons.append("ST1h en favor +1")
     else:
-        reasons.append("ST1h en contra (no puntos)")
+        reasons.append("ST1h en contra")
 
-    # +1: SuperTrend 4h en favor
     if i4h:
         st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or \
                   (direction == "SHORT" and i4h.get("st_bear"))
@@ -539,9 +493,8 @@ def _score_tendencia(
             score += 1
             reasons.append("ST4h en favor +1")
         else:
-            reasons.append("ST4h en contra (no puntos)")
+            reasons.append("ST4h en contra")
 
-    # +1: MACD 15m en favor
     macd_ok = (direction == "LONG" and i15.get("macd_bull")) or \
               (direction == "SHORT" and i15.get("macd_bear"))
     if macd_ok:
@@ -550,7 +503,6 @@ def _score_tendencia(
     else:
         reasons.append("MACD15m en contra")
 
-    # +1: Pullback — precio tocó EMA21 del 15m en las últimas N velas
     ema21_15m = i15.get("ema21")
     close_15m = i15.get("close", 0)
     if ema21_15m and close_15m:
@@ -572,13 +524,12 @@ def _score_tendencia(
                     (direction == "SHORT" and price_dir == "falling")
         if touched_ema and returning:
             score += 1
-            reasons.append(f"Pullback a EMA21_15m confirmado (rebote en {direction}) +1")
+            reasons.append(f"Pullback a EMA21_15m confirmado +1")
         elif touched_ema:
-            reasons.append("Tocó EMA21 pero aún no rebota")
+            reasons.append("Tocó EMA21 pero aun no rebota")
         else:
-            reasons.append(f"Sin pullback a EMA21_15m en últimas {_PULLBACK_LOOKBACK} velas")
+            reasons.append(f"Sin pullback a EMA21_15m")
 
-    # +1: RSI 15m en zona de rebote
     rsi_15m = i15.get("rsi_val")
     if rsi_15m is not None:
         rsi_ok_long  = direction == "LONG"  and 40 <= rsi_15m <= 60
@@ -588,12 +539,11 @@ def _score_tendencia(
             reasons.append(f"RSI15m={rsi_15m:.0f} zona rebote +1")
         elif (direction == "LONG" and rsi_15m > 72) or \
              (direction == "SHORT" and rsi_15m < 28):
-            reasons.append(f"RSI15m={rsi_15m:.0f} SOBREEXTENDIDO — filtro duro aplicado")
+            reasons.append(f"RSI15m={rsi_15m:.0f} SOBREEXTENDIDO — filtro duro")
             score = 0
         else:
             reasons.append(f"RSI15m={rsi_15m:.0f} zona neutra")
 
-    # +1: Vol 15m >= 1.2x
     vol_ratio = i15.get("vol_ratio", 1.0)
     if vol_ratio >= _VOL_CONFIRM_MIN:
         score += 1
@@ -601,7 +551,6 @@ def _score_tendencia(
     else:
         reasons.append(f"Vol15m={vol_ratio:.1f}x débil")
 
-    # +1: Confluencia total ST (15m + 1h + 4h)
     st15m_ok = (direction == "LONG" and i15.get("st_bull")) or \
                (direction == "SHORT" and i15.get("st_bear"))
     confluencia = st15m_ok and st1h_ok and (not i4h or st4h_ok)
@@ -609,7 +558,7 @@ def _score_tendencia(
         score += 1
         reasons.append("Confluencia total ST 15m+1h+4h +1")
     else:
-        reasons.append("Sin confluencia total ST (no puntos)")
+        reasons.append("Sin confluencia total ST")
 
     if not st1h_ok:
         reasons.append("⚠️ ST1h en contra — filtro duro")
@@ -659,8 +608,7 @@ def _compute_indicators(bars: list) -> dict:
     }
 
 
-# ─── _fetch_bars (fallback sin caché) ────────────────────────────────────────────────────────
-
+# ─── _fetch_bars ────────────────────────────────────────────────────────────────────────────────
 async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
     ccxt_sym = _to_ccxt_symbol(symbol)
     try:
@@ -671,8 +619,7 @@ async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
         return []
 
 
-# ─── _hold_result ───────────────────────────────────────────────────────────────────────────────
-
+# ─── _hold_result ────────────────────────────────────────────────────────────────────────────────
 def _hold_result(symbol: str, reason: str) -> SignalResult:
     return SignalResult(
         symbol=symbol,
@@ -694,7 +641,6 @@ def _hold_result(symbol: str, reason: str) -> SignalResult:
 
 
 # ─── format_signal_block ────────────────────────────────────────────────────────────────────────────
-
 def format_signal_block(signal: Optional[SignalResult]) -> str:
     if signal is None:
         return ""
