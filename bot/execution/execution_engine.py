@@ -35,6 +35,11 @@ FIX entry_px en place_sl/place_tp (2026-06-02):
   Solución: execute() acepta entry_px opcional (fallback a arrival_price)
   y lo propaga a _place_tpsl(), que lo pasa a place_sl()/place_tp().
 
+FIX BUG #9 (2026-06-02) — _records sin límite:
+  _finalize_rec acumulaba TradeRecord indefinidamente por symbol.
+  En despliegues de larga duración sin restart (Railway), esto causaba
+  un leak de memoria lento. Fix: mantener máximo 500 records por symbol.
+
 Variables de entorno (todas opcionales):
   EE_LIMIT_TIMEOUT_S          default 4
   EE_MAX_SPREAD_BPS_LIMIT     default 15
@@ -45,6 +50,7 @@ Variables de entorno (todas opcionales):
   EE_TPSL_RETRY_BASE_DELAY_S  default 1.5
   EE_MARKET_429_RETRIES       default 3
   EE_MARKET_429_DELAY_S       default 2.0
+  EE_MAX_RECORDS_PER_SYMBOL   default 500
 """
 from __future__ import annotations
 
@@ -86,6 +92,9 @@ class TradeRecord:
     cancel_reason:      str   = ""
     success:            bool  = False
     _t0:                float = field(default=0.0, repr=False)
+
+
+_MAX_RECORDS_PER_SYMBOL = int(os.getenv("EE_MAX_RECORDS_PER_SYMBOL", "500"))
 
 
 class ExecutionEngine:
@@ -171,7 +180,7 @@ class ExecutionEngine:
         reduce_only:   bool = False,
         sl:            Optional[float] = None,
         tp:            Optional[float] = None,
-        entry_px:      Optional[float] = None,  # FIX entry_px: precio real de entrada para validar SL/TP
+        entry_px:      Optional[float] = None,
     ) -> dict:
         sym    = trader.symbol
         client = self._get_client(sym)
@@ -267,8 +276,6 @@ class ExecutionEngine:
 
         # ── Colocar SL + TP tras entrada confirmada ──────────────────
         if entry_ok and not reduce_only and trade_side == "open":
-            # FIX entry_px: usar entry_px si se proporcionó, si no usar arrival_price
-            # para que place_sl/place_tp puedan validar y corregir precios inválidos
             effective_entry_px = entry_px if (entry_px and entry_px > 0) else arrival_price
             await self._place_tpsl(client, is_buy, qty, sl, tp, sym, effective_entry_px)
 
@@ -285,9 +292,9 @@ class ExecutionEngine:
         sl: Optional[float],
         tp: Optional[float],
         sym: str,
-        entry_px: Optional[float] = None,  # FIX: propagado desde execute()
+        entry_px: Optional[float] = None,
     ) -> None:
-        close_is_buy = not is_buy  # cerrar LONG = SELL (False) | cerrar SHORT = BUY (True)
+        close_is_buy = not is_buy
 
         # ── SL ────────────────────────────────────────────────────────
         if sl is not None and sl > 0:
@@ -307,7 +314,7 @@ class ExecutionEngine:
                             is_buy=close_is_buy,
                             sz=qty,
                             trigger_px=float(sl),
-                            entry_px=entry_px,  # FIX: permite validar SL < entry (LONG) / SL > entry (SHORT)
+                            entry_px=entry_px,
                         ),
                     )
                     statuses = result.get("response", {}).get("data", {}).get("statuses", [{}])
@@ -358,7 +365,7 @@ class ExecutionEngine:
                             sz=qty,
                             trigger_px=float(tp),
                             limit_px=tp_limit,
-                            entry_px=entry_px,  # FIX: permite validar TP > entry (LONG) / TP < entry (SHORT)
+                            entry_px=entry_px,
                         ),
                     )
                     statuses = result.get("response", {}).get("data", {}).get("statuses", [{}])
@@ -389,18 +396,6 @@ class ExecutionEngine:
                 )
 
     # ── LIMIT INTERNO + TELEMETRÍA ─────────────────────────────────────────
-    #
-    # FIX DUPLICACIONES (2026-06-02):
-    #   Hyperliquid devuelve status[0] = {"filled": {...}} cuando una limit
-    #   se llena al instante (fill inmediato). El campo "resting" NO aparece
-    #   en ese caso → order_id = None → el bucle de polling no encontraba
-    #   la orden en open_orders (ya estaba en historial) → asumía no-fill
-    #   → fallback market → SEGUNDA APERTURA (duplicado).
-    #
-    #   Fix: detectar fill inmediato comprobando si status[0] tiene "filled".
-    #   Si order_id es None y no hay fill inmediato → asumir filled (seguro:
-    #   mejor no abrir que duplicar).
-    # ──────────────────────────────────────────────────────────────────────────
 
     async def _try_limit_sdk(
         self,
@@ -425,29 +420,21 @@ class ExecutionEngine:
                 rec.cancel_reason = f"agent_not_found:{err_str}"
             return result, False
 
-        # ── FIX: detectar fill inmediato ANTES de buscar order_id ──────────
-        # Hyperliquid devuelve {"filled": {...}} cuando la limit se ejecuta
-        # al instante. En ese caso NO hay "resting" y NO hay order_id.
         try:
             status_0 = result["response"]["data"]["statuses"][0]
         except (KeyError, IndexError, TypeError):
             status_0 = {}
 
         if "filled" in status_0:
-            # Fill inmediato confirmado por el exchange
             logger.info(
                 "[%s] ✅ Limit llenada al instante (fill inmediato detectado)",
                 rec.symbol,
             )
             return result, True
 
-        # Orden descansando en el libro → obtener order_id para polling
         order_id = status_0.get("resting", {}).get("oid") if isinstance(status_0.get("resting"), dict) else None
 
         if order_id is None:
-            # Sin fill inmediato y sin order_id — estado ambiguo.
-            # Asumir filled para NO caer en fallback market (evitar duplicado).
-            # _confirm_position_with_retry en trader.py verificará la posición real.
             logger.warning(
                 "[%s] Limit: sin 'filled' ni 'resting.oid' en respuesta — "
                 "asumiendo filled para evitar duplicado. Response: %s",
@@ -455,7 +442,6 @@ class ExecutionEngine:
             )
             return result, True
 
-        # ── Polling: esperar a que la orden desaparezca de open_orders ──────
         deadline = time.monotonic() + self.limit_timeout_s
         filled   = False
 
@@ -504,7 +490,12 @@ class ExecutionEngine:
             else:
                 rec.slippage_bps = (arrival_price - rec.fill_price) / arrival_price * 10_000
 
-        self._records[rec.symbol].append(rec)
+        # BUG #9 FIX: limitar _records a MAX_RECORDS_PER_SYMBOL entradas por symbol
+        # Evita leak de memoria lento en despliegues de larga duración sin restart.
+        records = self._records[rec.symbol]
+        records.append(rec)
+        if len(records) > _MAX_RECORDS_PER_SYMBOL:
+            del records[:-_MAX_RECORDS_PER_SYMBOL]
 
         log_msg = (
             f"[{rec.symbol}] 📊 Exec: type={rec.order_type_used} side={side} qty={rec.qty} "
