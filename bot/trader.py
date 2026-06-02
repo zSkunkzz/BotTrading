@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-bot/trader.py — FuturesTrader: punto de entrada público para main.py.
+bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
-FIX DEADLOCK (2026-06-03):
-  Causa raíz del freeze «se queda pillado»:
-  El SDK de Hyperliquid (Exchange + Info) usa `requests` internamente, que es
-  síncrono y bloqueante. Llamar self._hl_client._exchange.order() / update_leverage()
-  / _info._session.post() directamente desde una corrutina async bloquea el event
-  loop entero. Con 7+ traders en paralelo, el primer bloqueo congela todos los demás.
+FIX FREEZE (2026-06-03):
+  CAUSA RAÍZ del freeze «no veo nada más / TradingLoop iniciado y silencio»:
+  FuturesTrader.__init__ llamaba HLClient(symbol) directamente, que a su vez
+  llamaba _HLCore.get(), que ejecuta _warm_cache() con 3 llamadas HTTP
+  bloqueantes (requests). Con 7+ traders, el primer trader bloqueaba el hilo
+  principal ~2-5s; si había latencia o 429, time.sleep() en los reintentos
+  congelaba el event loop entero — ningún trader llegaba a _iteration().
 
-  Fix: todas las llamadas al SDK síncrono se envuelven en asyncio.to_thread() para
-  que se ejecuten en un hilo del ThreadPoolExecutor sin bloquear el event loop.
+  Fixes aplicados:
+    1. __init__: _hl_client = None. El SDK jamás se crea aquí.
+    2. _get_ccxt(): crea _hl_client vía HLClient.create() (async) la primera
+       vez que se llama. TradingLoop.run() invoca _get_ccxt() desde _init()
+       dentro del event loop, por lo que es seguro awaitar.
+    3. _set_leverage: asyncio.wait_for con timeout=15s.
+    4. Todos los métodos que usan _hl_client verifican que no sea None.
 
-  Funciones corregidas:
-    - _info_post        → ahora async, usa asyncio.to_thread
-    - _set_leverage     → asyncio.to_thread para update_leverage
-    - _place_tpsl       → asyncio.to_thread para place_sl / place_tp
-    - open_order (real) → asyncio.to_thread para place_market, place_sl, place_tp
+FIX DEADLOCK (2026-06-03 anterior):
+  Todas las llamadas al SDK síncrono se envuelven en asyncio.to_thread().
 """
 from __future__ import annotations
 
@@ -39,10 +42,8 @@ _API_URL = (
     else "https://api.hyperliquid.xyz"
 )
 
-# Cuántas velas pedir por timeframe
 _OHLCV_BARS = int(os.getenv("BARS_NEEDED", "100"))
 
-# Mapeo timeframe → intervalo en minutos para candle_snapshot
 _TF_MINUTES = {
     "1m":  1,
     "3m":  3,
@@ -56,11 +57,9 @@ _TF_MINUTES = {
     "1d":  1440,
 }
 
-# Intentos de confirmación de fill tras orden de mercado
 _FILL_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "3"))
 _FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "2.0"))
 
-# Desfase máximo permitido entre ref_price y signal.entry antes de cancelar.
 _MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "3.0")) / 100.0
 
 
@@ -69,14 +68,6 @@ def _check_price_staleness(
     ref_price: float,
     is_long: bool,
 ) -> Optional[str]:
-    """
-    Comprueba si el precio actual (ref_price) se ha alejado demasiado del
-    entry calculado por el signal_engine.
-
-    Retorna:
-      None        → precio aceptable, puede continuar
-      str (motivo) → desfase excesivo, abortar la entrada
-    """
     entry_signal = float(signal.get("entry") or 0)
     if entry_signal <= 0:
         return None
@@ -127,10 +118,6 @@ def _adjust_levels_to_fill(
     filled_price: float,
     ref_price: float,
 ) -> tuple[float, float, float]:
-    """
-    Re-escala SL, TP1 y TP2 del signal para que mantengan los mismos
-    offsets porcentuales relativos al precio real de fill.
-    """
     sl_px  = float(signal.get("sl")  or 0)
     tp1_px = float(signal.get("tp1") or 0)
     tp2_px = float(signal.get("tp2") or 0)
@@ -199,10 +186,12 @@ class FuturesTrader:
         self._api_key    = api_key or ""
         self._api_secret = api_secret or ""
 
-        self._hl_client = HLClient(symbol)
-
-        self._master_addr = self._hl_client._account_addr
-        self._agent_mode  = self._hl_client._agent_mode
+        # FIX FREEZE: NO crear HLClient aquí (bloquea el event loop).
+        # Se inicializa de forma async en _get_ccxt(), que TradingLoop
+        # llama desde _init() dentro del event loop.
+        self._hl_client: Optional[HLClient] = None
+        self._master_addr: str = ""
+        self._agent_mode:  bool = False
 
         self._stopped_event = asyncio.Event()
         self._trading_loop  = TradingLoop(symbol)
@@ -226,10 +215,50 @@ class FuturesTrader:
             logger.debug("[%s] cleanup ai_trader sessions: %s", self.symbol, e)
         self._stopped_event.set()
 
-    # ── Métodos que TradingLoop llama sobre el objeto trader ──────────
+    # ── _get_ccxt: crea HLClient la primera vez (async-safe) ──────────
 
     async def _get_ccxt(self) -> None:
-        pass
+        """
+        FIX FREEZE: inicializa _hl_client vía HLClient.create() (async).
+        Llamar solo desde _init() de TradingLoop, que ya está dentro del
+        event loop. La primera llamada puede tardar 2-5s (warm cache),
+        pero NO bloquea el event loop porque usa asyncio.to_thread().
+        Llamadas subsiguientes son instantáneas (singleton ya listo).
+        """
+        if self._hl_client is not None:
+            return
+
+        try:
+            logger.info("[%s] _get_ccxt: inicializando HLClient...", self.symbol)
+            self._hl_client = await HLClient.create(self.symbol)
+            self._master_addr = self._hl_client._account_addr
+            self._agent_mode  = self._hl_client._agent_mode
+            logger.info(
+                "[%s] _get_ccxt: HLClient listo | addr=%s | agente=%s",
+                self.symbol,
+                self._master_addr[:10] + "..." if self._master_addr else "N/A",
+                self._agent_mode,
+            )
+        except Exception as e:
+            logger.error("[%s] _get_ccxt: error inicializando HLClient: %s", self.symbol, e)
+            raise
+
+    # ── Acceso seguro a _hl_client ────────────────────────────────────
+
+    def _require_hl(self) -> Optional[HLClient]:
+        """
+        Devuelve _hl_client si está inicializado, o None con log de error.
+        Usar en cualquier método que necesite el SDK.
+        """
+        if self._hl_client is None:
+            logger.error(
+                "[%s] _hl_client no inicializado. ¿Se llamó _get_ccxt() antes?",
+                self.symbol,
+            )
+            return None
+        return self._hl_client
+
+    # ── Métodos que TradingLoop llama sobre el objeto trader ──────────
 
     async def get_price(self) -> float:
         import aiohttp
@@ -374,6 +403,10 @@ class FuturesTrader:
         is_long: bool,
         reduce_only: bool = True,
     ) -> None:
+        hl = self._require_hl()
+        if hl is None:
+            return
+
         if self.dry_run:
             logger.info(
                 "[%s] DRY_RUN: _place_tpsl sl=%.4f tp=%.4f omitido.",
@@ -384,7 +417,7 @@ class FuturesTrader:
         if sl_price and sl_price > 0:
             try:
                 result = await asyncio.to_thread(
-                    self._hl_client.place_sl,
+                    hl.place_sl,
                     is_buy=not is_long,
                     sz=qty,
                     trigger_px=sl_price,
@@ -397,7 +430,7 @@ class FuturesTrader:
         if tp_price and tp_price > 0:
             try:
                 result = await asyncio.to_thread(
-                    self._hl_client.place_tp,
+                    hl.place_tp,
                     is_buy=not is_long,
                     sz=qty,
                     trigger_px=tp_price,
@@ -408,31 +441,45 @@ class FuturesTrader:
                 logger.error("[%s] _place_tpsl TP error: %s", self.symbol, e)
 
     def _round_qty(self, qty: float) -> float:
-        return self._hl_client.round_sz(qty)
+        hl = self._require_hl()
+        if hl is None:
+            return qty
+        return hl.round_sz(qty)
 
     async def _set_leverage(self, leverage: int) -> None:
+        hl = self._require_hl()
+        if hl is None:
+            return
+
         if self.dry_run:
             logger.info("[%s] DRY_RUN: _set_leverage(%d) omitido.", self.symbol, leverage)
             return
         try:
-            # FIX DEADLOCK: update_leverage es síncrono (requests) — usar to_thread
-            result = await asyncio.to_thread(
-                self._hl_client._exchange.update_leverage,
-                leverage, self.coin, False,
+            # FIX FREEZE: timeout de 15s + asyncio.to_thread para no bloquear el event loop
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    hl._exchange.update_leverage,
+                    leverage, self.coin, False,
+                ),
+                timeout=15.0,
             )
             logger.info("[%s] Leverage configurado a %dx: %s", self.symbol, leverage, result)
+        except asyncio.TimeoutError:
+            logger.warning("[%s] _set_leverage timeout (15s) — continuando sin confirmar leverage.", self.symbol)
         except Exception as e:
             logger.warning("[%s] No se pudo configurar leverage: %s", self.symbol, e)
 
     async def _info_post(self, payload: dict) -> dict:
         """
-        FIX DEADLOCK: _info._session.post() es síncrono (requests).
+        Llamada async-safe a la API REST de HL.
         Se envuelve en asyncio.to_thread para no bloquear el event loop.
-        balance_service hace await sobre esta función — antes devolvía un
-        dict (no corrutina) y el await bloqueaba silenciosamente el loop.
         """
+        hl = self._require_hl()
+        if hl is None:
+            return {}
+
         def _sync_call() -> dict:
-            return self._hl_client._info._session.post(
+            return hl._info._session.post(
                 f"{_API_URL}/info", json=payload
             ).json()
 
@@ -443,11 +490,13 @@ class FuturesTrader:
     async def open_order(self, signal: dict, risk) -> None:
         """
         Abre una posición en el mercado con SL y TP1 opcionales.
-
-        FIX DEADLOCK: place_market, place_sl, place_tp son síncronos
-        (usan requests internamente via el SDK). Se envuelven en
-        asyncio.to_thread() para no bloquear el event loop.
+        Todas las llamadas al SDK síncrono van envueltas en asyncio.to_thread().
         """
+        hl = self._require_hl()
+        if hl is None:
+            logger.error("[%s] open_order: _hl_client no inicializado, abortando.", self.symbol)
+            return
+
         if self.position is not None:
             logger.info("[%s] open_order ignorado — ya hay posición abierta (%s).", self.symbol, self.position)
             return
@@ -477,7 +526,7 @@ class FuturesTrader:
             return
 
         qty = notional / ref_price
-        qty = self._hl_client.round_sz(qty)
+        qty = hl.round_sz(qty)
 
         if qty <= 0:
             logger.error("[%s] open_order: qty calculada = 0 (notional=%.2f ref_price=%.4f) — abortando.",
@@ -512,10 +561,10 @@ class FuturesTrader:
             self._protection_ok = (sl_px > 0)
             return
 
-        # ── Orden de mercado (FIX: asyncio.to_thread) ──────────────────
+        # ── Orden de mercado ────────────────────────────────────────────────
         try:
             result = await asyncio.to_thread(
-                self._hl_client.place_market,
+                hl.place_market,
                 is_buy,
                 qty,
                 False,
@@ -531,7 +580,7 @@ class FuturesTrader:
             logger.error("[%s] open_order: orden rechazada por exchange: %s", self.symbol, result)
             return
 
-        # ── Esperar fill y obtener precio real de entrada ──────────────
+        # ── Esperar fill y obtener precio real de entrada ─────────────────
         filled_price = ref_price
         for attempt in range(_FILL_RETRIES):
             await asyncio.sleep(_FILL_DELAY)
@@ -550,7 +599,7 @@ class FuturesTrader:
             logger.warning("[%s] open_order: fill no confirmado tras %d intentos — usando ref_price=%.4f",
                            self.symbol, _FILL_RETRIES, ref_price)
 
-        # ── Re-escalar SL/TP al precio real de fill ────────────────────
+        # ── Re-escalar SL/TP al precio real de fill ────────────────────────
         sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, filled_price, ref_price)
 
         tp3_raw = float(signal.get("tp3") or 0)
@@ -563,7 +612,7 @@ class FuturesTrader:
             else:
                 tp3_px = tp3_raw
 
-        # ── Actualizar estado interno ───────────────────────────────
+        # ── Actualizar estado interno ──────────────────────────────────────
         self.position    = "long" if is_long else "short"
         self.entry_price = filled_price
         self.sl          = sl_px  if sl_px  > 0 else None
@@ -576,11 +625,11 @@ class FuturesTrader:
         self._protection_ok = False
         self._tp1_be_done   = False
 
-        # ── Colocar SL (FIX: asyncio.to_thread) ────────────────────────
+        # ── Colocar SL ───────────────────────────────────────────────────
         if sl_px and sl_px > 0:
             try:
                 sl_result = await asyncio.to_thread(
-                    self._hl_client.place_sl,
+                    hl.place_sl,
                     not is_buy,
                     qty,
                     sl_px,
@@ -591,11 +640,11 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: error colocando SL: %s", self.symbol, e)
 
-        # ── Colocar TP1 (FIX: asyncio.to_thread) ───────────────────────
+        # ── Colocar TP1 ──────────────────────────────────────────────────
         if tp1_px and tp1_px > 0:
             try:
                 tp_result = await asyncio.to_thread(
-                    self._hl_client.place_tp,
+                    hl.place_tp,
                     not is_buy,
                     qty,
                     tp1_px,
@@ -606,7 +655,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: error colocando TP1: %s", self.symbol, e)
 
-        # ── Persistir estado ────────────────────────────────────────
+        # ── Persistir estado ───────────────────────────────────────────────
         try:
             save_position(self.symbol, {
                 "side":        self.position,
