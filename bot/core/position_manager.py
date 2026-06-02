@@ -9,7 +9,8 @@ Responsabilidades:
   - Persistir y limpiar estado de posición
   - Notificar cierres y TP parciales via Telegram
   - Cancelar trigger orders huérfanos tras cierre/parcial
-  - Llamar signal_cooldown.mark_closed() al cerrar (#4)
+  - Llamar signal_cooldown.mark_closed() al cerrar por SL/TP/TIMEOUT (#4)
+  - Llamar signal_cooldown.mark_manual_close() al detectar cierre externo (#5)
   - [V4] position_timeout, trailing_hl, correlation_guard on_close,
           daily_drawdown register_loss
   - Llamar decision_engine.on_position_closed() en todos los cierres
@@ -17,6 +18,11 @@ Responsabilidades:
 FIX v4.1: correlation_guard import corregido — el módulo expone funciones libres,
           no un singleton. on_close() no existía; se elimina esa llamada.
           _open_leverage incluido en save_position del breakeven.
+
+FIX v5: detect_external_close() — punto de entrada para que trading_loop notifique
+        que la posición desapareció sin SL/TP hit (cierre manual en exchange).
+        Llama mark_manual_close() para activar cooldown de 600s y evitar reentrada
+        inmediata en el mismo símbolo. Se limpia estado igual que _reset_trader_state.
 """
 from __future__ import annotations
 
@@ -94,6 +100,50 @@ class PositionManager:
         En un sistema multi-symbol el trading_loop puede sobreescribir este método.
         """
         return {}
+
+    def detect_external_close(self, trader) -> None:
+        """
+        Llamar desde trading_loop cuando se detecta que la posición desapareció
+        en el exchange sin que position_manager haya emitido un cierre.
+
+        Situaciones típicas:
+          - Cierre manual por el usuario en la UI de Hyperliquid
+          - Liquidación forzada por el exchange
+          - Orden de cierre enviada desde otro cliente
+
+        Activa cooldown MANUAL_CLOSE (COOLDOWN_MANUAL_CLOSE segundos, default 600)
+        para evitar que el bot reabra la posición inmediatamente.
+        """
+        notional = getattr(trader, "_open_notional", 0) or 0
+        logger.warning(
+            "[%s] ⚠️  Cierre externo detectado (manual/liquidación) — "
+            "activando cooldown manual.",
+            self.symbol,
+        )
+        # Registrar cooldown manual ANTES de limpiar estado
+        signal_cooldown.mark_manual_close(self.symbol)
+
+        # Liberar exposición en pretrade_risk
+        if notional > 0:
+            try:
+                pretrade_risk.register_close(self.symbol, notional)
+            except Exception as e:
+                logger.debug("[%s] pretrade_risk.register_close error: %s", self.symbol, e)
+
+        # Notificar al DecisionEngine
+        if self._decision_engine is not None:
+            try:
+                margin = getattr(trader, "_open_margin", None)
+                self._decision_engine.on_position_closed(
+                    symbol=self.symbol,
+                    margin=margin,
+                    reason="MANUAL",
+                    entry_mode=self._entry_mode,
+                )
+            except Exception as e:
+                logger.debug("[%s] on_position_closed(MANUAL) error: %s", self.symbol, e)
+
+        self._reset_trader_state(trader)
 
     async def manage(
         self,
