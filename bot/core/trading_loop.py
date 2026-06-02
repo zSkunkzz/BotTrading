@@ -17,7 +17,14 @@ FIX v3 (2026-06-02):
 FIX v4 (2026-06-02):
   `from bot.cooldown import signal_cooldown` → módulo incorrecto.
   El archivo real es bot/signal_cooldown.py.
-  Fix: `from bot.signal_cooldown import signal_cooldown`.
+  Fix: `from bot.signal_cooldown import signal_cooldown`
+
+FIX v5 (Bug Q) (2026-06-02):
+  _build_decision_engine usaba `getattr(risk, "pretrade_risk", risk)` que
+  devuelve GlobalRisk como fallback cuando el atributo no existe.
+  GlobalRisk no tiene .check() → warning en cada evaluate() y el bot
+  nunca aprueba entradas.
+  Fix: importar el singleton pretrade_risk directamente desde bot.pretrade_risk.
 """
 from __future__ import annotations
 
@@ -54,15 +61,25 @@ class TradingLoop:
         self._last_pos_check_at: float = 0.0
 
     def _build_decision_engine(self, risk):
-        """Construye DecisionEngine con los objetos correctos del risk manager."""
+        """
+        Construye DecisionEngine con los objetos correctos del risk manager.
+
+        Bug Q fix: NO usar getattr(risk, "pretrade_risk", risk) como fallback
+        porque risk es GlobalRisk y no tiene .check().
+        Importamos el singleton pretrade_risk directamente desde su módulo.
+        """
         from bot import signal_engine
         # FIX v4: el módulo se llama signal_cooldown.py, no cooldown.py
         from bot.signal_cooldown import signal_cooldown
+        # FIX v5 (Bug Q): importar pretrade_risk singleton directamente —
+        # nunca usar GlobalRisk como fallback para pretrade_risk.
+        from bot.pretrade_risk import pretrade_risk as _pretrade_singleton
 
-        # risk es el objeto TradeRisk / GlobalRisk que llega desde main.py
-        # Intentamos obtener pretrade_risk desde risk; si no existe, usamos risk mismo.
-        pretrade_risk = getattr(risk, "pretrade_risk", risk)
-        risk_manager  = getattr(risk, "risk_manager",  risk)
+        # risk_manager es GlobalRisk (gestiona límites globales, dailydrawdown, etc.)
+        risk_manager = risk
+
+        # pretrade_risk es el singleton PreTradeRisk (tiene .check(), .register_close())
+        pretrade_risk = _pretrade_singleton
 
         return DecisionEngine(
             risk_manager  = risk_manager,
