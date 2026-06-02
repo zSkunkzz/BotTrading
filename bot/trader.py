@@ -31,6 +31,13 @@ FIX bulk sz rounding (2026-06-02):
 FIX DecisionEngine import (2026-06-02 v3):
   El módulo real es bot/decision_engine.py, NO bot/core/decision_engine.py.
   Corregido: from bot.decision_engine import DecisionEngine as _DecisionEngine
+
+FIX KS L3 falso positivo tras restart (2026-06-02):
+  Al restaurar posición, _protection_ok=False pero el watchdog disparaba
+  on_state_mismatch cada 30s antes de que _manage_open_position verificara
+  la protección (cada 120s). Fix: llamar _ensure_tpsl_on_exchange() en _init()
+  envuelto con mark_tpsl_retrying()/clear_tpsl_retrying() para inhibir el
+  watchdog durante la verificación/reposición.
 """
 from __future__ import annotations
 
@@ -386,6 +393,43 @@ class FuturesTrader:
         self._trailing_sl_activated     = saved.get("trailing_sl_activated", False)
         self._trail_peak                = saved.get("trail_peak", 0.0)
 
+    async def _verify_protection_on_restore(self) -> None:
+        """
+        Llamado desde _init() tras restaurar una posición guardada.
+        Verifica si ya existen SL/TP en el exchange y, si no, los repone.
+        Usa mark_tpsl_retrying() para que el watchdog del KS ignore este
+        símbolo durante la verificación y evite falsos state_mismatch.
+        """
+        if not self.position or not self.sl or not self.tp1:
+            # Sin datos suficientes para reponer — el loop normal lo manejará
+            return
+
+        kill_switch.mark_tpsl_retrying(self.symbol)
+        try:
+            await self._ensure_tpsl_on_exchange(
+                qty=self._open_qty,
+                sl=self.sl,
+                tp1=self.tp1,
+                pos_side=self.position,
+            )
+            # Marcar como verificado para que _manage_open_position no repita
+            # la verificación inmediatamente
+            self._last_tpsl_verify_at = time.monotonic()
+            if self._protection_ok:
+                logger.info(
+                    "[%s] Protección SL/TP verificada/repuesta tras restart — _protection_ok=True",
+                    self.symbol,
+                )
+            else:
+                logger.warning(
+                    "[%s] No se pudo verificar/reponer SL/TP tras restart",
+                    self.symbol,
+                )
+        except Exception as e:
+            logger.warning("[%s] _verify_protection_on_restore error: %s", self.symbol, e)
+        finally:
+            kill_switch.clear_tpsl_retrying(self.symbol)
+
     async def _init(self, usdc_per_trade: float):
         await self._get_ccxt()
         saved = load_position(self.symbol)
@@ -407,6 +451,11 @@ class FuturesTrader:
                         )
 
                 await self._cleanup_excess_ro_orders()
+
+                # FIX KS L3: verificar/reponer SL/TP antes de que el watchdog
+                # empiece a comprobar _protection_ok (el watchdog actúa cada 30s,
+                # pero _manage_open_position verifica cada 120s — llegaba tarde).
+                await self._verify_protection_on_restore()
 
             elif exchange_pos is not None and len(exchange_pos) == 0:
                 logger.warning(
