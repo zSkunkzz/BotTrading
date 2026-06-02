@@ -6,19 +6,22 @@ Fuentes RSS (100% gratuitas, sin API key, sin registro):
   - CoinDesk      : https://coindesk.com/arc/outboundfeeds/rss/
   - Decrypt       : https://decrypt.co/feed
 
+Resolucion de nombres de coins:
+  En lugar de una lista estatica hardcodeada, se consulta CoinGecko API
+  (/search?query=SYMBOL) la primera vez que se ve un simbolo. El nombre
+  completo se cachea en memoria 24h. Esto cubre los 230+ pares de Hyperliquid
+  sin mantenimiento manual.
+
+  Overrides estaticos para tickers ambiguos donde CoinGecko devuelve resultados
+  incorrectos (ej: ENA -> busca "ethena" directamente).
+
 Flujo:
   1. Check cache  → si vigente, devuelve sin ninguna llamada externa.
   2. Fetch RSS de las 3 fuentes en paralelo (una sola ClientSession).
-  3. Filtra titulares que mencionen el simbolo con word-boundary (evita falsos
-     positivos como ENA dentro de "Ethena", OP dentro de "optimize", etc).
+  3. Filtra titulares con word-boundary para tickers cortos + nombre completo.
   4. Sin titulares relevantes → 0.0 SIN llamar a Groq.
   5. Con titulares → llama a Groq (misma sesion reutilizada).
   6. Cachea el resultado.
-
-Fix 2026-06-02a: ClientSession unica por operacion (evita Unclosed connection).
-Fix 2026-06-02b: word-boundary regex para simbolos de 1-4 letras que son
-  substrings comunes (ENA en "Ethena", OP en "options", etc). Simbolos de
-  5+ letras siguen usando substring simple. Keywords siempre usan boundary.
 
 Variables de entorno:
   GROQ_API_KEY            — clave Groq
@@ -48,6 +51,7 @@ _HOURS_LOOKBACK = float(os.getenv("AI_NEWS_HOURS_LOOKBACK", "6"))
 _CACHE_TTL_S    = float(os.getenv("AI_NEWS_CACHE_TTL_H", "2")) * 3600
 _SCORE_MIN      = -2.0
 _SCORE_MAX      =  2.0
+_BOUNDARY_THRESHOLD = 4  # Tickers de <= 4 chars usan word-boundary
 
 RSS_FEEDS = [
     "https://cointelegraph.com/rss",
@@ -55,49 +59,51 @@ RSS_FEEDS = [
     "https://decrypt.co/feed",
 ]
 
-# Simbolos con <= 4 chars usan word-boundary en el match (evita falsos positivos).
-# Keywords siempre usan word-boundary.
-_BOUNDARY_THRESHOLD = 4
-
-# Mapa simbolo -> keywords adicionales (todas en minusculas, sin regex especial)
-_SYMBOL_KEYWORDS: dict[str, list[str]] = {
-    "BTC":   ["bitcoin"],
-    "ETH":   ["ethereum", "ether"],
-    "SOL":   ["solana"],
+# Overrides estaticos para tickers donde CoinGecko puede devolver el resultado
+# equivocado o donde el nombre en los medios difiere del nombre oficial.
+# Solo se usan si CoinGecko falla o devuelve un nombre demasiado generico.
+_STATIC_OVERRIDES: dict[str, list[str]] = {
+    "ENA":   ["ethena"],
+    "OP":    ["optimism"],
+    "TON":   ["toncoin", "the open network"],
+    "HYPE":  ["hyperliquid"],
+    "PUMP":  ["pump.fun"],
+    "WLD":   ["worldcoin"],
+    "ONDO":  ["ondo finance"],
+    "LIT":   ["litentry"],
+    "ZEC":   ["zcash"],
     "BNB":   ["binance"],
     "XRP":   ["ripple"],
     "ADA":   ["cardano"],
-    "DOGE":  ["dogecoin"],
-    "AVAX":  ["avalanche"],
+    "SOL":   ["solana"],
+    "ETH":   ["ethereum"],
+    "BTC":   ["bitcoin"],
     "DOT":   ["polkadot"],
-    "MATIC": ["polygon", "matic network"],
-    "LINK":  ["chainlink"],
     "UNI":   ["uniswap"],
+    "LINK":  ["chainlink"],
     "ATOM":  ["cosmos"],
     "LTC":   ["litecoin"],
-    "NEAR":  ["near protocol"],
     "ARB":   ["arbitrum"],
-    "OP":    ["optimism"],
     "SUI":   ["sui network"],
     "APT":   ["aptos"],
     "INJ":   ["injective"],
-    # Pares activos en el bot segun logs
-    "ENA":   ["ethena"],          # ENA es ticker de Ethena — sin keyword da falsos positivos
-    "HYPE":  ["hyperliquid"],
-    "ZEC":   ["zcash"],
-    "TON":   ["toncoin", "the open network"],
-    "WLD":   ["worldcoin"],
-    "ONDO":  ["ondo finance"],
-    "PUMP":  ["pump.fun"],
-    "LIT":   ["litentry"],
+    "NEAR":  ["near protocol"],
+    "AVAX":  ["avalanche"],
+    "DOGE":  ["dogecoin"],
+    "MATIC": ["polygon"],
 }
 
-# Cache en memoria: {symbol: (score_delta, timestamp_monotonic)}
+# Cache de nombres: {symbol: ([keywords], timestamp_monotonic)}
+# TTL de 24h — los nombres de coins no cambian
+_NAME_CACHE: dict[str, tuple[list[str], float]] = {}
+_NAME_CACHE_TTL_S = 86400.0
+
+# Cache de score: {symbol: (score_delta, timestamp_monotonic)}
 _NEWS_CACHE: dict[str, tuple[float, float]] = {}
 
 
 # ---------------------------------------------------------------------------
-# Cache helpers
+# Score cache
 # ---------------------------------------------------------------------------
 
 def _get_cached(symbol: str) -> float | None:
@@ -116,30 +122,85 @@ def _set_cached(symbol: str, delta: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Symbol matching con word-boundary para simbolos cortos
+# Resolucion de nombre via CoinGecko (con cache 24h)
+# ---------------------------------------------------------------------------
+
+async def _resolve_coin_name(
+    session: aiohttp.ClientSession,
+    symbol: str,
+) -> list[str]:
+    """
+    Devuelve lista de keywords para el simbolo: [nombre_completo_lower, ...].
+    Orden de prioridad:
+      1. Cache en memoria (TTL 24h)
+      2. Override estatico (_STATIC_OVERRIDES)
+      3. CoinGecko /search API (gratis, sin key)
+      4. Fallback: lista vacia (solo se usara el ticker con word-boundary)
+    """
+    # 1. Cache
+    entry = _NAME_CACHE.get(symbol)
+    if entry is not None:
+        kws, ts = entry
+        if time.monotonic() - ts < _NAME_CACHE_TTL_S:
+            return kws
+
+    # 2. Override estatico (rapido, sin red)
+    if symbol in _STATIC_OVERRIDES:
+        kws = _STATIC_OVERRIDES[symbol]
+        _NAME_CACHE[symbol] = (kws, time.monotonic())
+        return kws
+
+    # 3. CoinGecko search
+    try:
+        url = f"https://api.coingecko.com/api/v3/search?query={symbol}"
+        async with session.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; TradingBot/1.0)"},
+            timeout=aiohttp.ClientTimeout(total=6),
+        ) as resp:
+            if resp.status != 200:
+                _NAME_CACHE[symbol] = ([], time.monotonic())
+                return []
+            data = await resp.json()
+
+        coins = data.get("coins", [])
+        # Buscar el resultado cuyo simbolo coincida exactamente (case-insensitive)
+        full_name = ""
+        for coin in coins[:10]:
+            if coin.get("symbol", "").upper() == symbol.upper():
+                full_name = coin.get("name", "").lower().strip()
+                break
+
+        kws = [full_name] if full_name and full_name != symbol.lower() else []
+        _NAME_CACHE[symbol] = (kws, time.monotonic())
+        if kws:
+            logger.debug("[AIFilter] CoinGecko: %s → '%s'", symbol, kws[0])
+        return kws
+
+    except Exception as e:
+        logger.debug("[AIFilter] CoinGecko error para %s: %s", symbol, e)
+        _NAME_CACHE[symbol] = ([], time.monotonic())
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Symbol matching con word-boundary para tickers cortos
 # ---------------------------------------------------------------------------
 
 def _word_boundary_match(text_lower: str, term: str) -> bool:
-    """Busca 'term' en text_lower con word-boundary para evitar substrings falsos."""
-    pattern = rf"\b{re.escape(term)}\b"
-    return bool(re.search(pattern, text_lower))
+    return bool(re.search(rf"\b{re.escape(term)}\b", text_lower))
 
 
-def _matches_symbol(text: str, symbol: str) -> bool:
+def _matches_symbol(text: str, symbol: str, keywords: list[str]) -> bool:
     """
-    True si el texto menciona el simbolo o alguna de sus keywords.
-
-    Logica:
-    - Simbolos de <= 4 chars (ENA, OP, DOT, BTC, ETH...): word-boundary obligatorio.
-      Evita que "ENA" haga match en "Ethena", "OP" en "options", etc.
-    - Simbolos de >= 5 chars (AVAX, DOGE, MATIC...): substring simple (son suficientemente
-      especificos para no dar falsos positivos).
-    - Keywords siempre usan word-boundary.
+    True si el texto menciona el simbolo o alguna keyword.
+    - Tickers de <= 4 chars: word-boundary obligatorio.
+    - Tickers de >= 5 chars: substring simple.
+    - Keywords: siempre word-boundary.
     """
     text_lower = text.lower()
     sym_lower  = symbol.lower()
 
-    # Match del ticker
     if len(symbol) <= _BOUNDARY_THRESHOLD:
         if _word_boundary_match(text_lower, sym_lower):
             return True
@@ -147,8 +208,7 @@ def _matches_symbol(text: str, symbol: str) -> bool:
         if sym_lower in text_lower:
             return True
 
-    # Match de keywords (siempre con boundary)
-    for kw in _SYMBOL_KEYWORDS.get(symbol, []):
+    for kw in keywords:
         if _word_boundary_match(text_lower, kw):
             return True
 
@@ -156,17 +216,16 @@ def _matches_symbol(text: str, symbol: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# RSS fetch — recibe session ya abierta, NO crea una nueva
+# RSS fetch — recibe session ya abierta
 # ---------------------------------------------------------------------------
 
 async def _fetch_feed(
     session: aiohttp.ClientSession,
     url: str,
     symbol: str,
+    keywords: list[str],
     cutoff: datetime,
 ) -> list[str]:
-    """Descarga un feed RSS y devuelve titulares relevantes para el simbolo.
-    Recibe la sesion del caller — no la cierra."""
     try:
         async with session.get(
             url,
@@ -185,7 +244,7 @@ async def _fetch_feed(
             if not title_m:
                 continue
             title = re.sub(r"<[^>]+>", "", title_m.group(1)).strip()
-            if not title or not _matches_symbol(title, symbol):
+            if not title or not _matches_symbol(title, symbol, keywords):
                 continue
             date_m = re.search(r"<pubDate>(.*?)</pubDate>", item)
             if date_m:
@@ -210,10 +269,11 @@ async def _fetch_recent_headlines(
     symbol: str,
     hours: float,
 ) -> list[str]:
-    """Busca titulares en todos los feeds en paralelo usando la sesion compartida."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    cutoff   = datetime.now(timezone.utc) - timedelta(hours=hours)
+    keywords = await _resolve_coin_name(session, symbol)
+
     results = await asyncio.gather(
-        *[_fetch_feed(session, url, symbol, cutoff) for url in RSS_FEEDS],
+        *[_fetch_feed(session, url, symbol, keywords, cutoff) for url in RSS_FEEDS],
         return_exceptions=True,
     )
     headlines: list[str] = []
@@ -223,14 +283,14 @@ async def _fetch_recent_headlines(
     seen: set[str] = set()
     unique = [h for h in headlines if not (h in seen or seen.add(h))]  # type: ignore[func-returns-value]
     logger.debug(
-        "[AIFilter] %s — %d titulares relevantes en ultimas %.0fh",
-        symbol, len(unique), hours,
+        "[AIFilter] %s (keywords=%s) — %d titulares en ultimas %.0fh",
+        symbol, keywords or ["-"], len(unique), hours,
     )
     return unique[:10]
 
 
 # ---------------------------------------------------------------------------
-# Groq analysis — recibe session ya abierta, NO crea una nueva
+# Groq analysis — recibe session ya abierta
 # ---------------------------------------------------------------------------
 
 def _clean_json(content: str) -> str:
@@ -249,7 +309,6 @@ async def _groq_analyze(
     symbol: str,
     headlines: list[str],
 ) -> float:
-    """Llama a Groq con los titulares. Usa la sesion compartida del caller."""
     groq_key = os.getenv("GROQ_API_KEY", "")
     if not groq_key:
         return 0.0
@@ -312,14 +371,14 @@ async def news_score_adjustment(symbol: str) -> float:
     """
     Devuelve un delta de score en [-2.0, +2.0] basado en noticias reales.
 
-    Crea UNA sola ClientSession para toda la operacion (RSS + Groq si aplica)
-    y la cierra correctamente al terminar, evitando 'Unclosed connection'.
+    Crea UNA sola ClientSession para toda la operacion y la cierra correctamente.
 
     Flujo:
       1. Cache       → devuelve sin llamadas si vigente.
-      2. RSS (gratis)→ busca titulares que mencionen el simbolo (word-boundary).
-      3. Sin titulares → 0.0 SIN llamar a Groq.
-      4. Con titulares → llama a Groq para analizar sentimiento.
+      2. CoinGecko   → resuelve nombre completo del ticker (cache 24h).
+      3. RSS (gratis)→ busca titulares con ticker + nombre.
+      4. Sin titulares → 0.0 SIN llamar a Groq.
+      5. Con titulares → llama a Groq para analizar sentimiento.
     """
     base = symbol.replace("USDT", "").replace("USDC", "").replace("-PERP", "").upper()
 
