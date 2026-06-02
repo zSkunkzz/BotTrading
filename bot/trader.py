@@ -44,6 +44,81 @@ _TF_MINUTES = {
 _FILL_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
 _FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
 
+# Desfase máximo permitido entre ref_price y signal.entry antes de cancelar.
+# Si el precio actual se alejó más de este % del entry del signal, el setup
+# se considera inválido y la orden NO se envía.
+# Configurable vía variable de entorno MAX_ENTRY_DRIFT_PCT (default: 1.5)
+_MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "1.5")) / 100.0
+
+
+def _check_price_staleness(
+    signal: dict,
+    ref_price: float,
+    is_long: bool,
+) -> Optional[str]:
+    """
+    Comprueba si el precio actual (ref_price) se ha alejado demasiado del
+    entry calculado por el signal_engine.
+
+    Retorna:
+      None        → precio aceptable, puede continuar
+      str (motivo) → desfase excesivo, abortar la entrada
+
+    Lógica:
+      - Si entry del signal es 0 (no calculado), se omite el check.
+      - drift = (ref_price - entry) / entry
+      - Para LONG: drift > +threshold  → precio subió demasiado (entrada cara)
+                   drift < -threshold  → precio cayó demasiado (setup roto)
+      - Para SHORT: drift < -threshold → precio bajó demasiado (entrada cara)
+                    drift > +threshold → precio subió demasiado (setup roto)
+      - |drift| > 2*threshold          → cancelar siempre (mercado volátil)
+    """
+    entry_signal = float(signal.get("entry") or 0)
+    if entry_signal <= 0:
+        return None  # sin referencia, no podemos hacer el check
+
+    drift = (ref_price - entry_signal) / entry_signal
+    abs_drift = abs(drift)
+    threshold = _MAX_ENTRY_DRIFT_PCT
+
+    # Siempre cancelar si el desfase absoluto es enorme (> 2x threshold)
+    if abs_drift > threshold * 2:
+        return (
+            f"⚠️ Precio actual ({ref_price:.4f}) se alejó {drift*100:+.2f}% del entry del signal "
+            f"({entry_signal:.4f}) — supera el límite absoluto de ±{threshold*200:.1f}% — entrada cancelada"
+        )
+
+    if abs_drift <= threshold:
+        return None  # dentro del margen aceptable
+
+    # Desfase entre threshold y 2*threshold: revisar dirección
+    if is_long:
+        if drift > 0:
+            return (
+                f"⏫ [LONG] Precio actual ({ref_price:.4f}) subió {drift*100:+.2f}% sobre entry del signal "
+                f"({entry_signal:.4f}) — entrada demasiado cara, cancelada "
+                f"(límite: +{threshold*100:.1f}%)"
+            )
+        else:
+            return (
+                f"⏪ [LONG] Precio actual ({ref_price:.4f}) cayó {drift*100:+.2f}% bajo entry del signal "
+                f"({entry_signal:.4f}) — setup roto (precio en caída), cancelado "
+                f"(límite: -{threshold*100:.1f}%)"
+            )
+    else:  # SHORT
+        if drift < 0:
+            return (
+                f"⏪ [SHORT] Precio actual ({ref_price:.4f}) bajó {drift*100:+.2f}% bajo entry del signal "
+                f"({entry_signal:.4f}) — entrada demasiado barata/cara para short, cancelada "
+                f"(límite: -{threshold*100:.1f}%)"
+            )
+        else:
+            return (
+                f"⏫ [SHORT] Precio actual ({ref_price:.4f}) subió {drift*100:+.2f}% sobre entry del signal "
+                f"({entry_signal:.4f}) — setup roto (precio en subida), cancelado "
+                f"(límite: +{threshold*100:.1f}%)"
+            )
+
 
 def _adjust_levels_to_fill(
     signal: dict,
@@ -53,22 +128,6 @@ def _adjust_levels_to_fill(
     """
     Re-escala SL, TP1 y TP2 del signal para que mantengan los mismos
     offsets porcentuales relativos al precio real de fill.
-
-    El signal_engine calcula SL/TP sobre `entry` (close de vela).  Si el
-    fill ocurre a un precio distinto, aplicar los niveles originales genera
-    distancias incorrectas (SL demasiado cerca, TP demasiado lejos, o
-    viceversa).
-
-    Algoritmo:
-      base         = signal.entry si > 0, si no ref_price
-      sl_pct       = (sl - base) / base          (negativo para LONG)
-      tp1_pct      = (tp1 - base) / base         (positivo para LONG)
-      tp2_pct      = (tp2 - base) / base
-      sl_adj       = filled_price * (1 + sl_pct)
-      tp1_adj      = filled_price * (1 + tp1_pct)
-      tp2_adj      = filled_price * (1 + tp2_pct)
-
-    Si base == filled_price (sin desfase) los valores no cambian.
     """
     sl_px  = float(signal.get("sl")  or 0)
     tp1_px = float(signal.get("tp1") or 0)
@@ -131,7 +190,7 @@ class FuturesTrader:
         self.tp2_hit:         bool            = False
         self._open_notional:  float           = 0.0
         self._open_leverage:  int             = leverage
-        self._open_qty:       float           = 0.0   # qty en unidades del activo
+        self._open_qty:       float           = 0.0
         self._protection_ok:  bool            = False
         self._tp1_be_done:    bool            = False
         self._last_price:     float           = 0.0
@@ -190,11 +249,6 @@ class FuturesTrader:
         return float(price)
 
     async def get_ohlcv(self, timeframe: str) -> list:
-        """
-        Descarga velas OHLCV desde Hyperliquid /info candle_snapshot.
-        Devuelve lista de [timestamp, open, high, low, close, volume] compatible
-        con signal_engine._compute_indicators().
-        """
         import aiohttp
         import json as _json
         import time as _time
@@ -252,10 +306,6 @@ class FuturesTrader:
         return bars
 
     def get_ohlcv_fn(self) -> Callable:
-        """
-        Devuelve un callable async compatible con analyze_pair(ohlcv_fn=...).
-        El signal_engine llama a ohlcv_fn(timeframe) para cada TF.
-        """
         async def _fn(tf: str) -> list:
             return await self.get_ohlcv(tf)
         return _fn
@@ -293,11 +343,6 @@ class FuturesTrader:
         return result
 
     async def _get_open_orders_raw(self) -> list[dict]:
-        """
-        Obtiene las órdenes abiertas del exchange para esta cuenta.
-        Devuelve lista de dicts con la estructura nativa de Hyperliquid.
-        Requerido por position_manager._ensure_tpsl.
-        """
         import aiohttp
         import json as _json
 
@@ -328,11 +373,6 @@ class FuturesTrader:
         is_long: bool,
         reduce_only: bool = True,
     ) -> None:
-        """
-        Coloca una orden de SL o TP en el exchange.
-        Requerido por position_manager._place_emergency_sl_tp.
-        Si sl_price es None se coloca solo TP, y viceversa.
-        """
         if self.dry_run:
             logger.info(
                 "[%s] DRY_RUN: _place_tpsl sl=%.4f tp=%.4f omitido.",
@@ -359,10 +399,6 @@ class FuturesTrader:
             logger.info("[%s] _place_tpsl TP=%.4f: %s", self.symbol, tp_price, result)
 
     def _round_qty(self, qty: float) -> float:
-        """
-        Redondea qty al número de decimales que acepta el exchange.
-        Requerido por position_manager._round_qty_safe.
-        """
         return self._hl_client.round_sz(qty)
 
     async def _set_leverage(self, leverage: int) -> None:
@@ -388,21 +424,14 @@ class FuturesTrader:
         """
         Abre una posición en el mercado con SL y TP1 opcionales.
 
-        signal keys esperados (producidos por signal_engine / decision_engine):
-          action      : "BUY" | "SELL"
-          side        : "long" | "short"
-          entry       : float  — precio de referencia del signal (close de vela)
-          sl          : float  — precio de stop loss calculado sobre entry
-          tp1         : float  — precio de take profit 1 calculado sobre entry
-          tp2, tp3    : float  — TPs adicionales (opcionales)
-          entry_mode  : str    — "EARLY" | "CONFIRMED" (informativo)
-          score       : int    — score de la señal (informativo)
+        PROTECCIÓN DE ENTRADA:
+          Antes de enviar la orden, comprueba que el precio actual (ref_price)
+          no se haya alejado más de MAX_ENTRY_DRIFT_PCT (default 1.5%) del
+          entry calculado por el signal_engine. Si se superó ese umbral, la
+          entrada se cancela completamente — el setup ya no es válido.
 
-        NOTA: SL/TP se re-escalan automáticamente al precio real de fill
-        para preservar los offsets porcentuales correctos (ver _adjust_levels_to_fill).
-
-        risk keys esperados:
-          usdc_per_trade : float — capital por operación en USDC
+          Tras el fill, SL/TP se re-escalan automáticamente al precio real
+          de fill para preservar los offsets porcentuales correctos.
         """
         if self.position is not None:
             logger.info("[%s] open_order ignorado — ya hay posición abierta (%s).", self.symbol, self.position)
@@ -417,7 +446,7 @@ class FuturesTrader:
         usdc_per_trade = float(getattr(risk, "usdc_per_trade", 20.0))
         notional       = usdc_per_trade * self.leverage
 
-        # Obtener precio actual para calcular qty
+        # Obtener precio actual
         try:
             ref_price = await self.get_price()
         except Exception as e:
@@ -426,6 +455,12 @@ class FuturesTrader:
 
         if ref_price <= 0:
             logger.error("[%s] open_order: precio inválido (%s) — abortando.", self.symbol, ref_price)
+            return
+
+        # ── CHECK DE DESFASE: cancelar si precio actual se alejó demasiado ───
+        stale_reason = _check_price_staleness(signal, ref_price, is_long)
+        if stale_reason:
+            logger.warning("[%s] open_order: ENTRADA CANCELADA — %s", self.symbol, stale_reason)
             return
 
         qty = notional / ref_price
@@ -438,16 +473,16 @@ class FuturesTrader:
 
         logger.info(
             "[%s] open_order: %s | qty=%.6f | ref_price=%.4f | notional=%.2f USDC | lev=%dx | "
-            "entry_signal=%.4f | sl_signal=%.4f | tp1_signal=%.4f",
+            "entry_signal=%.4f | sl_signal=%.4f | tp1_signal=%.4f | drift=%.2f%%",
             self.symbol, "LONG" if is_long else "SHORT",
             qty, ref_price, notional, self.leverage,
             float(signal.get("entry") or 0),
             float(signal.get("sl") or 0),
             float(signal.get("tp1") or 0),
+            (ref_price - float(signal.get("entry") or ref_price)) / float(signal.get("entry") or ref_price) * 100,
         )
 
         if self.dry_run:
-            # En dry_run no hay fill real; usamos ref_price como filled_price
             sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, ref_price, ref_price)
             tp3_px = float(signal.get("tp3") or 0)
 
@@ -477,14 +512,13 @@ class FuturesTrader:
             logger.error("[%s] open_order: error al enviar orden de mercado: %s", self.symbol, e)
             return
 
-        # Verificar éxito básico del resultado
         status = (result or {}).get("status", "")
         if status not in ("ok", ""):
             logger.error("[%s] open_order: orden rechazada por exchange: %s", self.symbol, result)
             return
 
         # ── Esperar fill y obtener precio real de entrada ──────────────
-        filled_price = ref_price  # fallback
+        filled_price = ref_price
         for attempt in range(_FILL_RETRIES):
             await asyncio.sleep(_FILL_DELAY)
             try:
@@ -503,12 +537,9 @@ class FuturesTrader:
                            self.symbol, _FILL_RETRIES, ref_price)
 
         # ── Re-escalar SL/TP al precio real de fill ────────────────────
-        # FIX: el signal calcula SL/TP sobre el close de la vela (entry_signal).
-        # Si filled_price difiere, los offsets porcentuales se preservan aquí.
         sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, filled_price, ref_price)
         tp3_px = float(signal.get("tp3") or 0)
         if tp3_px > 0:
-            # Re-escalar tp3 con el mismo mecanismo
             _, _, _tp3_tmp = _adjust_levels_to_fill(
                 {**signal, "tp2": signal.get("tp3")}, filled_price, ref_price
             )
@@ -531,7 +562,7 @@ class FuturesTrader:
         if sl_px and sl_px > 0:
             try:
                 sl_result = self._hl_client.place_sl(
-                    is_buy=not is_buy,   # opuesto: cierra la posición
+                    is_buy=not is_buy,
                     sz=qty,
                     trigger_px=sl_px,
                     entry_px=filled_price,
@@ -554,7 +585,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: error colocando TP1: %s", self.symbol, e)
 
-        # ── Persistir estado (incluye qty para que el próximo restart la restaure) ─
+        # ── Persistir estado ────────────────────────────────────────
         try:
             save_position(self.symbol, {
                 "side":        self.position,
@@ -566,7 +597,7 @@ class FuturesTrader:
                 "tp2_hit":     self.tp2_hit,
                 "usdc_amount": usdc_per_trade,
                 "leverage":    self.leverage,
-                "qty":         self._open_qty,   # persiste qty en disco
+                "qty":         self._open_qty,
             })
         except Exception as e:
             logger.warning("[%s] open_order: no se pudo persistir estado: %s", self.symbol, e)
