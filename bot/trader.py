@@ -54,7 +54,7 @@ FIX DecisionEngine/pretrade_risk interface (2026-06-02):
 
 FIX _get_signal → strategy.decide() (2026-06-02):
   _get_signal llamaba ai_decide() directamente, devolviendo solo
-  {"action","confidence","reasoning"} sin sl/tp1/tp2.
+  {\"action\",\"confidence\",\"reasoning\"} sin sl/tp1/tp2.
   _execute_signal recíbia sl=None, tp1=None → nunca colocaba SL/TP
   → _protection_ok=False → KillSwitch disparaba KS L3 en 30s.
   Además todo el pipeline técnico (signal_engine, enriched_filter,
@@ -65,7 +65,7 @@ FIX _get_signal → strategy.decide() (2026-06-02):
 FIX _execute_signal risk.usdc_per_trade (2026-06-02):
   _execute_signal usaba `risk.usdc_per_trade` como fallback de margin, pero
   `risk` es RiskManager (no tiene ese atributo) → AttributeError silencioso.
-  Fix: usar float(os.getenv("USDC_PER_TRADE", "20")) como fallback.
+  Fix: usar float(os.getenv(\"USDC_PER_TRADE\", \"20\")) como fallback.
 
 FIX MANUAL_CLOSE cooldown (2026-06-02):
   Al detectar CLOSED_EXTERNALLY (posición en estado local pero ausente en
@@ -81,6 +81,19 @@ FIX cooldown general en _try_open_position (2026-06-02):
   CPU y arriesgando una entrada prematura si la señal era fuerte.
   Fix: añadir check de signal_cooldown.is_in_cooldown() al inicio de
   _try_open_position, antes de evaluar cualquier señal.
+
+FIX entry price real post-fill (2026-06-02) — BUG #1:
+  En _execute_signal, self.entry_price se asignaba con `price` (precio del
+  momento de la señal/iteración), NO con el precio real de fill del exchange.
+  Con market orders y latencia en Railway, el fill puede ocurrir a un precio
+  diferente, lo que causaba que los SL/TP se calculasen y colocasen sobre un
+  precio incorrecto. Si el mercado se mueve entre señal y fill (e.g. 0.5%),
+  el SL puede quedar demasiado cerca o demasiado lejos del precio real.
+  Fix: tras _confirm_position_with_retry(), leer entryPx del campo 'entryPx'
+  de la primera posición en clearinghouseState. Si no está disponible,
+  fallback al precio de señal con WARNING en log. El entryPx real se usa
+  tanto para self.entry_price como para entry_px en _place_tpsl() y se
+  persiste en save_position() para que restart recupere el precio correcto.
 """
 from __future__ import annotations
 
@@ -595,7 +608,7 @@ class FuturesTrader:
     async def get_balance(self) -> float | None:
         return await balance_svc.get()
 
-    # ── Leverage ───────────────────────────────────────────────────────────────────────────────
+    # ── Leverage ───────────────────────────────────────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int) -> None:
         if self.dry_run:
@@ -1034,42 +1047,51 @@ class FuturesTrader:
                     loop = asyncio.get_event_loop()
                     raw_orders = await loop.run_in_executor(None, self._hl_client.get_open_orders)
                     coin_orders = [o for o in (raw_orders or []) if o.get("coin") == self.coin]
+                    # FIX #5: filtrar SOLO la orden SL por tpsl=="sl"; si no se identifica,
+                    # abortar en lugar de usar fallback destructivo que cancela también el TP.
                     sl_orders = [
                         o for o in coin_orders
                         if _is_reduce_only_order(o) and (
                             isinstance(o.get("orderType"), dict) and
                             o["orderType"].get("trigger", {}).get("tpsl") == "sl"
                         )
-                    ] or [o for o in coin_orders if _is_reduce_only_order(o)]
+                    ]
+                    if not sl_orders:
+                        logger.warning(
+                            "[%s] Trailing SL: no se puede identificar la orden SL específica "
+                            "(no hay órdenes con tpsl=='sl') — abortando actualización para "
+                            "no cancelar el TP activo.",
+                            self.symbol,
+                        )
+                    else:
+                        for o in sl_orders:
+                            oid = o.get("oid") or o.get("id") or o.get("orderId")
+                            if oid:
+                                try:
+                                    await loop.run_in_executor(
+                                        None,
+                                        lambda _oid=oid: _hl_cancel_order(
+                                            self._hl_client._exchange, self.coin, _oid
+                                        ),
+                                    )
+                                except Exception as ce:
+                                    logger.warning("[%s] Error cancelando SL oid=%s: %s", self.symbol, oid, ce)
 
-                    for o in sl_orders:
-                        oid = o.get("oid") or o.get("id") or o.get("orderId")
-                        if oid:
-                            try:
-                                await loop.run_in_executor(
-                                    None,
-                                    lambda _oid=oid: _hl_cancel_order(
-                                        self._hl_client._exchange, self.coin, _oid
-                                    ),
-                                )
-                            except Exception as ce:
-                                logger.warning("[%s] Error cancelando SL oid=%s: %s", self.symbol, oid, ce)
-
-                    await asyncio.sleep(0.3)
-                    await self._place_tpsl(qty=self._open_qty, sl=new_sl, tp=None)
-                    self.sl = new_sl
-                    self._trail_peak = new_peak
-                    save_position(self.symbol, {
-                        "side":  self.position, "entry": self.entry_price,
-                        "sl":    self.sl,       "tp1":   self.tp1,
-                        "tp2":   self.tp2,      "tp3":   self.tp3,
-                        "tp1_hit": self._tp1_hit, "tp2_hit": self.tp2_hit,
-                        "usdc_amount": self._open_notional, "leverage": self._open_leverage,
-                        "margin_usdc": self._open_margin,   "qty":      self._open_qty,
-                        "entry_mode": self._open_entry_mode,
-                        "trailing_sl_activated": self._trailing_sl_activated,
-                        "trail_peak": self._trail_peak,
-                    })
+                        await asyncio.sleep(0.3)
+                        await self._place_tpsl(qty=self._open_qty, sl=new_sl, tp=None)
+                        self.sl = new_sl
+                        self._trail_peak = new_peak
+                        save_position(self.symbol, {
+                            "side":  self.position, "entry": self.entry_price,
+                            "sl":    self.sl,       "tp1":   self.tp1,
+                            "tp2":   self.tp2,      "tp3":   self.tp3,
+                            "tp1_hit": self._tp1_hit, "tp2_hit": self.tp2_hit,
+                            "usdc_amount": self._open_notional, "leverage": self._open_leverage,
+                            "margin_usdc": self._open_margin,   "qty":      self._open_qty,
+                            "entry_mode": self._open_entry_mode,
+                            "trailing_sl_activated": self._trailing_sl_activated,
+                            "trail_peak": self._trail_peak,
+                        })
                 except Exception as e:
                     logger.error("[%s] Error actualizando trailing SL: %s", self.symbol, e)
 
@@ -1146,7 +1168,7 @@ class FuturesTrader:
 
         FIX 2026-06-02:
           Antes se llamaba ai_decide() directamente, que solo devuelve
-          {"action","confidence","reasoning"} sin sl/tp1/tp2.
+          {\"action\",\"confidence\",\"reasoning\"} sin sl/tp1/tp2.
           _execute_signal recíbia sl=None, tp1=None → nunca colocaba SL/TP
           → _protection_ok=False → KillSwitch disparaba KS L3 en 30s.
           Además todo el pipeline técnico (signal_engine, enriched_filter,
@@ -1213,7 +1235,16 @@ class FuturesTrader:
             return None
 
     async def _execute_signal(self, enriched: dict, price: float, risk) -> None:
-        """Abre posición basada en señal enriquecida por DecisionEngine."""
+        """
+        Abre posición basada en señal enriquecida por DecisionEngine.
+
+        FIX #1 (2026-06-02) — entry price real post-fill:
+          self.entry_price se asignaba con `price` (precio del momento de la
+          señal/iteración), NO con el precio real de fill del exchange.
+          Fix: tras _confirm_position_with_retry(), leer entryPx del campo
+          'entryPx' de la primera posición en clearinghouseState. Si no está
+          disponible, fallback al precio de señal con WARNING en log.
+        """
         side = enriched.get("side")
         margin = enriched.get("_margin", _USDC_PER_TRADE)
         leverage = enriched.get("_leverage", self.leverage)
@@ -1249,8 +1280,40 @@ class FuturesTrader:
                 logger.warning("[%s] Posición no confirmada tras fill.", self.symbol)
                 return
 
+            # FIX #1: leer precio de entry real del exchange (entryPx del fill),
+            # en lugar de usar el precio de la señal que puede diferir del fill
+            # real por latencia o movimiento de mercado entre señal y ejecución.
+            real_entry_price = price  # fallback al precio de señal
+            try:
+                exchange_entry_px = float(positions[0].get("entryPx") or 0)
+                if exchange_entry_px > 0:
+                    if abs(exchange_entry_px - price) / price > 0.002:
+                        logger.warning(
+                            "[%s] Slippage post-fill: señal=%.5f fill=%.5f (%.3f%%) — "
+                            "usando entryPx real del exchange para SL/TP",
+                            self.symbol, price, exchange_entry_px,
+                            abs(exchange_entry_px - price) / price * 100,
+                        )
+                    else:
+                        logger.info(
+                            "[%s] entryPx real: %.5f (señal: %.5f)",
+                            self.symbol, exchange_entry_px, price,
+                        )
+                    real_entry_price = exchange_entry_px
+                else:
+                    logger.warning(
+                        "[%s] entryPx no disponible en posición del exchange — "
+                        "usando precio de señal %.5f como fallback",
+                        self.symbol, price,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[%s] No se pudo leer entryPx del exchange (%s) — fallback a precio señal %.5f",
+                    self.symbol, e, price,
+                )
+
             self.position       = side
-            self.entry_price    = price
+            self.entry_price    = real_entry_price  # FIX #1: precio real de fill
             self.sl             = sl
             self.tp1            = tp1
             self.tp2            = tp2
@@ -1263,13 +1326,15 @@ class FuturesTrader:
 
             if sl and tp1:
                 try:
-                    await self._place_tpsl(qty=qty, sl=sl, tp=tp1, entry_px=price)
+                    # FIX #1: pasar entry_px real al _place_tpsl para que los
+                    # ajustes de SL/TP se calculen sobre el precio de fill real
+                    await self._place_tpsl(qty=qty, sl=sl, tp=tp1, entry_px=real_entry_price)
                     self._protection_ok = True
                 except Exception as e:
                     logger.error("[%s] Error colocando SL/TP: %s", self.symbol, e)
 
             save_position(self.symbol, {
-                "side": side, "entry": price,
+                "side": side, "entry": real_entry_price,  # FIX #1: guardar precio real
                 "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": None,
                 "tp1_hit": False, "tp2_hit": False,
                 "usdc_amount": notional, "leverage": leverage,
@@ -1284,7 +1349,7 @@ class FuturesTrader:
                 logger.warning("[%s] DecisionEngine.on_order_confirmed error: %s", self.symbol, e)
 
             try:
-                await notify_open(self.symbol, side, price, qty, sl=sl, tp=tp1)
+                await notify_open(self.symbol, side, real_entry_price, qty, sl=sl, tp=tp1)
             except Exception:
                 pass
 
