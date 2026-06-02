@@ -49,18 +49,18 @@ FIX DecisionEngine/pretrade_risk interface (2026-06-02):
      Fix: envuelto en try/except con log.warning.
   3. _last_tpsl_verify_at = 0.0 antes de _verify_protection_on_restore()
      era redundante y exponía race condition si _verify fallaba:
-     el watchdog veía 0.0 y disparaba inmediatamente.
+     el watchdog veía 0.0 y disparaba on_state_mismatch inmediatamente.
      Fix: eliminada la asignación explícita (ya vale 0.0 en __init__).
 
-FIX _get_signal ai_decide args (2026-06-02):
-  _get_signal llamaba ai_decide(self.symbol, ohlcv, price) pasando `price`
-  como tercer argumento posicional. La firma real es:
-    ai_decide(symbol, bars, position, entry_price, leverage, context_override)
-  Resultado: position=price (float truthy) → ai_decide entraba en el path
-  de posición abierta y devolvía {"action":"HOLD"} sin "side" → Gate 1 del
-  DecisionEngine rechazaba TODAS las señales → el bot nunca abría trades.
-  Fix: pasar position=None, entry_price=0.0, leverage=self.leverage cuando
-  no hay posición abierta (path de búsqueda de nuevas entradas).
+FIX _get_signal → strategy.decide() (2026-06-02):
+  _get_signal llamaba ai_decide() directamente, devolviendo solo
+  {"action","confidence","reasoning"} sin sl/tp1/tp2.
+  _execute_signal recibía sl=None, tp1=None → nunca colocaba SL/TP
+  → _protection_ok=False → KillSwitch disparaba KS L3 en 30s.
+  Además todo el pipeline técnico (signal_engine, enriched_filter,
+  F&G, funding, OI) era ignorado completamente.
+  Fix: _get_signal ahora llama strategy.decide() con la firma correcta
+  y extrae sl/tp1/tp2/entry_mode/rr del SignalResult devuelto.
 
 FIX _execute_signal risk.usdc_per_trade (2026-06-02):
   _execute_signal usaba `risk.usdc_per_trade` como fallback de margin, pero
@@ -1123,38 +1123,72 @@ class FuturesTrader:
 
     async def _get_signal(self, price: float) -> dict | None:
         """
-        Obtiene señal de la estrategia para este símbolo.
+        Obtiene señal completa (con sl/tp1/tp2) usando strategy.decide().
 
-        FIX: ai_decide(symbol, bars, position, entry_price, leverage, context_override)
-        Antes se llamaba como ai_decide(self.symbol, ohlcv, price), lo que
-        hacía que `price` fuera interpretado como `position` (float truthy) y
-        ai_decide entraba en el path de gestión de posición abierta, devolviendo
-        HOLD sin "side" → DecisionEngine rechazaba todas las señales en Gate 1.
-        Fix: pasar los argumentos correctos con position=None cuando no hay
-        posición abierta (path de búsqueda de nuevas entradas).
+        FIX 2026-06-02:
+          Antes se llamaba ai_decide() directamente, que solo devuelve
+          {"action","confidence","reasoning"} sin sl/tp1/tp2.
+          _execute_signal recibía sl=None, tp1=None → nunca colocaba SL/TP
+          → _protection_ok=False → KillSwitch disparaba KS L3 en 30s.
+          Además todo el pipeline técnico (signal_engine, enriched_filter,
+          F&G, funding, OI) era ignorado completamente.
+
+          Fix: llamar strategy.decide() con la firma correcta:
+            decide(exch, symbol, ai_decide_fn, has_open_position, ohlcv_fn)
+          y extraer sl/tp1/tp2/entry_mode/rr del SignalResult devuelto.
         """
         try:
             ohlcv = await self.get_ohlcv()
             if not ohlcv or len(ohlcv) < OHLCV_MIN_BARS:
                 return None
-            # FIX: pasar position=None, entry_price=0.0, leverage correctos
-            result = await ai_decide(
+
+            exch = await self._get_ccxt()
+
+            result = await decide(
+                exch,
                 self.symbol,
-                ohlcv,
-                None,           # position — no hay posición abierta
-                0.0,            # entry_price — no aplica sin posición
-                self.leverage,  # leverage — necesario para sizing interno
+                ai_decide,               # ai_decide_fn — usado solo si hay noticias relevantes
+                has_open_position=False,
+                current_pnl=None,
+                ohlcv_fn=self.get_ohlcv,
             )
-            # ai_decide devuelve {"action": ..., "confidence": ..., "reasoning": ...}
-            # DecisionEngine.evaluate() espera {"side": "long"|"short", ...}
-            # Mapear action → side
-            action = result.get("action", "HOLD") if result else "HOLD"
-            if action == "BUY":
-                return {**result, "side": "long"}
-            if action == "SELL":
-                return {**result, "side": "short"}
-            # HOLD / CLOSE / cualquier otro → sin señal accionable
-            return None
+
+            action = result.get("action", "HOLD")
+            if action not in ("BUY", "SELL"):
+                logger.debug(
+                    "[%s] strategy.decide → %s | %s",
+                    self.symbol, action, result.get("reason", ""),
+                )
+                return None
+
+            sig = result.get("signal")   # SignalResult con .sl, .tp1, .tp2, etc.
+            if sig is None:
+                logger.warning("[%s] strategy.decide devolvió action=%s pero signal=None", self.symbol, action)
+                return None
+
+            side = "long" if action == "BUY" else "short"
+
+            logger.info(
+                "[%s] ✅ Señal: %s | sl=%.5f tp1=%.5f tp2=%s | score=%s | %s",
+                self.symbol, side,
+                sig.sl or 0, sig.tp1 or 0,
+                f"{sig.tp2:.5f}" if sig.tp2 else "N/A",
+                getattr(sig, "score", "?"),
+                result.get("reason", ""),
+            )
+
+            return {
+                "side":       side,
+                "sl":         sig.sl,
+                "tp1":        sig.tp1,
+                "tp2":        sig.tp2,
+                "entry_mode": getattr(sig, "entry_mode", "NORMAL"),
+                "rr":         getattr(sig, "rr", 2.0),
+                "_leverage":  getattr(sig, "suggested_lev", self.leverage),
+                "confidence": result.get("ai_confidence", getattr(sig, "score", 5)),
+                "reasoning":  result.get("reason", ""),
+            }
+
         except Exception as e:
             logger.debug("[%s] _get_signal error: %s", self.symbol, e)
             return None
