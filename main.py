@@ -15,7 +15,7 @@ from bot.telegram_bot import notify_startup, notify_scanner_update, setup_telegr
 from bot.ws_feed import ws_feed
 from bot.balance_service import balance_svc
 from bot.kill_switch import kill_switch
-from bot.state import bot_state
+from bot.state import bot_state, clear_position
 from ai_rate_limiter import start_traders_staggered, telegram_ai_status
 from webhook import start_webhook_server, register_traders
 
@@ -43,6 +43,9 @@ _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
 
 # ── USDC por operación — fuente ÚNICA: variable de entorno USDC_PER_TRADE ──
 _USDC_PER_TRADE = float(os.getenv("USDC_PER_TRADE", "20"))
+
+_USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
+_API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
 
 def _resolve_hl_address() -> str:
@@ -184,6 +187,74 @@ async def _stop_pair_with_cleanup(symbol: str) -> None:
         logger.info("⏹ Trader detenido: %s", symbol)
 
 
+async def _purge_stale_state(hl_addr: str) -> set:
+    """
+    STALE STATE FIX: verifica qué símbolos del state local realmente
+    tienen posición abierta en el exchange. Los que NO existen en el
+    exchange se borran del state para no ocupar slots de MAX_ACTIVE_TRADERS.
+
+    Retorna el conjunto de símbolos con posición REAL en el exchange.
+    """
+    import aiohttp
+    import json as _json
+
+    saved_symbols = set(bot_state._positions.keys())
+    if not saved_symbols:
+        return set()
+
+    if not hl_addr:
+        logger.warning("⚠️  No hay dirección HL — no se puede verificar state contra exchange.")
+        return saved_symbols
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{_API_URL}/info",
+                json={"type": "clearinghouseState", "user": hl_addr},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = _json.loads(await resp.text())
+    except Exception as e:
+        logger.warning("⚠️  No se pudo consultar exchange para purge stale state: %s — conservando state.", e)
+        return saved_symbols
+
+    # Coins con posición real (szi != 0) en el exchange
+    real_positions: set = set()
+    for p in data.get("assetPositions", []):
+        pos = p.get("position", {})
+        try:
+            szi = float(pos.get("szi", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(szi) > 0:
+            real_positions.add(pos.get("coin", "").upper())
+
+    # Limpiar del state local los símbolos que ya NO existen en el exchange
+    stale = saved_symbols - real_positions
+    if stale:
+        for sym in stale:
+            clear_position(sym)
+            logger.warning(
+                "🧹 STALE STATE: '%s' estaba en state local pero NO en exchange — eliminado.",
+                sym,
+            )
+        logger.info(
+            "🧹 State purgado: %d fantasmas eliminados (%s). "
+            "Posiciones reales en exchange: %s",
+            len(stale),
+            ", ".join(stale),
+            ", ".join(real_positions) if real_positions else "ninguna",
+        )
+    else:
+        logger.info(
+            "✅ State OK: todas las posiciones guardadas existen en el exchange (%s).",
+            ", ".join(saved_symbols),
+        )
+
+    return real_positions
+
+
 async def on_pairs_updated(new_pairs: list, added: set = None, removed: set = None):
     """
     BUG #4 FIX: callback con firma nueva (new_pairs, added, removed).
@@ -273,6 +344,12 @@ async def main():
         hl_addr[:12] + "..." if hl_addr else "N/A",
     )
 
+    # ── STALE STATE FIX: purgar posiciones fantasma ANTES de todo lo demás ──
+    # Elimina del state local cualquier símbolo que ya NO tenga posición
+    # real en el exchange. Así no ocupan slots de MAX_ACTIVE_TRADERS.
+    logger.info("🔍 Verificando state local contra exchange...")
+    real_open_symbols = await _purge_stale_state(hl_addr)
+
     global_risk = GlobalRisk(
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", str(MAX_ACTIVE_TRADERS))),
         max_global_daily_loss_pct=float(os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")),
@@ -323,19 +400,17 @@ async def main():
 
     logger.info("✅ Pares finales (%d): %s", len(final_pairs), ", ".join(final_pairs))
 
-    # ── OPEN_POSITION FIX: garantizar traders para posiciones abiertas ──────
-    # Si hay posiciones guardadas en state para pares que NO están en
-    # final_pairs (ej: HYPE), los añadimos al frente de la lista para
-    # asegurar que siempre tienen un trader activo al arrancar.
-    open_symbols = set(bot_state._positions.keys())
+    # ── OPEN_POSITION FIX: garantizar traders para posiciones REALES ────────
+    # Usamos real_open_symbols (verificado contra exchange), NO bot_state._positions
+    # para evitar que posiciones cerradas/fantasma bloqueen el límite de traders.
+    open_symbols = real_open_symbols  # solo los que existen DE VERDAD en el exchange
     missing_from_scan = open_symbols - set(final_pairs)
     if missing_from_scan:
         logger.warning(
-            "⚠️  Pares con posición abierta NO están en el scanner — "
+            "⚠️  Pares con posición REAL NO están en el scanner — "
             "forzando arranque: %s",
             ", ".join(missing_from_scan),
         )
-        # Insertar al frente para que tengan prioridad sobre el límite MAX_ACTIVE_TRADERS
         final_pairs = list(missing_from_scan) + final_pairs
 
     ws_feed.start(final_pairs)
@@ -343,8 +418,8 @@ async def main():
 
     await asyncio.sleep(3)
 
-    # Los pares con posición abierta siempre arrancan, luego los del scanner
-    # hasta completar MAX_ACTIVE_TRADERS
+    # Los pares con posición real siempre arrancan primero,
+    # luego los del scanner hasta completar MAX_ACTIVE_TRADERS
     guaranteed = [p for p in final_pairs if p in open_symbols]
     scanner_fill = [
         p for p in final_pairs
