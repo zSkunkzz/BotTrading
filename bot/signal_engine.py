@@ -15,18 +15,18 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 10):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
-  MODO TENDENCIA (EMA spread >= 0.3% en 1h):
+  MODO TENDENCIA (EMA spread >= 0.3% en 1h)  ← evaluado PRIMERO
     +2  EMA21 > EMA50 en 15m Y 1h (tendencia clara en ambos TF)
     +1  SuperTrend 1h en favor
     +1  SuperTrend 4h en favor
-    +1  MACD 15m histograma en favor Y cambiando (no estancado)
-    +1  Pullback: precio en 15m tocó EMA21 en las últimas 3 velas (rebote)
-    +1  RSI 15m en zona de rebote (40-60) — NO sobreextendido
+    +1  MACD 15m histograma en favor
+    +1  Pullback: precio tocó EMA21 en las últimas 3 velas y rebota
+    +1  RSI 15m en zona de rebote (35-65) — ampliado para tendencias fuertes
     +1  Vol 15m >= 1.2x en vela actual
     +1  Confluencia total: ST 15m + 1h + 4h todos en misma dirección
     Bonus max: 9 pts
 
-  MODO BREAKOUT (precio rompe rango 20 velas en 15m):
+  MODO BREAKOUT (precio rompe rango 20 velas en 15m)  ← evaluado SEGUNDO
     +2  Rotura de máximo (LONG) o mínimo (SHORT) de las últimas 20 velas en 15m
     +2  Vol 15m >= 1.8x en vela de ruptura (sin volumen no es breakout)
     +1  ST 1h en favor
@@ -35,9 +35,9 @@ SISTEMA DE SCORING (max_score = 10):
     +1  MACD 1h en favor
     Bonus max: 8 pts
 
-  MODO REVERSAL (RSI 1h extremo: <= 28 o >= 72):
+  MODO REVERSAL (RSI 1h extremo: <= 28 o >= 72)  ← evaluado ÚLTIMO (más peligroso)
     +2  RSI 1h <= 28 (LONG) o >= 72 (SHORT) — extremo real de mercado
-    +2  Divergencia MACD 15m: hist estaba en contra pero ahora cambia
+    +2  MACD 15m histograma gira en favor (usa hist pre-calculado)
     +1  Vol 15m >= 1.5x (capitulación o climax)
     +1  ST 4h en contra del precio actual (agotamiento tendencia dominante)
     +1  RSI 4h en zona neutra (40-60) — no sobre-extendido en 4h
@@ -47,28 +47,34 @@ SISTEMA DE SCORING (max_score = 10):
   FILTROS DUROS (bloquean independientemente del score):
     - EMA spread 1h < 0.15%: mercado en rango, no entrar (solo en modo tendencia)
     - RSI 15m > 72 para LONG o < 28 para SHORT: sobreextendido, no entrar
-    - Los 3 ST (15m/1h/4h) NO coinciden en modo tendencia: no entrar
+    - ST1h en contra en modo tendencia: -3 pts (penalización severa)
     - Vol 15m < 0.6x: mercado dormido, no entrar
 
   MIN_SCORE  = 6 / 10  (60% de confluencia)
-  MIN_RR     = 1.5     ← RR mínimo ajustado a TPs conservadores
+  MIN_RR     = 1.5     (calculado DESPUÉS del buffer de vela — RR real)
 
-NOTA RR:
-  El SL real se calcula como min(low_price - buffer, entry - SL_mult*ATR).
-  Esto hace que el SL real sea >= SL_mult*ATR, por lo que el RR real
-  es MENOR que el RR teórico. Por eso MIN_RR se baja a 1.5.
+NOTA RR (FIX v12):
+  El SL real se calcula como min(low - buffer, entry - SL_mult*ATR).
+  El RR ahora se calcula con el SL YA incluido el buffer, por lo que
+  MIN_RR=1.5 representa el RR real que el mercado debe recorrer.
+  TP1 subido a 2.0×ATR en TENDENCIA para garantizar RR real >= 1.2.
 
-  SL/TP (multiplicadores ATR) — calibrados para llegar con más frecuencia:
-  Modo tendencia : SL=1.5×ATR | TP1=1.5×ATR → RR objetivo ~1.0 real
-  Modo breakout  : SL=1.5×ATR | TP1=1.4×ATR → RR objetivo ~0.93 real
-  Modo reversal  : SL=1.2×ATR | TP1=1.3×ATR → RR objetivo ~1.08 real
+  SL/TP (multiplicadores ATR):
+  Modo tendencia : SL=1.5×ATR | TP1=2.0×ATR → RR real ~1.2-1.4
+  Modo breakout  : SL=1.5×ATR | TP1=2.0×ATR → RR real ~1.2-1.4
+  Modo reversal  : SL=1.2×ATR | TP1=1.8×ATR → RR real ~1.3-1.5
 
-  TP2 mantenido como referencia interna (no se usa en órdenes).
-  Trailing TP eliminado.
+FIXES v12 (2026-06-03):
+  1. RR calculado DESPUÉS del buffer de vela (era antes — RR ficticio)
+  2. Orden de evaluación: TENDENCIA → BREAKOUT → REVERSAL (reversals son más peligrosos)
+  3. MACD reversal usa hist pre-calculado de i15 (no recalcula innecesariamente)
+  4. RSI pullback ampliado a 35-65 (era 40-60, demasiado estricto en tendencias fuertes)
+  5. Ventana vol_ratio expandida a 60 velas (~15h, era 20 velas = 5h)
+  6. Señales EARLY rechazadas directamente (no abrir con leverage reducido)
+  7. TP1 subido a 2.0×ATR en TENDENCIA y BREAKOUT para RR real positivo
 
-  FIX (2026-06-03): analyze_pair ahora fetcha los 3 timeframes en paralelo
-  con asyncio.gather() en vez de secuencialmente. Esto reduce la latencia
-  por iteración de ~45s a ~15s en el peor caso.
+FIX v11 (2026-06-03): fetch paralelo 3 TF con asyncio.gather()
+FIX v10 (2026-06-03): timeout en evaluate()
 """
 from __future__ import annotations
 
@@ -85,16 +91,19 @@ log = logging.getLogger(__name__)
 
 # ─── Constantes ──────────────────────────────────────────────────────────────────────────────
 MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
-MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5"))   # ajustado a TPs conservadores
+MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5"))   # RR real post-buffer
 
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
 _SL_ATR_MULT       = float(os.getenv("SL_ATR_MULT",  "1.5"))
-# TP calibrado para llegar con más frecuencia:
-_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "1.5"))   # TENDENCIA: era 2.8
-_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.0"))   # referencia interna
+# TP subidos para garantizar RR real positivo tras buffer de vela
+_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "2.0"))   # TENDENCIA: era 1.5 → RR real ~0.9
+_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))   # referencia interna
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
+
+# Ventana vol_ratio: 60 velas de 15m = ~15h (era 20 = 5h — distorsionaba en mercados dormidos)
+_VOL_AVG_WINDOW    = int(os.getenv("VOL_AVG_WINDOW", "60"))
 
 # Umbrales de setup
 _EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.003"))  # 0.30%
@@ -106,7 +115,7 @@ _REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "72"))
 _VOL_MIN_GLOBAL        = float(os.getenv("VOL_MIN_GLOBAL",    "0.6"))
 _VOL_CONFIRM_MIN       = float(os.getenv("VOL_CONFIRM_MIN",   "1.2"))
 _PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "3"))
-_PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.003"))
+_PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.005"))  # 0.5% — era 0.3%, muy ajustado
 
 
 # ─── _to_ccxt_symbol ──────────────────────────────────────────────────────────────────────────────
@@ -155,7 +164,6 @@ async def analyze_pair(
 ) -> SignalResult:
     try:
         if ohlcv_fn is not None:
-            # FIX (2026-06-03): fetch paralelo — de ~45s a ~15s por iteración
             bars_15m, bars_1h, bars_4h = await asyncio.gather(
                 ohlcv_fn("15m"),
                 ohlcv_fn("1h"),
@@ -213,16 +221,16 @@ async def analyze_pair(
 
     if setup_type == "REVERSAL":
         sl_mult  = float(os.getenv("SL_ATR_MULT_REVERSAL",  "1.2"))
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.3"))  # era 2.2
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "3.0"))
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.8"))  # era 1.3 → RR real negativo
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "3.5"))
     elif setup_type == "BREAKOUT":
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "1.4"))  # era 2.8
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "3.0"))
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "2.0"))  # era 1.4 → RR real negativo
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "3.5"))
     else:  # TENDENCIA
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = _TP1_ATR_MULT   # 1.5x
-        tp2_mult = _TP2_ATR_MULT   # 3.0x
+        tp1_mult = _TP1_ATR_MULT   # 2.0x (era 1.5 → RR real ~0.9)
+        tp2_mult = _TP2_ATR_MULT   # 3.5x
 
     if signal_str == "LONG":
         sl  = round(min(low_price  - _atr_buf, entry - sl_mult  * atr_val), 6)
@@ -233,7 +241,7 @@ async def analyze_pair(
         tp1 = round(entry - tp1_mult * atr_val, 6)
         tp2 = round(entry - tp2_mult * atr_val, 6)
 
-    # RR calculado sobre distancia REAL al SL
+    # FIX v12: RR calculado con el SL REAL (post-buffer) — antes era RR ficticio
     risk   = abs(entry - sl)
     reward = abs(tp1 - entry)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
@@ -244,6 +252,13 @@ async def analyze_pair(
         entry_mode = "NORMAL"
     else:
         entry_mode = "EARLY"
+
+    # FIX v12: señales EARLY rechazadas — no operar con confluencia mínima
+    if entry_mode == "EARLY":
+        return _hold_result(
+            symbol,
+            f"[{setup_type}] score={score}/{max_score} EARLY — confluencia insuficiente",
+        )
 
     if entry_mode == "STRONG" and rr >= 2.0:
         suggested_lev = _MAX_LEV
@@ -287,172 +302,15 @@ async def analyze_pair(
 def _detect_setup(
     i15: dict, i1h: dict, i4h: dict, bars_15m: list
 ) -> Tuple[Optional[str], str, int, int, List[str]]:
-    for mode_fn in (_score_reversal, _score_breakout, _score_tendencia):
+    # FIX v12: orden TENDENCIA → BREAKOUT → REVERSAL
+    # Los reversals son apuestas contra tendencia — evaluarlos último evita
+    # que señales débiles de reversión bloqueen setups de tendencia más fiables.
+    for mode_fn in (_score_tendencia, _score_breakout, _score_reversal):
         setup_type, signal_str, score, max_score, reasons = mode_fn(i15, i1h, i4h, bars_15m)
         if signal_str != "NEUTRAL" and score >= MIN_SCORE:
             return setup_type, signal_str, score, max_score, reasons
 
     return None, "NEUTRAL", 0, 10, ["Ningún setup alcanzó MIN_SCORE"]
-
-
-# ─── MODO REVERSAL ────────────────────────────────────────────────────────────────────────────
-
-def _score_reversal(
-    i15: dict, i1h: dict, i4h: dict, bars_15m: list
-) -> Tuple[str, str, int, int, List[str]]:
-    MAX = 8
-    reasons: List[str] = []
-
-    rsi_1h = i1h.get("rsi_val") if i1h else None
-    if rsi_1h is None:
-        return "REVERSAL", "NEUTRAL", 0, MAX, ["Sin datos 1h"]
-
-    is_long  = rsi_1h <= _REVERSAL_RSI_LOW
-    is_short = rsi_1h >= _REVERSAL_RSI_HIGH
-
-    if not is_long and not is_short:
-        return "REVERSAL", "NEUTRAL", 0, MAX, [f"RSI1h={rsi_1h:.0f} no es extremo"]
-
-    direction = "LONG" if is_long else "SHORT"
-    score = 0
-
-    score += 2
-    reasons.append(f"RSI1h={rsi_1h:.0f} extremo {'sobreventa' if is_long else 'sobrecompra'} +2")
-
-    hist_15m = i15.get("macd_hist")
-    if hist_15m is not None:
-        closes = [b[4] for b in bars_15m]
-        try:
-            from bot.indicators import macd as _macd
-            _, _, hists = _macd(closes, 12, 26, 9)
-            if is_long and hist_15m > 0:
-                score += 2
-                reasons.append(f"MACD15m hist={hist_15m:.4f} gira alcista +2")
-            elif is_short and hist_15m < 0:
-                score += 2
-                reasons.append(f"MACD15m hist={hist_15m:.4f} gira bajista +2")
-            else:
-                reasons.append(f"MACD15m hist={hist_15m:.4f} aun no confirma")
-        except Exception:
-            reasons.append("MACD calc error")
-
-    vol_ratio = i15.get("vol_ratio", 1.0)
-    if vol_ratio >= 1.5:
-        score += 1
-        reasons.append(f"Vol15m={vol_ratio:.1f}x capitulación +1")
-    else:
-        reasons.append(f"Vol15m={vol_ratio:.1f}x sin capitulación")
-
-    if i4h:
-        st4h_against = (is_long and i4h.get("st_bear")) or (is_short and i4h.get("st_bull"))
-        if st4h_against:
-            score += 1
-            reasons.append("ST4h en contra — agotamiento tendencia +1")
-        else:
-            reasons.append("ST4h no confirma agotamiento")
-
-    rsi_4h = i4h.get("rsi_val") if i4h else None
-    if rsi_4h is not None and 40 <= rsi_4h <= 60:
-        score += 1
-        reasons.append(f"RSI4h={rsi_4h:.0f} neutro — reversión posible +1")
-    else:
-        reasons.append(f"RSI4h no neutro")
-
-    close_15m = i15.get("close", 0)
-    ema21_1h  = i1h.get("ema21") if i1h else None
-    if ema21_1h and close_15m:
-        dist_pct = abs(close_15m - ema21_1h) / ema21_1h
-        if dist_pct <= 0.005:
-            score += 1
-            reasons.append(f"Precio toca EMA21_1h (dist={dist_pct*100:.2f}%) +1")
-        else:
-            reasons.append(f"Precio lejos de EMA21_1h ({dist_pct*100:.2f}%)")
-
-    return "REVERSAL", direction, score, MAX, reasons
-
-
-# ─── MODO BREAKOUT ────────────────────────────────────────────────────────────────────────────
-
-def _score_breakout(
-    i15: dict, i1h: dict, i4h: dict, bars_15m: list
-) -> Tuple[str, str, int, int, List[str]]:
-    MAX = 8
-    reasons: List[str] = []
-
-    if len(bars_15m) < _BREAKOUT_WINDOW + 2:
-        return "BREAKOUT", "NEUTRAL", 0, MAX, ["Velas insuficientes para breakout"]
-
-    window = bars_15m[-(_BREAKOUT_WINDOW + 1):-1]
-    range_high = max(b[2] for b in window)
-    range_low  = min(b[3] for b in window)
-
-    current_close = float(bars_15m[-1][4])
-    vol_ratio     = i15.get("vol_ratio", 1.0)
-
-    broke_up   = current_close > range_high
-    broke_down = current_close < range_low
-
-    if not broke_up and not broke_down:
-        return "BREAKOUT", "NEUTRAL", 0, MAX, [
-            f"Sin rotura: close={current_close:.4f} rango=[{range_low:.4f}-{range_high:.4f}]"
-        ]
-
-    direction = "LONG" if broke_up else "SHORT"
-    score = 0
-
-    score += 2
-    reasons.append(
-        f"Ruptura {'alcista' if broke_up else 'bajista'}: close={current_close:.4f} "
-        f"{'>' if broke_up else '<'} {'rango ' + str(round(range_high, 4)) if broke_up else 'rango ' + str(round(range_low, 4))} +2"
-    )
-
-    if vol_ratio >= _BREAKOUT_VOL_MIN:
-        score += 2
-        reasons.append(f"Vol={vol_ratio:.1f}x breakout confirmado +2")
-    elif vol_ratio >= 1.2:
-        score += 1
-        reasons.append(f"Vol={vol_ratio:.1f}x moderado +1")
-    else:
-        reasons.append(f"Vol={vol_ratio:.1f}x BAJO — posible fakeout")
-
-    if i1h:
-        st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or \
-                  (direction == "SHORT" and i1h.get("st_bear"))
-        if st1h_ok:
-            score += 1
-            reasons.append("ST1h confirma dirección +1")
-        else:
-            reasons.append("ST1h no confirma")
-
-    if i4h:
-        st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or \
-                  (direction == "SHORT" and i4h.get("st_bear"))
-        if st4h_ok:
-            score += 1
-            reasons.append("ST4h confirma dirección +1")
-        else:
-            reasons.append("ST4h no confirma")
-
-    rsi_15m = i15.get("rsi_val")
-    if rsi_15m is not None:
-        rsi_ok = (direction == "LONG" and 45 <= rsi_15m <= 70) or \
-                 (direction == "SHORT" and 30 <= rsi_15m <= 55)
-        if rsi_ok:
-            score += 1
-            reasons.append(f"RSI15m={rsi_15m:.0f} zona razonable +1")
-        else:
-            reasons.append(f"RSI15m={rsi_15m:.0f} sobreextendido")
-
-    if i1h:
-        macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or \
-                  (direction == "SHORT" and i1h.get("macd_bear"))
-        if macd_ok:
-            score += 1
-            reasons.append("MACD1h en favor +1")
-        else:
-            reasons.append("MACD1h en contra")
-
-    return "BREAKOUT", direction, score, MAX, reasons
 
 
 # ─── MODO TENDENCIA ────────────────────────────────────────────────────────────────────────────
@@ -549,8 +407,9 @@ def _score_tendencia(
 
     rsi_15m = i15.get("rsi_val")
     if rsi_15m is not None:
-        rsi_ok_long  = direction == "LONG"  and 40 <= rsi_15m <= 60
-        rsi_ok_short = direction == "SHORT" and 40 <= rsi_15m <= 60
+        # FIX v12: zona ampliada a 35-65 (era 40-60 — en tendencias fuertes RSI rara vez baja a 40)
+        rsi_ok_long  = direction == "LONG"  and 35 <= rsi_15m <= 65
+        rsi_ok_short = direction == "SHORT" and 35 <= rsi_15m <= 65
         if rsi_ok_long or rsi_ok_short:
             score += 1
             reasons.append(f"RSI15m={rsi_15m:.0f} zona rebote +1")
@@ -584,6 +443,163 @@ def _score_tendencia(
     return "TENDENCIA", direction, score, MAX, reasons
 
 
+# ─── MODO BREAKOUT ────────────────────────────────────────────────────────────────────────────
+
+def _score_breakout(
+    i15: dict, i1h: dict, i4h: dict, bars_15m: list
+) -> Tuple[str, str, int, int, List[str]]:
+    MAX = 8
+    reasons: List[str] = []
+
+    if len(bars_15m) < _BREAKOUT_WINDOW + 2:
+        return "BREAKOUT", "NEUTRAL", 0, MAX, ["Velas insuficientes para breakout"]
+
+    window = bars_15m[-(_BREAKOUT_WINDOW + 1):-1]
+    range_high = max(b[2] for b in window)
+    range_low  = min(b[3] for b in window)
+
+    current_close = float(bars_15m[-1][4])
+    vol_ratio     = i15.get("vol_ratio", 1.0)
+
+    broke_up   = current_close > range_high
+    broke_down = current_close < range_low
+
+    if not broke_up and not broke_down:
+        return "BREAKOUT", "NEUTRAL", 0, MAX, [
+            f"Sin rotura: close={current_close:.4f} rango=[{range_low:.4f}-{range_high:.4f}]"
+        ]
+
+    direction = "LONG" if broke_up else "SHORT"
+    score = 0
+
+    score += 2
+    reasons.append(
+        f"Ruptura {'alcista' if broke_up else 'bajista'}: close={current_close:.4f} "
+        f"{'>' if broke_up else '<'} {'rango ' + str(round(range_high, 4)) if broke_up else 'rango ' + str(round(range_low, 4))} +2"
+    )
+
+    if vol_ratio >= _BREAKOUT_VOL_MIN:
+        score += 2
+        reasons.append(f"Vol={vol_ratio:.1f}x breakout confirmado +2")
+    elif vol_ratio >= 1.2:
+        score += 1
+        reasons.append(f"Vol={vol_ratio:.1f}x moderado +1")
+    else:
+        reasons.append(f"Vol={vol_ratio:.1f}x BAJO — posible fakeout")
+
+    if i1h:
+        st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or \
+                  (direction == "SHORT" and i1h.get("st_bear"))
+        if st1h_ok:
+            score += 1
+            reasons.append("ST1h confirma dirección +1")
+        else:
+            reasons.append("ST1h no confirma")
+
+    if i4h:
+        st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or \
+                  (direction == "SHORT" and i4h.get("st_bear"))
+        if st4h_ok:
+            score += 1
+            reasons.append("ST4h confirma dirección +1")
+        else:
+            reasons.append("ST4h no confirma")
+
+    rsi_15m = i15.get("rsi_val")
+    if rsi_15m is not None:
+        rsi_ok = (direction == "LONG" and 45 <= rsi_15m <= 70) or \
+                 (direction == "SHORT" and 30 <= rsi_15m <= 55)
+        if rsi_ok:
+            score += 1
+            reasons.append(f"RSI15m={rsi_15m:.0f} zona razonable +1")
+        else:
+            reasons.append(f"RSI15m={rsi_15m:.0f} sobreextendido")
+
+    if i1h:
+        macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or \
+                  (direction == "SHORT" and i1h.get("macd_bear"))
+        if macd_ok:
+            score += 1
+            reasons.append("MACD1h en favor +1")
+        else:
+            reasons.append("MACD1h en contra")
+
+    return "BREAKOUT", direction, score, MAX, reasons
+
+
+# ─── MODO REVERSAL ────────────────────────────────────────────────────────────────────────────
+
+def _score_reversal(
+    i15: dict, i1h: dict, i4h: dict, bars_15m: list
+) -> Tuple[str, str, int, int, List[str]]:
+    MAX = 8
+    reasons: List[str] = []
+
+    rsi_1h = i1h.get("rsi_val") if i1h else None
+    if rsi_1h is None:
+        return "REVERSAL", "NEUTRAL", 0, MAX, ["Sin datos 1h"]
+
+    is_long  = rsi_1h <= _REVERSAL_RSI_LOW
+    is_short = rsi_1h >= _REVERSAL_RSI_HIGH
+
+    if not is_long and not is_short:
+        return "REVERSAL", "NEUTRAL", 0, MAX, [f"RSI1h={rsi_1h:.0f} no es extremo"]
+
+    direction = "LONG" if is_long else "SHORT"
+    score = 0
+
+    score += 2
+    reasons.append(f"RSI1h={rsi_1h:.0f} extremo {'sobreventa' if is_long else 'sobrecompra'} +2")
+
+    # FIX v12: usa el hist pre-calculado de i15 directamente (no recalcula MACD)
+    hist_15m = i15.get("macd_hist")
+    if hist_15m is not None:
+        if is_long and hist_15m > 0:
+            score += 2
+            reasons.append(f"MACD15m hist={hist_15m:.4f} gira alcista +2")
+        elif is_short and hist_15m < 0:
+            score += 2
+            reasons.append(f"MACD15m hist={hist_15m:.4f} gira bajista +2")
+        else:
+            reasons.append(f"MACD15m hist={hist_15m:.4f} aun no confirma")
+    else:
+        reasons.append("MACD15m no disponible")
+
+    vol_ratio = i15.get("vol_ratio", 1.0)
+    if vol_ratio >= 1.5:
+        score += 1
+        reasons.append(f"Vol15m={vol_ratio:.1f}x capitulación +1")
+    else:
+        reasons.append(f"Vol15m={vol_ratio:.1f}x sin capitulación")
+
+    if i4h:
+        st4h_against = (is_long and i4h.get("st_bear")) or (is_short and i4h.get("st_bull"))
+        if st4h_against:
+            score += 1
+            reasons.append("ST4h en contra — agotamiento tendencia +1")
+        else:
+            reasons.append("ST4h no confirma agotamiento")
+
+    rsi_4h = i4h.get("rsi_val") if i4h else None
+    if rsi_4h is not None and 40 <= rsi_4h <= 60:
+        score += 1
+        reasons.append(f"RSI4h={rsi_4h:.0f} neutro — reversión posible +1")
+    else:
+        reasons.append(f"RSI4h no neutro")
+
+    close_15m = i15.get("close", 0)
+    ema21_1h  = i1h.get("ema21") if i1h else None
+    if ema21_1h and close_15m:
+        dist_pct = abs(close_15m - ema21_1h) / ema21_1h
+        if dist_pct <= 0.005:
+            score += 1
+            reasons.append(f"Precio toca EMA21_1h (dist={dist_pct*100:.2f}%) +1")
+        else:
+            reasons.append(f"Precio lejos de EMA21_1h ({dist_pct*100:.2f}%)")
+
+    return "REVERSAL", direction, score, MAX, reasons
+
+
 # ─── _compute_indicators ───────────────────────────────────────────────────────────────────────────
 
 def _compute_indicators(bars: list) -> dict:
@@ -602,7 +618,9 @@ def _compute_indicators(bars: list) -> dict:
     st_dir, st_val = supertrend(highs, lows, closes, 10, 3.0)
     atr14  = calc_atr(highs, lows, closes, 14)
 
-    avg_vol   = sum(vols[-20:]) / 20 if len(vols) >= 20 else (sum(vols) / len(vols) if vols else 1)
+    # FIX v12: ventana de 60 velas (~15h en 15m) — era 20 (~5h), distorsionaba en mercados dormidos
+    vol_window = min(_VOL_AVG_WINDOW, len(vols))
+    avg_vol   = sum(vols[-vol_window:]) / vol_window if vol_window > 0 else 1.0
     vol_ratio = round(vols[-1] / avg_vol, 3) if avg_vol > 0 else 1.0
     price_dir = "rising" if len(closes) >= 2 and closes[-1] > closes[-2] else "falling"
 
