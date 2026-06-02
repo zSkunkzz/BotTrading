@@ -94,6 +94,15 @@ FIX entry price real post-fill (2026-06-02) — BUG #1:
   fallback al precio de señal con WARNING en log. El entryPx real se usa
   tanto para self.entry_price como para entry_px en _place_tpsl() y se
   persiste en save_position() para que restart recupere el precio correcto.
+
+FIX Gate 3 market regime (2026-06-02) — BUG #4:
+  _get_signal devolvía el signal dict sin indicators._closes_1h, por lo que
+  decision_engine.evaluate() siempre recibía closes_1h=[] y saltaba el
+  Gate 3 (market regime) en silencio sin filtrar ninguna entrada en mercado
+  lateral o con tendencia desfavorable.
+  Fix: en _get_signal, obtener ohlcv 1h (con fallback seguro si falla o si
+  el timeframe principal ya es 1h) y añadir indicators._closes_1h al dict
+  retornado. El Gate 3 en decision_engine filtra si len(closes_1h) >= 30.
 """
 from __future__ import annotations
 
@@ -1177,6 +1186,16 @@ class FuturesTrader:
           Fix: llamar strategy.decide() con la firma correcta:
             decide(exch, symbol, ai_decide_fn, has_open_position, ohlcv_fn)
           y extraer sl/tp1/tp2/entry_mode/rr del SignalResult devuelto.
+
+        FIX Gate 3 (2026-06-02) — BUG #4:
+          El signal dict no incluía indicators._closes_1h, por lo que
+          decision_engine.evaluate() siempre recibía closes_1h=[] y
+          saltaba el Gate 3 (market regime) en silencio.
+          Fix: obtener OHLCV 1h e incluir closes_1h en indicators.
+          Si el timeframe principal ya es 1h se reutilizan esos datos.
+          Si la petición 1h falla, se pasa [] y el gate se salta con
+          debug log (comportamiento idéntico al anterior pero ahora
+          funciona cuando los datos están disponibles).
         """
         try:
             ohlcv = await self.get_ohlcv()
@@ -1209,6 +1228,20 @@ class FuturesTrader:
 
             side = "long" if action == "BUY" else "short"
 
+            # FIX #4: obtener closes 1h para Gate 3 (market regime).
+            # Si el timeframe principal ya es 1h, reutilizar ohlcv directamente.
+            # Si no, hacer una petición específica 1h con fallback seguro.
+            closes_1h: list = []
+            try:
+                if OHLCV_TF == "1h":
+                    closes_1h = [bar[4] for bar in ohlcv]
+                else:
+                    ohlcv_1h = await self.get_ohlcv("1h")
+                    if ohlcv_1h and len(ohlcv_1h) >= 30:
+                        closes_1h = [bar[4] for bar in ohlcv_1h]
+            except Exception as e_1h:
+                logger.debug("[%s] _get_signal: no se pudo obtener OHLCV 1h para Gate 3: %s", self.symbol, e_1h)
+
             logger.info(
                 "[%s] ✅ Señal: %s | sl=%.5f tp1=%.5f tp2=%s | score=%s | %s",
                 self.symbol, side,
@@ -1228,6 +1261,9 @@ class FuturesTrader:
                 "_leverage":  getattr(sig, "suggested_lev", self.leverage),
                 "confidence": result.get("ai_confidence", getattr(sig, "score", 5)),
                 "reasoning":  result.get("reason", ""),
+                "indicators": {
+                    "_closes_1h": closes_1h,  # FIX #4: Gate 3 market regime
+                },
             }
 
         except Exception as e:
