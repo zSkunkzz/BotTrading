@@ -45,6 +45,62 @@ _FILL_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
 _FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
 
 
+def _adjust_levels_to_fill(
+    signal: dict,
+    filled_price: float,
+    ref_price: float,
+) -> tuple[float, float, float]:
+    """
+    Re-escala SL, TP1 y TP2 del signal para que mantengan los mismos
+    offsets porcentuales relativos al precio real de fill.
+
+    El signal_engine calcula SL/TP sobre `entry` (close de vela).  Si el
+    fill ocurre a un precio distinto, aplicar los niveles originales genera
+    distancias incorrectas (SL demasiado cerca, TP demasiado lejos, o
+    viceversa).
+
+    Algoritmo:
+      base         = signal.entry si > 0, si no ref_price
+      sl_pct       = (sl - base) / base          (negativo para LONG)
+      tp1_pct      = (tp1 - base) / base         (positivo para LONG)
+      tp2_pct      = (tp2 - base) / base
+      sl_adj       = filled_price * (1 + sl_pct)
+      tp1_adj      = filled_price * (1 + tp1_pct)
+      tp2_adj      = filled_price * (1 + tp2_pct)
+
+    Si base == filled_price (sin desfase) los valores no cambian.
+    """
+    sl_px  = float(signal.get("sl")  or 0)
+    tp1_px = float(signal.get("tp1") or 0)
+    tp2_px = float(signal.get("tp2") or 0)
+
+    base = float(signal.get("entry") or 0)
+    if base <= 0:
+        base = ref_price
+
+    # Si no hay desfase relevante (< 0.05%) no tocar nada
+    if abs(filled_price - base) / base < 0.0005:
+        return sl_px, tp1_px, tp2_px
+
+    def _rescale(level: float) -> float:
+        if level <= 0:
+            return level
+        pct = (level - base) / base
+        return filled_price * (1.0 + pct)
+
+    sl_adj  = _rescale(sl_px)
+    tp1_adj = _rescale(tp1_px)
+    tp2_adj = _rescale(tp2_px)
+
+    logger.info(
+        "Ajuste SL/TP por desfase de fill: base=%.4f → filled=%.4f (%.2f%%) | "
+        "SL %.4f→%.4f | TP1 %.4f→%.4f | TP2 %.4f→%.4f",
+        base, filled_price, (filled_price - base) / base * 100,
+        sl_px, sl_adj, tp1_px, tp1_adj, tp2_px, tp2_adj,
+    )
+    return sl_adj, tp1_adj, tp2_adj
+
+
 class FuturesTrader:
     """
     Orquestador principal de un par de trading en Hyperliquid.
@@ -335,12 +391,15 @@ class FuturesTrader:
         signal keys esperados (producidos por signal_engine / decision_engine):
           action      : "BUY" | "SELL"
           side        : "long" | "short"
-          entry       : float  — precio de referencia (puede ser 0 → usar precio actual)
-          sl          : float  — precio de stop loss  (0 → sin SL)
-          tp1         : float  — precio de take profit 1 (0 → sin TP)
+          entry       : float  — precio de referencia del signal (close de vela)
+          sl          : float  — precio de stop loss calculado sobre entry
+          tp1         : float  — precio de take profit 1 calculado sobre entry
           tp2, tp3    : float  — TPs adicionales (opcionales)
           entry_mode  : str    — "EARLY" | "CONFIRMED" (informativo)
           score       : int    — score de la señal (informativo)
+
+        NOTA: SL/TP se re-escalan automáticamente al precio real de fill
+        para preservar los offsets porcentuales correctos (ver _adjust_levels_to_fill).
 
         risk keys esperados:
           usdc_per_trade : float — capital por operación en USDC
@@ -351,10 +410,6 @@ class FuturesTrader:
 
         action = signal.get("action", "").upper()
         side   = signal.get("side", "").lower()
-        sl_px  = float(signal.get("sl")  or 0)
-        tp1_px = float(signal.get("tp1") or 0)
-        tp2_px = float(signal.get("tp2") or 0)
-        tp3_px = float(signal.get("tp3") or 0)
 
         is_long = (action == "BUY" or side == "long")
         is_buy  = is_long
@@ -382,17 +437,24 @@ class FuturesTrader:
             return
 
         logger.info(
-            "[%s] open_order: %s | qty=%.6f | ref_price=%.4f | notional=%.2f USDC | lev=%dx | sl=%.4f | tp1=%.4f",
+            "[%s] open_order: %s | qty=%.6f | ref_price=%.4f | notional=%.2f USDC | lev=%dx | "
+            "entry_signal=%.4f | sl_signal=%.4f | tp1_signal=%.4f",
             self.symbol, "LONG" if is_long else "SHORT",
             qty, ref_price, notional, self.leverage,
-            sl_px, tp1_px,
+            float(signal.get("entry") or 0),
+            float(signal.get("sl") or 0),
+            float(signal.get("tp1") or 0),
         )
 
         if self.dry_run:
+            # En dry_run no hay fill real; usamos ref_price como filled_price
+            sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, ref_price, ref_price)
+            tp3_px = float(signal.get("tp3") or 0)
+
             logger.info("[%s] DRY_RUN: open_order simulado — sin orden real.", self.symbol)
             self.position    = "long" if is_long else "short"
             self.entry_price = ref_price
-            self.sl          = sl_px if sl_px > 0 else None
+            self.sl          = sl_px  if sl_px  > 0 else None
             self.tp1         = tp1_px if tp1_px > 0 else None
             self.tp2         = tp2_px if tp2_px > 0 else None
             self.tp3         = tp3_px if tp3_px > 0 else None
@@ -440,10 +502,22 @@ class FuturesTrader:
             logger.warning("[%s] open_order: fill no confirmado tras %d intentos — usando ref_price=%.4f",
                            self.symbol, _FILL_RETRIES, ref_price)
 
+        # ── Re-escalar SL/TP al precio real de fill ────────────────────
+        # FIX: el signal calcula SL/TP sobre el close de la vela (entry_signal).
+        # Si filled_price difiere, los offsets porcentuales se preservan aquí.
+        sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, filled_price, ref_price)
+        tp3_px = float(signal.get("tp3") or 0)
+        if tp3_px > 0:
+            # Re-escalar tp3 con el mismo mecanismo
+            _, _, _tp3_tmp = _adjust_levels_to_fill(
+                {**signal, "tp2": signal.get("tp3")}, filled_price, ref_price
+            )
+            tp3_px = _tp3_tmp
+
         # ── Actualizar estado interno ───────────────────────────────
         self.position    = "long" if is_long else "short"
         self.entry_price = filled_price
-        self.sl          = sl_px if sl_px > 0 else None
+        self.sl          = sl_px  if sl_px  > 0 else None
         self.tp1         = tp1_px if tp1_px > 0 else None
         self.tp2         = tp2_px if tp2_px > 0 else None
         self.tp3         = tp3_px if tp3_px > 0 else None
@@ -492,7 +566,7 @@ class FuturesTrader:
                 "tp2_hit":     self.tp2_hit,
                 "usdc_amount": usdc_per_trade,
                 "leverage":    self.leverage,
-                "qty":         self._open_qty,   # ← NUEVO: persiste qty en disco
+                "qty":         self._open_qty,   # persiste qty en disco
             })
         except Exception as e:
             logger.warning("[%s] open_order: no se pudo persistir estado: %s", self.symbol, e)
