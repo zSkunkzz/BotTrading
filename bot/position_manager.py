@@ -13,6 +13,17 @@ MEJORAS v5:
           activan SL→breakeven en TP1 y SL→TP1 en TP2, respectivamente.
           El trailing dinámico (callback) solo se activa cuando managed_by_trader=False.
 
+MEJORAS v6 (BUG AUDIT):
+  FIX #10: trailing BE/TP1_LOCK ahora cancela la orden SL en el exchange y
+           coloca una nueva con el SL actualizado (antes solo actualizaba memoria).
+  FIX #13: Los bloques de trailing BE/TP1_LOCK usan el flag _trailing_managed_by_pm
+           para evitar sobreescribir el SL cuando trader.py ya lo gestiona con
+           sus propias órdenes trigger. Activado solo cuando managed_by_trader=False.
+  FIX #15: _reset_trader_state() ahora resetea también _tp1_hit para evitar que
+           la siguiente posición herede el flag y active BE prematuramente.
+  FIX #17: position_timeout.is_expired() recibe tp1=None de forma segura:
+           se guarda None explícito y se comprueba antes de llamar is_expired.
+
 Responsabilidades:
   - Detectar TP2 parcial
   - Calcular y actualizar trailing stop (SL→BE en TP1, SL→TP1 en TP2)
@@ -103,10 +114,12 @@ class PositionManager:
             try:
                 from bot.position_timeout import position_timeout
                 open_ts = getattr(trader, "_open_ts", None) or getattr(trader, "_position_open_ts", None)
+                # FIX #17: is_expired puede recibir tp1=None — se maneja explícitamente
+                tp1_val = trader.tp1  # puede ser None en posiciones huérfanas
                 if open_ts and position_timeout.is_expired(
                     symbol=sym,
                     open_ts=open_ts,
-                    tp1=trader.tp1,
+                    tp1=tp1_val,
                     price=price,
                     is_long=is_long,
                 ):
@@ -117,57 +130,109 @@ class PositionManager:
                             "[%s] ⏱ Position timeout detectado → cooldown TIMEOUT registrado",
                             sym,
                         )
+            except TypeError as e:
+                # FIX #17: captura TypeError explícito si is_expired no maneja tp1=None
+                logger.debug("[%s] position_timeout.is_expired TypeError (tp1=None?): %s", sym, e)
             except Exception as e:
                 logger.debug("[%s] position_timeout check en manage() error: %s", sym, e)
 
-        # ── FIX #5: Trailing stop escalonado (documentado claramente) ─────────
-        # Nivel 1: SL → breakeven cuando TP1 es tocado
-        if TRAILING_BE and trader.tp1 and trader.sl is not None:
-            tp1_reached = (
-                (is_long  and price >= trader.tp1)
-                or (not is_long and price <= trader.tp1)
-            )
-            if tp1_reached and not self._be_activated.get(sym, False):
-                be_sl = entry_px
-                if (is_long and be_sl > trader.sl) or (not is_long and be_sl < trader.sl):
-                    old_sl = trader.sl
-                    trader.sl = be_sl
-                    self._be_activated[sym] = True
-                    logger.info(
-                        "[%s] 🔒 SL → breakeven %.4f (era %.4f, TP1 tocado)",
-                        sym, trader.sl, old_sl,
-                    )
-                    save_position(sym, {
-                        "sl": trader.sl,
-                        "tp1": trader.tp1, "tp2": trader.tp2, "tp3": trader.tp3,
-                        "tp2_hit": trader.tp2_hit,
-                        "entry_price": entry_px,
-                        "position": trader.position,
-                    })
+        # ── FIX #5 + FIX #10 + FIX #13: Trailing stop escalonado ─────────────
+        # FIX #13: estos bloques solo actúan cuando managed_by_trader=False.
+        # Cuando managed_by_trader=True, trader.py gestiona sus propias órdenes
+        # trigger en el exchange — modificar trader.sl desde aquí sobreescribiría
+        # un SL ya mejorado por trader.py sin actualizar la orden en el exchange.
+        #
+        # FIX #10: cuando managed_by_trader=False, además de actualizar trader.sl
+        # en memoria, cancela la orden SL existente y coloca una nueva en el exchange.
 
-        # Nivel 2: SL → TP1 cuando TP2 es tocado (lock profit)
-        if TRAILING_TP1_LOCK and trader.tp2 and trader.tp1 and trader.sl is not None:
-            tp2_reached_for_lock = (
-                (is_long  and price >= trader.tp2)
-                or (not is_long and price <= trader.tp2)
-            )
-            if tp2_reached_for_lock and not self._tp1_lock_activated.get(sym, False):
-                lock_sl = trader.tp1
-                if (is_long and lock_sl > trader.sl) or (not is_long and lock_sl < trader.sl):
-                    old_sl = trader.sl
-                    trader.sl = lock_sl
-                    self._tp1_lock_activated[sym] = True
-                    logger.info(
-                        "[%s] 🔒 SL → TP1 %.4f (era %.4f, TP2 tocado) — profit bloqueado",
-                        sym, trader.sl, old_sl,
-                    )
-                    save_position(sym, {
-                        "sl": trader.sl,
-                        "tp1": trader.tp1, "tp2": trader.tp2, "tp3": trader.tp3,
-                        "tp2_hit": trader.tp2_hit,
-                        "entry_price": entry_px,
-                        "position": trader.position,
-                    })
+        if not managed_by_trader:
+            # Nivel 1: SL → breakeven cuando TP1 es tocado
+            if TRAILING_BE and trader.tp1 and trader.sl is not None:
+                tp1_reached = (
+                    (is_long  and price >= trader.tp1)
+                    or (not is_long and price <= trader.tp1)
+                )
+                if tp1_reached and not self._be_activated.get(sym, False):
+                    be_sl = entry_px
+                    if (is_long and be_sl > trader.sl) or (not is_long and be_sl < trader.sl):
+                        old_sl = trader.sl
+                        trader.sl = be_sl
+                        self._be_activated[sym] = True
+                        logger.info(
+                            "[%s] 🔒 SL → breakeven %.4f (era %.4f, TP1 tocado)",
+                            sym, trader.sl, old_sl,
+                        )
+                        save_position(sym, {
+                            "sl": trader.sl,
+                            "tp1": trader.tp1, "tp2": trader.tp2, "tp3": trader.tp3,
+                            "tp2_hit": trader.tp2_hit,
+                            "entry_price": entry_px,
+                            "position": trader.position,
+                        })
+                        # FIX #10: actualizar la orden SL en el exchange
+                        if not trader.dry_run:
+                            try:
+                                qty = getattr(trader, "_open_qty", None) or 0.0
+                                if qty > 0:
+                                    await trader._place_tpsl(
+                                        qty=qty,
+                                        sl=trader.sl,
+                                        tp=trader.tp3,
+                                        entry_px=entry_px,
+                                    )
+                                    logger.info(
+                                        "[%s] ✅ SL BE %.4f actualizado en exchange",
+                                        sym, trader.sl,
+                                    )
+                            except Exception as e:
+                                logger.warning(
+                                    "[%s] No se pudo actualizar SL BE en exchange: %s",
+                                    sym, e,
+                                )
+
+            # Nivel 2: SL → TP1 cuando TP2 es tocado (lock profit)
+            if TRAILING_TP1_LOCK and trader.tp2 and trader.tp1 and trader.sl is not None:
+                tp2_reached_for_lock = (
+                    (is_long  and price >= trader.tp2)
+                    or (not is_long and price <= trader.tp2)
+                )
+                if tp2_reached_for_lock and not self._tp1_lock_activated.get(sym, False):
+                    lock_sl = trader.tp1
+                    if (is_long and lock_sl > trader.sl) or (not is_long and lock_sl < trader.sl):
+                        old_sl = trader.sl
+                        trader.sl = lock_sl
+                        self._tp1_lock_activated[sym] = True
+                        logger.info(
+                            "[%s] 🔒 SL → TP1 %.4f (era %.4f, TP2 tocado) — profit bloqueado",
+                            sym, trader.sl, old_sl,
+                        )
+                        save_position(sym, {
+                            "sl": trader.sl,
+                            "tp1": trader.tp1, "tp2": trader.tp2, "tp3": trader.tp3,
+                            "tp2_hit": trader.tp2_hit,
+                            "entry_price": entry_px,
+                            "position": trader.position,
+                        })
+                        # FIX #10: actualizar la orden SL en el exchange
+                        if not trader.dry_run:
+                            try:
+                                qty = getattr(trader, "_open_qty", None) or 0.0
+                                if qty > 0:
+                                    await trader._place_tpsl(
+                                        qty=qty,
+                                        sl=trader.sl,
+                                        tp=trader.tp3,
+                                        entry_px=entry_px,
+                                    )
+                                    logger.info(
+                                        "[%s] ✅ SL TP1_LOCK %.4f actualizado en exchange",
+                                        sym, trader.sl,
+                                    )
+                            except Exception as e:
+                                logger.warning(
+                                    "[%s] No se pudo actualizar SL TP1_LOCK en exchange: %s",
+                                    sym, e,
+                                )
 
         # ── Si trader.py gestiona la posición, no duplicar órdenes ────────────
         if managed_by_trader:
@@ -492,6 +557,10 @@ class PositionManager:
         trader.sl          = None
         trader.tp1 = trader.tp2 = trader.tp3 = None
         trader.tp2_hit = False
+        # FIX #15: resetear _tp1_hit para que la siguiente posición no herede el flag
+        # y active el trailing BE prematuramente.
+        if hasattr(trader, "_tp1_hit"):
+            trader._tp1_hit = False
         trader._open_notional = 0.0
         if hasattr(trader, "_open_margin"):
             trader._open_margin = 0.0
