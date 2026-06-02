@@ -73,6 +73,14 @@ FIX MANUAL_CLOSE cooldown (2026-06-02):
   (por defecto 600s = 10 min) para evitar reentrar inmediatamente en el
   mismo símbolo tras un cierre manual. El cooldown se comprueba al inicio
   de _try_open_position y bloquea nuevas entradas hasta que expire.
+
+FIX cooldown general en _try_open_position (2026-06-02):
+  _try_open_position solo chequeaba is_manual_close_cooldown() pero no el
+  cooldown general (SL/TP/TIMEOUT). Resultado: el bot podía llamar a
+  strategy.decide() aunque hubiera un cooldown por SL activo, desperdiciando
+  CPU y arriesgando una entrada prematura si la señal era fuerte.
+  Fix: añadir check de signal_cooldown.is_in_cooldown() al inicio de
+  _try_open_position, antes de evaluar cualquier señal.
 """
 from __future__ import annotations
 
@@ -1102,11 +1110,14 @@ class FuturesTrader:
     # ── _try_open_position ──────────────────────────────────────────────────────────────────────
 
     async def _try_open_position(self, price: float, risk, global_risk) -> None:
-        # ── BLOQUEO MANUAL_CLOSE ───────────────────────────────────────────────────
-        if signal_cooldown.is_manual_close_cooldown(self.symbol):
+        # ── BLOQUEO COOLDOWN GENERAL (SL / TP / TIMEOUT / MANUAL_CLOSE) ───────
+        # Cubre todos los casos: cierre por SL/TP (mark_closed) y cierre manual
+        # (mark_manual_close). Un único check antes de evaluar cualquier señal
+        # evita llamadas innecesarias a strategy.decide() y entradas prematuras.
+        if signal_cooldown.is_in_cooldown(self.symbol):
             rem = signal_cooldown.remaining(self.symbol)
             logger.debug(
-                "[%s] MANUAL_CLOSE cooldown activo — bloqueando entrada (%.0fs restantes)",
+                "[%s] Cooldown activo — bloqueando entrada (%.0fs restantes)",
                 self.symbol, rem,
             )
             return
