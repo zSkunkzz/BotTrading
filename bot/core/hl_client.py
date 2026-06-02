@@ -1,27 +1,40 @@
 """
 hl_client.py — Cliente Hyperliquid basado en el SDK oficial.
 
-FIX CRÍTICO (2026-06-01):
-  Causa raíz del error "Invalid TPSL price":
-  1. round_px usaba math.floor → para SL en LONG con precios de pocos decimales,
-     el floor podía dejar el precio igual al entry o incluso superior, y HL lo rechaza.
-  2. pxDecimals se infería incorrectamente por rango de precio. Hyperliquid
-     determina los decimales válidos a partir del markPx real del asset (string
-     con precisión exacta). Si el markPx es "1.9061", pxDecimals=4.
-  3. place_sl / place_tp no validaban que SL < entry (LONG) / SL > entry (SHORT)
-     antes de enviar.
+FIX CRÍTICO FREEZE (2026-06-03):
+  CAUSA RAÍZ DEL FREEZE «no veo nada más / TradingLoop iniciado y silencio»:
+  _HLCore.get() se llamaba desde FuturesTrader.__init__ (código SÍNCRONO),
+  que ejecuta _warm_cache() con 3 llamadas HTTP bloqueantes via requests:
+    - self.info.meta()
+    - self.info.all_mids()
+    - self.info.meta_and_asset_ctxs()
 
-  Solución:
-  - round_px ahora usa round() (redondeo estándar) en lugar de math.floor.
-  - _warm_cache() lee markPx string de meta_and_asset_ctxs() para derivar
-    los decimales exactos que HL acepta internamente.
-  - place_sl / place_tp reciben opcionalmente entry_px y validan lógica antes
-    de enviar (ajustando 1 tick si es necesario).
+  Con 7+ traders arrancando en paralelo:
+    - El primer trader crea el singleton y bloquea el hilo ~2-5s.
+    - Si hay latencia o 429, _build_*_with_retry() usa time.sleep() directo,
+      congelando el event loop entero — NINGÚN trader llega a _iteration().
+    - Resultado: «TradingLoop iniciado» aparece (ese log está en _init() ANTES
+      de que _iteration() corra) pero nada más jamás se imprime.
+
+  FIXES aplicados:
+    1. _HLCore.get_async(): classmethod async que crea el singleton dentro
+       de asyncio.to_thread(), sin bloquear el event loop.
+    2. HLClient.create(symbol): classmethod async que usa get_async().
+    3. FuturesTrader.__init__: _hl_client = None (no crea el SDK aquí).
+       La creación real ocurre en _get_ccxt() que es async y se llama desde
+       _init() en TradingLoop.run() — ya dentro del event loop.
+    4. _set_leverage: asyncio.wait_for timeout=15s para no colgarse.
+    5. _init_lock: asyncio.Lock para serializar creaciones concurrentes y
+       evitar que 7 traders lancen 7 _warm_cache() simultáneos.
+
+FIX CRÍTICO (2026-06-01):
+  Causa raíz del error «Invalid TPSL price»:
+  - round_px usaba math.floor.
+  - pxDecimals se infería incorrectamente.
+  - place_sl/place_tp no validaban lógica entry vs trigger.
 
 FIX float_to_wire rounding (2026-06-02):
-  place_sl / place_tp ahora redondean sz a szDecimals antes de pasarlo al SDK.
-  Sin este redondeo, valores como 0.0016922144035649317 (BTC qty calculada como
-  notional/entry_price) provocan 'float_to_wire causes rounding' en el SDK.
+  place_sl / place_tp redondean sz a szDecimals antes de pasarlo al SDK.
 
 Autenticación soportada:
   Opción A (recomendada): API Wallet
@@ -33,10 +46,11 @@ Autenticación soportada:
     HL_ACCOUNT_ADDR        — dirección pública (opcional, se deriva automáticamente)
 
 Opcionales:
-  HL_TESTNET             — "true" para testnet
+  HL_TESTNET             — «true» para testnet
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
@@ -72,11 +86,6 @@ def _norm_coin(symbol: str) -> str:
 
 
 def _px_decimals_from_tick(tick: float) -> int:
-    """
-    Deriva pxDecimals a partir del tick size real.
-    tick=0.0001 → 4, tick=0.001 → 3, tick=0.01 → 2, etc.
-    Clamp entre 0 y 6.
-    """
     if tick <= 0:
         return 4
     dec = max(0, min(6, round(-math.log10(tick))))
@@ -84,7 +93,6 @@ def _px_decimals_from_tick(tick: float) -> int:
 
 
 def _round_sz(sz: float, sz_decimals: int) -> float:
-    """Redondea sz (qty) a szDecimals usando floor, como hace el SDK internamente."""
     factor = 10 ** sz_decimals
     return math.floor(sz * factor) / factor
 
@@ -97,9 +105,17 @@ class _HLCore:
     """
     Singleton que mantiene UNA instancia de Exchange + Info.
     Pre-carga szDecimals, pxDecimals y maxLeverage al arrancar.
+
+    IMPORTANTE: la creación debe hacerse SIEMPRE mediante get_async()
+    desde código async (dentro del event loop). Nunca llamar get()
+    directamente desde __init__ de clases que se instancian antes de
+    que asyncio.run() esté activo.
     """
 
     _instance: "_HLCore | None" = None
+    # Lock para serializar la creación concurrente del singleton.
+    # Se inicializa lazy para evitar problemas si se importa antes de asyncio.run().
+    _init_lock: "asyncio.Lock | None" = None
 
     def __init__(self) -> None:
         api_pk     = os.getenv("HL_API_PRIVATE_KEY", "").strip()
@@ -148,8 +164,10 @@ class _HLCore:
 
     def _warm_cache(self) -> None:
         """
-        Pre-carga szDecimals, pxDecimals (desde markPx string del contexto perp),
-        tick_size y maxLeverage para todos los coins.
+        Pre-carga szDecimals, pxDecimals, tick_size y maxLeverage.
+        NOTA: este método es síncrono y bloqueante — debe llamarse SIEMPRE
+        desde asyncio.to_thread() (via get_async()), nunca directamente
+        desde código async o desde __init__ de clases raíz.
         """
         try:
             meta     = self.info.meta()
@@ -236,11 +254,54 @@ class _HLCore:
             len(universe),
         )
 
+    # ── Acceso síncrono (SOLO para código que ya corre en un hilo) ────
     @classmethod
     def get(cls) -> "_HLCore":
+        """
+        Acceso SÍNCRONO al singleton. Solo usar desde:
+          - asyncio.to_thread() (ya en hilo separado)
+          - tests síncronos
+        NUNCA llamar directamente desde __init__ de clases que se crean
+        antes del event loop, ni desde corrutinas async.
+        """
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    # ── Acceso async (usar siempre desde código async) ────────────────
+    @classmethod
+    async def get_async(cls) -> "_HLCore":
+        """
+        FIX FREEZE: crea o devuelve el singleton de forma async-safe.
+
+        Si el singleton no existe, lo crea dentro de asyncio.to_thread()
+        para que todas las llamadas HTTP síncronas del SDK (requests)
+        no bloqueen el event loop.
+
+        El asyncio.Lock serializa creaciones concurrentes: si 7 traders
+        llaman get_async() en paralelo, solo el primero crea el singleton;
+        los demás esperan (sin bloquear el event loop) y luego reutilizan
+        la instancia ya creada.
+        """
+        # Inicializar el lock lazy (debe crearse dentro del event loop)
+        if cls._init_lock is None:
+            cls._init_lock = asyncio.Lock()
+
+        if cls._instance is not None:
+            return cls._instance
+
+        async with cls._init_lock:
+            # Double-check tras adquirir el lock
+            if cls._instance is not None:
+                return cls._instance
+            logger.info("[HLCore] Inicializando SDK en hilo separado (asyncio.to_thread)...")
+            cls._instance = await asyncio.to_thread(cls._create_sync)
+            return cls._instance
+
+    @classmethod
+    def _create_sync(cls) -> "_HLCore":
+        """Creación síncrona del singleton — solo llamar desde to_thread."""
+        return cls()
 
     @staticmethod
     def _build_exchange_with_retry(wallet, kwargs: dict, retries: int = 6) -> Exchange:
@@ -292,18 +353,39 @@ class _HLCore:
 class HLClient:
     """
     Cliente ligero por symbol. Comparte Exchange + Info via _HLCore singleton.
+
+    IMPORTANTE: usar siempre HLClient.create(symbol) (async) para instanciar.
+    El __init__ estándar requiere que _HLCore ya esté inicializado.
     """
 
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str, core: "_HLCore | None" = None):
         self.symbol = symbol
         self.coin   = _norm_coin(symbol)
-        core = _HLCore.get()
+        if core is None:
+            # Fallback síncrono — solo seguro si _HLCore ya fue creado antes
+            # via get_async(). Si no, lanzará una excepción clara.
+            if _HLCore._instance is None:
+                raise RuntimeError(
+                    f"[HLClient] {symbol}: _HLCore no inicializado. "
+                    "Usar HLClient.create(symbol) (async) en lugar de HLClient(symbol)."
+                )
+            core = _HLCore._instance
         self._exchange     = core.exchange
         self._info         = core.info
         self._account_addr = core.account_addr
         self._agent_addr   = core.agent_addr
         self._agent_mode   = core.agent_mode
         self._core         = core
+
+    @classmethod
+    async def create(cls, symbol: str) -> "HLClient":
+        """
+        FIX FREEZE: constructor async-safe.
+        Inicializa _HLCore (si no existe) en un hilo separado via to_thread,
+        luego crea el HLClient ligero sin ninguna llamada HTTP.
+        """
+        core = await _HLCore.get_async()
+        return cls(symbol, core=core)
 
     # ── METADATOS ─────────────────────────────────────────────────
 
@@ -327,7 +409,6 @@ class HLClient:
         return dec
 
     def get_px_decimals(self) -> int:
-        """Devuelve pxDecimals desde caché (pre-cargado al arrancar)."""
         cache = self._core._px_decimals_cache
         if self.coin in cache:
             return cache[self.coin]
@@ -389,7 +470,6 @@ class HLClient:
         return round(price, dec)
 
     def round_sz(self, sz: float) -> float:
-        """Redondea sz (qty) a szDecimals usando floor — igual que el SDK internamente."""
         dec = self.get_sz_decimals()
         return _round_sz(sz, dec)
 
@@ -488,11 +568,6 @@ class HLClient:
         limit_px:  Optional[float] = None,
         entry_px:  Optional[float] = None,
     ) -> dict:
-        """
-        Coloca un Take Profit trigger order.
-        FIX float_to_wire: sz redondeado a szDecimals antes de enviar al SDK.
-        """
-        # FIX: redondear sz antes de pasarlo al SDK
         sz         = self.round_sz(sz)
         is_long    = not is_buy
         trigger_px = self._adjust_tp_px(trigger_px, entry_px, is_long)
@@ -534,11 +609,6 @@ class HLClient:
         trigger_px: float,
         entry_px:   Optional[float] = None,
     ) -> dict:
-        """
-        Coloca un Stop Loss trigger order.
-        FIX float_to_wire: sz redondeado a szDecimals antes de enviar al SDK.
-        """
-        # FIX: redondear sz antes de pasarlo al SDK
         sz         = self.round_sz(sz)
         is_long    = not is_buy
         trigger_px = self._adjust_sl_px(trigger_px, entry_px, is_long)
@@ -568,7 +638,6 @@ class HLClient:
         cleaned = []
         for o in orders:
             o  = dict(o)
-            # FIX: redondear sz en bulk también
             if "sz" in o:
                 o["sz"] = self.round_sz(float(o["sz"]))
             ot = o.get("order_type", {})
