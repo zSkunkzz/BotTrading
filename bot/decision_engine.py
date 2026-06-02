@@ -19,13 +19,16 @@ INTEGRATION_NOTE para trader.py:
         entry_mode=<mode>
     )
 
-FIX 2026-06-02:
+FIX 2026-06-02 v1:
   on_position_closed llamaba await self._risk.register_close() pero
-  pretrade_risk.register_close() es síncrono (no corrutina). Llamar
-  await sobre un método síncrono devuelve None y lanza:
-    TypeError: object NoneType can't be used in 'await' expression
-  Fix: llamada directa sin await (es thread-safe ya que no usa asyncio.Lock
-  en el path de escritura, sólo en check()).
+  pretrade_risk.register_close() es síncrono. Fix: llamada directa.
+
+FIX 2026-06-02 v2:
+  register_close(symbol, notional_or_margin) y confirm_order(symbol,
+  notional_or_margin) no aceptan keyword argument 'margin'.
+  Error: unexpected keyword argument 'margin'.
+  Fix: llamadas posicionales (sin keywords) para eliminar cualquier
+  divergencia de firma presente o futura.
 """
 from __future__ import annotations
 
@@ -149,8 +152,8 @@ class DecisionEngine:
         Registra el margin en el risk ledger + sella el rate-limiter.
         """
         m = margin if margin is not None else self._usdc
-        # confirm_order es síncrono — llamada directa
-        self._risk.confirm_order(symbol=symbol, notional_or_margin=m)
+        # FIX: llamada posicional — confirm_order(symbol, notional_or_margin)
+        self._risk.confirm_order(symbol, m)
         log.debug("[DecisionEngine] order confirmed %s (margin %.2f)", symbol, m)
 
     async def on_position_closed(
@@ -164,10 +167,9 @@ class DecisionEngine:
         Llamar cuando una posición se cierra completamente.
         Libera el margin + actualiza el cooldown dinámico.
 
-        FIX 2026-06-02: register_close() es síncrono en PreTradeRisk.
-        Llamar con await generaba:
-          TypeError: object NoneType can't be used in 'await' expression
-        Fix: llamada directa (síncrona).
+        FIX v1: register_close() es síncrono — NO usar await.
+        FIX v2: llamada posicional register_close(symbol, m) para evitar
+                'unexpected keyword argument margin'.
 
         Parameters
         ----------
@@ -177,8 +179,8 @@ class DecisionEngine:
             Modo de entrada original (para escalar el cooldown correctamente)
         """
         m = margin if margin is not None else self._usdc
-        # FIX: register_close es síncrono — NO usar await
-        self._risk.register_close(symbol=symbol, notional_or_margin=m)
+        # FIX: llamada posicional — register_close(symbol, notional_or_margin)
+        self._risk.register_close(symbol, m)
         log.debug("[DecisionEngine] position closed %s (%.2f released, reason=%s)", symbol, m, reason)
 
         try:
