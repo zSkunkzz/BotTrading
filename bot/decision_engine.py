@@ -14,9 +14,21 @@ Fix Bug K (2026-06-02):
   pasara y el bot nunca abriera posiciones.
   Fix: llamar a analyze_pair() directamente y convertir SignalResult al
   dict que espera el caller ({action, entry_mode, sl, tp1, tp2, ...}).
+
+Fix Bug P (2026-06-02):
+  Gate 2 llamaba self._pretrade.check(symbol, price) SIN await y con firma
+  incorrecta. check() es async y requiere (symbol, margin=..., ...) — no
+  (symbol, price). Sin await devuelve una coroutine siempre truthy → nunca
+  bloquea nada y se filtra silenciosamente. Ahora se llama correctamente
+  con await y se pasa margin desde la configuración del trader.
+
+  _register_close_safe llamaba self._risk.register_close() (GlobalRisk)
+  que es async, sin await. Corregido: on_position_closed ahora es async
+  y usa await para ambas llamadas.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Optional
 
@@ -45,7 +57,14 @@ class DecisionEngine:
 
     # ── Evaluación de señal ───────────────────────────────────────────────────
 
-    async def evaluate(self, symbol: str, price: float, ohlcv: list) -> Optional[dict]:
+    async def evaluate(
+        self,
+        symbol: str,
+        price: float,
+        ohlcv: list,
+        margin: float = 0.0,
+        leverage: float = 1.0,
+    ) -> Optional[dict]:
         """
         Evalúa si hay condiciones para abrir una posición.
 
@@ -55,6 +74,8 @@ class DecisionEngine:
 
         Bug K fix: usa analyze_pair() de signal_engine (no get_signal() que
         no existe) y convierte SignalResult → dict para compatibilidad.
+
+        Bug P fix: await pretrade_risk.check() con firma correcta.
         """
         # Gate 1: cooldown activo
         if self._cooldown.is_in_cooldown(symbol):
@@ -63,8 +84,14 @@ class DecisionEngine:
             return None
 
         # Gate 2: pretrade risk (margin, daily loss, correlación, etc.)
+        # Bug P fix: check() es ASYNC → await; firma correcta con margin/leverage/price
         try:
-            allowed, reason = self._pretrade.check(symbol, price)
+            allowed, reason = await self._pretrade.check(
+                symbol=symbol,
+                price=price,
+                margin=margin if margin > 0 else 1.0,  # evitar margin=0 que siempre bloquea
+                leverage=leverage,
+            )
         except Exception as e:
             log.warning("[%s] evaluate: pretrade_risk.check error: %s", symbol, e)
             return None
@@ -122,7 +149,7 @@ class DecisionEngine:
 
     # ── Notificación de cierre ────────────────────────────────────────────────
 
-    def on_position_closed(
+    async def on_position_closed(
         self,
         symbol: str,
         pnl: float,
@@ -131,6 +158,8 @@ class DecisionEngine:
     ) -> None:
         """
         Bug D fix: register_close se ejecuta dentro de try/finally.
+        Bug P fix: on_position_closed ahora es async para poder awaitar
+          GlobalRisk.register_close() que es async.
 
         Garantiza que el slot de margin se libera aunque register_close
         lance una excepción (p.ej. error de serialización, I/O, etc.).
@@ -144,7 +173,7 @@ class DecisionEngine:
             log.error("[%s] on_position_closed: cooldown.mark_closed falló: %s", symbol, e)
 
         # 2. Liberar margin — SIEMPRE debe ejecutarse aunque paso 1 o 3 fallen
-        self._register_close_safe(symbol=symbol, pnl=pnl)
+        await self._register_close_safe(symbol=symbol, pnl=pnl)
 
         # 3. Logging de resultado
         try:
@@ -156,23 +185,32 @@ class DecisionEngine:
         except Exception:
             pass
 
-    def _register_close_safe(self, symbol: str, pnl: float) -> None:
+    async def _register_close_safe(self, symbol: str, pnl: float) -> None:
         """
-        Wrapper seguro de _risk.register_close con try/except + log.
+        Bug P fix: GlobalRisk.register_close es ASYNC → requiere await.
+        PreTradeRisk.register_close es SYNC → llamar directamente.
 
-        Nunca relanza la excepción: si register_close falla, se loggea
-        el error pero el flujo de cierre sigue adelante normalmente.
-        Esto garantiza que el margin siempre se libera (Bug D).
+        Wrapper seguro: nunca relanza la excepción — si falla, se loggea
+        y el flujo de cierre sigue adelante normalmente.
         """
+        # GlobalRisk (async)
         try:
-            # register_close es síncrono — NO usar await
-            self._risk.register_close(symbol, pnl)
+            await self._risk.register_close(pnl_pct=pnl, symbol=symbol)
         except Exception as e:
             log.error(
-                "[%s] CRÍTICO: _risk.register_close falló con %s: %s — "
-                "el margin puede haberse liberado incorrectamente. "
-                "Verificar estado de GlobalRisk.",
-                symbol, type(e).__name__, e,
+                "[%s] CRÍTICO: GlobalRisk.register_close falló: %s — "
+                "verificar estado de GlobalRisk.",
+                symbol, e,
+                exc_info=True,
+            )
+
+        # PreTradeRisk (sync) — libera el margen reservado para este symbol
+        try:
+            self._pretrade.register_close(symbol=symbol, notional_or_margin=0.0)
+        except Exception as e:
+            log.error(
+                "[%s] CRÍTICO: PreTradeRisk.register_close falló: %s",
+                symbol, e,
                 exc_info=True,
             )
 
