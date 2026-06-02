@@ -21,7 +21,7 @@ SISTEMA DE SCORING (max_score = 10):
     +1  SuperTrend 4h en favor
     +1  MACD 15m histograma en favor Y cambiando (no estancado)
     +1  Pullback: precio en 15m tocó EMA21 en las últimas 3 velas (rebote)
-    +1  RSI 15m en zona de rebote (40-58 LONG, 42-60 SHORT) — NO sobreextendido
+    +1  RSI 15m en zona de rebote (40-60) — NO sobreextendido
     +1  Vol 15m >= 1.2x en vela actual
     +1  Confluencia total: ST 15m + 1h + 4h todos en misma dirección
     Bonus max: 9 pts
@@ -40,7 +40,7 @@ SISTEMA DE SCORING (max_score = 10):
     +2  Divergencia MACD 15m: hist estaba en contra pero ahora cambia
     +1  Vol 15m >= 1.5x (capitulación o climax)
     +1  ST 4h en contra del precio actual (agotamiento tendencia dominante)
-    +1  RSI 4h en zona neutra (45-55) — no sobre-extendido en 4h
+    +1  RSI 4h en zona neutra (40-60) — no sobre-extendido en 4h
     +1  Precio toca EMA21 del 1h o la cruza (punto de inflexion)
     Bonus max: 8 pts
 
@@ -51,15 +51,18 @@ SISTEMA DE SCORING (max_score = 10):
     - Vol 15m < 0.6x: mercado dormido, no entrar
 
   MIN_SCORE  = 6 / 10  (60% de confluencia)
-  MIN_RR     = 2.5     ← sólo trades con RR mínimo real
+  MIN_RR     = 1.8     ← RR mínimo real (calculado sobre SL real, no teórico)
 
-SL/TP (multiplicadores ATR para garantizar RR >= 2.5):
-  SL ATR mult = 1.5 (base)
-  Para RR=2.5 necesitamos TP >= SL_dist * 2.5, es decir TP_mult >= SL_mult * 2.5 = 3.75
+NOTA RR:
+  El SL real se calcula como min(low_price - buffer, entry - SL_mult*ATR).
+  Esto hace que el SL real sea >= SL_mult*ATR, por lo que el RR real
+  es MENOR que el RR teórico. Por eso MIN_RR se baja a 1.8 para no
+  rechazar todos los trades válidos.
 
-  Modo tendencia : SL=1.5×ATR | TP=3.8×ATR  → RR ~2.53
-  Modo breakout  : SL=1.5×ATR | TP=3.8×ATR  → RR ~2.53
-  Modo reversal  : SL=1.2×ATR | TP=3.1×ATR  → RR ~2.58
+  SL/TP (multiplicadores ATR):
+  Modo tendencia : SL=1.5×ATR | TP=2.8×ATR → RR objetivo ~1.87
+  Modo breakout  : SL=1.5×ATR | TP=2.8×ATR → RR objetivo ~1.87
+  Modo reversal  : SL=1.2×ATR | TP=2.2×ATR → RR objetivo ~1.83
 
   TP2 mantenido como referencia interna (no se usa en órdenes).
   Trailing TP eliminado.
@@ -78,15 +81,14 @@ log = logging.getLogger(__name__)
 
 # ─── Constantes ──────────────────────────────────────────────────────────────────────────────
 MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
-MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "2.5"))
+MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.8"))   # FIX: bajado de 2.5 a 1.8
 
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
 _SL_ATR_MULT       = float(os.getenv("SL_ATR_MULT",  "1.5"))
-# TP calibrado para garantizar RR >= 2.5 con SL de 1.5x ATR:
-#   TP_mult >= SL_mult * MIN_RR  → 1.5 * 2.5 = 3.75 → usamos 3.8 con margen
-_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "3.8"))
-_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "5.5"))
+# TP calibrado para RR objetivo ~1.87 con SL base 1.5x ATR:
+_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "2.8"))
+_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "4.5"))
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 
@@ -197,17 +199,14 @@ async def analyze_pair(
 
     if setup_type == "REVERSAL":
         sl_mult  = float(os.getenv("SL_ATR_MULT_REVERSAL",  "1.2"))
-        # Reversal con SL=1.2×ATR: TP_mult >= 1.2 * 2.5 = 3.0 → usamos 3.1 con margen
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "3.1"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "5.0"))
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "2.2"))
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "4.0"))
     elif setup_type == "BREAKOUT":
         sl_mult  = _SL_ATR_MULT
-        # Breakout con SL=1.5×ATR: TP_mult >= 1.5 * 2.5 = 3.75 → usamos 3.8
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "3.8"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "5.5"))
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "2.8"))
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "4.5"))
     else:  # TENDENCIA
         sl_mult  = _SL_ATR_MULT
-        # Tendencia con SL=1.5×ATR: TP_mult >= 3.75 → usamos 3.8
         tp1_mult = _TP1_ATR_MULT
         tp2_mult = _TP2_ATR_MULT
 
@@ -220,6 +219,7 @@ async def analyze_pair(
         tp1 = round(entry - tp1_mult * atr_val, 6)
         tp2 = round(entry - tp2_mult * atr_val, 6)
 
+    # FIX RR: calcular sobre la distancia REAL al SL (no teórica)
     risk   = abs(entry - sl)
     reward = abs(tp1 - entry)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
@@ -231,8 +231,7 @@ async def analyze_pair(
     else:
         entry_mode = "EARLY"
 
-    # STRONG necesita RR >= 2.5 para apalancamiento máximo
-    if entry_mode == "STRONG" and rr >= 2.5:
+    if entry_mode == "STRONG" and rr >= 2.0:
         suggested_lev = _MAX_LEV
     elif entry_mode == "NORMAL":
         suggested_lev = max(1, int(_MAX_LEV * 0.6))
@@ -264,7 +263,7 @@ async def analyze_pair(
         suggested_lev=suggested_lev,
         indicators=indicators,
         is_valid=is_valid,
-        reason="" if is_valid else f"[{setup_type}] score={score}/{max_score} rr={rr:.2f}",
+        reason="" if is_valid else f"[{setup_type}] score={score}/{max_score} rr={rr:.2f} (min {MIN_RR})",
         extra={"setup_type": setup_type},
     )
 
@@ -645,7 +644,7 @@ def _hold_result(symbol: str, reason: str) -> SignalResult:
 
 
 # ─── format_signal_block ────────────────────────────────────────────────────────────────────────────
-def format_signal_block(signal: Optional[SignalResult]) -> str:
+def format_signal_block(signal) -> str:
     if signal is None:
         return ""
 

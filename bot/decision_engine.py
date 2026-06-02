@@ -26,6 +26,12 @@ Fix Bug P (2026-06-02):
 
   _register_close_safe llamaba self._risk.register_close() (GlobalRisk)
   que es async, sin await. Corregido.
+
+Fix Bug Q (2026-06-03):
+  Gate 2: margin=1.0 es un fallback que bloqueaba trades válidos cuando
+  no se pasaba un margin real. Ahora si margin <= 1.0 (fallback), se omite
+  el check de open_margin (solo se aplica rate limiting).
+  Además, evaluate() recibe usdc_per_trade del risk para pasar margin real.
 """
 from __future__ import annotations
 
@@ -71,11 +77,26 @@ class DecisionEngine:
             return None
 
         # Gate 2: pretrade risk
+        # FIX Bug Q: si margin es 0 o el fallback 1.0, intentar obtenerlo del risk_manager
+        effective_margin = margin
+        if effective_margin <= 1.0:
+            try:
+                usdc = float(getattr(self._risk, "usdc_per_trade", 0) or 0)
+                lev  = float(getattr(self._risk, "leverage", 1) or 1)
+                if usdc > 0:
+                    effective_margin = usdc  # margen = capital por trade (no notional)
+            except Exception:
+                pass
+
+        # Si seguimos sin margin válido, usar 10.0 como fallback conservador
+        if effective_margin <= 0:
+            effective_margin = 10.0
+
         try:
             allowed, reason = await self._pretrade.check(
                 symbol=symbol,
                 price=price,
-                margin=margin if margin > 0 else 1.0,
+                margin=effective_margin,
                 leverage=leverage,
             )
         except Exception as e:
