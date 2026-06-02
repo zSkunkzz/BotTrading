@@ -36,7 +36,7 @@ _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
 # Cuántos ciclos de HOLD consecutivos (sin posición) antes de rotar un trader
-# Un ciclo = un tick del loop de decisión del trader (~60s por defecto).
+# Un ciclo = una iteración del idle_rotation_loop (~60s).
 # 30 ciclos x 60s = ~30 minutos sin entrar → se rota.
 _IDLE_ROTATE_CYCLES = int(os.getenv("IDLE_ROTATE_CYCLES", "30"))
 _idle_cycles: dict[str, int] = {}  # symbol -> ciclos consecutivos sin posición
@@ -236,20 +236,28 @@ async def _idle_rotation_loop(scanner: "PairScanner") -> None:
     FIX 2026-06-02: _last_scored es lista de dicts, no de strings.
     La línea `scanner.normalize(s)` pasaba el dict entero → AttributeError.
     Fix: extraer p["symbol"] directamente antes de normalizar.
+
+    FIX 2026-06-03 (Bug C): usaba bot_state._positions para saber si hay
+    posición abierta. En dry_run / cierre externo, esto puede estar
+    desincronizado con trader.position (estado en memoria).
+    Fix: verificar trader.position (fuente primaria) antes de bot_state.
     """
     while True:
         await asyncio.sleep(60)
         try:
-            open_symbols = set(bot_state._positions.keys())
             to_rotate = []
             for sym, cycles in list(_idle_cycles.items()):
-                if sym in open_symbols:
+                # FIX Bug C: usar trader.position como fuente primaria de verdad
+                trader = _trader_instances.get(sym)
+                has_position = (
+                    (trader is not None and getattr(trader, "position", None) is not None)
+                    or sym in bot_state._positions  # fallback: estado en disco
+                )
+
+                if has_position:
                     _idle_cycles[sym] = 0  # resetear si tiene posición
                     continue
-                trader = _trader_instances.get(sym)
-                if trader and getattr(trader, "position", None):
-                    _idle_cycles[sym] = 0
-                    continue
+
                 _idle_cycles[sym] = cycles + 1
                 if _idle_cycles[sym] >= _IDLE_ROTATE_CYCLES:
                     to_rotate.append(sym)
@@ -285,6 +293,11 @@ async def _idle_rotation_loop(scanner: "PairScanner") -> None:
 
 async def on_pairs_updated(new_pairs: list, added: set = None, removed: set = None):
     open_symbols = set(bot_state._positions.keys())
+    # Complementar con posiciones en memoria de traders activos
+    for sym, t in _trader_instances.items():
+        if getattr(t, "position", None) is not None:
+            open_symbols.add(sym)
+
     protected = open_symbols - set(new_pairs)
     if protected:
         logger.info("\U0001f512 Pares con posición abierta reinyectados: %s", ", ".join(protected))
@@ -368,9 +381,6 @@ async def main():
     initial_pairs = await scanner.scan()
 
     # FIX: sincronizar scanner.active_pairs con el resultado del scan inicial.
-    # Sin esto, run_scanner_loop ve active_pairs=[] en el primer ciclo y trata
-    # todos los pares como "nuevos" (added=todos) → intenta re-arrancar traders
-    # que ya están activos, generando logs "Límite alcanzado" innecesarios.
     scanner.active_pairs = list(initial_pairs)
 
     scored_data = list(getattr(scanner, "_last_scored", []))
