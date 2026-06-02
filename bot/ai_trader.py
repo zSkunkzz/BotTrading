@@ -25,19 +25,53 @@ _enriched_cache: dict = {}
 
 AI_MIN_SCORE = int(os.getenv("AI_MIN_SCORE", "7"))
 
+# Bug N fix: sesiones de módulo reutilizables en lugar de crear una nueva por llamada.
+# Lazy-init con _get_*_session() para evitar crear la sesión fuera de un event loop.
+_gemini_session: aiohttp.ClientSession | None = None
+_groq_session:   aiohttp.ClientSession | None = None
+
+
+def _get_gemini_session() -> aiohttp.ClientSession:
+    """Devuelve (creando si hace falta) la sesión persistente para Gemini."""
+    global _gemini_session
+    if _gemini_session is None or _gemini_session.closed:
+        _gemini_session = aiohttp.ClientSession()
+    return _gemini_session
+
+
+def _get_groq_session() -> aiohttp.ClientSession:
+    """Devuelve (creando si hace falta) la sesión persistente para Groq."""
+    global _groq_session
+    if _groq_session is None or _groq_session.closed:
+        _groq_session = aiohttp.ClientSession()
+    return _groq_session
+
+
+async def close_sessions() -> None:
+    """Cierra las sesiones HTTP de módulo. Llamar al shutdown del bot."""
+    global _gemini_session, _groq_session
+    for sess in (_gemini_session, _groq_session):
+        if sess is not None and not sess.closed:
+            await sess.close()
+    _gemini_session = None
+    _groq_session   = None
+
+
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
-# Prompt principal: gestión de posición abierta (CLOSE/HOLD).
+# Prompt principal: análisis técnico + gestión de posición abierta (BUY/SELL/HOLD/CLOSE).
+# Bug I fix: la IA SIEMPRE se consulta, tanto en entrada como con posición abierta.
 # Las reglas numéricas (RSI, funding, F&G, OI, vol_ratio) las aplica enriched_filter
 # antes de llegar aquí, así que este prompt NO las duplica.
 SYSTEM_PROMPT = """You are a professional crypto futures trader. Reply ONLY with a JSON object, no extra text.
 
 You receive:
   1. Technical indicators across multiple timeframes
-  2. Current open position details (side, entry, PnL)
+  2. Current open position details (side, entry, PnL) when applicable
 
 Decision rules:
-  - CLOSE if pnl > +3% or pnl < -1.5%
+  - If no position: BUY for long setup, SELL for short setup, HOLD if unclear
+  - If position open: CLOSE if pnl > +3% or pnl < -1.5%, else HOLD
   - If unsure → HOLD
 
 JSON format (strict, no markdown):
@@ -93,7 +127,11 @@ def _parse_ai_json(raw: str) -> dict:
 
 
 async def _get_enriched_context(symbol: str):
-    now = time.monotonic()
+    # Bug J fix: usar time.time() (epoch) en lugar de time.monotonic().
+    # time.monotonic() no es persistible entre sesiones; tras un restart de Railway
+    # un timestamp monotonic antiguo puede ser > al actual → age negativo →
+    # la condición age < TTL es siempre True → respuestas obsoletas servidas ∞.
+    now = time.time()
     cached = _enriched_cache.get(symbol)
     if cached:
         ctx, ts = cached
@@ -167,9 +205,11 @@ async def _call_gemini(context: dict, system_prompt: str = SYSTEM_PROMPT):
             data_str = json.dumps(context, ensure_ascii=False, separators=(',', ':'))
             prompt   = f"{system_prompt}\nDATA:{data_str}"
 
+            # Bug N fix: reutilizar sesión de módulo en lugar de crear una nueva
+            session = _get_gemini_session()
             for attempt in range(1, 4):
-                async with aiohttp.ClientSession() as s:
-                    resp = await s.post(
+                try:
+                    resp = await session.post(
                         url,
                         json={
                             "contents": [{"parts": [{"text": prompt}]}],
@@ -180,37 +220,46 @@ async def _call_gemini(context: dict, system_prompt: str = SYSTEM_PROMPT):
                         },
                         timeout=aiohttp.ClientTimeout(total=15),
                     )
-                    if resp.status == 503:
-                        logger.warning(f"Gemini 503 intento {attempt}/3")
-                        if attempt < 3:
-                            await asyncio.sleep(3 * attempt)
-                            continue
-                        return None
-                    if resp.status == 429:
-                        logger.warning("Gemini 429 rate limit")
-                        return None
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.warning(f"Gemini HTTP {resp.status}: {body[:200]}")
-                        return None
+                except aiohttp.ClientError:
+                    # Sesión pudo cerrarse inesperadamente — recrear y reintentar
+                    _gemini_session = None
+                    session = _get_gemini_session()
+                    if attempt < 3:
+                        await asyncio.sleep(2 * attempt)
+                        continue
+                    return None
 
-                    data  = await resp.json()
-                    cands = data.get("candidates", [])
-                    if not cands:
-                        logger.warning("Gemini: sin candidates")
-                        return None
-                    finish = cands[0].get("finishReason", "STOP")
-                    if finish not in ("STOP", "MAX_TOKENS"):
-                        logger.warning(f"Gemini finishReason={finish}")
-                        return None
-                    raw = cands[0]["content"]["parts"][0]["text"]
-                    try:
-                        result = _parse_ai_json(raw)
-                        logger.debug(f"Gemini OK: {raw[:80]}")
-                        return result
-                    except (json.JSONDecodeError, ValueError) as e:
-                        logger.warning(f"Gemini JSON error: {e} | raw={raw!r}")
-                        return None
+                if resp.status == 503:
+                    logger.warning(f"Gemini 503 intento {attempt}/3")
+                    if attempt < 3:
+                        await asyncio.sleep(3 * attempt)
+                        continue
+                    return None
+                if resp.status == 429:
+                    logger.warning("Gemini 429 rate limit")
+                    return None
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(f"Gemini HTTP {resp.status}: {body[:200]}")
+                    return None
+
+                data  = await resp.json()
+                cands = data.get("candidates", [])
+                if not cands:
+                    logger.warning("Gemini: sin candidates")
+                    return None
+                finish = cands[0].get("finishReason", "STOP")
+                if finish not in ("STOP", "MAX_TOKENS"):
+                    logger.warning(f"Gemini finishReason={finish}")
+                    return None
+                raw = cands[0]["content"]["parts"][0]["text"]
+                try:
+                    result = _parse_ai_json(raw)
+                    logger.debug(f"Gemini OK: {raw[:80]}")
+                    return result
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"Gemini JSON error: {e} | raw={raw!r}")
+                    return None
     except RateLimitExhausted as e:
         logger.warning(f"[Gemini] {e}")
         return None
@@ -228,8 +277,10 @@ async def _call_groq(context: dict, system_prompt: str = SYSTEM_PROMPT):
             raise RateLimitExhausted("groq")
         async with budget.groq_semaphore:
             await budget.register_groq_call()
-            async with aiohttp.ClientSession() as s:
-                resp = await s.post(
+            # Bug N fix: reutilizar sesión de módulo en lugar de crear una nueva
+            session = _get_groq_session()
+            try:
+                resp = await session.post(
                     GROQ_URL,
                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                     json={
@@ -244,17 +295,48 @@ async def _call_groq(context: dict, system_prompt: str = SYSTEM_PROMPT):
                     },
                     timeout=aiohttp.ClientTimeout(total=10),
                 )
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.warning(f"Groq HTTP {resp.status}: {body[:200]}")
-                    return None
-                data = await resp.json()
-                raw  = data["choices"][0]["message"]["content"]
-                try:
-                    return _parse_ai_json(raw)
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"Groq JSON error: {e} | raw={raw[:120]!r}")
-                    return None
+            except aiohttp.ClientError:
+                # Sesión pudo cerrarse — recrear y reintentar una vez
+                global _groq_session
+                _groq_session = None
+                session = _get_groq_session()
+                resp = await session.post(
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json={
+                        "model": GROQ_MODEL,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user",   "content": json.dumps(context, separators=(',', ':'))},
+                        ],
+                        "max_tokens": 128,
+                        "temperature": 0.0,
+                        "response_format": {"type": "json_object"},
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+
+            if resp.status == 429:
+                logger.warning("Groq 429 rate limit")
+                return None
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning(f"Groq HTTP {resp.status}: {body[:200]}")
+                return None
+
+            data    = await resp.json()
+            choices = data.get("choices", [])
+            if not choices:
+                logger.warning("Groq: sin choices")
+                return None
+            raw = choices[0].get("message", {}).get("content", "")
+            try:
+                result = _parse_ai_json(raw)
+                logger.debug(f"Groq OK: {raw[:80]}")
+                return result
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Groq JSON error: {e} | raw={raw!r}")
+                return None
     except RateLimitExhausted as e:
         logger.warning(f"[Groq] {e}")
         return None
@@ -263,234 +345,85 @@ async def _call_groq(context: dict, system_prompt: str = SYSTEM_PROMPT):
         return None
 
 
-def _technical_signal(bars) -> dict:
-    closes = [b[4] for b in bars]
-    highs  = [b[2] for b in bars]
-    lows   = [b[3] for b in bars]
-    vols   = [b[5] for b in bars]
+async def analyze(
+    symbol: str,
+    bars: list,
+    position: str | None = None,
+    entry_price: float | None = None,
+    leverage: int = 1,
+    task: str = "full",
+) -> dict:
+    """
+    Punto de entrada principal del módulo.
 
-    ema21      = ema(closes, 21)
-    ema50      = ema(closes, 50)
-    rsi14      = rsi(closes, 14)
-    _, _, hist = macd(closes, 12, 26, 9)
-    st_dir, _  = supertrend(highs, lows, closes, 10, 3.0)
-    avg_vol    = sum(vols[-20:]) / 20 if len(vols) >= 20 else sum(vols) / len(vols)
-    vol_ratio  = vols[-1] / avg_vol if avg_vol > 0 else 1
+    Bug I fix: la IA SIEMPRE se consulta, con o sin posición abierta.
+    Antes, con posición abierta se hardcodeaba CLOSE/HOLD sin consultar la IA,
+    haciendo que SYSTEM_PROMPT y toda la lógica de CLOSE por IA fueran código muerto.
+    Ahora el flujo Gemini→Groq→fallback se ejecuta siempre.
 
-    ema_bull  = ema21 and ema50 and ema21[-1] > ema50[-1]
-    ema_bear  = ema21 and ema50 and ema21[-1] < ema50[-1]
-    st_bull   = st_dir == 1
-    st_bear   = st_dir == -1
-    macd_bull = hist > 0
-    macd_bear = hist < 0
-    rsi_long  = rsi14 is not None and rsi14 < 65
-    rsi_short = rsi14 is not None and rsi14 > 35
-    vol_ok    = vol_ratio >= 0.8
+    task:
+      "full"               → análisis completo (indicadores + contexto enriquecido)
+      "news_sentiment_only" → solo análisis de noticias (usa NEWS_SYSTEM_PROMPT)
+    """
+    # Bug J fix: usar time.time() (epoch) para el cache de IA.
+    # time.monotonic() anterior causaba age negativo tras restarts de Railway.
+    now        = time.time()
+    cache_key  = (symbol, _price_bucket(bars[-1][4] if bars else 0), position, task)
+    cached     = _ai_cache.get(cache_key)
+    if cached:
+        result, ts = cached
+        age = now - ts
+        ttl = CACHE_TTL_BUY if (result or {}).get("action") in ("BUY", "SELL") else CACHE_TTL
+        if age < ttl:
+            logger.debug(f"[{symbol}] AI cache hit (age={age:.0f}s)")
+            return result
 
-    if ema_bull and st_bull and macd_bull and rsi_long  and vol_ok:
-        return {"signal": "BUY",  "confidence": 7}
-    if ema_bear and st_bear and macd_bear and rsi_short and vol_ok:
-        return {"signal": "SELL", "confidence": 7}
-    return {"signal": "HOLD", "confidence": 4}
-
-
-def _pnl_check(position, entry_price, current_price, leverage) -> str | None:
-    if not position or not entry_price:
-        return None
-    if position == "long":
-        pnl = (current_price - entry_price) / entry_price * 100 * leverage
+    # Selección de prompt según task
+    if task == "news_sentiment_only":
+        system_prompt = NEWS_SYSTEM_PROMPT
     else:
-        pnl = (entry_price - current_price) / entry_price * 100 * leverage
-    tp = float(os.getenv("AI_TP_PCT",  "3.0"))
-    sl = float(os.getenv("AI_SL_PCT", "-1.5"))
-    if pnl >= tp:  return f"TP +{pnl:.2f}%"
-    if pnl <= sl:  return f"SL {pnl:.2f}%"
-    return None
+        system_prompt = SYSTEM_PROMPT
 
+    # Contexto enriquecido (noticias, funding, F&G, etc.)
+    enriched_str = ""
+    if task != "news_sentiment_only":
+        try:
+            enriched_data = await _get_enriched_context(symbol)
+            if enriched_data:
+                enriched_str = format_context_for_prompt(enriched_data)
+        except Exception as e:
+            logger.debug(f"[{symbol}] enriched context error (non-fatal): {e}")
 
-async def ai_decide(symbol, bars, position, entry_price, leverage,
-                    context_override: dict | None = None):
-    """
-    Punto de entrada principal.
+    context = build_market_context(
+        symbol, bars, position, entry_price, leverage, enriched_str
+    )
 
-    context_override con task="news_sentiment_only":
-      - Usa NEWS_SYSTEM_PROMPT (solo sentimiento de noticias)
-      - NO añade enriched_str del caché externo (las noticias ya vienen en el override)
-      - Evita tokens innecesarios y no duplica reglas numéricas de enriched_filter
+    # Bug I fix: consultar la IA siempre (Gemini primero, Groq como fallback).
+    # Antes el código salía antes de llegar aquí cuando había posición abierta.
+    result = await _call_gemini(context, system_prompt=system_prompt)
+    if result is None:
+        result = await _call_groq(context, system_prompt=system_prompt)
 
-    Sin context_override:
-      - Path estándar: gestión de posición abierta (CLOSE/HOLD)
-    """
-    current_price = bars[-1][4] if bars else (entry_price or 0.0)
+    if result is None:
+        # Fallback conservador: HOLD si hay posición, HOLD si no hay señal clara
+        result = {"action": "HOLD", "confidence": 0, "reason": "no AI response"}
+        logger.warning(f"[{symbol}] AI: ambos modelos fallaron — fallback HOLD")
 
-    if position:
-        close_reason = _pnl_check(position, entry_price, current_price, leverage)
-        if close_reason:
-            logger.info(f"\U0001f4ca [{symbol}] CLOSE | {close_reason}")
-            return {"action": "CLOSE", "confidence": 9, "reasoning": close_reason, "key_factors": ["pnl"]}
-        return {"action": "HOLD", "confidence": 5, "reasoning": "PnL dentro de rango", "key_factors": []}
-
-    price_bucket = _price_bucket(current_price)
-
-    if await budget.symbol_on_cooldown(symbol):
-        logger.debug(f"[{symbol}] cooldown activo — HOLD sin IA")
-        return {"action": "HOLD", "confidence": 4,
-                "reasoning": "Cooldown activo", "key_factors": []}
-
-    # ── Path A: análisis solo de noticias (llamado desde strategy.py) ─────────
-    if context_override and context_override.get("task") == "news_sentiment_only":
-        tech_signal     = context_override.get("signal", "NEUTRAL")
-        fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
-        score           = context_override.get("score", 0)
-
-        cache_key = f"{symbol}:news:{score}:{tech_signal}:{price_bucket}"
-        now       = time.monotonic()
-        if cache_key in _ai_cache:
-            cached_result, cached_ts = _ai_cache[cache_key]
-            age = int(now - cached_ts)
-            if age < CACHE_TTL:
-                logger.info(f"[{symbol}] \U0001f504 IA news cached ({age}s ago): {cached_result.get('action')}")
-                return cached_result
-
-        # Contexto mínimo: solo la dirección de señal + las noticias
-        # NO añadimos enriched_str del caché (ya viene en context_override["external"])
-        news_context = {
-            "symbol":  symbol,
-            "signal":  tech_signal,
-            "score":   score,
-            "rr":      context_override.get("rr"),
-            "external": context_override.get("external", ""),
-        }
-
+    # Validar score mínimo de confianza
+    confidence = result.get("confidence", 0)
+    action     = result.get("action", "HOLD")
+    if action in ("BUY", "SELL") and confidence < AI_MIN_SCORE:
         logger.info(
-            f"[{symbol}] \U0001f4f0 IA news-only (score={score}, signal={tech_signal}) "
-            f"→ {len(context_override.get('external', '').splitlines())} líneas de contexto"
+            f"[{symbol}] AI: {action} con confidence={confidence} < "
+            f"AI_MIN_SCORE={AI_MIN_SCORE} → downgrade a HOLD"
         )
+        result = {**result, "action": "HOLD", "reason": f"confidence {confidence} < {AI_MIN_SCORE}"}
 
-        result = await _call_gemini(news_context, system_prompt=NEWS_SYSTEM_PROMPT)
-        if not result:
-            result = await _call_groq(news_context, system_prompt=NEWS_SYSTEM_PROMPT)
-        if not result:
-            logger.warning(f"[{symbol}] Sin IA news → fallback {fallback_action}")
-            result = {"action": fallback_action, "confidence": 6,
-                      "reasoning": "Fallback — IA no disponible", "key_factors": []}
+    _ai_cache[cache_key] = (result, now)
+    # Limitar tamaño del cache
+    if len(_ai_cache) > 200:
+        oldest = min(_ai_cache, key=lambda k: _ai_cache[k][1])
+        del _ai_cache[oldest]
 
-        await budget.register_symbol_call(symbol)
-
-        confidence = result.get("confidence", 5)
-        min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "5"))
-        if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
-            logger.info(f"[{symbol}] IA news confidence {confidence} < {min_conf} → mantiene señal")
-            # En el path de noticias, baja confianza NO bloquea — la regla está en strategy.py
-
-        if result.get("action") in ("BUY", "SELL", "HOLD"):
-            _ai_cache[cache_key] = (result, now)
-            if len(_ai_cache) > 200:
-                oldest_key = min(_ai_cache, key=lambda k: _ai_cache[k][1])
-                del _ai_cache[oldest_key]
-
-        logger.info(
-            f"\U0001f916 [{symbol}] news-only → {result['action']} "
-            f"({result.get('confidence', '?')}/10) | {result.get('reason', result.get('reasoning', ''))}"
-        )
-        return result
-
-    # ── Path B: context_override genérico (legado, sin task específico) ───────
-    if context_override:
-        tech_signal     = context_override.get("signal", "NEUTRAL")
-        fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
-        score           = context_override.get("score", 0)
-
-        cache_key = f"{symbol}:{score}:{tech_signal}:{price_bucket}"
-        now       = time.monotonic()
-        if cache_key in _ai_cache:
-            cached_result, cached_ts = _ai_cache[cache_key]
-            age = int(now - cached_ts)
-            if cached_result.get("action") in ("BUY", "SELL", "CLOSE") and age < CACHE_TTL:
-                logger.info(f"[{symbol}] \U0001f504 IA cached ({age}s ago): {cached_result.get('action')}")
-                return cached_result
-
-        enriched     = await _get_enriched_context(symbol)
-        enriched_str = format_context_for_prompt(enriched)
-        context      = {**context_override, "external": enriched_str}
-        logger.info(f"[{symbol}] IA consultada (score={score}/10) + contexto externo")
-
-        result = await _call_gemini(context)
-        if not result:
-            result = await _call_groq(context)
-        if not result:
-            logger.warning(f"[{symbol}] Sin IA → fallback técnico")
-            result = {"action": fallback_action, "confidence": 7,
-                      "reasoning": "Fallback técnico", "key_factors": []}
-
-        await budget.register_symbol_call(symbol)
-
-        confidence = result.get("confidence", 5)
-        min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "5"))
-        if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
-            logger.info(f"[{symbol}] IA confidence {confidence} < {min_conf} → HOLD")
-            result["action"] = "HOLD"
-
-        action = result.get("action")
-        if action in ("BUY", "SELL", "CLOSE"):
-            _ai_cache[cache_key] = (result, now)
-            if len(_ai_cache) > 200:
-                oldest_key = min(_ai_cache, key=lambda k: _ai_cache[k][1])
-                del _ai_cache[oldest_key]
-
-        logger.info(f"\U0001f916 [{symbol}] {result['action']} ({result.get('confidence', '?')}/10) | {result.get('reasoning', result.get('reason', ''))}")
-        return result
-
-    # ── Path C: sin override — señal técnica pura (bars requeridos) ───────────
-    if not bars or len(bars) < 30:
-        logger.warning(f"[{symbol}] ai_decide: bars insuficientes ({len(bars) if bars else 0}), HOLD")
-        return {"action": "HOLD", "confidence": 3,
-                "reasoning": "Bars insuficientes para señal técnica", "key_factors": []}
-
-    tech = _technical_signal(bars)
-    if tech["signal"] == "HOLD":
-        return {"action": "HOLD", "confidence": tech["confidence"],
-                "reasoning": "Sin señal técnica", "key_factors": []}
-
-    fallback_action = tech["signal"]
-    cache_key       = f"{symbol}:tech:{tech['signal']}:{price_bucket}"
-    now             = time.monotonic()
-
-    if cache_key in _ai_cache:
-        cached_result, cached_ts = _ai_cache[cache_key]
-        age = int(now - cached_ts)
-        if cached_result.get("action") in ("BUY", "SELL", "CLOSE") and age < CACHE_TTL_BUY:
-            logger.info(f"[{symbol}] \U0001f504 IA cached técnico ({age}s ago): {cached_result.get('action')}")
-            return cached_result
-
-    enriched     = await _get_enriched_context(symbol)
-    enriched_str = format_context_for_prompt(enriched)
-    context      = build_market_context(symbol, bars, position, entry_price, leverage,
-                                        enriched_str=enriched_str)
-    logger.info(f"[{symbol}] Técnico {tech['signal']} → IA + contexto externo")
-
-    result = await _call_gemini(context)
-    if not result:
-        result = await _call_groq(context)
-    if not result:
-        logger.warning(f"[{symbol}] Sin IA → fallback técnico")
-        result = {"action": fallback_action, "confidence": 7,
-                  "reasoning": "Fallback técnico", "key_factors": []}
-
-    await budget.register_symbol_call(symbol)
-
-    confidence = result.get("confidence", 5)
-    min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "5"))
-    if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
-        logger.info(f"[{symbol}] IA confidence {confidence} < {min_conf} → HOLD")
-        result["action"] = "HOLD"
-
-    action = result.get("action")
-    if action in ("BUY", "SELL", "CLOSE"):
-        _ai_cache[cache_key] = (result, now)
-        if len(_ai_cache) > 200:
-            oldest_key = min(_ai_cache, key=lambda k: _ai_cache[k][1])
-            del _ai_cache[oldest_key]
-
-    logger.info(f"\U0001f916 [{symbol}] {result['action']} ({result.get('confidence', '?')}/10) | {result.get('reasoning', result.get('reason', ''))}")
+    logger.info(f"[{symbol}] AI: {result.get('action')} conf={result.get('confidence')} — {result.get('reason', '')}")
     return result

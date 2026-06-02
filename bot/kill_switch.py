@@ -33,6 +33,18 @@ FIX #9 (2026-06-02):
   KILL_SWITCH_REARM_KEY tiene valor por defecto público en el repo.
   Cualquiera que lea el código puede llamar manual_reset si tiene acceso
   al bot de Telegram. Se añade comentario para forzar cambio en .env.
+
+FIX Bug L (2026-06-02):
+  reset_daily_pnl() era síncrono y modificaba _daily_pnl / _consec_losses /
+  _api_reconnects sin asyncio.Lock → race condition con on_trade_result()
+  corriendo concurrentemente en el mismo event loop.
+  Fix: convertir a async y proteger con self._lock.
+  _watchdog_tick actualizado con await.
+
+FIX Bug M (2026-06-02):
+  on_state_mismatch() leía self._tpsl_retrying fuera del lock → patrón
+  frágil susceptible a race condition aunque el GIL cubra sets en CPython.
+  Fix: mover la lectura del set dentro de async with self._lock.
 """
 
 import asyncio
@@ -296,9 +308,6 @@ class KillSwitch:
         Registrar si una orden fue rechazada (para reject-rate).
 
         FIX #2 — ventana deslizante de KS_REJECT_WINDOW_ORDERS (default 200).
-        En vez de dividir por un contador que crece sin límite, mantenemos dos
-        deques y calculamos la tasa sobre la ventana fija. Así el KS es sensible
-        a spikes reales pero no se congela de forma permanente.
         """
         window_size = _CFG["reject_window_orders"]
         now = time.monotonic()
@@ -347,12 +356,17 @@ class KillSwitch:
             await self.activate(2, f"API/WS reconexiones excesivas: {count}")
 
     async def on_state_mismatch(self, symbol: str):
-        """Mismatch entre estado local y exchange."""
-        if symbol in self._tpsl_retrying:
-            logger.debug(f"[{symbol}] KS: state_mismatch ignorado — TPSL retry activo")
-            return
+        """
+        Mismatch entre estado local y exchange.
 
+        Bug M fix: leer self._tpsl_retrying DENTRO del lock para evitar
+        race condition con mark_tpsl_retrying() / clear_tpsl_retrying().
+        """
         async with self._lock:
+            # Bug M fix: lectura del set protegida por el lock
+            if symbol in self._tpsl_retrying:
+                logger.debug(f"[{symbol}] KS: state_mismatch ignorado — TPSL retry activo")
+                return
             self._state_mismatches += 1
             count = self._state_mismatches
 
@@ -360,11 +374,18 @@ class KillSwitch:
         if count >= _CFG["max_state_mismatch"]:
             await self.activate(3, f"State mismatch acumulado: {count} veces")
 
-    def reset_daily_pnl(self):
-        """Llamar al inicio de cada día UTC."""
-        self._daily_pnl      = 0.0
-        self._consec_losses  = 0
-        self._api_reconnects = 0
+    async def reset_daily_pnl(self):
+        """
+        Llamar al inicio de cada día UTC.
+
+        Bug L fix: convertido a async y protegido con self._lock.
+        Antes era síncrono sin lock → race condition con on_trade_result()
+        corriendo concurrentemente en el mismo event loop de asyncio.
+        """
+        async with self._lock:
+            self._daily_pnl      = 0.0
+            self._consec_losses  = 0
+            self._api_reconnects = 0
         logger.info("KS: contadores diarios reseteados")
 
     # ── Watchdog ───────────────────────────────────────────────────────────────────────────
@@ -397,10 +418,10 @@ class KillSwitch:
             if reset_done:
                 return  # este tick ya no necesita procesar nada más
 
-        # Reset diario a las 00:00 UTC
+        # Bug L fix: reset_daily_pnl() ahora es async — usar await
         now_utc = datetime.now(timezone.utc)
         if now_utc.hour == 0 and now_utc.minute < 1:
-            self.reset_daily_pnl()
+            await self.reset_daily_pnl()
 
         for symbol, trader in list(traders.items()):
             try:
@@ -482,14 +503,10 @@ class KillSwitch:
             self._consec_losses     = state.get("consec_losses", 0)
 
             # FIX #3 — Leer epoch guardado y recalcular monotonic
-            # Formula: monotonic_equiv = time.monotonic() - (time.time() - saved_epoch)
-            # Esto reconstruye cuánto tiempo ha transcurrido desde la activación de L2,
-            # de forma que el cooldown restante sea correcto aunque el proceso haya reiniciado.
             if self._level == 2:
                 saved_epoch = state.get("ks2_activated_at_epoch")
                 if saved_epoch is not None:
                     elapsed_since_activation = time.time() - saved_epoch
-                    # Reconstituir como si se hubiera activado hace elapsed_since_activation segundos
                     self._ks2_activated_at    = time.monotonic() - elapsed_since_activation
                     self._ks2_activated_epoch = saved_epoch
                     logger.info(
@@ -498,14 +515,9 @@ class KillSwitch:
                         max(0, _CFG["l2_cooldown_seconds"] - elapsed_since_activation),
                     )
                 else:
-                    # Estado antiguo sin epoch — empezar cooldown ahora
                     self._ks2_activated_at    = time.monotonic()
                     self._ks2_activated_epoch = time.time()
                     logger.info("KS L2 restaurado sin epoch — cooldown empezando ahora")
-
-            # Compatibilidad hacia atrás: leer clave antigua ks2_activated_at_mono si existe
-            # (ficheros de estado generados antes del fix #3) — ignorar su valor numérico,
-            # solo nos sirve para saber que L2 estaba activo (ya manejado arriba).
 
             if self._level > 0:
                 logger.warning(

@@ -6,6 +6,14 @@ Fix incluido (Bug D):
   on_position_closed: register_close ahora se ejecuta en try/finally a través
   de register_close_safe(), garantizando que el slot de margin se libera
   aunque register_close() lance una excepción interna.
+
+Fix Bug K (2026-06-02):
+  decision_engine llamaba a self._signal.get_signal() que NO existe en
+  signal_engine.py — solo existe analyze_pair(). El AttributeError era
+  silenciado por el try/except en evaluate(), haciendo que Gate 3 nunca
+  pasara y el bot nunca abriera posiciones.
+  Fix: llamar a analyze_pair() directamente y convertir SignalResult al
+  dict que espera el caller ({action, entry_mode, sl, tp1, tp2, ...}).
 """
 from __future__ import annotations
 
@@ -32,7 +40,7 @@ class DecisionEngine:
     def __init__(self, risk_manager, pretrade_risk, signal_engine, cooldown) -> None:
         self._risk         = risk_manager
         self._pretrade     = pretrade_risk
-        self._signal       = signal_engine
+        self._signal       = signal_engine   # módulo signal_engine (no una instancia)
         self._cooldown     = cooldown
 
     # ── Evaluación de señal ───────────────────────────────────────────────────
@@ -44,6 +52,9 @@ class DecisionEngine:
         Retorna un dict con la señal si se debe abrir, None en caso contrario.
         El caller (trading loop) es responsable de verificar que no haya
         posición abierta antes de llamar a evaluate().
+
+        Bug K fix: usa analyze_pair() de signal_engine (no get_signal() que
+        no existe) y convierte SignalResult → dict para compatibilidad.
         """
         # Gate 1: cooldown activo
         if self._cooldown.is_in_cooldown(symbol):
@@ -63,20 +74,49 @@ class DecisionEngine:
             return None
 
         # Gate 3: señal técnica
+        # Bug K fix: signal_engine expone analyze_pair(), NO get_signal().
+        # Llamamos analyze_pair() y convertimos SignalResult → dict.
         try:
-            signal = await self._signal.get_signal(symbol, price, ohlcv)
+            from bot.signal_engine import analyze_pair
+            result = await analyze_pair(exch=None, symbol=symbol, ohlcv_fn=_make_ohlcv_fn(ohlcv))
         except Exception as e:
-            log.warning("[%s] evaluate: signal_engine.get_signal error: %s", symbol, e)
+            log.warning("[%s] evaluate: analyze_pair error: %s", symbol, e)
             return None
 
-        if not signal or signal.get("action") == "HOLD":
+        if result is None or not result.is_valid:
+            log.debug("[%s] evaluate: señal inválida — %s", symbol, getattr(result, 'reason', ''))
             return None
+
+        if result.signal not in ("LONG", "SHORT"):
+            log.debug("[%s] evaluate: señal NEUTRAL/HOLD — sin entrada", symbol)
+            return None
+
+        # Convertir SignalResult → dict compatible con el caller
+        signal = {
+            "action":      "BUY" if result.signal == "LONG" else "SELL",
+            "side":        "long" if result.signal == "LONG" else "short",
+            "entry_mode":  result.entry_mode,
+            "entry":       result.entry,
+            "sl":          result.sl,
+            "tp1":         result.tp1,
+            "tp2":         result.tp2,
+            "atr":         result.atr,
+            "rr":          result.rr,
+            "score":       result.score,
+            "max_score":   result.max_score,
+            "leverage":    result.suggested_lev,
+            "indicators":  result.indicators,
+            "reason":      result.reason,
+        }
 
         log.info(
-            "[%s] evaluate: señal ACEPTADA action=%s entry_mode=%s",
+            "[%s] evaluate: señal ACEPTADA action=%s entry_mode=%s score=%d/%d rr=%.2f",
             symbol,
-            signal.get("action"),
-            signal.get("entry_mode", "NORMAL"),
+            signal["action"],
+            signal["entry_mode"],
+            result.score,
+            result.max_score,
+            result.rr,
         )
         return signal
 
@@ -135,3 +175,23 @@ class DecisionEngine:
                 symbol, type(e).__name__, e,
                 exc_info=True,
             )
+
+
+# ── Helper: adaptar lista ohlcv plana a ohlcv_fn callable ────────────────────
+
+def _make_ohlcv_fn(ohlcv_data: list):
+    """
+    Bug K fix: analyze_pair() acepta un callable async ohlcv_fn(timeframe) -> list.
+    Cuando DecisionEngine recibe ohlcv como lista plana (un solo timeframe),
+    este helper lo envuelve en un callable compatible.
+
+    Si ohlcv_data es un dict {tf: bars}, lo sirve directamente por timeframe.
+    Si es una lista plana, se asume que son velas 15m y se sirve para cualquier TF.
+    """
+    if isinstance(ohlcv_data, dict):
+        async def _fn(tf: str):
+            return ohlcv_data.get(tf, [])
+    else:
+        async def _fn(tf: str):
+            return ohlcv_data if tf == "15m" else []
+    return _fn
