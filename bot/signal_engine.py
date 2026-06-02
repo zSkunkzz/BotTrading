@@ -33,34 +33,33 @@ FIX symbol_format:
 
 FIX ST4h:
   SuperTrend 4h añadido al scoring (+1 LONG / +1 SHORT).
-  max_score sube de 10 a 12. Los umbrales de entry_mode se ajustan proporcionalmente:
-    STRONG : score >= max_score - 2  (antes -1)
-    NORMAL : score >= MIN_SCORE + 2  (sin cambio)
-    EARLY  : resto válido
+  max_score sube de 10 a 12. Los umbrales de entry_mode se ajustan proporcionalmente.
+
+FIX rsi_vol_1h:
+  RSI y volumen del 1h añadidos al scoring (+1 LONG / +1 SHORT cada uno).
+  max_score sube de 12 a 14. MIN_SCORE sube de 8 a 10 (mantiene ~71% efectivo).
+  El 4h NO recibe RSI/vol: la vela 4h cambia cada 4h y es demasiado lenta
+  para añadir información direccional util en ciclos de 15m.
+  Umbrales recalibrados:
+    STRONG : score >= max_score - 2 = 12
+    NORMAL : score >= MIN_SCORE + 2 = 12  (igual que STRONG en este punto)
+    EARLY  : score >= MIN_SCORE     = 10
 
 FIX entry=close:
   entry usa close_price en lugar del mid de vela (high+low)/2.
-  El mid puede diferir significativamente del precio real si la vela está incompleta.
 
 FIX FlipGuard .signal:
-  SignalFlipGuard.allow() ahora lee .signal de SignalResult además de .side,
-  lo que antes hacía que el guard siempre devolviera True con objetos SignalResult.
+  SignalFlipGuard.allow() ahora lee .signal de SignalResult además de .side.
 
 FIX manual_close_cooldown:
-  ManualCloseCooldown registra cierres manuales (sin SL/TP hit) y bloquea
-  reentradas al mismo símbolo durante MANUAL_CLOSE_COOLDOWN_S segundos.
-  Exportado como manual_close_cooldown (singleton).
+  ManualCloseCooldown registra cierres manuales y bloquea reentradas.
 
 FIX tf1h_empty (CRÍTICO):
   tf1h_ok ahora requiere que i1h NO esté vacío Y tenga ema_bull/st_bull.
-  Antes, un dict vacío {} hacía que (not i1h) == True y el check 1h se saltaba
-  completamente, permitiendo entradas sin confirmación de timeframe mayor.
 
 FIX min_score_max_score (CRÍTICO):
-  MIN_SCORE por defecto sube de 6 a 8 ahora que max_score=12.
-  Con max_score=10 (antes), MIN_SCORE=6 era el 60%. Con max_score=12,
-  MIN_SCORE=6 era solo el 50% — señales de baja calidad pasaban como válidas.
-  MIN_SCORE=8 restaura el umbral efectivo al ~67%.
+  MIN_SCORE default 10 (antes 8) para max_score=14.
+  Umbral efectivo: 10/14 = 71%.
 """
 from __future__ import annotations
 
@@ -74,10 +73,10 @@ from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr
 
 log = logging.getLogger(__name__)
 
-# ─── Constantes exportadas ────────────────────────────────────────────────────
+# ─── Constantes exportadas ──────────────────────────────────────────────────────────────────────────
 
-# FIX min_score_max_score: default sube a 8 (antes 6) para compensar max_score=12
-MIN_SCORE: int   = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
+# FIX rsi_vol_1h: MIN_SCORE sube a 10 para compensar max_score=14
+MIN_SCORE: int   = int(os.getenv("MIN_SIGNAL_SCORE", "10"))
 MIN_RR: float    = float(os.getenv("MIN_RR_REQUIRED", "1.8"))
 
 _TIMEFRAMES  = ["15m", "1h", "4h"]
@@ -89,7 +88,7 @@ _TP1_ATR_MULT = float(os.getenv("TP1_ATR_MULT", "2.8"))
 _TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "4.5"))
 _MAX_LEV      = int(os.getenv("LEVERAGE", "15"))
 
-# FIX 1: Zonas RSI asimétricas y no solapadas
+# Zonas RSI asimétricas y no solapadas (aplicadas en 15m y 1h)
 _RSI_LONG_MIN  = float(os.getenv("RSI_SCORE_LONG_MIN",  "45"))
 _RSI_LONG_MAX  = float(os.getenv("RSI_SCORE_LONG_MAX",  "65"))
 _RSI_SHORT_MIN = float(os.getenv("RSI_SCORE_SHORT_MIN", "35"))
@@ -101,7 +100,7 @@ _VOL_WEAK_MAX        = float(os.getenv("VOL_WEAK_MAX",        "0.8"))
 _SL_CANDLE_BUFFER = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 
 
-# ─── _to_ccxt_symbol ────────────────────────────────────────────────────────────────────
+# ─── _to_ccxt_symbol ─────────────────────────────────────────────────────────────────────────────────────
 
 def _to_ccxt_symbol(symbol: str) -> str:
     """
@@ -117,7 +116,6 @@ def _to_ccxt_symbol(symbol: str) -> str:
     if "/USDC:USDC" in symbol:
         return symbol
 
-    # Quitar sufijos comunes
     coin = (
         symbol
         .replace(":USDT", "")
@@ -132,7 +130,7 @@ def _to_ccxt_symbol(symbol: str) -> str:
     return f"{coin}/USDC:USDC"
 
 
-# ─── SignalResult ───────────────────────────────────────────────────────────────────────
+# ─── SignalResult ───────────────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class SignalResult:
@@ -156,7 +154,7 @@ class SignalResult:
     extra:        Dict = field(default_factory=dict)
 
 
-# ─── analyze_pair ──────────────────────────────────────────────────────────────────────
+# ─── analyze_pair ──────────────────────────────────────────────────────────────────────────────────────
 
 async def analyze_pair(
     exch,
@@ -195,11 +193,10 @@ async def analyze_pair(
         return _hold_result(symbol, f"NEUTRAL (score={score}/{max_score})")
 
     last_bar    = bars_15m[-1]
-    # FIX entry=close: usar close_price en lugar de mid de vela incompleta
     close_price = float(last_bar[4])
     high_price  = float(last_bar[2])
     low_price   = float(last_bar[3])
-    entry = close_price  # precio real de ejecución, no (high+low)/2
+    entry = close_price
 
     atr_val = float(ind_15m.get("atr", 0) or 0)
     if atr_val <= 0:
@@ -223,10 +220,10 @@ async def analyze_pair(
     reward = abs(tp1 - entry)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
 
-    # FIX ST4h: max_score ahora es 12, ajustar umbrales de entry_mode
-    if score >= max_score - 2:
+    # FIX rsi_vol_1h: max_score=14, STRONG >= 12, NORMAL >= 12, EARLY >= 10
+    if score >= max_score - 2:      # >= 12
         entry_mode = "STRONG"
-    elif score >= MIN_SCORE + 2:
+    elif score >= MIN_SCORE + 2:    # >= 12 (con MIN_SCORE=10)
         entry_mode = "NORMAL"
     else:
         entry_mode = "EARLY"
@@ -266,7 +263,7 @@ async def analyze_pair(
     )
 
 
-# ─── OHLCV fetch (fallback sin caché) ────────────────────────────────────────────────────
+# ─── OHLCV fetch (fallback sin caché) ──────────────────────────────────────────────────────────────────────────────
 
 async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
     """
@@ -282,7 +279,7 @@ async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
         return []
 
 
-# ─── Indicadores ────────────────────────────────────────────────────────────────────────
+# ─── Indicadores ──────────────────────────────────────────────────────────────────────────────────────
 
 def _compute_indicators(bars: list) -> dict:
     """Calcula EMA21/50, RSI14, MACD, SuperTrend, ATR14 y vol_ratio."""
@@ -323,85 +320,114 @@ def _compute_indicators(bars: list) -> dict:
     }
 
 
-# ─── Scoring ──────────────────────────────────────────────────────────────────────────────
+# ─── _score_rsi_vol: helper reutilizable para RSI+vol en cualquier TF ─────────────────────────
+
+def _score_rsi_vol(
+    ind: dict,
+    tf_label: str,
+    long_pts: int,
+    short_pts: int,
+    reasons: List[str],
+) -> Tuple[int, int]:
+    """
+    Aplica scoring de RSI y volumen de un timeframe dado.
+    Retorna (long_pts, short_pts) actualizados.
+    Usado en 15m y 1h. No se aplica a 4h (vela demasiado lenta).
+    """
+    rsi_val   = ind.get("rsi_val")
+    vol_ratio = ind.get("vol_ratio", 1.0)
+    price_dir = ind.get("price_dir", "unknown")
+
+    if rsi_val is not None:
+        if _RSI_LONG_MIN <= rsi_val <= _RSI_LONG_MAX:
+            long_pts += 1
+            reasons.append(f"RSI{tf_label}={rsi_val:.0f} zona LONG (45-65)")
+        elif _RSI_SHORT_MIN <= rsi_val < _RSI_LONG_MIN:
+            short_pts += 1
+            reasons.append(f"RSI{tf_label}={rsi_val:.0f} zona SHORT (35-44)")
+        elif rsi_val > 70:
+            reasons.append(f"RSI{tf_label}={rsi_val:.0f} sobrecompra — no puntua")
+        elif rsi_val < 30:
+            reasons.append(f"RSI{tf_label}={rsi_val:.0f} sobreventa — no puntua")
+        else:
+            reasons.append(f"RSI{tf_label}={rsi_val:.0f} zona neutra — no puntua")
+
+    if vol_ratio >= _VOL_DIRECTIONAL_MIN:
+        if price_dir == "rising":
+            long_pts  += 1
+            reasons.append(f"Vol{tf_label}={vol_ratio:.1f}x subiendo \u2191")
+        elif price_dir == "falling":
+            short_pts += 1
+            reasons.append(f"Vol{tf_label}={vol_ratio:.1f}x bajando \u2193")
+        else:
+            reasons.append(f"Vol{tf_label}={vol_ratio:.1f}x sin dir clara")
+    elif vol_ratio < _VOL_WEAK_MAX:
+        reasons.append(f"Vol{tf_label}={vol_ratio:.1f}x debil — no puntua")
+    else:
+        reasons.append(f"Vol{tf_label}={vol_ratio:.1f}x normal — no puntua")
+
+    return long_pts, short_pts
+
+
+# ─── Scoring ──────────────────────────────────────────────────────────────────────────────────────────────
 
 def _score_signal(
     i15: dict, i1h: dict, i4h: dict
 ) -> Tuple[int, int, str, List[str]]:
-    # FIX ST4h: max_score sube a 12 (+1 ST4h LONG, +1 ST4h SHORT)
-    max_score = 12
+    """
+    Puntuacion maxima por timeframe:
+      15m: EMA(1) + MACD(1) + ST(1) + RSI(1) + Vol(1) = 5 pts
+       1h: EMA(1) + MACD(1) + ST(1) + RSI(1) + Vol(1) = 5 pts  <- FIX rsi_vol_1h
+       4h: EMA(1) + MACD(1) + ST(1)                   = 4 pts
+    Total max_score = 14
+    """
+    # FIX rsi_vol_1h: max_score sube a 14
+    max_score = 14
     long_pts  = 0
     short_pts = 0
     reasons   = []
 
-    if i15.get("ema_bull"):  long_pts  += 1; reasons.append("EMA15m↑")
-    if i15.get("ema_bear"):  short_pts += 1; reasons.append("EMA15m↓")
-    if i15.get("macd_bull"): long_pts  += 1; reasons.append("MACD15m↑")
-    if i15.get("macd_bear"): short_pts += 1; reasons.append("MACD15m↓")
-    if i15.get("st_bull"):   long_pts  += 1; reasons.append("ST15m↑")
-    if i15.get("st_bear"):   short_pts += 1; reasons.append("ST15m↓")
+    # —— 15m: EMA + MACD + ST ——
+    if i15.get("ema_bull"):  long_pts  += 1; reasons.append("EMA15m\u2191")
+    if i15.get("ema_bear"):  short_pts += 1; reasons.append("EMA15m\u2193")
+    if i15.get("macd_bull"): long_pts  += 1; reasons.append("MACD15m\u2191")
+    if i15.get("macd_bear"): short_pts += 1; reasons.append("MACD15m\u2193")
+    if i15.get("st_bull"):   long_pts  += 1; reasons.append("ST15m\u2191")
+    if i15.get("st_bear"):   short_pts += 1; reasons.append("ST15m\u2193")
 
-    rsi15 = i15.get("rsi_val")
-    if rsi15 is not None:
-        if _RSI_LONG_MIN <= rsi15 <= _RSI_LONG_MAX:
-            long_pts += 1
-            reasons.append(f"RSI15m={rsi15:.0f} zona LONG (45-65)")
-        elif _RSI_SHORT_MIN <= rsi15 < _RSI_LONG_MIN:
-            short_pts += 1
-            reasons.append(f"RSI15m={rsi15:.0f} zona SHORT (35-44)")
-        elif _RSI_SHORT_MAX < rsi15 < _RSI_LONG_MIN:
-            reasons.append(f"RSI15m={rsi15:.0f} zona neutra — no puntúa")
-        elif rsi15 > 70:
-            reasons.append(f"RSI15m={rsi15:.0f} sobrecompra — no puntúa")
-        elif rsi15 < 30:
-            reasons.append(f"RSI15m={rsi15:.0f} sobreventa — no puntúa")
-        else:
-            reasons.append(f"RSI15m={rsi15:.0f} zona neutra — no puntúa")
+    # —— 15m: RSI + Volumen ——
+    long_pts, short_pts = _score_rsi_vol(i15, "15m", long_pts, short_pts, reasons)
 
-    vol15     = i15.get("vol_ratio", 1.0)
-    price_dir = i15.get("price_dir", "unknown")
-    if vol15 >= _VOL_DIRECTIONAL_MIN:
-        if price_dir == "rising":
-            long_pts  += 1
-            reasons.append(f"Vol15m={vol15:.1f}x subiendo ↑")
-        elif price_dir == "falling":
-            short_pts += 1
-            reasons.append(f"Vol15m={vol15:.1f}x bajando ↓")
-        else:
-            reasons.append(f"Vol15m={vol15:.1f}x sin dir clara")
-    elif vol15 < _VOL_WEAK_MAX:
-        reasons.append(f"Vol15m={vol15:.1f}x débil — no puntúa")
-    else:
-        reasons.append(f"Vol15m={vol15:.1f}x normal — no puntúa")
-
+    # —— 1h: EMA + MACD + ST ——
     if i1h:
-        if i1h.get("ema_bull"):  long_pts  += 1; reasons.append("EMA1h↑")
-        if i1h.get("ema_bear"):  short_pts += 1; reasons.append("EMA1h↓")
-        if i1h.get("macd_bull"): long_pts  += 1; reasons.append("MACD1h↑")
-        if i1h.get("macd_bear"): short_pts += 1; reasons.append("MACD1h↓")
-        if i1h.get("st_bull"):   long_pts  += 1; reasons.append("ST1h↑")
-        if i1h.get("st_bear"):   short_pts += 1; reasons.append("ST1h↓")
+        if i1h.get("ema_bull"):  long_pts  += 1; reasons.append("EMA1h\u2191")
+        if i1h.get("ema_bear"):  short_pts += 1; reasons.append("EMA1h\u2193")
+        if i1h.get("macd_bull"): long_pts  += 1; reasons.append("MACD1h\u2191")
+        if i1h.get("macd_bear"): short_pts += 1; reasons.append("MACD1h\u2193")
+        if i1h.get("st_bull"):   long_pts  += 1; reasons.append("ST1h\u2191")
+        if i1h.get("st_bear"):   short_pts += 1; reasons.append("ST1h\u2193")
 
+        # FIX rsi_vol_1h: RSI + Volumen en 1h
+        long_pts, short_pts = _score_rsi_vol(i1h, "1h", long_pts, short_pts, reasons)
+
+    # —— 4h: EMA + MACD + ST (sin RSI/vol: vela demasiado lenta) ——
     if i4h:
-        if i4h.get("ema_bull"):  long_pts  += 1; reasons.append("EMA4h↑")
-        if i4h.get("ema_bear"):  short_pts += 1; reasons.append("EMA4h↓")
-        if i4h.get("macd_bull"): long_pts  += 1; reasons.append("MACD4h↑")
-        if i4h.get("macd_bear"): short_pts += 1; reasons.append("MACD4h↓")
-        # FIX ST4h: SuperTrend 4h añadido al scoring
-        if i4h.get("st_bull"):   long_pts  += 1; reasons.append("ST4h↑")
-        if i4h.get("st_bear"):   short_pts += 1; reasons.append("ST4h↓")
+        if i4h.get("ema_bull"):  long_pts  += 1; reasons.append("EMA4h\u2191")
+        if i4h.get("ema_bear"):  short_pts += 1; reasons.append("EMA4h\u2193")
+        if i4h.get("macd_bull"): long_pts  += 1; reasons.append("MACD4h\u2191")
+        if i4h.get("macd_bear"): short_pts += 1; reasons.append("MACD4h\u2193")
+        if i4h.get("st_bull"):   long_pts  += 1; reasons.append("ST4h\u2191")
+        if i4h.get("st_bear"):   short_pts += 1; reasons.append("ST4h\u2193")
 
+    # —— Confirmacion de tendencia en 1h (obligatoria) ——
     if long_pts > short_pts:
-        # FIX tf1h_empty (CRÍTICO): i1h vacío ({}) NO cuenta como confirmación.
-        # Antes: (not i1h) era True con {} → check 1h ignorado completamente.
-        # Ahora: se requiere que i1h tenga datos Y confirme alcista.
+        # FIX tf1h_empty: i1h vacio ({}) NO cuenta como confirmacion
         tf1h_ok = bool(i1h) and (i1h.get("ema_bull") or i1h.get("st_bull"))
         if tf1h_ok:
             return long_pts, max_score, "LONG", reasons
         return long_pts, max_score, "NEUTRAL", reasons + ["1h_no_confirma"]
 
     if short_pts > long_pts:
-        # FIX tf1h_empty (CRÍTICO): mismo fix para SHORT
         tf1h_ok = bool(i1h) and (i1h.get("ema_bear") or i1h.get("st_bear"))
         if tf1h_ok:
             return short_pts, max_score, "SHORT", reasons
@@ -410,7 +436,7 @@ def _score_signal(
     return long_pts, max_score, "NEUTRAL", reasons + ["empate"]
 
 
-# ─── _hold_result ──────────────────────────────────────────────────────────────────────────
+# ─── _hold_result ────────────────────────────────────────────────────────────────────────────────────────
 
 def _hold_result(symbol: str, reason: str) -> SignalResult:
     return SignalResult(
@@ -418,7 +444,7 @@ def _hold_result(symbol: str, reason: str) -> SignalResult:
         signal="NEUTRAL",
         entry_mode="HOLD",
         score=0,
-        max_score=12,
+        max_score=14,
         entry=0.0,
         sl=0.0,
         tp1=0.0,
@@ -432,19 +458,19 @@ def _hold_result(symbol: str, reason: str) -> SignalResult:
     )
 
 
-# ─── format_signal_block ───────────────────────────────────────────────────────────────────
+# ─── format_signal_block ───────────────────────────────────────────────────────────────────────────────────────
 
 def format_signal_block(signal: Optional[SignalResult]) -> str:
     if signal is None:
         return ""
 
-    arrow = "🟢 LONG" if signal.signal == "LONG" else "🔴 SHORT" if signal.signal == "SHORT" else "⚪ NEUTRAL"
+    arrow = "\U0001f7e2 LONG" if signal.signal == "LONG" else "\U0001f534 SHORT" if signal.signal == "SHORT" else "\u26aa NEUTRAL"
     lev   = f"{signal.suggested_lev}x" if signal.suggested_lev else "—"
     rr    = f"{signal.rr:.2f}" if signal.rr else "—"
 
     lines = [
-        f"**{signal.symbol}** · {arrow}",
-        f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
+        f"**{signal.symbol}** \u00b7 {arrow}",
+        f"Score: `{signal.score}/{signal.max_score}` \u00b7 Mode: `{signal.entry_mode}` \u00b7 Lev: `{lev}` \u00b7 R/R: `{rr}`",
     ]
     if signal.entry:
         lines.append(
@@ -456,7 +482,7 @@ def format_signal_block(signal: Optional[SignalResult]) -> str:
     return "\n".join(lines)
 
 
-# ─── SignalFlipGuard ───────────────────────────────────────────────────────────────────────
+# ─── SignalFlipGuard ───────────────────────────────────────────────────────────────────────────────────────
 
 _FLIP_COOLDOWN_S = float(os.getenv("SIGNAL_FLIP_COOLDOWN_S", "120"))
 
@@ -476,8 +502,7 @@ class SignalFlipGuard:
         if signal is None:
             return True
 
-        # FIX FlipGuard .signal: leer .signal de SignalResult además de .side
-        # Antes solo buscaba .side (que no existe en SignalResult) → siempre True
+        # FIX FlipGuard .signal: leer .signal de SignalResult ademas de .side
         side = getattr(signal, "side", None) or getattr(signal, "signal", None)
         if not side:
             if isinstance(signal, str) and signal in ("long", "short", "buy", "sell",
@@ -514,7 +539,7 @@ class SignalFlipGuard:
 signal_flip_guard = SignalFlipGuard()
 
 
-# ─── ManualCloseCooldown ──────────────────────────────────────────────────────────────────
+# ─── ManualCloseCooldown ────────────────────────────────────────────────────────────────────────────────────
 
 _MANUAL_CLOSE_COOLDOWN_S = int(os.getenv("MANUAL_CLOSE_COOLDOWN_S", "600"))  # 10 min default
 
@@ -522,15 +547,7 @@ _MANUAL_CLOSE_COOLDOWN_S = int(os.getenv("MANUAL_CLOSE_COOLDOWN_S", "600"))  # 1
 class ManualCloseCooldown:
     """
     FIX manual_close_cooldown: registra cierres manuales (sin SL/TP hit) y bloquea
-    reentradas al mismo símbolo durante MANUAL_CLOSE_COOLDOWN_S segundos.
-
-    Uso en trader:
-        # Al detectar posición=0 sin SL/TP hit:
-        manual_close_cooldown.register(symbol)
-
-    Uso en strategy.decide() o trader antes de llamar a decide():
-        if manual_close_cooldown.is_blocked(symbol):
-            return  # no entrar
+    reentradas al mismo simbolo durante MANUAL_CLOSE_COOLDOWN_S segundos.
     """
 
     def __init__(self, cooldown_s: int = _MANUAL_CLOSE_COOLDOWN_S):
@@ -538,7 +555,6 @@ class ManualCloseCooldown:
         self._closed: Dict[str, float] = {}
 
     def register(self, symbol: str) -> None:
-        """Registra un cierre manual para el símbolo."""
         self._closed[symbol] = time.monotonic()
         log.info(
             "[ManualCloseCooldown] %s: cooldown manual activado (%ds)",
@@ -546,7 +562,6 @@ class ManualCloseCooldown:
         )
 
     def is_blocked(self, symbol: str) -> bool:
-        """Devuelve True si el símbolo está en cooldown por cierre manual."""
         ts = self._closed.get(symbol)
         if ts is None:
             return False
@@ -558,12 +573,10 @@ class ManualCloseCooldown:
                 symbol, remaining,
             )
             return True
-        # Expirado: limpiar
         del self._closed[symbol]
         return False
 
     def clear(self, symbol: str) -> None:
-        """Elimina el cooldown manual de un símbolo (ej: si el trader cambia de estado)."""
         self._closed.pop(symbol, None)
 
 
