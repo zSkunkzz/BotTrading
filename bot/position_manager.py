@@ -16,6 +16,10 @@ Fixes incluidos en esta versión:
            trader.position sea un str ("long"/"short") además de un dict
            {"side": "long"/"short"}, evitando AttributeError: 'str' object
            has no attribute 'get'.
+  Bug J — _place_emergency_sl_tp calcula TP dinámico cuando trader.tp es
+           None (posiciones restauradas desde state no tienen tp asignado).
+           El TP se calcula como entry ± (entry - sl) * TP_FALLBACK_RR,
+           garantizando que siempre exista una orden TP en el exchange.
 """
 from __future__ import annotations
 
@@ -42,6 +46,11 @@ _TPSL_VERIFY_INTERVAL_S = float(os.getenv("TPSL_VERIFY_INTERVAL_S", "60"))
 
 # Máximo de reintentos para colocar SL/TP de emergencia
 _EMERGENCY_TPSL_RETRIES = int(os.getenv("EMERGENCY_TPSL_RETRIES", "3"))
+
+# Bug J: RR mínimo para calcular TP dinámico cuando trader.tp es None.
+# TP_fallback = entry ± (entry - sl) * _TP_FALLBACK_RR
+# Ejemplo: entry=609.49, sl=592.80 → risk=16.69 → TP = 609.49 + 16.69*1.5 = 634.52
+_TP_FALLBACK_RR = float(os.getenv("TP_FALLBACK_RR", "1.5"))
 
 
 def _is_reduce_only(order: dict) -> bool:
@@ -93,6 +102,26 @@ def _resolve_is_long(position) -> bool:
     if isinstance(position, str):
         return position.upper() == "LONG"
     return False
+
+
+def _calc_fallback_tp(entry: float, sl: float, is_long: bool, rr: float) -> Optional[float]:
+    """
+    Bug J fix: calcula un TP razonable cuando trader.tp es None.
+    Usa el mismo riesgo (entry-sl) multiplicado por rr al lado contrario.
+    Retorna None si no se puede calcular (datos inválidos).
+    """
+    if not entry or not sl or entry <= 0 or sl <= 0:
+        return None
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None
+    if is_long:
+        tp = entry + risk * rr
+    else:
+        tp = entry - risk * rr
+    if tp <= 0:
+        return None
+    return tp
 
 
 class PositionManager:
@@ -242,6 +271,11 @@ class PositionManager:
         """
         Bug C fix: redondea qty antes de enviar la orden al exchange.
         Bug I fix: tolera position como str o dict.
+        Bug J fix: calcula TP dinámico cuando trader.tp es None.
+          Ocurre en posiciones restauradas desde state (restart del bot)
+          donde trader.tp no se persiste. Se calcula como:
+            TP = entry ± risk * TP_FALLBACK_RR
+          donde risk = abs(entry - sl).
         """
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
@@ -260,6 +294,23 @@ class PositionManager:
         position = getattr(trader, "position", None)
         # Bug I: usar helper que acepta str o dict
         is_long = _resolve_is_long(position)
+
+        # Bug J: si tp_price es None, calcularlo dinámicamente desde entry+sl
+        if place_tp and tp_price is None:
+            entry_price = getattr(trader, "entry_price", None) or getattr(trader, "_entry_price", None)
+            tp_price = _calc_fallback_tp(entry_price, sl_price, is_long, _TP_FALLBACK_RR)
+            if tp_price is not None:
+                # Persistir en el trader para que futuros checks lo encuentren
+                trader.tp = tp_price
+                log.info(
+                    "[%s] TP calculado dinámicamente (entry=%.4f sl=%.4f rr=%.1f) → tp=%.4f",
+                    symbol, entry_price, sl_price, _TP_FALLBACK_RR, tp_price,
+                )
+            else:
+                log.warning(
+                    "[%s] No se puede calcular TP dinámico: entry=%s sl=%s — saltando TP",
+                    symbol, entry_price, sl_price,
+                )
 
         for attempt in range(1, _EMERGENCY_TPSL_RETRIES + 1):
             try:
