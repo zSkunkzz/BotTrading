@@ -11,11 +11,18 @@ MEJORAS v2:
   - Se resetea al cerrar en TP1/TP2/TP3 (cierre ganador)
   - Ventana de "consecutivo": solo cuenta SLs sin TP intermedio
 
+MEJORAS v3:
+  - Cooldown MANUAL_CLOSE: evita reentrar en un símbolo recién cerrado a mano
+      por defecto 600s (env: COOLDOWN_MANUAL_CLOSE). Bypass si override=True.
+  - Cooldown TP_HIT reducido: tras TP, cooldown = base × 0.5 (ya existía como
+      "timeout") ahora con reason='TP' explícito para claridad en logs.
+
 Config Railway:
-  COOLDOWN_EARLY    → cooldown base modo EARLY  (default 300s = 5min)
-  COOLDOWN_NORMAL   → cooldown base modo NORMAL (default 180s = 3min)
-  COOLDOWN_STRONG   → cooldown base modo STRONG (default 120s = 2min)
-  COOLDOWN_SL_MULT  → multiplicador por SL (default 2.0 para 2º SL, 4.0 para 3º+)
+  COOLDOWN_EARLY          → cooldown base modo EARLY  (default 300s = 5min)
+  COOLDOWN_NORMAL         → cooldown base modo NORMAL (default 180s = 3min)
+  COOLDOWN_STRONG         → cooldown base modo STRONG (default 120s = 2min)
+  COOLDOWN_SL_MULT        → multiplicador por SL (default 2.0 para 2º SL, 4.0 para 3º+)
+  COOLDOWN_MANUAL_CLOSE   → cooldown tras cierre manual (default 600s = 10min)
 """
 from __future__ import annotations
 
@@ -32,12 +39,14 @@ COOLDOWN_BY_MODE: Dict[str, float] = {
     "STRONG":  float(os.getenv("COOLDOWN_STRONG", "120")),
     "NONE":    float(os.getenv("COOLDOWN_NORMAL", "180")),
 }
-COOLDOWN_SL_MULT = float(os.getenv("COOLDOWN_SL_MULT", "2.0"))
+COOLDOWN_SL_MULT    = float(os.getenv("COOLDOWN_SL_MULT",      "2.0"))
+COOLDOWN_MANUAL_SEC = float(os.getenv("COOLDOWN_MANUAL_CLOSE", "600"))
 
 
 class SignalCooldown:
     """
     Rastrea el cooldown por símbolo con escalado dinámico por SL consecutivos.
+    Incluye cooldown separado para cierres manuales (MANUAL_CLOSE).
     """
 
     def __init__(self) -> None:
@@ -45,23 +54,58 @@ class SignalCooldown:
         self._cooldown_until: Dict[str, float] = {}
         # {symbol: número de SL consecutivos sin TP intermedio}
         self._consecutive_sl: Dict[str, int] = {}
+        # {symbol: timestamp de cierre manual}
+        self._manual_close_until: Dict[str, float] = {}
+
+    # ── Consultas ─────────────────────────────────────────────────────────────
 
     def is_in_cooldown(self, symbol: str) -> bool:
-        """True si el símbolo todavía está en cooldown."""
-        until = self._cooldown_until.get(symbol, 0.0)
-        return time.time() < until
+        """True si el símbolo está en cooldown (SL/TP/TIMEOUT o MANUAL_CLOSE)."""
+        if time.time() < self._cooldown_until.get(symbol, 0.0):
+            return True
+        if time.time() < self._manual_close_until.get(symbol, 0.0):
+            return True
+        return False
 
     def remaining(self, symbol: str) -> float:
-        """Segundos restantes de cooldown (0 si ya expiró)."""
-        until = self._cooldown_until.get(symbol, 0.0)
-        return max(0.0, until - time.time())
+        """Segundos restantes del cooldown más largo activo (0 si expiró)."""
+        sl_tp_rem  = max(0.0, self._cooldown_until.get(symbol, 0.0) - time.time())
+        manual_rem = max(0.0, self._manual_close_until.get(symbol, 0.0) - time.time())
+        return max(sl_tp_rem, manual_rem)
+
+    def is_manual_close_cooldown(self, symbol: str) -> bool:
+        """True si el símbolo está específicamente en cooldown por cierre manual."""
+        until = self._manual_close_until.get(symbol, 0.0)
+        if time.time() < until:
+            return True
+        # Limpiar entrada expirada
+        self._manual_close_until.pop(symbol, None)
+        return False
+
+    # ── Registro de cierres ───────────────────────────────────────────────────
+
+    def mark_manual_close(self, symbol: str) -> None:
+        """
+        Llamar cuando se detecta cierre manual (posición desaparece sin SL/TP hit).
+        Bloquea nuevas entradas durante COOLDOWN_MANUAL_CLOSE segundos.
+        """
+        until = time.time() + COOLDOWN_MANUAL_SEC
+        self._manual_close_until[symbol] = until
+        log.warning(
+            "[cooldown] %s: MANUAL_CLOSE → cooldown %.0fs (hasta %s)",
+            symbol, COOLDOWN_MANUAL_SEC,
+            time.strftime("%H:%M:%S", time.localtime(until)),
+        )
 
     def mark_closed(self, symbol: str, reason: str, entry_mode: str = "NORMAL") -> None:
         """
-        Llamar al cerrar una posición.
+        Llamar al cerrar una posición por SL, TP o timeout.
 
-        reason: 'SL' | 'TP1' | 'TP2' | 'TP3' | 'TIMEOUT'
+        reason: 'SL' | 'TP1' | 'TP2' | 'TP3' | 'TP' | 'TIMEOUT'
         """
+        # Limpiar cooldown manual si existía (cierre ya registrado correctamente)
+        self._manual_close_until.pop(symbol, None)
+
         if reason == "SL":
             # Incrementar contador de SL consecutivos
             self._consecutive_sl[symbol] = self._consecutive_sl.get(symbol, 0) + 1
@@ -84,10 +128,13 @@ class SignalCooldown:
                 cooldown = base
                 log.info("[cooldown] %s: SL → cooldown base %.0fs", symbol, cooldown)
         else:
-            # TP o timeout → reset contador consecutivo, cooldown corto
+            # TP o timeout → reset contador consecutivo, cooldown reducido
             self._consecutive_sl[symbol] = 0
             cooldown = COOLDOWN_BY_MODE.get(entry_mode, COOLDOWN_BY_MODE["NORMAL"]) * 0.5
-            log.debug("[cooldown] %s: %s → cooldown %.0fs (reset consecutivos)", symbol, reason, cooldown)
+            log.info(
+                "[cooldown] %s: %s → cooldown %.0fs (reset SL consecutivos)",
+                symbol, reason, cooldown,
+            )
 
         self._cooldown_until[symbol] = time.time() + cooldown
 
@@ -95,6 +142,7 @@ class SignalCooldown:
         """Forzar reset completo (para tests o admin manual)."""
         self._cooldown_until.pop(symbol, None)
         self._consecutive_sl.pop(symbol, None)
+        self._manual_close_until.pop(symbol, None)
 
     def consecutive_sl(self, symbol: str) -> int:
         """Número de SL consecutivos actuales para el símbolo."""
