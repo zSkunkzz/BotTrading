@@ -39,6 +39,12 @@ FIX _get_positions NoneType (2026-06-03):
 FIX NameError aiohttp (2026-06-03):
   _fetch_candles usaba aiohttp.ClientTimeout pero el import estaba solo
   dentro de get_ohlcv (scope distinto). Movido al nivel de módulo.
+
+FIX get_price NoneType (2026-06-03):
+  Si HL devuelve null, un error HTTP, o un body no-dict (e.g. string de error),
+  data.get(self.coin) lanzaba 'NoneType object has no attribute get'.
+  Fix: guard isinstance(data, dict) antes de llamar .get().
+  Si data no es dict → raise ValueError con el body truncado para diagnóstico.
 """
 from __future__ import annotations
 
@@ -276,7 +282,22 @@ class FuturesTrader:
                 headers={"Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
-                data = _json.loads(await resp.text())
+                text = await resp.text()
+
+        # FIX: HL puede devolver null, string de error, o un dict vacío.
+        # Si data no es dict, .get() lanza AttributeError → crash en TradingLoop.
+        try:
+            data = _json.loads(text)
+        except Exception:
+            raise ValueError(
+                f"[{self.symbol}] allMids respuesta no-JSON: {text[:200]}"
+            )
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"[{self.symbol}] allMids devolvió tipo inesperado "
+                f"({type(data).__name__}): {text[:200]}"
+            )
 
         price = data.get(self.coin)
         if price is None:
