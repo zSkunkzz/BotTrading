@@ -1,7 +1,7 @@
 aiohttp>=3.9
 aiohttp-retry>=2.8
 ccxt>=4.0
-eth-account>=0.10
+eth-account>=0.8,<0.9
 eth-utils>=2.3
 feedparser>=6.0
 hyperliquid-python-sdk==0.1.9
