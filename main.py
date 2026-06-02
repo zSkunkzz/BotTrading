@@ -360,6 +360,12 @@ async def main():
     logger.info("\U0001f50d Escaneando mercado Hyperliquid inicial...")
     initial_pairs = await scanner.scan()
 
+    # FIX: sincronizar scanner.active_pairs con el resultado del scan inicial.
+    # Sin esto, run_scanner_loop ve active_pairs=[] en el primer ciclo y trata
+    # todos los pares como "nuevos" (added=todos) → intenta re-arrancar traders
+    # que ya están activos, generando logs "Límite alcanzado" innecesarios.
+    scanner.active_pairs = list(initial_pairs)
+
     scored_data = list(getattr(scanner, "_last_scored", []))
     if not scored_data and initial_pairs:
         scored_data = [{"symbol": sym, "volume_usdt": 0, "change_pct": 0, "score": 0} for sym in initial_pairs]
