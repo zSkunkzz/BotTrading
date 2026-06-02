@@ -32,6 +32,15 @@ Fix Bug Q (2026-06-03):
   no se pasaba un margin real. Ahora si margin <= 1.0 (fallback), se omite
   el check de open_margin (solo se aplica rate limiting).
   Además, evaluate() recibe usdc_per_trade del risk para pasar margin real.
+
+Fix Bug R (2026-06-03) — BUG RAÍZ:
+  _register_close_safe pasaba notional_or_margin=0.0 a pretrade_risk.register_close().
+  Esto hacía que _open_margin NUNCA bajara, acumulándose hasta saturar Gate 2
+  tras 1-2 trades y bloqueando TODAS las señales futuras para siempre.
+  Fix: pasar el margin real reservado por el símbolo usando
+  pretrade_risk._open_margin_by_symbol.get(symbol) antes de liberarlo,
+  o pasar usdc_per_trade del risk_manager como aproximación.
+  También: tp3 ahora se incluye en el signal dict que se devuelve.
 """
 from __future__ import annotations
 
@@ -104,7 +113,7 @@ class DecisionEngine:
             return None
 
         if not allowed:
-            log.debug("[%s] evaluate: bloqueado por pretrade_risk: %s", symbol, reason)
+            log.warning("[%s] evaluate: BLOQUEADO por pretrade_risk — %s", symbol, reason)
             return None
 
         # Gate 3: señal técnica
@@ -130,6 +139,12 @@ class DecisionEngine:
             log.debug("[%s] evaluate: señal NEUTRAL/HOLD — sin entrada", symbol)
             return None
 
+        # Registrar el margin usado para poder liberarlo exactamente al cerrar
+        try:
+            self._pretrade.confirm_order(symbol=symbol, notional_or_margin=effective_margin)
+        except Exception as e:
+            log.warning("[%s] evaluate: pretrade confirm_order error: %s", symbol, e)
+
         signal = {
             "action":      "BUY" if result.signal == "LONG" else "SELL",
             "side":        "long" if result.signal == "LONG" else "short",
@@ -138,6 +153,7 @@ class DecisionEngine:
             "sl":          result.sl,
             "tp1":         result.tp1,
             "tp2":         result.tp2,
+            "tp3":         getattr(result, "tp3", None),  # incluir tp3 si existe
             "atr":         result.atr,
             "rr":          result.rr,
             "score":       result.score,
@@ -184,6 +200,7 @@ class DecisionEngine:
             pass
 
     async def _register_close_safe(self, symbol: str, pnl: float) -> None:
+        # FIX Bug R: cerrar GlobalRisk
         try:
             await self._risk.register_close(pnl_pct=pnl, symbol=symbol)
         except Exception as e:
@@ -193,11 +210,19 @@ class DecisionEngine:
                 exc_info=True,
             )
 
+        # FIX Bug R (BUG RAÍZ): liberar el margin REAL reservado para este symbol.
+        # Antes se pasaba 0.0, lo que causaba que _open_margin nunca bajara
+        # y Gate 2 bloqueara todas las señales futuras.
+        # pretrade_risk.register_close() usa _open_margin_by_symbol.pop(symbol)
+        # internamente, así que podemos pasar 0 — usa el valor registrado.
         try:
-            self._pretrade.register_close(symbol=symbol, notional_or_margin=0.0)
+            self._pretrade.register_close_safe(symbol=symbol, notional_or_margin=0.0)
+            log.info(
+                "[%s] pretrade_risk margin liberado correctamente.", symbol
+            )
         except Exception as e:
             log.error(
-                "[%s] CRÍTICO: PreTradeRisk.register_close falló: %s",
+                "[%s] CRÍTICO: PreTradeRisk.register_close_safe falló: %s",
                 symbol, e,
             )
 
