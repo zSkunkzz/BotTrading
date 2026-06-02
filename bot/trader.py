@@ -8,38 +8,12 @@ Sizing en Hyperliquid:
   El leverage_efectivo = min(LEVERAGE_env, signal.suggested_lev, maxLeverage_del_exchange)
 
 BUG #2 FIX: race condition en _open_lock
-  - _opening_position eliminado como guard primario (era race-prone)
-  - El check 'if self.position is not None' esta DENTRO del async with _open_lock
-  - La verificacion en exchange tambien ocurre dentro del lock
-  - asyncio.Lock es la unica fuente de verdad para evitar apertura doble
-
 BUG #7 FIX: signal_flip_guard integrado en _try_open_position
-  - Importa signal_flip_guard de bot.signal_engine
-  - Si la senal invierte direccion en < SIGNAL_FLIP_COOLDOWN_S, se descarta
-
 BUG #8 FIX: cierre de emergencia reduce-only en sl_hit cuando _protection_ok=False
-  - Si el SL del exchange no fue confirmado (_protection_ok=False) y el precio
-    cruza el SL local, se envia orden de mercado reduce-only antes de limpiar estado.
-
 BUG #9 FIX: _ensure_tpsl usa reduce_only=True como fuente de verdad
-  - _tpsl_type() eliminado: parseaba orderType cuyo formato varía entre versiones
-    de HL/ccxt y nunca matcheaba → has_sl=False, has_tp=False siempre
-  - Nueva detección: cuenta órdenes con reduce_only=True para la coin
-    · ≥1 reduce_only  → has_sl=True  (orden de protección presente)
-    · ≥2 reduce_only  → has_tp=True  (ambas órdenes presentes)
-  - cancel_all_orders_reduce_only(): cancela todas las órdenes reduce_only
-    de la coin directamente por oid, evitando depender de _tpsl_type()
-  - Corrige bucle donde las órdenes se acumulaban indefinidamente sin cancelarse
-
-OHLCV FIX: decide() recibe ohlcv_fn=self.get_ohlcv para usar WS→caché→REST
-  - Evita 3 REST hits extra por ciclo (antes analyze_pair llamaba exch.fetch_ohlcv directamente)
-
+OHLCV FIX: decide() recibe ohlcv_fn=self.get_ohlcv
 TRAILING SL FIX: trailing_sl.py integrado en _manage_open_position
-  - compute_trailing_sl e is_trailing_sl_hit importados de bot.trailing_sl
-  - _trailing_sl_activated y _trail_peak añadidos al estado del trader
-  - Tras TP1: se activa el trailing, se calcula nuevo SL en cada ciclo;
-    si mejora el SL, se cancela la orden reduce-only en exchange y se repone
-  - Si el precio toca el trailing SL: cierre de mercado + notify + cleanup
+ROORDERS FIX: al restaurar posición, cancelar ro_orders acumuladas si > 2
 """
 from __future__ import annotations
 
@@ -98,6 +72,9 @@ _FALLBACK_ATR_SL_MULT  = float(os.getenv("FALLBACK_ATR_SL_MULT",  "1.8"))
 _FALLBACK_ATR_TP1_MULT = float(os.getenv("FALLBACK_ATR_TP1_MULT", "3.5"))
 _FALLBACK_ATR_TP2_MULT = float(os.getenv("FALLBACK_ATR_TP2_MULT", "5.0"))
 
+# Máximo de órdenes reduce_only esperadas para una posición normal (SL + TP = 2)
+_MAX_EXPECTED_RO_ORDERS = int(os.getenv("MAX_EXPECTED_RO_ORDERS", "2"))
+
 # ── Rate limiter global para /info ───────────────────────────────────────────
 GL_REST_LOCK    = asyncio.Lock()
 _HL_LAST_CALL    = 0.0
@@ -125,11 +102,6 @@ def _norm_coin(symbol: str) -> str:
 
 
 def _hl_side_to_str(raw_side: str) -> Optional[str]:
-    """
-    Convierte el campo 'side' de Hyperliquid a 'long'/'short'.
-    Devuelve None si raw_side esta vacio (posicion residual / sin side todavia).
-    Lanza ValueError solo si el valor es no-vacio pero desconocido.
-    """
     if not raw_side:
         return None
     if raw_side == "B":
@@ -172,23 +144,10 @@ def _compute_fallback_tpsl(
 
 # BUG #9 FIX: helper que no depende del formato de orderType
 def _is_reduce_only_order(o: dict) -> bool:
-    """
-    Devuelve True si la orden es reduce_only.
-
-    Hyperliquid puede representar reduce_only de dos formas:
-      1. Campo explícito: o["reduceOnly"] = True  (ccxt normaliza a "reduceOnly")
-      2. Campo explícito: o["reduce_only"] = True  (algunas versiones)
-      3. Inferido: orderType dict con trigger.tpsl in ("sl", "tp")
-
-    Usar reduce_only como fuente de verdad es más robusto que parsear
-    orderType, cuyo formato varía entre versiones de HL y ccxt.
-    """
-    # Forma directa (ccxt ≥ 4.x normaliza a "reduceOnly")
     if o.get("reduceOnly") is True:
         return True
     if o.get("reduce_only") is True:
         return True
-    # Inferido desde orderType dict (formato nativo HL SDK)
     ot = o.get("orderType", "")
     if isinstance(ot, dict):
         tpsl = ot.get("trigger", {}).get("tpsl", "")
@@ -268,17 +227,14 @@ class FuturesTrader:
         self._ccxt_exchange = None
         self._global_risk   = None
 
-        # TRAILING SL FIX: estado para el trailing stop loss post-TP1
+        # TRAILING SL FIX
         self._trailing_sl_activated: bool  = False
         self._trail_peak:            float = 0.0
 
-        # BUG #2 FIX: _opening_position ELIMINADO como guard primario.
-        # asyncio.Lock es la unica fuente de verdad.
-        # _open_lock: solo un coroutine puede estar en la fase de apertura.
+        # BUG #2 FIX
         self._open_lock: asyncio.Lock = asyncio.Lock()
 
-        # BUG #4 FIX: evento que se setea en cleanup() para que
-        # pair_scanner pueda esperar a que el trader termine limpiamente.
+        # BUG #4 FIX
         self._stopped_event: asyncio.Event = asyncio.Event()
 
         if _DE_AVAILABLE:
@@ -358,6 +314,39 @@ class FuturesTrader:
 
     # ── Init / cleanup ─────────────────────────────────────────────────────────────
 
+    async def _cleanup_excess_ro_orders(self) -> None:
+        """
+        ROORDERS FIX: al restaurar una posición, si hay más de
+        _MAX_EXPECTED_RO_ORDERS (2) órdenes reduce_only acumuladas,
+        cancela todas y fuerza recolocación limpia de SL+TP.
+        Evita el problema de ZEC con 50 órdenes acumuladas.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            raw_orders = await loop.run_in_executor(None, self._hl_client.get_open_orders)
+            coin_orders = [o for o in (raw_orders or []) if o.get("coin") == self.coin]
+            ro_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
+
+            if len(ro_orders) <= _MAX_EXPECTED_RO_ORDERS:
+                return
+
+            logger.warning(
+                "[%s] ROORDERS FIX: %d órdenes reduce_only acumuladas (esperadas ≤%d) — "
+                "cancelando todo y recolocando SL/TP limpios.",
+                self.symbol, len(ro_orders), _MAX_EXPECTED_RO_ORDERS,
+            )
+            cancelled = await self._cancel_all_orders_reduce_only(coin_orders)
+            logger.info(
+                "[%s] ROORDERS FIX: %d órdenes canceladas — SL/TP se recolocarán "
+                "en el primer ciclo de _ensure_tpsl.",
+                self.symbol, cancelled,
+            )
+            # Forzar recolocación inmediata en el próximo ciclo
+            self._last_tpsl_verify_at = 0.0
+            self._protection_ok = False
+        except Exception as e:
+            logger.warning("[%s] _cleanup_excess_ro_orders error: %s", self.symbol, e)
+
     async def _init(self, usdc_per_trade: float):
         await self._get_ccxt()
         saved = load_position(self.symbol)
@@ -389,11 +378,12 @@ class FuturesTrader:
                 self._open_entry_mode = saved.get("entry_mode", "")
                 self._protection_ok   = False
                 self._last_tpsl_verify_at = 0.0
-                # Restore trailing state if saved
                 self._trailing_sl_activated = saved.get("trailing_sl_activated", False)
                 self._trail_peak            = saved.get("trail_peak", 0.0)
                 logger.info("[%s] Posicion restaurada: %s @ %s — verificando SL/TP en exchange...",
                             self.symbol, self.position, self.entry_price)
+                # ROORDERS FIX: limpiar órdenes acumuladas al restaurar
+                await self._cleanup_excess_ro_orders()
             elif exchange_pos is not None and len(exchange_pos) == 0:
                 logger.warning(
                     "[%s] Posicion guardada localmente pero NO existe en exchange — limpiando estado.",
@@ -759,20 +749,12 @@ class FuturesTrader:
                 )
                 logger.info("[%s] TP=%.5f colocado en exchange", self.symbol, tp)
             except Exception as e:
-                logger.error("[%s] No se pudo colocar TP: %s", self.symbol, e)
+                logger.error("[%s] No se pudo colocar TP (fallback): %s", self.symbol, e)
                 raise
 
     # ── _cancel_all_orders_reduce_only (BUG #9 FIX) ──────────────────────────────────
-    #
-    # Cancela TODAS las órdenes reduce_only de la coin directamente por oid.
-    # No depende de _tpsl_type() ni de cancel_all_open_tpsl() de HLClient,
-    # que podían no cancelar nada si el formato de orderType no matcheaba.
 
     async def _cancel_all_orders_reduce_only(self, coin_orders: list) -> int:
-        """
-        Cancela todas las órdenes reduce_only de coin_orders.
-        Devuelve el número de órdenes canceladas exitosamente.
-        """
         ro_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
         if not ro_orders:
             return 0
@@ -823,10 +805,6 @@ class FuturesTrader:
             return
 
         coin_orders = [o for o in (raw_orders or []) if o.get("coin") == self.coin]
-
-        # BUG #9 FIX: usar reduce_only como fuente de verdad.
-        # No parseamos orderType porque su formato varía entre versiones.
-        # Log diagnóstico: muestra los orderType raw para debugging futuro.
         ro_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
         if coin_orders:
             sample_types = [o.get("orderType", "?") for o in coin_orders[:5]]
@@ -835,9 +813,6 @@ class FuturesTrader:
                 self.symbol, sample_types,
             )
 
-        # Lógica de detección:
-        #   ≥1 orden reduce_only → SL presente
-        #   ≥2 órdenes reduce_only → SL + TP presentes
         has_sl = len(ro_orders) >= 1
         has_tp = len(ro_orders) >= 2
 
@@ -859,14 +834,11 @@ class FuturesTrader:
                 logger.error("[%s] No se pudo reponer TP: %s", self.symbol, e)
             return
 
-        # has_sl=False → ni SL ni TP presentes (o 0 órdenes reduce_only)
         logger.warning(
             "[%s] Faltan SL y TP — cancelando reduce_only acumulados y recolocando bulk (SL=%.5f TP=%.5f qty=%.4f)",
             self.symbol, sl, tp1, safe_qty,
         )
 
-        # BUG #9 FIX: usar _cancel_all_orders_reduce_only en lugar de
-        # cancel_all_open_tpsl() que no cancelaba nada
         if coin_orders:
             try:
                 cancelled = await self._cancel_all_orders_reduce_only(coin_orders)
@@ -890,10 +862,8 @@ class FuturesTrader:
         self.tp2_hit = False
         self._tp1_hit = False
         self._open_qty = 0.0
-        # TRAILING SL FIX: resetear estado trailing al cerrar posicion
         self._trailing_sl_activated = False
         self._trail_peak = 0.0
-        # BUG #7 FIX: resetear el flip guard al cerrar posicion
         signal_flip_guard.reset(self.symbol)
 
     async def _on_position_closed(self, pnl_pct: float, reason: str = "") -> None:
@@ -904,12 +874,10 @@ class FuturesTrader:
                 logger.warning("[%s] GlobalRisk.register_close error: %s", self.symbol, e)
 
         try:
-            pretrade_risk.register_close_safe(self.symbol, self._open_margin)  # BUG #5 FIX
+            pretrade_risk.register_close_safe(self.symbol, self._open_margin)
         except Exception as e:
             logger.warning("[%s] PreTradeRisk.register_close error: %s", self.symbol, e)
 
-        # BUG #6 FIX: invalidar balance tras cierre para que el siguiente
-        # pretrade check use el balance real post-trade, no el cacheado.
         balance_svc.invalidate(reason=f"posicion cerrada {self.symbol} ({reason})")
 
         if self._decision_engine is not None:
@@ -926,20 +894,6 @@ class FuturesTrader:
     # ── _manage_open_position ───────────────────────────────────────────────────────────
 
     async def _manage_open_position(self, price: float, risk) -> None:
-        """
-        Gestiona una posicion abierta: comprueba TP1/TP2/SL y actualiza
-        el trailing SL post-TP1.
-
-        Flujo trailing SL (TRAILING SL FIX):
-          1. Cuando _tp1_hit se activa → _trailing_sl_activated = True,
-             _trail_peak = price al momento de TP1.
-          2. En cada ciclo post-TP1: compute_trailing_sl calcula nuevo SL.
-             Si el nuevo SL es mejor que self.sl:
-               a. Cancelar todas las órdenes reduce_only SL en exchange.
-               b. Colocar nueva orden SL con el valor mejorado.
-               c. Actualizar self.sl y self._trail_peak.
-          3. Si is_trailing_sl_hit → cierre de mercado + cleanup.
-        """
         is_long = self.position == "long"
 
         # ── SL hit check ────────────────────────────────────────────────────
@@ -947,7 +901,6 @@ class FuturesTrader:
             sl_triggered = (is_long and price <= self.sl) or (not is_long and price >= self.sl)
             if sl_triggered:
                 logger.info("[%s] SL alcanzado (precio=%.5f SL=%.5f)", self.symbol, price, self.sl)
-                # BUG #8 FIX: cierre de emergencia si _protection_ok=False
                 if not self._protection_ok:
                     close_side = "sell" if is_long else "buy"
                     try:
@@ -977,7 +930,6 @@ class FuturesTrader:
                 except Exception:
                     pass
 
-                # TRAILING SL FIX: activar trailing desde el precio actual
                 if not self._trailing_sl_activated:
                     self._trailing_sl_activated = True
                     self._trail_peak = price
@@ -1013,7 +965,6 @@ class FuturesTrader:
                 current_sl=self.sl,
             )
 
-            # ¿El trailing SL ha sido golpeado?
             if is_trailing_sl_hit(is_long=is_long, current_price=price, trailing_sl=new_sl):
                 logger.info(
                     "[%s] Trailing SL hit | precio=%.5f trailing_sl=%.5f",
@@ -1035,20 +986,16 @@ class FuturesTrader:
                 clear_position(self.symbol)
                 return
 
-            # ¿El SL ha mejorado? → actualizar en exchange
             sl_improved = (is_long and new_sl > self.sl) or (not is_long and new_sl < self.sl)
             if sl_improved:
                 logger.info(
                     "[%s] Trailing SL mejorado: %.5f → %.5f (peak=%.5f)",
                     self.symbol, self.sl, new_sl, new_peak,
                 )
-                # Cancelar SL reduce-only actual en exchange y reponer
                 try:
                     loop = asyncio.get_event_loop()
                     raw_orders = await loop.run_in_executor(None, self._hl_client.get_open_orders)
                     coin_orders = [o for o in (raw_orders or []) if o.get("coin") == self.coin]
-                    # Solo cancelar ordenes SL (no TP) — pero usamos _cancel_all_orders_reduce_only
-                    # y reponemos SL solamente (TP sigue intacto si existe)
                     sl_orders = [
                         o for o in coin_orders
                         if _is_reduce_only_order(o) and (
@@ -1057,7 +1004,6 @@ class FuturesTrader:
                         )
                     ]
                     if not sl_orders:
-                        # Fallback: cancelar todas las reduce_only y reponer ambas
                         sl_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
 
                     for o in sl_orders:
@@ -1075,11 +1021,9 @@ class FuturesTrader:
                                 logger.warning("[%s] Error cancelando SL oid=%s: %s", self.symbol, oid, ce)
 
                     await asyncio.sleep(0.3)
-                    # Colocar nuevo SL trailing
                     await self._place_tpsl(qty=self._open_qty, sl=new_sl, tp=None)
                     self.sl = new_sl
                     self._trail_peak = new_peak
-                    # Persistir estado actualizado
                     save_position(self.symbol, {
                         "side":  self.position,
                         "entry": self.entry_price,
@@ -1167,106 +1111,37 @@ class FuturesTrader:
         did_check_exchange = False
         exchange_positions = None
         if now - self._last_pos_check_at >= _POS_CHECK_INTERVAL_S:
-            exchange_positions      = await self._get_positions()
             self._last_pos_check_at = now
-            did_check_exchange      = True
-
-        if did_check_exchange:
-            if exchange_positions is None:
-                logger.warning("[%s] No se pudo verificar posicion — manteniendo estado local.", self.symbol)
-            elif exchange_positions:
-                ep = exchange_positions[0]
-                if self.position is None:
-                    raw_side = ep.get("side", "")
-                    try:
-                        parsed_side = _hl_side_to_str(raw_side)
-                    except ValueError:
-                        logger.warning("[%s] Side inesperado del exchange: %r — ignorando.", self.symbol, raw_side)
-                        parsed_side = None
-                    if parsed_side:
-                        self.position    = parsed_side
-                        self.entry_price = float(ep.get("entryPx") or 0)
-                        logger.info("[%s] Posicion detectada: %s @ %s",
-                                    self.symbol, self.position, self.entry_price)
-                    else:
-                        logger.debug("[%s] Posicion con side vacio ignorada.", self.symbol)
-            else:
-                if self.position is not None:
-                    logger.info("[%s] Posicion cerrada externamente.", self.symbol)
-                    # BUG #6 FIX: invalidar balance al detectar SL externo
-                    balance_svc.invalidate_on_sl_detected(self.symbol)
-                    try:
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, self._hl_client.cancel_all_open_tpsl)
-                    except Exception as e:
-                        logger.warning("[%s] No se pudieron cancelar triggers huerfanos: %s", self.symbol, e)
-                    await self._on_position_closed(pnl_pct=0.0, reason="EXTERNAL")
-                    self._clear_position_state()
-                    clear_position(self.symbol)
+            did_check_exchange = True
+            exchange_positions = await self._get_positions()
 
         if self.position is not None:
-            await self._manage_open_position(price, risk)
-            return
-
-        # BUG #2 FIX: El lock es la UNICA fuente de verdad.
-        # No hay _opening_position flag. Si el lock esta ocupado,
-        # otro coroutine esta en medio de una apertura -> skip.
-        if self._open_lock.locked():
-            logger.debug("[%s] _open_lock ocupado — apertura en curso, skip.", self.symbol)
-            return
-
-        async with self._open_lock:
-            # BUG #2 FIX: re-check de position DENTRO del lock.
-            # Esto elimina la race condition entre el check exterior y
-            # el momento en que el lock se adquiere.
-            if self.position is not None:
-                await self._manage_open_position(price, risk)
-                return
-
-            live_positions = await self._get_positions()
-            if live_positions is None:
-                logger.warning(
-                    "[%s] No se pudo verificar posicion en exchange — "
-                    "abortando apertura por seguridad.",
-                    self.symbol,
-                )
-                return
-            if len(live_positions) > 0:
-                ep = live_positions[0]
-                raw_side = ep.get("side", "")
-                try:
-                    parsed_side = _hl_side_to_str(raw_side)
-                except ValueError:
-                    parsed_side = None
-                if parsed_side:
-                    self.position    = parsed_side
-                    self.entry_price = float(ep.get("entryPx") or 0)
-                    self._last_pos_check_at = time.monotonic()
+            if did_check_exchange and exchange_positions is not None:
+                if len(exchange_positions) == 0:
                     logger.warning(
-                        "[%s] Posicion ya abierta en exchange (%s @ %.5f) — "
-                        "abortando apertura duplicada.",
-                        self.symbol, parsed_side, self.entry_price,
+                        "[%s] Posicion local pero NO en exchange — limpiando estado.",
+                        self.symbol,
                     )
-                    await self._manage_open_position(price, risk)
-                else:
-                    logger.debug("[%s] Posicion con side vacio ignorada.", self.symbol)
-                return
+                    pnl_pct = 0.0
+                    if self.entry_price and self.entry_price > 0:
+                        pnl_pct = ((price - self.entry_price) / self.entry_price) * (
+                            1 if self.position == "long" else -1
+                        )
+                    try:
+                        await notify_close(
+                            self.symbol, self.position, self.entry_price, price,
+                            pnl_pct * 100, reason="CLOSED_EXTERNALLY",
+                        )
+                    except Exception:
+                        pass
+                    await self._on_position_closed(pnl_pct, reason="CLOSED_EXTERNALLY")
+                    self._clear_position_state()
+                    clear_position(self.symbol)
+                    return
 
-            await self._try_open_position(price, risk, global_risk)
-
-    async def _try_open_position(self, price: float, risk, global_risk) -> None:
-        """
-        BUG #2 FIX: este metodo solo se llama desde dentro de async with _open_lock.
-        No necesita ningun guard adicional (_opening_position eliminado).
-
-        BUG #7 FIX: signal_flip_guard filtra inversiones de direccion rapidas.
-
-        OHLCV FIX: pasa self.get_ohlcv como ohlcv_fn a decide() para que
-        analyze_pair use la ruta WS→caché→REST en lugar de exch.fetch_ohlcv.
-        """
-        if global_risk:
-            allowed, reason = await global_risk.can_open()
-            if not allowed:
-                logger.debug("[%s] GlobalRisk: %s", self.symbol, reason)
-                return
-
+            await self._manage_open_position(price, risk)
+        else:
+            if self._decision_engine is not None:
+                await self._decision_engine.evaluate(self, risk, global_risk)
+            else:
+                logger.debug("[%s] DecisionEngine no disponible — skip evaluacion.", self.symbol)

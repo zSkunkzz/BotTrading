@@ -15,6 +15,7 @@ from bot.telegram_bot import notify_startup, notify_scanner_update, setup_telegr
 from bot.ws_feed import ws_feed
 from bot.balance_service import balance_svc
 from bot.kill_switch import kill_switch
+from bot.state import bot_state
 from ai_rate_limiter import start_traders_staggered, telegram_ai_status
 from webhook import start_webhook_server, register_traders
 
@@ -41,18 +42,10 @@ _max_leverage_map: dict[str, int] = {}
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
 
 # ── USDC por operación — fuente ÚNICA: variable de entorno USDC_PER_TRADE ──
-# NOTA: el antiguo fallback "USBC_PER_TRADE" era un typo (B en vez de D).
-#       Se elimina para evitar confusión. El default es 20 USDC.
 _USDC_PER_TRADE = float(os.getenv("USDC_PER_TRADE", "20"))
 
 
 def _resolve_hl_address() -> str:
-    """
-    Resuelve la dirección del wallet principal en orden de prioridad:
-      1. HL_API_WALLET_ADDRESS  (Opción A: API key agente)
-      2. HL_ACCOUNT_ADDR        (Opción B: dirección explícita)
-      3. Derivada de HL_PRIVATE_KEY (Opción B: derivación automática)
-    """
     addr = os.getenv("HL_API_WALLET_ADDRESS", "").strip()
     if addr:
         return addr
@@ -69,11 +62,6 @@ def _resolve_hl_address() -> str:
 
 
 def make_risk():
-    """
-    Crea el objeto RiskManager para cada trader.
-    usdc_per_trade = _USDC_PER_TRADE (leído una vez al arranque desde USDC_PER_TRADE).
-    Por defecto: 20 USDC por operación.
-    """
     return RiskManager(
         usdc_per_trade=_USDC_PER_TRADE,
         tp_pct=float(os.getenv("TP_PCT", "4.0")),
@@ -87,13 +75,6 @@ def make_risk():
 
 
 def _effective_leverage(symbol: str) -> int:
-    """
-    Devuelve min(LEVERAGE_BASE, max_leverage_del_par).
-
-    Si el par no está en el mapa (scanner API, sin snapshot),
-    se usa LEVERAGE_BASE directamente — trader.py luego lo capará
-    con _exchange_max_lev() al arrancar.
-    """
     snapshot_max = _max_leverage_map.get(symbol.upper())
     if snapshot_max and snapshot_max > 0:
         effective = min(_LEVERAGE_BASE, snapshot_max)
@@ -103,7 +84,6 @@ def _effective_leverage(symbol: str) -> int:
                 symbol, _LEVERAGE_BASE, effective, snapshot_max,
             )
         return effective
-    # Sin dato de snapshot — usamos la base; trader.py consultará la API
     return _LEVERAGE_BASE
 
 
@@ -132,7 +112,7 @@ async def _start_single_pair(symbol: str):
         api_secret=private_key,
         passphrase=None,
         symbol=symbol,
-        leverage=_effective_leverage(symbol),   # ← capado por max_leverage del par
+        leverage=_effective_leverage(symbol),
         margin_mode=os.getenv("MARGIN_MODE", "isolated"),
         dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
     )
@@ -157,11 +137,6 @@ async def stop_pair(symbol: str):
 
 
 def _update_leverage_map(scored_data: list[dict]) -> None:
-    """
-    Rellena _max_leverage_map con los datos del último snapshot/scanner.
-    Acepta tanto el formato del snapshot (max_leverage) como el de la API
-    (no tiene ese campo — se ignora y se deja la entrada anterior si existe).
-    """
     updated = 0
     for entry in scored_data:
         sym = entry.get("symbol", "").upper()
@@ -181,9 +156,6 @@ async def _stop_pair_with_cleanup(symbol: str) -> None:
     """
     BUG #4 FIX: cancela la tarea del trader y espera a que cleanup()
     setee _stopped_event antes de continuar, con timeout de seguridad.
-
-    Esto evita la race condition donde el nuevo trader arranca mientras
-    el anterior aún tiene posición abierta o locks adquiridos.
     """
     task = active_traders.pop(symbol, None)
     trader = _trader_instances.pop(symbol, None)
@@ -204,9 +176,6 @@ async def _stop_pair_with_cleanup(symbol: str) -> None:
                 "[%s] Trader no paró en %.0fs — continuando de todas formas.",
                 symbol, _TRADER_STOP_TIMEOUT_S,
             )
-        # cleanup() ya fue llamado desde dentro del trader (run() finally),
-        # pero lo llamamos también aquí por si la tarea fue cancelada antes
-        # de llegar al finally.
         try:
             await trader.cleanup()
         except Exception as e:
@@ -219,25 +188,32 @@ async def on_pairs_updated(new_pairs: list, added: set = None, removed: set = No
     """
     BUG #4 FIX: callback con firma nueva (new_pairs, added, removed).
 
-    pair_scanner.py detecta automáticamente esta firma con inspect.signature
-    y la llama con los 3 argumentos. Si se llama con firma antigua (solo
-    new_pairs), added/removed son None y se recalculan aquí.
-
-    El orden importa:
-      1. Primero hacer cleanup de traders SALIENTES (con espera de _stopped_event).
-      2. Después arrancar traders ENTRANTES.
-
-    Esto garantiza que no hay dos traders operando el mismo símbolo
-    simultáneamente ni tampoco traders zombi bloqueando locks/márgenes.
+    OPEN_POSITION FIX: los pares con posición abierta guardada en state
+    NUNCA se eliminan aunque salgan del top scanner. Se reinyectan en
+    new_pairs para garantizar que siempre tienen un trader activo.
     """
-    current = set(active_traders.keys())
-    capped  = set(new_pairs[:MAX_ACTIVE_TRADERS])
+    # Reinyectar pares con posición abierta para que nunca sean eliminados
+    open_symbols = set(bot_state._positions.keys())
+    protected = open_symbols - set(new_pairs)
+    if protected:
+        logger.info(
+            "🔒 Pares con posición abierta reinyectados en lista activa: %s",
+            ", ".join(protected),
+        )
+        new_pairs = list(protected) + list(new_pairs)
+        # Recortar al límite máximo de traders
+        new_pairs = new_pairs[:MAX_ACTIVE_TRADERS + len(protected)]
 
-    # Recalcular si se llama con firma antigua
+    current = set(active_traders.keys())
+    capped  = set(new_pairs[:MAX_ACTIVE_TRADERS + len(protected)])
+
     if added is None:
         added = capped - current
     if removed is None:
         removed = current - capped
+
+    # Nunca eliminar traders con posición abierta
+    removed = removed - open_symbols
 
     # ── 1. Cleanup traders salientes PRIMERO ──────────────────────────────
     if removed:
@@ -261,18 +237,11 @@ async def main():
     logger.info("  HyperliquidBot v1.0 — IA + Scanner + Telegram + KS")
     logger.info("=" * 60)
 
-    # ── Confirmar sizing al arranque ──────────────────────────────────────
     logger.info(
         "💰 Sizing: USDC_PER_TRADE=%.2f USDC | LEVERAGE=%dx",
         _USDC_PER_TRADE, _LEVERAGE_BASE,
     )
 
-    # ── Balance service ──────────────────────────────────
-    # FIX: init_hl(address, info_post_fn) — firma real de BalanceService.
-    # La llamada anterior usaba addr= y testnet= que no existen en la clase.
-    # info_post_fn se inyecta desde trader.py via _hl_info_post cuando está
-    # disponible; aquí se inicializa con None y se sobreescribe al arrancar
-    # el primer trader (balance_svc.init_hl se puede llamar de nuevo).
     hl_addr = _resolve_hl_address()
     if not hl_addr:
         logger.warning(
@@ -280,8 +249,6 @@ async def main():
             "Configura HL_API_WALLET_ADDRESS o HL_ACCOUNT_ADDR."
         )
 
-    # info_post_fn: función async que hace POST al endpoint de info de HL.
-    # Se construye aquí con httpx para no depender de que un trader esté activo.
     import httpx
 
     _HL_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
@@ -334,7 +301,6 @@ async def main():
             for sym in initial_pairs
         ]
 
-    # ── Poblar mapa de leverage desde el scan inicial ─────────────────
     _update_leverage_map(scored_data)
 
     if scored_data:
@@ -357,12 +323,35 @@ async def main():
 
     logger.info("✅ Pares finales (%d): %s", len(final_pairs), ", ".join(final_pairs))
 
+    # ── OPEN_POSITION FIX: garantizar traders para posiciones abiertas ──────
+    # Si hay posiciones guardadas en state para pares que NO están en
+    # final_pairs (ej: HYPE), los añadimos al frente de la lista para
+    # asegurar que siempre tienen un trader activo al arrancar.
+    open_symbols = set(bot_state._positions.keys())
+    missing_from_scan = open_symbols - set(final_pairs)
+    if missing_from_scan:
+        logger.warning(
+            "⚠️  Pares con posición abierta NO están en el scanner — "
+            "forzando arranque: %s",
+            ", ".join(missing_from_scan),
+        )
+        # Insertar al frente para que tengan prioridad sobre el límite MAX_ACTIVE_TRADERS
+        final_pairs = list(missing_from_scan) + final_pairs
+
     ws_feed.start(final_pairs)
     logger.info("🔌 WS feed arrancado para %d símbolos", len(final_pairs))
 
     await asyncio.sleep(3)
 
-    pairs_to_trade = final_pairs[:MAX_ACTIVE_TRADERS]
+    # Los pares con posición abierta siempre arrancan, luego los del scanner
+    # hasta completar MAX_ACTIVE_TRADERS
+    guaranteed = [p for p in final_pairs if p in open_symbols]
+    scanner_fill = [
+        p for p in final_pairs
+        if p not in open_symbols
+    ][:max(0, MAX_ACTIVE_TRADERS - len(guaranteed))]
+    pairs_to_trade = guaranteed + scanner_fill
+
     logger.info(
         "🚀 Arrancando %d traders (de %d disponibles): %s",
         len(pairs_to_trade), len(final_pairs), ", ".join(pairs_to_trade),
@@ -374,7 +363,6 @@ async def main():
     )
     logger.info("🐕 Kill Switch Watchdog arrancado")
 
-    # ── Telegram command polling (long-poll ligero, task independiente) ──
     tg_task = setup_telegram_commands()
     if tg_task:
         logger.info("📲 Telegram comandos activos (/resetks, /ksstatus)")
