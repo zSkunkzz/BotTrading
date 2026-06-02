@@ -99,7 +99,7 @@ class DecisionEngine:
         """Conecta el PositionManager para que reciba entry_mode al abrir."""
         self._position_mgr = pm
 
-    def on_position_closed(
+    async def on_position_closed(
         self,
         symbol: str,
         margin: float | None,
@@ -109,6 +109,9 @@ class DecisionEngine:
         """
         Callback invocado desde PositionManager al cerrar cualquier posición.
         Actualiza cooldown dinámico y registra resultado en shadow_mode.
+
+        FIX: convertido a async def para que trader.py pueda llamarlo con await
+        sin lanzar 'object NoneType can't be used in await expression'.
         """
         is_win = reason in ("TP1", "TP2", "TP3")
         logger.debug(
