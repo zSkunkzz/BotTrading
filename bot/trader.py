@@ -33,6 +33,13 @@ BUG #9 FIX: _ensure_tpsl usa reduce_only=True como fuente de verdad
 
 OHLCV FIX: decide() recibe ohlcv_fn=self.get_ohlcv para usar WS→caché→REST
   - Evita 3 REST hits extra por ciclo (antes analyze_pair llamaba exch.fetch_ohlcv directamente)
+
+TRAILING SL FIX: trailing_sl.py integrado en _manage_open_position
+  - compute_trailing_sl e is_trailing_sl_hit importados de bot.trailing_sl
+  - _trailing_sl_activated y _trail_peak añadidos al estado del trader
+  - Tras TP1: se activa el trailing, se calcula nuevo SL en cada ciclo;
+    si mejora el SL, se cancela la orden reduce-only en exchange y se repone
+  - Si el precio toca el trailing SL: cierre de mercado + notify + cleanup
 """
 from __future__ import annotations
 
@@ -57,6 +64,7 @@ from bot.kill_switch import kill_switch
 from bot.execution.execution_engine import execution_engine
 from bot.ohlcv_cache import ohlcv_cache
 from bot.signal_engine import signal_flip_guard  # BUG #7 FIX
+from bot.trailing_sl import compute_trailing_sl, is_trailing_sl_hit  # TRAILING SL FIX
 
 # ── DecisionEngine (opcional) ──────────────────────────────────────────────────
 try:
@@ -260,6 +268,10 @@ class FuturesTrader:
         self._ccxt_exchange = None
         self._global_risk   = None
 
+        # TRAILING SL FIX: estado para el trailing stop loss post-TP1
+        self._trailing_sl_activated: bool  = False
+        self._trail_peak:            float = 0.0
+
         # BUG #2 FIX: _opening_position ELIMINADO como guard primario.
         # asyncio.Lock es la unica fuente de verdad.
         # _open_lock: solo un coroutine puede estar en la fase de apertura.
@@ -377,6 +389,9 @@ class FuturesTrader:
                 self._open_entry_mode = saved.get("entry_mode", "")
                 self._protection_ok   = False
                 self._last_tpsl_verify_at = 0.0
+                # Restore trailing state if saved
+                self._trailing_sl_activated = saved.get("trailing_sl_activated", False)
+                self._trail_peak            = saved.get("trail_peak", 0.0)
                 logger.info("[%s] Posicion restaurada: %s @ %s — verificando SL/TP en exchange...",
                             self.symbol, self.position, self.entry_price)
             elif exchange_pos is not None and len(exchange_pos) == 0:
@@ -414,6 +429,8 @@ class FuturesTrader:
                     self._open_qty = self._open_notional / self.entry_price
                 self._open_entry_mode = saved.get("entry_mode", "")
                 self._protection_ok   = False
+                self._trailing_sl_activated = saved.get("trailing_sl_activated", False)
+                self._trail_peak            = saved.get("trail_peak", 0.0)
 
         if not balance_svc.is_ready():
             balance_svc.init_hl(self._master_addr, self._info_post)
@@ -873,6 +890,9 @@ class FuturesTrader:
         self.tp2_hit = False
         self._tp1_hit = False
         self._open_qty = 0.0
+        # TRAILING SL FIX: resetear estado trailing al cerrar posicion
+        self._trailing_sl_activated = False
+        self._trail_peak = 0.0
         # BUG #7 FIX: resetear el flip guard al cerrar posicion
         signal_flip_guard.reset(self.symbol)
 
@@ -902,6 +922,220 @@ class FuturesTrader:
                 )
             except Exception as e:
                 logger.warning("[%s] DecisionEngine.on_position_closed error: %s", self.symbol, e)
+
+    # ── _manage_open_position ───────────────────────────────────────────────────────────
+
+    async def _manage_open_position(self, price: float, risk) -> None:
+        """
+        Gestiona una posicion abierta: comprueba TP1/TP2/SL y actualiza
+        el trailing SL post-TP1.
+
+        Flujo trailing SL (TRAILING SL FIX):
+          1. Cuando _tp1_hit se activa → _trailing_sl_activated = True,
+             _trail_peak = price al momento de TP1.
+          2. En cada ciclo post-TP1: compute_trailing_sl calcula nuevo SL.
+             Si el nuevo SL es mejor que self.sl:
+               a. Cancelar todas las órdenes reduce_only SL en exchange.
+               b. Colocar nueva orden SL con el valor mejorado.
+               c. Actualizar self.sl y self._trail_peak.
+          3. Si is_trailing_sl_hit → cierre de mercado + cleanup.
+        """
+        is_long = self.position == "long"
+
+        # ── SL hit check ────────────────────────────────────────────────────
+        if self.sl and self.sl > 0:
+            sl_triggered = (is_long and price <= self.sl) or (not is_long and price >= self.sl)
+            if sl_triggered:
+                logger.info("[%s] SL alcanzado (precio=%.5f SL=%.5f)", self.symbol, price, self.sl)
+                # BUG #8 FIX: cierre de emergencia si _protection_ok=False
+                if not self._protection_ok:
+                    close_side = "sell" if is_long else "buy"
+                    try:
+                        await self._place_order(close_side, self._open_qty, reduce_only=True)
+                        logger.info("[%s] Cierre emergencia reduce-only enviado (SL local).", self.symbol)
+                    except Exception as e:
+                        logger.error("[%s] Cierre emergencia fallo: %s", self.symbol, e)
+                pnl_pct = ((price - self.entry_price) / self.entry_price) * (1 if is_long else -1)
+                try:
+                    await notify_close(self.symbol, self.position, self.entry_price, price,
+                                       pnl_pct * 100, reason="SL")
+                except Exception:
+                    pass
+                await self._on_position_closed(pnl_pct, reason="SL")
+                self._clear_position_state()
+                clear_position(self.symbol)
+                return
+
+        # ── TP1 hit check ───────────────────────────────────────────────────
+        if not self._tp1_hit and self.tp1 and self.tp1 > 0:
+            tp1_triggered = (is_long and price >= self.tp1) or (not is_long and price <= self.tp1)
+            if tp1_triggered:
+                logger.info("[%s] TP1 alcanzado (precio=%.5f TP1=%.5f)", self.symbol, price, self.tp1)
+                self._tp1_hit = True
+                try:
+                    await notify_tp_partial(self.symbol, self.position, self.entry_price, price, level=1)
+                except Exception:
+                    pass
+
+                # TRAILING SL FIX: activar trailing desde el precio actual
+                if not self._trailing_sl_activated:
+                    self._trailing_sl_activated = True
+                    self._trail_peak = price
+                    logger.info(
+                        "[%s] Trailing SL activado tras TP1 | peak=%.5f | SL_base=%.5f",
+                        self.symbol, self._trail_peak, self.sl or 0.0,
+                    )
+
+                save_position(self.symbol, {
+                    "side":  self.position,
+                    "entry": self.entry_price,
+                    "sl":    self.sl,
+                    "tp1":   self.tp1,
+                    "tp2":   self.tp2,
+                    "tp3":   self.tp3,
+                    "tp1_hit": True,
+                    "tp2_hit": self.tp2_hit,
+                    "usdc_amount": self._open_notional,
+                    "leverage":    self._open_leverage,
+                    "margin_usdc": self._open_margin,
+                    "qty":         self._open_qty,
+                    "entry_mode":  self._open_entry_mode,
+                    "trailing_sl_activated": self._trailing_sl_activated,
+                    "trail_peak":            self._trail_peak,
+                })
+
+        # ── Trailing SL update (post-TP1) ──────────────────────────────────
+        if self._trailing_sl_activated and self.sl and self.sl > 0:
+            new_sl, new_peak = compute_trailing_sl(
+                is_long=is_long,
+                current_price=price,
+                peak_price=self._trail_peak,
+                current_sl=self.sl,
+            )
+
+            # ¿El trailing SL ha sido golpeado?
+            if is_trailing_sl_hit(is_long=is_long, current_price=price, trailing_sl=new_sl):
+                logger.info(
+                    "[%s] Trailing SL hit | precio=%.5f trailing_sl=%.5f",
+                    self.symbol, price, new_sl,
+                )
+                close_side = "sell" if is_long else "buy"
+                try:
+                    await self._place_order(close_side, self._open_qty, reduce_only=True)
+                except Exception as e:
+                    logger.error("[%s] Cierre trailing SL fallo: %s", self.symbol, e)
+                pnl_pct = ((price - self.entry_price) / self.entry_price) * (1 if is_long else -1)
+                try:
+                    await notify_close(self.symbol, self.position, self.entry_price, price,
+                                       pnl_pct * 100, reason="TRAILING_SL")
+                except Exception:
+                    pass
+                await self._on_position_closed(pnl_pct, reason="TRAILING_SL")
+                self._clear_position_state()
+                clear_position(self.symbol)
+                return
+
+            # ¿El SL ha mejorado? → actualizar en exchange
+            sl_improved = (is_long and new_sl > self.sl) or (not is_long and new_sl < self.sl)
+            if sl_improved:
+                logger.info(
+                    "[%s] Trailing SL mejorado: %.5f → %.5f (peak=%.5f)",
+                    self.symbol, self.sl, new_sl, new_peak,
+                )
+                # Cancelar SL reduce-only actual en exchange y reponer
+                try:
+                    loop = asyncio.get_event_loop()
+                    raw_orders = await loop.run_in_executor(None, self._hl_client.get_open_orders)
+                    coin_orders = [o for o in (raw_orders or []) if o.get("coin") == self.coin]
+                    # Solo cancelar ordenes SL (no TP) — pero usamos _cancel_all_orders_reduce_only
+                    # y reponemos SL solamente (TP sigue intacto si existe)
+                    sl_orders = [
+                        o for o in coin_orders
+                        if _is_reduce_only_order(o) and (
+                            isinstance(o.get("orderType"), dict) and
+                            o["orderType"].get("trigger", {}).get("tpsl") == "sl"
+                        )
+                    ]
+                    if not sl_orders:
+                        # Fallback: cancelar todas las reduce_only y reponer ambas
+                        sl_orders = [o for o in coin_orders if _is_reduce_only_order(o)]
+
+                    for o in sl_orders:
+                        oid = o.get("oid") or o.get("id") or o.get("orderId")
+                        if oid:
+                            try:
+                                await loop.run_in_executor(
+                                    None,
+                                    lambda _oid=oid: self._hl_client._exchange.cancel_order(
+                                        str(_oid), self.coin
+                                    ),
+                                )
+                                logger.debug("[%s] SL reduce-only cancelado: oid=%s", self.symbol, oid)
+                            except Exception as ce:
+                                logger.warning("[%s] Error cancelando SL oid=%s: %s", self.symbol, oid, ce)
+
+                    await asyncio.sleep(0.3)
+                    # Colocar nuevo SL trailing
+                    await self._place_tpsl(qty=self._open_qty, sl=new_sl, tp=None)
+                    self.sl = new_sl
+                    self._trail_peak = new_peak
+                    # Persistir estado actualizado
+                    save_position(self.symbol, {
+                        "side":  self.position,
+                        "entry": self.entry_price,
+                        "sl":    self.sl,
+                        "tp1":   self.tp1,
+                        "tp2":   self.tp2,
+                        "tp3":   self.tp3,
+                        "tp1_hit": self._tp1_hit,
+                        "tp2_hit": self.tp2_hit,
+                        "usdc_amount": self._open_notional,
+                        "leverage":    self._open_leverage,
+                        "margin_usdc": self._open_margin,
+                        "qty":         self._open_qty,
+                        "entry_mode":  self._open_entry_mode,
+                        "trailing_sl_activated": self._trailing_sl_activated,
+                        "trail_peak":            self._trail_peak,
+                    })
+                except Exception as e:
+                    logger.error("[%s] Error actualizando trailing SL en exchange: %s", self.symbol, e)
+
+        # ── TP2 hit check ───────────────────────────────────────────────────
+        if self._tp1_hit and not self.tp2_hit and self.tp2 and self.tp2 > 0:
+            tp2_triggered = (is_long and price >= self.tp2) or (not is_long and price <= self.tp2)
+            if tp2_triggered:
+                logger.info("[%s] TP2 alcanzado (precio=%.5f TP2=%.5f)", self.symbol, price, self.tp2)
+                self.tp2_hit = True
+                mark_tp2_hit(self.symbol)
+                partial_qty = self._round_qty(self._open_qty * TP2_PARTIAL_RATIO)
+                if partial_qty > 0:
+                    close_side = "sell" if is_long else "buy"
+                    try:
+                        await self._place_order(close_side, partial_qty, reduce_only=True)
+                    except Exception as e:
+                        logger.error("[%s] Cierre parcial TP2 fallo: %s", self.symbol, e)
+                try:
+                    await notify_tp_partial(self.symbol, self.position, self.entry_price, price, level=2)
+                except Exception:
+                    pass
+
+        # ── Verificacion periodica SL/TP en exchange ────────────────────────
+        now = time.monotonic()
+        if (
+            not self._trailing_sl_activated
+            and self.sl and self.tp1
+            and now - self._last_tpsl_verify_at >= _TPSL_VERIFY_INTERVAL_S
+        ):
+            self._last_tpsl_verify_at = now
+            try:
+                await self._ensure_tpsl_on_exchange(
+                    qty=self._open_qty,
+                    sl=self.sl,
+                    tp1=self.tp1,
+                    pos_side=self.position,
+                )
+            except Exception as e:
+                logger.error("[%s] _ensure_tpsl error: %s", self.symbol, e)
 
     # ── Loop principal ─────────────────────────────────────────────────────────────────────
 
@@ -1036,358 +1270,3 @@ class FuturesTrader:
                 logger.debug("[%s] GlobalRisk: %s", self.symbol, reason)
                 return
 
-        balance = await self.get_balance()
-        if balance is not None and balance < risk.usdc_per_trade:
-            logger.warning("[%s] Balance insuficiente (%.2f < %.2f USDC).",
-                           self.symbol, balance, risk.usdc_per_trade)
-            return
-
-        usdc_per_trade = risk.usdc_per_trade
-        try:
-            ok, pt_reason = await pretrade_risk.check(
-                symbol=self.symbol,
-                side="buy",
-                margin=usdc_per_trade,
-            )
-            if not ok:
-                logger.debug("[%s] pretrade_risk bloqueo la entrada: %s", self.symbol, pt_reason)
-                return
-        except Exception as e:
-            logger.warning("[%s] pretrade_risk.check error: %s", self.symbol, e)
-
-        try:
-            exch = await self._get_ccxt()
-            decision = await decide(
-                exch=exch,
-                symbol=self.symbol,
-                ai_decide_fn=ai_decide,
-                has_open_position=False,
-                current_pnl=None,
-                ohlcv_fn=self.get_ohlcv,  # OHLCV FIX: usa WS→caché→REST del trader
-            )
-        except Exception as e:
-            logger.error("[%s] decide() error: %s", self.symbol, e)
-            return
-
-        action = decision.get("action", "HOLD")
-        signal = decision.get("signal")
-        if action not in ("BUY", "SELL"):
-            return
-
-        # BUG #7 FIX: verificar flip-flop antes de procesar la senal
-        if not signal_flip_guard.allow(self.symbol, signal):
-            return  # senal bloqueada por cooldown anti flip-flop
-
-        if signal:
-            entry      = signal.entry or price
-            sl         = _nonzero(signal.sl)
-            tp1        = _nonzero(signal.tp1)
-            tp2        = _nonzero(signal.tp2)
-            tp3        = _nonzero(getattr(signal, "tp3", None))
-            lev        = int(signal.suggested_lev or self.leverage)
-            atr        = getattr(signal, "atr", None) or (entry * 0.005)
-            entry_mode = getattr(signal, "entry_mode", "") or ""
-        else:
-            entry = price
-            sl = tp1 = tp2 = tp3 = None
-            lev = self.leverage
-            atr = entry * 0.005
-            entry_mode = ""
-
-        exchange_max_lev = self._exchange_max_lev()
-        lev = min(lev, self.leverage, exchange_max_lev)
-        if lev < 1:
-            lev = 1
-
-        if not self.dry_run:
-            try:
-                await self._set_leverage(lev)
-            except Exception as e:
-                logger.error(
-                    "[%s] No se pudo establecer leverage %dx — abortando entrada: %s",
-                    self.symbol, lev, e,
-                )
-                return
-
-        margin_usdc     = usdc_per_trade
-        notional_target = margin_usdc * lev
-        qty             = self._round_qty(notional_target / entry)
-        notional        = qty * entry
-
-        logger.info(
-            "[%s] Sizing | margen=%.2f USDC | lev=%dx | notional=%.2f USDC | entry=%.4f | qty=%s",
-            self.symbol, margin_usdc, lev, notional, entry, qty,
-        )
-
-        if qty <= 0:
-            logger.warning("[%s] qty <= 0 tras redondeo, skip.", self.symbol)
-            return
-
-        pos_side       = "long" if action == "BUY" else "short"
-        trade_side_str = "buy"  if action == "BUY" else "sell"
-
-        if sl is None or tp1 is None:
-            fb_sl, fb_tp1, fb_tp2 = _compute_fallback_tpsl(pos_side, entry, float(atr))
-            if sl is None:
-                sl = fb_sl
-                logger.warning("[%s] signal.sl vacio — fallback ATR: SL=%.5f", self.symbol, sl)
-            if tp1 is None:
-                tp1 = fb_tp1
-                logger.warning("[%s] signal.tp1 vacio — fallback ATR: TP1=%.5f", self.symbol, tp1)
-            if tp2 is None:
-                tp2 = fb_tp2
-
-        assert sl  and sl  > 0, f"[{self.symbol}] SL invalido: {sl}"
-        assert tp1 and tp1 > 0, f"[{self.symbol}] TP1 invalido: {tp1}"
-
-        # BUG #2 FIX: NO se usa _opening_position flag aqui.
-        # El lock ya garantiza exclusion mutua. El try/finally es solo
-        # para cleanup en caso de excepcion, no como guard de concurrencia.
-        try:
-            order_result = await self._place_order(trade_side_str, qty, sl=sl, tp=tp1)
-            if order_result.get("status") != "ok":
-                logger.error("[%s] Orden rechazada: %s", self.symbol, order_result)
-                return
-
-            positions = await self._confirm_position_with_retry()
-            if positions is None or len(positions) == 0:
-                logger.warning("[%s] Orden ejecutada pero posicion no confirmada.", self.symbol)
-                return
-
-            pos_data   = positions[0]
-            fill_entry = float(pos_data.get("entryPx") or entry)
-            confirmed_qty = qty
-
-            if fill_entry != entry and entry > 0:
-                fill_ratio = fill_entry / entry
-                sl_recalc  = round(sl  * fill_ratio, 6)
-                tp1_recalc = round(tp1 * fill_ratio, 6)
-                tp2_recalc = round(tp2 * fill_ratio, 6) if tp2 else tp2
-                tp3_recalc = round(tp3 * fill_ratio, 6) if tp3 else tp3
-                logger.info(
-                    "[%s] Fill slippage: signal_entry=%.5f fill=%.5f (ratio=%.6f) "
-                    "SL: %.5f->%.5f | TP1: %.5f->%.5f",
-                    self.symbol, entry, fill_entry, fill_ratio,
-                    sl, sl_recalc, tp1, tp1_recalc,
-                )
-                sl  = sl_recalc
-                tp1 = tp1_recalc
-                tp2 = tp2_recalc
-                tp3 = tp3_recalc
-
-            self.position         = pos_side
-            self.entry_price      = fill_entry
-            self.sl               = sl
-            self.tp1              = tp1
-            self.tp2              = tp2
-            self.tp3              = tp3
-            self.tp2_hit          = False
-            self._tp1_hit         = False
-            self._open_margin     = margin_usdc
-            self._open_notional   = confirmed_qty * fill_entry
-            self._open_leverage   = lev
-            self._open_qty        = confirmed_qty
-            self._open_entry_mode = entry_mode
-            self._last_pos_check_at = time.monotonic()
-
-            save_position(self.symbol, {
-                "side":        pos_side,
-                "entry":       fill_entry,
-                "sl":          sl,
-                "tp1":         tp1,
-                "tp2":         tp2,
-                "tp3":         tp3,
-                "tp2_hit":     False,
-                "tp1_hit":     False,
-                "leverage":    lev,
-                "usdc_amount": self._open_notional,
-                "margin_usdc": margin_usdc,
-                "qty":         confirmed_qty,
-                "entry_mode":  entry_mode,
-            })
-
-            pretrade_risk.confirm_order(self.symbol, margin_usdc)
-
-            try:
-                await self._place_tpsl(qty=confirmed_qty, sl=sl, tp=tp1, entry_px=fill_entry)
-                self._protection_ok = True
-            except Exception as e:
-                logger.error(
-                    "[%s] _place_tpsl fallo al abrir — _ensure_tpsl lo repondra en <120s: %s",
-                    self.symbol, e,
-                )
-                self._protection_ok = False
-
-            await notify_open(
-                symbol=self.symbol,
-                side=pos_side,
-                price=fill_entry,
-                sl=sl,
-                tp1=tp1,
-                tp2=tp2,
-                usdt=margin_usdc,
-                leverage=lev,
-            )
-
-            logger.info(
-                "[%s] Posicion abierta | %s @ %.5f | margen=%.2f USDC | "
-                "notional=%.2f USDC | qty=%s | lev=%dx | SL=%.5f | TP1=%.5f",
-                self.symbol, pos_side, fill_entry, margin_usdc,
-                self._open_notional, confirmed_qty, lev, sl, tp1,
-            )
-
-        except Exception as e:
-            logger.error("[%s] _try_open_position excepcion: %s", self.symbol, e, exc_info=True)
-            # BUG #5 FIX: liberar margen si la apertura fallo a mitad
-            pretrade_risk.register_close_safe(self.symbol)
-            raise
-
-    async def _manage_open_position(self, price: float, risk) -> None:
-        if not self.position or not self.entry_price:
-            return
-
-        is_long  = self.position == "long"
-        entry    = self.entry_price
-        sl       = self.sl
-        tp1      = self.tp1
-        tp2      = self.tp2
-        tp3      = self.tp3
-
-        now = time.monotonic()
-        if (
-            not self._protection_ok
-            or now - self._last_tpsl_verify_at >= _TPSL_VERIFY_INTERVAL_S
-        ):
-            self._last_tpsl_verify_at = now
-            if sl and tp1 and self._open_qty > 0:
-                await self._ensure_tpsl_on_exchange(
-                    qty=self._open_qty, sl=sl, tp1=tp1, pos_side=self.position
-                )
-            elif sl and tp1:
-                positions = await self._get_positions()
-                if positions:
-                    pos_data = positions[0]
-                    exchange_qty = abs(float(pos_data.get("szi", 0)))
-                    if exchange_qty > 0:
-                        self._open_qty = exchange_qty
-                        await self._ensure_tpsl_on_exchange(
-                            qty=exchange_qty, sl=sl, tp1=tp1, pos_side=self.position
-                        )
-
-        if sl:
-            sl_hit = (is_long and price <= sl) or (not is_long and price >= sl)
-            if sl_hit:
-                logger.info("[%s] SL alcanzado @ %.5f", self.symbol, price)
-                # BUG #8 FIX: si el SL del exchange no fue confirmado y hay qty abierta,
-                # enviar cierre de emergencia reduce-only antes de limpiar estado.
-                if not self._protection_ok and self._open_qty > 0:
-                    logger.warning(
-                        "[%s] SL local sin _protection_ok — enviando cierre de emergencia reduce-only",
-                        self.symbol,
-                    )
-                    close_side = "sell" if is_long else "buy"
-                    try:
-                        await self._place_order(close_side, self._open_qty, reduce_only=True)
-                    except Exception as e:
-                        logger.error("[%s] Cierre de emergencia SL fallido: %s", self.symbol, e)
-                pnl_pct = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
-                self.trade_count += 1
-                self.total_pnl   += pnl_pct
-                await self._on_position_closed(pnl_pct=pnl_pct, reason="SL")
-                self._clear_position_state()
-                clear_position(self.symbol)
-                await notify_close(self.symbol, "SL", price, pnl_pct)
-                return
-
-        if tp1 and not self._tp1_hit:
-            tp1_hit = (is_long and price >= tp1) or (not is_long and price <= tp1)
-            if tp1_hit:
-                logger.info("[%s] TP1 alcanzado @ %.5f — cierre parcial", self.symbol, price)
-                positions = await self._get_positions()
-                remaining_qty = 0.0
-                if positions:
-                    pos_data    = positions[0]
-                    current_qty = abs(float(pos_data.get("szi", 0)))
-                    partial_qty = self._round_qty(current_qty * TP2_PARTIAL_RATIO)
-                    if partial_qty > 0:
-                        close_side = "sell" if is_long else "buy"
-                        await self._place_order(close_side, partial_qty, reduce_only=True)
-                    remaining_qty = max(0.0, current_qty - partial_qty)
-
-                self._tp1_hit = True
-                self.tp1      = None
-                self.sl = entry * (1 + _SL_SW_MARGIN) if is_long else entry * (1 - _SL_SW_MARGIN)
-                if remaining_qty > 0:
-                    self._open_qty = remaining_qty
-
-                save_position(self.symbol, {
-                    "side":        self.position,
-                    "entry":       entry,
-                    "sl":          self.sl,
-                    "tp1":         None,
-                    "tp2":         tp2,
-                    "tp3":         tp3,
-                    "tp2_hit":     False,
-                    "tp1_hit":     True,
-                    "leverage":    self._open_leverage,
-                    "usdc_amount": self._open_notional,
-                    "margin_usdc": self._open_margin,
-                    "qty":         self._open_qty,
-                    "entry_mode":  self._open_entry_mode,
-                })
-                self._protection_ok = False
-                await notify_tp_partial(self.symbol, self.position, price, tp_level=1)
-                return
-
-        if tp2 and not self.tp2_hit:
-            tp2_hit = (is_long and price >= tp2) or (not is_long and price <= tp2)
-            if tp2_hit:
-                logger.info("[%s] TP2 alcanzado @ %.5f — cierre parcial", self.symbol, price)
-                positions = await self._get_positions()
-                if positions:
-                    pos_data    = positions[0]
-                    current_qty = abs(float(pos_data.get("szi", 0)))
-                    partial_qty = self._round_qty(current_qty * TP2_PARTIAL_RATIO)
-                    if partial_qty > 0:
-                        close_side = "sell" if is_long else "buy"
-                        await self._place_order(close_side, partial_qty, reduce_only=True)
-                mark_tp2_hit(self.symbol)
-                self.tp2_hit = True
-                save_position(self.symbol, {
-                    "side":        self.position,
-                    "entry":       entry,
-                    "sl":          self.sl,
-                    "tp1":         self.tp1,
-                    "tp2":         tp2,
-                    "tp3":         tp3,
-                    "tp2_hit":     True,
-                    "tp1_hit":     self._tp1_hit,
-                    "leverage":    self._open_leverage,
-                    "usdc_amount": self._open_notional,
-                    "margin_usdc": self._open_margin,
-                    "qty":         self._open_qty,
-                    "entry_mode":  self._open_entry_mode,
-                })
-                await notify_tp_partial(self.symbol, self.position, price, tp_level=2)
-                return
-
-        if tp3:
-            tp3_hit = (is_long and price >= tp3) or (not is_long and price <= tp3)
-            if tp3_hit:
-                logger.info("[%s] TP3 alcanzado @ %.5f — cierre total", self.symbol, price)
-                pnl_pct = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
-                self.trade_count += 1
-                self.win_count   += 1
-                self.total_pnl   += pnl_pct
-                positions = await self._get_positions()
-                if positions:
-                    pos_data    = positions[0]
-                    current_qty = abs(float(pos_data.get("szi", 0)))
-                    if current_qty > 0:
-                        close_side = "sell" if is_long else "buy"
-                        await self._place_order(close_side, current_qty, reduce_only=True)
-                await self._on_position_closed(pnl_pct=pnl_pct, reason="TP3")
-                self._clear_position_state()
-                clear_position(self.symbol)
-                await notify_close(self.symbol, "TP3", price, pnl_pct)
-                return
