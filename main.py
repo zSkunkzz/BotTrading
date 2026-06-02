@@ -232,6 +232,10 @@ async def _idle_rotation_loop(scanner: "PairScanner") -> None:
     Cada 60 segundos revisa qué traders llevan demasiados ciclos sin posición
     abierta (idle). Los rota por el siguiente par del scanner que no esté activo.
     Los traders con posición abierta nunca se rotan.
+
+    FIX 2026-06-02: _last_scored es lista de dicts, no de strings.
+    La línea `scanner.normalize(s)` pasaba el dict entero → AttributeError.
+    Fix: extraer p["symbol"] directamente antes de normalizar.
     """
     while True:
         await asyncio.sleep(60)
@@ -253,9 +257,12 @@ async def _idle_rotation_loop(scanner: "PairScanner") -> None:
             if not to_rotate:
                 continue
 
-            # Pares disponibles en el scanner que no están activos
-            scanner_pairs = [scanner.normalize(s) for s in (getattr(scanner, "_last_scored", None) or [])]
-            scanner_pairs = [p["symbol"] if isinstance(p, dict) else p for p in (getattr(scanner, "_last_scored", []) or [])]
+            # FIX: _last_scored es lista de dicts — extraer "symbol" antes de normalizar
+            last_scored = getattr(scanner, "_last_scored", None) or []
+            scanner_pairs = [
+                scanner.normalize(p["symbol"] if isinstance(p, dict) else p)
+                for p in last_scored
+            ]
             available = [p for p in scanner_pairs if p not in active_traders]
 
             for sym in to_rotate:
