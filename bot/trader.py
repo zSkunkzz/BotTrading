@@ -456,6 +456,7 @@ class FuturesTrader:
         # ── Colocar SL ────────────────────────────────────────────
         if sl_px and sl_px > 0:
             try:
+            try:
                 sl_result = self._hl_client.place_sl(
                     is_buy=not is_buy,   # opuesto: cierra la posición
                     sz=qty,
@@ -480,7 +481,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: error colocando TP1: %s", self.symbol, e)
 
-        # ── Persistir estado ───────────────────────────────────────
+        # ── Persistir estado (incluye qty para que el próximo restart la restaure) ─
         try:
             save_position(self.symbol, {
                 "side":        self.position,
@@ -492,6 +493,7 @@ class FuturesTrader:
                 "tp2_hit":     self.tp2_hit,
                 "usdc_amount": usdc_per_trade,
                 "leverage":    self.leverage,
+                "qty":         self._open_qty,   # ← NUEVO: persiste qty en disco
             })
         except Exception as e:
             logger.warning("[%s] open_order: no se pudo persistir estado: %s", self.symbol, e)

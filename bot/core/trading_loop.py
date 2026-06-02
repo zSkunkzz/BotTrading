@@ -23,6 +23,11 @@ FIX v6 (2026-06-02): adapt to real PositionManager interface
   - manage() takes no args (trader bound in __init__)
   - open_position() does not exist → use trader.open_order() directly
   - detect_external_close() and set_entry_mode() do not exist → removed
+
+FIX v7 (2026-06-02): restaurar _open_qty al cargar posición desde disco
+  - Al restaurar desde disco _open_qty quedaba 0 → _place_emergency_sl_tp abortaba.
+  - Fix: calcular qty = (notional * leverage) / entry_price al restaurar.
+    Si entry_price == 0 se deja 0 y se loguea warning para no silenciar el problema.
 """
 from __future__ import annotations
 
@@ -99,6 +104,35 @@ class TradingLoop:
             trader._open_leverage = saved.get("leverage", trader.leverage)
             trader._protection_ok = True
             trader._tp1_be_done   = False
+
+            # ── Restaurar _open_qty ──────────────────────────────────────
+            # Prioridad 1: valor guardado explícitamente en disco (versiones nuevas)
+            if saved.get("qty") and float(saved["qty"]) > 0:
+                trader._open_qty = float(saved["qty"])
+            else:
+                # Prioridad 2: recalcular a partir de notional * leverage / entry_price
+                entry_px = float(trader.entry_price or 0)
+                notional_usdc = float(trader._open_notional or 0)
+                lev = int(trader._open_leverage or trader.leverage or 1)
+                if entry_px > 0 and notional_usdc > 0:
+                    raw_qty = (notional_usdc * lev) / entry_px
+                    try:
+                        trader._open_qty = trader._hl_client.round_sz(raw_qty)
+                    except Exception:
+                        trader._open_qty = raw_qty
+                    logger.info(
+                        "[%s] _open_qty recalculado desde disco: %.6f "
+                        "(notional=%.2f lev=%dx entry=%.4f)",
+                        self.symbol, trader._open_qty, notional_usdc, lev, entry_px,
+                    )
+                else:
+                    trader._open_qty = 0.0
+                    logger.warning(
+                        "[%s] _open_qty no se pudo recalcular "
+                        "(entry_price=%s, usdc_amount=%s) — TPSL de emergencia deshabilitado hasta próxima entrada.",
+                        self.symbol, trader.entry_price, trader._open_notional,
+                    )
+
             logger.info(
                 "[%s] Posición restaurada: %s @ %s",
                 self.symbol, trader.position, trader.entry_price,
@@ -141,6 +175,17 @@ class TradingLoop:
                         "[%s] Posición detectada en exchange: %s @ %s",
                         self.symbol, trader.position, trader.entry_price,
                     )
+                # Si _open_qty sigue en 0 pero el exchange confirma la posición,
+                # recalcular qty desde el tamaño real reportado por el exchange.
+                if trader._open_qty == 0.0 and ep.get("size", 0) > 0:
+                    try:
+                        trader._open_qty = trader._hl_client.round_sz(float(ep["size"]))
+                    except Exception:
+                        trader._open_qty = float(ep["size"])
+                    logger.info(
+                        "[%s] _open_qty sincronizado desde exchange: %.6f",
+                        self.symbol, trader._open_qty,
+                    )
             else:
                 if trader.position is not None:
                     logger.info(
@@ -162,6 +207,7 @@ class TradingLoop:
                     trader.tp1         = None
                     trader.tp2         = None
                     trader.tp3         = None
+                    trader._open_qty   = 0.0
                     clear_position(self.symbol)
 
         # ── Gestionar posición abierta o evaluar nueva entrada ────────────────
