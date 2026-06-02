@@ -18,6 +18,14 @@ FIX 5: Fallback seguro cuando fetch_enriched_context falla:
   - enriched=None y score < MIN_SCORE+2 → HOLD (no entrar a ciegas en señal marginal)
   - enriched=None y score >= MIN_SCORE+2 → entra con WARNING explícito en el log
 
+FIX 6: Propagar ef_penalty al decision_engine (v4.4):
+  - _result() ahora acepta ef_penalty (default 0)
+  - El dict devuelto incluye siempre 'ef_penalty'
+  - Paso 4 (entrada tras enriched_filter OK) pasa ef_result.penalty
+  - Todos los demás caminos (HOLD, fallback, sin enriched) propagan 0
+  - decision_engine.evaluate() ya lee decision.get('ef_penalty', 0)
+    y aplica sizing reducido según calidad de señal
+
 Variables de entorno:
   MIN_SIGNAL_SCORE             (default: 6)
   MIN_RR_REQUIRED              (default: 1.8)
@@ -77,6 +85,7 @@ async def decide(
         signal_block : str (Markdown)
         ai_confidence: int (0 if IA not used)
         ai_reason    : str
+        ef_penalty   : int (0-3, penalización de enriched_filter para sizing)
     """
 
     if has_open_position:
@@ -226,16 +235,19 @@ async def decide(
                             f"🔁 Override técnico (score={signal.score}) · IA news dudó (conf={ai_confidence}/10) | {ai_reason}",
                             ai_confidence=ai_confidence,
                             ai_reason=ai_reason,
+                            ef_penalty=ef_result.penalty,
                         )
 
                 except Exception as e:
                     log.warning(f"[strategy] IA noticias falló: {e} — ignorando")
 
         # ── Paso 4: entrada (filtro determinista pasado) ──────────────────────
+        # FIX 6: propagar ef_result.penalty para que decision_engine ajuste sizing
         return _result(
             action_if_pass, signal, False,
             f"✅ EnrichedFilter OK · {ef_result.reason} · "
-            f"score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x"
+            f"score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x",
+            ef_penalty=ef_result.penalty,
         )
 
     # FIX 5: Fallback seguro — sin datos externos
@@ -284,7 +296,9 @@ def _result(
     reason: str,
     ai_confidence: int = 0,
     ai_reason: str = "",
+    ef_penalty: int = 0,
 ) -> dict:
+    # FIX 6: incluir ef_penalty en el dict para que decision_engine pueda leerlo
     return {
         "action":        action,
         "signal":        signal,
@@ -293,4 +307,5 @@ def _result(
         "signal_block":  format_signal_block(signal) if signal else "",
         "ai_confidence": ai_confidence,
         "ai_reason":     ai_reason,
+        "ef_penalty":    ef_penalty,
     }
