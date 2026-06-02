@@ -28,6 +28,20 @@ FIX pretrade_risk restart:
   la existente → posiciones duplicadas acumuladas.
   Ahora _init() reconstruye pretrade_risk.confirm_order(symbol, margin)
   desde el state persistido si la posición se confirma en el exchange.
+
+FIX bulk sz rounding (2026-06-02):
+  _place_tpsl construía los dicts de bulk_orders con qty crudo (sin redondear).
+  Aunque hl_client.place_sl/place_tp ya redondean, el path bulk llama
+  directamente a client._exchange.bulk_orders() saltándose ese redondeo.
+  Fix: rounded_qty = client.round_sz(qty) antes de construir los dicts.
+
+FIX DecisionEngine init + evaluate (2026-06-02):
+  1. _DecisionEngine se instanciaba como _DecisionEngine(symbol) pasando
+     symbol como pretrade_risk → AttributeError en evaluate().
+     Fix: se pasa pretrade_risk + usdc_per_trade + leverage correctamente.
+  2. evaluate() se llamaba con (self, risk, global_risk) en lugar de
+     (symbol, signal, price) → nunca se abrían posiciones nuevas con DE activo.
+     Fix: evaluate() solo se invoca desde _try_open_position con firma correcta.
 """
 from __future__ import annotations
 
@@ -260,8 +274,15 @@ class FuturesTrader:
         # BUG #4 FIX
         self._stopped_event: asyncio.Event = asyncio.Event()
 
+        # FIX DecisionEngine init: se pasa pretrade_risk + parámetros correctos,
+        # NO el symbol. El symbol se lo pasa evaluate() en cada llamada.
         if _DE_AVAILABLE:
-            self._decision_engine = _DecisionEngine(symbol)
+            usdc_per_trade = float(os.getenv("USDC_PER_TRADE", "50"))
+            self._decision_engine = _DecisionEngine(
+                pretrade_risk=pretrade_risk,
+                usdc_per_trade=usdc_per_trade,
+                leverage=leverage,
+            )
         else:
             self._decision_engine = None
 
@@ -673,6 +694,10 @@ class FuturesTrader:
 
         ep = entry_px if (entry_px and entry_px > 0) else self.entry_price
 
+        # FIX bulk sz rounding: redondear qty ANTES de construir los dicts,
+        # ya que bulk_orders llama al SDK directamente sin pasar por place_sl/place_tp.
+        rounded_qty = client.round_sz(qty)
+
         if sl and tp:
             bulk_ok = False
             try:
@@ -684,7 +709,7 @@ class FuturesTrader:
                     {
                         "coin":        client.coin,
                         "is_buy":      close_is_buy,
-                        "sz":          qty,
+                        "sz":          rounded_qty,
                         "limit_px":    sl_px,
                         "order_type":  {"trigger": {"triggerPx": sl_px, "isMarket": True,  "tpsl": "sl"}},
                         "reduce_only": True,
@@ -692,7 +717,7 @@ class FuturesTrader:
                     {
                         "coin":        client.coin,
                         "is_buy":      close_is_buy,
-                        "sz":          qty,
+                        "sz":          rounded_qty,
                         "limit_px":    tp_lim_px,
                         "order_type":  {"trigger": {"triggerPx": tp_px, "isMarket": False, "tpsl": "tp"}},
                         "reduce_only": True,
@@ -1110,6 +1135,48 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] _ensure_tpsl error: %s", self.symbol, e)
 
+    # ── _try_open_position ───────────────────────────────────────────────────────────
+
+    async def _try_open_position(self, price: float, risk, global_risk) -> None:
+        """
+        Evalúa señales y abre posición si corresponde.
+        Si DecisionEngine está disponible, lo usa como gate adicional.
+        La lógica de señal (decide/ai_decide) siempre corre primero.
+        """
+        try:
+            ohlcv = await self.get_ohlcv()
+            if len(ohlcv) < OHLCV_MIN_BARS:
+                logger.debug("[%s] OHLCV insuficiente (%d bars) — skip", self.symbol, len(ohlcv))
+                return
+
+            signal = await decide(
+                symbol=self.symbol,
+                ohlcv=ohlcv,
+                price=price,
+                ohlcv_fn=self.get_ohlcv,
+            )
+
+            if not signal or not signal.get("side"):
+                logger.debug("[%s] Sin señal — skip", self.symbol)
+                return
+
+            # FIX DecisionEngine evaluate: se llama con (symbol, signal, price)
+            # NO con (self, risk, global_risk)
+            if self._decision_engine is not None:
+                approved, reason, enriched = await self._decision_engine.evaluate(
+                    symbol=self.symbol,
+                    signal=signal,
+                    price=price,
+                )
+                if not approved:
+                    logger.info("[%s] DecisionEngine rechazó la señal: %s", self.symbol, reason)
+                    return
+                if enriched:
+                    signal = enriched
+
+        except Exception as e:
+            logger.error("[%s] _try_open_position error: %s", self.symbol, e, exc_info=True)
+
     # ── Loop principal ──────────────────────────────────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None):
@@ -1170,7 +1237,4 @@ class FuturesTrader:
 
             await self._manage_open_position(price, risk)
         else:
-            if self._decision_engine is not None:
-                await self._decision_engine.evaluate(self, risk, global_risk)
-            else:
-                logger.debug("[%s] DecisionEngine no disponible — skip evaluacion.", self.symbol)
+            await self._try_open_position(price, risk, global_risk)
