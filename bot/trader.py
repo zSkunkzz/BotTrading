@@ -25,8 +25,7 @@ FIX get_ohlcv None (2026-06-03):
   Hyperliquid candleSnapshot devuelve null (Python None) cuando startTime
   es demasiado antiguo o el request falla silenciosamente.
   Fixes:
-    - Reducir startTime: n = BARS_NEEDED (sin el +20 extra que lo hacía
-      pedir velas de hace ~25h en 15m, fuera del rango de HL).
+    - Reducir startTime: n = BARS_NEEDED (sin el +20 extra).
     - Guard: si raw is None, retry 1 vez con ventana aún más corta.
     - Log del status HTTP y body truncado cuando no es lista.
 
@@ -36,14 +35,21 @@ FIX _get_positions NoneType (2026-06-03):
     - Guard early-return si _master_addr vacío.
     - if data is None: log + return [].
     - try/except TypeError alrededor de data.get().
+
+FIX NameError aiohttp (2026-06-03):
+  _fetch_candles usaba aiohttp.ClientTimeout pero el import estaba solo
+  dentro de get_ohlcv (scope distinto). Movido al nivel de módulo.
 """
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import logging
 import os
 import time
 from typing import Callable, Optional
+
+import aiohttp
 
 from bot.core.hl_client import HLClient, _norm_coin
 from bot.core.trading_loop import TradingLoop
@@ -263,9 +269,6 @@ class FuturesTrader:
     # ── Métodos que TradingLoop llama sobre el objeto trader ────────
 
     async def get_price(self) -> float:
-        import aiohttp
-        import json as _json
-
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{_API_URL}/info",
@@ -285,11 +288,8 @@ class FuturesTrader:
         Llama a candleSnapshot con n_bars velas. Devuelve la respuesta raw
         (lista, None, o dict de error) sin procesar.
         """
-        import json as _json
-        import time as _time
-
         interval = _TF_MINUTES.get(timeframe, 15)
-        end_ms   = int(_time.time() * 1000)
+        end_ms   = int(time.time() * 1000)
         start_ms = end_ms - (n_bars * interval * 60 * 1000)
 
         payload = {
@@ -318,16 +318,12 @@ class FuturesTrader:
                 return None
 
     async def get_ohlcv(self, timeframe: str) -> list:
-        import aiohttp
-
-        n = _OHLCV_BARS  # FIX: era BARS_NEEDED+20, que pedia ventana demasiado larga
+        n = _OHLCV_BARS
 
         try:
             async with aiohttp.ClientSession() as session:
                 raw = await self._fetch_candles(session, timeframe, n)
 
-                # FIX: HL devuelve None cuando la ventana es demasiado larga.
-                # Retry con ventana reducida a la mitad.
                 if raw is None or not isinstance(raw, list):
                     logger.warning(
                         "[%s] get_ohlcv(%s) respuesta inesperada (tipo=%s val=%r) — "
@@ -374,10 +370,6 @@ class FuturesTrader:
         return _fn
 
     async def _get_positions(self) -> list[dict]:
-        import aiohttp
-        import json as _json
-
-        # FIX: si _master_addr está vacío (init incompleto), no llamar a la API
         if not self._master_addr:
             logger.debug("[%s] _get_positions: _master_addr vacío — skip.", self.symbol)
             return []
@@ -395,7 +387,6 @@ class FuturesTrader:
             logger.warning("[%s] _get_positions error: %s", self.symbol, e)
             return []
 
-        # FIX: HL puede devolver null o un objeto de error
         if data is None:
             logger.warning("[%s] _get_positions: respuesta null de HL API.", self.symbol)
             return []
@@ -429,9 +420,6 @@ class FuturesTrader:
         return result
 
     async def _get_open_orders_raw(self) -> list[dict]:
-        import aiohttp
-        import json as _json
-
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
