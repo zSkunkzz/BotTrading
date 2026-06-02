@@ -13,6 +13,12 @@ BUG #4 FIX: rotacion de par sin esperar cleanup del trader
 FIX #2 (2026-06-02): run_scanner_loop arrancaba con sleep(refresh_interval)
   → el primer re-scan ocurría 30 minutos después del arranque.
   Fix: mover el sleep AL FINAL del ciclo para que el primer scan sea inmediato.
+
+IA (2026-06-02): integración de news_score_adjustment()
+  Cuando AI_NEWS_FILTER=true, después de calcular el score técnico base
+  se llama a ai_filter.news_score_adjustment(coin) para cada par candidato
+  y el delta [-2.0, +2.0] se suma al score antes de ordenar.
+  Fallback seguro: si Groq falla → delta=0.0, score sin cambios.
 """
 import logging
 import asyncio
@@ -36,6 +42,9 @@ _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https
 
 # BUG #4: timeout maximo para esperar cleanup de un trader saliente
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
+
+# IA: activar filtro de noticias con AI_NEWS_FILTER=true
+_AI_NEWS_FILTER: bool = os.getenv("AI_NEWS_FILTER", "false").lower() in ("true", "1", "yes")
 
 
 async def _info_post(payload: dict) -> dict:
@@ -152,6 +161,7 @@ class PairScanner:
                 change_pct = None
 
             score_change = change_pct if change_pct is not None else 0.0
+            # Score técnico base (sin IA)
             score = (day_volume / 1_000_000) * 0.6 + score_change * 0.4
             scored.append({
                 "symbol":        coin,
@@ -162,12 +172,41 @@ class PairScanner:
                 "oi_usdt":       round(open_interest * mark_px / 1_000_000, 2),
                 "score":         round(score, 3),
                 "max_leverage":  max_lev,
+                "ai_delta":      0.0,  # se rellena abajo si AI_NEWS_FILTER=true
             })
 
         logger.debug(
             "[PairScanner] scan: total=%d | blacklist=%d | vol_filter=%d | change_filter=%d | passed=%d",
             total_seen, skipped_blacklist, skipped_volume, skipped_change, len(scored),
         )
+
+        # ── Filtro de noticias IA ──────────────────────────────────────────────
+        # Solo activo con AI_NEWS_FILTER=true. Consulta Groq para cada par
+        # candidato y suma el delta al score técnico antes de ordenar.
+        # Todas las llamadas se lanzan en paralelo (gather) para no ralentizar
+        # el ciclo de scan con N llamadas secuenciales.
+        if _AI_NEWS_FILTER and scored:
+            try:
+                from ai_filter import news_score_adjustment
+
+                async def _fetch_delta(pair: dict) -> float:
+                    try:
+                        return await news_score_adjustment(pair["symbol"])
+                    except Exception:
+                        return 0.0
+
+                deltas = await asyncio.gather(*[_fetch_delta(p) for p in scored])
+                for pair, delta in zip(scored, deltas):
+                    if delta != 0.0:
+                        pair["score"]    = round(pair["score"] + delta, 3)
+                        pair["ai_delta"] = round(delta, 2)
+                logger.info(
+                    "[PairScanner] Filtro IA aplicado — %d pares con delta != 0",
+                    sum(1 for d in deltas if d != 0.0),
+                )
+            except Exception as e:
+                logger.warning("[PairScanner] Error en filtro IA — scores sin modificar: %s", e)
+        # ──────────────────────────────────────────────────────────────────────
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         top = scored[:self.top_n]
@@ -176,10 +215,11 @@ class PairScanner:
         logger.info("🏆 Top %d pares Hyperliquid seleccionados:", len(top))
         for p in top[:5]:
             change_str = f"{p['change_pct']}%" if p["change_pct"] is not None else "N/A"
+            ai_str     = f" | IA: {p['ai_delta']:+.1f}" if p.get("ai_delta") else ""
             logger.info(
-                "  %-12s Vol: $%sM | Cambio: %s | MaxLev: %dx | Score: %s",
+                "  %-12s Vol: $%sM | Cambio: %s | MaxLev: %dx | Score: %s%s",
                 p["symbol"], p["volume_usdt"], change_str,
-                p.get("max_leverage", 0), p["score"],
+                p.get("max_leverage", 0), p["score"], ai_str,
             )
 
         return [p["symbol"] for p in top]
