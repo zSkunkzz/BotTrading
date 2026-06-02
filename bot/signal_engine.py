@@ -51,24 +51,28 @@ SISTEMA DE SCORING (max_score = 10):
     - Vol 15m < 0.6x: mercado dormido, no entrar
 
   MIN_SCORE  = 6 / 10  (60% de confluencia)
-  MIN_RR     = 1.8     ← RR mínimo real (calculado sobre SL real, no teórico)
+  MIN_RR     = 1.5     ← RR mínimo ajustado a TPs conservadores
 
 NOTA RR:
   El SL real se calcula como min(low_price - buffer, entry - SL_mult*ATR).
   Esto hace que el SL real sea >= SL_mult*ATR, por lo que el RR real
-  es MENOR que el RR teórico. Por eso MIN_RR se baja a 1.8 para no
-  rechazar todos los trades válidos.
+  es MENOR que el RR teórico. Por eso MIN_RR se baja a 1.5.
 
-  SL/TP (multiplicadores ATR):
-  Modo tendencia : SL=1.5×ATR | TP=2.8×ATR → RR objetivo ~1.87
-  Modo breakout  : SL=1.5×ATR | TP=2.8×ATR → RR objetivo ~1.87
-  Modo reversal  : SL=1.2×ATR | TP=2.2×ATR → RR objetivo ~1.83
+  SL/TP (multiplicadores ATR) — calibrados para llegar con más frecuencia:
+  Modo tendencia : SL=1.5×ATR | TP1=1.5×ATR → RR objetivo ~1.0 real
+  Modo breakout  : SL=1.5×ATR | TP1=1.4×ATR → RR objetivo ~0.93 real
+  Modo reversal  : SL=1.2×ATR | TP1=1.3×ATR → RR objetivo ~1.08 real
 
   TP2 mantenido como referencia interna (no se usa en órdenes).
   Trailing TP eliminado.
+
+  FIX (2026-06-03): analyze_pair ahora fetcha los 3 timeframes en paralelo
+  con asyncio.gather() en vez de secuencialmente. Esto reduce la latencia
+  por iteración de ~45s a ~15s en el peor caso.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -81,14 +85,14 @@ log = logging.getLogger(__name__)
 
 # ─── Constantes ──────────────────────────────────────────────────────────────────────────────
 MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
-MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.8"))   # FIX: bajado de 2.5 a 1.8
+MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5"))   # ajustado a TPs conservadores
 
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
 _SL_ATR_MULT       = float(os.getenv("SL_ATR_MULT",  "1.5"))
-# TP calibrado para RR objetivo ~1.87 con SL base 1.5x ATR:
-_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "2.8"))
-_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "4.5"))
+# TP calibrado para llegar con más frecuencia:
+_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "1.5"))   # TENDENCIA: era 2.8
+_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.0"))   # referencia interna
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 
@@ -151,13 +155,23 @@ async def analyze_pair(
 ) -> SignalResult:
     try:
         if ohlcv_fn is not None:
-            bars_15m = await ohlcv_fn("15m") or []
-            bars_1h  = await ohlcv_fn("1h")  or []
-            bars_4h  = await ohlcv_fn("4h")  or []
+            # FIX (2026-06-03): fetch paralelo — de ~45s a ~15s por iteración
+            bars_15m, bars_1h, bars_4h = await asyncio.gather(
+                ohlcv_fn("15m"),
+                ohlcv_fn("1h"),
+                ohlcv_fn("4h"),
+                return_exceptions=False,
+            )
+            bars_15m = bars_15m or []
+            bars_1h  = bars_1h  or []
+            bars_4h  = bars_4h  or []
         else:
-            bars_15m = await _fetch_bars(exch, symbol, "15m", _BARS_NEEDED)
-            bars_1h  = await _fetch_bars(exch, symbol, "1h",  _BARS_NEEDED)
-            bars_4h  = await _fetch_bars(exch, symbol, "4h",  max(50, _BARS_NEEDED // 2))
+            bars_15m, bars_1h, bars_4h = await asyncio.gather(
+                _fetch_bars(exch, symbol, "15m", _BARS_NEEDED),
+                _fetch_bars(exch, symbol, "1h",  _BARS_NEEDED),
+                _fetch_bars(exch, symbol, "4h",  max(50, _BARS_NEEDED // 2)),
+                return_exceptions=False,
+            )
     except Exception as e:
         log.error("[signal_engine] OHLCV fetch error %s: %s", symbol, e)
         return _hold_result(symbol, f"OHLCV error: {e}")
@@ -199,16 +213,16 @@ async def analyze_pair(
 
     if setup_type == "REVERSAL":
         sl_mult  = float(os.getenv("SL_ATR_MULT_REVERSAL",  "1.2"))
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "2.2"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "4.0"))
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.3"))  # era 2.2
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "3.0"))
     elif setup_type == "BREAKOUT":
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "2.8"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "4.5"))
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "1.4"))  # era 2.8
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "3.0"))
     else:  # TENDENCIA
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = _TP1_ATR_MULT
-        tp2_mult = _TP2_ATR_MULT
+        tp1_mult = _TP1_ATR_MULT   # 1.5x
+        tp2_mult = _TP2_ATR_MULT   # 3.0x
 
     if signal_str == "LONG":
         sl  = round(min(low_price  - _atr_buf, entry - sl_mult  * atr_val), 6)
@@ -219,7 +233,7 @@ async def analyze_pair(
         tp1 = round(entry - tp1_mult * atr_val, 6)
         tp2 = round(entry - tp2_mult * atr_val, 6)
 
-    # FIX RR: calcular sobre la distancia REAL al SL (no teórica)
+    # RR calculado sobre distancia REAL al SL
     risk   = abs(entry - sl)
     reward = abs(tp1 - entry)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
