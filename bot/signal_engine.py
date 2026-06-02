@@ -50,6 +50,17 @@ FIX manual_close_cooldown:
   ManualCloseCooldown registra cierres manuales (sin SL/TP hit) y bloquea
   reentradas al mismo símbolo durante MANUAL_CLOSE_COOLDOWN_S segundos.
   Exportado como manual_close_cooldown (singleton).
+
+FIX tf1h_empty (CRÍTICO):
+  tf1h_ok ahora requiere que i1h NO esté vacío Y tenga ema_bull/st_bull.
+  Antes, un dict vacío {} hacía que (not i1h) == True y el check 1h se saltaba
+  completamente, permitiendo entradas sin confirmación de timeframe mayor.
+
+FIX min_score_max_score (CRÍTICO):
+  MIN_SCORE por defecto sube de 6 a 8 ahora que max_score=12.
+  Con max_score=10 (antes), MIN_SCORE=6 era el 60%. Con max_score=12,
+  MIN_SCORE=6 era solo el 50% — señales de baja calidad pasaban como válidas.
+  MIN_SCORE=8 restaura el umbral efectivo al ~67%.
 """
 from __future__ import annotations
 
@@ -65,7 +76,8 @@ log = logging.getLogger(__name__)
 
 # ─── Constantes exportadas ────────────────────────────────────────────────────
 
-MIN_SCORE: int   = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
+# FIX min_score_max_score: default sube a 8 (antes 6) para compensar max_score=12
+MIN_SCORE: int   = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
 MIN_RR: float    = float(os.getenv("MIN_RR_REQUIRED", "1.8"))
 
 _TIMEFRAMES  = ["15m", "1h", "4h"]
@@ -380,13 +392,17 @@ def _score_signal(
         if i4h.get("st_bear"):   short_pts += 1; reasons.append("ST4h↓")
 
     if long_pts > short_pts:
-        tf1h_ok = (not i1h) or i1h.get("ema_bull") or i1h.get("st_bull")
+        # FIX tf1h_empty (CRÍTICO): i1h vacío ({}) NO cuenta como confirmación.
+        # Antes: (not i1h) era True con {} → check 1h ignorado completamente.
+        # Ahora: se requiere que i1h tenga datos Y confirme alcista.
+        tf1h_ok = bool(i1h) and (i1h.get("ema_bull") or i1h.get("st_bull"))
         if tf1h_ok:
             return long_pts, max_score, "LONG", reasons
         return long_pts, max_score, "NEUTRAL", reasons + ["1h_no_confirma"]
 
     if short_pts > long_pts:
-        tf1h_ok = (not i1h) or i1h.get("ema_bear") or i1h.get("st_bear")
+        # FIX tf1h_empty (CRÍTICO): mismo fix para SHORT
+        tf1h_ok = bool(i1h) and (i1h.get("ema_bear") or i1h.get("st_bear"))
         if tf1h_ok:
             return short_pts, max_score, "SHORT", reasons
         return short_pts, max_score, "NEUTRAL", reasons + ["1h_no_confirma"]
