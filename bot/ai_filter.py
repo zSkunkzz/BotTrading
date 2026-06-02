@@ -9,16 +9,16 @@ Fuentes RSS (100% gratuitas, sin API key, sin registro):
 Flujo:
   1. Check cache  → si vigente, devuelve sin ninguna llamada externa.
   2. Fetch RSS de las 3 fuentes en paralelo (una sola ClientSession).
-  3. Filtra titulares que mencionen el simbolo o su nombre completo.
+  3. Filtra titulares que mencionen el simbolo con word-boundary (evita falsos
+     positivos como ENA dentro de "Ethena", OP dentro de "optimize", etc).
   4. Sin titulares relevantes → 0.0 SIN llamar a Groq.
   5. Con titulares → llama a Groq (misma sesion reutilizada).
   6. Cachea el resultado.
 
-Fix 2026-06-02: se eliminaron las ClientSession anidadas dentro de helpers.
-Ahora news_score_adjustment() crea UNA sola sesion aiohttp con
-connector_owner=True y la pasa a todos los helpers. Esto evita el warning
-"Unclosed connection" que aparecia cuando una excepcion interrumpia el flujo
-antes de que el context manager interno pudiera cerrar la sesion.
+Fix 2026-06-02a: ClientSession unica por operacion (evita Unclosed connection).
+Fix 2026-06-02b: word-boundary regex para simbolos de 1-4 letras que son
+  substrings comunes (ENA en "Ethena", OP en "options", etc). Simbolos de
+  5+ letras siguen usando substring simple. Keywords siempre usan boundary.
 
 Variables de entorno:
   GROQ_API_KEY            — clave Groq
@@ -55,6 +55,11 @@ RSS_FEEDS = [
     "https://decrypt.co/feed",
 ]
 
+# Simbolos con <= 4 chars usan word-boundary en el match (evita falsos positivos).
+# Keywords siempre usan word-boundary.
+_BOUNDARY_THRESHOLD = 4
+
+# Mapa simbolo -> keywords adicionales (todas en minusculas, sin regex especial)
 _SYMBOL_KEYWORDS: dict[str, list[str]] = {
     "BTC":   ["bitcoin"],
     "ETH":   ["ethereum", "ether"],
@@ -65,7 +70,7 @@ _SYMBOL_KEYWORDS: dict[str, list[str]] = {
     "DOGE":  ["dogecoin"],
     "AVAX":  ["avalanche"],
     "DOT":   ["polkadot"],
-    "MATIC": ["polygon"],
+    "MATIC": ["polygon", "matic network"],
     "LINK":  ["chainlink"],
     "UNI":   ["uniswap"],
     "ATOM":  ["cosmos"],
@@ -76,6 +81,15 @@ _SYMBOL_KEYWORDS: dict[str, list[str]] = {
     "SUI":   ["sui network"],
     "APT":   ["aptos"],
     "INJ":   ["injective"],
+    # Pares activos en el bot segun logs
+    "ENA":   ["ethena"],          # ENA es ticker de Ethena — sin keyword da falsos positivos
+    "HYPE":  ["hyperliquid"],
+    "ZEC":   ["zcash"],
+    "TON":   ["toncoin", "the open network"],
+    "WLD":   ["worldcoin"],
+    "ONDO":  ["ondo finance"],
+    "PUMP":  ["pump.fun"],
+    "LIT":   ["litentry"],
 }
 
 # Cache en memoria: {symbol: (score_delta, timestamp_monotonic)}
@@ -102,18 +116,48 @@ def _set_cached(symbol: str, delta: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RSS fetch — recibe session ya abierta, NO crea una nueva
+# Symbol matching con word-boundary para simbolos cortos
 # ---------------------------------------------------------------------------
 
+def _word_boundary_match(text_lower: str, term: str) -> bool:
+    """Busca 'term' en text_lower con word-boundary para evitar substrings falsos."""
+    pattern = rf"\b{re.escape(term)}\b"
+    return bool(re.search(pattern, text_lower))
+
+
 def _matches_symbol(text: str, symbol: str) -> bool:
+    """
+    True si el texto menciona el simbolo o alguna de sus keywords.
+
+    Logica:
+    - Simbolos de <= 4 chars (ENA, OP, DOT, BTC, ETH...): word-boundary obligatorio.
+      Evita que "ENA" haga match en "Ethena", "OP" en "options", etc.
+    - Simbolos de >= 5 chars (AVAX, DOGE, MATIC...): substring simple (son suficientemente
+      especificos para no dar falsos positivos).
+    - Keywords siempre usan word-boundary.
+    """
     text_lower = text.lower()
-    if symbol.lower() in text_lower:
-        return True
-    for kw in _SYMBOL_KEYWORDS.get(symbol, []):
-        if kw in text_lower:
+    sym_lower  = symbol.lower()
+
+    # Match del ticker
+    if len(symbol) <= _BOUNDARY_THRESHOLD:
+        if _word_boundary_match(text_lower, sym_lower):
             return True
+    else:
+        if sym_lower in text_lower:
+            return True
+
+    # Match de keywords (siempre con boundary)
+    for kw in _SYMBOL_KEYWORDS.get(symbol, []):
+        if _word_boundary_match(text_lower, kw):
+            return True
+
     return False
 
+
+# ---------------------------------------------------------------------------
+# RSS fetch — recibe session ya abierta, NO crea una nueva
+# ---------------------------------------------------------------------------
 
 async def _fetch_feed(
     session: aiohttp.ClientSession,
@@ -273,7 +317,7 @@ async def news_score_adjustment(symbol: str) -> float:
 
     Flujo:
       1. Cache       → devuelve sin llamadas si vigente.
-      2. RSS (gratis)→ busca titulares que mencionen el simbolo.
+      2. RSS (gratis)→ busca titulares que mencionen el simbolo (word-boundary).
       3. Sin titulares → 0.0 SIN llamar a Groq.
       4. Con titulares → llama a Groq para analizar sentimiento.
     """
@@ -284,7 +328,6 @@ async def news_score_adjustment(symbol: str) -> float:
         logger.debug("[AIFilter] %s — cache hit, score_delta=%+.1f", base, cached)
         return cached
 
-    # Una sola sesion para toda la operacion
     async with aiohttp.ClientSession() as session:
         headlines = await _fetch_recent_headlines(session, base, _HOURS_LOOKBACK)
 
