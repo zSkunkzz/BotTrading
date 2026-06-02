@@ -28,19 +28,9 @@ FIX bulk sz rounding (2026-06-02):
   _place_tpsl construía los dicts de bulk_orders con qty crudo (sin redondear).
   Fix: rounded_qty = client.round_sz(qty) antes de construir los dicts.
 
-FIX DecisionEngine (2026-06-02 v2):
-  Firma real de decision_engine.py:
-    __init__(self, symbol: str, position_mgr=None)
-    evaluate(self, trader, risk, global_risk=None)  <- maneja todo internamente
-    on_position_closed(self, symbol, margin, reason, entry_mode)  <- ya es async def
-
-  Correcciones en trader.py:
-  1. _DecisionEngine se instancia como _DecisionEngine(symbol),
-     NO con pretrade_risk=/usdc_per_trade=/leverage= (kwargs inexistentes).
-  2. evaluate() se llama con (trader=self, risk=risk, global_risk=global_risk).
-     El DE maneja la apertura completa internamente; no devuelve (approved, reason, enriched).
-  3. _try_open_position delega COMPLETAMENTE en el DE si está disponible.
-     Sin DE, usa el path de decide() propio (sin abrir posición, solo placeholder).
+FIX DecisionEngine import (2026-06-02 v3):
+  El módulo real es bot/decision_engine.py, NO bot/core/decision_engine.py.
+  Corregido: from bot.decision_engine import DecisionEngine as _DecisionEngine
 """
 from __future__ import annotations
 
@@ -69,7 +59,7 @@ from bot.trailing_sl import compute_trailing_sl, is_trailing_sl_hit
 
 # ── DecisionEngine (opcional) ───────────────────────────────────────────────
 try:
-    from bot.core.decision_engine import DecisionEngine as _DecisionEngine
+    from bot.decision_engine import DecisionEngine as _DecisionEngine  # FIX: era bot.core.decision_engine
     _DE_AVAILABLE = True
 except ImportError:
     _DecisionEngine = None
@@ -261,10 +251,13 @@ class FuturesTrader:
         self._open_lock: asyncio.Lock = asyncio.Lock()
         self._stopped_event: asyncio.Event = asyncio.Event()
 
-        # FIX: firma real es _DecisionEngine(symbol, position_mgr=None)
-        # NO kwargs pretrade_risk=/usdc_per_trade=/leverage=
+        # DecisionEngine: firma real __init__(pretrade_risk, signal_engine, usdc_per_trade, leverage)
         if _DE_AVAILABLE:
-            self._decision_engine = _DecisionEngine(symbol)
+            self._decision_engine = _DecisionEngine(
+                pretrade_risk=pretrade_risk,
+                usdc_per_trade=float(os.getenv("USDC_PER_TRADE", "20")),
+                leverage=leverage,
+            )
         else:
             self._decision_engine = None
 
@@ -849,7 +842,6 @@ class FuturesTrader:
 
         if self._decision_engine is not None:
             try:
-                # on_position_closed es async def en decision_engine.py
                 await self._decision_engine.on_position_closed(
                     symbol=self.symbol,
                     margin=self._open_margin,
@@ -1029,24 +1021,108 @@ class FuturesTrader:
     # ── _try_open_position ───────────────────────────────────────────────────────────
 
     async def _try_open_position(self, price: float, risk, global_risk) -> None:
-        """
-        Si DecisionEngine está disponible, delega en él completamente:
-          evaluate(trader=self, risk=risk, global_risk=global_risk)
-          El DE evalua señal, filtros, sizing y abre la posición internamente.
-
-        Sin DE, no hace nada (path legacy no implementado aquí).
-        """
         if self._decision_engine is not None:
             try:
-                await self._decision_engine.evaluate(
-                    trader=self,
-                    risk=risk,
-                    global_risk=global_risk,
-                )
+                signal = await self._get_signal(price)
+                if signal:
+                    approved, reason, enriched = await self._decision_engine.evaluate(
+                        symbol=self.symbol,
+                        signal=signal,
+                        price=price,
+                    )
+                    if approved and enriched:
+                        await self._execute_signal(enriched, price, risk)
+                    elif not approved:
+                        logger.debug("[%s] DecisionEngine rechazó señal: %s", self.symbol, reason)
             except Exception as e:
                 logger.error("[%s] DecisionEngine.evaluate error: %s", self.symbol, e, exc_info=True)
         else:
             logger.debug("[%s] DecisionEngine no disponible — sin entradas automáticas.", self.symbol)
+
+    async def _get_signal(self, price: float) -> dict | None:
+        """Obtiene señal de la estrategia para este símbolo."""
+        try:
+            ohlcv = await self.get_ohlcv()
+            if not ohlcv or len(ohlcv) < OHLCV_MIN_BARS:
+                return None
+            signal = await ai_decide(self.symbol, ohlcv, price)
+            return signal
+        except Exception as e:
+            logger.debug("[%s] _get_signal error: %s", self.symbol, e)
+            return None
+
+    async def _execute_signal(self, enriched: dict, price: float, risk) -> None:
+        """Abre posición basada en señal enriquecida por DecisionEngine."""
+        side = enriched.get("side")
+        margin = enriched.get("_margin", risk.usdc_per_trade)
+        leverage = enriched.get("_leverage", self.leverage)
+        sl = enriched.get("sl")
+        tp1 = enriched.get("tp1")
+        tp2 = enriched.get("tp2")
+        entry_mode = enriched.get("entry_mode", "NORMAL")
+
+        if not side:
+            return
+
+        notional = margin * leverage
+        qty = self._round_qty(notional / price)
+        if qty <= 0:
+            logger.warning("[%s] qty calculada = 0, skip.", self.symbol)
+            return
+
+        async with self._open_lock:
+            if self.position is not None:
+                return
+
+            logger.info(
+                "[%s] Abriendo %s | qty=%.4f | margin=%.2f | lev=%dx | sl=%s | tp1=%s",
+                self.symbol, side, qty, margin, leverage, sl, tp1,
+            )
+            r = await self._place_order(side, qty, sl=sl, tp=tp1)
+            if r.get("status") != "ok":
+                logger.warning("[%s] Orden rechazada: %s", self.symbol, r)
+                return
+
+            positions = await self._confirm_position_with_retry()
+            if not positions:
+                logger.warning("[%s] Posición no confirmada tras fill.", self.symbol)
+                return
+
+            self.position       = side
+            self.entry_price    = price
+            self.sl             = sl
+            self.tp1            = tp1
+            self.tp2            = tp2
+            self._open_qty      = qty
+            self._open_margin   = margin
+            self._open_notional = notional
+            self._open_leverage = leverage
+            self._open_entry_mode = entry_mode
+            self._protection_ok = False
+
+            if sl and tp1:
+                try:
+                    await self._place_tpsl(qty=qty, sl=sl, tp=tp1, entry_px=price)
+                    self._protection_ok = True
+                except Exception as e:
+                    logger.error("[%s] Error colocando SL/TP: %s", self.symbol, e)
+
+            save_position(self.symbol, {
+                "side": side, "entry": price,
+                "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": None,
+                "tp1_hit": False, "tp2_hit": False,
+                "usdc_amount": notional, "leverage": leverage,
+                "margin_usdc": margin, "qty": qty,
+                "entry_mode": entry_mode,
+                "trailing_sl_activated": False, "trail_peak": 0.0,
+            })
+
+            await self._decision_engine.on_order_confirmed(symbol=self.symbol, margin=margin)
+
+            try:
+                await notify_open(self.symbol, side, price, qty, sl=sl, tp=tp1)
+            except Exception:
+                pass
 
     # ── Loop principal ──────────────────────────────────────────────────────────────────────────────
 
