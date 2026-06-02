@@ -41,14 +41,15 @@ _TF_MINUTES = {
 }
 
 # Intentos de confirmación de fill tras orden de mercado
-_FILL_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
-_FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
+# Reducido a 3 intentos x 2s = 6s máx (antes era 6x3s=18s)
+_FILL_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "3"))
+_FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "2.0"))
 
 # Desfase máximo permitido entre ref_price y signal.entry antes de cancelar.
-# Si el precio actual se alejó más de este % del entry del signal, el setup
-# se considera inválido y la orden NO se envía.
-# Configurable vía variable de entorno MAX_ENTRY_DRIFT_PCT (default: 1.5)
-_MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "1.5")) / 100.0
+# Aumentado de 1.5% a 3.0% — en cryptos volátiles el precio puede moverse
+# 1-2% entre generación del signal y ejecución de la orden.
+# Configurable vía variable de entorno MAX_ENTRY_DRIFT_PCT (default: 3.0)
+_MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "3.0")) / 100.0
 
 
 def _check_price_staleness(
@@ -426,7 +427,7 @@ class FuturesTrader:
 
         PROTECCIÓN DE ENTRADA:
           Antes de enviar la orden, comprueba que el precio actual (ref_price)
-          no se haya alejado más de MAX_ENTRY_DRIFT_PCT (default 1.5%) del
+          no se haya alejado más de MAX_ENTRY_DRIFT_PCT (default 3.0%) del
           entry calculado por el signal_engine. Si se superó ese umbral, la
           entrada se cancela completamente — el setup ya no es válido.
 
@@ -538,12 +539,17 @@ class FuturesTrader:
 
         # ── Re-escalar SL/TP al precio real de fill ────────────────────
         sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, filled_price, ref_price)
-        tp3_px = float(signal.get("tp3") or 0)
-        if tp3_px > 0:
-            _, _, _tp3_tmp = _adjust_levels_to_fill(
-                {**signal, "tp2": signal.get("tp3")}, filled_price, ref_price
-            )
-            tp3_px = _tp3_tmp
+
+        # Fix: re-escalar tp3 usando su propio key, no sobreescribiendo tp2
+        tp3_raw = float(signal.get("tp3") or 0)
+        tp3_px = 0.0
+        if tp3_raw > 0:
+            base = float(signal.get("entry") or ref_price)
+            if base > 0 and abs(filled_price - base) / base >= 0.0005:
+                pct = (tp3_raw - base) / base
+                tp3_px = filled_price * (1.0 + pct)
+            else:
+                tp3_px = tp3_raw
 
         # ── Actualizar estado interno ───────────────────────────────
         self.position    = "long" if is_long else "short"
