@@ -20,6 +20,22 @@ FIX FREEZE (2026-06-03):
 
 FIX DEADLOCK (2026-06-03 anterior):
   Todas las llamadas al SDK síncrono se envuelven en asyncio.to_thread().
+
+FIX get_ohlcv None (2026-06-03):
+  Hyperliquid candleSnapshot devuelve null (Python None) cuando startTime
+  es demasiado antiguo o el request falla silenciosamente.
+  Fixes:
+    - Reducir startTime: n = BARS_NEEDED (sin el +20 extra que lo hacía
+      pedir velas de hace ~25h en 15m, fuera del rango de HL).
+    - Guard: si raw is None, retry 1 vez con ventana aún más corta.
+    - Log del status HTTP y body truncado cuando no es lista.
+
+FIX _get_positions NoneType (2026-06-03):
+  Cuando _master_addr está vacío (init incompleto) o HL devuelve error JSON,
+  data es None o un dict sin 'assetPositions'. Fix:
+    - Guard early-return si _master_addr vacío.
+    - if data is None: log + return [].
+    - try/except TypeError alrededor de data.get().
 """
 from __future__ import annotations
 
@@ -187,8 +203,6 @@ class FuturesTrader:
         self._api_secret = api_secret or ""
 
         # FIX FREEZE: NO crear HLClient aquí (bloquea el event loop).
-        # Se inicializa de forma async en _get_ccxt(), que TradingLoop
-        # llama desde _init() dentro del event loop.
         self._hl_client: Optional[HLClient] = None
         self._master_addr: str = ""
         self._agent_mode:  bool = False
@@ -197,7 +211,7 @@ class FuturesTrader:
         self._trading_loop  = TradingLoop(symbol)
         self._ccxt_exchange  = None
 
-    # ── Interfaz pública requerida por main.py ──────────────────────
+    # ── Interfaz pública requerida por main.py ──────────────────
 
     async def run(self, risk, *, global_risk=None) -> None:
         try:
@@ -218,16 +232,8 @@ class FuturesTrader:
     # ── _get_ccxt: crea HLClient la primera vez (async-safe) ──────────
 
     async def _get_ccxt(self) -> None:
-        """
-        FIX FREEZE: inicializa _hl_client vía HLClient.create() (async).
-        Llamar solo desde _init() de TradingLoop, que ya está dentro del
-        event loop. La primera llamada puede tardar 2-5s (warm cache),
-        pero NO bloquea el event loop porque usa asyncio.to_thread().
-        Llamadas subsiguientes son instantáneas (singleton ya listo).
-        """
         if self._hl_client is not None:
             return
-
         try:
             logger.info("[%s] _get_ccxt: inicializando HLClient...", self.symbol)
             self._hl_client = await HLClient.create(self.symbol)
@@ -243,13 +249,9 @@ class FuturesTrader:
             logger.error("[%s] _get_ccxt: error inicializando HLClient: %s", self.symbol, e)
             raise
 
-    # ── Acceso seguro a _hl_client ────────────────────────────────────
+    # ── Acceso seguro a _hl_client ────────────────────────────────
 
     def _require_hl(self) -> Optional[HLClient]:
-        """
-        Devuelve _hl_client si está inicializado, o None con log de error.
-        Usar en cualquier método que necesite el SDK.
-        """
         if self._hl_client is None:
             logger.error(
                 "[%s] _hl_client no inicializado. ¿Se llamó _get_ccxt() antes?",
@@ -258,7 +260,7 @@ class FuturesTrader:
             return None
         return self._hl_client
 
-    # ── Métodos que TradingLoop llama sobre el objeto trader ──────────
+    # ── Métodos que TradingLoop llama sobre el objeto trader ────────
 
     async def get_price(self) -> float:
         import aiohttp
@@ -278,41 +280,72 @@ class FuturesTrader:
             raise ValueError(f"[{self.symbol}] Precio no encontrado en allMids")
         return float(price)
 
-    async def get_ohlcv(self, timeframe: str) -> list:
-        import aiohttp
+    async def _fetch_candles(self, session, timeframe: str, n_bars: int):
+        """
+        Llama a candleSnapshot con n_bars velas. Devuelve la respuesta raw
+        (lista, None, o dict de error) sin procesar.
+        """
         import json as _json
         import time as _time
 
         interval = _TF_MINUTES.get(timeframe, 15)
-        n = _OHLCV_BARS + 20
         end_ms   = int(_time.time() * 1000)
-        start_ms = end_ms - (n * interval * 60 * 1000)
+        start_ms = end_ms - (n_bars * interval * 60 * 1000)
 
         payload = {
-            "type":      "candleSnapshot",
+            "type": "candleSnapshot",
             "req": {
-                "coin":       self.coin,
-                "interval":   timeframe,
-                "startTime":  start_ms,
-                "endTime":    end_ms,
+                "coin":      self.coin,
+                "interval":  timeframe,
+                "startTime": start_ms,
+                "endTime":   end_ms,
             },
         }
+        async with session.post(
+            f"{_API_URL}/info",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            text = await resp.text()
+            try:
+                return _json.loads(text)
+            except Exception:
+                logger.warning(
+                    "[%s] get_ohlcv(%s): respuesta no-JSON (status=%s): %s",
+                    self.symbol, timeframe, resp.status, text[:200],
+                )
+                return None
+
+    async def get_ohlcv(self, timeframe: str) -> list:
+        import aiohttp
+
+        n = _OHLCV_BARS  # FIX: era BARS_NEEDED+20, que pedia ventana demasiado larga
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{_API_URL}/info",
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    raw = _json.loads(await resp.text())
+                raw = await self._fetch_candles(session, timeframe, n)
+
+                # FIX: HL devuelve None cuando la ventana es demasiado larga.
+                # Retry con ventana reducida a la mitad.
+                if raw is None or not isinstance(raw, list):
+                    logger.warning(
+                        "[%s] get_ohlcv(%s) respuesta inesperada (tipo=%s val=%r) — "
+                        "reintentando con ventana reducida...",
+                        self.symbol, timeframe, type(raw).__name__, raw,
+                    )
+                    raw = await self._fetch_candles(session, timeframe, n // 2)
+
+                if raw is None or not isinstance(raw, list):
+                    logger.warning(
+                        "[%s] get_ohlcv(%s) sigue sin ser lista tras retry (tipo=%s) — "
+                        "devolviendo lista vacía.",
+                        self.symbol, timeframe, type(raw).__name__,
+                    )
+                    return []
+
         except Exception as e:
             logger.warning("[%s] get_ohlcv(%s) error: %s", self.symbol, timeframe, e)
-            return []
-
-        if not isinstance(raw, list):
-            logger.warning("[%s] get_ohlcv(%s) respuesta inesperada: %s", self.symbol, timeframe, raw)
             return []
 
         bars = []
@@ -344,32 +377,55 @@ class FuturesTrader:
         import aiohttp
         import json as _json
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{_API_URL}/info",
-                json={"type": "clearinghouseState", "user": self._master_addr},
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                data = _json.loads(await resp.text())
+        # FIX: si _master_addr está vacío (init incompleto), no llamar a la API
+        if not self._master_addr:
+            logger.debug("[%s] _get_positions: _master_addr vacío — skip.", self.symbol)
+            return []
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{_API_URL}/info",
+                    json={"type": "clearinghouseState", "user": self._master_addr},
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = _json.loads(await resp.text())
+        except Exception as e:
+            logger.warning("[%s] _get_positions error: %s", self.symbol, e)
+            return []
+
+        # FIX: HL puede devolver null o un objeto de error
+        if data is None:
+            logger.warning("[%s] _get_positions: respuesta null de HL API.", self.symbol)
+            return []
+
+        try:
+            asset_positions = data.get("assetPositions", [])
+        except (TypeError, AttributeError) as e:
+            logger.warning("[%s] _get_positions: respuesta inesperada (tipo=%s): %s",
+                           self.symbol, type(data).__name__, e)
+            return []
 
         result = []
-        for p in data.get("assetPositions", []):
-            pos = p.get("position", {})
-            if pos.get("coin", "").upper() != self.coin.upper():
-                continue
+        for p in asset_positions:
             try:
+                pos = p.get("position", {})
+                if pos.get("coin", "").upper() != self.coin.upper():
+                    continue
                 szi = float(pos.get("szi", 0) or 0)
-            except (TypeError, ValueError):
+                if abs(szi) == 0:
+                    continue
+                result.append({
+                    "side":    "long" if szi > 0 else "short",
+                    "size":    abs(szi),
+                    "entryPx": float(pos.get("entryPx") or 0),
+                    "coin":    pos.get("coin", ""),
+                })
+            except (TypeError, AttributeError, ValueError) as e:
+                logger.debug("[%s] _get_positions: error parseando posición: %s", self.symbol, e)
                 continue
-            if abs(szi) == 0:
-                continue
-            result.append({
-                "side":    "long" if szi > 0 else "short",
-                "size":    abs(szi),
-                "entryPx": float(pos.get("entryPx") or 0),
-                "coin":    pos.get("coin", ""),
-            })
+
         return result
 
     async def _get_open_orders_raw(self) -> list[dict]:
@@ -455,7 +511,6 @@ class FuturesTrader:
             logger.info("[%s] DRY_RUN: _set_leverage(%d) omitido.", self.symbol, leverage)
             return
         try:
-            # FIX FREEZE: timeout de 15s + asyncio.to_thread para no bloquear el event loop
             result = await asyncio.wait_for(
                 asyncio.to_thread(
                     hl._exchange.update_leverage,
@@ -470,10 +525,6 @@ class FuturesTrader:
             logger.warning("[%s] No se pudo configurar leverage: %s", self.symbol, e)
 
     async def _info_post(self, payload: dict) -> dict:
-        """
-        Llamada async-safe a la API REST de HL.
-        Se envuelve en asyncio.to_thread para no bloquear el event loop.
-        """
         hl = self._require_hl()
         if hl is None:
             return {}
@@ -485,13 +536,9 @@ class FuturesTrader:
 
         return await asyncio.to_thread(_sync_call)
 
-    # ── open_order: entrada al mercado + SL + TP ────────────────────
+    # ── open_order: entrada al mercado + SL + TP ──────────────────
 
     async def open_order(self, signal: dict, risk) -> None:
-        """
-        Abre una posición en el mercado con SL y TP1 opcionales.
-        Todas las llamadas al SDK síncrono van envueltas en asyncio.to_thread().
-        """
         hl = self._require_hl()
         if hl is None:
             logger.error("[%s] open_order: _hl_client no inicializado, abortando.", self.symbol)
@@ -561,7 +608,7 @@ class FuturesTrader:
             self._protection_ok = (sl_px > 0)
             return
 
-        # ── Orden de mercado ────────────────────────────────────────────────
+        # ── Orden de mercado ──────────────────────────────────────
         try:
             result = await asyncio.to_thread(
                 hl.place_market,
@@ -599,7 +646,7 @@ class FuturesTrader:
             logger.warning("[%s] open_order: fill no confirmado tras %d intentos — usando ref_price=%.4f",
                            self.symbol, _FILL_RETRIES, ref_price)
 
-        # ── Re-escalar SL/TP al precio real de fill ────────────────────────
+        # ── Re-escalar SL/TP al precio real de fill ────────────────────
         sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, filled_price, ref_price)
 
         tp3_raw = float(signal.get("tp3") or 0)
@@ -612,7 +659,7 @@ class FuturesTrader:
             else:
                 tp3_px = tp3_raw
 
-        # ── Actualizar estado interno ──────────────────────────────────────
+        # ── Actualizar estado interno ──────────────────────────────
         self.position    = "long" if is_long else "short"
         self.entry_price = filled_price
         self.sl          = sl_px  if sl_px  > 0 else None
@@ -625,7 +672,7 @@ class FuturesTrader:
         self._protection_ok = False
         self._tp1_be_done   = False
 
-        # ── Colocar SL ───────────────────────────────────────────────────
+        # ── Colocar SL ────────────────────────────────────────────
         if sl_px and sl_px > 0:
             try:
                 sl_result = await asyncio.to_thread(
@@ -640,7 +687,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: error colocando SL: %s", self.symbol, e)
 
-        # ── Colocar TP1 ──────────────────────────────────────────────────
+        # ── Colocar TP1 ──────────────────────────────────────────
         if tp1_px and tp1_px > 0:
             try:
                 tp_result = await asyncio.to_thread(
@@ -655,7 +702,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: error colocando TP1: %s", self.symbol, e)
 
-        # ── Persistir estado ───────────────────────────────────────────────
+        # ── Persistir estado ────────────────────────────────────
         try:
             save_position(self.symbol, {
                 "side":        self.position,
