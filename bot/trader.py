@@ -57,6 +57,13 @@ FIX _ensure_tpsl spam (2026-06-03):
   y viven en el endpoint openTriggerOrders, NO en openOrders. Por eso
   _ensure_tpsl los veía siempre como «faltantes» y los recolocaba en bucle.
   Fix: añadido _get_open_trigger_orders_raw() que llama al endpoint correcto.
+
+FIX OHLCV semáforo (2026-06-03):
+  Con 10 traders × 3 timeframes = 30 fetch simultáneos a HL → NoneType spam.
+  Añadido _OHLCV_SEMAPHORE global (asyncio.Semaphore) que limita los fetch
+  de candleSnapshot a max OHLCV_MAX_CONCURRENCY peticiones en paralelo.
+  El semáforo se inicializa lazy en get_ohlcv() la primera vez que se llama
+  (dentro del event loop), evitando el error de "attached to a different loop".
 """
 from __future__ import annotations
 
@@ -83,6 +90,7 @@ _API_URL = (
 )
 
 _OHLCV_BARS = int(os.getenv("BARS_NEEDED", "100"))
+_OHLCV_MAX_CONCURRENCY = int(os.getenv("OHLCV_MAX_CONCURRENCY", "5"))
 
 _TF_MINUTES = {
     "1m":  1,
@@ -101,6 +109,24 @@ _FILL_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "3"))
 _FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "2.0"))
 
 _MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "3.0")) / 100.0
+
+# Semáforo OHLCV — inicializado lazy dentro del event loop la primera vez
+# que get_ohlcv() se llama. No se crea a nivel de módulo para evitar el error
+# "got Future attached to a different loop" en Python <3.10.
+_OHLCV_SEMAPHORE: Optional[asyncio.Semaphore] = None
+_OHLCV_SEM_LOCK = asyncio.Lock.__new__(asyncio.Lock)  # placeholder, se crea lazy
+
+
+def _get_ohlcv_semaphore() -> asyncio.Semaphore:
+    """Devuelve el semáforo OHLCV global, creándolo la primera vez."""
+    global _OHLCV_SEMAPHORE
+    if _OHLCV_SEMAPHORE is None:
+        _OHLCV_SEMAPHORE = asyncio.Semaphore(_OHLCV_MAX_CONCURRENCY)
+        logger.info(
+            "[OHLCVSemaphore] Inicializado: max_concurrency=%d (env OHLCV_MAX_CONCURRENCY)",
+            _OHLCV_MAX_CONCURRENCY,
+        )
+    return _OHLCV_SEMAPHORE
 
 
 def _check_price_staleness(
@@ -346,26 +372,28 @@ class FuturesTrader:
 
     async def get_ohlcv(self, timeframe: str) -> list:
         n = _OHLCV_BARS
+        sem = _get_ohlcv_semaphore()
 
         try:
-            async with aiohttp.ClientSession() as session:
-                raw = await self._fetch_candles(session, timeframe, n)
+            async with sem:
+                async with aiohttp.ClientSession() as session:
+                    raw = await self._fetch_candles(session, timeframe, n)
 
-                if raw is None or not isinstance(raw, list):
-                    logger.warning(
-                        "[%s] get_ohlcv(%s) respuesta inesperada (tipo=%s val=%r) — "
-                        "reintentando con ventana reducida...",
-                        self.symbol, timeframe, type(raw).__name__, raw,
-                    )
-                    raw = await self._fetch_candles(session, timeframe, n // 2)
+                    if raw is None or not isinstance(raw, list):
+                        logger.warning(
+                            "[%s] get_ohlcv(%s) respuesta inesperada (tipo=%s val=%r) — "
+                            "reintentando con ventana reducida...",
+                            self.symbol, timeframe, type(raw).__name__, raw,
+                        )
+                        raw = await self._fetch_candles(session, timeframe, n // 2)
 
-                if raw is None or not isinstance(raw, list):
-                    logger.warning(
-                        "[%s] get_ohlcv(%s) sigue sin ser lista tras retry (tipo=%s) — "
-                        "devolviendo lista vacía.",
-                        self.symbol, timeframe, type(raw).__name__,
-                    )
-                    return []
+                    if raw is None or not isinstance(raw, list):
+                        logger.warning(
+                            "[%s] get_ohlcv(%s) sigue sin ser lista tras retry (tipo=%s) — "
+                            "devolviendo lista vacía.",
+                            self.symbol, timeframe, type(raw).__name__,
+                        )
+                        return []
 
         except Exception as e:
             logger.warning("[%s] get_ohlcv(%s) error: %s", self.symbol, e)
