@@ -1,6 +1,14 @@
 """
 bot/ohlcv_cache.py — Caché de OHLCV con TTL por timeframe y LRU eviction.
 
+v4 — Semáforo global _HL_OHLCV_SEMAPHORE:
+  Con 10 traders × 3 TF = hasta 30 requests OHLCV simultáneas a HL,
+  la API devuelve None de forma masiva (rate limit silencioso no documentado).
+  Se añade asyncio.Semaphore(HL_OHLCV_CONCURRENCY) que limita las requests
+  reales en vuelo. Las lecturas del caché caliente NO consumen el semáforo
+  (el guard ocurre antes de llamar fetch_fn).
+  Env var: HL_OHLCV_CONCURRENCY (int, default 5)
+
 v3 — TTL diferenciado por timeframe:
   15m → 12s  (igual que antes, velas de 15m se invalidan rápido)
   1h  → 60s  (velas de 1h cambian cada hora, no hace falta refrescar cada 12s)
@@ -31,6 +39,26 @@ _TTL_1H            = float(os.getenv("OHLCV_CACHE_TTL_1H",   "60"))
 _TTL_4H            = float(os.getenv("OHLCV_CACHE_TTL_4H",   "180"))
 _MAX_CACHE_SYMBOLS = int(os.getenv("MAX_OHLCV_CACHE_SYMBOLS", "20"))
 
+# ── Semáforo global: limita requests OHLCV reales en vuelo ──────────────────
+# Con 10 traders × 3 TF = hasta 30 requests simultáneas → HL devuelve None.
+# HL_OHLCV_CONCURRENCY=5 significa máximo 5 fetch_fn activos a la vez.
+# Las lecturas del caché caliente no consumen el semáforo (guard previo).
+_HL_OHLCV_CONCURRENCY = int(os.getenv("HL_OHLCV_CONCURRENCY", "5"))
+_HL_OHLCV_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Lazy-init del semáforo dentro del event loop activo."""
+    global _HL_OHLCV_SEMAPHORE
+    if _HL_OHLCV_SEMAPHORE is None:
+        _HL_OHLCV_SEMAPHORE = asyncio.Semaphore(_HL_OHLCV_CONCURRENCY)
+        log.info(
+            "[OHLCVCache] Semáforo OHLCV inicializado: max_concurrency=%d (env HL_OHLCV_CONCURRENCY)",
+            _HL_OHLCV_CONCURRENCY,
+        )
+    return _HL_OHLCV_SEMAPHORE
+
+
 _TTL_BY_TF: Dict[str, float] = {
     "1m":  _OHLCV_TTL_S,
     "3m":  _OHLCV_TTL_S,
@@ -51,7 +79,7 @@ def _ttl_for(tf: str) -> float:
 
 class OHLCVCache:
     """
-    Caché OHLCV con TTL por timeframe + LRU eviction por número de símbolos.
+    Caché OHLCV con TTL por timeframe + LRU eviction + semáforo de concurrencia.
     """
 
     def __init__(self, max_symbols: int = _MAX_CACHE_SYMBOLS):
@@ -67,6 +95,8 @@ class OHLCVCache:
     ) -> list:
         """
         Devuelve OHLCV desde caché si está fresco (TTL por TF), si no llama fetch_fn.
+        El semáforo global _HL_OHLCV_SEMAPHORE solo se adquiere cuando hay que
+        hacer un fetch real (caché miss o expirado), nunca en lecturas calientes.
         """
         key = f"{coin}:{tf}"
         ttl = _ttl_for(tf)
@@ -78,8 +108,11 @@ class OHLCVCache:
                 entry["last_access"] = now
                 return entry["data"]
 
+        # Cache miss o expirado → adquirir semáforo antes de fetch
+        sem = _get_semaphore()
         try:
-            data = await fetch_fn(tf)
+            async with sem:
+                data = await fetch_fn(tf)
         except Exception as e:
             log.error("[OHLCVCache] fetch error %s/%s: %s", coin, tf, e)
             async with self._lock:

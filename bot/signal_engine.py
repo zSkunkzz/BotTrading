@@ -15,6 +15,14 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 10):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v18 (fix SL estructura demasiado ancho):
+  - _structure_sl añade cap SL_STRUCTURE_MAX_DIST_PCT (default 4.0%).
+    Si el swing SL candidato está a más de MAX_DIST_PCT del entry, se
+    rechaza y se usa el ATR SL como fallback. Resuelve el caso ZEC donde
+    swing_low estaba al 6.1% del entry → RR=0.37 → setup válido descartado
+    en bucle 20+ min.
+    Env var: SL_STRUCTURE_MAX_DIST_PCT (float %, default 4.0)
+
 CAMBIOS v17 (mejoras de estrategia):
   - _detect_setup evalúa los 3 setups y elige el de mayor ratio score/max_score.
     Antes paraba en el primero que pasaba MIN_SCORE (orden TENDENCIA → BREAKOUT → REVERSAL).
@@ -72,6 +80,13 @@ _TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))   # referencia inte
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 _SL_STRUCTURE_ENABLED = os.getenv("SL_STRUCTURE_ENABLED", "true").lower() != "false"
+
+# Cap de distancia máxima del SL de estructura respecto al entry.
+# Si el swing SL candidato está a más de X% del entry, se descarta
+# y se usa el ATR SL como fallback. Resuelve coins volátiles (ZEC, etc.)
+# donde swing_low puede estar al 5-8% y destruir el RR.
+# Configurable via Railway: SL_STRUCTURE_MAX_DIST_PCT=4.0
+_SL_STRUCTURE_MAX_DIST_PCT = float(os.getenv("SL_STRUCTURE_MAX_DIST_PCT", "4.0")) / 100.0
 
 _VOL_AVG_WINDOW    = int(os.getenv("VOL_AVG_WINDOW", "20"))
 
@@ -138,10 +153,15 @@ def _structure_sl(
     atr_val: float,
 ) -> float:
     """
-    v16: Calcula SL anclado al swing low/high de structure_analyzer (1h).
-    Si el swing SL es más protector (más alejado del entry) que el ATR SL,
-    lo usa. Si es más agresivo (más cercano), usa el ATR SL como fallback.
-    Si structure_analyzer falla, devuelve sl_atr sin cambios.
+    v18: Calcula SL anclado al swing low/high de structure_analyzer (1h).
+
+    Reglas de selección:
+      1. El swing SL debe estar más alejado del entry que el ATR SL (más protector).
+      2. v18 NEW: El swing SL no puede estar a más de SL_STRUCTURE_MAX_DIST_PCT
+         del entry (default 4%). Coins volátiles como ZEC pueden tener swing_low
+         al 6%+ → RR colpasa → setup descartado en bucle. Si supera el cap,
+         se usa el ATR SL como fallback.
+      3. Si structure_analyzer falla, devuelve sl_atr sin cambios.
 
     Un buffer del 0.1×ATR se añade más allá del swing para evitar stops
     que se tocan exactamente en el swing.
@@ -161,6 +181,17 @@ def _structure_sl(
             swing_low = struct.get("last_sl", 0.0)
             if swing_low > 0:
                 candidate = round(swing_low - swing_sl_buffer, 6)
+                # v18: cap de distancia máxima
+                if entry > 0:
+                    dist_pct = abs(entry - candidate) / entry
+                    if dist_pct > _SL_STRUCTURE_MAX_DIST_PCT:
+                        log.debug(
+                            "[signal_engine] SL estructura LONG: swing_low=%.6f → candidato=%.6f "
+                            "(dist=%.2f%% > cap=%.2f%%) → fallback ATR SL=%.6f",
+                            swing_low, candidate, dist_pct * 100,
+                            _SL_STRUCTURE_MAX_DIST_PCT * 100, sl_atr,
+                        )
+                        return sl_atr
                 # Usar el más alejado del entry (más protector)
                 if candidate < sl_atr:
                     log.debug(
@@ -177,6 +208,17 @@ def _structure_sl(
             swing_high = struct.get("last_sh", 0.0)
             if swing_high > 0:
                 candidate = round(swing_high + swing_sl_buffer, 6)
+                # v18: cap de distancia máxima
+                if entry > 0:
+                    dist_pct = abs(candidate - entry) / entry
+                    if dist_pct > _SL_STRUCTURE_MAX_DIST_PCT:
+                        log.debug(
+                            "[signal_engine] SL estructura SHORT: swing_high=%.6f → candidato=%.6f "
+                            "(dist=%.2f%% > cap=%.2f%%) → fallback ATR SL=%.6f",
+                            swing_high, candidate, dist_pct * 100,
+                            _SL_STRUCTURE_MAX_DIST_PCT * 100, sl_atr,
+                        )
+                        return sl_atr
                 # Usar el más alejado del entry (más alto para SHORT)
                 if candidate > sl_atr:
                     log.debug(
@@ -289,7 +331,7 @@ async def analyze_pair(
         tp1    = round(entry - tp1_mult * atr_val, 6)
         tp2    = round(entry - tp2_mult * atr_val, 6)
 
-    # v16: intentar anclar SL a swing low/high de 1h (structure_analyzer)
+    # v16+v18: intentar anclar SL a swing low/high de 1h, con cap de distancia
     sl = _structure_sl(bars_1h, signal_str, entry, sl_atr, atr_val)
 
     risk   = abs(entry - sl)
