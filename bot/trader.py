@@ -45,6 +45,12 @@ FIX get_price NoneType (2026-06-03):
   data.get(self.coin) lanzaba 'NoneType object has no attribute get'.
   Fix: guard isinstance(data, dict) antes de llamar .get().
   Si data no es dict → raise ValueError con el body truncado para diagnóstico.
+
+FIX _ensure_tpsl spam (2026-06-03):
+  En Hyperliquid, los SL/TP colocados con place_sl/place_tp son TRIGGER ORDERS
+  y viven en el endpoint openTriggerOrders, NO en openOrders. Por eso
+  _ensure_tpsl los veía siempre como «faltantes» y los recolocaba en bucle.
+  Fix: añadido _get_open_trigger_orders_raw() que llama al endpoint correcto.
 """
 from __future__ import annotations
 
@@ -284,8 +290,6 @@ class FuturesTrader:
             ) as resp:
                 text = await resp.text()
 
-        # FIX: HL puede devolver null, string de error, o un dict vacío.
-        # Si data no es dict, .get() lanza AttributeError → crash en TradingLoop.
         try:
             data = _json.loads(text)
         except Exception:
@@ -305,10 +309,6 @@ class FuturesTrader:
         return float(price)
 
     async def _fetch_candles(self, session, timeframe: str, n_bars: int):
-        """
-        Llama a candleSnapshot con n_bars velas. Devuelve la respuesta raw
-        (lista, None, o dict de error) sin procesar.
-        """
         interval = _TF_MINUTES.get(timeframe, 15)
         end_ms   = int(time.time() * 1000)
         start_ms = end_ms - (n_bars * interval * 60 * 1000)
@@ -441,6 +441,9 @@ class FuturesTrader:
         return result
 
     async def _get_open_orders_raw(self) -> list[dict]:
+        """Órdenes normales (limit/market). NO contiene SL/TP trigger orders."""
+        if not self._master_addr:
+            return []
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -456,6 +459,40 @@ class FuturesTrader:
 
         if not isinstance(data, list):
             logger.warning("[%s] _get_open_orders_raw respuesta inesperada: %s", self.symbol, type(data))
+            return []
+
+        return data
+
+    async def _get_open_trigger_orders_raw(self) -> list[dict]:
+        """
+        FIX _ensure_tpsl spam: En Hyperliquid, place_sl / place_tp crean
+        TRIGGER ORDERS que viven en el endpoint 'frontendOpenOrders', no en
+        'openOrders'. Este método los obtiene para que _ensure_tpsl los detecte
+        correctamente y no los recoloque en bucle.
+
+        Endpoint: POST /info {"type": "frontendOpenOrders", "user": addr}
+        La respuesta incluye orderType.trigger.tpsl = "sl" | "tp".
+        """
+        if not self._master_addr:
+            return []
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{_API_URL}/info",
+                    json={"type": "frontendOpenOrders", "user": self._master_addr},
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = _json.loads(await resp.text())
+        except Exception as e:
+            logger.warning("[%s] _get_open_trigger_orders_raw error: %s", self.symbol, e)
+            return []
+
+        if not isinstance(data, list):
+            logger.debug(
+                "[%s] _get_open_trigger_orders_raw respuesta inesperada tipo=%s",
+                self.symbol, type(data).__name__,
+            )
             return []
 
         return data

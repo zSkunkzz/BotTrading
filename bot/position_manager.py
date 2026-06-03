@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """
-position_manager.py — Gestión de posiciones abiertas.
+bot/position_manager.py — Gestión de protección SL/TP para posiciones abiertas.
 
-Fixes incluidos en esta versión:
-  Bug A — _ensure_tpsl detecta SL/TP por tipo de orden (tpsl=="sl"/"tp"),
-           no por conteo total de órdenes reduce_only.
-  Bug B — check_sl_software añade margen configurable SL_SW_MARGIN_PCT
-           para evitar doble cierre cuando el exchange ya ejecutó el SL.
-  Bug C — _place_emergency_sl_tp redondea qty antes de enviar la orden.
-  Bug H — _update_trailing_sl ahora invoca trailing_hl.update() para
-           que el trailing stop nativo de HL esté activo en producción.
-           Anteriormente solo delegaba en trader._do_trailing_sl_update()
-           que no existe en ai_trader.py, dejando el trailing inactivo.
-  Bug I — _check_sl_software y _place_emergency_sl_tp ahora toleran que
-           trader.position sea un str ("long"/"short") además de un dict
-           {"side": "long"/"short"}, evitando AttributeError: 'str' object
-           has no attribute 'get'.
-  Bug J — _place_emergency_sl_tp calcula TP dinámico cuando trader.tp es
-           None (posiciones restauradas desde state no tienen tp asignado).
-           El TP se calcula como entry ± (entry - sl) * TP_FALLBACK_RR,
-           garantizando que siempre exista una orden TP en el exchange.
+Bug A (CRÍTICO) — _ensure_tpsl consultaba solo openOrders, pero en Hyperliquid
+  los SL/TP colocados con place_sl/place_tp son TRIGGER ORDERS que viven en
+  frontendOpenOrders. El resultado: _ensure_tpsl siempre los veía como
+  "faltantes" y los recolocaba cada ~30s → spam infinito en logs.
+  Fix: consultar también _get_open_trigger_orders_raw() y combinar ambas listas.
+
+Bug B — fallback por precio para detectar SL/TP cuando el campo tpsl no viene
+  correctamente parseado por alguna variante de la respuesta de HL.
+
+Bug C — _place_emergency_sl_tp redondea qty antes de enviar la orden.
+
+Bug I — _resolve_is_long tolera position como str o dict.
+
+Bug J — TP dinámico cuando trader.tp es None (posiciones restauradas del state).
 """
 from __future__ import annotations
 
@@ -27,62 +23,52 @@ import asyncio
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Optional
-
-if TYPE_CHECKING:
-    pass
-
-from bot.trailing_hl import trailing_hl  # Bug H fix
+from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Bug B: margen de precio para el check de SL por software.
-# Evita disparar cierre cuando el exchange ya ejecutó el SL (doble cierre).
-# Valor: fracción del precio SL (0.0005 = 0.05%).
+# Margen de precio para el check de SL por software (evita doble cierre)
 _SL_SW_MARGIN = float(os.getenv("SL_SW_MARGIN_PCT", "0.0005"))
 
-# Intervalo entre checks de TPSL en el exchange (segundos)
+# Intervalo entre verificaciones del SL/TP en el exchange (segundos)
 _TPSL_VERIFY_INTERVAL_S = float(os.getenv("TPSL_VERIFY_INTERVAL_S", "60"))
 
-# Máximo de reintentos para colocar SL/TP de emergencia
+# Máximo de reintentos al colocar SL/TP de emergencia
 _EMERGENCY_TPSL_RETRIES = int(os.getenv("EMERGENCY_TPSL_RETRIES", "3"))
 
-# Bug J: RR mínimo para calcular TP dinámico cuando trader.tp es None.
-# TP_fallback = entry ± (entry - sl) * _TP_FALLBACK_RR
-# Ejemplo: entry=609.49, sl=592.80 → risk=16.69 → TP = 609.49 + 16.69*1.5 = 634.52
+# RR mínimo para TP dinámico cuando trader.tp es None
 _TP_FALLBACK_RR = float(os.getenv("TP_FALLBACK_RR", "1.5"))
-
-
-def _is_reduce_only(order: dict) -> bool:
-    """True si la orden es reduce-only (cierre de posición)."""
-    if order.get("reduceOnly"):
-        return True
-    ot = order.get("orderType", {})
-    if isinstance(ot, dict):
-        trigger = ot.get("trigger", {})
-        if isinstance(trigger, dict) and trigger.get("tpsl") in ("sl", "tp"):
-            return True
-    return False
 
 
 def _get_tpsl_type(order: dict) -> Optional[str]:
     """
-    Retorna 'sl', 'tp', o None según el campo orderType.trigger.tpsl.
-    Bug A fix: usamos este helper en lugar de contar reduce_only totales.
+    Extrae 'sl', 'tp' o None del campo orderType.trigger.tpsl.
+    Compatible con openOrders y frontendOpenOrders de Hyperliquid.
     """
+    # Formato openOrders: {"orderType": {"trigger": {"tpsl": "sl"}}}
     ot = order.get("orderType", {})
     if isinstance(ot, dict):
         trigger = ot.get("trigger", {})
-        if isinstance(trigger, dict):
-            return trigger.get("tpsl")  # 'sl', 'tp', o None
-    return None
+        if isinstance(trigger, dict) and trigger.get("tpsl"):
+            return trigger["tpsl"]
+    # Formato alternativo: {"type": {"trigger": {"tpsl": "sl"}}}
+    t = order.get("type", {})
+    if isinstance(t, dict):
+        trigger = t.get("trigger", {})
+        if isinstance(trigger, dict) and trigger.get("tpsl"):
+            return trigger["tpsl"]
+    # Campo plano (algunas versiones del SDK)
+    return order.get("tpsl") or None
+
+
+def _is_reduce_only(order: dict) -> bool:
+    if order.get("reduceOnly"):
+        return True
+    return _get_tpsl_type(order) in ("sl", "tp")
 
 
 def _round_qty_safe(trader, qty: float) -> float:
-    """
-    Bug C fix: redondea qty usando el método del trader si existe,
-    sino usa round() con 4 decimales como fallback seguro.
-    """
+    """Bug C: redondea qty con el método del trader si está disponible."""
     if hasattr(trader, "_round_qty") and callable(trader._round_qty):
         try:
             return trader._round_qty(qty)
@@ -92,11 +78,7 @@ def _round_qty_safe(trader, qty: float) -> float:
 
 
 def _resolve_is_long(position) -> bool:
-    """
-    Bug I fix: extrae el lado de la posición tanto si position es un dict
-    {"side": "long"/"short"} como si es directamente un str "long"/"short".
-    Devuelve True para LONG, False para SHORT.
-    """
+    """Bug I: soporta position como dict {'side': '...'} o str 'long'/'short'."""
     if isinstance(position, dict):
         return position.get("side", "").upper() == "LONG"
     if isinstance(position, str):
@@ -105,70 +87,42 @@ def _resolve_is_long(position) -> bool:
 
 
 def _calc_fallback_tp(entry: float, sl: float, is_long: bool, rr: float) -> Optional[float]:
-    """
-    Bug J fix: calcula un TP razonable cuando trader.tp es None.
-    Usa el mismo riesgo (entry-sl) multiplicado por rr al lado contrario.
-    Retorna None si no se puede calcular (datos inválidos).
-    """
+    """Bug J: TP dinámico cuando trader.tp es None."""
     if not entry or not sl or entry <= 0 or sl <= 0:
         return None
     risk = abs(entry - sl)
     if risk <= 0:
         return None
-    if is_long:
-        tp = entry + risk * rr
-    else:
-        tp = entry - risk * rr
-    if tp <= 0:
-        return None
-    return tp
+    tp = (entry + risk * rr) if is_long else (entry - risk * rr)
+    return tp if tp > 0 else None
 
 
 class PositionManager:
     """
     Gestiona el ciclo de vida de una posición abierta:
-      - Verificación periódica de órdenes SL/TP en el exchange
-      - Colocación de emergencia si faltan SL/TP
       - Check de SL por software (con margen anti-doble-cierre)
-      - Trailing SL nativo en HL (Bug H fix)
+      - Verificación periódica de SL/TP en el exchange
+      - Colocación de emergencia si faltan SL/TP
     """
 
     def __init__(self, trader) -> None:
         self._trader = trader
         self._last_tpsl_check: float = 0.0
 
-    # ── API pública ────────────────────────────────────────────────────────────
-
     async def manage(self) -> None:
         """Llamar cada tick mientras hay posición abierta."""
-        trader = self._trader
         now = time.monotonic()
 
-        # 1. Check SL por software (con margen anti-doble-cierre)
         if await self._check_sl_software():
-            return  # posición cerrada
+            return
 
-        # 2. Verificación periódica de SL/TP en el exchange
         if now - self._last_tpsl_check >= _TPSL_VERIFY_INTERVAL_S:
             self._last_tpsl_check = now
             await self._ensure_tpsl()
 
-        # 3. Trailing SL (si está activado)
-        if getattr(trader, "_trailing_sl_active", False):
-            await self._update_trailing_sl()
-
-    # ── Check SL por software ──────────────────────────────────────────────────
+    # ── Check SL por software ─────────────────────────────────────────
 
     async def _check_sl_software(self) -> bool:
-        """
-        Bug B fix: comprueba si el precio actual ha cruzado el SL,
-        aplicando un margen configurable (_SL_SW_MARGIN) para evitar
-        disparar un cierre cuando el exchange ya ejecutó el SL.
-
-        Bug I fix: tolera position como str o dict.
-
-        Retorna True si se ha disparado el cierre, False en caso contrario.
-        """
         trader = self._trader
         sl = getattr(trader, "sl", None)
         position = getattr(trader, "position", None)
@@ -179,77 +133,104 @@ class PositionManager:
         if not price:
             return False
 
-        # Bug I: usar helper que acepta str o dict
         is_long = _resolve_is_long(position)
-
-        if is_long:
-            # Long: SL se activa si el precio cae por debajo de sl × (1 - margen)
-            threshold = sl * (1.0 - _SL_SW_MARGIN)
-            triggered = price <= threshold
-        else:
-            # Short: SL se activa si el precio sube por encima de sl × (1 + margen)
-            threshold = sl * (1.0 + _SL_SW_MARGIN)
-            triggered = price >= threshold
+        threshold = sl * (1.0 - _SL_SW_MARGIN) if is_long else sl * (1.0 + _SL_SW_MARGIN)
+        triggered = (price <= threshold) if is_long else (price >= threshold)
 
         if not triggered:
             return False
 
+        symbol = getattr(trader, "symbol", "?")
         log.warning(
             "[%s] SL SW disparado: precio=%.4f umbral=%.4f sl=%.4f margen=%.4f%%",
-            getattr(trader, "symbol", "?"),
-            price, threshold, sl, _SL_SW_MARGIN * 100,
+            symbol, price, threshold, sl, _SL_SW_MARGIN * 100,
         )
 
-        # Solo cerrar por software si el exchange NO tiene protección activa
-        if not getattr(trader, "_protection_ok", False):
-            await self._emergency_close(reason="SL_SW")
-            return True
-        else:
+        # Si _protection_ok=True, el exchange ya tiene la orden — esperar su fill
+        if getattr(trader, "_protection_ok", False):
             log.info(
                 "[%s] SL SW: precio cruzó umbral pero _protection_ok=True → esperando fill del exchange",
-                getattr(trader, "symbol", "?"),
+                symbol,
             )
             return False
 
-    # ── Verificación SL/TP en exchange ─────────────────────────────────────────
+        await self._emergency_close(reason="SL_SW")
+        return True
+
+    # ── Verificación SL/TP en exchange ────────────────────────────────
 
     async def _ensure_tpsl(self) -> None:
         """
-        Bug A fix: verifica que haya una orden SL Y una orden TP activas
-        en el exchange usando el campo orderType.trigger.tpsl, NO por conteo
-        de órdenes reduce_only totales.
-
-        Si falta alguna, la coloca de emergencia.
+        Bug A fix: Los SL/TP de Hyperliquid son trigger orders.
+        Se detectan en frontendOpenOrders, no en openOrders.
+        Combinamos ambos endpoints para detectar correctamente.
         """
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
 
+        # 1. Órdenes normales (limit/market)
         try:
-            raw_orders = await trader._get_open_orders_raw()
+            raw_orders = await trader._get_open_orders_raw() or []
         except Exception as e:
-            log.warning("[%s] _ensure_tpsl: no se pudieron obtener órdenes: %s", symbol, e)
-            return
+            log.warning("[%s] _ensure_tpsl: openOrders error: %s", symbol, e)
+            raw_orders = []
 
+        # 2. Trigger orders (donde viven SL/TP en HL)
+        trigger_orders: list[dict] = []
+        get_trigger_fn = getattr(trader, "_get_open_trigger_orders_raw", None)
+        if callable(get_trigger_fn):
+            try:
+                trigger_orders = await get_trigger_fn() or []
+            except Exception as e:
+                log.warning("[%s] _ensure_tpsl: frontendOpenOrders error: %s", symbol, e)
+
+        # 3. Combinar y filtrar por coin
+        all_orders = raw_orders + trigger_orders
+        coin = getattr(trader, "coin", symbol).upper()
         coin_orders = [
-            o for o in (raw_orders or [])
-            if o.get("coin", "").upper() == symbol.upper()
+            o for o in all_orders
+            if str(o.get("coin", "")).upper() == coin
         ]
 
-        # Bug A: filtrar por tipo explícito, no por conteo
+        # 4. Detectar SL/TP por tipo de orden
         has_sl = any(_get_tpsl_type(o) == "sl" for o in coin_orders)
         has_tp = any(_get_tpsl_type(o) == "tp" for o in coin_orders)
 
-        sl_count = sum(1 for o in coin_orders if _get_tpsl_type(o) == "sl")
-        tp_count = sum(1 for o in coin_orders if _get_tpsl_type(o) == "tp")
-        ro_count = sum(1 for o in coin_orders if _is_reduce_only(o))
+        # 5. Bug B: fallback por precio si el campo tpsl no viene parseado
+        if not has_sl or not has_tp:
+            sl_price = getattr(trader, "sl", None)
+            tp_price = getattr(trader, "tp1", None) or getattr(trader, "tp", None)
+            for o in coin_orders:
+                if not _is_reduce_only(o):
+                    continue
+                try:
+                    opx = float(o.get("limitPx") or o.get("triggerPx") or 0)
+                except (TypeError, ValueError):
+                    opx = 0.0
+                if not has_sl and sl_price and opx:
+                    if abs(opx - sl_price) / sl_price < 0.002:
+                        has_sl = True
+                if not has_tp and tp_price and opx:
+                    if abs(opx - tp_price) / tp_price < 0.002:
+                        has_tp = True
 
         log.debug(
-            "[%s] _ensure_tpsl: sl=%d tp=%d ro_total=%d → has_sl=%s has_tp=%s",
-            symbol, sl_count, tp_count, ro_count, has_sl, has_tp,
+            "[%s] _ensure_tpsl: total=%d (normal=%d trigger=%d) has_sl=%s has_tp=%s",
+            symbol, len(all_orders), len(raw_orders), len(trigger_orders), has_sl, has_tp,
         )
 
         if has_sl and has_tp:
             trader._protection_ok = True
+            return
+
+        # Si _protection_ok ya era True y ahora no encontramos SL/TP,
+        # probablemente ya se ejecutaron (fill). No spamear con emergencia.
+        if getattr(trader, "_protection_ok", False):
+            log.info(
+                "[%s] _ensure_tpsl: no se detectan SL/TP pero _protection_ok=True "
+                "(probablemente ejecutados). Saltando emergencia.",
+                symbol,
+            )
             return
 
         trader._protection_ok = False
@@ -265,43 +246,29 @@ class PositionManager:
         )
         await self._place_emergency_sl_tp(place_sl=not has_sl, place_tp=not has_tp)
 
-    # ── Colocación de emergencia SL/TP ─────────────────────────────────────────
+    # ── Colocación de emergencia SL/TP ─────────────────────────────────
 
     async def _place_emergency_sl_tp(self, place_sl: bool = True, place_tp: bool = True) -> None:
-        """
-        Bug C fix: redondea qty antes de enviar la orden al exchange.
-        Bug I fix: tolera position como str o dict.
-        Bug J fix: calcula TP dinámico cuando trader.tp es None.
-          Ocurre en posiciones restauradas desde state (restart del bot)
-          donde trader.tp no se persiste. Se calcula como:
-            TP = entry ± risk * TP_FALLBACK_RR
-          donde risk = abs(entry - sl).
-        """
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
 
         sl_price = getattr(trader, "sl", None)
-        tp_price = getattr(trader, "tp", None)
-        open_qty_raw = getattr(trader, "_open_qty", 0.0) or 0.0
-
-        # Bug C: redondear qty al número de decimales que el exchange acepta
-        open_qty = _round_qty_safe(trader, open_qty_raw)
+        tp_price = getattr(trader, "tp1", None) or getattr(trader, "tp", None)
+        open_qty = _round_qty_safe(trader, getattr(trader, "_open_qty", 0.0) or 0.0)
 
         if open_qty <= 0:
             log.error("[%s] _place_emergency_sl_tp: qty=0 — no se puede colocar orden", symbol)
             return
 
         position = getattr(trader, "position", None)
-        # Bug I: usar helper que acepta str o dict
         is_long = _resolve_is_long(position)
 
-        # Bug J: si tp_price es None, calcularlo dinámicamente desde entry+sl
+        # Bug J: TP dinámico cuando falta
         if place_tp and tp_price is None:
             entry_price = getattr(trader, "entry_price", None) or getattr(trader, "_entry_price", None)
             tp_price = _calc_fallback_tp(entry_price, sl_price, is_long, _TP_FALLBACK_RR)
             if tp_price is not None:
-                # Persistir en el trader para que futuros checks lo encuentren
-                trader.tp = tp_price
+                trader.tp1 = tp_price
                 log.info(
                     "[%s] TP calculado dinámicamente (entry=%.4f sl=%.4f rr=%.1f) → tp=%.4f",
                     symbol, entry_price, sl_price, _TP_FALLBACK_RR, tp_price,
@@ -311,6 +278,7 @@ class PositionManager:
                     "[%s] No se puede calcular TP dinámico: entry=%s sl=%s — saltando TP",
                     symbol, entry_price, sl_price,
                 )
+                place_tp = False
 
         for attempt in range(1, _EMERGENCY_TPSL_RETRIES + 1):
             try:
@@ -334,7 +302,9 @@ class PositionManager:
                     )
                     log.info("[%s] TP emergencia colocado: %.4f (qty=%.4f)", symbol, tp_price, open_qty)
 
-                break  # éxito
+                # Marcar protección OK tras colocación exitosa
+                trader._protection_ok = True
+                break
 
             except Exception as e:
                 log.warning(
@@ -342,64 +312,11 @@ class PositionManager:
                     symbol, attempt, _EMERGENCY_TPSL_RETRIES, e,
                 )
                 if attempt < _EMERGENCY_TPSL_RETRIES:
-                    await asyncio.sleep(2 ** attempt)  # backoff exponencial
+                    await asyncio.sleep(2 ** attempt)
 
-    # ── Trailing SL ───────────────────────────────────────────────────────────
-
-    async def _update_trailing_sl(self) -> None:
-        """
-        Bug H fix: invoca trailing_hl.update() para que el trailing stop
-        nativo de Hyperliquid se coloque/actualice en el exchange.
-
-        Antes solo delegaba en trader._do_trailing_sl_update() que no existe
-        en ai_trader.py, dejando el trailing completamente inactivo.
-
-        Prioridad:
-          1. trailing_hl.update() — trailing nativo en HL (supervive crashes)
-          2. trader._do_trailing_sl_update() — fallback legacy si existe
-        """
-        trader = self._trader
-        symbol = getattr(trader, "symbol", "?")
-        price  = getattr(trader, "_last_price", None)
-
-        # 1. Trailing nativo HL (Bug H fix)
-        if price:
-            position = getattr(trader, "position", {}) or {}
-            # Bug I: tolerar position como str
-            if isinstance(position, str):
-                side_raw = position.lower()
-            else:
-                side_raw = position.get("side", "long").lower()
-            side = "long" if "long" in side_raw else "short"
-            size = getattr(trader, "_open_qty", 0.0) or 0.0
-            exch = getattr(trader, "_exch", None) or getattr(trader, "exchange", None)
-            try:
-                trail_px = await trailing_hl.update(
-                    symbol=symbol,
-                    current_price=price,
-                    exch=exch,
-                    size=size,
-                )
-                if trail_px is not None:
-                    log.debug(
-                        "[%s] trailing_hl activo → trail_px=%.4f",
-                        symbol, trail_px,
-                    )
-            except Exception as e:
-                log.debug("[%s] trailing_hl.update error: %s", symbol, e)
-
-        # 2. Fallback legacy (compatibilidad)
-        update_fn = getattr(trader, "_do_trailing_sl_update", None)
-        if callable(update_fn):
-            try:
-                await update_fn()
-            except Exception as e:
-                log.debug("[%s] trailing SL legacy update error: %s", symbol, e)
-
-    # ── Cierre de emergencia ──────────────────────────────────────────────────
+    # ── Cierre de emergencia ──────────────────────────────────────────
 
     async def _emergency_close(self, reason: str = "EMERGENCY") -> None:
-        """Cierra la posición a mercado como último recurso."""
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
         close_fn = getattr(trader, "_close_position", None)
