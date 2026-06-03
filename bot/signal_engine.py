@@ -15,32 +15,32 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 10):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
-  MODO TENDENCIA (EMA spread >= 0.3% en 1h)  ← evaluado PRIMERO
+  MODO TENDENCIA (EMA spread >= 0.2% en 1h)  ← evaluado PRIMERO
     +2  EMA21 > EMA50 en 15m Y 1h (tendencia clara en ambos TF)
     +1  SuperTrend 1h en favor
     +1  SuperTrend 4h en favor
     +1  MACD 15m histograma en favor
-    +1  Pullback: precio tocó EMA21 en las últimas 3 velas y rebota
-    +1  RSI 15m en zona de rebote (35-65) — ampliado para tendencias fuertes
+    +1  Pullback: precio tocó EMA21 en las últimas 3 velas (sin requerir rebote confirmado)
+    +1  RSI 15m en zona de rebote (35-65)
     +1  Vol 15m >= 1.2x en vela actual
     +1  Confluencia total: ST 15m + 1h + 4h todos en misma dirección
     Bonus max: 9 pts
 
   MODO BREAKOUT (precio rompe rango 20 velas en 15m)  ← evaluado SEGUNDO
     +2  Rotura de máximo (LONG) o mínimo (SHORT) de las últimas 20 velas en 15m
-    +2  Vol 15m >= 1.8x en vela de ruptura (sin volumen no es breakout)
+    +2  Vol 15m >= 1.4x en vela de ruptura (era 1.8x — demasiado restrictivo)
     +1  ST 1h en favor
     +1  ST 4h en favor
-    +1  RSI 15m entre 45-70 (LONG) o 30-55 (SHORT) — no sobreextendido
+    +1  RSI 15m entre 45-70 (LONG) o 30-55 (SHORT)
     +1  MACD 1h en favor
     Bonus max: 8 pts
 
   MODO REVERSAL (RSI 1h extremo: <= 28 o >= 72)  ← evaluado ÚLTIMO (más peligroso)
-    +2  RSI 1h <= 28 (LONG) o >= 72 (SHORT) — extremo real de mercado
-    +2  MACD 15m histograma gira en favor (usa hist pre-calculado)
+    +2  RSI 1h <= 28 (LONG) o >= 72 (SHORT)
+    +2  MACD 15m histograma gira en favor
     +1  Vol 15m >= 1.5x (capitulación o climax)
     +1  ST 4h en contra del precio actual (agotamiento tendencia dominante)
-    +1  RSI 4h en zona neutra (40-60) — no sobre-extendido en 4h
+    +1  RSI 4h en zona neutra (40-60)
     +1  Precio toca EMA21 del 1h o la cruza (punto de inflexion)
     Bonus max: 8 pts
 
@@ -50,31 +50,30 @@ SISTEMA DE SCORING (max_score = 10):
     - ST1h en contra en modo tendencia: -3 pts (penalización severa)
     - Vol 15m < 0.6x: mercado dormido, no entrar
 
-  MIN_SCORE  = 6 / 10  (60% de confluencia)
+  MIN_SCORE  = 5 / 10  (50% de confluencia — era 6)
   MIN_RR     = 1.5     (calculado DESPUÉS del buffer de vela — RR real)
+
+CAMBIOS v13 (más trades):
+  1. MIN_SCORE 6 → 5: más señales válidas sin sacrificar RR
+  2. Pullback sin requiring rebote confirmado (returning): el toque a EMA21 ya es
+     suficiente confluencia; el requisito de price_dir=='rising' eliminaba setups
+     válidos cuando el bot cicla un tick tarde
+  3. EMA_SPREAD_TREND_MIN 0.003 → 0.002 (0.30% → 0.20%): activos con spread
+     menor seguían en tendencia válida
+  4. BREAKOUT_VOL_MIN 1.8 → 1.4: breakouts reales en HL rara vez tienen 1.8x;
+     1.4x es el umbral más realista para confirmar impulso
+  5. Señales EARLY permitidas con leverage reducido (0.3x MAX_LEV) en lugar de
+     ser rechazadas; añaden trades conservadores en setups parciales
 
 NOTA RR (FIX v12):
   El SL real se calcula como min(low - buffer, entry - SL_mult*ATR).
   El RR ahora se calcula con el SL YA incluido el buffer, por lo que
   MIN_RR=1.5 representa el RR real que el mercado debe recorrer.
-  TP1 subido a 2.0×ATR en TENDENCIA para garantizar RR real >= 1.2.
 
   SL/TP (multiplicadores ATR):
   Modo tendencia : SL=1.5×ATR | TP1=2.0×ATR → RR real ~1.2-1.4
   Modo breakout  : SL=1.5×ATR | TP1=2.0×ATR → RR real ~1.2-1.4
   Modo reversal  : SL=1.2×ATR | TP1=1.8×ATR → RR real ~1.3-1.5
-
-FIXES v12 (2026-06-03):
-  1. RR calculado DESPUÉS del buffer de vela (era antes — RR ficticio)
-  2. Orden de evaluación: TENDENCIA → BREAKOUT → REVERSAL (reversals son más peligrosos)
-  3. MACD reversal usa hist pre-calculado de i15 (no recalcula innecesariamente)
-  4. RSI pullback ampliado a 35-65 (era 40-60, demasiado estricto en tendencias fuertes)
-  5. Ventana vol_ratio expandida a 60 velas (~15h, era 20 velas = 5h)
-  6. Señales EARLY rechazadas directamente (no abrir con leverage reducido)
-  7. TP1 subido a 2.0×ATR en TENDENCIA y BREAKOUT para RR real positivo
-
-FIX v11 (2026-06-03): fetch paralelo 3 TF con asyncio.gather()
-FIX v10 (2026-06-03): timeout en evaluate()
 """
 from __future__ import annotations
 
@@ -90,32 +89,37 @@ from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr
 log = logging.getLogger(__name__)
 
 # ─── Constantes ──────────────────────────────────────────────────────────────────────────────
-MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "6"))
+# v13: MIN_SCORE bajado de 6 a 5 para generar más trades con confluencia parcial
+MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "5"))
 MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5"))   # RR real post-buffer
 
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
 _SL_ATR_MULT       = float(os.getenv("SL_ATR_MULT",  "1.5"))
-# TP subidos para garantizar RR real positivo tras buffer de vela
-_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "2.0"))   # TENDENCIA: era 1.5 → RR real ~0.9
-_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))   # referencia interna
+_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "2.0"))
+_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 
-# Ventana vol_ratio: 60 velas de 15m = ~15h (era 20 = 5h — distorsionaba en mercados dormidos)
+# v13: ventana vol_ratio 60 velas (~15h en 15m)
 _VOL_AVG_WINDOW    = int(os.getenv("VOL_AVG_WINDOW", "60"))
 
 # Umbrales de setup
-_EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.003"))  # 0.30%
+# v13: EMA_SPREAD_TREND_MIN bajado de 0.003 (0.30%) a 0.002 (0.20%)
+_EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.002"))  # 0.20%
 _EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.0015")) # 0.15% → rango
 _BREAKOUT_WINDOW       = int(os.getenv("BREAKOUT_WINDOW", "20"))
-_BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.8"))
+# v13: BREAKOUT_VOL_MIN bajado de 1.8 a 1.4 (breakouts reales en HL ~1.3-1.5x)
+_BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.4"))
 _REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "28"))
 _REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "72"))
 _VOL_MIN_GLOBAL        = float(os.getenv("VOL_MIN_GLOBAL",    "0.6"))
 _VOL_CONFIRM_MIN       = float(os.getenv("VOL_CONFIRM_MIN",   "1.2"))
 _PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "3"))
-_PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.005"))  # 0.5% — era 0.3%, muy ajustado
+_PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.005"))  # 0.5%
+
+# v13: leverage para señales EARLY (0.3x del máximo configurado)
+_EARLY_LEV_FACTOR      = float(os.getenv("EARLY_LEV_FACTOR", "0.3"))
 
 
 # ─── _to_ccxt_symbol ──────────────────────────────────────────────────────────────────────────────
@@ -221,16 +225,16 @@ async def analyze_pair(
 
     if setup_type == "REVERSAL":
         sl_mult  = float(os.getenv("SL_ATR_MULT_REVERSAL",  "1.2"))
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.8"))  # era 1.3 → RR real negativo
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.8"))
         tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "3.5"))
     elif setup_type == "BREAKOUT":
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "2.0"))  # era 1.4 → RR real negativo
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "2.0"))
         tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "3.5"))
     else:  # TENDENCIA
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = _TP1_ATR_MULT   # 2.0x (era 1.5 → RR real ~0.9)
-        tp2_mult = _TP2_ATR_MULT   # 3.5x
+        tp1_mult = _TP1_ATR_MULT
+        tp2_mult = _TP2_ATR_MULT
 
     if signal_str == "LONG":
         sl  = round(min(low_price  - _atr_buf, entry - sl_mult  * atr_val), 6)
@@ -241,7 +245,6 @@ async def analyze_pair(
         tp1 = round(entry - tp1_mult * atr_val, 6)
         tp2 = round(entry - tp2_mult * atr_val, 6)
 
-    # FIX v12: RR calculado con el SL REAL (post-buffer) — antes era RR ficticio
     risk   = abs(entry - sl)
     reward = abs(tp1 - entry)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
@@ -253,19 +256,14 @@ async def analyze_pair(
     else:
         entry_mode = "EARLY"
 
-    # FIX v12: señales EARLY rechazadas — no operar con confluencia mínima
-    if entry_mode == "EARLY":
-        return _hold_result(
-            symbol,
-            f"[{setup_type}] score={score}/{max_score} EARLY — confluencia insuficiente",
-        )
-
+    # v13: señales EARLY permitidas con leverage reducido en lugar de rechazadas
     if entry_mode == "STRONG" and rr >= 2.0:
         suggested_lev = _MAX_LEV
     elif entry_mode == "NORMAL":
         suggested_lev = max(1, int(_MAX_LEV * 0.6))
     else:
-        suggested_lev = max(1, int(_MAX_LEV * 0.4))
+        # EARLY: leverage muy conservador (0.3x del máximo)
+        suggested_lev = max(1, int(_MAX_LEV * _EARLY_LEV_FACTOR))
 
     is_valid = score >= MIN_SCORE and rr >= MIN_RR
 
@@ -302,9 +300,6 @@ async def analyze_pair(
 def _detect_setup(
     i15: dict, i1h: dict, i4h: dict, bars_15m: list
 ) -> Tuple[Optional[str], str, int, int, List[str]]:
-    # FIX v12: orden TENDENCIA → BREAKOUT → REVERSAL
-    # Los reversals son apuestas contra tendencia — evaluarlos último evita
-    # que señales débiles de reversión bloqueen setups de tendencia más fiables.
     for mode_fn in (_score_tendencia, _score_breakout, _score_reversal):
         setup_type, signal_str, score, max_score, reasons = mode_fn(i15, i1h, i4h, bars_15m)
         if signal_str != "NEUTRAL" and score >= MIN_SCORE:
@@ -378,6 +373,9 @@ def _score_tendencia(
     else:
         reasons.append("MACD15m en contra")
 
+    # v13: pullback — solo requiere toque a EMA21, NO rebote confirmado
+    # El requisito anterior (price_dir == "rising") eliminaba setups válidos
+    # cuando el bot cicla un tick después del rebote real
     ema21_15m = i15.get("ema21")
     close_15m = i15.get("close", 0)
     if ema21_15m and close_15m:
@@ -394,20 +392,14 @@ def _score_tendencia(
                 if bar_high >= ema21_15m * (1 - _PULLBACK_TOLERANCE):
                     touched_ema = True
                     break
-        price_dir = i15.get("price_dir", "")
-        returning = (direction == "LONG" and price_dir == "rising") or \
-                    (direction == "SHORT" and price_dir == "falling")
-        if touched_ema and returning:
+        if touched_ema:
             score += 1
-            reasons.append(f"Pullback a EMA21_15m confirmado +1")
-        elif touched_ema:
-            reasons.append("Tocó EMA21 pero aun no rebota")
+            reasons.append("Pullback a EMA21_15m detectado +1")
         else:
-            reasons.append(f"Sin pullback a EMA21_15m")
+            reasons.append("Sin pullback a EMA21_15m")
 
     rsi_15m = i15.get("rsi_val")
     if rsi_15m is not None:
-        # FIX v12: zona ampliada a 35-65 (era 40-60 — en tendencias fuertes RSI rara vez baja a 40)
         rsi_ok_long  = direction == "LONG"  and 35 <= rsi_15m <= 65
         rsi_ok_short = direction == "SHORT" and 35 <= rsi_15m <= 65
         if rsi_ok_long or rsi_ok_short:
@@ -478,10 +470,11 @@ def _score_breakout(
         f"{'>' if broke_up else '<'} {'rango ' + str(round(range_high, 4)) if broke_up else 'rango ' + str(round(range_low, 4))} +2"
     )
 
+    # v13: umbral bajado de 1.8x a 1.4x — breakouts reales en HL suelen tener 1.3-1.5x
     if vol_ratio >= _BREAKOUT_VOL_MIN:
         score += 2
         reasons.append(f"Vol={vol_ratio:.1f}x breakout confirmado +2")
-    elif vol_ratio >= 1.2:
+    elif vol_ratio >= 1.1:
         score += 1
         reasons.append(f"Vol={vol_ratio:.1f}x moderado +1")
     else:
@@ -551,7 +544,6 @@ def _score_reversal(
     score += 2
     reasons.append(f"RSI1h={rsi_1h:.0f} extremo {'sobreventa' if is_long else 'sobrecompra'} +2")
 
-    # FIX v12: usa el hist pre-calculado de i15 directamente (no recalcula MACD)
     hist_15m = i15.get("macd_hist")
     if hist_15m is not None:
         if is_long and hist_15m > 0:
@@ -585,7 +577,7 @@ def _score_reversal(
         score += 1
         reasons.append(f"RSI4h={rsi_4h:.0f} neutro — reversión posible +1")
     else:
-        reasons.append(f"RSI4h no neutro")
+        reasons.append("RSI4h no neutro")
 
     close_15m = i15.get("close", 0)
     ema21_1h  = i1h.get("ema21") if i1h else None
@@ -618,7 +610,6 @@ def _compute_indicators(bars: list) -> dict:
     st_dir, st_val = supertrend(highs, lows, closes, 10, 3.0)
     atr14  = calc_atr(highs, lows, closes, 14)
 
-    # FIX v12: ventana de 60 velas (~15h en 15m) — era 20 (~5h), distorsionaba en mercados dormidos
     vol_window = min(_VOL_AVG_WINDOW, len(vols))
     avg_vol   = sum(vols[-vol_window:]) / vol_window if vol_window > 0 else 1.0
     vol_ratio = round(vols[-1] / avg_vol, 3) if avg_vol > 0 else 1.0
