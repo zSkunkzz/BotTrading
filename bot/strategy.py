@@ -6,7 +6,9 @@ Flujo (sin IA para el caso normal):
   score < MIN_SIGNAL_SCORE  → HOLD directo
   RR < MIN_RR_REQUIRED      → HOLD directo
   NEUTRAL                   → HOLD directo
-  STRONG (score >=9)        → pasa por enriched_filter (CAMBIO v2: ya no salta filtros)
+  regime_gate               → bloquea por tipo de setup + score
+  score < AI_CALL_MIN_SCORE → HOLD (evita fetch_enriched innecesario)
+  STRONG (score >=9)        → pasa por enriched_filter
   EARLY/NORMAL (score >= AI_CALL_MIN_SCORE):
     1. Aplica enriched_filter (F&G, funding, OI, RSI, vol) — sin IA, instantáneo
     2. Si el filtro bloquea → HOLD (motivo detallado)
@@ -18,42 +20,40 @@ FIX 5 (REVISADO): Fallback cuando fetch_enriched_context falla:
   - enriched=None por error → SIEMPRE HOLD. No se entra sin datos externos.
   - Esto evita entradas en señales técnicas débiles sin validación externa.
 
-FIX 6: Propagar ef_penalty al decision_engine (v4.4):
-  - _result() ahora acepta ef_penalty (default 0)
-  - El dict devuelto incluye siempre 'ef_penalty'
-  - Paso 4 (entrada tras enriched_filter OK) pasa ef_result.penalty
-  - Todos los demás caminos (HOLD, fallback, sin enriched) propagan 0
-  - decision_engine.evaluate() ya lee decision.get('ef_penalty', 0)
-    y aplica sizing reducido según calidad de señal
+FIX 6: Propagar ef_penalty al decision_engine (v4.4)
 
-FIX 7: market_regime gate en RANGING:
-  - Si market_regime global está en RANGING, se eleva MIN_SIGNAL_SCORE a
-    RANGING_MIN_SCORE (default: 9) y se bloquean entradas EARLY.
-  - Si market_regime está en VOLATILE, se eleva a VOLATILE_MIN_SCORE (default: 8).
-  - Si MARKET_REGIME_GATE=false en Railway, este bloque se salta completamente.
+FIX 7 (MEJORADO): market_regime gate por tipo de setup:
+  - RANGING: bloquea TENDENCIA y BREAKOUT. Solo REVERSAL permitido.
+    Ratio de fakeout en breakout/tendencia durante RANGING es muy alto.
+  - TRENDING: bloquea REVERSAL (buscar reversal contra tendencia fuerte falla).
+  - VOLATILE: eleva MIN_SIGNAL_SCORE (ya estaba, mantenido).
+  - EARLY siempre bloqueado en RANGING (RANGING_BLOCK_EARLY=true).
+  Config Railway:
+    REGIME_BLOCK_TREND_ON_RANGING    → default true
+    REGIME_BLOCK_REVERSAL_ON_TRENDING → default true
+    RANGING_MIN_SCORE   → default 9
+    VOLATILE_MIN_SCORE  → default 8
+    RANGING_BLOCK_EARLY → default true
 
-FIX 8: price_direction robusto + momentum guard en fallback:
-  - _compute_price_direction() centraliza el cálculo de price_dir con múltiples
-    fuentes de fallback: _closes_15m → ohlcv_fn → None.
-  - Si price_dir es None tras todos los intentos, se trata como "falling" para
-    señales LONG y "rising" para señales SHORT (precaución conservadora).
-  - Los caminos fallback (sin enriched) ahora aplican un mini momentum check
-    propio (RSI + price_dir) antes de entrar, evitando entradas en caída libre
-    incluso cuando el enriquecimiento externo ha fallado.
+FIX 8: price_direction robusto + momentum guard en fallback
+
+FIX 9 (AI filter orden): fetch_enriched_context se mueve tras el check
+  score >= AI_CALL_MIN_SCORE. Señales que no superan ese umbral ya no
+  consumen llamadas HTTP al enricher (F&G, funding, OI, etc.).
 
 Variables de entorno:
-  MIN_SIGNAL_SCORE             (default: 8 — subido de 6 para compensar max_score=12)
+  MIN_SIGNAL_SCORE             (default: 8)
   MIN_RR_REQUIRED              (default: 1.8)
   SKIP_AI_ON_STRONG            (default: false)
   AI_CALL_MIN_SCORE            (default: 8)
   AI_HOLD_OVERRIDE_SCORE       (default: 8)
   AI_HIGH_CONFIDENCE_THRESHOLD (default: 8)
   USE_AI_FOR_NEWS              (default: true)
-  ENRICHED_FALLBACK_MIN_SCORE  (ELIMINADO — ya no se usa, siempre HOLD si enriched falla)
-  RANGING_MIN_SCORE            (default: 9)  — score mínimo en régimen RANGING
-  VOLATILE_MIN_SCORE           (default: 8)  — score mínimo en régimen VOLATILE
-  RANGING_BLOCK_EARLY          (default: true) — bloquear modo EARLY en RANGING
-  FALLBACK_MOMENTUM_BLOCK      (ELIMINADO — ya no aplica, fallback siempre HOLD)
+  RANGING_MIN_SCORE            (default: 9)
+  VOLATILE_MIN_SCORE           (default: 8)
+  RANGING_BLOCK_EARLY          (default: true)
+  REGIME_BLOCK_TREND_ON_RANGING    (default: true)
+  REGIME_BLOCK_REVERSAL_ON_TRENDING (default: true)
 """
 
 import logging
@@ -83,11 +83,13 @@ USE_AI_FOR_NEWS              = os.getenv("USE_AI_FOR_NEWS", "true").lower() != "
 _RANGING_MIN_SCORE    = int(os.getenv("RANGING_MIN_SCORE",   "9"))
 _VOLATILE_MIN_SCORE   = int(os.getenv("VOLATILE_MIN_SCORE",  "8"))
 _RANGING_BLOCK_EARLY  = os.getenv("RANGING_BLOCK_EARLY", "true").lower() != "false"
+_REGIME_BLOCK_TREND_ON_RANGING     = os.getenv("REGIME_BLOCK_TREND_ON_RANGING",     "true").lower() != "false"
+_REGIME_BLOCK_REVERSAL_ON_TRENDING = os.getenv("REGIME_BLOCK_REVERSAL_ON_TRENDING", "true").lower() != "false"
 
-# FIX 8: momentum guard (solo para path técnico puro sin error de red)
-_RSI_MOMENTUM_BLOCK      = float(os.getenv("EF_RSI_MOMENTUM_BLOCK", "50"))
+# FIX 8: momentum guard
+_RSI_MOMENTUM_BLOCK = float(os.getenv("EF_RSI_MOMENTUM_BLOCK", "50"))
 
-_AI_NEWS_COOLDOWN_S = int(os.getenv("AI_NEWS_COOLDOWN_S", "300"))  # 5 min
+_AI_NEWS_COOLDOWN_S = int(os.getenv("AI_NEWS_COOLDOWN_S", "300"))
 _last_ai_news_call: dict[str, float] = {}
 
 
@@ -95,10 +97,6 @@ def _compute_price_direction(
     signal: "SignalResult",
     ohlcv_fn: Optional[Callable] = None,
 ) -> Optional[str]:
-    """
-    FIX 8: Calcula price_direction con múltiples fuentes de fallback.
-    Returns "rising" | "falling" | None
-    """
     try:
         closes = signal.indicators.get("_closes_15m") or []
         if len(closes) >= 2:
@@ -120,20 +118,12 @@ def _compute_price_direction(
 
 
 def _conservative_price_dir(signal_direction: str, price_dir: Optional[str]) -> str:
-    """
-    FIX 8: Si price_dir es desconocido (None), asume el peor caso para la señal.
-    """
     if price_dir is not None:
         return price_dir
     return "falling" if signal_direction.upper() == "LONG" else "rising"
 
 
 def _momentum_guard_fallback(signal: "SignalResult", price_dir: Optional[str]) -> Optional[dict]:
-    """
-    FIX 8: Mini momentum check para el path técnico puro (enriched=None sin error).
-    Solo aplica cuando enriched es None de forma limpia (no por fallo de red).
-    Si hay fallo de red, strategy.decide() ya devuelve HOLD antes de llegar aqui.
-    """
     effective_dir = _conservative_price_dir(signal.signal, price_dir)
     i15     = signal.indicators.get("15m", {})
     rsi_val = i15.get("rsi_val")
@@ -172,8 +162,22 @@ def _momentum_guard_fallback(signal: "SignalResult", price_dir: Optional[str]) -
 
 def _apply_regime_gate(signal: SignalResult, symbol: str) -> Optional[dict]:
     """
-    FIX 7: Comprueba el régimen de mercado global (BTC) y eleva el umbral
-    de score o bloquea la entrada según el régimen.
+    FIX 7 (MEJORADO): Gate de régimen de mercado con bloqueo por tipo de setup.
+
+    RANGING:
+      - TENDENCIA y BREAKOUT bloqueados (fakeout rate muy alto en rango)
+      - REVERSAL permitido (busca agotamiento de movimientos en rango)
+      - EARLY siempre bloqueado (RANGING_BLOCK_EARLY=true)
+      - Score mínimo elevado a RANGING_MIN_SCORE
+
+    TRENDING:
+      - REVERSAL bloqueado (buscar reversión contra tendencia fuerte tiene
+        win rate muy bajo; el setup correcto en TRENDING es TENDENCIA)
+      - TENDENCIA y BREAKOUT permitidos
+
+    VOLATILE:
+      - Solo eleva score mínimo a VOLATILE_MIN_SCORE
+      - Ningún setup bloqueado por tipo (volatilidad es oportunidad)
     """
     try:
         from bot.market_regime import market_regime, MARKET_REGIME_GATE
@@ -181,12 +185,20 @@ def _apply_regime_gate(signal: SignalResult, symbol: str) -> Optional[dict]:
             return None
 
         regime_raw = market_regime.regime_raw()
+        setup_type = signal.extra.get("setup_type", "")
 
+        # ── RANGING ─────────────────────────────────────────────────
         if regime_raw == "RANGING":
             if _RANGING_BLOCK_EARLY and signal.entry_mode == "EARLY":
                 return _result(
                     "HOLD", signal, False,
                     f"🔴 market_regime=RANGING → modo EARLY bloqueado (false breakout risk)",
+                )
+            if _REGIME_BLOCK_TREND_ON_RANGING and setup_type in ("TENDENCIA", "BREAKOUT"):
+                return _result(
+                    "HOLD", signal, False,
+                    f"🔴 market_regime=RANGING → {setup_type} bloqueado "
+                    f"(fakeout rate alto en mercado lateral — usa REVERSAL)",
                 )
             if signal.score < _RANGING_MIN_SCORE:
                 return _result(
@@ -194,10 +206,20 @@ def _apply_regime_gate(signal: SignalResult, symbol: str) -> Optional[dict]:
                     f"🔴 market_regime=RANGING → score={signal.score} < {_RANGING_MIN_SCORE} requerido",
                 )
             log.info(
-                "[strategy] %s market_regime=RANGING pero score=%d >= %d — permitiendo",
-                symbol, signal.score, _RANGING_MIN_SCORE,
+                "[strategy] %s market_regime=RANGING, setup=%s, score=%d >= %d — permitiendo",
+                symbol, setup_type, signal.score, _RANGING_MIN_SCORE,
             )
 
+        # ── TRENDING ─────────────────────────────────────────────────
+        elif regime_raw == "TRENDING":
+            if _REGIME_BLOCK_REVERSAL_ON_TRENDING and setup_type == "REVERSAL":
+                return _result(
+                    "HOLD", signal, False,
+                    f"🟢 market_regime=TRENDING → REVERSAL bloqueado "
+                    f"(win rate bajo reversando contra tendencia fuerte — usa TENDENCIA)",
+                )
+
+        # ── VOLATILE ─────────────────────────────────────────────────
         elif regime_raw == "VOLATILE":
             if signal.score < _VOLATILE_MIN_SCORE:
                 return _result(
@@ -260,7 +282,7 @@ async def decide(
     if signal.signal == "NEUTRAL":
         return _result("HOLD", signal, False, "Señal técnica neutral")
 
-    # FIX 7: gate de régimen de mercado (RANGING/VOLATILE)
+    # FIX 7 (MEJORADO): gate de régimen por tipo de setup
     regime_block = _apply_regime_gate(signal, symbol)
     if regime_block is not None:
         return regime_block
@@ -272,13 +294,15 @@ async def decide(
             f"💥 STRONG entry directo · score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x"
         )
 
+    # FIX 9: score check ANTES de fetch_enriched_context
+    # Señales que no pasan este umbral no llegan al enricher (sin HTTP innecesarios)
     if signal.score < AI_CALL_MIN_SCORE:
         return _result(
             "HOLD", signal, False,
             f"⏭️ score={signal.score}/{signal.max_score} < {AI_CALL_MIN_SCORE} → HOLD"
         )
 
-    # FIX 8: calcular price_direction una sola vez aquí, con fallback robusto
+    # FIX 8: calcular price_direction una sola vez, con fallback robusto
     price_dir = _compute_price_direction(signal, ohlcv_fn)
     effective_price_dir = _conservative_price_dir(signal.signal, price_dir)
     if price_dir is None:
@@ -287,7 +311,8 @@ async def decide(
             symbol, effective_price_dir, signal.signal,
         )
 
-    # ── Paso 1: enriquecer contexto externo ────────────────────────────────────────
+    # ── Paso 1: enriquecer contexto externo ──────────────────────────────────────
+    # Solo llega aquí si score >= AI_CALL_MIN_SCORE (FIX 9)
     from bot.data_enricher import fetch_enriched_context
     from bot.enriched_filter import apply as ef_apply
 
@@ -299,10 +324,6 @@ async def decide(
         log.warning(f"[strategy] fetch_enriched_context error: {e} — bloqueando entrada (FIX: no entrar sin datos externos)")
         enriched_failed = True
 
-    # ── FIX 5 REVISADO: Si enriched falló por error de red, SIEMPRE HOLD ───────
-    # Antes: entraba si score >= ENRICHED_FALLBACK_MIN_SCORE (8).
-    # Ahora: NUNCA se entra sin datos externos. Una señal técnica sola no es
-    # suficiente justificación para abrir con dinero real.
     if enriched_failed:
         log.warning(
             f"[strategy] {symbol} ⛔ HOLD — datos externos no disponibles (error de red). "
@@ -313,7 +334,7 @@ async def decide(
             f"⛔ Sin datos externos (error de red) — entrada bloqueada para protección"
         )
 
-    # ── Paso 2: filtro determinista ───────────────────────────────────────────
+    # ── Paso 2: filtro determinista ──────────────────────────────────────────────
     action_if_pass = "BUY" if signal.signal == "LONG" else "SELL"
 
     if enriched is not None:
@@ -326,7 +347,7 @@ async def decide(
             enriched=enriched,
             rsi=rsi_val,
             vol_ratio=vol_ratio,
-            price_direction=effective_price_dir,  # FIX 8: nunca None
+            price_direction=effective_price_dir,
         )
 
         if not ef_result.allowed:
@@ -337,7 +358,7 @@ async def decide(
 
         base_confidence = max(5, signal.score - ef_result.penalty)
 
-        # ── Paso 3: IA solo si hay noticias relevantes ───────────────────────
+        # ── Paso 3: IA solo si hay noticias relevantes ────────────────────────
         if USE_AI_FOR_NEWS and ef_result.news_ai_needed:
             now = time.monotonic()
             cooldown_remaining = _AI_NEWS_COOLDOWN_S - (now - _last_ai_news_call.get(symbol, 0))
@@ -412,8 +433,7 @@ async def decide(
             ef_penalty=ef_result.penalty,
         )
 
-    # Path técnico puro (enriched=None sin error, rara vez — data_enricher retorna None sin excepción)
-    # FIX 8: aplicar momentum guard antes de entrar
+    # Path técnico puro (enriched=None sin error)
     momentum_block = _momentum_guard_fallback(signal, price_dir)
     if momentum_block is not None:
         return momentum_block

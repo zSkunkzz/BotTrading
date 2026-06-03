@@ -2,6 +2,12 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+FIX KELLY (#2 2026-06-03):
+  open_order ahora aplica kelly_multiplier() al usdc_per_trade base.
+  Si Kelly no tiene historial suficiente (<30 trades) usa mult=1.0 sin cambio.
+  El size efectivo = usdc_per_trade * kelly_mult, clampeado entre
+  KELLY_MIN_MULT y KELLY_MAX_MULT de kelly_sizer.py.
+
 FIX FREEZE (2026-06-03):
   CAUSA RAÍZ del freeze «no veo nada más / TradingLoop iniciado y silencio»:
   FuturesTrader.__init__ llamaba HLClient(symbol) directamente, que a su vez
@@ -362,7 +368,7 @@ class FuturesTrader:
                     return []
 
         except Exception as e:
-            logger.warning("[%s] get_ohlcv(%s) error: %s", self.symbol, timeframe, e)
+            logger.warning("[%s] get_ohlcv(%s) error: %s", self.symbol, e)
             return []
 
         bars = []
@@ -600,8 +606,26 @@ class FuturesTrader:
         is_long = (action == "BUY" or side == "long")
         is_buy  = is_long
 
-        usdc_per_trade = float(getattr(risk, "usdc_per_trade", 20.0))
-        notional       = usdc_per_trade * self.leverage
+        usdc_base = float(getattr(risk, "usdc_per_trade", 20.0))
+
+        # FIX KELLY (#2): aplicar kelly_multiplier al size base
+        # kelly_mult=1.0 si no hay historial suficiente (<KELLY_MIN_TRADES)
+        try:
+            from bot.kelly_sizer import kelly_multiplier
+            entry_mode = signal.get("entry_mode") or "NORMAL"
+            rr_val     = float(signal.get("rr") or 1.0)
+            kelly_mult = kelly_multiplier(entry_mode, rr_val)
+            usdc_per_trade = usdc_base * kelly_mult
+            if kelly_mult != 1.0:
+                logger.info(
+                    "[%s] Kelly sizing: base=%.2f USDC × %.3f (mode=%s, RR=%.2f) → %.2f USDC",
+                    self.symbol, usdc_base, kelly_mult, entry_mode, rr_val, usdc_per_trade,
+                )
+        except Exception as e:
+            logger.warning("[%s] Kelly sizer error (%s) — usando base sin ajuste", self.symbol, e)
+            usdc_per_trade = usdc_base
+
+        notional = usdc_per_trade * self.leverage
 
         try:
             ref_price = await self.get_price()
@@ -766,12 +790,13 @@ class FuturesTrader:
             logger.warning("[%s] open_order: no se pudo persistir estado: %s", self.symbol, e)
 
         logger.info(
-            "[%s] ✅ Posición abierta: %s @ %.4f | SL=%.4f | TP1=%.4f",
+            "[%s] ✅ Posición abierta: %s @ %.4f | SL=%.4f | TP1=%.4f | Kelly=%.2fx",
             self.symbol,
             self.position.upper(),
             self.entry_price,
             self.sl or 0,
             self.tp1 or 0,
+            kelly_mult if 'kelly_mult' in dir() else 1.0,
         )
 
 
