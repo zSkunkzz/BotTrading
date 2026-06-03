@@ -64,6 +64,16 @@ FIX OHLCV semáforo (2026-06-03):
   de candleSnapshot a max OHLCV_MAX_CONCURRENCY peticiones en paralelo.
   El semáforo se inicializa lazy en get_ohlcv() la primera vez que se llama
   (dentro del event loop), evitando el error de "attached to a different loop".
+
+FIX allMids NoneType — retry + caché último precio (2026-06-04):
+  Cuando HL devuelve null en allMids (cold-start o saturación puntual),
+  get_price() ahora:
+    1. Reintenta 1 vez tras 0.4s si data no es dict.
+    2. Si sigue fallando, devuelve self._last_price (último precio válido
+       cacheado) en lugar de propagar la excepción — el tick se procesa
+       con el precio anterior y el WARNING queda silenciado.
+    3. Si _last_price == 0 (primer arranque y falla) → propaga excepción.
+    4. Cada llamada exitosa actualiza self._last_price.
 """
 from __future__ import annotations
 
@@ -247,7 +257,7 @@ class FuturesTrader:
         self._open_qty:       float           = 0.0
         self._protection_ok:  bool            = False
         self._tp1_be_done:    bool            = False
-        self._last_price:     float           = 0.0
+        self._last_price:     float           = 0.0  # caché del último precio válido
 
         self._api_key    = api_key or ""
         self._api_secret = api_secret or ""
@@ -312,8 +322,9 @@ class FuturesTrader:
 
     # ── Métodos que TradingLoop llama sobre el objeto trader ────────
 
-    async def get_price(self) -> float:
-        async with aiohttp.ClientSession() as session:
+    async def _fetch_all_mids(self, session: aiohttp.ClientSession) -> Optional[dict]:
+        """Llama al endpoint allMids y devuelve el dict o None si falla."""
+        try:
             async with session.post(
                 f"{_API_URL}/info",
                 json={"type": "allMids"},
@@ -321,24 +332,62 @@ class FuturesTrader:
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
                 text = await resp.text()
-
-        try:
             data = _json.loads(text)
-        except Exception:
-            raise ValueError(
-                f"[{self.symbol}] allMids respuesta no-JSON: {text[:200]}"
+            if isinstance(data, dict):
+                return data
+            logger.warning(
+                "[%s] allMids devolvió tipo inesperado (%s): %s",
+                self.symbol, type(data).__name__, text[:120],
             )
+            return None
+        except Exception as e:
+            logger.warning("[%s] allMids error: %s", self.symbol, e)
+            return None
 
-        if not isinstance(data, dict):
+    async def get_price(self) -> float:
+        """
+        Obtiene el precio mid de self.coin vía allMids.
+
+        Estrategia de resiliencia:
+          1. Intento inicial.
+          2. Si data es None → espera 0.4 s y reintenta 1 vez.
+          3. Si sigue fallando → usa self._last_price (caché del último
+             precio válido). Sólo propaga excepción si no hay caché.
+          4. Cada precio válido actualiza self._last_price.
+        """
+        async with aiohttp.ClientSession() as session:
+            data = await self._fetch_all_mids(session)
+
+            if data is None:
+                # Retry único con backoff mínimo
+                await asyncio.sleep(0.4)
+                data = await self._fetch_all_mids(session)
+
+        if data is None:
+            # Fallback a último precio válido conocido
+            if self._last_price > 0:
+                logger.warning(
+                    "[%s] allMids falló tras retry — usando último precio válido en caché: %.4f",
+                    self.symbol, self._last_price,
+                )
+                return self._last_price
             raise ValueError(
-                f"[{self.symbol}] allMids devolvió tipo inesperado "
-                f"({type(data).__name__}): {text[:200]}"
+                f"[{self.symbol}] allMids devolvió tipo inesperado (NoneType): null"
             )
 
         price = data.get(self.coin)
         if price is None:
+            if self._last_price > 0:
+                logger.warning(
+                    "[%s] Precio no encontrado en allMids — usando caché: %.4f",
+                    self.symbol, self._last_price,
+                )
+                return self._last_price
             raise ValueError(f"[{self.symbol}] Precio no encontrado en allMids")
-        return float(price)
+
+        result = float(price)
+        self._last_price = result  # actualizar caché
+        return result
 
     async def _fetch_candles(self, session, timeframe: str, n_bars: int):
         interval = _TF_MINUTES.get(timeframe, 15)
