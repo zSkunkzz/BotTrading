@@ -15,6 +15,15 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 10):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v15 (TP conservadores, trailing eliminado):
+  - TP1 reducidos a multiplicadores alcanzables:
+      TENDENCIA:  2.3x ATR → 1.5x ATR
+      BREAKOUT:   2.3x ATR → 1.4x ATR
+      REVERSAL:   2.0x ATR → 1.3x ATR
+  - MIN_RR bajado de 1.5 a 1.2 para que señales con TP conservador pasen el filtro
+  - STRONG lev now requires RR >= 1.8 (antes 2.0) para adaptarse a nuevos TPs
+  - trailing_hl.py convertido en stub vacío (no ejecuta lógica)
+
 CAMBIOS v14 (mejora integral estrategia):
   1. RR alcanzable: TP1 tendencia/breakout sube a 2.3x ATR; reversal a 2.0x ATR
   2. Breakout anti-fakeout: exige rotura mínima de 0.3x ATR fuera del rango
@@ -39,13 +48,14 @@ from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr
 log = logging.getLogger(__name__)
 
 MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "5"))
-MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
+MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.2"))
 
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
 _SL_ATR_MULT       = float(os.getenv("SL_ATR_MULT",  "1.5"))
-_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "2.3"))
-_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))
+# TP1 conservadores v15: alcanzables con alta probabilidad
+_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "1.5"))   # TENDENCIA (era 2.3)
+_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))   # referencia interna, no se usa en órdenes
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 
@@ -161,17 +171,18 @@ async def analyze_pair(
 
     _atr_buf = _SL_CANDLE_BUFFER * atr_val
 
+    # v15: multiplicadores TP1 conservadores por tipo de setup
     if setup_type == "REVERSAL":
         sl_mult  = float(os.getenv("SL_ATR_MULT_REVERSAL",  "1.2"))
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "2.0"))
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.3"))  # era 2.0
         tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "3.5"))
     elif setup_type == "BREAKOUT":
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "2.3"))
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "1.4"))  # era 2.3
         tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "3.5"))
-    else:
+    else:  # TENDENCIA
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = _TP1_ATR_MULT
+        tp1_mult = _TP1_ATR_MULT   # 1.5x (env override disponible)
         tp2_mult = _TP2_ATR_MULT
 
     if signal_str == "LONG":
@@ -194,7 +205,8 @@ async def analyze_pair(
     else:
         entry_mode = "EARLY"
 
-    if entry_mode == "STRONG" and rr >= 2.0:
+    # v15: STRONG lev threshold bajado a 1.8 (antes 2.0) por TPs más conservadores
+    if entry_mode == "STRONG" and rr >= 1.8:
         suggested_lev = _MAX_LEV
     elif entry_mode == "NORMAL":
         suggested_lev = max(1, int(_MAX_LEV * 0.6))
