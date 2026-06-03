@@ -15,15 +15,23 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 10):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
-CAMBIOS v21 (Prioridad 1 — OHLCV robustos):
+CAMBIOS v21 (Prioridades 1 y 2):
+  P1 — OHLCV robustos:
   - _clean_bars(): elimina barras con None en cualquier campo OHLCV antes
     de pasarlas a los indicadores. Previene TypeError en EMA/RSI/ST cuando
     el exchange devuelve velas incompletas (campo vol=None, etc.).
   - Guard diferenciado 1h: si len(bars_1h) < 20 → warning log, pero no
     return — ind_1h quedará {} y el scoring lo penalizará correctamente
     (ST1h y EMA1h ausentes → NEUTRAL en _score_tendencia).
-  - _clean_bars() cubre también bars_4h, que es el otro timeframe propenso
-    a devolver barras parciales en pares de baja liquidez.
+  P2 — Filtros de calidad en analyze_pair:
+  - VOL_SIGNAL_MIN (default 1.0): la vela de señal (última 15m) debe tener
+    volumen >= VOL_SIGNAL_MIN × promedio de las _VOL_AVG_WINDOW velas
+    anteriores. Bloquea entradas en velas de rango muerto / trampa.
+  - funding_rate: float = 0.0 añadido como parámetro a analyze_pair.
+    FUNDING_LONG_MAX (+0.05%) y FUNDING_SHORT_MIN (-0.05%): bloquean
+    señales cuyo funding extremo contradice la dirección (funding elevado
+    → longs sobrecargados → presión bajista; funding muy negativo →
+    shorts sobrecargados → riesgo squeeze). Aplicado tras _detect_setup.
 
 CAMBIOS v20 (Opción A early entry + Opción B SL ATR dinámico):
   Opción A — Early entry para señales de máxima convicción:
@@ -31,30 +39,16 @@ CAMBIOS v20 (Opción A early entry + Opción B SL ATR dinámico):
     Si score>=FAST_ENTRY_MIN_SCORE y rr>=FAST_ENTRY_MIN_RR (default=1.2) →
     is_valid=True aunque rr < MIN_RR (1.5). Entry más rápido en 10/10.
     entry_mode="FAST" para distinguirlo en logs/Telegram.
-    Lógica: una señal 9-10/10 con RR=1.2 sigue siendo mejor que esperar
-    con entry más alto y el mismo SL.
   Opción B — SL dinámico ATR puro:
   - SL_ATR_DYNAMIC (default=false): cuando true, el SL base se calcula
     solo como entry ± SL_ATR_MULT×ATR, sin anclar al low/high de la vela.
-    Beneficio: SL más ajustado a la volatilidad actual → RR más alto.
-    El _structure_sl (swing low/high 1h) sigue aplicándose como última capa.
-    Útil cuando la vela actual tiene un low muy lejano del entry (impulso).
 
 CAMBIOS v19 (trend following puro — calidad sobre cantidad):
   - _score_tendencia: MACD15m a favor es REQUISITO OBLIGATORIO.
-    Si MACD está en contra → score=0, NEUTRAL inmediato.
-    Antes era opcional (+1). Un setup con MACD en contra no es trend following.
   - _score_tendencia: ST1h Y ST4h ambos requeridos.
-    Si ST4h en contra → penalización -2 (antes solo -1 oportunidad).
-    Trend following necesita alineación real multi-timeframe.
   - _score_tendencia: Volumen mínimo 1.0x para puntuar.
-    Vol<1.0x no suma +1. Vol<0.8x aplica penalización -1.
-  - TP1_ATR_MULT default 2.25 (era 1.5) → RR base 1.5 exacto con SL=1.5×ATR.
-  - TP2_ATR_MULT_TENDENCIA default 4.5 (era 3.5) → TP2 proporcional.
-  - MIN_RR default 1.5 (era 1.2).
-  - MIN_SCORE default 7 (era 5) → solo setups de alta convicción.
-  REVERSAL y BREAKOUT se mantienen sin cambios pero quedan eclipsados
-  por el MIN_SCORE=7 más exigente (sus MAX son 8 y 9 respectivamente).
+  - TP1_ATR_MULT default 2.25 · TP2_ATR_MULT default 4.5
+  - MIN_RR default 1.5 · MIN_SCORE default 7
 
 CAMBIOS v18 (fix SL estructura demasiado ancho):
   - _structure_sl añade cap SL_STRUCTURE_MAX_DIST_PCT (default 4.0%).
@@ -106,6 +100,13 @@ _SL_STRUCTURE_ENABLED = os.getenv("SL_STRUCTURE_ENABLED", "true").lower() != "fa
 _SL_STRUCTURE_MAX_DIST_PCT = float(os.getenv("SL_STRUCTURE_MAX_DIST_PCT", "4.0")) / 100.0
 
 _VOL_AVG_WINDOW    = int(os.getenv("VOL_AVG_WINDOW", "20"))
+
+# v21 P2: volumen mínimo en la vela de señal
+_VOL_SIGNAL_MIN = float(os.getenv("VOL_SIGNAL_MIN", "1.0"))
+
+# v21 P2: thresholds de funding rate
+_FUNDING_LONG_MAX  = float(os.getenv("FUNDING_LONG_MAX",  "0.0005"))   # +0.05%
+_FUNDING_SHORT_MIN = float(os.getenv("FUNDING_SHORT_MIN", "-0.0005"))  # -0.05%
 
 _EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.002"))
 _EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.0015"))
@@ -268,6 +269,7 @@ async def analyze_pair(
     exch,
     symbol: str,
     ohlcv_fn: Optional[Callable] = None,
+    funding_rate: float = 0.0,          # v21 P2: Opción B — funding pasado desde el scanner
 ) -> SignalResult:
     try:
         if ohlcv_fn is not None:
@@ -317,6 +319,21 @@ async def analyze_pair(
     if vol_ratio_15m < _VOL_MIN_GLOBAL:
         return _hold_result(symbol, f"Vol={vol_ratio_15m:.2f}x — mercado dormido (min {_VOL_MIN_GLOBAL}x)")
 
+    # ─── v21 P2: volumen de la vela de señal (última barra 15m) ─────────────
+    # Usa las _VOL_AVG_WINDOW velas anteriores a la última como referencia,
+    # de forma que la propia vela de señal no infle su propio promedio.
+    if len(bars_15m) >= _VOL_AVG_WINDOW + 1:
+        vol_last    = float(bars_15m[-1][5])
+        vol_avg_ref = sum(float(b[5]) for b in bars_15m[-_VOL_AVG_WINDOW - 1:-1]) / _VOL_AVG_WINDOW
+        vol_signal  = round(vol_last / vol_avg_ref, 3) if vol_avg_ref > 0 else 1.0
+        if vol_signal < _VOL_SIGNAL_MIN:
+            return _hold_result(
+                symbol,
+                f"Vol señal {vol_signal:.2f}x < {_VOL_SIGNAL_MIN}x (vela entrada sin convicción)",
+            )
+        log.debug("[signal_engine] %s vol_signal=%.2fx (min %.1fx)", symbol, vol_signal, _VOL_SIGNAL_MIN)
+    # ────────────────────────────────────────────────────────────────────────
+
     # v17: evalúa los 3 setups y elige el de mayor ratio score/max_score
     setup_type, signal_str, score, max_score, reasons = _detect_setup(
         ind_15m, ind_1h, ind_4h, bars_15m
@@ -330,6 +347,19 @@ async def analyze_pair(
     session_block = check_session(setup_type)
     if session_block:
         return _hold_result(symbol, session_block)
+
+    # ─── v21 P2: filtro funding rate extremo ────────────────────────────────
+    if signal_str == "LONG" and funding_rate > _FUNDING_LONG_MAX:
+        return _hold_result(
+            symbol,
+            f"Funding {funding_rate:.4%} > {_FUNDING_LONG_MAX:.4%} → no LONG (longs sobrecargados)",
+        )
+    if signal_str == "SHORT" and funding_rate < _FUNDING_SHORT_MIN:
+        return _hold_result(
+            symbol,
+            f"Funding {funding_rate:.4%} < {_FUNDING_SHORT_MIN:.4%} → no SHORT (shorts sobrecargados)",
+        )
+    # ────────────────────────────────────────────────────────────────────────
 
     last_bar    = bars_15m[-1]
     close_price = float(last_bar[4])
@@ -409,9 +439,10 @@ async def analyze_pair(
     is_valid = (score >= MIN_SCORE and rr >= MIN_RR) or is_fast_valid
 
     log.info(
-        "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s | %s",
+        "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s funding=%.4f%% | %s",
         symbol, signal_str, setup_type, score, max_score, rr,
         entry, sl, tp1, tp2, atr_val, suggested_lev, entry_mode, is_valid,
+        funding_rate * 100,
         " · ".join(reasons),
     )
 
@@ -431,7 +462,7 @@ async def analyze_pair(
         indicators=indicators,
         is_valid=is_valid,
         reason="" if is_valid else f"[{setup_type}] score={score}/{max_score} rr={rr:.2f} (min {MIN_RR})",
-        extra={"setup_type": setup_type, "sl_atr": sl_atr, "sl_used": sl, "is_fast": is_fast_valid},
+        extra={"setup_type": setup_type, "sl_atr": sl_atr, "sl_used": sl, "is_fast": is_fast_valid, "funding_rate": funding_rate},
     )
 
 
