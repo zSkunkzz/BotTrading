@@ -15,24 +15,26 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 10):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v16 (SL por estructura + filtro de sesión):
+  - SL ahora usa swing low/high de structure_analyzer (1h) si está disponible.
+    Si el swing SL es más agresivo que el ATR SL, usa el ATR como fallback.
+  - session_filter integrado: TENDENCIA/BREAKOUT bloqueados fuera de 07-18 UTC.
+    REVERSAL permitido 24h. Configurable por Railway vars SESSION_*.
+  - Todos los cambios de v15 se mantienen (TP1 conservadores, MIN_RR=1.2).
+
 CAMBIOS v15 (TP conservadores, trailing eliminado):
-  - TP1 reducidos a multiplicadores alcanzables:
-      TENDENCIA:  2.3x ATR → 1.5x ATR
-      BREAKOUT:   2.3x ATR → 1.4x ATR
-      REVERSAL:   2.0x ATR → 1.3x ATR
-  - MIN_RR bajado de 1.5 a 1.2 para que señales con TP conservador pasen el filtro
-  - STRONG lev now requires RR >= 1.8 (antes 2.0) para adaptarse a nuevos TPs
-  - trailing_hl.py convertido en stub vacío (no ejecuta lógica)
+  - TP1 reducidos: TENDENCIA 1.5x, BREAKOUT 1.4x, REVERSAL 1.3x ATR
+  - MIN_RR default 1.2
+  - STRONG leverage threshold RR >= 1.8
+  - trailing_hl.py stub vacío
 
 CAMBIOS v14 (mejora integral estrategia):
-  1. RR alcanzable: TP1 tendencia/breakout sube a 2.3x ATR; reversal a 2.0x ATR
-  2. Breakout anti-fakeout: exige rotura mínima de 0.3x ATR fuera del rango
-  3. Reversal con confirmación real: exige vela de giro (body en favor)
-  4. EARLY leverage más conservador: 0.3x → 0.2x del máximo
-  5. Volumen más reactivo: media 60 → 20 velas en 15m
-  6. Pullback más fresco: lookback 3 → 2 velas
-  7. Confluencia total de tendencia ahora vale +2
-  8. Cooldown específico tras SL/MANUAL_CLOSE se gestiona en DecisionEngine
+  1. Breakout anti-fakeout: exige rotura mínima de 0.3x ATR fuera del rango
+  2. Reversal con confirmación real: exige vela de giro (body en favor)
+  3. EARLY leverage más conservador: 0.2x del máximo
+  4. Volumen más reactivo: media 20 velas en 15m
+  5. Pullback más fresco: lookback 2 velas
+  6. Confluencia total de tendencia vale +2
 """
 from __future__ import annotations
 
@@ -42,6 +44,8 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
+
+import pandas as pd
 
 from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr
 
@@ -53,11 +57,11 @@ MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.2"))
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
 _SL_ATR_MULT       = float(os.getenv("SL_ATR_MULT",  "1.5"))
-# TP1 conservadores v15: alcanzables con alta probabilidad
-_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "1.5"))   # TENDENCIA (era 2.3)
-_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))   # referencia interna, no se usa en órdenes
+_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "1.5"))   # TENDENCIA
+_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))   # referencia interna
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
+_SL_STRUCTURE_ENABLED = os.getenv("SL_STRUCTURE_ENABLED", "true").lower() != "false"
 
 _VOL_AVG_WINDOW    = int(os.getenv("VOL_AVG_WINDOW", "20"))
 
@@ -107,6 +111,78 @@ class SignalResult:
     reason:        str  = ""
     signal_block:  str  = ""
     extra:         Dict = field(default_factory=dict)
+
+
+def _bars_to_df(bars: list) -> pd.DataFrame:
+    """Convierte lista OHLCV [t,o,h,l,c,v] a DataFrame para structure_analyzer."""
+    df = pd.DataFrame(bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
+    return df
+
+
+def _structure_sl(
+    bars_1h: list,
+    signal_str: str,
+    entry: float,
+    sl_atr: float,
+    atr_val: float,
+) -> float:
+    """
+    v16: Calcula SL anclado al swing low/high de structure_analyzer (1h).
+    Si el swing SL es más protector (más alejado del entry) que el ATR SL,
+    lo usa. Si es más agresivo (más cercano), usa el ATR SL como fallback.
+    Si structure_analyzer falla, devuelve sl_atr sin cambios.
+
+    Un buffer del 0.1×ATR se añade más allá del swing para evitar stops
+    que se tocan exactamente en el swing.
+    """
+    if not _SL_STRUCTURE_ENABLED or len(bars_1h) < 20:
+        return sl_atr
+
+    try:
+        from bot.structure_analyzer import analyze_structure, STRUCTURE_SWING_N
+        df = _bars_to_df(bars_1h)
+        direction = 1 if signal_str == "LONG" else -1
+        struct = analyze_structure(df, direction)
+
+        swing_sl_buffer = 0.1 * atr_val
+
+        if signal_str == "LONG":
+            swing_low = struct.get("last_sl", 0.0)
+            if swing_low > 0:
+                candidate = round(swing_low - swing_sl_buffer, 6)
+                # Usar el más alejado del entry (más protector)
+                if candidate < sl_atr:
+                    log.debug(
+                        "[signal_engine] SL estructura: swing_low=%.6f → SL=%.6f (ATR SL=%.6f — más agresivo, usando estructura)",
+                        swing_low, candidate, sl_atr,
+                    )
+                    return candidate
+                else:
+                    log.debug(
+                        "[signal_engine] SL estructura: swing_low=%.6f demasiado cercano (%.6f > ATR SL %.6f) → fallback ATR",
+                        swing_low, candidate, sl_atr,
+                    )
+        else:  # SHORT
+            swing_high = struct.get("last_sh", 0.0)
+            if swing_high > 0:
+                candidate = round(swing_high + swing_sl_buffer, 6)
+                # Usar el más alejado del entry (más alto para SHORT)
+                if candidate > sl_atr:
+                    log.debug(
+                        "[signal_engine] SL estructura: swing_high=%.6f → SL=%.6f (ATR SL=%.6f — más agresivo, usando estructura)",
+                        swing_high, candidate, sl_atr,
+                    )
+                    return candidate
+                else:
+                    log.debug(
+                        "[signal_engine] SL estructura: swing_high=%.6f demasiado cercano (%.6f < ATR SL %.6f) → fallback ATR",
+                        swing_high, candidate, sl_atr,
+                    )
+    except Exception as e:
+        log.debug("[signal_engine] _structure_sl error (fallback ATR): %s", e)
+
+    return sl_atr
 
 
 async def analyze_pair(
@@ -159,6 +235,12 @@ async def analyze_pair(
     if signal_str == "NEUTRAL" or setup_type is None:
         return _hold_result(symbol, f"NEUTRAL ({', '.join(reasons[-3:])})")
 
+    # v16: filtro de sesión — TENDENCIA/BREAKOUT bloqueados fuera de horario
+    from bot.session_filter import check_session
+    session_block = check_session(setup_type)
+    if session_block:
+        return _hold_result(symbol, session_block)
+
     last_bar    = bars_15m[-1]
     close_price = float(last_bar[4])
     high_price  = float(last_bar[2])
@@ -174,25 +256,29 @@ async def analyze_pair(
     # v15: multiplicadores TP1 conservadores por tipo de setup
     if setup_type == "REVERSAL":
         sl_mult  = float(os.getenv("SL_ATR_MULT_REVERSAL",  "1.2"))
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.3"))  # era 2.0
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.3"))
         tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "3.5"))
     elif setup_type == "BREAKOUT":
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "1.4"))  # era 2.3
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "1.4"))
         tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "3.5"))
     else:  # TENDENCIA
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = _TP1_ATR_MULT   # 1.5x (env override disponible)
+        tp1_mult = _TP1_ATR_MULT
         tp2_mult = _TP2_ATR_MULT
 
+    # Calcular SL ATR base
     if signal_str == "LONG":
-        sl  = round(min(low_price  - _atr_buf, entry - sl_mult  * atr_val), 6)
-        tp1 = round(entry + tp1_mult * atr_val, 6)
-        tp2 = round(entry + tp2_mult * atr_val, 6)
+        sl_atr = round(min(low_price - _atr_buf, entry - sl_mult * atr_val), 6)
+        tp1    = round(entry + tp1_mult * atr_val, 6)
+        tp2    = round(entry + tp2_mult * atr_val, 6)
     else:
-        sl  = round(max(high_price + _atr_buf, entry + sl_mult  * atr_val), 6)
-        tp1 = round(entry - tp1_mult * atr_val, 6)
-        tp2 = round(entry - tp2_mult * atr_val, 6)
+        sl_atr = round(max(high_price + _atr_buf, entry + sl_mult * atr_val), 6)
+        tp1    = round(entry - tp1_mult * atr_val, 6)
+        tp2    = round(entry - tp2_mult * atr_val, 6)
+
+    # v16: intentar anclar SL a swing low/high de 1h (structure_analyzer)
+    sl = _structure_sl(bars_1h, signal_str, entry, sl_atr, atr_val)
 
     risk   = abs(entry - sl)
     reward = abs(tp1 - entry)
@@ -205,7 +291,7 @@ async def analyze_pair(
     else:
         entry_mode = "EARLY"
 
-    # v15: STRONG lev threshold bajado a 1.8 (antes 2.0) por TPs más conservadores
+    # v15: STRONG lev threshold RR >= 1.8
     if entry_mode == "STRONG" and rr >= 1.8:
         suggested_lev = _MAX_LEV
     elif entry_mode == "NORMAL":
@@ -238,7 +324,7 @@ async def analyze_pair(
         indicators=indicators,
         is_valid=is_valid,
         reason="" if is_valid else f"[{setup_type}] score={score}/{max_score} rr={rr:.2f} (min {MIN_RR})",
-        extra={"setup_type": setup_type},
+        extra={"setup_type": setup_type, "sl_atr": sl_atr, "sl_used": sl},
     )
 
 
@@ -587,12 +673,15 @@ def format_signal_block(signal) -> str:
     lev = f"{signal.suggested_lev}x" if signal.suggested_lev else "—"
     rr = f"{signal.rr:.2f}" if signal.rr else "—"
     mode = signal.extra.get("setup_type", signal.entry_mode)
+    sl_note = ""
+    if signal.extra.get("sl_atr") and signal.extra.get("sl_used") != signal.extra.get("sl_atr"):
+        sl_note = " [struct]"
     lines = [
         f"**{signal.symbol}** · {arrow} [{mode}]",
         f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
     ]
     if signal.entry:
-        lines.append(f"Entry: `{signal.entry}` | SL: `{signal.sl}` | TP: `{signal.tp1}`")
+        lines.append(f"Entry: `{signal.entry}` | SL: `{signal.sl}`{sl_note} | TP: `{signal.tp1}`")
     if signal.reason:
         lines.append(f"_{signal.reason}_")
     return "\n".join(lines)
