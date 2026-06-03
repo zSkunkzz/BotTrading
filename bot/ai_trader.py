@@ -324,9 +324,6 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
     enriched_str = format_context_for_prompt(enriched)
 
     # ── FAST PATH: sin noticias → ejecutar señal técnica directamente ─────
-    # Si enriched.news está vacío no hay nada que la IA pueda aportar que
-    # los indicadores no reflejen ya. Nos ahorramos 100% de las llamadas
-    # a Gemini/Groq en condiciones de mercado sin catalizadores externos.
     has_news = bool(getattr(enriched, "news", None))
     if not has_news:
         if context_override:
@@ -340,6 +337,11 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
                 return {"action": "HOLD", "confidence": 3,
                         "reasoning": "Bars insuficientes", "key_factors": []}
             tech = _technical_signal(bars)
+            if tech["signal"] != "HOLD" and tech["confidence"] < AI_MIN_SCORE:
+                logger.info(f"[{symbol}] \U0001f7e1 Score técnico {tech['confidence']} < AI_MIN_SCORE {AI_MIN_SCORE} → HOLD")
+                return {"action": "HOLD", "confidence": tech["confidence"],
+                        "reasoning": f"Score técnico insuficiente ({tech['confidence']}/{AI_MIN_SCORE})",
+                        "key_factors": []}
             logger.info(f"[{symbol}] \U0001f7e2 Sin noticias → señal técnica directa ({tech['signal']})")
             return {"action": tech["signal"], "confidence": tech["confidence"],
                     "reasoning": "Sin noticias — señal técnica directa", "key_factors": ["technical"]}
@@ -404,14 +406,3 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
     min_conf   = int(os.getenv("AI_MIN_CONFIDENCE", "5"))
     if confidence < min_conf and result.get("action") in ("BUY", "SELL"):
         logger.info(f"[{symbol}] IA confidence {confidence} < {min_conf} → HOLD")
-        result["action"] = "HOLD"
-
-    action = result.get("action")
-    if action in ("BUY", "SELL", "CLOSE"):
-        _ai_cache[cache_key] = (result, now)
-        if len(_ai_cache) > 200:
-            oldest_key = min(_ai_cache, key=lambda k: _ai_cache[k][1])
-            del _ai_cache[oldest_key]
-
-    logger.info(f"\U0001f916 [{symbol}] {result['action']} ({confidence}/10) | {result.get('reasoning', result.get('reason', ''))}")
-    return result
