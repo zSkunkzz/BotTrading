@@ -15,44 +15,34 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 10):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v19 (trend following puro — calidad sobre cantidad):
+  - _score_tendencia: MACD15m a favor es REQUISITO OBLIGATORIO.
+    Si MACD está en contra → score=0, NEUTRAL inmediato.
+    Antes era opcional (+1). Un setup con MACD en contra no es trend following.
+  - _score_tendencia: ST1h Y ST4h ambos requeridos.
+    Si ST4h en contra → penalización -2 (antes solo -1 oportunidad).
+    Trend following necesita alineación real multi-timeframe.
+  - _score_tendencia: Volumen mínimo 1.0x para puntuar.
+    Vol<1.0x no suma +1. Vol<0.8x aplica penalización -1.
+  - TP1_ATR_MULT default 2.25 (era 1.5) → RR base 1.5 exacto con SL=1.5×ATR.
+  - TP2_ATR_MULT_TENDENCIA default 4.5 (era 3.5) → TP2 proporcional.
+  - MIN_RR default 1.5 (era 1.2).
+  - MIN_SCORE default 7 (era 5) → solo setups de alta convicción.
+  REVERSAL y BREAKOUT se mantienen sin cambios pero quedan eclipsados
+  por el MIN_SCORE=7 más exigente (sus MAX son 8 y 9 respectivamente).
+
 CAMBIOS v18 (fix SL estructura demasiado ancho):
   - _structure_sl añade cap SL_STRUCTURE_MAX_DIST_PCT (default 4.0%).
-    Si el swing SL candidato está a más de MAX_DIST_PCT del entry, se
-    rechaza y se usa el ATR SL como fallback. Resuelve el caso ZEC donde
-    swing_low estaba al 6.1% del entry → RR=0.37 → setup válido descartado
-    en bucle 20+ min.
-    Env var: SL_STRUCTURE_MAX_DIST_PCT (float %, default 4.0)
 
 CAMBIOS v17 (mejoras de estrategia):
   - _detect_setup evalúa los 3 setups y elige el de mayor ratio score/max_score.
-    Antes paraba en el primero que pasaba MIN_SCORE (orden TENDENCIA → BREAKOUT → REVERSAL).
-    Ahora un REVERSAL perfecto no queda oculto detrás de un TENDENCIA mediocre.
-  - TP2 diferenciado por tipo de setup:
-      REVERSAL  → TP2_ATR_MULT_REVERSAL  default 2.0 (era 3.5 — irrealista)
-      BREAKOUT  → TP2_ATR_MULT_BREAKOUT  default 3.0 (razonable para ruptura)
-      TENDENCIA → TP2_ATR_MULT_TENDENCIA default 3.5 (correcto para trend following)
-    Esto hace que TP2_PARTIAL_RATIO se ejecute con mayor frecuencia en reversals.
 
 CAMBIOS v16 (SL por estructura + filtro de sesión):
-  - SL ahora usa swing low/high de structure_analyzer (1h) si está disponible.
-    Si el swing SL es más agresivo que el ATR SL, usa el ATR como fallback.
+  - SL ahora usa swing low/high de structure_analyzer (1h).
   - session_filter integrado: TENDENCIA/BREAKOUT bloqueados fuera de 07-18 UTC.
-    REVERSAL permitido 24h. Configurable por Railway vars SESSION_*.
-  - Todos los cambios de v15 se mantienen (TP1 conservadores, MIN_RR=1.2).
 
 CAMBIOS v15 (TP conservadores, trailing eliminado):
-  - TP1 reducidos: TENDENCIA 1.5x, BREAKOUT 1.4x, REVERSAL 1.3x ATR
-  - MIN_RR default 1.2
-  - STRONG leverage threshold RR >= 1.8
   - trailing_hl.py stub vacío
-
-CAMBIOS v14 (mejora integral estrategia):
-  1. Breakout anti-fakeout: exige rotura mínima de 0.3x ATR fuera del rango
-  2. Reversal con confirmación real: exige vela de giro (body en favor)
-  3. EARLY leverage más conservador: 0.2x del máximo
-  4. Volumen más reactivo: media 20 velas en 15m
-  5. Pullback más fresco: lookback 2 velas
-  6. Confluencia total de tendencia vale +2
 """
 from __future__ import annotations
 
@@ -69,23 +59,18 @@ from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr
 
 log = logging.getLogger(__name__)
 
-MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "5"))
-MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.2"))
+MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "7"))    # v19: era 5
+MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5")) # v19: era 1.2
 
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
 _SL_ATR_MULT       = float(os.getenv("SL_ATR_MULT",  "1.5"))
-_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "1.5"))   # TENDENCIA
-_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))   # referencia interna (TENDENCIA)
+_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "2.25"))  # v19: era 1.5 → RR base 1.5
+_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "4.5"))   # v19: era 3.5
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 _SL_STRUCTURE_ENABLED = os.getenv("SL_STRUCTURE_ENABLED", "true").lower() != "false"
 
-# Cap de distancia máxima del SL de estructura respecto al entry.
-# Si el swing SL candidato está a más de X% del entry, se descarta
-# y se usa el ATR SL como fallback. Resuelve coins volátiles (ZEC, etc.)
-# donde swing_low puede estar al 5-8% y destruir el RR.
-# Configurable via Railway: SL_STRUCTURE_MAX_DIST_PCT=4.0
 _SL_STRUCTURE_MAX_DIST_PCT = float(os.getenv("SL_STRUCTURE_MAX_DIST_PCT", "4.0")) / 100.0
 
 _VOL_AVG_WINDOW    = int(os.getenv("VOL_AVG_WINDOW", "20"))
@@ -159,7 +144,7 @@ def _structure_sl(
       1. El swing SL debe estar más alejado del entry que el ATR SL (más protector).
       2. v18 NEW: El swing SL no puede estar a más de SL_STRUCTURE_MAX_DIST_PCT
          del entry (default 4%). Coins volátiles como ZEC pueden tener swing_low
-         al 6%+ → RR colpasa → setup descartado en bucle. Si supera el cap,
+         al 6%+ → RR colapsa → setup descartado en bucle. Si supera el cap,
          se usa el ATR SL como fallback.
       3. Si structure_analyzer falla, devuelve sl_atr sin cambios.
 
@@ -181,7 +166,6 @@ def _structure_sl(
             swing_low = struct.get("last_sl", 0.0)
             if swing_low > 0:
                 candidate = round(swing_low - swing_sl_buffer, 6)
-                # v18: cap de distancia máxima
                 if entry > 0:
                     dist_pct = abs(entry - candidate) / entry
                     if dist_pct > _SL_STRUCTURE_MAX_DIST_PCT:
@@ -192,7 +176,6 @@ def _structure_sl(
                             _SL_STRUCTURE_MAX_DIST_PCT * 100, sl_atr,
                         )
                         return sl_atr
-                # Usar el más alejado del entry (más protector)
                 if candidate < sl_atr:
                     log.debug(
                         "[signal_engine] SL estructura: swing_low=%.6f → SL=%.6f (ATR SL=%.6f — más agresivo, usando estructura)",
@@ -208,7 +191,6 @@ def _structure_sl(
             swing_high = struct.get("last_sh", 0.0)
             if swing_high > 0:
                 candidate = round(swing_high + swing_sl_buffer, 6)
-                # v18: cap de distancia máxima
                 if entry > 0:
                     dist_pct = abs(candidate - entry) / entry
                     if dist_pct > _SL_STRUCTURE_MAX_DIST_PCT:
@@ -219,7 +201,6 @@ def _structure_sl(
                             _SL_STRUCTURE_MAX_DIST_PCT * 100, sl_atr,
                         )
                         return sl_atr
-                # Usar el más alejado del entry (más alto para SHORT)
                 if candidate > sl_atr:
                     log.debug(
                         "[signal_engine] SL estructura: swing_high=%.6f → SL=%.6f (ATR SL=%.6f — más agresivo, usando estructura)",
@@ -306,20 +287,19 @@ async def analyze_pair(
 
     _atr_buf = _SL_CANDLE_BUFFER * atr_val
 
-    # v15: multiplicadores TP1 conservadores por tipo de setup
-    # v17: TP2 también diferenciado por tipo de setup
+    # v19: multiplicadores actualizados para RR≥1.5
     if setup_type == "REVERSAL":
         sl_mult  = float(os.getenv("SL_ATR_MULT_REVERSAL",  "1.2"))
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.3"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "2.0"))  # v17: era 3.5
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.8"))   # v19: era 1.3
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "2.5"))   # v19: era 2.0
     elif setup_type == "BREAKOUT":
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "1.4"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "3.0"))  # v17: era 3.5
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "2.1"))   # v19: era 1.4
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "4.0"))   # v19: era 3.0
     else:  # TENDENCIA
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = _TP1_ATR_MULT
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_TENDENCIA", str(_TP2_ATR_MULT)))  # default 3.5
+        tp1_mult = _TP1_ATR_MULT                                        # v19: 2.25 (era 1.5)
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_TENDENCIA", str(_TP2_ATR_MULT)))  # v19: 4.5
 
     # Calcular SL ATR base
     if signal_str == "LONG":
@@ -345,7 +325,6 @@ async def analyze_pair(
     else:
         entry_mode = "EARLY"
 
-    # v15: STRONG lev threshold RR >= 1.8
     if entry_mode == "STRONG" and rr >= 1.8:
         suggested_lev = _MAX_LEV
     elif entry_mode == "NORMAL":
@@ -387,8 +366,6 @@ def _detect_setup(
 ) -> Tuple[Optional[str], str, int, int, List[str]]:
     """
     v17: Evalúa los 3 setups y devuelve el de mayor ratio score/max_score.
-    Antes paraba en el primero que pasaba MIN_SCORE (orden fijo: TENDENCIA → BREAKOUT → REVERSAL),
-    lo que podía ocultar un REVERSAL perfecto detrás de un TENDENCIA mediocre.
     """
     candidates = []
     for mode_fn in (_score_tendencia, _score_breakout, _score_reversal):
@@ -399,7 +376,6 @@ def _detect_setup(
     if not candidates:
         return None, "NEUTRAL", 0, 10, ["Ningún setup alcanzó MIN_SCORE"]
 
-    # Elige el setup con mayor ratio score/max_score (normalizado)
     best = max(candidates, key=lambda x: x[2] / x[3])
     if len(candidates) > 1:
         log.debug(
@@ -412,6 +388,23 @@ def _detect_setup(
 
 
 def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
+    """
+    v19: Trend following puro.
+    REQUISITOS OBLIGATORIOS (score=0 si falla):
+      - EMA 1h en tendencia definida
+      - MACD15m a favor de la dirección
+      - ST1h a favor
+    PUNTUACIÓN ADICIONAL (max=10):
+      +2 EMA15m alineada con 1h
+      +1 ST4h a favor
+      +1 Pullback a EMA21_15m
+      +1 RSI15m en zona de rebote (35-65)
+      +1 Volumen ≥ 1.0x
+      +2 Confluencia total ST 15m+1h+4h
+    PENALIZACIONES:
+      -2 ST4h en contra (tendencia mayor diverge)
+      -1 Vol < 0.8x (mercado muerto)
+    """
     MAX = 10
     reasons: List[str] = []
 
@@ -433,8 +426,22 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
         return "TENDENCIA", "NEUTRAL", 0, MAX, ["Sin tendencia definida en 1h"]
 
     direction = "LONG" if trend_1h_up else "SHORT"
+
+    # v19: REQUISITO OBLIGATORIO — MACD15m debe confirmar dirección
+    macd_ok = (direction == "LONG" and i15.get("macd_bull")) or (direction == "SHORT" and i15.get("macd_bear"))
+    if not macd_ok:
+        reasons.append(f"MACD15m en contra de {direction} — requisito obligatorio no cumplido")
+        return "TENDENCIA", "NEUTRAL", 0, MAX, reasons
+
+    # v19: REQUISITO OBLIGATORIO — ST1h debe confirmar dirección
+    st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
+    if not st1h_ok:
+        reasons.append(f"ST1h en contra de {direction} — requisito obligatorio no cumplido")
+        return "TENDENCIA", "NEUTRAL", 0, MAX, reasons
+
     score = 0
 
+    # EMA15m alineada con 1h (+2 si alineada, +1 si solo 1h)
     ema_15m_ok = (direction == "LONG" and i15.get("ema_bull")) or (direction == "SHORT" and i15.get("ema_bear"))
     if ema_15m_ok:
         score += 2
@@ -443,13 +450,11 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
         score += 1
         reasons.append(f"EMA1h en {direction} pero 15m aun no (spread={ema_spread_1h*100:.2f}%) +1")
 
-    st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
-    if st1h_ok:
-        score += 1
-        reasons.append("ST1h en favor +1")
-    else:
-        reasons.append("ST1h en contra")
+    # ST1h ya confirmado como requisito
+    score += 1
+    reasons.append("ST1h en favor +1")
 
+    # ST4h
     st4h_ok = False
     if i4h:
         st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
@@ -457,15 +462,16 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
             score += 1
             reasons.append("ST4h en favor +1")
         else:
-            reasons.append("ST4h en contra")
-
-    macd_ok = (direction == "LONG" and i15.get("macd_bull")) or (direction == "SHORT" and i15.get("macd_bear"))
-    if macd_ok:
-        score += 1
-        reasons.append("MACD15m en favor +1")
+            score = max(0, score - 2)
+            reasons.append("ST4h en contra — penalización -2")
     else:
-        reasons.append("MACD15m en contra")
+        reasons.append("ST4h sin datos")
 
+    # MACD ya confirmado como requisito
+    score += 1
+    reasons.append("MACD15m en favor +1")
+
+    # Pullback a EMA21_15m
     ema21_15m = i15.get("ema21")
     close_15m = i15.get("close", 0)
     if ema21_15m and close_15m:
@@ -488,6 +494,7 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
         else:
             reasons.append("Sin pullback a EMA21_15m")
 
+    # RSI15m zona de rebote
     rsi_15m = i15.get("rsi_val")
     if rsi_15m is not None:
         rsi_ok = 35 <= rsi_15m <= 65
@@ -500,24 +507,27 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
         else:
             reasons.append(f"RSI15m={rsi_15m:.0f} zona neutra")
 
+    # v19: Volumen — mínimo 1.0x para puntuar, penalización si < 0.8x
     vol_ratio = i15.get("vol_ratio", 1.0)
     if vol_ratio >= _VOL_CONFIRM_MIN:
         score += 1
         reasons.append(f"Vol15m={vol_ratio:.1f}x confirma +1")
+    elif vol_ratio >= 1.0:
+        reasons.append(f"Vol15m={vol_ratio:.1f}x aceptable")
+    elif vol_ratio < 0.8:
+        score = max(0, score - 1)
+        reasons.append(f"Vol15m={vol_ratio:.1f}x muy débil — penalización -1")
     else:
         reasons.append(f"Vol15m={vol_ratio:.1f}x débil")
 
+    # Confluencia total ST 15m+1h+4h
     st15m_ok = (direction == "LONG" and i15.get("st_bull")) or (direction == "SHORT" and i15.get("st_bear"))
     confluencia = st15m_ok and st1h_ok and (not i4h or st4h_ok)
     if confluencia:
         score += 2
         reasons.append("Confluencia total ST 15m+1h+4h +2")
     else:
-        reasons.append("Sin confluencia total ST")
-
-    if not st1h_ok:
-        reasons.append("⚠️ ST1h en contra — filtro duro")
-        score = max(0, score - 3)
+        reasons.append(f"Confluencia ST parcial (15m={st15m_ok} 1h={st1h_ok} 4h={st4h_ok})")
 
     return "TENDENCIA", direction, score, MAX, reasons
 
