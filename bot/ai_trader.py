@@ -17,8 +17,6 @@ GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # TTL del caché de decisiones IA
-# Default subido a 300s (5 min) para reducir drasticamente llamadas con 14 traders.
-# Ajusta con AI_CACHE_TTL y AI_CACHE_TTL_BUY en Railway si quieres más o menos frescura.
 CACHE_TTL     = int(os.getenv("AI_CACHE_TTL",     "300"))
 CACHE_TTL_BUY = int(os.getenv("AI_CACHE_TTL_BUY", "300"))
 _ai_cache: dict = {}
@@ -316,9 +314,6 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
     price_bucket = _price_bucket(current_price)
 
     # --- Cooldown por símbolo -------------------------------------------
-    # Evita llamar a la IA para el mismo par más de 1 vez cada
-    # AI_SYMBOL_COOLDOWN segundos (default 300s = 5 min).
-    # Con 14 traders esto limita el gasto a máximo 14 calls/5min = ~2.8 RPM.
     if await budget.symbol_on_cooldown(symbol):
         logger.debug(f"[{symbol}] cooldown activo — HOLD sin IA")
         return {"action": "HOLD", "confidence": 4,
@@ -328,6 +323,29 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
     enriched     = await _get_enriched_context(symbol)
     enriched_str = format_context_for_prompt(enriched)
 
+    # ── FAST PATH: sin noticias → ejecutar señal técnica directamente ─────
+    # Si enriched.news está vacío no hay nada que la IA pueda aportar que
+    # los indicadores no reflejen ya. Nos ahorramos 100% de las llamadas
+    # a Gemini/Groq en condiciones de mercado sin catalizadores externos.
+    has_news = bool(getattr(enriched, "news", None))
+    if not has_news:
+        if context_override:
+            tech_signal = context_override.get("signal", "NEUTRAL")
+            score       = context_override.get("score", 0)
+            action      = "BUY" if tech_signal == "LONG" else ("SELL" if tech_signal == "SHORT" else "HOLD")
+            logger.info(f"[{symbol}] \U0001f7e2 Sin noticias → señal técnica directa ({action}, score={score}/10)")
+            return {"action": action, "confidence": score, "reasoning": "Sin noticias — señal técnica directa", "key_factors": ["technical"]}
+        else:
+            if not bars or len(bars) < 30:
+                return {"action": "HOLD", "confidence": 3,
+                        "reasoning": "Bars insuficientes", "key_factors": []}
+            tech = _technical_signal(bars)
+            logger.info(f"[{symbol}] \U0001f7e2 Sin noticias → señal técnica directa ({tech['signal']})")
+            return {"action": tech["signal"], "confidence": tech["confidence"],
+                    "reasoning": "Sin noticias — señal técnica directa", "key_factors": ["technical"]}
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── SLOW PATH: hay noticias → consultar IA ────────────────────────────
     if context_override:
         tech_signal     = context_override.get("signal", "NEUTRAL")
         fallback_action = "BUY" if tech_signal == "LONG" else "SELL"
@@ -343,7 +361,7 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
                 return cached_result
 
         context = {**context_override, "external": enriched_str}
-        logger.info(f"[{symbol}] IA consultada (score={score}/10) + contexto externo")
+        logger.info(f"[{symbol}] \U0001f4f0 Noticias detectadas — IA consultada (score={score}/10)")
 
     else:
         if not bars or len(bars) < 30:
@@ -369,7 +387,7 @@ async def ai_decide(symbol, bars, position, entry_price, leverage,
 
         context = build_market_context(symbol, bars, position, entry_price, leverage,
                                        enriched_str=enriched_str)
-        logger.info(f"[{symbol}] Técnico {tech['signal']} → IA + contexto externo")
+        logger.info(f"[{symbol}] \U0001f4f0 Noticias detectadas — Técnico {tech['signal']} → IA consultada")
 
     result = await _call_gemini(context)
     if not result:
