@@ -15,6 +15,16 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 10):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v21 (Prioridad 1 — OHLCV robustos):
+  - _clean_bars(): elimina barras con None en cualquier campo OHLCV antes
+    de pasarlas a los indicadores. Previene TypeError en EMA/RSI/ST cuando
+    el exchange devuelve velas incompletas (campo vol=None, etc.).
+  - Guard diferenciado 1h: si len(bars_1h) < 20 → warning log, pero no
+    return — ind_1h quedará {} y el scoring lo penalizará correctamente
+    (ST1h y EMA1h ausentes → NEUTRAL en _score_tendencia).
+  - _clean_bars() cubre también bars_4h, que es el otro timeframe propenso
+    a devolver barras parciales en pares de baja liquidez.
+
 CAMBIOS v20 (Opción A early entry + Opción B SL ATR dinámico):
   Opción A — Early entry para señales de máxima convicción:
   - FAST_ENTRY_MIN_SCORE (default=9): score >= este valor activa modo FAST.
@@ -122,6 +132,20 @@ def _to_ccxt_symbol(symbol: str) -> str:
         .upper().strip()
     )
     return f"{coin}/USDC:USDC"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v21 P1: limpieza OHLCV — elimina barras con None en cualquier campo
+# ─────────────────────────────────────────────────────────────────────────────
+def _clean_bars(bars: list) -> list:
+    """Elimina barras con None en cualquier campo OHLCV [t,o,h,l,c,v].
+
+    Motivación: algunos exchanges devuelven velas parciales al inicio del
+    historial (ej. campo vol=None en pares de baja liquidez). Pasarlas tal
+    cual a EMA/RSI/Supertrend provoca TypeError en la aritmética y un
+    NEUTRAL silencioso difícil de debuggear.
+    """
+    return [b for b in (bars or []) if b is not None and all(v is not None for v in b)]
 
 
 @dataclass
@@ -253,9 +277,6 @@ async def analyze_pair(
                 ohlcv_fn("4h"),
                 return_exceptions=False,
             )
-            bars_15m = bars_15m or []
-            bars_1h  = bars_1h  or []
-            bars_4h  = bars_4h  or []
         else:
             bars_15m, bars_1h, bars_4h = await asyncio.gather(
                 _fetch_bars(exch, symbol, "15m", _BARS_NEEDED),
@@ -267,8 +288,21 @@ async def analyze_pair(
         log.error("[signal_engine] OHLCV fetch error %s: %s", symbol, e)
         return _hold_result(symbol, f"OHLCV error: {e}")
 
+    # ─── v21 P1: limpiar barras con campos None antes de cualquier cálculo ───
+    bars_15m = _clean_bars(bars_15m)
+    bars_1h  = _clean_bars(bars_1h)
+    bars_4h  = _clean_bars(bars_4h)
+
     if len(bars_15m) < 30:
         return _hold_result(symbol, f"Insuficientes velas 15m ({len(bars_15m)})")
+
+    # v21 P1: guard diferenciado 1h — no return, pero ind_1h quedará {}
+    # y el scoring lo penalizará (ST1h/EMA1h ausentes → NEUTRAL en _score_tendencia)
+    if len(bars_1h) < 20:
+        log.warning(
+            "[signal_engine] %s 1h incompleto (%d velas) → análisis MTF degradado",
+            symbol, len(bars_1h),
+        )
 
     ind_15m = _compute_indicators(bars_15m)
     ind_1h  = _compute_indicators(bars_1h) if len(bars_1h) >= 30 else {}
