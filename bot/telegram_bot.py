@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 from telegram import Bot, Update
 from telegram.error import TelegramError, NetworkError
 from telegram.request import HTTPXRequest
@@ -14,6 +15,9 @@ _bot: Bot | None = None
 # DEBE ser mayor para que httpx no corte la conexión antes de que Telegram responda.
 _POLL_TIMEOUT    = int(os.getenv("TG_POLL_TIMEOUT",    "30"))
 _HTTP_READ_TIMEOUT = int(os.getenv("TG_HTTP_READ_TIMEOUT", "45"))  # > _POLL_TIMEOUT
+
+# Token pendiente de confirmación para /stop
+_STOP_PENDING: bool = False
 
 
 def _get_bot() -> Bot | None:
@@ -64,7 +68,8 @@ async def notify_startup(pairs: list, dry_run: bool, top_n: int):
     pairs_str = _esc(", ".join(pairs[:10])) + (" ..." if len(pairs) > 10 else "")
     await _send(
         f"\U0001f916 <b>HyperliquidBot arrancado</b> \u2014 {mode}\n"
-        f"Pares activos ({top_n}): <code>{pairs_str}</code>"
+        f"Pares activos ({top_n}): <code>{pairs_str}</code>\n"
+        f"Comandos: /stop | /pause | /resume | /ksstatus | /resetks"
     )
 
 
@@ -194,6 +199,13 @@ async def _handle_update(update: Update) -> None:
         await _cmd_resetks(msg.chat_id, parts[1:])
     elif text.startswith("/ksstatus"):
         await _cmd_ksstatus(msg.chat_id)
+    elif text.startswith("/stop"):
+        parts = text.split()
+        await _cmd_stop(msg.chat_id, parts[1:])
+    elif text.startswith("/pause"):
+        await _cmd_pause(msg.chat_id)
+    elif text.startswith("/resume"):
+        await _cmd_resume(msg.chat_id)
 
 
 async def _cmd_ksstatus(chat_id: int | str) -> None:
@@ -268,6 +280,111 @@ async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
     )
 
 
+async def _cmd_stop(chat_id: int | str, args: list[str]) -> None:
+    """
+    /stop          — Pide confirmación antes de parar el proceso.
+    /stop confirm  — Envía SIGTERM al proceso (graceful shutdown).
+
+    El SIGTERM desencadena el finally de main() que cancela todos los tasks,
+    para el WS feed y hace cleanup del webhook antes de salir.
+    Railway detecta la caída del proceso y NO lo reinicia automáticamente
+    si el código de salida es 0 (Railway restart policy = on_failure por defecto).
+    """
+    global _STOP_PENDING
+    bot = _get_bot()
+    if not bot:
+        return
+
+    async def reply(text: str):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        except TelegramError as e:
+            logger.warning("[Telegram cmd_stop] %s", e)
+
+    if not args or args[0].lower() != "confirm":
+        _STOP_PENDING = True
+        await reply(
+            "\U0001f6d1 <b>\u00bfSeguro que quieres parar el bot?</b>\n\n"
+            "Esto enviar\u00e1 SIGTERM al proceso \u2014 shutdown limpio.\n"
+            "Las posiciones abiertas <b>quedan vivas</b> en Hyperliquid "
+            "(SL/TP siguen activos en el exchange).\n\n"
+            "Confirma con: <code>/stop confirm</code>\n"
+            "Para cancelar, ignora este mensaje."
+        )
+        return
+
+    if not _STOP_PENDING:
+        await reply(
+            "\u26a0\ufe0f Usa primero <code>/stop</code> para iniciar la confirmaci\u00f3n."
+        )
+        return
+
+    _STOP_PENDING = False
+    logger.warning("[Telegram] /stop confirm recibido \u2014 enviando SIGTERM al proceso.")
+    await reply(
+        "\U0001f6d1 <b>Parando bot...</b>\n"
+        "Shutdown limpio iniciado. Las posiciones abiertas quedan con SL/TP activos."
+    )
+    # Peque\u00f1a pausa para que el mensaje se env\u00ede antes de que el proceso muera
+    await asyncio.sleep(1)
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+async def _cmd_pause(chat_id: int | str) -> None:
+    """
+    /pause — Activa KS nivel 4 (hard kill): el bot deja de abrir y gestionar
+    \u00f3rdenes pero el proceso sigue corriendo. \u00datil para pausar sin reiniciar.
+    Para reanudar: /resume
+    """
+    from bot.kill_switch import kill_switch
+    bot = _get_bot()
+    if not bot:
+        return
+
+    async def reply(text: str):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        except TelegramError as e:
+            logger.warning("[Telegram cmd_pause] %s", e)
+
+    await kill_switch.trigger(level=4, reason="/pause manual v\u00eda Telegram")
+    await reply(
+        "\u23f8\ufe0f <b>Bot PAUSADO</b>\n"
+        "Kill Switch L4 (Hard Kill) activado.\n"
+        "No se abrir\u00e1n nuevas \u00f3rdenes ni se gestionar\u00e1n posiciones.\n"
+        "Las posiciones existentes en el exchange siguen con SL/TP activos.\n\n"
+        "Para reanudar: <code>/resume</code>"
+    )
+
+
+async def _cmd_resume(chat_id: int | str) -> None:
+    """
+    /resume — Re-arma el Kill Switch (alias de /resetks).
+    El bot vuelve a operar normalmente.
+    """
+    from bot.kill_switch import kill_switch
+    bot = _get_bot()
+    if not bot:
+        return
+
+    async def reply(text: str):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        except TelegramError as e:
+            logger.warning("[Telegram cmd_resume] %s", e)
+
+    await kill_switch.manual_reset()
+    await reply(
+        "\u25b6\ufe0f <b>Bot REANUDADO</b>\n"
+        "Kill Switch re-armado \u2014 L0 OK.\n"
+        "El bot puede volver a abrir posiciones."
+    )
+    await _send(
+        "\U0001f513 <b>Bot reanudado manualmente</b> v\u00eda /resume.\n"
+        "Bot vuelve a estar operativo."
+    )
+
+
 async def _polling_loop() -> None:
     bot = _get_bot()
     if not bot:
@@ -275,7 +392,7 @@ async def _polling_loop() -> None:
         return
     offset: int | None = None
     logger.info(
-        "[Telegram polling] Iniciado \u2014 escuchando /resetks y /ksstatus "
+        "[Telegram polling] Iniciado \u2014 escuchando /stop /pause /resume /resetks /ksstatus "
         "(poll_timeout=%ds read_timeout=%ds)",
         _POLL_TIMEOUT, _HTTP_READ_TIMEOUT,
     )
@@ -298,8 +415,8 @@ async def _polling_loop() -> None:
         except NetworkError as e:
             # NetworkError incluye ReadError, WriteError, etc. Son transitorios
             # en long-polling (Telegram corta conexiones largas). No es un error
-            # real — logueamos a DEBUG para no contaminar los logs de trading.
-            logger.debug("[Telegram polling] red transitoria: %s — reintentando en 10 s", e)
+            # real \u2014 logueamos a DEBUG para no contaminar los logs de trading.
+            logger.debug("[Telegram polling] red transitoria: %s \u2014 reintentando en 10 s", e)
             await asyncio.sleep(10)
         except TelegramError as e:
             logger.warning("[Telegram polling] %s \u2014 reintentando en 10 s", e)
