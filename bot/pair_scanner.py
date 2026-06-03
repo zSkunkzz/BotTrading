@@ -17,12 +17,18 @@ FIX ROTÓ (2026-06-03): Rotación más agresiva para buscar más trades.
   - SCANNER_MIN_CHANGE (default 0.3%, antes 0.5%)
   - Score reformulado: vol 40% + cambio% 30% + funding_abs 20% + OI 10%
   - SCANNER_EXCLUDE_LOW_LEV: omite pares con maxLev < umbral (default 3)
+
+Prioridad 5 (v21): Funding Rate Trend
+  - _funding_history almacena los últimos N valores de funding por símbolo
+  - _funding_trend() devuelve RISING / FALLING / NEUTRAL
+  - El campo "funding_trend" se añade a cada par en el resultado de scan()
 """
 import logging
 import asyncio
 import os
 import aiohttp
 import json as _json
+from collections import defaultdict
 
 logger = logging.getLogger("PairScanner")
 
@@ -47,6 +53,28 @@ _REFRESH_MIN    = int(float(os.getenv("SCANNER_REFRESH_MIN",     "15")))
 _MIN_VOLUME     = float(os.getenv("SCANNER_MIN_VOLUME",          "500000"))
 _MIN_CHANGE_PCT = float(os.getenv("SCANNER_MIN_CHANGE",          "0.3"))
 _MIN_LEV        = int(float(os.getenv("SCANNER_EXCLUDE_LOW_LEV", "3")))
+
+# ── Prioridad 5: Funding trend ────────────────────────────────────────────────
+_FUNDING_TREND_N: int = int(os.getenv("FUNDING_TREND_WINDOW", "3"))
+_funding_history: dict[str, list[float]] = defaultdict(list)
+
+
+def _funding_trend(symbol: str, current: float) -> str:
+    """Actualiza el historial de funding del símbolo y devuelve la tendencia.
+
+    Returns:
+        "RISING"  — el funding ha subido entre el scan más antiguo y el actual
+        "FALLING" — el funding ha bajado
+        "NEUTRAL" — sin suficientes datos o sin cambio
+    """
+    hist = _funding_history[symbol]
+    hist.append(current)
+    if len(hist) > _FUNDING_TREND_N:
+        hist.pop(0)
+    if len(hist) < 2:
+        return "NEUTRAL"
+    return "RISING" if hist[-1] > hist[0] else "FALLING"
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 async def _info_post(payload: dict) -> dict:
@@ -86,9 +114,10 @@ class PairScanner:
 
         logger.info(
             "[PairScanner] Config: top_n=%d | refresh=%dmin | "
-            "min_vol=$%s | min_change=%.1f%% | min_lev=%dx",
+            "min_vol=$%s | min_change=%.1f%% | min_lev=%dx | funding_trend_n=%d",
             self.top_n, self.refresh_interval // 60,
-            f"{self.min_volume_usdt:,.0f}", self.min_price_change_pct, _MIN_LEV,
+            f"{self.min_volume_usdt:,.0f}", self.min_price_change_pct,
+            _MIN_LEV, _FUNDING_TREND_N,
         )
 
     def _is_valid(self, coin: str) -> bool:
@@ -109,6 +138,10 @@ class PairScanner:
             exclude_quotes={"USDE", "USDH", "USDT"},
             exclude_collateral=set(),
         )
+        # Añadir funding_trend a los resultados del snapshot
+        for p in scored:
+            raw_funding = p.get("funding", 0.0) / 100.0  # snapshot ya viene en %
+            p["funding_trend"] = _funding_trend(p["symbol"], raw_funding)
         self._last_scored = scored
         self.active_pairs = [s["symbol"] for s in scored]
         logger.info(
@@ -117,8 +150,9 @@ class PairScanner:
         )
         for p in scored[:10]:
             logger.info(
-                "  %-12s Vol: $%sM | Cambio: %.2f%% | Funding: %.4f%% | MaxLev: %dx | Score: %s",
+                "  %-12s Vol: $%sM | Cambio: %.2f%% | Funding: %.4f%% (%s) | MaxLev: %dx | Score: %s",
                 p["symbol"], p["volume_usdt"], p["change_pct"], p["funding"],
+                p.get("funding_trend", "?"),
                 p.get("max_leverage", 0), p["score"],
             )
         return self.active_pairs
@@ -188,16 +222,20 @@ class PairScanner:
                 oi_usd       * 0.1
             )
 
+            # Calcular tendencia de funding (actualiza historial en memoria)
+            trend = _funding_trend(coin, funding)
+
             scored.append({
-                "symbol":       coin,
-                "volume_usdt":  round(vol_m, 2),
-                "change_pct":   round(change_pct, 2) if change_pct is not None else None,
-                "last_price":   mark_px,
-                "funding":      round(funding * 100, 5),
-                "oi_usdt":      round(oi_usd, 2),
-                "score":        round(score, 3),
-                "max_leverage": max_lev,
-                "ai_delta":     0.0,
+                "symbol":        coin,
+                "volume_usdt":   round(vol_m, 2),
+                "change_pct":    round(change_pct, 2) if change_pct is not None else None,
+                "last_price":    mark_px,
+                "funding":       round(funding * 100, 5),
+                "funding_trend": trend,
+                "oi_usdt":       round(oi_usd, 2),
+                "score":         round(score, 3),
+                "max_leverage":  max_lev,
+                "ai_delta":      0.0,
             })
 
         logger.debug(
@@ -237,10 +275,11 @@ class PairScanner:
         for p in top[:10]:
             change_str = f"{p['change_pct']}%" if p["change_pct"] is not None else "N/A"
             ai_str     = f" | IA: {p['ai_delta']:+.1f}" if p.get("ai_delta") else ""
+            trend_str  = p.get("funding_trend", "?")
             logger.info(
-                "  %-12s Vol:$%sM Cambio:%s OI:$%sM Fund:%.3f%% Lev:%dx Score:%.2f%s",
+                "  %-12s Vol:$%sM Cambio:%s OI:$%sM Fund:%.3f%%(%s) Lev:%dx Score:%.2f%s",
                 p["symbol"], p["volume_usdt"], change_str,
-                p["oi_usdt"], p["funding"],
+                p["oi_usdt"], p["funding"], trend_str,
                 p.get("max_leverage", 0), p["score"], ai_str,
             )
 
