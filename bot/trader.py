@@ -620,6 +620,22 @@ class FuturesTrader:
             logger.debug("[%s] Fill real: %.4f (estimado: %.4f) — qty ajustada a %.6f",
                          self.symbol, fill_price, entry, qty)
 
+        # ── Fix: normalizar sl/tp1 con los mismos ajustes que usa hl_client ──
+        # Garantiza que self.sl / self.tp1 (y por tanto save_position, logs y
+        # notify_open) tengan exactamente el mismo precio que llegó al exchange.
+        # tp2 y tp3 no se ajustan porque no tienen trigger order en HL.
+        is_long_signal = (action == "BUY")
+        try:
+            if sl:
+                sl = self._hl_client.round_px(sl)
+                sl = self._hl_client._adjust_sl_px(sl, fill_price, is_long_signal)
+            if tp1:
+                tp1 = self._hl_client.round_px(tp1)
+                tp1 = self._hl_client._adjust_tp_px(tp1, fill_price, is_long_signal)
+        except Exception as _e:
+            logger.debug("[%s] Normalización sl/tp1 falló (no crítico): %s", self.symbol, _e)
+        # ─────────────────────────────────────────────────────────────────────
+
         # Solo actualizar estado local DESPUÉS de confirmar que la orden se ejecutó
         self.position       = "long" if action == "BUY" else "short"
         self.entry_price    = fill_price
