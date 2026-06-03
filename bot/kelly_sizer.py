@@ -27,11 +27,29 @@ import os
 
 log = logging.getLogger(__name__)
 
-KELLY_ENABLED    = os.getenv("KELLY_ENABLED",  "true").lower() != "false"   # default ON
+
+def _parse_int_env(name: str, default: int) -> int:
+    """Lee una env var como int de forma defensiva.
+
+    Si el valor no es un entero válido (p.ej. alguien puso 'false' por error),
+    devuelve el default y emite un warning en lugar de explotar con ValueError.
+    """
+    raw = os.getenv(name, str(default))
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        log.warning(
+            "[kelly] %s='%s' no es un entero válido — usando default=%d",
+            name, raw, default,
+        )
+        return default
+
+
+KELLY_ENABLED    = os.getenv("KELLY_ENABLED",  "true").lower() not in ("false", "0", "no")
 KELLY_FRACTION   = float(os.getenv("KELLY_FRACTION",   "0.25"))
 KELLY_MIN_MULT   = float(os.getenv("KELLY_MIN_MULT",   "0.5"))
 KELLY_MAX_MULT   = float(os.getenv("KELLY_MAX_MULT",   "2.0"))
-KELLY_MIN_TRADES = int(os.getenv("KELLY_MIN_TRADES",   "30"))
+KELLY_MIN_TRADES = _parse_int_env("KELLY_MIN_TRADES", 30)
 
 
 def kelly_multiplier(entry_mode: str, rr: float) -> float:
