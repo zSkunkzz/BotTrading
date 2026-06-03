@@ -15,65 +15,15 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 10):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
-  MODO TENDENCIA (EMA spread >= 0.2% en 1h)  ← evaluado PRIMERO
-    +2  EMA21 > EMA50 en 15m Y 1h (tendencia clara en ambos TF)
-    +1  SuperTrend 1h en favor
-    +1  SuperTrend 4h en favor
-    +1  MACD 15m histograma en favor
-    +1  Pullback: precio tocó EMA21 en las últimas 3 velas (sin requerir rebote confirmado)
-    +1  RSI 15m en zona de rebote (35-65)
-    +1  Vol 15m >= 1.2x en vela actual
-    +1  Confluencia total: ST 15m + 1h + 4h todos en misma dirección
-    Bonus max: 9 pts
-
-  MODO BREAKOUT (precio rompe rango 20 velas en 15m)  ← evaluado SEGUNDO
-    +2  Rotura de máximo (LONG) o mínimo (SHORT) de las últimas 20 velas en 15m
-    +2  Vol 15m >= 1.4x en vela de ruptura (era 1.8x — demasiado restrictivo)
-    +1  ST 1h en favor
-    +1  ST 4h en favor
-    +1  RSI 15m entre 45-70 (LONG) o 30-55 (SHORT)
-    +1  MACD 1h en favor
-    Bonus max: 8 pts
-
-  MODO REVERSAL (RSI 1h extremo: <= 28 o >= 72)  ← evaluado ÚLTIMO (más peligroso)
-    +2  RSI 1h <= 28 (LONG) o >= 72 (SHORT)
-    +2  MACD 15m histograma gira en favor
-    +1  Vol 15m >= 1.5x (capitulación o climax)
-    +1  ST 4h en contra del precio actual (agotamiento tendencia dominante)
-    +1  RSI 4h en zona neutra (40-60)
-    +1  Precio toca EMA21 del 1h o la cruza (punto de inflexion)
-    Bonus max: 8 pts
-
-  FILTROS DUROS (bloquean independientemente del score):
-    - EMA spread 1h < 0.15%: mercado en rango, no entrar (solo en modo tendencia)
-    - RSI 15m > 72 para LONG o < 28 para SHORT: sobreextendido, no entrar
-    - ST1h en contra en modo tendencia: -3 pts (penalización severa)
-    - Vol 15m < 0.6x: mercado dormido, no entrar
-
-  MIN_SCORE  = 5 / 10  (50% de confluencia — era 6)
-  MIN_RR     = 1.5     (calculado DESPUÉS del buffer de vela — RR real)
-
-CAMBIOS v13 (más trades):
-  1. MIN_SCORE 6 → 5: más señales válidas sin sacrificar RR
-  2. Pullback sin requiring rebote confirmado (returning): el toque a EMA21 ya es
-     suficiente confluencia; el requisito de price_dir=='rising' eliminaba setups
-     válidos cuando el bot cicla un tick tarde
-  3. EMA_SPREAD_TREND_MIN 0.003 → 0.002 (0.30% → 0.20%): activos con spread
-     menor seguían en tendencia válida
-  4. BREAKOUT_VOL_MIN 1.8 → 1.4: breakouts reales en HL rara vez tienen 1.8x;
-     1.4x es el umbral más realista para confirmar impulso
-  5. Señales EARLY permitidas con leverage reducido (0.3x MAX_LEV) en lugar de
-     ser rechazadas; añaden trades conservadores en setups parciales
-
-NOTA RR (FIX v12):
-  El SL real se calcula como min(low - buffer, entry - SL_mult*ATR).
-  El RR ahora se calcula con el SL YA incluido el buffer, por lo que
-  MIN_RR=1.5 representa el RR real que el mercado debe recorrer.
-
-  SL/TP (multiplicadores ATR):
-  Modo tendencia : SL=1.5×ATR | TP1=2.0×ATR → RR real ~1.2-1.4
-  Modo breakout  : SL=1.5×ATR | TP1=2.0×ATR → RR real ~1.2-1.4
-  Modo reversal  : SL=1.2×ATR | TP1=1.8×ATR → RR real ~1.3-1.5
+CAMBIOS v14 (mejora integral estrategia):
+  1. RR alcanzable: TP1 tendencia/breakout sube a 2.3x ATR; reversal a 2.0x ATR
+  2. Breakout anti-fakeout: exige rotura mínima de 0.3x ATR fuera del rango
+  3. Reversal con confirmación real: exige vela de giro (body en favor)
+  4. EARLY leverage más conservador: 0.3x → 0.2x del máximo
+  5. Volumen más reactivo: media 60 → 20 velas en 15m
+  6. Pullback más fresco: lookback 3 → 2 velas
+  7. Confluencia total de tendencia ahora vale +2
+  8. Cooldown específico tras SL/MANUAL_CLOSE se gestiona en DecisionEngine
 """
 from __future__ import annotations
 
@@ -88,41 +38,33 @@ from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr
 
 log = logging.getLogger(__name__)
 
-# ─── Constantes ──────────────────────────────────────────────────────────────────────────────
-# v13: MIN_SCORE bajado de 6 a 5 para generar más trades con confluencia parcial
 MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "5"))
-MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5"))   # RR real post-buffer
+MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
 
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
 _SL_ATR_MULT       = float(os.getenv("SL_ATR_MULT",  "1.5"))
-_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "2.0"))
+_TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "2.3"))
 _TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 
-# v13: ventana vol_ratio 60 velas (~15h en 15m)
-_VOL_AVG_WINDOW    = int(os.getenv("VOL_AVG_WINDOW", "60"))
+_VOL_AVG_WINDOW    = int(os.getenv("VOL_AVG_WINDOW", "20"))
 
-# Umbrales de setup
-# v13: EMA_SPREAD_TREND_MIN bajado de 0.003 (0.30%) a 0.002 (0.20%)
-_EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.002"))  # 0.20%
-_EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.0015")) # 0.15% → rango
+_EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.002"))
+_EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.0015"))
 _BREAKOUT_WINDOW       = int(os.getenv("BREAKOUT_WINDOW", "20"))
-# v13: BREAKOUT_VOL_MIN bajado de 1.8 a 1.4 (breakouts reales en HL ~1.3-1.5x)
 _BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.4"))
+_BREAKOUT_ATR_CONFIRM  = float(os.getenv("BREAKOUT_ATR_CONFIRM", "0.3"))
 _REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "28"))
 _REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "72"))
 _VOL_MIN_GLOBAL        = float(os.getenv("VOL_MIN_GLOBAL",    "0.6"))
 _VOL_CONFIRM_MIN       = float(os.getenv("VOL_CONFIRM_MIN",   "1.2"))
-_PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "3"))
-_PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.005"))  # 0.5%
-
-# v13: leverage para señales EARLY (0.3x del máximo configurado)
-_EARLY_LEV_FACTOR      = float(os.getenv("EARLY_LEV_FACTOR", "0.3"))
+_PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "2"))
+_PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.005"))
+_EARLY_LEV_FACTOR      = float(os.getenv("EARLY_LEV_FACTOR", "0.2"))
 
 
-# ─── _to_ccxt_symbol ──────────────────────────────────────────────────────────────────────────────
 def _to_ccxt_symbol(symbol: str) -> str:
     if "/USDC:USDC" in symbol:
         return symbol
@@ -135,8 +77,6 @@ def _to_ccxt_symbol(symbol: str) -> str:
     )
     return f"{coin}/USDC:USDC"
 
-
-# ─── SignalResult ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class SignalResult:
@@ -158,8 +98,6 @@ class SignalResult:
     signal_block:  str  = ""
     extra:         Dict = field(default_factory=dict)
 
-
-# ─── analyze_pair ──────────────────────────────────────────────────────────────────────────────
 
 async def analyze_pair(
     exch,
@@ -225,13 +163,13 @@ async def analyze_pair(
 
     if setup_type == "REVERSAL":
         sl_mult  = float(os.getenv("SL_ATR_MULT_REVERSAL",  "1.2"))
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.8"))
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "2.0"))
         tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "3.5"))
     elif setup_type == "BREAKOUT":
         sl_mult  = _SL_ATR_MULT
-        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "2.0"))
+        tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "2.3"))
         tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "3.5"))
-    else:  # TENDENCIA
+    else:
         sl_mult  = _SL_ATR_MULT
         tp1_mult = _TP1_ATR_MULT
         tp2_mult = _TP2_ATR_MULT
@@ -256,20 +194,17 @@ async def analyze_pair(
     else:
         entry_mode = "EARLY"
 
-    # v13: señales EARLY permitidas con leverage reducido en lugar de rechazadas
     if entry_mode == "STRONG" and rr >= 2.0:
         suggested_lev = _MAX_LEV
     elif entry_mode == "NORMAL":
         suggested_lev = max(1, int(_MAX_LEV * 0.6))
     else:
-        # EARLY: leverage muy conservador (0.3x del máximo)
         suggested_lev = max(1, int(_MAX_LEV * _EARLY_LEV_FACTOR))
 
     is_valid = score >= MIN_SCORE and rr >= MIN_RR
 
     log.info(
-        "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f entry=%.6f sl=%.6f tp1=%.6f "
-        "atr=%.6f lev=%dx mode=%s valid=%s | %s",
+        "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f entry=%.6f sl=%.6f tp1=%.6f atr=%.6f lev=%dx mode=%s valid=%s | %s",
         symbol, signal_str, setup_type, score, max_score, rr,
         entry, sl, tp1, atr_val, suggested_lev, entry_mode, is_valid,
         " · ".join(reasons),
@@ -295,25 +230,16 @@ async def analyze_pair(
     )
 
 
-# ─── _detect_setup ───────────────────────────────────────────────────────────────────────────────
-
-def _detect_setup(
-    i15: dict, i1h: dict, i4h: dict, bars_15m: list
-) -> Tuple[Optional[str], str, int, int, List[str]]:
+def _detect_setup(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[Optional[str], str, int, int, List[str]]:
     for mode_fn in (_score_tendencia, _score_breakout, _score_reversal):
         setup_type, signal_str, score, max_score, reasons = mode_fn(i15, i1h, i4h, bars_15m)
         if signal_str != "NEUTRAL" and score >= MIN_SCORE:
             return setup_type, signal_str, score, max_score, reasons
-
     return None, "NEUTRAL", 0, 10, ["Ningún setup alcanzó MIN_SCORE"]
 
 
-# ─── MODO TENDENCIA ────────────────────────────────────────────────────────────────────────────
-
-def _score_tendencia(
-    i15: dict, i1h: dict, i4h: dict, bars_15m: list
-) -> Tuple[str, str, int, int, List[str]]:
-    MAX = 9
+def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
+    MAX = 10
     reasons: List[str] = []
 
     if not i1h:
@@ -326,21 +252,17 @@ def _score_tendencia(
 
     ema_spread_1h = abs(ema21_1h - ema50_1h) / ema50_1h
     if ema_spread_1h < _EMA_SPREAD_RANGE_MAX:
-        return "TENDENCIA", "NEUTRAL", 0, MAX, [
-            f"Mercado en rango (spread EMA 1h={ema_spread_1h*100:.2f}%)"
-        ]
+        return "TENDENCIA", "NEUTRAL", 0, MAX, [f"Mercado en rango (spread EMA 1h={ema_spread_1h*100:.2f}%)"]
 
     trend_1h_up   = i1h.get("ema_bull", False)
     trend_1h_down = i1h.get("ema_bear", False)
-
     if not trend_1h_up and not trend_1h_down:
         return "TENDENCIA", "NEUTRAL", 0, MAX, ["Sin tendencia definida en 1h"]
 
     direction = "LONG" if trend_1h_up else "SHORT"
     score = 0
 
-    ema_15m_ok = (direction == "LONG" and i15.get("ema_bull")) or \
-                 (direction == "SHORT" and i15.get("ema_bear"))
+    ema_15m_ok = (direction == "LONG" and i15.get("ema_bull")) or (direction == "SHORT" and i15.get("ema_bear"))
     if ema_15m_ok:
         score += 2
         reasons.append(f"EMA15m+1h alineados {direction} (spread={ema_spread_1h*100:.2f}%) +2")
@@ -348,34 +270,29 @@ def _score_tendencia(
         score += 1
         reasons.append(f"EMA1h en {direction} pero 15m aun no (spread={ema_spread_1h*100:.2f}%) +1")
 
-    st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or \
-              (direction == "SHORT" and i1h.get("st_bear"))
+    st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
     if st1h_ok:
         score += 1
         reasons.append("ST1h en favor +1")
     else:
         reasons.append("ST1h en contra")
 
+    st4h_ok = False
     if i4h:
-        st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or \
-                  (direction == "SHORT" and i4h.get("st_bear"))
+        st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
         if st4h_ok:
             score += 1
             reasons.append("ST4h en favor +1")
         else:
             reasons.append("ST4h en contra")
 
-    macd_ok = (direction == "LONG" and i15.get("macd_bull")) or \
-              (direction == "SHORT" and i15.get("macd_bear"))
+    macd_ok = (direction == "LONG" and i15.get("macd_bull")) or (direction == "SHORT" and i15.get("macd_bear"))
     if macd_ok:
         score += 1
         reasons.append("MACD15m en favor +1")
     else:
         reasons.append("MACD15m en contra")
 
-    # v13: pullback — solo requiere toque a EMA21, NO rebote confirmado
-    # El requisito anterior (price_dir == "rising") eliminaba setups válidos
-    # cuando el bot cicla un tick después del rebote real
     ema21_15m = i15.get("ema21")
     close_15m = i15.get("close", 0)
     if ema21_15m and close_15m:
@@ -400,13 +317,11 @@ def _score_tendencia(
 
     rsi_15m = i15.get("rsi_val")
     if rsi_15m is not None:
-        rsi_ok_long  = direction == "LONG"  and 35 <= rsi_15m <= 65
-        rsi_ok_short = direction == "SHORT" and 35 <= rsi_15m <= 65
-        if rsi_ok_long or rsi_ok_short:
+        rsi_ok = 35 <= rsi_15m <= 65
+        if rsi_ok:
             score += 1
             reasons.append(f"RSI15m={rsi_15m:.0f} zona rebote +1")
-        elif (direction == "LONG" and rsi_15m > 72) or \
-             (direction == "SHORT" and rsi_15m < 28):
+        elif (direction == "LONG" and rsi_15m > 72) or (direction == "SHORT" and rsi_15m < 28):
             reasons.append(f"RSI15m={rsi_15m:.0f} SOBREEXTENDIDO — filtro duro")
             score = 0
         else:
@@ -419,12 +334,11 @@ def _score_tendencia(
     else:
         reasons.append(f"Vol15m={vol_ratio:.1f}x débil")
 
-    st15m_ok = (direction == "LONG" and i15.get("st_bull")) or \
-               (direction == "SHORT" and i15.get("st_bear"))
+    st15m_ok = (direction == "LONG" and i15.get("st_bull")) or (direction == "SHORT" and i15.get("st_bear"))
     confluencia = st15m_ok and st1h_ok and (not i4h or st4h_ok)
     if confluencia:
-        score += 1
-        reasons.append("Confluencia total ST 15m+1h+4h +1")
+        score += 2
+        reasons.append("Confluencia total ST 15m+1h+4h +2")
     else:
         reasons.append("Sin confluencia total ST")
 
@@ -435,11 +349,7 @@ def _score_tendencia(
     return "TENDENCIA", direction, score, MAX, reasons
 
 
-# ─── MODO BREAKOUT ────────────────────────────────────────────────────────────────────────────
-
-def _score_breakout(
-    i15: dict, i1h: dict, i4h: dict, bars_15m: list
-) -> Tuple[str, str, int, int, List[str]]:
+def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     MAX = 8
     reasons: List[str] = []
 
@@ -449,28 +359,24 @@ def _score_breakout(
     window = bars_15m[-(_BREAKOUT_WINDOW + 1):-1]
     range_high = max(b[2] for b in window)
     range_low  = min(b[3] for b in window)
-
     current_close = float(bars_15m[-1][4])
-    vol_ratio     = i15.get("vol_ratio", 1.0)
+    vol_ratio = i15.get("vol_ratio", 1.0)
+    atr_val = float(i15.get("atr", 0) or 0)
+    breakout_pad = atr_val * _BREAKOUT_ATR_CONFIRM
 
-    broke_up   = current_close > range_high
-    broke_down = current_close < range_low
+    broke_up = current_close > (range_high + breakout_pad)
+    broke_down = current_close < (range_low - breakout_pad)
 
     if not broke_up and not broke_down:
         return "BREAKOUT", "NEUTRAL", 0, MAX, [
-            f"Sin rotura: close={current_close:.4f} rango=[{range_low:.4f}-{range_high:.4f}]"
+            f"Sin rotura válida/fakeout: close={current_close:.4f} rango=[{range_low:.4f}-{range_high:.4f}] pad={breakout_pad:.4f}"
         ]
 
     direction = "LONG" if broke_up else "SHORT"
     score = 0
-
     score += 2
-    reasons.append(
-        f"Ruptura {'alcista' if broke_up else 'bajista'}: close={current_close:.4f} "
-        f"{'>' if broke_up else '<'} {'rango ' + str(round(range_high, 4)) if broke_up else 'rango ' + str(round(range_low, 4))} +2"
-    )
+    reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} confirmada fuera del rango +2")
 
-    # v13: umbral bajado de 1.8x a 1.4x — breakouts reales en HL suelen tener 1.3-1.5x
     if vol_ratio >= _BREAKOUT_VOL_MIN:
         score += 2
         reasons.append(f"Vol={vol_ratio:.1f}x breakout confirmado +2")
@@ -481,8 +387,7 @@ def _score_breakout(
         reasons.append(f"Vol={vol_ratio:.1f}x BAJO — posible fakeout")
 
     if i1h:
-        st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or \
-                  (direction == "SHORT" and i1h.get("st_bear"))
+        st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
         if st1h_ok:
             score += 1
             reasons.append("ST1h confirma dirección +1")
@@ -490,8 +395,7 @@ def _score_breakout(
             reasons.append("ST1h no confirma")
 
     if i4h:
-        st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or \
-                  (direction == "SHORT" and i4h.get("st_bear"))
+        st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
         if st4h_ok:
             score += 1
             reasons.append("ST4h confirma dirección +1")
@@ -500,8 +404,7 @@ def _score_breakout(
 
     rsi_15m = i15.get("rsi_val")
     if rsi_15m is not None:
-        rsi_ok = (direction == "LONG" and 45 <= rsi_15m <= 70) or \
-                 (direction == "SHORT" and 30 <= rsi_15m <= 55)
+        rsi_ok = (direction == "LONG" and 45 <= rsi_15m <= 70) or (direction == "SHORT" and 30 <= rsi_15m <= 55)
         if rsi_ok:
             score += 1
             reasons.append(f"RSI15m={rsi_15m:.0f} zona razonable +1")
@@ -509,8 +412,7 @@ def _score_breakout(
             reasons.append(f"RSI15m={rsi_15m:.0f} sobreextendido")
 
     if i1h:
-        macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or \
-                  (direction == "SHORT" and i1h.get("macd_bear"))
+        macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or (direction == "SHORT" and i1h.get("macd_bear"))
         if macd_ok:
             score += 1
             reasons.append("MACD1h en favor +1")
@@ -520,27 +422,21 @@ def _score_breakout(
     return "BREAKOUT", direction, score, MAX, reasons
 
 
-# ─── MODO REVERSAL ────────────────────────────────────────────────────────────────────────────
-
-def _score_reversal(
-    i15: dict, i1h: dict, i4h: dict, bars_15m: list
-) -> Tuple[str, str, int, int, List[str]]:
-    MAX = 8
+def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
+    MAX = 9
     reasons: List[str] = []
 
     rsi_1h = i1h.get("rsi_val") if i1h else None
     if rsi_1h is None:
         return "REVERSAL", "NEUTRAL", 0, MAX, ["Sin datos 1h"]
 
-    is_long  = rsi_1h <= _REVERSAL_RSI_LOW
+    is_long = rsi_1h <= _REVERSAL_RSI_LOW
     is_short = rsi_1h >= _REVERSAL_RSI_HIGH
-
     if not is_long and not is_short:
         return "REVERSAL", "NEUTRAL", 0, MAX, [f"RSI1h={rsi_1h:.0f} no es extremo"]
 
     direction = "LONG" if is_long else "SHORT"
     score = 0
-
     score += 2
     reasons.append(f"RSI1h={rsi_1h:.0f} extremo {'sobreventa' if is_long else 'sobrecompra'} +2")
 
@@ -556,6 +452,16 @@ def _score_reversal(
             reasons.append(f"MACD15m hist={hist_15m:.4f} aun no confirma")
     else:
         reasons.append("MACD15m no disponible")
+
+    last_open = float(bars_15m[-1][1])
+    last_close = float(bars_15m[-1][4])
+    bullish_reversal_candle = last_close > last_open
+    bearish_reversal_candle = last_close < last_open
+    if (is_long and bullish_reversal_candle) or (is_short and bearish_reversal_candle):
+        score += 1
+        reasons.append("Vela de giro confirmada +1")
+    else:
+        reasons.append("Sin vela de giro confirmada")
 
     vol_ratio = i15.get("vol_ratio", 1.0)
     if vol_ratio >= 1.5:
@@ -580,7 +486,7 @@ def _score_reversal(
         reasons.append("RSI4h no neutro")
 
     close_15m = i15.get("close", 0)
-    ema21_1h  = i1h.get("ema21") if i1h else None
+    ema21_1h = i1h.get("ema21") if i1h else None
     if ema21_1h and close_15m:
         dist_pct = abs(close_15m - ema21_1h) / ema21_1h
         if dist_pct <= 0.005:
@@ -591,8 +497,6 @@ def _score_reversal(
 
     return "REVERSAL", direction, score, MAX, reasons
 
-
-# ─── _compute_indicators ───────────────────────────────────────────────────────────────────────────
 
 def _compute_indicators(bars: list) -> dict:
     if not bars or len(bars) < 10:
@@ -611,30 +515,29 @@ def _compute_indicators(bars: list) -> dict:
     atr14  = calc_atr(highs, lows, closes, 14)
 
     vol_window = min(_VOL_AVG_WINDOW, len(vols))
-    avg_vol   = sum(vols[-vol_window:]) / vol_window if vol_window > 0 else 1.0
+    avg_vol = sum(vols[-vol_window:]) / vol_window if vol_window > 0 else 1.0
     vol_ratio = round(vols[-1] / avg_vol, 3) if avg_vol > 0 else 1.0
     price_dir = "rising" if len(closes) >= 2 and closes[-1] > closes[-2] else "falling"
 
     return {
-        "ema21":     ema21[-1] if ema21 else None,
-        "ema50":     ema50[-1] if ema50 else None,
-        "ema_bull":  bool(ema21 and ema50 and ema21[-1] > ema50[-1]),
-        "ema_bear":  bool(ema21 and ema50 and ema21[-1] < ema50[-1]),
-        "rsi_val":   rsi14,
+        "ema21": ema21[-1] if ema21 else None,
+        "ema50": ema50[-1] if ema50 else None,
+        "ema_bull": bool(ema21 and ema50 and ema21[-1] > ema50[-1]),
+        "ema_bear": bool(ema21 and ema50 and ema21[-1] < ema50[-1]),
+        "rsi_val": rsi14,
         "macd_hist": hist,
         "macd_bull": hist > 0,
         "macd_bear": hist < 0,
-        "st_dir":    st_dir,
-        "st_bull":   st_dir == 1,
-        "st_bear":   st_dir == -1,
-        "atr":       atr14,
+        "st_dir": st_dir,
+        "st_bull": st_dir == 1,
+        "st_bear": st_dir == -1,
+        "atr": atr14,
         "vol_ratio": vol_ratio,
         "price_dir": price_dir,
-        "close":     closes[-1],
+        "close": closes[-1],
     }
 
 
-# ─── _fetch_bars ────────────────────────────────────────────────────────────────────────────────
 async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
     ccxt_sym = _to_ccxt_symbol(symbol)
     try:
@@ -645,7 +548,6 @@ async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
         return []
 
 
-# ─── _hold_result ────────────────────────────────────────────────────────────────────────────────
 def _hold_result(symbol: str, reason: str) -> SignalResult:
     return SignalResult(
         symbol=symbol,
@@ -666,32 +568,23 @@ def _hold_result(symbol: str, reason: str) -> SignalResult:
     )
 
 
-# ─── format_signal_block ────────────────────────────────────────────────────────────────────────────
 def format_signal_block(signal) -> str:
     if signal is None:
         return ""
-
-    arrow = "\U0001f7e2 LONG" if signal.signal == "LONG" else \
-            "\U0001f534 SHORT" if signal.signal == "SHORT" else "⚪ NEUTRAL"
-    lev  = f"{signal.suggested_lev}x" if signal.suggested_lev else "—"
-    rr   = f"{signal.rr:.2f}" if signal.rr else "—"
+    arrow = "\U0001f7e2 LONG" if signal.signal == "LONG" else "\U0001f534 SHORT" if signal.signal == "SHORT" else "⚪ NEUTRAL"
+    lev = f"{signal.suggested_lev}x" if signal.suggested_lev else "—"
+    rr = f"{signal.rr:.2f}" if signal.rr else "—"
     mode = signal.extra.get("setup_type", signal.entry_mode)
-
     lines = [
         f"**{signal.symbol}** · {arrow} [{mode}]",
         f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
     ]
     if signal.entry:
-        lines.append(
-            f"Entry: `{signal.entry}` | SL: `{signal.sl}` | TP: `{signal.tp1}`"
-        )
+        lines.append(f"Entry: `{signal.entry}` | SL: `{signal.sl}` | TP: `{signal.tp1}`")
     if signal.reason:
         lines.append(f"_{signal.reason}_")
-
     return "\n".join(lines)
 
-
-# ─── SignalFlipGuard ─────────────────────────────────────────────────────────────────────────────
 
 _FLIP_COOLDOWN_S = float(os.getenv("SIGNAL_FLIP_COOLDOWN_S", "120"))
 
@@ -718,10 +611,7 @@ class SignalFlipGuard:
             last_side, last_ts = last
             elapsed = time.monotonic() - last_ts
             if last_side != side_norm and elapsed < self._cooldown:
-                log.warning(
-                    "[SignalFlipGuard] %s: señal %s BLOQUEADA (flip en %.1fs)",
-                    symbol, side_norm, elapsed,
-                )
+                log.warning("[SignalFlipGuard] %s: señal %s BLOQUEADA (flip en %.1fs)", symbol, side_norm, elapsed)
                 return False
         self._last[symbol] = (side_norm, time.monotonic())
         return True
@@ -735,9 +625,6 @@ class SignalFlipGuard:
 
 
 signal_flip_guard = SignalFlipGuard()
-
-
-# ─── ManualCloseCooldown ──────────────────────────────────────────────────────────────────────────────
 
 _MANUAL_CLOSE_COOLDOWN_S = int(os.getenv("MANUAL_CLOSE_COOLDOWN_S", "600"))
 
