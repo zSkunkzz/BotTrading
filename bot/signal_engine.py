@@ -15,6 +15,16 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 10):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v17 (mejoras de estrategia):
+  - _detect_setup evalúa los 3 setups y elige el de mayor ratio score/max_score.
+    Antes paraba en el primero que pasaba MIN_SCORE (orden TENDENCIA → BREAKOUT → REVERSAL).
+    Ahora un REVERSAL perfecto no queda oculto detrás de un TENDENCIA mediocre.
+  - TP2 diferenciado por tipo de setup:
+      REVERSAL  → TP2_ATR_MULT_REVERSAL  default 2.0 (era 3.5 — irrealista)
+      BREAKOUT  → TP2_ATR_MULT_BREAKOUT  default 3.0 (razonable para ruptura)
+      TENDENCIA → TP2_ATR_MULT_TENDENCIA default 3.5 (correcto para trend following)
+    Esto hace que TP2_PARTIAL_RATIO se ejecute con mayor frecuencia en reversals.
+
 CAMBIOS v16 (SL por estructura + filtro de sesión):
   - SL ahora usa swing low/high de structure_analyzer (1h) si está disponible.
     Si el swing SL es más agresivo que el ATR SL, usa el ATR como fallback.
@@ -58,7 +68,7 @@ _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
 _SL_ATR_MULT       = float(os.getenv("SL_ATR_MULT",  "1.5"))
 _TP1_ATR_MULT      = float(os.getenv("TP1_ATR_MULT", "1.5"))   # TENDENCIA
-_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))   # referencia interna
+_TP2_ATR_MULT      = float(os.getenv("TP2_ATR_MULT", "3.5"))   # referencia interna (TENDENCIA)
 _MAX_LEV           = int(os.getenv("LEVERAGE", "15"))
 _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 _SL_STRUCTURE_ENABLED = os.getenv("SL_STRUCTURE_ENABLED", "true").lower() != "false"
@@ -228,6 +238,7 @@ async def analyze_pair(
     if vol_ratio_15m < _VOL_MIN_GLOBAL:
         return _hold_result(symbol, f"Vol={vol_ratio_15m:.2f}x — mercado dormido (min {_VOL_MIN_GLOBAL}x)")
 
+    # v17: evalúa los 3 setups y elige el de mayor ratio score/max_score
     setup_type, signal_str, score, max_score, reasons = _detect_setup(
         ind_15m, ind_1h, ind_4h, bars_15m
     )
@@ -254,18 +265,19 @@ async def analyze_pair(
     _atr_buf = _SL_CANDLE_BUFFER * atr_val
 
     # v15: multiplicadores TP1 conservadores por tipo de setup
+    # v17: TP2 también diferenciado por tipo de setup
     if setup_type == "REVERSAL":
         sl_mult  = float(os.getenv("SL_ATR_MULT_REVERSAL",  "1.2"))
         tp1_mult = float(os.getenv("TP1_ATR_MULT_REVERSAL", "1.3"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "3.5"))
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_REVERSAL", "2.0"))  # v17: era 3.5
     elif setup_type == "BREAKOUT":
         sl_mult  = _SL_ATR_MULT
         tp1_mult = float(os.getenv("TP1_ATR_MULT_BREAKOUT", "1.4"))
-        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "3.5"))
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_BREAKOUT", "3.0"))  # v17: era 3.5
     else:  # TENDENCIA
         sl_mult  = _SL_ATR_MULT
         tp1_mult = _TP1_ATR_MULT
-        tp2_mult = _TP2_ATR_MULT
+        tp2_mult = float(os.getenv("TP2_ATR_MULT_TENDENCIA", str(_TP2_ATR_MULT)))  # default 3.5
 
     # Calcular SL ATR base
     if signal_str == "LONG":
@@ -302,9 +314,9 @@ async def analyze_pair(
     is_valid = score >= MIN_SCORE and rr >= MIN_RR
 
     log.info(
-        "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f entry=%.6f sl=%.6f tp1=%.6f atr=%.6f lev=%dx mode=%s valid=%s | %s",
+        "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s | %s",
         symbol, signal_str, setup_type, score, max_score, rr,
-        entry, sl, tp1, atr_val, suggested_lev, entry_mode, is_valid,
+        entry, sl, tp1, tp2, atr_val, suggested_lev, entry_mode, is_valid,
         " · ".join(reasons),
     )
 
@@ -328,12 +340,33 @@ async def analyze_pair(
     )
 
 
-def _detect_setup(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[Optional[str], str, int, int, List[str]]:
+def _detect_setup(
+    i15: dict, i1h: dict, i4h: dict, bars_15m: list
+) -> Tuple[Optional[str], str, int, int, List[str]]:
+    """
+    v17: Evalúa los 3 setups y devuelve el de mayor ratio score/max_score.
+    Antes paraba en el primero que pasaba MIN_SCORE (orden fijo: TENDENCIA → BREAKOUT → REVERSAL),
+    lo que podía ocultar un REVERSAL perfecto detrás de un TENDENCIA mediocre.
+    """
+    candidates = []
     for mode_fn in (_score_tendencia, _score_breakout, _score_reversal):
         setup_type, signal_str, score, max_score, reasons = mode_fn(i15, i1h, i4h, bars_15m)
         if signal_str != "NEUTRAL" and score >= MIN_SCORE:
-            return setup_type, signal_str, score, max_score, reasons
-    return None, "NEUTRAL", 0, 10, ["Ningún setup alcanzó MIN_SCORE"]
+            candidates.append((setup_type, signal_str, score, max_score, reasons))
+
+    if not candidates:
+        return None, "NEUTRAL", 0, 10, ["Ningún setup alcanzó MIN_SCORE"]
+
+    # Elige el setup con mayor ratio score/max_score (normalizado)
+    best = max(candidates, key=lambda x: x[2] / x[3])
+    if len(candidates) > 1:
+        log.debug(
+            "[signal_engine] %d setups válidos — elegido %s (score=%d/%d=%.2f) sobre %s",
+            len(candidates),
+            best[0], best[2], best[3], best[2] / best[3],
+            ", ".join(f"{c[0]}({c[2]}/{c[3]})" for c in candidates if c is not best),
+        )
+    return best
 
 
 def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
@@ -681,7 +714,7 @@ def format_signal_block(signal) -> str:
         f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
     ]
     if signal.entry:
-        lines.append(f"Entry: `{signal.entry}` | SL: `{signal.sl}`{sl_note} | TP: `{signal.tp1}`")
+        lines.append(f"Entry: `{signal.entry}` | SL: `{signal.sl}`{sl_note} | TP1: `{signal.tp1}` | TP2: `{signal.tp2}`")
     if signal.reason:
         lines.append(f"_{signal.reason}_")
     return "\n".join(lines)

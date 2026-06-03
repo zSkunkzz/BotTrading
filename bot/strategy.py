@@ -27,7 +27,7 @@ FIX 7 (MEJORADO): market_regime gate por tipo de setup:
     Ratio de fakeout en breakout/tendencia durante RANGING es muy alto.
   - TRENDING: bloquea REVERSAL (buscar reversal contra tendencia fuerte falla).
   - VOLATILE: eleva MIN_SIGNAL_SCORE (ya estaba, mantenido).
-  - EARLY siempre bloqueado en RANGING (RANGING_BLOCK_EARLY=true).
+  - EARLY bloqueado en RANGING EXCEPTO para REVERSAL (v17: fix).
   Config Railway:
     REGIME_BLOCK_TREND_ON_RANGING    → default true
     REGIME_BLOCK_REVERSAL_ON_TRENDING → default true
@@ -40,6 +40,10 @@ FIX 8: price_direction robusto + momentum guard en fallback
 FIX 9 (AI filter orden): fetch_enriched_context se mueve tras el check
   score >= AI_CALL_MIN_SCORE. Señales que no superan ese umbral ya no
   consumen llamadas HTTP al enricher (F&G, funding, OI, etc.).
+
+v17: RANGING_BLOCK_EARLY excluye REVERSAL — los reversals en rango son
+  precisamente el setup correcto para mercado lateral. Antes se bloqueaban
+  por error aunque el regime_gate ya permitía REVERSAL en RANGING.
 
 Variables de entorno:
   MIN_SIGNAL_SCORE             (default: 8)
@@ -162,12 +166,14 @@ def _momentum_guard_fallback(signal: "SignalResult", price_dir: Optional[str]) -
 
 def _apply_regime_gate(signal: SignalResult, symbol: str) -> Optional[dict]:
     """
-    FIX 7 (MEJORADO): Gate de régimen de mercado con bloqueo por tipo de setup.
+    FIX 7 (MEJORADO) + v17:
 
     RANGING:
       - TENDENCIA y BREAKOUT bloqueados (fakeout rate muy alto en rango)
       - REVERSAL permitido (busca agotamiento de movimientos en rango)
-      - EARLY siempre bloqueado (RANGING_BLOCK_EARLY=true)
+      - EARLY bloqueado en RANGING EXCEPTO para REVERSAL (v17):
+        Los reversals en rango en modo EARLY son el setup correcto para
+        mercados laterales. Bloquearlos era contradictorio con permitir REVERSAL.
       - Score mínimo elevado a RANGING_MIN_SCORE
 
     TRENDING:
@@ -189,10 +195,11 @@ def _apply_regime_gate(signal: SignalResult, symbol: str) -> Optional[dict]:
 
         # ── RANGING ─────────────────────────────────────────────────
         if regime_raw == "RANGING":
-            if _RANGING_BLOCK_EARLY and signal.entry_mode == "EARLY":
+            # v17: REVERSAL en EARLY está permitido en RANGING — es el setup correcto
+            if _RANGING_BLOCK_EARLY and signal.entry_mode == "EARLY" and setup_type != "REVERSAL":
                 return _result(
                     "HOLD", signal, False,
-                    f"🔴 market_regime=RANGING → modo EARLY bloqueado (false breakout risk)",
+                    f"🔴 market_regime=RANGING → modo EARLY bloqueado para {setup_type} (false breakout risk)",
                 )
             if _REGIME_BLOCK_TREND_ON_RANGING and setup_type in ("TENDENCIA", "BREAKOUT"):
                 return _result(
@@ -282,7 +289,7 @@ async def decide(
     if signal.signal == "NEUTRAL":
         return _result("HOLD", signal, False, "Señal técnica neutral")
 
-    # FIX 7 (MEJORADO): gate de régimen por tipo de setup
+    # FIX 7 + v17: gate de régimen por tipo de setup
     regime_block = _apply_regime_gate(signal, symbol)
     if regime_block is not None:
         return regime_block
@@ -295,7 +302,6 @@ async def decide(
         )
 
     # FIX 9: score check ANTES de fetch_enriched_context
-    # Señales que no pasan este umbral no llegan al enricher (sin HTTP innecesarios)
     if signal.score < AI_CALL_MIN_SCORE:
         return _result(
             "HOLD", signal, False,
@@ -312,7 +318,6 @@ async def decide(
         )
 
     # ── Paso 1: enriquecer contexto externo ──────────────────────────────────────
-    # Solo llega aquí si score >= AI_CALL_MIN_SCORE (FIX 9)
     from bot.data_enricher import fetch_enriched_context
     from bot.enriched_filter import apply as ef_apply
 
