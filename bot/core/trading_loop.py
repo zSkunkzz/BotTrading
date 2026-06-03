@@ -19,6 +19,11 @@ FIX v11 (2026-06-03): logs INFO visibles en cada scan
   - Cada iteración sin posición loguea precio + score en INFO.
   - Con posición abierta loguea precio actual + PnL% en INFO.
   - Cada 6 iteraciones (~60s) muestra un heartbeat de todos los traders.
+
+FIX v12 (2026-06-03): PnL real en notify_close para cierre externo
+  - El PnL se calculaba siempre como 0.0 (hardcodeado).
+  - Ahora se calcula: pnl_pct = (exit - entry) / entry * leverage * ±1
+  - El mismo PnL real se pasa a on_position_closed y register_close.
 """
 from __future__ import annotations
 
@@ -47,6 +52,18 @@ _EVALUATE_TIMEOUT_S     = float(os.getenv("EVALUATE_TIMEOUT_S",     "60"))
 
 # Cada cuántas iteraciones mostrar el log de scan visible (default: cada 1 = siempre)
 _SCAN_LOG_EVERY         = int(os.getenv("SCAN_LOG_EVERY", "1"))
+
+
+def _calc_pnl_pct(entry: float, exit_p: float, is_long: bool, leverage: int) -> float:
+    """
+    Calcula el PnL% real con apalancamiento.
+    LONG:  (exit - entry) / entry * leverage * 100
+    SHORT: (entry - exit) / entry * leverage * 100
+    """
+    if not entry or entry <= 0:
+        return 0.0
+    raw = (exit_p - entry) / entry if is_long else (entry - exit_p) / entry
+    return raw * leverage * 100
 
 
 class TradingLoop:
@@ -165,7 +182,7 @@ class TradingLoop:
             logger.debug("[%s] Kill switch activo — skip.", self.symbol)
             return
 
-        # ── Precio ──────────────────────────────────────────────────────────
+        # ── Precio ─────────────────────────────────────────────────────────────────
         try:
             price = await asyncio.wait_for(
                 trader.get_price(),
@@ -181,7 +198,7 @@ class TradingLoop:
 
         logger.debug("[%s] #%d precio=%.4f", self.symbol, n, price)
 
-        # ── Sincronización periódica con exchange ────────────────────────────
+        # ── Sincronización periódica con exchange ──────────────────────────────────
         now = time.monotonic()
         if now - self._last_pos_check_at >= _POS_CHECK_INTERVAL_S:
             try:
@@ -220,21 +237,32 @@ class TradingLoop:
                         )
                 else:
                     if trader.position is not None:
-                        closed_side = trader.position
+                        closed_side  = trader.position
+                        entry_price  = trader.entry_price or price
+                        leverage     = int(trader._open_leverage or trader.leverage or 1)
+                        is_long      = closed_side == "long"
+                        exit_price   = round(price, 6)
+
+                        # — PnL real con apalancamiento —
+                        pnl_pct = _calc_pnl_pct(entry_price, exit_price, is_long, leverage)
+
                         logger.info(
-                            "[%s] Posición cerrada externamente — limpiando estado local.",
-                            self.symbol,
+                            "[%s] Posición cerrada externamente — %s | entry=%.4f exit=%.4f "
+                            "lev=%dx | PnL=%+.2f%%",
+                            self.symbol, closed_side.upper(),
+                            entry_price, exit_price, leverage, pnl_pct,
                         )
+
                         try:
                             from bot.telegram_bot import notify_close
                             await notify_close(
-                                symbol   = self.symbol,
-                                side     = closed_side,
-                                exit_p   = round(price, 6),
-                                pnl      = 0.0,
-                                entry    = trader.entry_price,
-                                reason   = "Cierre manual / externo",
-                                dry_run  = trader.dry_run,
+                                symbol  = self.symbol,
+                                side    = closed_side,
+                                exit_p  = exit_price,
+                                pnl     = pnl_pct,
+                                entry   = round(entry_price, 6),
+                                reason  = "Cierre manual / externo",
+                                dry_run = trader.dry_run,
                             )
                         except Exception as _te:
                             logger.debug("[%s] notify_close error: %s", self.symbol, _te)
@@ -252,7 +280,7 @@ class TradingLoop:
                             if self._decision_engine is not None:
                                 await self._decision_engine.on_position_closed(
                                     symbol     = self.symbol,
-                                    pnl        = 0.0,
+                                    pnl        = pnl_pct,
                                     reason     = "MANUAL_CLOSE",
                                     entry_mode = "NORMAL",
                                 )
@@ -269,7 +297,7 @@ class TradingLoop:
                         _gr = self._global_risk or global_risk
                         if _gr is not None:
                             try:
-                                await _gr.register_close(pnl_pct=0.0, symbol=self.symbol)
+                                await _gr.register_close(pnl_pct=pnl_pct, symbol=self.symbol)
                                 logger.info(
                                     "[%s] global_risk.register_close() llamado — slot liberado.",
                                     self.symbol,
@@ -291,7 +319,7 @@ class TradingLoop:
                         trader._open_qty   = 0.0
                         clear_position(self.symbol)
 
-        # ── Gestionar posición abierta o evaluar nueva entrada ───────────────
+        # ── Gestionar posición abierta o evaluar nueva entrada ───────────────────
         if trader.position is not None:
             trader._last_price = price
 
@@ -303,7 +331,7 @@ class TradingLoop:
                 sl_dist = abs(price - trader.sl) / price * 100 if trader.sl else 0
                 tp_dist = abs(trader.tp1 - price) / price * 100 if trader.tp1 else 0
                 logger.info(
-                    "[%s] 📊 %s @ %.4f | entry=%.4f | PnL=%+.2f%% | "
+                    "[%s] \U0001f4ca %s @ %.4f | entry=%.4f | PnL=%+.2f%% | "
                     "SL=%.4f (%.2f%%) | TP1=%.4f (%.2f%%)",
                     self.symbol, trader.position.upper(), price,
                     entry, pnl_pct,
@@ -317,7 +345,7 @@ class TradingLoop:
             if remaining > 0:
                 if n % max(1, _SCAN_LOG_EVERY) == 0:
                     logger.info(
-                        "[%s] ⏳ Cooldown activo — %.0f s restantes.",
+                        "[%s] \u23f3 Cooldown activo — %.0f s restantes.",
                         self.symbol, remaining,
                     )
                 return
@@ -325,7 +353,7 @@ class TradingLoop:
             # Log visible de scan activo
             if n % max(1, _SCAN_LOG_EVERY) == 0:
                 logger.info(
-                    "[%s] 🔍 Scan #%d | precio=%.4f | buscando señal...",
+                    "[%s] \U0001f50d Scan #%d | precio=%.4f | buscando se\u00f1al...",
                     self.symbol, n, price,
                 )
 
@@ -352,7 +380,7 @@ class TradingLoop:
                 score = signal.get("score", signal.get("strength", "?"))
                 mode  = signal.get("mode", signal.get("entry_mode", "?"))
                 logger.info(
-                    "[%s] ✅ Señal aceptada por DecisionEngine: action=%s side=%s "
+                    "[%s] \u2705 Se\u00f1al aceptada por DecisionEngine: action=%s side=%s "
                     "score=%s mode=%s entry=%.4f sl=%.4f tp1=%.4f",
                     self.symbol,
                     signal.get("action"), signal.get("side"),
@@ -386,6 +414,6 @@ class TradingLoop:
                 # Sin señal — log del resultado del scan
                 if n % max(1, _SCAN_LOG_EVERY) == 0:
                     logger.info(
-                        "[%s] ⬜ Sin señal | precio=%.4f",
+                        "[%s] \u2b1c Sin se\u00f1al | precio=%.4f",
                         self.symbol, price,
                     )
