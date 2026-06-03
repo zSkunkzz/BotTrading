@@ -2,11 +2,18 @@ import asyncio
 import logging
 import os
 from telegram import Bot, Update
-from telegram.error import TelegramError
+from telegram.error import TelegramError, NetworkError
+from telegram.request import HTTPXRequest
 
 logger = logging.getLogger("TelegramBot")
 
 _bot: Bot | None = None
+
+# Long-poll timeout enviado a Telegram (segundos que el servidor espera antes de
+# responder con lista vacía si no hay updates). El read_timeout del cliente HTTP
+# DEBE ser mayor para que httpx no corte la conexión antes de que Telegram responda.
+_POLL_TIMEOUT    = int(os.getenv("TG_POLL_TIMEOUT",    "30"))
+_HTTP_READ_TIMEOUT = int(os.getenv("TG_HTTP_READ_TIMEOUT", "45"))  # > _POLL_TIMEOUT
 
 
 def _get_bot() -> Bot | None:
@@ -14,7 +21,18 @@ def _get_bot() -> Bot | None:
     if _bot is None:
         token = os.getenv("TELEGRAM_TOKEN", "")
         if token:
-            _bot = Bot(token=token)
+            # FIX httpx.ReadError: el read_timeout del cliente debe superar el
+            # poll timeout de getUpdates. De lo contrario httpx corta la
+            # conexión long-poll antes de que Telegram devuelva respuesta.
+            _bot = Bot(
+                token=token,
+                request=HTTPXRequest(
+                    read_timeout=_HTTP_READ_TIMEOUT,
+                    write_timeout=10,
+                    connect_timeout=10,
+                    pool_timeout=5,
+                ),
+            )
     return _bot
 
 
@@ -228,7 +246,6 @@ async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
         except TelegramError as e:
             logger.warning("[Telegram cmd_resetks] %s", e)
 
-    # /resetks daily — resetea solo contadores diarios sin tocar el nivel del KS
     if args and args[0].lower() == "daily":
         await kill_switch.reset_daily_pnl()
         await reply(
@@ -238,7 +255,6 @@ async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
         )
         return
 
-    # /resetks — re-arm completo sin clave
     await kill_switch.manual_reset()
     await reply(
         "\u2705 <b>Kill Switch RE-ARMADO</b>\n"
@@ -258,10 +274,18 @@ async def _polling_loop() -> None:
         logger.info("[Telegram polling] Sin token \u2014 comandos desactivados.")
         return
     offset: int | None = None
-    logger.info("[Telegram polling] Iniciado \u2014 escuchando /resetks y /ksstatus")
+    logger.info(
+        "[Telegram polling] Iniciado \u2014 escuchando /resetks y /ksstatus "
+        "(poll_timeout=%ds read_timeout=%ds)",
+        _POLL_TIMEOUT, _HTTP_READ_TIMEOUT,
+    )
     while True:
         try:
-            updates = await bot.get_updates(offset=offset, timeout=30, allowed_updates=["message"])
+            updates = await bot.get_updates(
+                offset=offset,
+                timeout=_POLL_TIMEOUT,
+                allowed_updates=["message"],
+            )
             for upd in updates:
                 offset = upd.update_id + 1
                 try:
@@ -271,6 +295,12 @@ async def _polling_loop() -> None:
         except asyncio.CancelledError:
             logger.info("[Telegram polling] Cancelado.")
             break
+        except NetworkError as e:
+            # NetworkError incluye ReadError, WriteError, etc. Son transitorios
+            # en long-polling (Telegram corta conexiones largas). No es un error
+            # real — logueamos a DEBUG para no contaminar los logs de trading.
+            logger.debug("[Telegram polling] red transitoria: %s — reintentando en 10 s", e)
+            await asyncio.sleep(10)
         except TelegramError as e:
             logger.warning("[Telegram polling] %s \u2014 reintentando en 10 s", e)
             await asyncio.sleep(10)
