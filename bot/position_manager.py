@@ -16,6 +16,14 @@ Bug C — _place_emergency_sl_tp redondea qty antes de enviar la orden.
 Bug I — _resolve_is_long tolera position como str o dict.
 
 Bug J — TP dinámico cuando trader.tp es None (posiciones restauradas del state).
+
+FEAT BE (Break-Even) — Cuando el precio se aleja de la entrada un porcentaje
+  configurable hacia el TP, el SL se mueve automáticamente a la entrada.
+  Configurable con:
+    BE_TRIGGER_PCT  (default 0.4) — % del recorrido entry→TP1 necesario para activar
+    BE_OFFSET_PCT   (default 0.0) — offset sobre entry (0 = BE exacto, >0 = pequeño beneficio)
+  El BE solo se activa una vez por posición (_tp1_be_done). Una vez activado,
+  cancela el SL antiguo del exchange y coloca uno nuevo en entry+offset.
 """
 from __future__ import annotations
 
@@ -39,25 +47,27 @@ _EMERGENCY_TPSL_RETRIES = int(os.getenv("EMERGENCY_TPSL_RETRIES", "3"))
 # RR mínimo para TP dinámico cuando trader.tp es None
 _TP_FALLBACK_RR = float(os.getenv("TP_FALLBACK_RR", "1.5"))
 
+# Break-Even: porcentaje del recorrido entry→TP1 para activar (0.4 = 40%)
+_BE_TRIGGER_PCT = float(os.getenv("BE_TRIGGER_PCT", "0.4"))
+# Break-Even: offset sobre entry en % (0.0 = BE exacto, 0.001 = +0.1% sobre entry)
+_BE_OFFSET_PCT  = float(os.getenv("BE_OFFSET_PCT", "0.0"))
+
 
 def _get_tpsl_type(order: dict) -> Optional[str]:
     """
     Extrae 'sl', 'tp' o None del campo orderType.trigger.tpsl.
     Compatible con openOrders y frontendOpenOrders de Hyperliquid.
     """
-    # Formato openOrders: {"orderType": {"trigger": {"tpsl": "sl"}}}
     ot = order.get("orderType", {})
     if isinstance(ot, dict):
         trigger = ot.get("trigger", {})
         if isinstance(trigger, dict) and trigger.get("tpsl"):
             return trigger["tpsl"]
-    # Formato alternativo: {"type": {"trigger": {"tpsl": "sl"}}}
     t = order.get("type", {})
     if isinstance(t, dict):
         trigger = t.get("trigger", {})
         if isinstance(trigger, dict) and trigger.get("tpsl"):
             return trigger["tpsl"]
-    # Campo plano (algunas versiones del SDK)
     return order.get("tpsl") or None
 
 
@@ -101,6 +111,7 @@ class PositionManager:
     """
     Gestiona el ciclo de vida de una posición abierta:
       - Check de SL por software (con margen anti-doble-cierre)
+      - Break-Even automático cuando el precio avanza lo suficiente hacia el TP
       - Verificación periódica de SL/TP en el exchange
       - Colocación de emergencia si faltan SL/TP
     """
@@ -116,11 +127,162 @@ class PositionManager:
         if await self._check_sl_software():
             return
 
+        # BE: mover SL a entrada cuando el precio avanza hacia el TP
+        await self._check_break_even()
+
         if now - self._last_tpsl_check >= _TPSL_VERIFY_INTERVAL_S:
             self._last_tpsl_check = now
             await self._ensure_tpsl()
 
-    # ── Check SL por software ─────────────────────────────────────────
+    # ── Break-Even ─────────────────────────────────────────────────────────────────
+
+    async def _check_break_even(self) -> None:
+        """
+        Mueve el SL a break-even (entry + offset) cuando el precio alcanza
+        BE_TRIGGER_PCT del recorrido entry → TP1.
+
+        Ejemplo con BE_TRIGGER_PCT=0.4:
+          LONG entry=100, TP1=110 → recorrido=10
+          Trigger en precio >= 100 + 10*0.4 = 104
+          SL se mueve a 100 * (1 + BE_OFFSET_PCT)
+
+        Solo se activa UNA VEZ por posición (_tp1_be_done).
+        """
+        trader = self._trader
+
+        # Ya activado o sin datos mínimos
+        if getattr(trader, "_tp1_be_done", False):
+            return
+
+        position   = getattr(trader, "position", None)
+        entry      = getattr(trader, "entry_price", None)
+        tp1        = getattr(trader, "tp1", None)
+        sl         = getattr(trader, "sl", None)
+        price      = getattr(trader, "_last_price", None)
+        symbol     = getattr(trader, "symbol", "?")
+
+        if not position or not entry or not tp1 or not price:
+            return
+
+        is_long   = _resolve_is_long(position)
+        recorrido = abs(tp1 - entry)
+        if recorrido <= 0:
+            return
+
+        trigger_dist = recorrido * _BE_TRIGGER_PCT
+
+        # ¿El precio alcanzó el trigger?
+        if is_long:
+            triggered = price >= entry + trigger_dist
+        else:
+            triggered = price <= entry - trigger_dist
+
+        if not triggered:
+            return
+
+        # Calcular precio de BE
+        be_price = round(entry * (1 + _BE_OFFSET_PCT) if is_long else entry * (1 - _BE_OFFSET_PCT), 6)
+
+        # No mover si el SL ya está por encima (LONG) o por debajo (SHORT) del BE
+        if sl is not None:
+            if is_long and sl >= be_price:
+                trader._tp1_be_done = True
+                return
+            if not is_long and sl <= be_price:
+                trader._tp1_be_done = True
+                return
+
+        log.info(
+            "[%s] 🟡 BREAK-EVEN activado: precio=%.4f trigger=%.4f (%.0f%% de %.4f recorrido) "
+            "| SL anterior=%.4f → BE=%.4f",
+            symbol, price, entry + (trigger_dist if is_long else -trigger_dist),
+            _BE_TRIGGER_PCT * 100, recorrido,
+            sl or 0, be_price,
+        )
+
+        # Marcar como hecho ANTES de la llamada async (evita doble ejecución)
+        trader._tp1_be_done = True
+        trader.sl = be_price
+
+        # Actualizar SL en el exchange
+        await self._update_sl_to_be(be_price, is_long, symbol)
+
+    async def _update_sl_to_be(self, be_price: float, is_long: bool, symbol: str) -> None:
+        """
+        Cancela el SL antiguo y coloca uno nuevo en be_price.
+        En dry_run solo logea.
+        """
+        trader = self._trader
+
+        if getattr(trader, "dry_run", True):
+            log.info("[%s] DRY_RUN: BE SL=%.4f omitido (sin orden real).", symbol, be_price)
+            return
+
+        hl = getattr(trader, "_hl_client", None)
+        if hl is None:
+            log.warning("[%s] BE: _hl_client no disponible — SL no actualizado.", symbol)
+            return
+
+        open_qty = _round_qty_safe(trader, getattr(trader, "_open_qty", 0.0) or 0.0)
+        if open_qty <= 0:
+            log.warning("[%s] BE: qty=0 — no se puede colocar SL de BE.", symbol)
+            return
+
+        # 1. Cancelar SL antiguo
+        try:
+            await asyncio.to_thread(hl.cancel_all_open_tpsl)
+            log.info("[%s] BE: SL/TP anteriores cancelados.", symbol)
+        except Exception as e:
+            log.warning("[%s] BE: no se pudo cancelar SL antiguo: %s", symbol, e)
+
+        # 2. Colocar SL nuevo en BE
+        entry_price = getattr(trader, "entry_price", be_price)
+        try:
+            result = await asyncio.to_thread(
+                hl.place_sl,
+                not is_long,   # is_buy del SL es contrario a la posición
+                open_qty,
+                be_price,
+                entry_price,
+            )
+            log.info("[%s] BE: SL colocado en entrada (%.4f): %s", symbol, be_price, result)
+        except Exception as e:
+            log.error("[%s] BE: error colocando SL en BE: %s", symbol, e)
+            # Revertir flag para que lo reintente en el siguiente tick
+            trader._tp1_be_done = False
+            trader.sl = None
+            return
+
+        # 3. Recolocar TP1 (cancel_all_open_tpsl lo borró también)
+        tp1 = getattr(trader, "tp1", None)
+        if tp1 and tp1 > 0:
+            try:
+                result = await asyncio.to_thread(
+                    hl.place_tp,
+                    not is_long,
+                    open_qty,
+                    tp1,
+                    None,
+                    entry_price,
+                )
+                log.info("[%s] BE: TP1 recolocado en %.4f: %s", symbol, tp1, result)
+            except Exception as e:
+                log.warning("[%s] BE: error recolocando TP1: %s", symbol, e)
+
+        trader._protection_ok = True
+
+        # Notificar por Telegram
+        try:
+            from bot.telegram_bot import send_message
+            side_emoji = "🟢" if is_long else "🔴"
+            await send_message(
+                f"{side_emoji} *BE activado* `{symbol}`\n"
+                f"SL movido a entrada: `{be_price:.6f}` — posición sin riesgo 🛡️"
+            )
+        except Exception:
+            pass
+
+    # ── Check SL por software ───────────────────────────────────────────────────
 
     async def _check_sl_software(self) -> bool:
         trader = self._trader
@@ -157,7 +319,7 @@ class PositionManager:
         await self._emergency_close(reason="SL_SW")
         return True
 
-    # ── Verificación SL/TP en exchange ────────────────────────────────
+    # ── Verificación SL/TP en exchange ──────────────────────────────────────────────
 
     async def _ensure_tpsl(self) -> None:
         """
@@ -246,7 +408,7 @@ class PositionManager:
         )
         await self._place_emergency_sl_tp(place_sl=not has_sl, place_tp=not has_tp)
 
-    # ── Colocación de emergencia SL/TP ─────────────────────────────────
+    # ── Colocación de emergencia SL/TP ───────────────────────────────────────────────
 
     async def _place_emergency_sl_tp(self, place_sl: bool = True, place_tp: bool = True) -> None:
         trader = self._trader
@@ -314,7 +476,7 @@ class PositionManager:
                 if attempt < _EMERGENCY_TPSL_RETRIES:
                     await asyncio.sleep(2 ** attempt)
 
-    # ── Cierre de emergencia ──────────────────────────────────────────
+    # ── Cierre de emergencia ───────────────────────────────────────────────────────────────
 
     async def _emergency_close(self, reason: str = "EMERGENCY") -> None:
         trader = self._trader
