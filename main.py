@@ -26,20 +26,17 @@ active_traders: dict = {}
 global_risk: GlobalRisk = None
 _trader_instances: dict = {}
 
-MAX_ACTIVE_TRADERS = int(os.getenv("MAX_ACTIVE_TRADERS", "5"))
-_LEVERAGE_BASE     = int(os.getenv("LEVERAGE", "5"))
+MAX_ACTIVE_TRADERS     = int(os.getenv("MAX_ACTIVE_TRADERS", "10"))   # era 5
+_LEVERAGE_BASE         = int(os.getenv("LEVERAGE", "5"))
 _max_leverage_map: dict[str, int] = {}
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
-_USDC_PER_TRADE = float(os.getenv("USDC_PER_TRADE", "20"))
+_USDC_PER_TRADE        = float(os.getenv("USDC_PER_TRADE", "20"))
 
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
-# Cuántos ciclos de HOLD consecutivos (sin posición) antes de rotar un trader
-# Un ciclo = una iteración del idle_rotation_loop (~60s).
-# 30 ciclos x 60s = ~30 minutos sin entrar → se rota.
 _IDLE_ROTATE_CYCLES = int(os.getenv("IDLE_ROTATE_CYCLES", "30"))
-_idle_cycles: dict[str, int] = {}  # symbol -> ciclos consecutivos sin posición
+_idle_cycles: dict[str, int] = {}
 
 
 def _resolve_hl_address() -> str:
@@ -141,11 +138,7 @@ def _update_leverage_map(scored_data: list[dict]) -> None:
             _max_leverage_map[sym] = ml
             updated += 1
     if updated:
-        logger.info(
-            "\u2699\ufe0f  Mapa de leverage actualizado: %d pares | ejemplo: %s",
-            updated,
-            ", ".join(f"{k}={v}x" for k, v in list(_max_leverage_map.items())[:5]),
-        )
+        logger.debug("\u2699\ufe0f  Mapa de leverage actualizado: %d pares", updated)
 
 
 async def _stop_pair_with_cleanup(symbol: str) -> None:
@@ -170,11 +163,6 @@ async def _stop_pair_with_cleanup(symbol: str) -> None:
 
 
 async def _purge_stale_state(hl_addr: str) -> set:
-    """
-    Verifica qué símbolos del state local realmente tienen posición abierta
-    en el exchange. Los que NO existen se borran del state.
-    Retorna el conjunto de símbolos con posición REAL en el exchange.
-    """
     import aiohttp
     import json as _json
 
@@ -228,36 +216,19 @@ async def _purge_stale_state(hl_addr: str) -> set:
 
 
 async def _idle_rotation_loop(scanner: "PairScanner") -> None:
-    """
-    Cada 60 segundos revisa qué traders llevan demasiados ciclos sin posición
-    abierta (idle). Los rota por el siguiente par del scanner que no esté activo.
-    Los traders con posición abierta nunca se rotan.
-
-    FIX 2026-06-02: _last_scored es lista de dicts, no de strings.
-    La línea `scanner.normalize(s)` pasaba el dict entero → AttributeError.
-    Fix: extraer p["symbol"] directamente antes de normalizar.
-
-    FIX 2026-06-03 (Bug C): usaba bot_state._positions para saber si hay
-    posición abierta. En dry_run / cierre externo, esto puede estar
-    desincronizado con trader.position (estado en memoria).
-    Fix: verificar trader.position (fuente primaria) antes de bot_state.
-    """
     while True:
         await asyncio.sleep(60)
         try:
             to_rotate = []
             for sym, cycles in list(_idle_cycles.items()):
-                # FIX Bug C: usar trader.position como fuente primaria de verdad
                 trader = _trader_instances.get(sym)
                 has_position = (
                     (trader is not None and getattr(trader, "position", None) is not None)
-                    or sym in bot_state._positions  # fallback: estado en disco
+                    or sym in bot_state._positions
                 )
-
                 if has_position:
-                    _idle_cycles[sym] = 0  # resetear si tiene posición
+                    _idle_cycles[sym] = 0
                     continue
-
                 _idle_cycles[sym] = cycles + 1
                 if _idle_cycles[sym] >= _IDLE_ROTATE_CYCLES:
                     to_rotate.append(sym)
@@ -265,7 +236,6 @@ async def _idle_rotation_loop(scanner: "PairScanner") -> None:
             if not to_rotate:
                 continue
 
-            # FIX: _last_scored es lista de dicts — extraer "symbol" antes de normalizar
             last_scored = getattr(scanner, "_last_scored", None) or []
             scanner_pairs = [
                 scanner.normalize(p["symbol"] if isinstance(p, dict) else p)
@@ -278,7 +248,7 @@ async def _idle_rotation_loop(scanner: "PairScanner") -> None:
                     break
                 new_sym = available.pop(0)
                 logger.info(
-                    "\U0001f504 Rotando trader idle: %s (%d ciclos sin posición) → %s",
+                    "\U0001f504 Rotando trader idle: %s (%d ciclos sin posición) \u2192 %s",
                     sym, _idle_cycles.get(sym, 0), new_sym,
                 )
                 await _stop_pair_with_cleanup(sym)
@@ -293,7 +263,6 @@ async def _idle_rotation_loop(scanner: "PairScanner") -> None:
 
 async def on_pairs_updated(new_pairs: list, added: set = None, removed: set = None):
     open_symbols = set(bot_state._positions.keys())
-    # Complementar con posiciones en memoria de traders activos
     for sym, t in _trader_instances.items():
         if getattr(t, "position", None) is not None:
             open_symbols.add(sym)
@@ -339,7 +308,7 @@ async def main():
         logger.warning("\u26a0\ufe0f No se pudo resolver dirección HL.")
 
     import httpx
-    _HL_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
+    _HL_TESTNET  = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
     _HL_INFO_URL = "https://api.hyperliquid-testnet.xyz/info" if _HL_TESTNET else "https://api.hyperliquid.xyz/info"
 
     async def _info_post(payload: dict) -> dict:
@@ -359,28 +328,24 @@ async def main():
         max_global_daily_loss_pct=float(os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")),
     )
 
-    # FIX: sincronizar GlobalRisk._open con las posiciones REALES del exchange.
-    # Sin esto, si el archivo en disco dice _open=1 pero no hay posición real,
-    # can_open() bloquea todos los traders y el bot no abre ningún trade.
     await global_risk.sync_open_count(len(real_open_symbols))
 
     webhook_runner = await start_webhook_server()
 
-    top_n = int(os.getenv("TOP_PAIRS", str(MAX_ACTIVE_TRADERS * 2)))
-    logger.info("\u2699\ufe0f  MAX_ACTIVE_TRADERS=%d | TOP_PAIRS=%d | LEVERAGE_BASE=%dx | IDLE_ROTATE_CYCLES=%d",
-                MAX_ACTIVE_TRADERS, top_n, _LEVERAGE_BASE, _IDLE_ROTATE_CYCLES)
-
-    scanner = PairScanner(
-        min_volume_usdt=float(os.getenv("MIN_VOLUME_USDT", "1000000")),
-        min_price_change_pct=float(os.getenv("MIN_CHANGE_PCT", "0.5")),
-        top_n=top_n,
-        refresh_interval_min=int(os.getenv("SCANNER_REFRESH_MIN", "30")),
+    # TOP_PAIRS = MAX_ACTIVE_TRADERS * 3 para tener suficientes candidatos en rotación
+    top_n = int(os.getenv("TOP_PAIRS", str(MAX_ACTIVE_TRADERS * 3)))
+    logger.info(
+        "\u2699\ufe0f  MAX_ACTIVE_TRADERS=%d | TOP_PAIRS=%d | LEVERAGE_BASE=%dx | IDLE_ROTATE_CYCLES=%d",
+        MAX_ACTIVE_TRADERS, top_n, _LEVERAGE_BASE, _IDLE_ROTATE_CYCLES,
     )
+
+    # PairScanner sin args explícitos: hereda SCANNER_TOP_N, SCANNER_REFRESH_MIN,
+    # SCANNER_MIN_VOLUME, SCANNER_MIN_CHANGE de env vars (defaults en pair_scanner.py)
+    scanner = PairScanner(top_n=top_n)
 
     logger.info("\U0001f50d Escaneando mercado Hyperliquid inicial...")
     initial_pairs = await scanner.scan()
 
-    # FIX: sincronizar scanner.active_pairs con el resultado del scan inicial.
     scanner.active_pairs = list(initial_pairs)
 
     scored_data = list(getattr(scanner, "_last_scored", []))
@@ -399,17 +364,17 @@ async def main():
         final_pairs = []
 
     if not final_pairs:
-        logger.warning("\u26a0\ufe0f ai_rank_pairs vacío → usando scanner directamente")
+        logger.warning("\u26a0\ufe0f ai_rank_pairs vacío \u2192 usando scanner directamente")
         final_pairs = [scanner.normalize(s) for s in initial_pairs[:top_n]]
         seen = set()
         final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
 
     if not final_pairs:
-        logger.error("\u274c Scanner devolvio 0 pares. Revisa MIN_VOLUME_USDT y MIN_CHANGE_PCT.")
+        logger.error("\u274c Scanner devolvio 0 pares. Revisa SCANNER_MIN_VOLUME y SCANNER_MIN_CHANGE.")
 
     logger.info("\u2705 Pares finales (%d): %s", len(final_pairs), ", ".join(final_pairs))
 
-    open_symbols   = real_open_symbols
+    open_symbols = real_open_symbols
     missing_from_scan = open_symbols - set(final_pairs)
     if missing_from_scan:
         logger.warning("\u26a0\ufe0f  Pares con posición REAL no están en scanner — forzando: %s", ", ".join(missing_from_scan))
@@ -428,8 +393,8 @@ async def main():
                 len(pairs_to_trade), len(final_pairs), ", ".join(pairs_to_trade))
     await start_traders_staggered(pairs_to_trade, _start_single_pair, delay=3.0)
 
-    watchdog_task  = asyncio.create_task(kill_switch.run_watchdog(_trader_instances))
-    rotation_task  = asyncio.create_task(_idle_rotation_loop(scanner))
+    watchdog_task = asyncio.create_task(kill_switch.run_watchdog(_trader_instances))
+    rotation_task = asyncio.create_task(_idle_rotation_loop(scanner))
     logger.info("\U0001f415 Kill Switch Watchdog arrancado")
     logger.info("\U0001f504 Idle Rotation Loop arrancado (rota después de %d ciclos idle)", _IDLE_ROTATE_CYCLES)
 
