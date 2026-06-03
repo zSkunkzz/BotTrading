@@ -13,6 +13,9 @@ Flujo (sin IA para el caso normal):
     1. Aplica enriched_filter (F&G, funding, OI, RSI, vol) — sin IA, instantáneo
     2. Si el filtro bloquea → HOLD (motivo detallado)
     3. Si hay >= NEWS_AI_THRESHOLD noticias relevantes → consulta IA solo para noticias
+       El score_delta de la IA se cachea (NEWS_SCORE_TTL_MINUTES, default 30 min).
+       En ciclos siguientes dentro del TTL se reutiliza el score más alto
+       entre el fresco y el cacheado — evita que una noticia negativa se olvide.
     4. Si la IA de noticias dice HOLD con alta confianza → respeta
     5. Si no hay noticias relevantes o la IA confirma → entra
 
@@ -27,7 +30,7 @@ FIX 7 (MEJORADO): market_regime gate por tipo de setup:
     Ratio de fakeout en breakout/tendencia durante RANGING es muy alto.
   - TRENDING: bloquea REVERSAL (buscar reversal contra tendencia fuerte falla).
   - VOLATILE: eleva MIN_SIGNAL_SCORE (ya estaba, mantenido).
-  - EARLY bloqueado en RANGING EXCEPTO para REVERSAL (v17: fix).
+  - EARLY bloqueado en RANGING EXCEPTO para REVERSAL (v17: fix)
   Config Railway:
     REGIME_BLOCK_TREND_ON_RANGING    → default true
     REGIME_BLOCK_REVERSAL_ON_TRENDING → default true
@@ -45,6 +48,12 @@ v17: RANGING_BLOCK_EARLY excluye REVERSAL — los reversals en rango son
   precisamente el setup correcto para mercado lateral. Antes se bloqueaban
   por error aunque el regime_gate ya permitía REVERSAL en RANGING.
 
+v21-P4: cache TTL para score_delta de noticias.
+  NEWS_SCORE_TTL_MINUTES (default 30): tiempo en minutos que se retiene
+  el score_delta de noticias aunque la señal técnica no llegue a disparar
+  la IA. _get_news_score() devuelve el peor (más alto en absoluto) entre
+  fresco y cacheado — la noticia negativa más fuerte manda.
+
 Variables de entorno:
   MIN_SIGNAL_SCORE             (default: 8)
   MIN_RR_REQUIRED              (default: 1.8)
@@ -53,6 +62,7 @@ Variables de entorno:
   AI_HOLD_OVERRIDE_SCORE       (default: 8)
   AI_HIGH_CONFIDENCE_THRESHOLD (default: 8)
   USE_AI_FOR_NEWS              (default: true)
+  NEWS_SCORE_TTL_MINUTES       (default: 30)
   RANGING_MIN_SCORE            (default: 9)
   VOLATILE_MIN_SCORE           (default: 8)
   RANGING_BLOCK_EARLY          (default: true)
@@ -95,6 +105,56 @@ _RSI_MOMENTUM_BLOCK = float(os.getenv("EF_RSI_MOMENTUM_BLOCK", "50"))
 
 _AI_NEWS_COOLDOWN_S = int(os.getenv("AI_NEWS_COOLDOWN_S", "300"))
 _last_ai_news_call: dict[str, float] = {}
+
+# v21-P4: cache TTL para score_delta de noticias
+# Estructura: symbol → (score_delta: float, expires_ts: float)
+_news_score_cache: dict[str, tuple[float, float]] = {}
+_NEWS_SCORE_TTL = float(os.getenv("NEWS_SCORE_TTL_MINUTES", "30")) * 60  # segundos
+
+
+def _get_news_score(symbol: str, fresh_score: float) -> float:
+    """Devuelve el score_delta de noticias más representativo.
+
+    Lógica:
+    - Si hay un valor cacheado no expirado, devuelve el de mayor
+      valor absoluto (la noticia más fuerte manda).
+    - Actualiza el cache solo si el fresh_score tiene mayor absoluto
+      que el cacheado (no se sobreescribe con señales más débiles).
+    - Si el cache expiró, usa fresh_score directamente y lo almacena.
+
+    El resultado es que una noticia muy negativa recibida en ciclo N
+    sigue bloqueando entradas en ciclos N+1, N+2… hasta que el TTL
+    expire, aunque en esos ciclos la IA no haya sido consultada.
+    """
+    now = time.time()
+    cached_score, expires = _news_score_cache.get(symbol, (0.0, 0.0))
+
+    if now < expires:
+        # Cache válido: elegir el score de mayor peso absoluto
+        if abs(fresh_score) >= abs(cached_score):
+            best = fresh_score
+            _news_score_cache[symbol] = (fresh_score, now + _NEWS_SCORE_TTL)
+            log.debug(
+                "[strategy] %s news_cache actualizado: %.3f → %.3f (TTL %.0fs)",
+                symbol, cached_score, fresh_score, _NEWS_SCORE_TTL,
+            )
+        else:
+            best = cached_score
+            log.debug(
+                "[strategy] %s news_cache reutilizado: %.3f (fresh=%.3f, expira en %.0fs)",
+                symbol, cached_score, fresh_score, expires - now,
+            )
+    else:
+        # Cache expirado o vacío: usar fresh y almacenar
+        best = fresh_score
+        if fresh_score != 0.0:
+            _news_score_cache[symbol] = (fresh_score, now + _NEWS_SCORE_TTL)
+            log.debug(
+                "[strategy] %s news_cache nuevo: %.3f (TTL %.0fs)",
+                symbol, fresh_score, _NEWS_SCORE_TTL,
+            )
+
+    return best
 
 
 def _compute_price_direction(
@@ -402,27 +462,44 @@ async def decide(
                     ai_action     = str(ai_result.get("action", "HOLD")).upper().strip()
                     ai_confidence = ai_result.get("confidence", 0)
                     ai_reason     = ai_result.get("reason", ai_result.get("reasoning", ""))
+                    # v21-P4: extraer score_delta de la respuesta IA y cachearlo
+                    ai_score_delta = float(ai_result.get("score_delta", 0.0))
+                    cached_delta   = _get_news_score(symbol, ai_score_delta)
 
                     if ai_action not in ("BUY", "SELL"):
                         ai_action = "HOLD"
 
-                    if ai_action == "HOLD" and ai_confidence >= AI_HIGH_CONFIDENCE_THRESHOLD:
+                    # v21-P4: usar el cached_delta para decisión si es más pesado
+                    effective_confidence = ai_confidence
+                    if cached_delta != ai_score_delta:
+                        log.info(
+                            "[strategy] %s 📰 score_delta cacheado %.3f vs fresco %.3f — "
+                            "usando el de mayor peso para la decisión",
+                            symbol, cached_delta, ai_score_delta,
+                        )
+                        # Si el delta cacheado era bloqueante y el fresco no, mantener HOLD
+                        if ai_action != "HOLD" and abs(cached_delta) > abs(ai_score_delta):
+                            ai_action = "HOLD"
+                            effective_confidence = AI_HIGH_CONFIDENCE_THRESHOLD
+                            ai_reason = f"[cache news TTL] score_delta cacheado={cached_delta:.3f} | {ai_reason}"
+
+                    if ai_action == "HOLD" and effective_confidence >= AI_HIGH_CONFIDENCE_THRESHOLD:
                         return _result(
                             "HOLD", signal, True,
-                            f"📰 IA news→HOLD ({ai_confidence}/10) bloqueó entrada | {ai_reason}",
-                            ai_confidence=ai_confidence,
+                            f"📰 IA news→HOLD ({effective_confidence}/10) bloqueó entrada | {ai_reason}",
+                            ai_confidence=effective_confidence,
                             ai_reason=ai_reason,
                         )
 
                     if ai_action == "HOLD" and signal.score >= AI_HOLD_OVERRIDE_SCORE:
                         log.info(
-                            f"[strategy] {symbol} 🔁 IA news→HOLD (conf={ai_confidence}) "
+                            f"[strategy] {symbol} 🔁 IA news→HOLD (conf={effective_confidence}) "
                             f"pero score={signal.score}>={AI_HOLD_OVERRIDE_SCORE} → override"
                         )
                         return _result(
                             action_if_pass, signal, True,
-                            f"🔁 Override técnico (score={signal.score}) · IA news dudó (conf={ai_confidence}/10) | {ai_reason}",
-                            ai_confidence=ai_confidence,
+                            f"🔁 Override técnico (score={signal.score}) · IA news dudó (conf={effective_confidence}/10) | {ai_reason}",
+                            ai_confidence=effective_confidence,
                             ai_reason=ai_reason,
                             ef_penalty=ef_result.penalty,
                         )

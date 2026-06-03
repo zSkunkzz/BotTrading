@@ -80,3 +80,31 @@ def supertrend(highs, lows, closes, period=10, factor=3.0):
             direction = -1
             st = upper
     return direction, round(st, 6)
+
+
+def vwap(bars: list) -> float:
+    """VWAP acumulado de las barras provistas.
+
+    Usa el Typical Price (H+L+C)/3 ponderado por volumen.
+    Seguro ante barras con v=0 o v=None (las omite sin lanzar excepción).
+    Retorna 0.0 si no hay volumen acumulado válido.
+
+    Uso habitual: pasar bars_15m completas para obtener VWAP intradía
+    referenciado al inicio de la sesión de datos disponibles.
+    """
+    cum_vol = 0.0
+    cum_tpv = 0.0
+    for b in bars:
+        try:
+            h = float(b[2])
+            l = float(b[3])
+            c = float(b[4])
+            v = float(b[5]) if b[5] is not None else 0.0
+        except (TypeError, IndexError, ValueError):
+            continue
+        if v <= 0:
+            continue
+        tp = (h + l + c) / 3
+        cum_tpv += tp * v
+        cum_vol  += v
+    return round(cum_tpv / cum_vol, 6) if cum_vol > 0 else 0.0
