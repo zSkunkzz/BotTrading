@@ -15,6 +15,21 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 10):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v20 (Opción A early entry + Opción B SL ATR dinámico):
+  Opción A — Early entry para señales de máxima convicción:
+  - FAST_ENTRY_MIN_SCORE (default=9): score >= este valor activa modo FAST.
+    Si score>=FAST_ENTRY_MIN_SCORE y rr>=FAST_ENTRY_MIN_RR (default=1.2) →
+    is_valid=True aunque rr < MIN_RR (1.5). Entry más rápido en 10/10.
+    entry_mode="FAST" para distinguirlo en logs/Telegram.
+    Lógica: una señal 9-10/10 con RR=1.2 sigue siendo mejor que esperar
+    con entry más alto y el mismo SL.
+  Opción B — SL dinámico ATR puro:
+  - SL_ATR_DYNAMIC (default=false): cuando true, el SL base se calcula
+    solo como entry ± SL_ATR_MULT×ATR, sin anclar al low/high de la vela.
+    Beneficio: SL más ajustado a la volatilidad actual → RR más alto.
+    El _structure_sl (swing low/high 1h) sigue aplicándose como última capa.
+    Útil cuando la vela actual tiene un low muy lejano del entry (impulso).
+
 CAMBIOS v19 (trend following puro — calidad sobre cantidad):
   - _score_tendencia: MACD15m a favor es REQUISITO OBLIGATORIO.
     Si MACD está en contra → score=0, NEUTRAL inmediato.
@@ -61,6 +76,13 @@ log = logging.getLogger(__name__)
 
 MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "7"))    # v19: era 5
 MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5")) # v19: era 1.2
+
+# v20 Opción A — early entry para señales de máxima convicción
+_FAST_ENTRY_MIN_SCORE = int(os.getenv("FAST_ENTRY_MIN_SCORE", "9"))
+_FAST_ENTRY_MIN_RR    = float(os.getenv("FAST_ENTRY_MIN_RR", "1.2"))
+
+# v20 Opción B — SL dinámico ATR puro (sin anclar a low/high de vela)
+_SL_ATR_DYNAMIC = os.getenv("SL_ATR_DYNAMIC", "false").lower() == "true"
 
 _BARS_NEEDED = int(os.getenv("BARS_NEEDED", "100"))
 
@@ -301,13 +323,22 @@ async def analyze_pair(
         tp1_mult = _TP1_ATR_MULT                                        # v19: 2.25 (era 1.5)
         tp2_mult = float(os.getenv("TP2_ATR_MULT_TENDENCIA", str(_TP2_ATR_MULT)))  # v19: 4.5
 
-    # Calcular SL ATR base
+    # v20 Opción B: SL_ATR_DYNAMIC — usa solo entry ± sl_mult×ATR sin anclar a vela
+    # El _structure_sl sigue aplicándose como capa posterior (swing 1h).
     if signal_str == "LONG":
-        sl_atr = round(min(low_price - _atr_buf, entry - sl_mult * atr_val), 6)
+        if _SL_ATR_DYNAMIC:
+            sl_atr = round(entry - sl_mult * atr_val, 6)
+            log.debug("[signal_engine] SL_ATR_DYNAMIC LONG: entry=%.6f - %.1f×ATR(%.6f) = %.6f", entry, sl_mult, atr_val, sl_atr)
+        else:
+            sl_atr = round(min(low_price - _atr_buf, entry - sl_mult * atr_val), 6)
         tp1    = round(entry + tp1_mult * atr_val, 6)
         tp2    = round(entry + tp2_mult * atr_val, 6)
     else:
-        sl_atr = round(max(high_price + _atr_buf, entry + sl_mult * atr_val), 6)
+        if _SL_ATR_DYNAMIC:
+            sl_atr = round(entry + sl_mult * atr_val, 6)
+            log.debug("[signal_engine] SL_ATR_DYNAMIC SHORT: entry=%.6f + %.1f×ATR(%.6f) = %.6f", entry, sl_mult, atr_val, sl_atr)
+        else:
+            sl_atr = round(max(high_price + _atr_buf, entry + sl_mult * atr_val), 6)
         tp1    = round(entry - tp1_mult * atr_val, 6)
         tp2    = round(entry - tp2_mult * atr_val, 6)
 
@@ -318,8 +349,11 @@ async def analyze_pair(
     reward = abs(tp1 - entry)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
 
+    # v20 Opción A — determinar entry_mode incluyendo modo FAST
     if score >= max_score - 1:
         entry_mode = "STRONG"
+    elif score >= _FAST_ENTRY_MIN_SCORE:
+        entry_mode = "FAST"      # ← nuevo: score alto pero aun no STRONG
     elif score >= MIN_SCORE + 1:
         entry_mode = "NORMAL"
     else:
@@ -327,12 +361,18 @@ async def analyze_pair(
 
     if entry_mode == "STRONG" and rr >= 1.8:
         suggested_lev = _MAX_LEV
-    elif entry_mode == "NORMAL":
+    elif entry_mode in ("NORMAL", "FAST"):
         suggested_lev = max(1, int(_MAX_LEV * 0.6))
     else:
         suggested_lev = max(1, int(_MAX_LEV * _EARLY_LEV_FACTOR))
 
-    is_valid = score >= MIN_SCORE and rr >= MIN_RR
+    # v20 Opción A — is_valid: señales FAST/STRONG con RR reducido también son válidas
+    is_fast_valid = (
+        entry_mode in ("FAST", "STRONG")
+        and score >= _FAST_ENTRY_MIN_SCORE
+        and rr >= _FAST_ENTRY_MIN_RR
+    )
+    is_valid = (score >= MIN_SCORE and rr >= MIN_RR) or is_fast_valid
 
     log.info(
         "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s | %s",
@@ -357,7 +397,7 @@ async def analyze_pair(
         indicators=indicators,
         is_valid=is_valid,
         reason="" if is_valid else f"[{setup_type}] score={score}/{max_score} rr={rr:.2f} (min {MIN_RR})",
-        extra={"setup_type": setup_type, "sl_atr": sl_atr, "sl_used": sl},
+        extra={"setup_type": setup_type, "sl_atr": sl_atr, "sl_used": sl, "is_fast": is_fast_valid},
     )
 
 
@@ -761,8 +801,9 @@ def format_signal_block(signal) -> str:
     sl_note = ""
     if signal.extra.get("sl_atr") and signal.extra.get("sl_used") != signal.extra.get("sl_atr"):
         sl_note = " [struct]"
+    fast_note = " ⚡FAST" if signal.extra.get("is_fast") else ""
     lines = [
-        f"**{signal.symbol}** · {arrow} [{mode}]",
+        f"**{signal.symbol}** · {arrow} [{mode}]{fast_note}",
         f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
     ]
     if signal.entry:
