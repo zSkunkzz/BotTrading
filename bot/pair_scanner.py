@@ -2,23 +2,21 @@
 pair_scanner.py — Escaner de pares para Hyperliquid perpetuos.
 
 BUG #4 FIX: rotacion de par sin esperar cleanup del trader
-  run_scanner_loop ahora llama on_update_callback con (new_pairs, removed)
+  run_scanner_loop ahora llama on_update_callback con (new_pairs, added, removed)
   para que main.py pueda hacer cleanup SELECTIVO de los traders salientes
-  antes de arrancar los nuevos. El callback debe:
-    1. Para cada par en 'removed': cancelar tarea, llamar trader.cleanup(),
-       y await trader._stopped_event.wait() con timeout.
-    2. Arrancar traders para pares en 'added'.
-  Si el callback solo acepta (new_pairs,), se hace fallback seguro.
+  antes de arrancar los nuevos.
 
-FIX #2 (2026-06-02): run_scanner_loop arrancaba con sleep(refresh_interval)
-  → el primer re-scan ocurría 30 minutos después del arranque.
-  Fix: mover el sleep AL FINAL del ciclo para que el primer scan sea inmediato.
+FIX #2 (2026-06-02): primer re-scan inmediato al arrancar.
 
 IA (2026-06-02): integración de news_score_adjustment()
-  Cuando AI_NEWS_FILTER=true, después de calcular el score técnico base
-  se llama a ai_filter.news_score_adjustment(coin) para cada par candidato
-  y el delta [-2.0, +2.0] se suma al score antes de ordenar.
-  Fallback seguro: si Groq falla → delta=0.0, score sin cambios.
+
+FIX ROTÓ (2026-06-03): Rotación más agresiva para buscar más trades.
+  - SCANNER_TOP_N (default 25, antes 15)
+  - SCANNER_REFRESH_MIN (default 15, antes 30)
+  - SCANNER_MIN_VOLUME (default 500_000 USDT, antes 1_000_000)
+  - SCANNER_MIN_CHANGE (default 0.3%, antes 0.5%)
+  - Score reformulado: vol 40% + cambio% 30% + funding_abs 20% + OI 10%
+  - SCANNER_EXCLUDE_LOW_LEV: omite pares con maxLev < umbral (default 3)
 """
 import logging
 import asyncio
@@ -40,11 +38,15 @@ NON_CRYPTO_BASES = {
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
 _API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
 
-# BUG #4: timeout maximo para esperar cleanup de un trader saliente
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
+_AI_NEWS_FILTER: bool  = os.getenv("AI_NEWS_FILTER", "false").lower() in ("true", "1", "yes")
 
-# IA: activar filtro de noticias con AI_NEWS_FILTER=true
-_AI_NEWS_FILTER: bool = os.getenv("AI_NEWS_FILTER", "false").lower() in ("true", "1", "yes")
+# FIX ROTÓ: parámetros configurables vía Railway
+_TOP_N          = int(float(os.getenv("SCANNER_TOP_N",           "25")))
+_REFRESH_MIN    = int(float(os.getenv("SCANNER_REFRESH_MIN",     "15")))
+_MIN_VOLUME     = float(os.getenv("SCANNER_MIN_VOLUME",          "500000"))
+_MIN_CHANGE_PCT = float(os.getenv("SCANNER_MIN_CHANGE",          "0.3"))
+_MIN_LEV        = int(float(os.getenv("SCANNER_EXCLUDE_LOW_LEV", "3")))
 
 
 async def _info_post(payload: dict) -> dict:
@@ -62,15 +64,16 @@ class PairScanner:
     def __init__(
         self,
         api_key=None, api_secret=None, passphrase=None,
-        min_volume_usdt=1_000_000,
-        min_price_change_pct=0.5,
-        top_n=15,
-        refresh_interval_min=30,
+        min_volume_usdt=None,
+        min_price_change_pct=None,
+        top_n=None,
+        refresh_interval_min=None,
     ):
-        self.min_volume_usdt      = min_volume_usdt
-        self.min_price_change_pct = min_price_change_pct
-        self.top_n                = top_n
-        self.refresh_interval     = refresh_interval_min * 60
+        # Prioridad: arg explícito → env var → default
+        self.min_volume_usdt      = min_volume_usdt      if min_volume_usdt      is not None else _MIN_VOLUME
+        self.min_price_change_pct = min_price_change_pct if min_price_change_pct is not None else _MIN_CHANGE_PCT
+        self.top_n                = top_n                if top_n                is not None else _TOP_N
+        self.refresh_interval     = (refresh_interval_min if refresh_interval_min is not None else _REFRESH_MIN) * 60
         self.active_pairs: list   = []
         self._last_scored: list   = []
 
@@ -80,6 +83,13 @@ class PairScanner:
         }
 
         self.exchange = _HLExchangeStub()
+
+        logger.info(
+            "[PairScanner] Config: top_n=%d | refresh=%dmin | "
+            "min_vol=$%s | min_change=%.1f%% | min_lev=%dx",
+            self.top_n, self.refresh_interval // 60,
+            f"{self.min_volume_usdt:,.0f}", self.min_price_change_pct, _MIN_LEV,
+        )
 
     def _is_valid(self, coin: str) -> bool:
         if coin.upper() in self.blacklist:
@@ -102,10 +112,10 @@ class PairScanner:
         self._last_scored = scored
         self.active_pairs = [s["symbol"] for s in scored]
         logger.info(
-            "[PairScanner] inject_snapshot: %d mercados activos → top %d seleccionados",
+            "[PairScanner] inject_snapshot: %d activos → top %d seleccionados",
             sum(1 for r in rows if r.active), len(scored),
         )
-        for p in scored[:5]:
+        for p in scored[:10]:
             logger.info(
                 "  %-12s Vol: $%sM | Cambio: %.2f%% | Funding: %.4f%% | MaxLev: %dx | Score: %s",
                 p["symbol"], p["volume_usdt"], p["change_pct"], p["funding"],
@@ -123,10 +133,11 @@ class PairScanner:
         universe = data[0].get("universe", []) if isinstance(data, list) and data else []
         ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
 
-        total_seen = 0
+        total_seen        = 0
         skipped_blacklist = 0
-        skipped_volume = 0
-        skipped_change = 0
+        skipped_lev       = 0
+        skipped_volume    = 0
+        skipped_change    = 0
 
         scored = []
         for i, meta in enumerate(universe):
@@ -148,6 +159,10 @@ class PairScanner:
             except (ValueError, TypeError):
                 continue
 
+            if max_lev < _MIN_LEV:
+                skipped_lev += 1
+                continue
+
             if day_volume < self.min_volume_usdt or mark_px <= 0:
                 skipped_volume += 1
                 continue
@@ -160,31 +175,37 @@ class PairScanner:
             else:
                 change_pct = None
 
+            # Score diversificado: vol + momentum + funding_extremo + OI
             score_change = change_pct if change_pct is not None else 0.0
-            # Score técnico base (sin IA)
-            score = (day_volume / 1_000_000) * 0.6 + score_change * 0.4
+            funding_abs  = abs(funding) * 10_000          # bps
+            oi_usd       = open_interest * mark_px / 1_000_000
+            vol_m        = day_volume / 1_000_000
+
+            score = (
+                vol_m        * 0.4 +
+                score_change * 0.3 +
+                funding_abs  * 0.2 +
+                oi_usd       * 0.1
+            )
+
             scored.append({
-                "symbol":        coin,
-                "volume_usdt":   round(day_volume / 1_000_000, 2),
-                "change_pct":    round(change_pct, 2) if change_pct is not None else None,
-                "last_price":    mark_px,
-                "funding":       round(funding * 100, 5),
-                "oi_usdt":       round(open_interest * mark_px / 1_000_000, 2),
-                "score":         round(score, 3),
-                "max_leverage":  max_lev,
-                "ai_delta":      0.0,  # se rellena abajo si AI_NEWS_FILTER=true
+                "symbol":       coin,
+                "volume_usdt":  round(vol_m, 2),
+                "change_pct":   round(change_pct, 2) if change_pct is not None else None,
+                "last_price":   mark_px,
+                "funding":      round(funding * 100, 5),
+                "oi_usdt":      round(oi_usd, 2),
+                "score":        round(score, 3),
+                "max_leverage": max_lev,
+                "ai_delta":     0.0,
             })
 
         logger.debug(
-            "[PairScanner] scan: total=%d | blacklist=%d | vol_filter=%d | change_filter=%d | passed=%d",
-            total_seen, skipped_blacklist, skipped_volume, skipped_change, len(scored),
+            "[PairScanner] scan: total=%d | blacklist=%d | lev=%d | vol=%d | change=%d | passed=%d",
+            total_seen, skipped_blacklist, skipped_lev, skipped_volume, skipped_change, len(scored),
         )
 
-        # ── Filtro de noticias IA ──────────────────────────────────────────────
-        # Solo activo con AI_NEWS_FILTER=true. Consulta Groq para cada par
-        # candidato y suma el delta al score técnico antes de ordenar.
-        # Todas las llamadas se lanzan en paralelo (gather) para no ralentizar
-        # el ciclo de scan con N llamadas secuenciales.
+        # ── Filtro IA de noticias ──────────────────────────────────────────────
         if _AI_NEWS_FILTER and scored:
             try:
                 from bot.ai_filter import news_score_adjustment
@@ -201,24 +222,25 @@ class PairScanner:
                         pair["score"]    = round(pair["score"] + delta, 3)
                         pair["ai_delta"] = round(delta, 2)
                 logger.info(
-                    "[PairScanner] Filtro IA aplicado — %d pares con delta != 0",
+                    "[PairScanner] IA aplicada — %d pares con delta != 0",
                     sum(1 for d in deltas if d != 0.0),
                 )
             except Exception as e:
-                logger.warning("[PairScanner] Error en filtro IA — scores sin modificar: %s", e)
-        # ──────────────────────────────────────────────────────────────────────
+                logger.warning("[PairScanner] Error filtro IA — scores sin modificar: %s", e)
+        # ─────────────────────────────────────────────────────────────
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         top = scored[:self.top_n]
         self._last_scored = top
 
-        logger.info("🏆 Top %d pares Hyperliquid seleccionados:", len(top))
-        for p in top[:5]:
+        logger.info("🏆 Top %d pares seleccionados:", len(top))
+        for p in top[:10]:
             change_str = f"{p['change_pct']}%" if p["change_pct"] is not None else "N/A"
             ai_str     = f" | IA: {p['ai_delta']:+.1f}" if p.get("ai_delta") else ""
             logger.info(
-                "  %-12s Vol: $%sM | Cambio: %s | MaxLev: %dx | Score: %s%s",
+                "  %-12s Vol:$%sM Cambio:%s OI:$%sM Fund:%.3f%% Lev:%dx Score:%.2f%s",
                 p["symbol"], p["volume_usdt"], change_str,
+                p["oi_usdt"], p["funding"],
                 p.get("max_leverage", 0), p["score"], ai_str,
             )
 
@@ -228,43 +250,15 @@ class PairScanner:
         return symbol.replace("/", "").replace(":USDT", "").replace("USDT", "").upper()
 
     async def run_scanner_loop(self, on_update_callback):
-        """
-        BUG #4 FIX: el callback recibe (new_pairs, added, removed) para
-        que main.py pueda hacer cleanup SELECTIVO antes de arrancar nuevos.
-
-        FIX #2: sleep movido AL FINAL del ciclo → primer re-scan inmediato
-        al arrancar (antes dormía 30 min antes del primer scan).
-
-        Protocolo del callback en main.py:
-          async def _on_pairs_updated(new_pairs, added, removed):
-              # 1. Cleanup traders salientes
-              for sym in removed:
-                  trader = active_traders.get(sym)
-                  if trader:
-                      task = trader_tasks.get(sym)
-                      if task: task.cancel()
-                      try:
-                          await asyncio.wait_for(
-                              trader._stopped_event.wait(),
-                              timeout=TRADER_STOP_TIMEOUT_S
-                          )
-                      except asyncio.TimeoutError:
-                          logger.warning("Trader %s no paro en tiempo", sym)
-                      await trader.cleanup()
-              # 2. Arrancar traders para pares nuevos
-              for sym in added:
-                  start_trader(sym)
-
-        Fallback: si el callback solo acepta 1 argumento (new_pairs),
-        se llama con la firma antigua para compatibilidad.
-        """
         import inspect
         cb_params = len(inspect.signature(on_update_callback).parameters)
 
         while True:
-            # FIX #2: scan ejecuta PRIMERO, sleep va al FINAL del ciclo
             try:
-                logger.info("🔍 Re-escaneando mercado Hyperliquid...")
+                logger.info(
+                    "🔍 Re-escaneando (top_n=%d | refresh=%dmin)...",
+                    self.top_n, self.refresh_interval // 60,
+                )
                 new_pairs = await self.scan()
                 if not new_pairs:
                     logger.warning("⚠️ Scanner devolvio 0 pares — manteniendo pares actuales")
@@ -281,31 +275,27 @@ class PairScanner:
                     self.active_pairs = new_pairs
 
                     if added:
-                        logger.info("➕ Nuevos pares: %s", ", ".join(added))
+                        logger.info("➕ Nuevos pares (%d): %s", len(added), ", ".join(sorted(added)))
                     if removed:
-                        logger.info("➖ Pares eliminados: %s", ", ".join(removed))
+                        logger.info("➖ Pares eliminados (%d): %s", len(removed), ", ".join(sorted(removed)))
 
                     if added or removed:
-                        # BUG #4 FIX: pasar added y removed al callback
                         if cb_params >= 3:
-                            # Nueva firma: callback(new_pairs, added, removed)
                             await on_update_callback(new_pairs, added, removed)
                         else:
-                            # Fallback: firma antigua callback(new_pairs)
                             logger.warning(
                                 "[PairScanner] Callback con firma antigua — "
                                 "traders salientes no esperaran al ciclo siguiente"
                             )
                             await on_update_callback(new_pairs)
                     else:
-                        logger.info("✅ Sin cambios en pares activos")
+                        logger.info("✅ Sin cambios en pares activos (%d pares)", len(self.active_pairs))
 
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.error("[PairScanner] Error en run_scanner_loop: %s", e, exc_info=True)
 
-            # FIX #2: sleep AL FINAL → próximo ciclo en refresh_interval
             await asyncio.sleep(self.refresh_interval)
 
 
