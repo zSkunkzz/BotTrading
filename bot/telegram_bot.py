@@ -16,7 +16,7 @@ _bot: Bot | None = None
 _POLL_TIMEOUT    = int(os.getenv("TG_POLL_TIMEOUT",    "30"))
 _HTTP_READ_TIMEOUT = int(os.getenv("TG_HTTP_READ_TIMEOUT", "45"))  # > _POLL_TIMEOUT
 
-# Token pendiente de confirmación para /stop
+# Flag pendiente de confirmación para /stop
 _STOP_PENDING: bool = False
 
 
@@ -25,9 +25,6 @@ def _get_bot() -> Bot | None:
     if _bot is None:
         token = os.getenv("TELEGRAM_TOKEN", "")
         if token:
-            # FIX httpx.ReadError: el read_timeout del cliente debe superar el
-            # poll timeout de getUpdates. De lo contrario httpx corta la
-            # conexión long-poll antes de que Telegram devuelva respuesta.
             _bot = Bot(
                 token=token,
                 request=HTTPXRequest(
@@ -240,12 +237,8 @@ async def _cmd_ksstatus(chat_id: int | str) -> None:
 
 async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
     """
-    /resetks          — re-arma el Kill Switch completamente (sin clave)
-    /resetks daily    — resetea solo contadores diarios (sin clave)
-    /ksstatus         — muestra estado sin modificar nada
-
-    El acceso está protegido únicamente por TELEGRAM_CHAT_ID: solo el chat
-    autorizado puede enviar comandos. No se requiere clave adicional.
+    /resetks          — re-arma el Kill Switch completamente
+    /resetks daily    — resetea solo contadores diarios
     """
     from bot.kill_switch import kill_switch
     bot = _get_bot()
@@ -284,11 +277,6 @@ async def _cmd_stop(chat_id: int | str, args: list[str]) -> None:
     """
     /stop          — Pide confirmación antes de parar el proceso.
     /stop confirm  — Envía SIGTERM al proceso (graceful shutdown).
-
-    El SIGTERM desencadena el finally de main() que cancela todos los tasks,
-    para el WS feed y hace cleanup del webhook antes de salir.
-    Railway detecta la caída del proceso y NO lo reinicia automáticamente
-    si el código de salida es 0 (Railway restart policy = on_failure por defecto).
     """
     global _STOP_PENDING
     bot = _get_bot()
@@ -325,16 +313,14 @@ async def _cmd_stop(chat_id: int | str, args: list[str]) -> None:
         "\U0001f6d1 <b>Parando bot...</b>\n"
         "Shutdown limpio iniciado. Las posiciones abiertas quedan con SL/TP activos."
     )
-    # Peque\u00f1a pausa para que el mensaje se env\u00ede antes de que el proceso muera
     await asyncio.sleep(1)
     os.kill(os.getpid(), signal.SIGTERM)
 
 
 async def _cmd_pause(chat_id: int | str) -> None:
     """
-    /pause — Activa KS nivel 4 (hard kill): el bot deja de abrir y gestionar
-    \u00f3rdenes pero el proceso sigue corriendo. \u00datil para pausar sin reiniciar.
-    Para reanudar: /resume
+    /pause — Activa KS L4 via hard_kill(): el bot deja de abrir y gestionar
+    órdenes pero el proceso sigue corriendo. Para reanudar: /resume
     """
     from bot.kill_switch import kill_switch
     bot = _get_bot()
@@ -347,7 +333,8 @@ async def _cmd_pause(chat_id: int | str) -> None:
         except TelegramError as e:
             logger.warning("[Telegram cmd_pause] %s", e)
 
-    await kill_switch.trigger(level=4, reason="/pause manual v\u00eda Telegram")
+    # FIX: el método correcto es hard_kill(trigger), no trigger(level, reason)
+    await kill_switch.hard_kill("/pause manual v\u00eda Telegram")
     await reply(
         "\u23f8\ufe0f <b>Bot PAUSADO</b>\n"
         "Kill Switch L4 (Hard Kill) activado.\n"
@@ -413,9 +400,6 @@ async def _polling_loop() -> None:
             logger.info("[Telegram polling] Cancelado.")
             break
         except NetworkError as e:
-            # NetworkError incluye ReadError, WriteError, etc. Son transitorios
-            # en long-polling (Telegram corta conexiones largas). No es un error
-            # real \u2014 logueamos a DEBUG para no contaminar los logs de trading.
             logger.debug("[Telegram polling] red transitoria: %s \u2014 reintentando en 10 s", e)
             await asyncio.sleep(10)
         except TelegramError as e:
