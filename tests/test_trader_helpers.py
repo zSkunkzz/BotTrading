@@ -1,6 +1,6 @@
 """tests/test_trader_helpers.py"""
 import pytest
-from bot.trader import _check_price_staleness, _adjust_levels_to_fill
+from bot.trader_helpers import _check_price_staleness, _adjust_levels_to_fill
 
 
 class TestCheckPriceStaleness:
