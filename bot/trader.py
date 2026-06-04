@@ -9,6 +9,8 @@ Responsabilidades:
       get_price(), _fetch_all_mids(), _place_tpsl(), _round_qty(), _set_leverage().
   - Estado de posición inicializado aquí (position, entry_price, sl, tp*, …).
   - _get_positions(): consulta posiciones abiertas al exchange y normaliza el resultado.
+  - get_ohlcv_fn(): devuelve un callable (symbol, timeframe, limit) -> list[OHLCV].
+  - _get_open_orders_raw(): devuelve las órdenes abiertas raw del símbolo actual.
 
 Lo que NO vive aquí (ya extraído a módulos propios):
   - OHLCV            → bot/ohlcv.py  (o OHLCVFetcher)
@@ -193,6 +195,49 @@ class FuturesTrader:
                 "size":    abs(szi),
             })
         return result
+
+    # ── OHLCV callable ────────────────────────────────────────────
+
+    def get_ohlcv_fn(self):
+        """
+        Devuelve un callable compatible con DecisionEngine / analyze_pair:
+            (symbol, timeframe, limit) -> list[OHLCV]
+
+        TradingLoop._iteration() llama trader.get_ohlcv_fn() para obtener
+        esta función y pasarla a evaluate(ohlcv=...). Delega en
+        self._hl_client.fetch_ohlcv, que debe aceptar la misma firma.
+
+        Si el cliente aún no está listo devuelve un callable que lanza
+        AttributeError con mensaje claro, para que el loop lo capture y
+        reintente en la siguiente iteración (igual que _get_positions).
+        """
+        hl = self._require_hl()
+        if hl is None:
+            def _not_ready(symbol, timeframe="15", limit=100):
+                raise AttributeError(
+                    f"[{self.symbol}] get_ohlcv_fn: HLClient no inicializado aún"
+                )
+            return _not_ready
+        return hl.fetch_ohlcv
+
+    # ── Órdenes abiertas raw ──────────────────────────────────────
+
+    async def _get_open_orders_raw(self) -> list:
+        """
+        Devuelve las órdenes abiertas raw del símbolo actual desde HLClient.
+
+        PositionManager._ensure_tpsl() llama este método (vía trader._get_open_orders_raw)
+        en lugar de acceder al cliente directamente. Devuelve [] si el cliente
+        no está listo o la llamada falla.
+        """
+        hl = self._require_hl()
+        if hl is None:
+            return []
+        try:
+            return await asyncio.to_thread(hl.get_open_orders)
+        except Exception as e:
+            logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e)
+            return []
 
     # ── Precio live ───────────────────────────────────────────────
 
