@@ -4,7 +4,7 @@ Usage: from bot.risk import RiskManager
 """
 
 from bot.risk.global_risk import GlobalRisk
-from bot.risk.pretrade import PretradeRisk
+from bot.risk.pretrade import PreTradeRisk
 from bot.risk.drawdown import DailyDrawdown
 from bot.risk.kelly import KellySizer
 from bot.risk.correlation import CorrelationGuard
@@ -15,7 +15,7 @@ class RiskManager:
 
     def __init__(self, config: dict):
         self.global_risk   = GlobalRisk(config)
-        self.pretrade      = PretradeRisk(config)
+        self.pretrade      = PreTradeRisk(config)
         self.drawdown      = DailyDrawdown(config)
         self.kelly         = KellySizer(config)
         self.correlation   = CorrelationGuard(config)
