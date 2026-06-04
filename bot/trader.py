@@ -50,6 +50,13 @@ FIX get_ohlcv WARNING spam (2026-06-05 v3):
       (default 1800s = 30 min) para reintentar coins que puedan haber
       ganado liquidez.
 
+FIX _fetch_candles endTime vela abierta (2026-06-05 v4):
+  CAUSA RAÍZ de candleSnapshot devolviendo [] para coins con datos:
+  endTime = now() caía dentro de la vela actual (aún no cerrada).
+  Hyperliquid devuelve [] silenciosamente cuando endTime está en una
+  vela abierta. Fix: endTime retrocede 1 intervalo completo para que
+  siempre apunte a la última vela cerrada.
+
 FIX _get_positions NoneType (2026-06-03):
   Cuando _master_addr está vacío (init incompleto) o HL devuelve error JSON,
   data es None o un dict sin 'assetPositions'. Fix:
@@ -486,8 +493,12 @@ class FuturesTrader:
 
     async def _fetch_candles(self, session: aiohttp.ClientSession, timeframe: str, n_bars: int) -> Optional[list]:
         interval = _TF_MINUTES.get(timeframe, 15)
-        end_ms   = int(time.time() * 1000)
-        start_ms = end_ms - (n_bars * interval * 60 * 1000)
+        interval_ms = interval * 60 * 1000
+        # FIX vela abierta: endTime retrocede 1 intervalo para apuntar siempre
+        # a la última vela CERRADA. HL devuelve [] si endTime cae en una vela
+        # aún abierta (comportamiento silencioso no documentado).
+        end_ms   = int(time.time() * 1000) - interval_ms
+        start_ms = end_ms - (n_bars * interval_ms)
 
         payload = {
             "type": "candleSnapshot",
