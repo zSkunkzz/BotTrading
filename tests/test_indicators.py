@@ -19,6 +19,21 @@ def _trending_down(n=100, start=200.0, step=1.0):
     return [start - i * step for i in range(n)]
 
 
+def _accel_up(n=120, start=100.0, coeff=0.05):
+    """Serie con aceleración creciente (cuadrática).
+
+    Una serie lineal produce una macd_line plana → la línea de señal
+    converge al mismo valor → hist ≈ 0. Con aceleración el macd_line
+    crece y la señal queda rezagada → hist > 0.
+    """
+    return [start + i * i * coeff for i in range(n)]
+
+
+def _accel_down(n=120, start=400.0, coeff=0.05):
+    """Serie con aceleración decreciente (cuadrática invertida)."""
+    return [start - i * i * coeff for i in range(n)]
+
+
 class TestEma:
     def test_empty_when_insufficient_data(self):
         assert ema([1, 2, 3], 10) == []
@@ -77,20 +92,20 @@ class TestMacd:
         assert macd([1, 2, 3], 12, 26, 9) == (0.0, 0.0, 0.0)
 
     def test_bullish_hist_in_uptrend(self):
-        """Tendencia alcista sostenida → histograma positivo.
+        """Tendencia alcista con aceleración → histograma positivo.
 
-        Necesitamos suficientes velas para que la línea de señal (9 periodos
-        del MACD line) esté por debajo del MACD line en una tendencia alcista.
-        Con 120 velas y step=2.0 la diferencia ema_fast-ema_slow es claramente
-        positiva y la señal sigue por debajo → hist > 0.
+        Una serie lineal (velocidad constante) produce una macd_line plana
+        y la señal converge al mismo valor → hist ≈ 0. Se usa una serie
+        cuadrática (aceleración) para que el macd_line sea creciente y la
+        señal quede rezagada → hist > 0.
         """
-        closes = _trending_up(120, step=2.0)
+        closes = _accel_up(120)
         _, _, hist = macd(closes, 12, 26, 9)
         assert hist > 0
 
     def test_bearish_hist_in_downtrend(self):
-        """Tendencia bajista sostenida → histograma negativo."""
-        closes = _trending_down(120, step=2.0)
+        """Tendencia bajista con aceleración → histograma negativo."""
+        closes = _accel_down(120)
         _, _, hist = macd(closes, 12, 26, 9)
         assert hist < 0
 
