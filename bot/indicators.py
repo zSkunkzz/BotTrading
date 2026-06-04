@@ -29,15 +29,18 @@ def macd(closes, fast=12, slow=26, signal=9):
         return 0.0, 0.0, 0.0
     ema_fast = ema(closes, fast)
     ema_slow = ema(closes, slow)
-    # Alinear por el final: ema_slow es siempre la más corta
-    diff = len(ema_fast) - len(ema_slow)
-    macd_line = [ema_fast[diff + i] - ema_slow[i] for i in range(len(ema_slow))]
+    # ema_fast tiene (slow - fast) elementos más que ema_slow.
+    # Recortamos el inicio de ema_fast para que ambas listas
+    # correspondan a las mismas velas (alineación temporal correcta).
+    offset = len(ema_fast) - len(ema_slow)
+    macd_line = [ema_fast[offset + i] - ema_slow[i] for i in range(len(ema_slow))]
     signal_line = ema(macd_line, signal)
     if not signal_line:
         return 0.0, 0.0, 0.0
-    m = round(macd_line[-1], 8)
+    # Alinear macd_line con signal_line (signal_line es más corta)
+    sig_offset = len(macd_line) - len(signal_line)
+    m = round(macd_line[sig_offset + len(signal_line) - 1], 8)
     s = round(signal_line[-1], 8)
-    # Histograma: 8 decimales para no truncar diferencias pequeñas a 0.0
     return m, s, round(m - s, 8)
 
 def atr(highs, lows, closes, period=14):
