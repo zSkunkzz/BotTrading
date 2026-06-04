@@ -35,9 +35,10 @@ def macd(closes, fast=12, slow=26, signal=9):
     signal_line = ema(macd_line, signal)
     if not signal_line:
         return 0.0, 0.0, 0.0
-    m = round(macd_line[-1], 6)
-    s = round(signal_line[-1], 6)
-    return m, s, round(m - s, 6)
+    m = round(macd_line[-1], 8)
+    s = round(signal_line[-1], 8)
+    # Histograma: 8 decimales para no truncar diferencias pequeñas a 0.0
+    return m, s, round(m - s, 8)
 
 def atr(highs, lows, closes, period=14):
     trs = []
