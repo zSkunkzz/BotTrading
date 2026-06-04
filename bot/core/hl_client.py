@@ -36,6 +36,11 @@ FIX CRÍTICO (2026-06-01):
 FIX float_to_wire rounding (2026-06-02):
   place_sl / place_tp redondean sz a szDecimals antes de pasarlo al SDK.
 
+FIX fetch_ohlcv (2026-06-04):
+  HLClient no exponía fetch_ohlcv, causando AttributeError en todos los traders
+  al arrancar. Añadido fetch_ohlcv() que delega en self._info.candles_snapshot()
+  y normaliza la respuesta al formato CCXT [[ts, o, h, l, c, v], ...].
+
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -75,6 +80,29 @@ _TP_LIMIT_BUFFER = 0.001
 
 POST_FILL_CONFIRM_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
 POST_FILL_CONFIRM_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
+
+# Mapping from CCXT-style timeframe strings to Hyperliquid interval strings
+_TIMEFRAME_TO_HL: dict[str, str] = {
+    "1m":  "1m",
+    "3m":  "3m",
+    "5m":  "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h":  "1h",
+    "2h":  "2h",
+    "4h":  "4h",
+    "8h":  "8h",
+    "12h": "12h",
+    "1d":  "1d",
+    # Numeric aliases (legacy callers passing bare numbers as strings)
+    "1":   "1m",
+    "5":   "5m",
+    "15":  "15m",
+    "30":  "30m",
+    "60":  "1h",
+    "240": "4h",
+    "1440":"1d",
+}
 
 
 def _norm_coin(symbol: str) -> str:
@@ -652,6 +680,65 @@ class HLClient:
                 o["limit_px"] = self.round_px(float(o["limit_px"]))
             cleaned.append(o)
         return self._exchange.bulk_orders(cleaned)
+
+    # ── OHLCV ─────────────────────────────────────────────────────
+
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "15m",
+        limit: int = 200,
+    ) -> list[list]:
+        """
+        Descarga velas OHLCV desde Hyperliquid y las devuelve en el formato
+        estándar CCXT: [[timestamp_ms, open, high, low, close, volume], ...]
+
+        Parámetros
+        ----------
+        symbol    : ignorado (se usa self.coin, mantenido por compatibilidad de firma)
+        timeframe : string CCXT («1m», «5m», «15m», «1h», «4h», «1d») o alias
+                    numérico («15», «60», «240»). Defecto: «15m».
+        limit     : número de velas a pedir. Defecto: 200.
+
+        El SDK de Hyperliquid (Info.candles_snapshot) devuelve una lista de dicts:
+            {"t": <open_time_ms>, "T": <close_time_ms>,
+             "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume",
+             "n": <num_trades>}
+        """
+        hl_interval = _TIMEFRAME_TO_HL.get(timeframe, timeframe)
+        try:
+            raw: list[dict] = self._info.candles_snapshot(
+                coin=self.coin,
+                interval=hl_interval,
+                startTime=0,
+                endTime=0,
+            )
+        except TypeError:
+            # Older SDK versions may not accept startTime/endTime kwargs
+            raw = self._info.candles_snapshot(self.coin, hl_interval)
+
+        if not raw:
+            return []
+
+        # Trim to `limit` most-recent candles
+        if len(raw) > limit:
+            raw = raw[-limit:]
+
+        result = []
+        for c in raw:
+            try:
+                result.append([
+                    int(c["t"]),
+                    float(c["o"]),
+                    float(c["h"]),
+                    float(c["l"]),
+                    float(c["c"]),
+                    float(c["v"]),
+                ])
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.debug("[%s] fetch_ohlcv: vela malformada ignorada: %s | %s", self.coin, c, exc)
+
+        return result
 
     # ── CONSULTAS INFO ────────────────────────────────────────────────
 
