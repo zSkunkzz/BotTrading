@@ -26,13 +26,13 @@ def _check_price_staleness(
     the signal's entry price to be worth entering, else return ``None``.
 
     Rules (symmetric for long/short):
-    - Entry missing or zero  → skip (returns reason).
+    - Entry missing or zero  → skip silently (returns None, does not block).
     - Adverse drift > STALE_DRIFT_PCT → skip.
     - |drift| > STALE_ABS_PCT in either direction → skip.
     """
     entry = float(signal.get("entry") or 0)
     if entry <= 0:
-        return "signal entry is zero or missing"
+        return None  # Cannot validate without an entry price; allow trade through.
 
     drift = (current_price - entry) / entry  # positive = price rose
 

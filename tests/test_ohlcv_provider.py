@@ -163,19 +163,26 @@ class TestSemaphore:
         """Con Semaphore(1) dos fetches concurrentes se ejecutan en serie."""
         sem = asyncio.Semaphore(1)
         provider = _make_provider(semaphore=sem)
-        order: list[int] = []
+        order: list[str] = []
 
-        async def slow_fetch(*_args, **_kwargs):
+        # hl_http.get_candles is a *sync* function inside an async method.
+        # To instrument concurrent ordering we replace it with an AsyncMock
+        # whose side_effect appends to `order` and yields via sleep(0) so
+        # the event loop can interleave the two gather'd coroutines.
+        async def _slow(*_args, **_kwargs):
             order.append("start")
-            await asyncio.sleep(0)  # cede el control
+            await asyncio.sleep(0)  # yield — lets the other coroutine try to acquire sem
             order.append("end")
             return FAKE_BARS
 
-        with patch("bot.infra.ohlcv_provider.hl_http.get_candles", side_effect=slow_fetch):
+        mock_gc = AsyncMock(side_effect=_slow)
+
+        with patch("bot.infra.ohlcv_provider.hl_http.get_candles", mock_gc), \
+             patch("bot.infra.ohlcv_provider.asyncio.sleep", new_callable=AsyncMock):
             await asyncio.gather(
                 provider.fetch(SYMBOL, INTERVAL),
                 provider.fetch(SYMBOL, INTERVAL),
             )
 
-        # Con sem=1 el orden debe ser start, end, start, end (nunca start, start)
+        # With sem=1 the order must be start, end, start, end (never start, start)
         assert order == ["start", "end", "start", "end"]
