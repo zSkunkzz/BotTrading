@@ -27,13 +27,16 @@ FIX FREEZE (2026-06-03):
 FIX DEADLOCK (2026-06-03 anterior):
   Todas las llamadas al SDK síncrono se envuelven en asyncio.to_thread().
 
-FIX get_ohlcv None (2026-06-03):
+FIX get_ohlcv None (2026-06-03 / 2026-06-05 v2):
   Hyperliquid candleSnapshot devuelve null (Python None) cuando startTime
   es demasiado antiguo o el request falla silenciosamente.
   Fixes:
     - Reducir startTime: n = BARS_NEEDED (sin el +20 extra).
-    - Guard: si raw is None, retry 1 vez con ventana aún más corta.
+    - Guard: si raw is None, retry exponencial (hasta 3 intentos con
+      ventana reducida: 100% → 66% → 33%).
     - Log del status HTTP y body truncado cuando no es lista.
+    - CORRECCIÓN BUG: faltaba 'timeframe' como argumento en logger del except.
+    - WARNING de retry → DEBUG (es comportamiento normal intermitente).
 
 FIX _get_positions NoneType (2026-06-03):
   Cuando _master_addr está vacío (init incompleto) o HL devuelve error JSON,
@@ -46,11 +49,12 @@ FIX NameError aiohttp (2026-06-03):
   _fetch_candles usaba aiohttp.ClientTimeout pero el import estaba solo
   dentro de get_ohlcv (scope distinto). Movido al nivel de módulo.
 
-FIX get_price NoneType (2026-06-03):
+FIX get_price NoneType (2026-06-03 / 2026-06-05 v2):
   Si HL devuelve null, un error HTTP, o un body no-dict (e.g. string de error),
   data.get(self.coin) lanzaba 'NoneType object has no attribute get'.
   Fix: guard isinstance(data, dict) antes de llamar .get().
   Si data no es dict → raise ValueError con el body truncado para diagnóstico.
+  v2: WARNING → DEBUG cuando hay caché válida; WARNING solo en cold-start sin precio.
 
 FIX _ensure_tpsl spam (2026-06-03):
   En Hyperliquid, los SL/TP colocados con place_sl/place_tp son TRIGGER ORDERS
@@ -65,15 +69,17 @@ FIX OHLCV semáforo (2026-06-03):
   El semáforo se inicializa lazy en get_ohlcv() la primera vez que se llama
   (dentro del event loop), evitando el error de "attached to a different loop".
 
-FIX allMids NoneType — retry + caché último precio (2026-06-04):
+FIX allMids NoneType — retry + caché último precio (2026-06-04 / 2026-06-05 v2):
   Cuando HL devuelve null en allMids (cold-start o saturación puntual),
   get_price() ahora:
     1. Reintenta 1 vez tras 0.4s si data no es dict.
     2. Si sigue fallando, devuelve self._last_price (último precio válido
        cacheado) en lugar de propagar la excepción — el tick se procesa
-       con el precio anterior y el WARNING queda silenciado.
+       con el precio anterior.
     3. Si _last_price == 0 (primer arranque y falla) → propaga excepción.
     4. Cada llamada exitosa actualiza self._last_price.
+    5. v2: los logs de uso de caché son DEBUG, no WARNING, para evitar
+       spam en operación normal con pequeñas interrupciones de red.
 """
 from __future__ import annotations
 
@@ -101,6 +107,14 @@ _API_URL = (
 
 _OHLCV_BARS = int(os.getenv("BARS_NEEDED", "100"))
 _OHLCV_MAX_CONCURRENCY = int(os.getenv("OHLCV_MAX_CONCURRENCY", "5"))
+
+# Esperas (segundos) entre reintentos OHLCV: intento 1→2 y 2→3.
+# Se puede sobreescribir con OHLCV_RETRY_DELAYS="0.5,1.0"
+_OHLCV_RETRY_DELAYS_RAW = os.getenv("OHLCV_RETRY_DELAYS", "0.5,1.5")
+try:
+    _OHLCV_RETRY_DELAYS = [float(x) for x in _OHLCV_RETRY_DELAYS_RAW.split(",") if x.strip()]
+except Exception:
+    _OHLCV_RETRY_DELAYS = [0.5, 1.5]
 
 _TF_MINUTES = {
     "1m":  1,
@@ -332,16 +346,31 @@ class FuturesTrader:
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
                 text = await resp.text()
-            data = _json.loads(text)
+
+            try:
+                data = _json.loads(text)
+            except _json.JSONDecodeError:
+                logger.debug(
+                    "[%s] allMids: respuesta no-JSON (status=%s): %s",
+                    self.symbol, resp.status, text[:200],
+                )
+                return None
+
             if isinstance(data, dict):
                 return data
-            logger.warning(
-                "[%s] allMids devolvió tipo inesperado (%s): %s",
+
+            # Respuesta inesperada — logueamos solo en DEBUG para no spamear
+            # (el caller decide si escalar a WARNING según si tiene caché).
+            logger.debug(
+                "[%s] allMids: tipo inesperado (%s): %s",
                 self.symbol, type(data).__name__, text[:120],
             )
             return None
+        except asyncio.TimeoutError:
+            logger.debug("[%s] allMids: timeout", self.symbol)
+            return None
         except Exception as e:
-            logger.warning("[%s] allMids error: %s", self.symbol, e)
+            logger.debug("[%s] allMids error: %s", self.symbol, e)
             return None
 
     async def get_price(self) -> float:
@@ -354,6 +383,8 @@ class FuturesTrader:
           3. Si sigue fallando → usa self._last_price (caché del último
              precio válido). Sólo propaga excepción si no hay caché.
           4. Cada precio válido actualiza self._last_price.
+          5. Los logs de caché son DEBUG (no WARNING) para evitar spam
+             durante interrupciones breves de red.
         """
         async with aiohttp.ClientSession() as session:
             data = await self._fetch_all_mids(session)
@@ -366,19 +397,24 @@ class FuturesTrader:
         if data is None:
             # Fallback a último precio válido conocido
             if self._last_price > 0:
-                logger.warning(
-                    "[%s] allMids falló tras retry — usando último precio válido en caché: %.4f",
+                logger.debug(
+                    "[%s] allMids no disponible — usando último precio en caché: %.4f",
                     self.symbol, self._last_price,
                 )
                 return self._last_price
+            # Cold-start sin caché: esto sí merece WARNING
+            logger.warning(
+                "[%s] allMids devolvió tipo inesperado (NoneType): null — sin caché disponible",
+                self.symbol,
+            )
             raise ValueError(
-                f"[{self.symbol}] allMids devolvió tipo inesperado (NoneType): null"
+                f"[{self.symbol}] allMids no disponible y sin precio en caché"
             )
 
         price = data.get(self.coin)
         if price is None:
             if self._last_price > 0:
-                logger.warning(
+                logger.debug(
                     "[%s] Precio no encontrado en allMids — usando caché: %.4f",
                     self.symbol, self._last_price,
                 )
@@ -389,7 +425,7 @@ class FuturesTrader:
         self._last_price = result  # actualizar caché
         return result
 
-    async def _fetch_candles(self, session, timeframe: str, n_bars: int):
+    async def _fetch_candles(self, session: aiohttp.ClientSession, timeframe: str, n_bars: int) -> Optional[list]:
         interval = _TF_MINUTES.get(timeframe, 15)
         end_ms   = int(time.time() * 1000)
         start_ms = end_ms - (n_bars * interval * 60 * 1000)
@@ -403,49 +439,79 @@ class FuturesTrader:
                 "endTime":   end_ms,
             },
         }
-        async with session.post(
-            f"{_API_URL}/info",
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            text = await resp.text()
-            try:
-                return _json.loads(text)
-            except Exception:
-                logger.warning(
-                    "[%s] get_ohlcv(%s): respuesta no-JSON (status=%s): %s",
-                    self.symbol, timeframe, resp.status, text[:200],
-                )
-                return None
+        try:
+            async with session.post(
+                f"{_API_URL}/info",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                text = await resp.text()
+                try:
+                    return _json.loads(text)
+                except _json.JSONDecodeError:
+                    logger.debug(
+                        "[%s] get_ohlcv(%s): respuesta no-JSON (status=%s): %s",
+                        self.symbol, timeframe, resp.status, text[:200],
+                    )
+                    return None
+        except asyncio.TimeoutError:
+            logger.debug("[%s] get_ohlcv(%s): timeout en _fetch_candles", self.symbol, timeframe)
+            return None
+        except Exception as e:
+            logger.debug("[%s] get_ohlcv(%s): error en _fetch_candles: %s", self.symbol, timeframe, e)
+            return None
 
     async def get_ohlcv(self, timeframe: str) -> list:
-        n = _OHLCV_BARS
+        """
+        Descarga velas OHLCV con reintentos exponenciales.
+
+        Estrategia de reintentos:
+          - Intento 0: BARS_NEEDED (100% de barras)
+          - Intento 1: 66% de barras, tras OHLCV_RETRY_DELAYS[0] s
+          - Intento 2: 33% de barras, tras OHLCV_RETRY_DELAYS[1] s
+          - Si sigue fallando → devuelve []
+        Los reintentos se logean en DEBUG, no WARNING, para evitar spam.
+        Solo se emite WARNING si los 3 intentos fallan.
+        """
+        n_bars_sequence = [
+            _OHLCV_BARS,
+            max(20, _OHLCV_BARS * 2 // 3),
+            max(10, _OHLCV_BARS // 3),
+        ]
         sem = _get_ohlcv_semaphore()
 
+        raw = None
         try:
             async with sem:
                 async with aiohttp.ClientSession() as session:
-                    raw = await self._fetch_candles(session, timeframe, n)
+                    for attempt, n_bars in enumerate(n_bars_sequence):
+                        raw = await self._fetch_candles(session, timeframe, n_bars)
 
-                    if raw is None or not isinstance(raw, list):
-                        logger.warning(
-                            "[%s] get_ohlcv(%s) respuesta inesperada (tipo=%s val=%r) — "
-                            "reintentando con ventana reducida...",
-                            self.symbol, timeframe, type(raw).__name__, raw,
-                        )
-                        raw = await self._fetch_candles(session, timeframe, n // 2)
+                        if isinstance(raw, list) and len(raw) > 0:
+                            break  # éxito
 
-                    if raw is None or not isinstance(raw, list):
-                        logger.warning(
-                            "[%s] get_ohlcv(%s) sigue sin ser lista tras retry (tipo=%s) — "
-                            "devolviendo lista vacía.",
-                            self.symbol, timeframe, type(raw).__name__,
-                        )
-                        return []
+                        if attempt < len(n_bars_sequence) - 1:
+                            delay = _OHLCV_RETRY_DELAYS[attempt] if attempt < len(_OHLCV_RETRY_DELAYS) else 1.0
+                            logger.debug(
+                                "[%s] get_ohlcv(%s) intento %d/%d: respuesta no válida "
+                                "(tipo=%s) — reintentando con %d barras en %.1fs...",
+                                self.symbol, timeframe,
+                                attempt + 1, len(n_bars_sequence),
+                                type(raw).__name__, n_bars_sequence[attempt + 1], delay,
+                            )
+                            await asyncio.sleep(delay)
 
         except Exception as e:
-            logger.warning("[%s] get_ohlcv(%s) error: %s", self.symbol, e)
+            # BUG FIX: faltaba 'timeframe' como argumento en la versión anterior
+            logger.warning("[%s] get_ohlcv(%s) excepción inesperada: %s", self.symbol, timeframe, e)
+            return []
+
+        if raw is None or not isinstance(raw, list) or len(raw) == 0:
+            logger.warning(
+                "[%s] get_ohlcv(%s) sin datos tras %d intentos — devolviendo lista vacía.",
+                self.symbol, timeframe, len(n_bars_sequence),
+            )
             return []
 
         bars = []
