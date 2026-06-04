@@ -7,6 +7,8 @@ Responsabilidades:
   - Bootstrap del SDK exchange-specific (_get_ccxt, _require_hl).
   - Primitivas de exchange que el executor y el position manager necesitan vía interfaz:
       get_price(), _fetch_all_mids(), _place_tpsl(), _round_qty(), _set_leverage().
+  - Estado de posición inicializado aquí (position, entry_price, sl, tp*, …).
+  - _get_positions(): consulta posiciones abiertas al exchange y normaliza el resultado.
 
 Lo que NO vive aquí (ya extraído a módulos propios):
   - OHLCV            → bot/ohlcv.py  (o OHLCVFetcher)
@@ -76,6 +78,24 @@ class FuturesTrader:
         # Caché del último precio válido (resiliencia ante fallos de allMids)
         self._last_price: float = 0.0
 
+        # ── Estado de posición ────────────────────────────────────────────────
+        # Estos atributos son escritos por TradingLoop._init() (restauración
+        # desde disco) y por TradingLoop._iteration() (sincronización con el
+        # exchange). Se declaran aquí para que existan antes de cualquier lectura
+        # y para dejar claro cuál es el estado inicial de un trader recién creado.
+        self.position:       Optional[str]   = None   # "long" | "short" | None
+        self.entry_price:    Optional[float] = None
+        self.sl:             Optional[float] = None
+        self.tp1:            Optional[float] = None
+        self.tp2:            Optional[float] = None
+        self.tp3:            Optional[float] = None
+        self.tp2_hit:        bool            = False
+        self._open_notional: float           = 0.0
+        self._open_leverage: int             = leverage
+        self._open_qty:      float           = 0.0
+        self._protection_ok: bool            = False
+        self._tp1_be_done:   bool            = False
+
         self._stopped_event = asyncio.Event()
         self._trading_loop  = TradingLoop(symbol)
         self._ccxt_exchange  = None
@@ -128,6 +148,51 @@ class FuturesTrader:
             )
             return None
         return self._hl_client
+
+    # ── Posiciones ────────────────────────────────────────────────
+
+    async def _get_positions(self) -> list:
+        """
+        Obtiene las posiciones abiertas de self.coin desde el exchange y
+        normaliza el resultado al formato que TradingLoop espera:
+            [{"side": "long"|"short", "entryPx": float, "size": float}, ...]
+
+        HLClient.get_positions() devuelve los objetos crudos de HL:
+            [{"position": {"coin": ..., "szi": ..., "entryPx": ..., ...}, ...}, ...]
+
+        Filtra la posición activa (szi != 0) y convierte al formato interno.
+        Devuelve [] si no hay posición, el cliente no está listo, o falla la llamada.
+        """
+        hl = self._require_hl()
+        if hl is None:
+            return []
+        try:
+            raw: list = await asyncio.to_thread(hl.get_positions)
+        except Exception as e:
+            logger.warning("[%s] _get_positions error: %s", self.symbol, e)
+            return []
+
+        result = []
+        for entry in raw:
+            pos = entry.get("position", {})
+            szi_str = str(pos.get("szi", "0"))
+            try:
+                szi = float(szi_str)
+            except (ValueError, TypeError):
+                continue
+            if szi == 0:
+                continue
+            side = "long" if szi > 0 else "short"
+            try:
+                entry_px = float(pos.get("entryPx") or 0)
+            except (ValueError, TypeError):
+                entry_px = 0.0
+            result.append({
+                "side":    side,
+                "entryPx": entry_px,
+                "size":    abs(szi),
+            })
+        return result
 
     # ── Precio live ───────────────────────────────────────────────
 
