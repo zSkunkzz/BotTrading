@@ -61,7 +61,6 @@ class TestRsi:
 
     def test_neutral_oscillating(self):
         """Serie sin tendencia clara con alternancia +1/-1 → RSI cerca de 50."""
-        # Alternancia perfecta: la mitad sube, la mitad baja → RSI ≈ 50
         closes = [100.0]
         for i in range(79):
             closes.append(closes[-1] + (1.0 if i % 2 == 0 else -1.0))
@@ -78,15 +77,20 @@ class TestMacd:
         assert macd([1, 2, 3], 12, 26, 9) == (0.0, 0.0, 0.0)
 
     def test_bullish_hist_in_uptrend(self):
-        """Tendencia alcista sostenida con suficientes velas → histograma positivo."""
-        # Necesitamos >= 26 + 9 = 35 velas para que la señal se calcule bien
-        closes = _trending_up(80, step=2.0)
+        """Tendencia alcista sostenida → histograma positivo.
+
+        Necesitamos suficientes velas para que la línea de señal (9 periodos
+        del MACD line) esté por debajo del MACD line en una tendencia alcista.
+        Con 120 velas y step=2.0 la diferencia ema_fast-ema_slow es claramente
+        positiva y la señal sigue por debajo → hist > 0.
+        """
+        closes = _trending_up(120, step=2.0)
         _, _, hist = macd(closes, 12, 26, 9)
         assert hist > 0
 
     def test_bearish_hist_in_downtrend(self):
         """Tendencia bajista sostenida → histograma negativo."""
-        closes = _trending_down(80, step=2.0)
+        closes = _trending_down(120, step=2.0)
         _, _, hist = macd(closes, 12, 26, 9)
         assert hist < 0
 
@@ -122,7 +126,6 @@ class TestSupertrend:
     def test_bullish_in_strong_uptrend(self):
         """Tendencia alcista clara con ATR pequeño relativo al avance → Supertrend 1."""
         closes = _trending_up(60, step=2.0)
-        # high/low muy ceñidos al cierre para ATR bajo → banda estrecha
         highs  = [c + 0.5 for c in closes]
         lows   = [c - 0.5 for c in closes]
         direction, _ = supertrend(highs, lows, closes, 10, 1.5)

@@ -11,7 +11,7 @@ from bot.position_manager import (
 )
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────────────────────
 
 def _make_trader(
     symbol="BTCUSDC",
@@ -41,6 +41,9 @@ def _make_trader(
     t._get_open_trigger_orders_raw  = AsyncMock(return_value=[])
     t._place_tpsl                   = AsyncMock()
     t._close_position               = AsyncMock()
+    # _round_qty devuelve siempre el mismo qty para que _round_qty_safe
+    # retorne float(qty) en lugar de un MagicMock
+    t._round_qty = MagicMock(return_value=qty)
     return t
 
 
@@ -52,7 +55,7 @@ def _tp_order(price=110.0):
     return {"orderType": {"trigger": {"tpsl": "tp"}}, "coin": "BTCUSDC", "limitPx": str(price)}
 
 
-# ── _get_tpsl_type ─────────────────────────────────────────────────────────────
+# ── _get_tpsl_type ───────────────────────────────────────────────────────────────────────────
 
 class TestGetTpslType:
     def test_via_orderType_trigger(self):
@@ -75,7 +78,7 @@ class TestGetTpslType:
         assert _get_tpsl_type(o) is None
 
 
-# ── _is_reduce_only ────────────────────────────────────────────────────────────
+# ── _is_reduce_only ──────────────────────────────────────────────────────────────────────────
 
 class TestIsReduceOnly:
     def test_reduce_only_flag(self):
@@ -91,7 +94,7 @@ class TestIsReduceOnly:
         assert not _is_reduce_only({"orderType": {}})
 
 
-# ── _resolve_is_long ──────────────────────────────────────────────────────────
+# ── _resolve_is_long ─────────────────────────────────────────────────────────────────────────
 
 class TestResolveIsLong:
     def test_str_long(self):
@@ -116,7 +119,7 @@ class TestResolveIsLong:
         assert _resolve_is_long(None) is False
 
 
-# ── _round_qty_safe ───────────────────────────────────────────────────────────
+# ── _round_qty_safe ─────────────────────────────────────────────────────────────────────────
 
 class TestRoundQtySafe:
     def test_uses_trader_round_qty(self):
@@ -136,7 +139,7 @@ class TestRoundQtySafe:
         assert result == round(0.1234, 4)
 
 
-# ── _calc_fallback_tp ─────────────────────────────────────────────────────────
+# ── _calc_fallback_tp ────────────────────────────────────────────────────────────────────────
 
 class TestCalcFallbackTp:
     def test_long_positive_rr(self):
@@ -157,7 +160,7 @@ class TestCalcFallbackTp:
         assert _calc_fallback_tp(100.0, 100.0, True, 2.0) is None
 
 
-# ── _check_sl_software ────────────────────────────────────────────────────────
+# ── _check_sl_software ────────────────────────────────────────────────────────────────────────
 
 class TestCheckSlSoftware:
     @pytest.mark.asyncio
@@ -204,7 +207,7 @@ class TestCheckSlSoftware:
         t._close_position.assert_not_awaited()
 
 
-# ── _check_break_even ─────────────────────────────────────────────────────────
+# ── _check_break_even ────────────────────────────────────────────────────────────────────────
 
 class TestCheckBreakEven:
     @pytest.mark.asyncio
@@ -212,7 +215,6 @@ class TestCheckBreakEven:
         t = _make_trader(tp1_be_done=True)
         pm = PositionManager(t)
         await pm._check_break_even()
-        # no cambia sl
         assert t.sl == 97.0
 
     @pytest.mark.asyncio
@@ -230,7 +232,6 @@ class TestCheckBreakEven:
         pm = PositionManager(t)
         await pm._check_break_even()
         assert t._tp1_be_done is True
-        # En dry_run el sl se actualiza igualmente en memoria
         assert t.sl == pytest.approx(100.0, abs=0.001)
 
     @pytest.mark.asyncio
@@ -250,7 +251,7 @@ class TestCheckBreakEven:
         await pm._check_break_even()  # no debe lanzar
 
 
-# ── _ensure_tpsl ─────────────────────────────────────────────────────────────
+# ── _ensure_tpsl ───────────────────────────────────────────────────────────────────────────
 
 class TestEnsureTpsl:
     @pytest.mark.asyncio
@@ -304,14 +305,12 @@ class TestEnsureTpsl:
     async def test_fallback_by_price_detects_sl(self):
         """Bug B: detecta SL por precio cuando el campo tpsl no viene."""
         t = _make_trader(sl=97.0)
-        # Orden reduce_only sin campo tpsl, pero precio muy cercano al SL
         order = {"coin": "BTCUSDC", "reduceOnly": True, "limitPx": "97.01"}
         tp_order = _tp_order()
         t._get_open_orders_raw         = AsyncMock(return_value=[order, tp_order])
         t._get_open_trigger_orders_raw = AsyncMock(return_value=[])
         pm = PositionManager(t)
         await pm._ensure_tpsl()
-        # SL detectado por fallback → no emergencia
         t._place_tpsl.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -323,7 +322,7 @@ class TestEnsureTpsl:
         await pm._ensure_tpsl()  # no debe lanzar
 
 
-# ── _place_emergency_sl_tp ─────────────────────────────────────────────────────
+# ── _place_emergency_sl_tp ──────────────────────────────────────────────────────────────────────
 
 class TestPlaceEmergencySlTp:
     @pytest.mark.asyncio
@@ -336,7 +335,10 @@ class TestPlaceEmergencySlTp:
 
     @pytest.mark.asyncio
     async def test_zero_qty_skips(self):
+        """qty=0.0 → _round_qty_safe retorna 0.0 → se salta la orden."""
         t = _make_trader(qty=0.0)
+        # Asegurar que _round_qty devuelva 0.0 para que float(0.0) == 0.0
+        t._round_qty = MagicMock(return_value=0.0)
         pm = PositionManager(t)
         await pm._place_emergency_sl_tp(place_sl=True, place_tp=True)
         t._place_tpsl.assert_not_awaited()
@@ -349,7 +351,6 @@ class TestPlaceEmergencySlTp:
         t.tp  = None
         pm = PositionManager(t)
         await pm._place_emergency_sl_tp(place_sl=False, place_tp=True)
-        # TP calculado dinámicamente: entry=100, sl=97 → risk=3, rr=1.5 → tp=104.5
         assert t.tp1 is not None
         assert t.tp1 > 100.0
 
@@ -365,15 +366,13 @@ class TestPlaceEmergencySlTp:
 
         t._place_tpsl = failing_place_tpsl
         pm = PositionManager(t)
-        # Parchear asyncio.sleep para no esperar
         with patch("bot.position_manager.asyncio.sleep", new=AsyncMock()):
             await pm._place_emergency_sl_tp(place_sl=True, place_tp=False)
-        # Debe haber reintentado EMERGENCY_TPSL_RETRIES veces
         from bot.position_manager import _EMERGENCY_TPSL_RETRIES
         assert call_count == _EMERGENCY_TPSL_RETRIES
 
 
-# ── _emergency_close ─────────────────────────────────────────────────────────
+# ── _emergency_close ────────────────────────────────────────────────────────────────────────
 
 class TestEmergencyClose:
     @pytest.mark.asyncio

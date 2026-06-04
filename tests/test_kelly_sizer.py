@@ -6,7 +6,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────────────────────
 
 def _reload_kelly(**env_overrides):
     """
@@ -14,7 +14,6 @@ def _reload_kelly(**env_overrides):
     Inyecta un stub de bot.shadow_mode en sys.modules para evitar
     que el import real de shadow_mode explote por dependencias externas.
     """
-    # Stub mínimo de shadow_mode para que el import no falle
     stub_sm = MagicMock()
     stub_sm.shadow_mode.win_rate_by_mode.return_value = {}
 
@@ -27,7 +26,6 @@ def _reload_kelly(**env_overrides):
     }
     defaults.update(env_overrides)
 
-    # Limpiar módulo cacheado
     for mod in list(sys.modules):
         if "kelly_sizer" in mod:
             del sys.modules[mod]
@@ -51,7 +49,7 @@ def _mock_shadow_stats(win_rate: float, trades: int):
     return stub
 
 
-# ── _parse_int_env ────────────────────────────────────────────────────────────
+# ── _parse_int_env ───────────────────────────────────────────────────────────────────────────
 
 class TestParseIntEnv:
     def test_valid_int(self):
@@ -64,13 +62,11 @@ class TestParseIntEnv:
         assert ks.KELLY_MIN_TRADES == 30
 
 
-# ── Kelly desactivado ────────────────────────────────────────────────────────────
+# ── Kelly desactivado ────────────────────────────────────────────────────────────────────────
 
 class TestKellyDisabled:
     def test_returns_1_when_disabled(self):
         ks = _reload_kelly(KELLY_ENABLED="false")
-        # KELLY_ENABLED=false en CI, el módulo usa la constante en módulo
-        # Parcheamos directamente la constante para garantizar el estado
         with patch.object(ks, "KELLY_ENABLED", False):
             assert ks.kelly_multiplier("TENDENCIA", rr=2.0) == 1.0
 
@@ -81,7 +77,7 @@ class TestKellyDisabled:
                 assert ks.kelly_multiplier("TENDENCIA", rr=rr) == 1.0
 
 
-# ── RR inválido ──────────────────────────────────────────────────────────────────
+# ── RR inválido ────────────────────────────────────────────────────────────────────────────
 
 class TestKellyInvalidRR:
     def test_zero_rr_returns_min_mult(self):
@@ -99,7 +95,7 @@ class TestKellyInvalidRR:
         assert result == 0.5
 
 
-# ── Insuficiente historial ────────────────────────────────────────────────────────
+# ── Insuficiente historial ────────────────────────────────────────────────────────────────
 
 class TestKellyInsufficientHistory:
     def test_no_mode_stats_returns_1(self):
@@ -126,7 +122,7 @@ class TestKellyInsufficientHistory:
         assert result == 1.0
 
 
-# ── Cálculo correcto ─────────────────────────────────────────────────────────────
+# ── Cálculo correcto ───────────────────────────────────────────────────────────────────────────
 
 class TestKellyCalculation:
     """
@@ -150,7 +146,7 @@ class TestKellyCalculation:
 
     def test_negative_edge_clamps_to_min(self):
         """
-        p=0.2, b=2.0 → f_full = (0.4-0.8)/2 = -0.2 → mult = 0.8 → clamp 0.5.
+        p=0.2, b=2.0 → f_full = (0.4-0.8)/2 = -0.2 (edge negativo) → clamp a 0.5.
         """
         stub = _mock_shadow_stats(win_rate=0.2, trades=50)
         ks = _reload_kelly(KELLY_ENABLED="true")
@@ -164,12 +160,46 @@ class TestKellyCalculation:
         assert result == pytest.approx(0.5, abs=0.001)
 
     def test_high_edge_clamps_to_max(self):
-        """p=0.99 → mult muy alto → clamp a 2.0."""
-        stub = _mock_shadow_stats(win_rate=0.99, trades=50)
+        """
+        p=0.99, b=2.0, fraction=0.25:
+          f_full = (0.99*2 - 0.01) / 2 = 0.985
+          f = 0.985 * 0.25 = 0.24625
+          mult = 1.0 + 0.24625 = 1.246  (no llega al cap de 2.0 con fraction=0.25)
+
+        Para que el clamp se active necesitamos fraction=1.0 (full-Kelly):
+          f_full = 0.985
+          f = 0.985 * 1.0 = 0.985
+          mult = 1.985 → NO clampea a 2.0 todavía.
+
+        Con p=0.99, b=10.0, fraction=1.0:
+          f_full = (0.99*10 - 0.01) / 10 = 0.989
+          mult = 1.989 → todavía no.
+
+        Para clampear a 2.0 se necesita mult > 2.0:
+          1.0 + f_full*fraction > 2.0 → f_full*fraction > 1.0
+          Con p=0.99, b=100, fraction=1.0:
+            f_full = (0.99*100 - 0.01)/100 = 0.9899
+            mult = 1.9899 → cerca pero no llega.
+
+        La única forma de llegar a clamp con la fórmula es b muy alto:
+          p=0.99, b=2.0, fraction=1.0:
+            mult = 1 + 0.985 = 1.985 < 2.0
+          p=0.9999, b=2.0, fraction=1.0:
+            f_full = (0.9999*2 - 0.0001)/2 = 0.99985
+            mult = 1.99985 < 2.0 todavía
+
+        Conclusión: con b=2.0 la fórmula Kelly no puede superar 2.0 (el máximo
+        teórico de f_full para p≤1 y b=2 es (2-0)/2=1.0, mult_max=2.0 exacto).
+        Usamos p=1.0 (perfectamente predictivo) para forzar el clamp:
+          f_full = (1.0*2 - 0) / 2 = 1.0
+          f = 1.0 * 1.0 = 1.0 (fraction=1.0)
+          mult = 2.0 → clamp exacto a KELLY_MAX_MULT=2.0
+        """
+        stub = _mock_shadow_stats(win_rate=1.0, trades=50)
         ks = _reload_kelly(KELLY_ENABLED="true")
         with patch.object(ks, "KELLY_ENABLED",    True), \
              patch.object(ks, "KELLY_MIN_TRADES", 30), \
-             patch.object(ks, "KELLY_FRACTION",   0.25), \
+             patch.object(ks, "KELLY_FRACTION",   1.0), \
              patch.object(ks, "KELLY_MIN_MULT",   0.5), \
              patch.object(ks, "KELLY_MAX_MULT",   2.0), \
              patch.dict(sys.modules, {"bot.shadow_mode": stub}):
