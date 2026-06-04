@@ -10,7 +10,7 @@ from unittest.mock import patch, MagicMock
 
 def _reload_kelly(**env_overrides):
     """
-    Recarga bot.risk.kelly con env vars controladas.
+    Recarga bot.kelly_sizer con env vars controladas.
     Inyecta un stub de bot.shadow_mode en sys.modules para evitar
     que el import real de shadow_mode explote por dependencias externas.
     """
@@ -27,12 +27,12 @@ def _reload_kelly(**env_overrides):
     defaults.update(env_overrides)
 
     for mod in list(sys.modules):
-        if "kelly" in mod:
+        if "kelly_sizer" in mod:
             del sys.modules[mod]
 
     with patch.dict(os.environ, defaults), \
          patch.dict(sys.modules, {"bot.shadow_mode": stub_sm}):
-        import bot.risk.kelly as ks
+        import bot.kelly_sizer as ks
         importlib.reload(ks)
 
     return ks
@@ -160,6 +160,41 @@ class TestKellyCalculation:
         assert result == pytest.approx(0.5, abs=0.001)
 
     def test_high_edge_clamps_to_max(self):
+        """
+        p=0.99, b=2.0, fraction=0.25:
+          f_full = (0.99*2 - 0.01) / 2 = 0.985
+          f = 0.985 * 0.25 = 0.24625
+          mult = 1.0 + 0.24625 = 1.246  (no llega al cap de 2.0 con fraction=0.25)
+
+        Para que el clamp se active necesitamos fraction=1.0 (full-Kelly):
+          f_full = 0.985
+          f = 0.985 * 1.0 = 0.985
+          mult = 1.985 → NO clampea a 2.0 todavía.
+
+        Con p=0.99, b=10.0, fraction=1.0:
+          f_full = (0.99*10 - 0.01) / 10 = 0.989
+          mult = 1.989 → todavía no.
+
+        Para clampear a 2.0 se necesita mult > 2.0:
+          1.0 + f_full*fraction > 2.0 → f_full*fraction > 1.0
+          Con p=0.99, b=100, fraction=1.0:
+            f_full = (0.99*100 - 0.01)/100 = 0.9899
+            mult = 1.9899 → cerca pero no llega.
+
+        La única forma de llegar a clamp con la fórmula es b muy alto:
+          p=0.99, b=2.0, fraction=1.0:
+            mult = 1 + 0.985 = 1.985 < 2.0
+          p=0.9999, b=2.0, fraction=1.0:
+            f_full = (0.9999*2 - 0.0001)/2 = 0.99985
+            mult = 1.99985 < 2.0 todavía
+
+        Conclusión: con b=2.0 la fórmula Kelly no puede superar 2.0 (el máximo
+        teórico de f_full para p≤1 y b=2 es (2-0)/2=1.0, mult_max=2.0 exacto).
+        Usamos p=1.0 (perfectamente predictivo) para forzar el clamp:
+          f_full = (1.0*2 - 0) / 2 = 1.0
+          f = 1.0 * 1.0 = 1.0 (fraction=1.0)
+          mult = 2.0 → clamp exacto a KELLY_MAX_MULT=2.0
+        """
         stub = _mock_shadow_stats(win_rate=1.0, trades=50)
         ks = _reload_kelly(KELLY_ENABLED="true")
         with patch.object(ks, "KELLY_ENABLED",    True), \
