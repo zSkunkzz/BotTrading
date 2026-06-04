@@ -496,7 +496,8 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
             reasons.append(f"RSI15m={rsi_15m:.0f} zona rebote +1")
         elif (direction == "LONG" and rsi_15m > 72) or (direction == "SHORT" and rsi_15m < 28):
             reasons.append(f"RSI15m={rsi_15m:.0f} SOBREEXTENDIDO — filtro duro")
-            score = 0
+            # Retorno explícito NEUTRAL: RSI extremo invalida el setup completamente
+            return "TENDENCIA", "NEUTRAL", 0, MAX, reasons
         else:
             reasons.append(f"RSI15m={rsi_15m:.0f} zona neutra")
 
