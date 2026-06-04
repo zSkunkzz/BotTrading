@@ -78,13 +78,15 @@ def _is_reduce_only(order: dict) -> bool:
 
 
 def _round_qty_safe(trader, qty: float) -> float:
-    """Bug C: redondea qty con el método del trader si está disponible."""
+    """Bug C: redondea qty con el método del trader si está disponible.
+    Envuelve el resultado en float() para que un MagicMock caiga al fallback.
+    """
     if hasattr(trader, "_round_qty") and callable(trader._round_qty):
         try:
-            return trader._round_qty(qty)
+            return float(trader._round_qty(qty))
         except Exception:
             pass
-    return round(qty, 4)
+    return round(float(qty), 4)
 
 
 def _resolve_is_long(position) -> bool:
@@ -140,17 +142,10 @@ class PositionManager:
         """
         Mueve el SL a break-even (entry + offset) cuando el precio alcanza
         BE_TRIGGER_PCT del recorrido entry → TP1.
-
-        Ejemplo con BE_TRIGGER_PCT=0.4:
-          LONG entry=100, TP1=110 → recorrido=10
-          Trigger en precio >= 100 + 10*0.4 = 104
-          SL se mueve a 100 * (1 + BE_OFFSET_PCT)
-
         Solo se activa UNA VEZ por posición (_tp1_be_done).
         """
         trader = self._trader
 
-        # Ya activado o sin datos mínimos
         if getattr(trader, "_tp1_be_done", False):
             return
 
@@ -171,7 +166,6 @@ class PositionManager:
 
         trigger_dist = recorrido * _BE_TRIGGER_PCT
 
-        # ¿El precio alcanzó el trigger?
         if is_long:
             triggered = price >= entry + trigger_dist
         else:
@@ -180,10 +174,8 @@ class PositionManager:
         if not triggered:
             return
 
-        # Calcular precio de BE
         be_price = round(entry * (1 + _BE_OFFSET_PCT) if is_long else entry * (1 - _BE_OFFSET_PCT), 6)
 
-        # No mover si el SL ya está por encima (LONG) o por debajo (SHORT) del BE
         if sl is not None:
             if is_long and sl >= be_price:
                 trader._tp1_be_done = True
@@ -200,11 +192,9 @@ class PositionManager:
             sl or 0, be_price,
         )
 
-        # Marcar como hecho ANTES de la llamada async (evita doble ejecución)
         trader._tp1_be_done = True
         trader.sl = be_price
 
-        # Actualizar SL en el exchange
         await self._update_sl_to_be(be_price, is_long, symbol)
 
     async def _update_sl_to_be(self, be_price: float, is_long: bool, symbol: str) -> None:
@@ -228,19 +218,17 @@ class PositionManager:
             log.warning("[%s] BE: qty=0 — no se puede colocar SL de BE.", symbol)
             return
 
-        # 1. Cancelar SL antiguo
         try:
             await asyncio.to_thread(hl.cancel_all_open_tpsl)
             log.info("[%s] BE: SL/TP anteriores cancelados.", symbol)
         except Exception as e:
             log.warning("[%s] BE: no se pudo cancelar SL antiguo: %s", symbol, e)
 
-        # 2. Colocar SL nuevo en BE
         entry_price = getattr(trader, "entry_price", be_price)
         try:
             result = await asyncio.to_thread(
                 hl.place_sl,
-                not is_long,   # is_buy del SL es contrario a la posición
+                not is_long,
                 open_qty,
                 be_price,
                 entry_price,
@@ -248,12 +236,10 @@ class PositionManager:
             log.info("[%s] BE: SL colocado en entrada (%.4f): %s", symbol, be_price, result)
         except Exception as e:
             log.error("[%s] BE: error colocando SL en BE: %s", symbol, e)
-            # Revertir flag para que lo reintente en el siguiente tick
             trader._tp1_be_done = False
             trader.sl = None
             return
 
-        # 3. Recolocar TP1 (cancel_all_open_tpsl lo borró también)
         tp1 = getattr(trader, "tp1", None)
         if tp1 and tp1 > 0:
             try:
@@ -271,7 +257,6 @@ class PositionManager:
 
         trader._protection_ok = True
 
-        # Notificar por Telegram
         try:
             from bot.telegram_bot import send_message
             side_emoji = "🟢" if is_long else "🔴"
@@ -308,7 +293,6 @@ class PositionManager:
             symbol, price, threshold, sl, _SL_SW_MARGIN * 100,
         )
 
-        # Si _protection_ok=True, el exchange ya tiene la orden — esperar su fill
         if getattr(trader, "_protection_ok", False):
             log.info(
                 "[%s] SL SW: precio cruzó umbral pero _protection_ok=True → esperando fill del exchange",
@@ -330,14 +314,12 @@ class PositionManager:
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
 
-        # 1. Órdenes normales (limit/market)
         try:
             raw_orders = await trader._get_open_orders_raw() or []
         except Exception as e:
             log.warning("[%s] _ensure_tpsl: openOrders error: %s", symbol, e)
             raw_orders = []
 
-        # 2. Trigger orders (donde viven SL/TP en HL)
         trigger_orders: list[dict] = []
         get_trigger_fn = getattr(trader, "_get_open_trigger_orders_raw", None)
         if callable(get_trigger_fn):
@@ -346,7 +328,6 @@ class PositionManager:
             except Exception as e:
                 log.warning("[%s] _ensure_tpsl: frontendOpenOrders error: %s", symbol, e)
 
-        # 3. Combinar y filtrar por coin
         all_orders = raw_orders + trigger_orders
         coin = getattr(trader, "coin", symbol).upper()
         coin_orders = [
@@ -354,11 +335,9 @@ class PositionManager:
             if str(o.get("coin", "")).upper() == coin
         ]
 
-        # 4. Detectar SL/TP por tipo de orden
         has_sl = any(_get_tpsl_type(o) == "sl" for o in coin_orders)
         has_tp = any(_get_tpsl_type(o) == "tp" for o in coin_orders)
 
-        # 5. Bug B: fallback por precio si el campo tpsl no viene parseado
         if not has_sl or not has_tp:
             sl_price = getattr(trader, "sl", None)
             tp_price = getattr(trader, "tp1", None) or getattr(trader, "tp", None)
@@ -385,8 +364,6 @@ class PositionManager:
             trader._protection_ok = True
             return
 
-        # Si _protection_ok ya era True y ahora no encontramos SL/TP,
-        # probablemente ya se ejecutaron (fill). No spamear con emergencia.
         if getattr(trader, "_protection_ok", False):
             log.info(
                 "[%s] _ensure_tpsl: no se detectan SL/TP pero _protection_ok=True "
@@ -425,7 +402,6 @@ class PositionManager:
         position = getattr(trader, "position", None)
         is_long = _resolve_is_long(position)
 
-        # Bug J: TP dinámico cuando falta
         if place_tp and tp_price is None:
             entry_price = getattr(trader, "entry_price", None) or getattr(trader, "_entry_price", None)
             tp_price = _calc_fallback_tp(entry_price, sl_price, is_long, _TP_FALLBACK_RR)
@@ -464,7 +440,6 @@ class PositionManager:
                     )
                     log.info("[%s] TP emergencia colocado: %.4f (qty=%.4f)", symbol, tp_price, open_qty)
 
-                # Marcar protección OK tras colocación exitosa
                 trader._protection_ok = True
                 break
 
