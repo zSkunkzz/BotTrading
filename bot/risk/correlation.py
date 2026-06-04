@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-correlation_guard.py — Guarda de correlación entre posiciones abiertas
+correlation.py — Guarda de correlación entre posiciones abiertas
 
 En cripto, la mayoría de altcoins están altamente correlacionadas con BTC.
 Abrir 5 posiciones SHORT simultáneas = 1 trade grande con más comisiones.
@@ -166,3 +166,45 @@ def size_penalty_btc(
         )
 
     return 1.0
+
+
+class CorrelationGuard:
+    """
+    Facade orientada a objetos sobre las funciones de correlación.
+    Usada por RiskManager como self.correlation.
+    """
+
+    def __init__(self, config: dict | None = None):
+        # config reservado para futura configuración por instancia
+        self._config = config or {}
+
+    def is_blocked(
+        self,
+        proposed_direction: str,
+        open_positions: Dict[str, dict],
+    ) -> tuple[bool, str]:
+        """
+        Delega en check_correlation.
+        Returns (blocked: bool, reason: str).
+        """
+        allowed, reason = check_correlation(proposed_direction, open_positions)
+        return not allowed, reason
+
+    def size_penalty(
+        self,
+        proposed_direction: str,
+        btc_trend: int,
+        prices_symbol: Optional[List[float]] = None,
+        prices_btc: Optional[List[float]] = None,
+    ) -> float:
+        """Delega en size_penalty_btc."""
+        return size_penalty_btc(proposed_direction, btc_trend, prices_symbol, prices_btc)
+
+    def rolling_correlation(
+        self,
+        prices_symbol: List[float],
+        prices_btc: List[float],
+        window: int = CORR_DYNAMIC_WINDOW,
+    ) -> Optional[float]:
+        """Delega en compute_rolling_correlation."""
+        return compute_rolling_correlation(prices_symbol, prices_btc, window)
