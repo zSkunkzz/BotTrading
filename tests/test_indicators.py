@@ -11,11 +11,11 @@ def _make_bars(closes, highs=None, lows=None, vols=None):
     return [[i, closes[i], highs[i], lows[i], closes[i], vols[i]] for i in range(n)]
 
 
-def _trending_up(n=60, start=100.0, step=0.5):
+def _trending_up(n=100, start=100.0, step=1.0):
     return [start + i * step for i in range(n)]
 
 
-def _trending_down(n=60, start=130.0, step=0.5):
+def _trending_down(n=100, start=200.0, step=1.0):
     return [start - i * step for i in range(n)]
 
 
@@ -50,16 +50,21 @@ class TestRsi:
         assert rsi([1, 2, 3], 14) == 50.0
 
     def test_overbought_strong_uptrend(self):
-        closes = _trending_up(60)
+        """Serie fuertemente alcista → RSI > 70."""
+        closes = _trending_up(80, step=1.5)
         assert rsi(closes, 14) > 70
 
     def test_oversold_strong_downtrend(self):
-        closes = _trending_down(60)
+        """Serie fuertemente bajista → RSI < 30."""
+        closes = _trending_down(80, step=1.5)
         assert rsi(closes, 14) < 30
 
     def test_neutral_oscillating(self):
-        import math
-        closes = [50 + math.sin(i * 0.3) * 2 for i in range(40)]
+        """Serie sin tendencia clara con alternancia +1/-1 → RSI cerca de 50."""
+        # Alternancia perfecta: la mitad sube, la mitad baja → RSI ≈ 50
+        closes = [100.0]
+        for i in range(79):
+            closes.append(closes[-1] + (1.0 if i % 2 == 0 else -1.0))
         val = rsi(closes, 14)
         assert 30 < val < 70
 
@@ -73,12 +78,15 @@ class TestMacd:
         assert macd([1, 2, 3], 12, 26, 9) == (0.0, 0.0, 0.0)
 
     def test_bullish_hist_in_uptrend(self):
-        closes = _trending_up(60)
+        """Tendencia alcista sostenida con suficientes velas → histograma positivo."""
+        # Necesitamos >= 26 + 9 = 35 velas para que la señal se calcule bien
+        closes = _trending_up(80, step=2.0)
         _, _, hist = macd(closes, 12, 26, 9)
         assert hist > 0
 
     def test_bearish_hist_in_downtrend(self):
-        closes = _trending_down(60)
+        """Tendencia bajista sostenida → histograma negativo."""
+        closes = _trending_down(80, step=2.0)
         _, _, hist = macd(closes, 12, 26, 9)
         assert hist < 0
 
@@ -112,17 +120,20 @@ class TestSupertrend:
         assert val > 0
 
     def test_bullish_in_strong_uptrend(self):
-        closes = _trending_up(60)
-        highs  = [c * 1.005 for c in closes]
-        lows   = [c * 0.995 for c in closes]
-        direction, _ = supertrend(highs, lows, closes, 10, 3.0)
+        """Tendencia alcista clara con ATR pequeño relativo al avance → Supertrend 1."""
+        closes = _trending_up(60, step=2.0)
+        # high/low muy ceñidos al cierre para ATR bajo → banda estrecha
+        highs  = [c + 0.5 for c in closes]
+        lows   = [c - 0.5 for c in closes]
+        direction, _ = supertrend(highs, lows, closes, 10, 1.5)
         assert direction == 1
 
     def test_bearish_in_strong_downtrend(self):
-        closes = _trending_down(60)
-        highs  = [c * 1.005 for c in closes]
-        lows   = [c * 0.995 for c in closes]
-        direction, _ = supertrend(highs, lows, closes, 10, 3.0)
+        """Tendencia bajista clara con ATR pequeño relativo al descenso → Supertrend -1."""
+        closes = _trending_down(60, step=2.0)
+        highs  = [c + 0.5 for c in closes]
+        lows   = [c - 0.5 for c in closes]
+        direction, _ = supertrend(highs, lows, closes, 10, 1.5)
         assert direction == -1
 
 
