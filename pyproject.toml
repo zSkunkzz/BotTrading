@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "bottrading"
+version = "0.1.0"
+description = "Bot de trading automático multi-exchange con gestión de riesgo avanzada"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+
+dependencies = [
+    "aiohttp>=3.9,<4.0",
+    "aiohttp-retry>=2.8,<3.0",
+    "ccxt>=4.0,<5.0",
+    "eth-account>=0.10.0,<0.14.0",
+    "eth-utils>=2.1.0,<6.0.0",
+    "feedparser>=6.0,<7.0",
+    "hyperliquid-python-sdk>=0.23.0",
+    "numpy>=1.26,<3.0",
+    "pandas>=2.0,<3.0",
+    "python-dotenv>=1.0,<2.0",
+    "python-telegram-bot>=20.0,<22.0",
+    "ta>=0.10,<1.0",
+    "websockets>=12.0,<15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9.0",
+    "pytest-asyncio>=0.23,<1.0",
+    "pytest-cov>=5.0,<7.0",
+    "ruff>=0.4,<1.0",
+]
+
+# ── pytest ──────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+log_cli = true
+log_cli_level = "WARNING"
+addopts = "-q --tb=short"
+
+# ── ruff (linter) ───────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = [
+    "E501",   # line too long (gestionado por formatter)
+    "F401",   # unused import (a veces son re-exports intencionados)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F811"]  # redefinición permitida en tests
+
+# ── coverage ────────────────────────────────────────────────────────────────
+[tool.coverage.run]
+source = ["bot"]
+omit = [
+    "bot/__init__.py",
+    "tests/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 40
