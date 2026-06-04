@@ -15,6 +15,21 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 11 desde v21-P3):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v22 (filtros de calidad de señal):
+  1. ATR Expansion filter:
+     - _compute_indicators añade atr_ma (media ATR de ATR_MA_WINDOW velas)
+       y atr_expanding (ATR actual > atr_ma * ATR_EXPANSION_MIN).
+     - _score_breakout exige atr_expanding=True como condición necesaria.
+     - _score_tendencia penaliza -1 si ATR no expande (señal en compresión).
+  2. Breakout distance filter:
+     - Para puntuar breakout completo (+2), el cierre debe superar el extremo
+       roto en al menos BREAKOUT_CLOSE_ATR_MIN × ATR.
+     - Si la distancia es menor, el breakout solo puntúa +1 (amago).
+  3. Reversal double confirm:
+     - _score_reversal exige continuidad perdida: al menos N_REVERSAL_CONFIRM
+       velas previas sin cierre a favor de la tendencia previa.
+     - VWAP añadido como confirmación: precio rebotando desde VWAP suma +1.
+
 CAMBIOS v21 (Prioridades 1, 2 y 3):
   P1 — OHLCV robustos:
   - _clean_bars(): elimina barras con None en cualquier campo OHLCV antes
@@ -93,8 +108,9 @@ _FUNDING_SHORT_MIN = float(os.getenv("FUNDING_SHORT_MIN", "-0.0005"))
 _EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.002"))
 _EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.0015"))
 _BREAKOUT_WINDOW       = int(os.getenv("BREAKOUT_WINDOW", "20"))
-_BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.4"))
+_BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.5"))   # v22: subido de 1.4 → 1.5
 _BREAKOUT_ATR_CONFIRM  = float(os.getenv("BREAKOUT_ATR_CONFIRM", "0.3"))
+_BREAKOUT_CLOSE_ATR_MIN = float(os.getenv("BREAKOUT_CLOSE_ATR_MIN", "0.25"))  # v22: distancia mínima cierre
 _REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "28"))
 _REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "72"))
 _VOL_MIN_GLOBAL        = float(os.getenv("VOL_MIN_GLOBAL",    "0.6"))
@@ -102,6 +118,11 @@ _VOL_CONFIRM_MIN       = float(os.getenv("VOL_CONFIRM_MIN",   "1.2"))
 _PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "2"))
 _PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.005"))
 _EARLY_LEV_FACTOR      = float(os.getenv("EARLY_LEV_FACTOR", "0.2"))
+# v22: ATR expansion
+_ATR_MA_WINDOW         = int(os.getenv("ATR_MA_WINDOW", "10"))
+_ATR_EXPANSION_MIN     = float(os.getenv("ATR_EXPANSION_MIN", "1.05"))
+# v22: Reversal double confirm
+_N_REVERSAL_CONFIRM    = int(os.getenv("N_REVERSAL_CONFIRM", "3"))
 
 
 def _to_ccxt_symbol(symbol: str) -> str:
@@ -339,10 +360,11 @@ async def analyze_pair(
 
     log.info(
         "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f entry=%.6f sl=%.6f tp1=%.6f "
-        "tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s vwap=%.6f funding=%.4f%% | %s",
+        "tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s vwap=%.6f funding=%.4f%% atr_exp=%s | %s",
         symbol, signal_str, setup_type, score, max_score, rr,
         entry, sl, tp1, tp2, atr_val, suggested_lev, entry_mode, is_valid,
         ind_15m.get("vwap", 0.0), funding_rate * 100,
+        ind_15m.get("atr_expanding", False),
         " · ".join(reasons),
     )
 
@@ -363,7 +385,8 @@ async def analyze_pair(
         is_valid=is_valid,
         reason="" if is_valid else f"[{setup_type}] score={score}/{max_score} rr={rr:.2f} (min {MIN_RR})",
         extra={"setup_type": setup_type, "sl_atr": sl_atr, "sl_used": sl,
-               "is_fast": is_fast_valid, "funding_rate": funding_rate},
+               "is_fast": is_fast_valid, "funding_rate": funding_rate,
+               "atr_expanding": ind_15m.get("atr_expanding", False)},
     )
 
 
@@ -389,6 +412,7 @@ def _detect_setup(
 
 def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     """
+    v22: Añade penalización -1 si ATR no expande (mercado comprimido).
     v21-P3: MAX=11 (se añade +1 VWAP).
     REQUISITOS OBLIGATORIOS:
       - EMA 1h en tendencia definida
@@ -403,12 +427,13 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
       +1 RSI15m zona rebote (35-65)
       +1 Vol ≥ VOL_CONFIRM_MIN
       +2 Confluencia total ST 15m+1h+4h
-      +1 Precio > VWAP (LONG) o < VWAP (SHORT)  ← nuevo P3
+      +1 Precio > VWAP (LONG) o < VWAP (SHORT)
     PENALIZACIONES:
       -2 ST4h en contra
       -1 Vol < 0.8x
+      -1 ATR no expandiendo (v22)
     """
-    MAX = 11  # v21-P3: era 10
+    MAX = 11
     reasons: List[str] = []
 
     if not i1h:
@@ -496,7 +521,6 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
             reasons.append(f"RSI15m={rsi_15m:.0f} zona rebote +1")
         elif (direction == "LONG" and rsi_15m > 72) or (direction == "SHORT" and rsi_15m < 28):
             reasons.append(f"RSI15m={rsi_15m:.0f} SOBREEXTENDIDO — filtro duro")
-            # Retorno explícito NEUTRAL: RSI extremo invalida el setup completamente
             return "TENDENCIA", "NEUTRAL", 0, MAX, reasons
         else:
             reasons.append(f"RSI15m={rsi_15m:.0f} zona neutra")
@@ -534,10 +558,25 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
     else:
         reasons.append("VWAP no disponible")
 
+    # v22: ATR expansion — penalización suave si no expande
+    atr_expanding = i15.get("atr_expanding", True)  # True por defecto si no hay datos (no bloquea)
+    if not atr_expanding:
+        score = max(0, score - 1)
+        reasons.append("ATR sin expansión (mercado comprimido) — penalización -1")
+    else:
+        reasons.append("ATR expandiendo ✓")
+
     return "TENDENCIA", direction, score, MAX, reasons
 
 
 def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
+    """
+    v22:
+    - BREAKOUT_VOL_MIN subido a 1.5 (era 1.4).
+    - atr_expanding requerido: si el ATR no expande, el breakout no puntúa como válido.
+    - Distancia mínima de cierre: el cierre debe superar el extremo roto
+      en BREAKOUT_CLOSE_ATR_MIN × ATR para puntuar +2. Si es menor, puntúa solo +1 (amago).
+    """
     MAX = 8
     reasons: List[str] = []
     if len(bars_15m) < _BREAKOUT_WINDOW + 2:
@@ -556,8 +595,27 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             f"Sin rotura: close={current_close:.4f} rango=[{range_low:.4f}-{range_high:.4f}]"
         ]
     direction = "LONG" if broke_up else "SHORT"
-    score = 2
-    reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} confirmada +2")
+
+    # v22: ATR expansion — requisito para breakout de calidad
+    atr_expanding = i15.get("atr_expanding", True)
+    if not atr_expanding:
+        reasons.append("ATR sin expansión — breakout en compresión, posible fakeout")
+        return "BREAKOUT", "NEUTRAL", 0, MAX, reasons
+
+    # v22: distancia de cierre al extremo roto
+    min_close_dist = atr_val * _BREAKOUT_CLOSE_ATR_MIN
+    if broke_up:
+        close_dist = current_close - range_high
+    else:
+        close_dist = range_low - current_close
+
+    if close_dist >= min_close_dist:
+        score = 2
+        reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} con desplazamiento real ({close_dist:.4f} ≥ {min_close_dist:.4f}) +2")
+    else:
+        score = 1
+        reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} pero cierre justo ({close_dist:.4f} < {min_close_dist:.4f}) — amago +1")
+
     if vol_ratio >= _BREAKOUT_VOL_MIN:
         score += 2; reasons.append(f"Vol={vol_ratio:.1f}x breakout +2")
     elif vol_ratio >= 1.1:
@@ -585,7 +643,15 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
 
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
-    MAX = 9
+    """
+    v22:
+    - Double confirm: exige continuidad perdida (N_REVERSAL_CONFIRM velas previas
+      sin cierre a favor de la tendencia previa antes del giro).
+    - VWAP añadido como confirmación extra (+1): precio rebotando desde VWAP
+      en la dirección del giro.
+    MAX sube de 9 a 10.
+    """
+    MAX = 10  # v22: era 9
     reasons: List[str] = []
     rsi_1h = i1h.get("rsi_val") if i1h else None
     if rsi_1h is None:
@@ -597,6 +663,27 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     direction = "LONG" if is_long else "SHORT"
     score = 2
     reasons.append(f"RSI1h={rsi_1h:.0f} extremo {'sobreventa' if is_long else 'sobrecompra'} +2")
+
+    # v22: double confirm — continuidad perdida en últimas N velas
+    if len(bars_15m) >= _N_REVERSAL_CONFIRM + 1:
+        prev_bars = bars_15m[-(_N_REVERSAL_CONFIRM + 1):-1]
+        # Tendencia previa perdida: si es LONG (venimos de bajada), ninguna vela previa
+        # debería cerrar claramente más baja que la anterior (ya no hay continuación bajista)
+        continuity_broken = False
+        for i in range(1, len(prev_bars)):
+            prev_close = float(prev_bars[i - 1][4])
+            curr_close = float(prev_bars[i][4])
+            if is_long and curr_close > prev_close:
+                continuity_broken = True; break
+            if is_short and curr_close < prev_close:
+                continuity_broken = True; break
+        if continuity_broken:
+            score += 1
+            reasons.append(f"Continuidad tendencia previa perdida ({_N_REVERSAL_CONFIRM} velas) +1")
+        else:
+            reasons.append(f"Tendencia previa aún continúa — reversal prematuro")
+            # No bloquea pero no suma; señal más débil
+
     hist_15m = i15.get("macd_hist")
     if hist_15m is not None:
         if is_long and hist_15m > 0:
@@ -635,6 +722,20 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             score += 1; reasons.append(f"Precio toca EMA21_1h (dist={dist_pct*100:.2f}%) +1")
         else:
             reasons.append(f"Precio lejos EMA21_1h ({dist_pct*100:.2f}%)")
+
+    # v22: VWAP como confirmación adicional en reversals
+    vwap_val = i15.get("vwap", 0.0)
+    if vwap_val and vwap_val > 0 and close_15m:
+        # En LONG: precio por encima de VWAP (ya rebotó). En SHORT: por debajo.
+        vwap_ok = (is_long and close_15m > vwap_val) or (is_short and close_15m < vwap_val)
+        if vwap_ok:
+            score += 1
+            reasons.append(f"Rebote confirmado {'sobre' if is_long else 'bajo'} VWAP({vwap_val:.4f}) +1")
+        else:
+            reasons.append(f"Precio aún {'bajo' if is_long else 'sobre'} VWAP — giro no confirmado")
+    else:
+        reasons.append("VWAP no disponible")
+
     return "REVERSAL", direction, score, MAX, reasons
 
 
@@ -656,23 +757,43 @@ def _compute_indicators(bars: list) -> dict:
     avg_vol   = sum(vols[-vol_window:]) / vol_window if vol_window > 0 else 1.0
     vol_ratio = round(vols[-1] / avg_vol, 3) if avg_vol > 0 else 1.0
     price_dir = "rising" if len(closes) >= 2 and closes[-1] > closes[-2] else "falling"
+
+    # v22: ATR expansion — media corta de ATR para detectar expansión real
+    atr_expanding = False
+    atr_ma = None
+    if atr14 is not None and len(bars) >= _ATR_MA_WINDOW + 14:
+        # Calculamos ATR para cada una de las últimas ATR_MA_WINDOW velas y sacamos la media
+        atr_series = []
+        for offset in range(_ATR_MA_WINDOW, 0, -1):
+            sub_h = highs[:-(offset - 1)] if offset > 1 else highs
+            sub_l = lows[:-(offset - 1)]  if offset > 1 else lows
+            sub_c = closes[:-(offset - 1)] if offset > 1 else closes
+            v = calc_atr(sub_h, sub_l, sub_c, 14)
+            if v is not None:
+                atr_series.append(v)
+        if atr_series:
+            atr_ma = sum(atr_series) / len(atr_series)
+            atr_expanding = atr14 > atr_ma * _ATR_EXPANSION_MIN
+
     return {
-        "ema21":     ema21[-1] if ema21 else None,
-        "ema50":     ema50[-1] if ema50 else None,
-        "ema_bull":  bool(ema21 and ema50 and ema21[-1] > ema50[-1]),
-        "ema_bear":  bool(ema21 and ema50 and ema21[-1] < ema50[-1]),
-        "rsi_val":   rsi14,
-        "macd_hist": hist,
-        "macd_bull": hist > 0,
-        "macd_bear": hist < 0,
-        "st_dir":    st_dir,
-        "st_bull":   st_dir == 1,
-        "st_bear":   st_dir == -1,
-        "atr":       atr14,
-        "vol_ratio": vol_ratio,
-        "price_dir": price_dir,
-        "close":     closes[-1],
-        "vwap":      vwap_v,    # v21 P3
+        "ema21":          ema21[-1] if ema21 else None,
+        "ema50":          ema50[-1] if ema50 else None,
+        "ema_bull":       bool(ema21 and ema50 and ema21[-1] > ema50[-1]),
+        "ema_bear":       bool(ema21 and ema50 and ema21[-1] < ema50[-1]),
+        "rsi_val":        rsi14,
+        "macd_hist":      hist,
+        "macd_bull":      hist > 0,
+        "macd_bear":      hist < 0,
+        "st_dir":         st_dir,
+        "st_bull":        st_dir == 1,
+        "st_bear":        st_dir == -1,
+        "atr":            atr14,
+        "atr_ma":         atr_ma,         # v22
+        "atr_expanding":  atr_expanding,  # v22
+        "vol_ratio":      vol_ratio,
+        "price_dir":      price_dir,
+        "close":          closes[-1],
+        "vwap":           vwap_v,         # v21 P3
     }
 
 
@@ -704,8 +825,9 @@ def format_signal_block(signal) -> str:
     mode = signal.extra.get("setup_type", signal.entry_mode)
     sl_note   = " [struct]" if signal.extra.get("sl_atr") and signal.extra.get("sl_used") != signal.extra.get("sl_atr") else ""
     fast_note = " ⚡FAST" if signal.extra.get("is_fast") else ""
+    atr_note  = " 📈ATR↑" if signal.extra.get("atr_expanding") else ""
     lines = [
-        f"**{signal.symbol}** · {arrow} [{mode}]{fast_note}",
+        f"**{signal.symbol}** · {arrow} [{mode}]{fast_note}{atr_note}",
         f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
     ]
     if signal.entry:
