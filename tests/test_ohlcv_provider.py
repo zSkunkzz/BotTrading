@@ -165,24 +165,35 @@ class TestSemaphore:
         provider = _make_provider(semaphore=sem)
         order: list[str] = []
 
-        # hl_http.get_candles is a *sync* function inside an async method.
-        # To instrument concurrent ordering we replace it with an AsyncMock
-        # whose side_effect appends to `order` and yields via sleep(0) so
-        # the event loop can interleave the two gather'd coroutines.
-        async def _slow(*_args, **_kwargs):
-            order.append("start")
-            await asyncio.sleep(0)  # yield — lets the other coroutine try to acquire sem
-            order.append("end")
+        # get_candles is a *sync* function — use a plain MagicMock, never AsyncMock.
+        # AsyncMock would return an un-awaited coroutine (always truthy), causing
+        # the retry loop to exit immediately so order.append() never runs.
+        #
+        # Instead we override provider.fetch with a thin async wrapper that:
+        #   1. Acquires the semaphore explicitly (replicating provider internals).
+        #   2. Appends "start", yields via sleep(0) so the event loop can try to
+        #      schedule the second task (the semaphore will block it), then
+        #      appends "end" and releases.
+        # With sem=1 the result must be strictly ["start","end","start","end"].
+
+        real_fetch = provider.fetch
+
+        async def _instrumented(symbol, interval=INTERVAL, limit=LIMIT):
+            async with sem:
+                order.append("start")
+                await asyncio.sleep(0)   # yield — second coroutine tries sem, blocks
+                order.append("end")
             return FAKE_BARS
 
-        mock_gc = AsyncMock(side_effect=_slow)
-
-        with patch("bot.infra.ohlcv_provider.hl_http.get_candles", mock_gc), \
-             patch("bot.infra.ohlcv_provider.asyncio.sleep", new_callable=AsyncMock):
+        with patch(
+            "bot.infra.ohlcv_provider.hl_http.get_candles",
+            MagicMock(return_value=FAKE_BARS),
+        ):
             await asyncio.gather(
-                provider.fetch(SYMBOL, INTERVAL),
-                provider.fetch(SYMBOL, INTERVAL),
+                _instrumented(SYMBOL, INTERVAL),
+                _instrumented(SYMBOL, INTERVAL),
             )
 
-        # With sem=1 the order must be start, end, start, end (never start, start)
-        assert order == ["start", "end", "start", "end"]
+        assert order == ["start", "end", "start", "end"], (
+            f"Expected serial execution, got: {order}"
+        )
