@@ -38,6 +38,18 @@ FIX get_ohlcv None (2026-06-03 / 2026-06-05 v2):
     - CORRECCIÓN BUG: faltaba 'timeframe' como argumento en logger del except.
     - WARNING de retry → DEBUG (es comportamiento normal intermitente).
 
+FIX get_ohlcv WARNING spam (2026-06-05 v3):
+  Coins sin datos OHLCV (ZEC y otras poco líquidas) emitían un WARNING
+  en CADA ciclo de scan (~cada 10s), creando spam masivo en los logs.
+  Fix:
+    - _OHLCV_NO_DATA_COINS: set global que registra coins que fallaron
+      los 3 intentos de get_ohlcv().
+    - Primera vez que un coin entra en el set → WARNING (aviso único).
+    - Fallos subsiguientes del mismo coin → DEBUG (sin spam).
+    - El set se resetea cada _OHLCV_NO_DATA_RESET_INTERVAL segundos
+      (default 1800s = 30 min) para reintentar coins que puedan haber
+      ganado liquidez.
+
 FIX _get_positions NoneType (2026-06-03):
   Cuando _master_addr está vacío (init incompleto) o HL devuelve error JSON,
   data es None o un dict sin 'assetPositions'. Fix:
@@ -116,6 +128,14 @@ try:
 except Exception:
     _OHLCV_RETRY_DELAYS = [0.5, 1.5]
 
+# ── Supresión de spam WARNING para coins sin datos OHLCV ────────────────────
+# Coins que fallan los 3 intentos de get_ohlcv() se registran aquí.
+# Primera vez → WARNING (aviso único). Siguientes → DEBUG (sin spam).
+# Se resetea cada _OHLCV_NO_DATA_RESET_INTERVAL segundos para reintentar.
+_OHLCV_NO_DATA_COINS: set[str] = set()
+_OHLCV_NO_DATA_RESET_INTERVAL = float(os.getenv("OHLCV_NO_DATA_RESET_INTERVAL", "1800"))
+_OHLCV_NO_DATA_LAST_RESET: float = time.monotonic()
+
 _TF_MINUTES = {
     "1m":  1,
     "3m":  3,
@@ -151,6 +171,45 @@ def _get_ohlcv_semaphore() -> asyncio.Semaphore:
             _OHLCV_MAX_CONCURRENCY,
         )
     return _OHLCV_SEMAPHORE
+
+
+def _ohlcv_no_data_log(coin: str, timeframe: str, n_attempts: int) -> None:
+    """
+    Emite WARNING la primera vez que un coin/tf falla todos los intentos OHLCV.
+    Fallos posteriores del mismo coin → solo DEBUG para evitar spam en logs.
+    El set global se resetea cada _OHLCV_NO_DATA_RESET_INTERVAL s.
+    """
+    global _OHLCV_NO_DATA_COINS, _OHLCV_NO_DATA_LAST_RESET
+
+    # Resetear periódicamente para reintentar coins que ganen liquidez
+    now = time.monotonic()
+    if now - _OHLCV_NO_DATA_LAST_RESET > _OHLCV_NO_DATA_RESET_INTERVAL:
+        if _OHLCV_NO_DATA_COINS:
+            logger.info(
+                "[OHLCVCache] Reset de coins sin datos (interval=%.0fs): %s",
+                _OHLCV_NO_DATA_RESET_INTERVAL,
+                ", ".join(sorted(_OHLCV_NO_DATA_COINS)),
+            )
+        _OHLCV_NO_DATA_COINS = set()
+        _OHLCV_NO_DATA_LAST_RESET = now
+
+    key = f"{coin}:{timeframe}"
+    if key not in _OHLCV_NO_DATA_COINS:
+        # Primera vez → WARNING
+        _OHLCV_NO_DATA_COINS.add(key)
+        logger.warning(
+            "[%s] get_ohlcv(%s) sin datos tras %d intentos — "
+            "coin posiblemente sin liquidez en HL. "
+            "Próximos fallos silenciados (DEBUG) durante %.0f min.",
+            coin, timeframe, n_attempts,
+            _OHLCV_NO_DATA_RESET_INTERVAL / 60,
+        )
+    else:
+        # Fallos siguientes → DEBUG (sin spam)
+        logger.debug(
+            "[%s] get_ohlcv(%s) sin datos (reintento suprimido — coin sin liquidez).",
+            coin, timeframe,
+        )
 
 
 def _check_price_staleness(
@@ -471,8 +530,11 @@ class FuturesTrader:
           - Intento 1: 66% de barras, tras OHLCV_RETRY_DELAYS[0] s
           - Intento 2: 33% de barras, tras OHLCV_RETRY_DELAYS[1] s
           - Si sigue fallando → devuelve []
-        Los reintentos se logean en DEBUG, no WARNING, para evitar spam.
-        Solo se emite WARNING si los 3 intentos fallan.
+
+        Logging de fallos totales:
+          - Primera vez que un coin falla los 3 intentos → WARNING (aviso único).
+          - Fallos siguientes del mismo coin → DEBUG (sin spam en logs).
+          - El registro se resetea cada OHLCV_NO_DATA_RESET_INTERVAL s (default 30 min).
         """
         n_bars_sequence = [
             _OHLCV_BARS,
@@ -503,15 +565,12 @@ class FuturesTrader:
                             await asyncio.sleep(delay)
 
         except Exception as e:
-            # BUG FIX: faltaba 'timeframe' como argumento en la versión anterior
             logger.warning("[%s] get_ohlcv(%s) excepción inesperada: %s", self.symbol, timeframe, e)
             return []
 
         if raw is None or not isinstance(raw, list) or len(raw) == 0:
-            logger.warning(
-                "[%s] get_ohlcv(%s) sin datos tras %d intentos — devolviendo lista vacía.",
-                self.symbol, timeframe, len(n_bars_sequence),
-            )
+            # FIX spam: WARNING solo la primera vez por coin+tf; luego DEBUG
+            _ohlcv_no_data_log(self.coin, timeframe, len(n_bars_sequence))
             return []
 
         bars = []
