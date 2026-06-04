@@ -39,7 +39,13 @@ FIX float_to_wire rounding (2026-06-02):
 FIX fetch_ohlcv (2026-06-04):
   HLClient no exponía fetch_ohlcv, causando AttributeError en todos los traders
   al arrancar. Añadido fetch_ohlcv() que delega en self._info.candles_snapshot()
-  y normaliza la respuesta al formato CCXT [[ts, o, h, l, c, v], ...].
+  y normaliza la respuesta al formato CCXT [[ts, o, h, l, c, v], ...]
+
+FIX fetch_ohlcv startTime/endTime (2026-06-04):
+  SDK ≥0.9.x requiere startTime y endTime como timestamps Unix en ms.
+  El código anterior pasaba startTime=0, endTime=0, lo que hace que la API
+  devuelva 0 velas (o lance TypeError). Ahora se calculan los timestamps
+  reales: end_ms = now, start_ms = end_ms - limit * interval_ms.
 
 Autenticación soportada:
   Opción A (recomendada): API Wallet
@@ -102,6 +108,21 @@ _TIMEFRAME_TO_HL: dict[str, str] = {
     "60":  "1h",
     "240": "4h",
     "1440":"1d",
+}
+
+# Interval → duration in milliseconds (used to compute startTime)
+_INTERVAL_MS: dict[str, int] = {
+    "1m":  60_000,
+    "3m":  180_000,
+    "5m":  300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h":  3_600_000,
+    "2h":  7_200_000,
+    "4h":  14_400_000,
+    "8h":  28_800_000,
+    "12h": 43_200_000,
+    "1d":  86_400_000,
 }
 
 
@@ -700,21 +721,34 @@ class HLClient:
                     numérico («15», «60», «240»). Defecto: «15m».
         limit     : número de velas a pedir. Defecto: 200.
 
+        SDK ≥0.9.x requiere startTime y endTime como timestamps Unix en ms.
+        Se calculan como:
+            end_ms   = now (tiempo actual en ms)
+            start_ms = end_ms - limit * interval_ms
+        Así se solicitan exactamente `limit` velas hacia atrás desde ahora.
+
         El SDK de Hyperliquid (Info.candles_snapshot) devuelve una lista de dicts:
             {"t": <open_time_ms>, "T": <close_time_ms>,
              "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume",
              "n": <num_trades>}
         """
         hl_interval = _TIMEFRAME_TO_HL.get(timeframe, timeframe)
+
+        # Compute real timestamps for the new SDK signature
+        end_ms   = int(time.time() * 1000)
+        step_ms  = _INTERVAL_MS.get(hl_interval, 3_600_000)
+        start_ms = end_ms - step_ms * limit
+
         try:
             raw: list[dict] = self._info.candles_snapshot(
                 coin=self.coin,
                 interval=hl_interval,
-                startTime=0,
-                endTime=0,
+                startTime=start_ms,
+                endTime=end_ms,
             )
         except TypeError:
-            # Older SDK versions may not accept startTime/endTime kwargs
+            # Older SDK versions that do not accept startTime/endTime kwargs
+            logger.debug("[%s] candles_snapshot: fallback a firma sin timestamps (SDK antiguo)", self.coin)
             raw = self._info.candles_snapshot(self.coin, hl_interval)
 
         if not raw:
