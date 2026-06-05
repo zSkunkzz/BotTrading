@@ -88,6 +88,16 @@ FIX get_ohlcv 3 bugs (2026-06-05):
     el bloque antes de asignar raw, el código posterior lanzaba NameError.
     Ahora raw se inicializa a None antes del bloque y el bloque de parseo
     queda dentro del try/except con early-return [] si raw no es lista.
+
+FIX kelly_mult scope + place_tp firma (2026-06-05):
+  Bug 1 — kelly_mult scope: el log final usaba dir() para comprobar si
+    kelly_mult estaba definida, pero dir() no incluye variables locales.
+    Resultado: siempre mostraba Kelly=1.00x aunque Kelly ajustara el size.
+    Fix: inicializar kelly_mult = 1.0 antes del bloque try/except de Kelly.
+  Bug 2 — place_tp firma incorrecta: se llamaba con 5 args posicionales
+    (not is_buy, qty, tp1_px, None, filled_price) pero la firma real es
+    place_tp(is_buy, sz, trigger_px, entry_px) — 4 args. El None extra
+    causaba TypeError en runtime. Fix: eliminar el None intermedio.
 """
 from __future__ import annotations
 
@@ -138,7 +148,6 @@ _MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "3.0")) / 100.0
 # que get_ohlcv() se llama. No se crea a nivel de módulo para evitar el error
 # "got Future attached to a different loop" en Python <3.10.
 _OHLCV_SEMAPHORE: Optional[asyncio.Semaphore] = None
-_OHLCV_SEM_LOCK = asyncio.Lock.__new__(asyncio.Lock)  # placeholder, se crea lazy
 
 
 def _get_ohlcv_semaphore() -> asyncio.Semaphore:
@@ -715,8 +724,11 @@ class FuturesTrader:
 
         usdc_base = float(getattr(risk, "usdc_per_trade", 20.0))
 
-        # FIX KELLY (#2): aplicar kelly_multiplier al size base
-        # kelly_mult=1.0 si no hay historial suficiente (<KELLY_MIN_TRADES)
+        # FIX KELLY (#2): aplicar kelly_multiplier al size base.
+        # kelly_mult se inicializa a 1.0 para que siempre esté definida
+        # en el scope del logger final, independientemente de si el bloque
+        # try/except llega a calcular un valor diferente.
+        kelly_mult = 1.0
         try:
             from bot.kelly_sizer import kelly_multiplier
             entry_mode = signal.get("entry_mode") or "NORMAL"
@@ -865,6 +877,8 @@ class FuturesTrader:
                 logger.error("[%s] open_order: error colocando SL: %s", self.symbol, e)
 
         # ── Colocar TP1 ──────────────────────────────────────────
+        # FIX: firma correcta place_tp(is_buy, sz, trigger_px, entry_px) — 4 args.
+        # Antes se pasaba un None extra entre trigger_px y entry_px → TypeError.
         if tp1_px and tp1_px > 0:
             try:
                 tp_result = await asyncio.to_thread(
@@ -872,7 +886,6 @@ class FuturesTrader:
                     not is_buy,
                     qty,
                     tp1_px,
-                    None,
                     filled_price,
                 )
                 logger.info("[%s] TP1 colocado en %.4f: %s", self.symbol, tp1_px, tp_result)
@@ -903,7 +916,7 @@ class FuturesTrader:
             self.entry_price,
             self.sl or 0,
             self.tp1 or 0,
-            kelly_mult if 'kelly_mult' in dir() else 1.0,
+            kelly_mult,
         )
 
 
