@@ -87,6 +87,21 @@ FIX double-checked locking en _get_user_state_cached (2026-06-05 v21):
   Resultado: con 20 traders, solo 1 thread hace el fetch real.
   Los otros 19 esperan el lock y al adquirirlo encuentran caché fresco.
 
+FIX _build_exchange/info_with_retry reintentos insuficientes (2026-06-05 v22):
+  CAUSA RAÍZ: BTC fue el primer trader en construir el singleton justo cuando
+  HL estaba throttleando a nivel de Exchange.__init__() (spotMeta interna).
+  Con solo 3 reintentos (~14s de ventana total) los intentos se agotaban antes
+  de que HL dejara de devolver 429. El resto de traders reutilizaban el
+  singleton ya construido, así que solo BTC (el primero) fallaba.
+
+  Fix:
+    - _build_exchange_with_retry: retries 3 → 8, delay inicial 2s → 5s.
+    - _build_info_with_retry:     retries 3 → 8, delay inicial 2s → 5s.
+    - Ventana total máxima con backoff x2 cap 30s: ~5+10+20+30+30+30+30 = 155s.
+    - Suficiente para sobrevivir cualquier pico de 429 al arrancar Railway.
+    - Configurable vía HL_SDK_INIT_RETRIES y HL_SDK_INIT_DELAY_S si se necesita
+      ajustar sin tocar código.
+
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -131,7 +146,13 @@ _NONCE_MIN_DELAY_MS = float(os.getenv("HL_NONCE_MIN_DELAY_MS", "50")) / 1000.0
 
 # Reintentos automáticos en _exchange_call cuando HL responde 429.
 _EXCHANGE_RETRIES     = int(float(os.getenv("HL_EXCHANGE_RETRIES", "3")))
-_EXCHANGE_RETRY_DELAY = float(os.getenv("HL_EXCHANGE_RETRY_DELAY_S", "2.0"))  
+_EXCHANGE_RETRY_DELAY = float(os.getenv("HL_EXCHANGE_RETRY_DELAY_S", "2.0"))
+
+# Reintentos para la inicialización del SDK (Exchange.__init__ / Info.__init__).
+# FIX v22: subidos de 3 → 8 y delay inicial de 2s → 5s para sobrevivir picos
+# de 429 en el primer arranque del singleton (ventana total ~155s con backoff).
+_SDK_INIT_RETRIES = int(float(os.getenv("HL_SDK_INIT_RETRIES", "8")))
+_SDK_INIT_DELAY_S = float(os.getenv("HL_SDK_INIT_DELAY_S", "5.0"))
 
 # Lock global de escritura al Exchange (threading porque va en to_thread).
 _EXCHANGE_LOCK = threading.Lock()
@@ -400,8 +421,15 @@ class _HLCore:
                 except Exception as exc:
                     logger.warning("[HLCore] _warm_cache tick parse falló para %s: %s", name, exc)
 
-    def _build_exchange_with_retry(self, wallet, kwargs: dict, retries: int = 3) -> Exchange:
-        delay = 2.0
+    def _build_exchange_with_retry(self, wallet, kwargs: dict) -> Exchange:
+        """
+        FIX v22: reintentos 3 → 8, delay inicial 2s → 5s.
+        Ventana total ~155s con backoff x2 cap 30s — sobrevive picos de 429
+        al construir el singleton por primera vez en Railway.
+        Configurable con HL_SDK_INIT_RETRIES y HL_SDK_INIT_DELAY_S.
+        """
+        retries = _SDK_INIT_RETRIES
+        delay   = _SDK_INIT_DELAY_S
         last_exc: Exception | None = None
         for attempt in range(retries):
             try:
@@ -416,8 +444,13 @@ class _HLCore:
                 delay = min(delay * 2, 30.0)
         raise RuntimeError(f"No se pudo inicializar Exchange tras {retries} intentos") from last_exc
 
-    def _build_info_with_retry(self, retries: int = 3) -> Info:
-        delay = 2.0
+    def _build_info_with_retry(self) -> Info:
+        """
+        FIX v22: reintentos 3 → 8, delay inicial 2s → 5s.
+        Configurable con HL_SDK_INIT_RETRIES y HL_SDK_INIT_DELAY_S.
+        """
+        retries = _SDK_INIT_RETRIES
+        delay   = _SDK_INIT_DELAY_S
         last_exc: Exception | None = None
         for attempt in range(retries):
             try:
