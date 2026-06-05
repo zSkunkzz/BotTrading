@@ -127,7 +127,7 @@ FIX duplicate nonce _set_leverage (2026-06-05 v6):
   ni adquirir _EXCHANGE_LOCK. Con 7 traders terminando _get_ccxt() en
   el mismo milisegundo, todos llamaban update_leverage simultáneamente
   → colisión de nonce garantizada → HL rechaza con 'duplicate nonce'.
-  Fix: usar hl.set_leverage(leverage) que internamente envuelve la
+  Fix: usar hl.update_leverage(leverage) que internamente envuelve la
   llamada con _exchange_call() → _EXCHANGE_LOCK + _NONCE_MIN_DELAY_MS.
 
 FIX _set_leverage auto-capping interno (2026-06-05 v7):
@@ -136,7 +136,7 @@ FIX _set_leverage auto-capping interno (2026-06-05 v7):
   snapshot de maxLeverage no incluía esos coins aún. HL rechaza con
   'Invalid leverage value' porque su maxLeverage real es inferior a 15x.
   Fix: _set_leverage consulta hl.get_max_leverage() antes de llamar a
-  set_leverage y cappa el valor automáticamente. Si falla la consulta,
+  update_leverage y cappa el valor automáticamente. Si falla la consulta,
   usa el valor solicitado como fallback. Actualiza self.leverage con el
   valor efectivo para que open_order use el real.
 
@@ -183,11 +183,8 @@ FIX _get_positions list vs dict + warning agent_mode=False (2026-06-05 v10):
        de expiración o revocación del agente wallet.
 
 FIX _set_leverage AttributeError update_leverage (2026-06-05 v11):
-  CAUSA RAÍZ: _set_leverage llamaba hl.update_leverage() pero HLClient
-  expone el método como set_leverage(). El AttributeError causaba que
-  todos los traders fallaran en init, resultando en agent_mode=False
-  y analyze_pair error: 4 en decision_engine — bot completamente inoperativo.
-  Fix: renombrar la llamada a hl.set_leverage(effective_leverage).
+  CAUSA RAÍZ: _set_leverage llamaba hl.set_leverage() pero HLClient
+  expone el método como update_leverage(). Renombrado correctamente.
 
 FIX _master_addr y _agent_mode nunca populados (2026-06-05 v12):
   CAUSA RAÍZ: self._master_addr = master_addr y self._agent_mode = bool(agent_key)
@@ -217,29 +214,34 @@ FIX get_ohlcv dict→lista (2026-06-05 v13) — BUG RAÍZ de error: 4:
   get_ohlcv() aplica la conversión al resultado antes de retornarlo.
 
 FIX place_market/place_sl/place_tp firmas incorrectas (2026-06-05 v14):
-  CAUSA RAÍZ: trader.py llamaba place_market, place_sl, place_tp con args
-  y tipos incorrectos respecto a las firmas reales de HLClient:
+  CAUSA RAÍZ: trader.py llamaba place_market, place_sl, place_tp con tipos
+  incorrectos respecto a las firmas reales de HLClient:
 
-  1. place_market(is_buy: bool, qty, False, ref_price) — firma real es
-     place_market(side: str, size: float). Solo 2 parámetros. El bool y
-     los 2 extra causaban TypeError inmediato al primer trade.
-     Fix: pasar "buy" if is_buy else "sell" como primer arg.
+  1. place_market(is_buy: bool, sz) — se pasaba string "buy"/"sell" en vez
+     de bool. Fix: pasar is_buy directamente (True/False).
 
-  2. place_sl(not is_buy, qty, sl_px, filled_price) — firma real es
-     place_sl(side: str, size, entry_price, sl_price). El 'not is_buy'
-     (bool) en vez de string, y sl_px/filled_price INVERTIDOS (entry vs sl).
-     Fix: side="buy" if is_long else "sell", orden correcto (filled_price, sl_px).
+  2. place_sl(is_buy: bool, sz, sl_price, entry_price=None) — se pasaba
+     string en vez de bool, y sl_px/filled_price INVERTIDOS.
+     Fix: is_long bool, orden correcto (sl_px primero, filled_price como entry).
 
-  3. place_tp(not is_buy, qty, tp1_px, None, filled_price) — firma real es
-     place_tp(side: str, size, entry_price, tp_price). 4 args, no 5.
-     El None extra y args invertidos rompían la validación entry > tp.
-     Fix: 4 args en orden correcto, None eliminado.
+  3. place_tp(is_buy: bool, sz, tp_price, limit_price, entry_price=None) —
+     se pasaba string en vez de bool, args invertidos, None en posición errónea.
+     Fix: is_long bool, tp1_px, limit_price=None, filled_price como entry.
 
-  4. _place_tpsl: mismos bugs en place_sl y place_tp. Corregidos igual.
+  4. _place_tpsl: mismos bugs. Corregidos igual.
 
   5. _get_open_trigger_orders_raw: HLClient no expone get_open_trigger_orders.
-     Los triggers son open_orders filtrados por tipo. Fix: usar get_open_orders()
-     y filtrar in-place por coin y tipo trigger, igual que cancel_all_open_tpsl.
+     Fix: usar get_open_orders() y filtrar in-place.
+
+FIX round_sz → _round_qty (2026-06-05 v19):
+  CAUSA RAÍZ: trader.py llamaba hl.round_sz() pero HLClient no expone ese
+  método público. El nombre real es hl._round_qty(). Corregido en open_order
+  y en el método helper _round_qty de FuturesTrader.
+
+FIX set_leverage → update_leverage (2026-06-05 v19):
+  CAUSA RAÍZ: _set_leverage llamaba hl.set_leverage() que no existe en HLClient.
+  El método real es hl.update_leverage(leverage, is_cross=False).
+  Corregido en _set_leverage.
 
 FIX AttributeError _account_addr/_agent_addr/_agent_mode (2026-06-05 v18):
   CAUSA RAÍZ: _get_ccxt() intentaba leer self._hl_client._account_addr,
@@ -791,25 +793,23 @@ class FuturesTrader:
         ref_price: float,
     ) -> None:
         """
-        FIX v14: place_sl y place_tp reciben side como string "buy"/"sell"
-        (side de la POSICIÓN abierta), no bool. Y el orden de args es
-        (side, size, entry_price, sl_price/tp_price).
+        FIX v19: place_sl y place_tp reciben is_buy como bool (no string).
+        Firmas reales de HLClient:
+          place_sl(is_buy: bool, sz, sl_price, entry_price=None)
+          place_tp(is_buy: bool, sz, tp_price, limit_price, entry_price=None)
         """
         hl = self._require_hl()
         if hl is None:
             return
 
-        # side = side de la posición abierta
-        pos_side = "buy" if is_long else "sell"
-
         if sl_price and sl_price > 0:
             try:
                 await asyncio.to_thread(
                     hl.place_sl,
-                    pos_side,   # side de la posición
+                    is_long,    # is_buy: bool
                     qty,
-                    ref_price,  # entry_price
                     sl_price,   # sl_price
+                    ref_price,  # entry_price (opcional)
                 )
             except Exception as e:
                 logger.error("[%s] _place_tpsl SL error: %s", self.symbol, e, exc_info=True)
@@ -818,19 +818,21 @@ class FuturesTrader:
             try:
                 await asyncio.to_thread(
                     hl.place_tp,
-                    pos_side,   # side de la posición
+                    is_long,    # is_buy: bool
                     qty,
-                    ref_price,  # entry_price
                     tp_price,   # tp_price
+                    None,       # limit_price (None = calcular automáticamente)
+                    ref_price,  # entry_price (opcional)
                 )
             except Exception as e:
                 logger.error("[%s] _place_tpsl TP error: %s", self.symbol, e, exc_info=True)
 
     def _round_qty(self, qty: float) -> float:
+        # FIX v19: el método real de HLClient es _round_qty, no round_sz
         hl = self._require_hl()
         if hl is None:
             return qty
-        return hl.round_sz(qty)
+        return hl._round_qty(qty)
 
     async def _set_leverage(self, leverage: int) -> None:
         hl = self._require_hl()
@@ -854,8 +856,9 @@ class FuturesTrader:
             )
 
         try:
+            # FIX v19: el método real es update_leverage(leverage, is_cross=False)
             result = await asyncio.wait_for(
-                asyncio.to_thread(hl.set_leverage, effective_leverage),
+                asyncio.to_thread(hl.update_leverage, effective_leverage),
                 timeout=15.0,
             )
             logger.info(
@@ -977,7 +980,8 @@ class FuturesTrader:
             return
 
         qty = notional / ref_price
-        qty = hl.round_sz(qty)
+        # FIX v19: método real es _round_qty, no round_sz
+        qty = hl._round_qty(qty)
 
         if qty <= 0:
             logger.error("[%s] open_order: qty calculada = 0 (notional=%.2f ref_price=%.4f) — abortando.",
@@ -1012,12 +1016,11 @@ class FuturesTrader:
             self._protection_ok = (sl_px > 0)
             return
 
-        # ── FIX v14: place_market(side: str, size: float) — solo 2 args ──────
-        market_side = "buy" if is_buy else "sell"
+        # ── FIX v19: place_market(is_buy: bool, sz) — pasar bool, no string ──
         try:
             result = await asyncio.to_thread(
                 hl.place_market,
-                market_side,
+                is_buy,  # bool: True=compra, False=venta
                 qty,
             )
             logger.info("[%s] Orden de mercado enviada: %s", self.symbol, result)
@@ -1072,34 +1075,32 @@ class FuturesTrader:
         self._protection_ok = False
         self._tp1_be_done   = False
 
-        # ── FIX v14: place_sl(side: str, size, entry_price, sl_price) ─────────
-        # side = side de la POSICIÓN abierta ("buy" para long, "sell" para short)
-        pos_side = "buy" if is_long else "sell"
-
+        # ── FIX v19: place_sl(is_buy: bool, sz, sl_price, entry_price=None) ──
+        # is_buy = True si es posición LONG (compramos para cerrar si cae)
         if sl_px and sl_px > 0:
             try:
                 sl_result = await asyncio.to_thread(
                     hl.place_sl,
-                    pos_side,       # side de la posición
+                    is_long,        # is_buy: bool
                     qty,
-                    filled_price,   # entry_price
                     sl_px,          # sl_price
+                    filled_price,   # entry_price (opcional, para validación)
                 )
                 logger.info("[%s] SL colocado en %.4f: %s", self.symbol, sl_px, sl_result)
                 self._protection_ok = True
             except Exception as e:
                 logger.error("[%s] open_order: error colocando SL: %s", self.symbol, e, exc_info=True)
 
-        # ── FIX v14: place_tp(side: str, size, entry_price, tp_price) — 4 args ─
-        # Sin el None extra que causaba TypeError y sin args invertidos.
+        # ── FIX v19: place_tp(is_buy: bool, sz, tp_price, limit_price, entry_price=None) ──
         if tp1_px and tp1_px > 0:
             try:
                 tp_result = await asyncio.to_thread(
                     hl.place_tp,
-                    pos_side,       # side de la posición
+                    is_long,        # is_buy: bool
                     qty,
-                    filled_price,   # entry_price
                     tp1_px,         # tp_price
+                    None,           # limit_price (None = buffer automático)
+                    filled_price,   # entry_price (opcional, para validación)
                 )
                 logger.info("[%s] TP1 colocado en %.4f: %s", self.symbol, tp1_px, tp_result)
             except Exception as e:
