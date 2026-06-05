@@ -79,6 +79,25 @@ FIX get_positions / get_balance_usdc (2026-06-05):
     3. Warning visible en startup cuando agent_mode=False para detectar
        inmediatamente agente expirado/no configurado.
 
+FIX 429 en _info calls + get_ohlcv endTime vela abierta (2026-06-05 v14):
+  BUG 1 — 429 en _get_positions (clearinghouseState):
+    CAUSA RAÍZ: get_positions() llama self._info.user_state() que usa el
+    SDK síncrono requests. Al ejecutarse via asyncio.to_thread(), el
+    semáforo _HL_SEMAPHORE de trader.py (aiohttp) NO lo cubre.
+    Con 10 traders llamando get_positions() simultáneamente en su
+    primer ciclo → 10 requests a clearinghouseState en ráfaga → 429.
+    FIX: _INFO_SEMAPHORE = threading.Semaphore(HL_INFO_CONCURRENCY, default 3)
+    Todas las llamadas a self._info.* que van a /info adquieren este
+    semáforo. Al ser threading.Semaphore funciona dentro de
+    asyncio.to_thread() (hilos OS, no event loop).
+
+  BUG 2 — get_ohlcv sin datos para BTC, HYPE y otros coins principales:
+    CAUSA RAÍZ: end_ts = int(time.time() * 1000) apunta al instante actual,
+    dentro de la vela abierta (aún no cerrada). HL devuelve [] silenciosamente
+    cuando endTime está en una vela abierta.
+    FIX: end_ts retrocede 2 intervalos para garantizar que siempre apunta
+    a la última vela CERRADA (2 intervalos absorben latencia y skew de reloj).
+
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -118,21 +137,21 @@ _MARKET_SLIPPAGE = 0.03
 _TP_LIMIT_BUFFER = 0.001
 
 # Delay mínimo entre llamadas de escritura consecutivas al Exchange.
-# Garantiza timestamps distintos (nonce = time_ns // 1_000_000) y reduce
-# el riesgo de 429 por rate-limit de HL en arranques con muchos traders.
-# Configurable con HL_NONCE_MIN_DELAY_MS (default 50ms).
 _NONCE_MIN_DELAY_MS = float(os.getenv("HL_NONCE_MIN_DELAY_MS", "50")) / 1000.0
 
 # Reintentos automáticos en _exchange_call cuando HL responde 429.
-# Configurable con HL_EXCHANGE_RETRIES (default 3) y
-# HL_EXCHANGE_RETRY_DELAY_S (espera inicial en segundos, default 2.0).
 _EXCHANGE_RETRIES     = int(float(os.getenv("HL_EXCHANGE_RETRIES", "3")))
 _EXCHANGE_RETRY_DELAY = float(os.getenv("HL_EXCHANGE_RETRY_DELAY_S", "2.0"))
 
-# Lock global de escritura al Exchange.
-# threading.Lock (no asyncio.Lock) porque las llamadas ocurren en hilos
-# via asyncio.to_thread(), no en el event loop directamente.
+# Lock global de escritura al Exchange (threading porque va en to_thread).
 _EXCHANGE_LOCK = threading.Lock()
+
+# ── Semáforo threading para llamadas de LECTURA a _info (SDK síncrono) ──────────
+# Limita la concurrencia de user_state / open_orders / candles_snapshot
+# que usan requests internamente y NO pasan por el semáforo aiohttp de trader.py.
+# threading.Semaphore porque se adquiere dentro de asyncio.to_thread() (hilos OS).
+_HL_INFO_CONCURRENCY = int(os.getenv("HL_INFO_CONCURRENCY", "3"))
+_INFO_SEMAPHORE = threading.Semaphore(_HL_INFO_CONCURRENCY)
 
 POST_FILL_CONFIRM_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
 POST_FILL_CONFIRM_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
@@ -161,11 +180,8 @@ def _round_sz(sz: float, sz_decimals: int) -> float:
 def _is_429(exc: Exception) -> bool:
     """Devuelve True si la excepción indica rate-limit (429) de HL."""
     err = str(exc)
-    # El SDK lanza una tupla/list con el status como primer elemento.
-    # También puede venir como string "429" en el mensaje.
     if "429" in err:
         return True
-    # Formato tuple del SDK: (status_code, ...) — primer arg int
     if exc.args and isinstance(exc.args[0], int) and exc.args[0] == 429:
         return True
     return False
@@ -174,11 +190,7 @@ def _is_429(exc: Exception) -> bool:
 def _exchange_call(fn, *args, **kwargs):
     """
     Ejecuta una llamada de escritura al Exchange SDK con lock global.
-
-    Garantiza:
-      1. Solo una llamada activa al SDK a la vez (_EXCHANGE_LOCK).
-      2. Timestamps distintos entre llamadas consecutivas (_NONCE_MIN_DELAY_MS).
-      3. Retry automático con backoff exponencial si HL responde 429.
+    Garantiza timestamps distintos y retry automático en 429.
     """
     last_exc: Exception | None = None
     delay = _EXCHANGE_RETRY_DELAY
@@ -202,7 +214,40 @@ def _exchange_call(fn, *args, **kwargs):
             else:
                 raise
 
-    # Solo llega aquí si _EXCHANGE_RETRIES == 0 (misconfiguración)
+    if last_exc is not None:
+        raise last_exc
+
+
+def _info_call(fn, *args, **kwargs):
+    """
+    Ejecuta una llamada de LECTURA al SDK Info con semáforo threading global.
+
+    FIX v14: protege user_state(), open_orders(), candles_snapshot() y
+    cualquier otra llamada a self._info.* contra concurrencia excesiva.
+    Sin este semáforo, 10 traders llamando get_positions() al mismo tiempo
+    lanzan 10 requests síncronos a /info en ráfaga => HL responde 429.
+
+    Incluye retry automático con backoff en caso de 429.
+    """
+    last_exc: Exception | None = None
+    delay = _EXCHANGE_RETRY_DELAY
+
+    for attempt in range(max(1, _EXCHANGE_RETRIES)):
+        try:
+            with _INFO_SEMAPHORE:
+                return fn(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if _is_429(exc) and attempt < _EXCHANGE_RETRIES - 1:
+                logger.warning(
+                    "[InfoCall] 429 rate-limit (intento %d/%d) — reintentando en %.1fs",
+                    attempt + 1, _EXCHANGE_RETRIES, delay,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+            else:
+                raise
+
     if last_exc is not None:
         raise last_exc
 
@@ -215,11 +260,6 @@ class _HLCore:
     """
     Singleton que mantiene UNA instancia de Exchange + Info.
     Pre-carga szDecimals, pxDecimals y maxLeverage al arrancar.
-
-    IMPORTANTE: la creación debe hacerse SIEMPRE mediante get_async()
-    desde código async (dentro del event loop). Nunca llamar get()
-    directamente desde __init__ de clases que se instancian antes de
-    que asyncio.run() esté activo.
     """
 
     _instance: "_HLCore | None" = None
@@ -275,12 +315,6 @@ class _HLCore:
         )
 
     def _warm_cache(self) -> None:
-        """
-        Pre-carga szDecimals, pxDecimals, tick_size y maxLeverage.
-        NOTA: este método es síncrono y bloqueante — debe llamarse SIEMPRE
-        desde asyncio.to_thread() (via get_async()), nunca directamente
-        desde código async o desde __init__ de clases raíz.
-        """
         try:
             meta     = self.info.meta()
             universe = meta.get("universe", [])
@@ -317,25 +351,14 @@ class _HLCore:
 
     @classmethod
     async def get_async(cls) -> "_HLCore":
-        """
-        Obtiene (o crea) el singleton de forma async-safe.
-        La creación real ocurre en asyncio.to_thread() para no bloquear
-        el event loop con las llamadas HTTP síncronas de _warm_cache().
-        """
         if cls._instance is not None:
             return cls._instance
-
-        # Crear el lock si aún no existe (primera llamada)
         if cls._init_lock is None:
             cls._init_lock = asyncio.Lock()
-
         async with cls._init_lock:
-            # Double-check dentro del lock
             if cls._instance is None:
                 cls._instance = await asyncio.to_thread(cls)
         return cls._instance
-
-    # ── Builders con retry ────────────────────────────────────────
 
     def _build_exchange_with_retry(self, wallet, kwargs: dict, retries: int = 3) -> Exchange:
         for attempt in range(retries):
@@ -361,8 +384,6 @@ class _HLCore:
                 else:
                     raise
 
-    # ── Acceso a caché ────────────────────────────────────────────
-
     def get_sz_decimals(self, coin: str) -> int:
         return self._sz_decimals_cache.get(coin, 4)
 
@@ -383,9 +404,7 @@ class _HLCore:
 class HLClient:
     """
     Cliente por símbolo (coin) que delega al singleton _HLCore.
-
-    Uso:
-        client = await HLClient.create("BTC")
+    Uso: client = await HLClient.create("BTC")
     """
 
     def __init__(self, symbol: str, core: "_HLCore | None" = None):
@@ -410,11 +429,11 @@ class HLClient:
         core = await _HLCore.get_async()
         return cls(symbol, core=core)
 
-    # ── METADATOS ──────────────────────────────────────────
+    # ── METADATOS ────────────────────────────────────────────────
 
     def _get_meta_asset(self) -> dict:
         try:
-            meta = self._info.meta()
+            meta = _info_call(self._info.meta)
             for asset in meta.get("universe", []):
                 if asset.get("name") == self.coin:
                     return asset
@@ -448,39 +467,50 @@ class HLClient:
     def round_sz(self, size: float) -> float:
         return _round_sz(size, self.get_sz_decimals())
 
-    # ── OHLCV ──────────────────────────────────────────────
+    # ── OHLCV ────────────────────────────────────────────────
 
     def get_ohlcv(self, timeframe: str = "15m", limit: int = 100) -> list[dict]:
+        """
+        Obtiene velas OHLCV via SDK.
+
+        FIX v14: end_ts retrocede 2 intervalos para garantizar que nunca
+        apunta a la vela abierta actual. HL devuelve [] silenciosamente
+        cuando endTime cae dentro de una vela no cerrada.
+        También usa _info_call() para pasar por el semáforo threading.
+        """
         tf_map = {
             "1m": 1, "3m": 3, "5m": 5, "15m": 15,
             "30m": 30, "1h": 60, "2h": 120, "4h": 240,
             "6h": 360, "8h": 480, "12h": 720, "1d": 1440,
         }
-        interval = tf_map.get(timeframe, 15)
-        end_ts   = int(time.time() * 1000)
-        start_ts = end_ts - limit * interval * 60 * 1000
+        interval    = tf_map.get(timeframe, 15)
+        interval_ms = interval * 60 * 1000
+        # Retroceder 2 intervalos: garantiza que endTime apunta a la ultima
+        # vela CERRADA incluso con latencia de red o skew de reloj.
+        end_ts   = int(time.time() * 1000) - 2 * interval_ms
+        start_ts = end_ts - limit * interval_ms
 
-        candles = self._info.candles_snapshot(self.coin, interval, start_ts, end_ts)
+        candles = _info_call(self._info.candles_snapshot, self.coin, interval, start_ts, end_ts)
         result  = []
-        for c in candles:
+        for c in (candles or []):
             try:
                 result.append({
                     "timestamp": int(c["T"]),
-                    "open":  float(c["o"]),
-                    "high":  float(c["h"]),
-                    "low":   float(c["l"]),
-                    "close": float(c["c"]),
+                    "open":   float(c["o"]),
+                    "high":   float(c["h"]),
+                    "low":    float(c["l"]),
+                    "close":  float(c["c"]),
                     "volume": float(c["v"]),
                 })
             except (KeyError, TypeError, ValueError):
                 continue
         return result
 
-    # ── PRECIO ─────────────────────────────────────────────
+    # ── PRECIO ───────────────────────────────────────────────
 
     def get_price(self) -> float:
         try:
-            mids = self._info.all_mids()
+            mids = _info_call(self._info.all_mids)
             val  = mids.get(self.coin)
             if val is not None:
                 return float(val)
@@ -491,7 +521,7 @@ class HLClient:
             return candles[-1]["close"]
         return 0.0
 
-    # ── LEVERAGE ───────────────────────────────────────────
+    # ── LEVERAGE ─────────────────────────────────────────────
 
     def set_leverage(self, leverage: int, is_cross: bool = True) -> dict:
         return _exchange_call(
@@ -501,27 +531,23 @@ class HLClient:
             is_cross,
         )
 
-    # ── CONSULTAS INFO (solo lectura, sin lock) ───────────────────
+    # ── CONSULTAS INFO (solo lectura, protegidas por _INFO_SEMAPHORE) ────────
 
     def get_user_state(self) -> dict:
-        return self._info.user_state(self._account_addr)
+        return _info_call(self._info.user_state, self._account_addr)
 
     def get_open_orders(self) -> list:
-        return self._info.open_orders(self._account_addr)
+        return _info_call(self._info.open_orders, self._account_addr)
 
     def get_positions(self) -> list:
         state = self.get_user_state()
-        # Hyperliquid puede devolver dict (normal) o list (sin agente / edge case).
-        # Cuando agent_mode=False el SDK puede retornar directamente la lista
-        # de posiciones sin el wrapper {assetPositions:[...]}.
         if isinstance(state, dict):
             asset_positions = state.get("assetPositions", [])
         elif isinstance(state, list):
-            # La API devolvió directamente la lista de posiciones
             asset_positions = state
         else:
             logger.warning(
-                "[%s] _get_positions: respuesta inesperada (tipo=%s): %r",
+                "[%s] get_positions: respuesta inesperada (tipo=%s): %r",
                 self.coin, type(state).__name__, state,
             )
             return []
@@ -572,7 +598,7 @@ class HLClient:
                     )
         return results
 
-    # ── ÓRDENES ────────────────────────────────────────────
+    # ── ÓRDENES ─────────────────────────────────────────────
 
     def place_market(self, side: str, size: float) -> dict:
         """
@@ -592,7 +618,6 @@ class HLClient:
         sz = self.round_sz(size)
         if sz <= 0:
             raise ValueError(f"[{self.coin}] place_market: size redondeado a 0 (raw={size})")
-        order = {"limit_px": limit_px, "is_buy": is_buy, "sz": sz, "reduce_only": False}
         return _exchange_call(
             self._exchange.order,
             self.coin,
@@ -624,17 +649,15 @@ class HLClient:
         side: side de la POSICIÓN abierta ('buy' → TP es sell, 'sell' → TP es buy).
         """
         is_buy_pos = side.lower() == "buy"
-        is_buy_tp  = not is_buy_pos   # la orden TP cierra la posición
+        is_buy_tp  = not is_buy_pos
         sz         = _round_sz(size, self.get_sz_decimals())
         if sz <= 0:
             raise ValueError(f"[{self.coin}] place_tp: size redondeado a 0 (raw={size})")
         trigger_px = self.round_px(tp_price)
-        # Precio límite ligeramente más favorable para garantizar fill
         if is_buy_tp:
             limit_px = self.round_px(trigger_px * (1 + _TP_LIMIT_BUFFER))
         else:
             limit_px = self.round_px(trigger_px * (1 - _TP_LIMIT_BUFFER))
-        # Validación lógica: TP debe estar al otro lado de entry
         if is_buy_pos and trigger_px <= entry_price:
             raise ValueError(f"[{self.coin}] place_tp LONG: tp_price({trigger_px}) debe ser > entry({entry_price})")
         if not is_buy_pos and trigger_px >= entry_price:
@@ -655,17 +678,15 @@ class HLClient:
         side: side de la POSICIÓN abierta ('buy' → SL es sell, 'sell' → SL es buy).
         """
         is_buy_pos = side.lower() == "buy"
-        is_buy_sl  = not is_buy_pos   # la orden SL cierra la posición
+        is_buy_sl  = not is_buy_pos
         sz         = _round_sz(size, self.get_sz_decimals())
         if sz <= 0:
             raise ValueError(f"[{self.coin}] place_sl: size redondeado a 0 (raw={size})")
         trigger_px = self.round_px(sl_price)
-        # Precio límite con slippage para garantizar fill en stop
         if is_buy_sl:
             limit_px = self.round_px(trigger_px * (1 + _MARKET_SLIPPAGE))
         else:
             limit_px = self.round_px(trigger_px * (1 - _MARKET_SLIPPAGE))
-        # Validación lógica: SL debe estar al mismo lado (contrario del TP)
         if is_buy_pos and trigger_px >= entry_price:
             raise ValueError(f"[{self.coin}] place_sl LONG: sl_price({trigger_px}) debe ser < entry({entry_price})")
         if not is_buy_pos and trigger_px <= entry_price:
@@ -683,7 +704,5 @@ class HLClient:
     def place_bulk(self, orders: list[dict]) -> dict:
         """
         Envía múltiples órdenes en un solo request (bulk order).
-        Cada elemento de orders es un dict con keys:
-          coin, is_buy, sz, limit_px, order_type, reduce_only (opcional).
         """
         return _exchange_call(self._exchange.bulk_orders, orders)
