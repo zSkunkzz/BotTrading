@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HyperliquidBot v1.0 — IA + Scanner + Telegram + Webhook + Balance Service + Kill Switch"""
+"""OKXBot v2.0 — IA + Scanner + Telegram + Webhook + Balance Service + Kill Switch"""
 
 import asyncio
 import logging
@@ -32,27 +32,15 @@ _max_leverage_map: dict[str, int] = {}
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
 _USDC_PER_TRADE        = float(os.getenv("USDC_PER_TRADE", "20"))
 
-_USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
-_API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
+# ── Credenciales OKX ─────────────────────────────────────────────
+_OKX_API_KEY    = os.getenv("OKX_API_KEY",    "")
+_OKX_API_SECRET = os.getenv("OKX_API_SECRET", "")
+_OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
+_USE_DEMO       = os.getenv("OKX_DEMO", "false").lower() in ("true", "1", "yes")
+_FLAG           = "1" if _USE_DEMO else "0"  # 1=demo, 0=live
 
 _IDLE_ROTATE_CYCLES = int(os.getenv("IDLE_ROTATE_CYCLES", "30"))
 _idle_cycles: dict[str, int] = {}
-
-
-def _resolve_hl_address() -> str:
-    addr = os.getenv("HL_API_WALLET_ADDRESS", "").strip()
-    if addr:
-        return addr
-    addr = os.getenv("HL_ACCOUNT_ADDR", "").strip()
-    if addr:
-        return addr
-    pk = os.getenv("HL_PRIVATE_KEY", "").strip()
-    if pk:
-        import eth_account
-        addr = eth_account.Account.from_key(pk).address
-        logger.info("\U0001f511 Dirección derivada de HL_PRIVATE_KEY: %s", addr[:12] + "...")
-        return addr
-    return ""
 
 
 def make_risk():
@@ -94,14 +82,10 @@ async def _start_single_pair(symbol: str):
         "\U0001f680 Iniciando trader: %s (leverage=%dx | usdc_per_trade=%.2f)",
         symbol, _effective_leverage(symbol), _USDC_PER_TRADE,
     )
-    private_key = (
-        os.getenv("HL_API_PRIVATE_KEY", "").strip()
-        or os.getenv("HL_PRIVATE_KEY", "").strip()
-    )
     trader = FuturesTrader(
-        api_key=os.getenv("HL_API_WALLET_ADDRESS", "").strip() or None,
-        api_secret=private_key,
-        passphrase=None,
+        api_key=_OKX_API_KEY   or None,
+        api_secret=_OKX_API_SECRET,
+        passphrase=_OKX_PASSPHRASE or None,
         symbol=symbol,
         leverage=_effective_leverage(symbol),
         margin_mode=os.getenv("MARGIN_MODE", "isolated"),
@@ -162,46 +146,48 @@ async def _stop_pair_with_cleanup(symbol: str) -> None:
         logger.info("\u23f9 Trader detenido: %s", symbol)
 
 
-async def _purge_stale_state(hl_addr: str) -> set:
-    import aiohttp
-    import json as _json
-
+async def _purge_stale_state() -> set:
+    """
+    Compara el state local contra las posiciones reales en OKX.
+    Elimina del state los símbolos que ya no tienen posición abierta.
+    """
     saved_symbols = set(bot_state._positions.keys())
     if not saved_symbols:
         return set()
 
-    if not hl_addr:
-        logger.warning("\u26a0\ufe0f  No hay dirección HL — no se puede verificar state contra exchange.")
+    if not _OKX_API_KEY:
+        logger.warning("\u26a0\ufe0f  No hay credenciales OKX — no se puede verificar state.")
         return saved_symbols
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{_API_URL}/info",
-                json={"type": "clearinghouseState", "user": hl_addr},
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                data = _json.loads(await resp.text())
+        import okx.Account as Account
+        account_api = Account.AccountAPI(
+            _OKX_API_KEY, _OKX_API_SECRET, _OKX_PASSPHRASE, False, _FLAG
+        )
+        data = await asyncio.to_thread(account_api.get_positions)
+        positions = data.get("data", [])
     except Exception as e:
-        logger.warning("\u26a0\ufe0f  No se pudo consultar exchange para purge stale state: %s — conservando state.", e)
+        logger.warning(
+            "\u26a0\ufe0f  No se pudo consultar OKX para purge stale state: %s — conservando state.", e
+        )
         return saved_symbols
 
     real_positions: set = set()
-    for p in data.get("assetPositions", []):
-        pos = p.get("position", {})
-        try:
-            szi = float(pos.get("szi", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if abs(szi) > 0:
-            real_positions.add(pos.get("coin", "").upper())
+    for p in positions:
+        inst_id = p.get("instId", "")
+        pos_qty = float(p.get("pos") or 0)
+        if abs(pos_qty) > 0:
+            # inst_id es 'BTC-USDT-SWAP' → extraer 'BTC'
+            coin = inst_id.split("-")[0].upper()
+            real_positions.add(coin)
 
     stale = saved_symbols - real_positions
     if stale:
         for sym in stale:
             clear_position(sym)
-            logger.warning("\U0001f9f9 STALE STATE: '%s' estaba en state local pero NO en exchange — eliminado.", sym)
+            logger.warning(
+                "\U0001f9f9 STALE STATE: '%s' estaba en state local pero NO en OKX — eliminado.", sym
+            )
         logger.info(
             "\U0001f9f9 State purgado: %d fantasmas eliminados (%s). Posiciones reales: %s",
             len(stale), ", ".join(stale),
@@ -209,7 +195,7 @@ async def _purge_stale_state(hl_addr: str) -> set:
         )
     else:
         logger.info(
-            "\u2705 State OK: todas las posiciones guardadas existen en el exchange (%s).",
+            "\u2705 State OK: todas las posiciones guardadas existen en OKX (%s).",
             ", ".join(saved_symbols),
         )
     return real_positions
@@ -299,29 +285,28 @@ async def main():
     global global_risk
 
     logger.info("=" * 60)
-    logger.info("  HyperliquidBot v1.0 — IA + Scanner + Telegram + KS")
+    logger.info("  OKXBot v2.0 — IA + Scanner + Telegram + KS")
     logger.info("=" * 60)
-    logger.info("\U0001f4b0 Sizing: USDC_PER_TRADE=%.2f USDC | LEVERAGE=%dx", _USDC_PER_TRADE, _LEVERAGE_BASE)
+    logger.info("\U0001f4b0 Sizing: USDC_PER_TRADE=%.2f USDT | LEVERAGE=%dx | DEMO=%s",
+                _USDC_PER_TRADE, _LEVERAGE_BASE, _USE_DEMO)
 
-    hl_addr = _resolve_hl_address()
-    if not hl_addr:
-        logger.warning("\u26a0\ufe0f No se pudo resolver dirección HL.")
+    if not _OKX_API_KEY:
+        logger.warning("\u26a0\ufe0f  OKX_API_KEY no configurado — operando en DRY-RUN.")
 
-    import httpx
-    _HL_TESTNET  = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
-    _HL_INFO_URL = "https://api.hyperliquid-testnet.xyz/info" if _HL_TESTNET else "https://api.hyperliquid.xyz/info"
+    # ── Balance service ──────────────────────────────────────────
+    try:
+        import okx.Account as Account
+        _account_api = Account.AccountAPI(
+            _OKX_API_KEY, _OKX_API_SECRET, _OKX_PASSPHRASE, False, _FLAG
+        )
+        balance_svc.init_okx(_account_api)
+        logger.info("\u2705 Balance service inicializado (OKX, demo=%s)", _USE_DEMO)
+    except Exception as e:
+        logger.warning("\u26a0\ufe0f  Balance service no pudo inicializarse: %s", e)
 
-    async def _info_post(payload: dict) -> dict:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(_HL_INFO_URL, json=payload)
-            resp.raise_for_status()
-            return resp.json()
-
-    balance_svc.init_hl(address=hl_addr, info_post_fn=_info_post)
-    logger.info("\u2705 Balance service inicializado (addr=%s)", hl_addr[:12] + "..." if hl_addr else "N/A")
-
-    logger.info("\U0001f50d Verificando state local contra exchange...")
-    real_open_symbols = await _purge_stale_state(hl_addr)
+    # ── Purge stale state ────────────────────────────────────────
+    logger.info("\U0001f50d Verificando state local contra OKX...")
+    real_open_symbols = await _purge_stale_state()
 
     global_risk = GlobalRisk(
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", str(MAX_ACTIVE_TRADERS))),
@@ -332,106 +317,28 @@ async def main():
 
     webhook_runner = await start_webhook_server()
 
-    # ── PRE-WARM _HLCore UNA SOLA VEZ ────────────────────────────────────────
-    # FIX FREEZE: inicializar el SDK (Exchange + Info + _warm_cache) ANTES de
-    # lanzar cualquier trader. Así cuando los N traders llamen _get_ccxt() →
-    # HLClient.create() → _HLCore.get_async(), el singleton ya existe y
-    # retornan instantáneamente sin bloquear el event loop.
-    logger.info("\U0001f504 Pre-inicializando SDK Hyperliquid (Exchange + Info)...")
-    try:
-        from bot.core.hl_client import _HLCore
-        await _HLCore.get_async()
-        logger.info("\u2705 SDK Hyperliquid listo — traders arrancarán sin bloqueo.")
-    except Exception as _sdk_err:
-        logger.error("\u274c Error pre-inicializando SDK: %s — abortando.", _sdk_err)
-        raise
-    # ─────────────────────────────────────────────────────────────────────────
+    scanner = PairScanner(on_pairs_updated=on_pairs_updated)
+    asyncio.create_task(scanner.run())
 
-    top_n = int(os.getenv("TOP_PAIRS", str(MAX_ACTIVE_TRADERS * 3)))
-    logger.info(
-        "\u2699\ufe0f  MAX_ACTIVE_TRADERS=%d | TOP_PAIRS=%d | LEVERAGE_BASE=%dx | IDLE_ROTATE_CYCLES=%d",
-        MAX_ACTIVE_TRADERS, top_n, _LEVERAGE_BASE, _IDLE_ROTATE_CYCLES,
+    asyncio.create_task(kill_switch.run())
+    asyncio.create_task(_idle_rotation_loop(scanner))
+
+    await setup_telegram_commands(
+        start_pair_fn=start_pair,
+        stop_pair_fn=stop_pair,
+        active_traders=active_traders,
+        trader_instances=_trader_instances,
     )
 
-    scanner = PairScanner(top_n=top_n)
+    await notify_startup(
+        pairs=list(active_traders.keys()),
+        leverage=_LEVERAGE_BASE,
+        usdc_per_trade=_USDC_PER_TRADE,
+    )
 
-    logger.info("\U0001f50d Escaneando mercado Hyperliquid inicial...")
-    initial_pairs = await scanner.scan()
-
-    scanner.active_pairs = list(initial_pairs)
-
-    scored_data = list(getattr(scanner, "_last_scored", []))
-    if not scored_data and initial_pairs:
-        scored_data = [{"symbol": sym, "volume_usdt": 0, "change_pct": 0, "score": 0} for sym in initial_pairs]
-
-    _update_leverage_map(scored_data)
-
-    if scored_data:
-        logger.info("\U0001f916 Filtrando con IA (%d pares)...", len(scored_data))
-        ai_ranked   = await ai_rank_pairs(scored_data)
-        final_pairs = [scanner.normalize(s) for s in ai_ranked[:top_n]]
-        seen = set()
-        final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
-    else:
-        final_pairs = []
-
-    if not final_pairs:
-        logger.warning("\u26a0\ufe0f ai_rank_pairs vacío \u2192 usando scanner directamente")
-        final_pairs = [scanner.normalize(s) for s in initial_pairs[:top_n]]
-        seen = set()
-        final_pairs = [p for p in final_pairs if not (p in seen or seen.add(p))]
-
-    if not final_pairs:
-        logger.error("\u274c Scanner devolvio 0 pares. Revisa SCANNER_MIN_VOLUME y SCANNER_MIN_CHANGE.")
-
-    logger.info("\u2705 Pares finales (%d): %s", len(final_pairs), ", ".join(final_pairs))
-
-    open_symbols = real_open_symbols
-    missing_from_scan = open_symbols - set(final_pairs)
-    if missing_from_scan:
-        logger.warning("\u26a0\ufe0f  Pares con posición REAL no están en scanner — forzando: %s", ", ".join(missing_from_scan))
-        final_pairs = list(missing_from_scan) + final_pairs
-
-    ws_feed.start(final_pairs)
-    logger.info("\U0001f50c WS feed arrancado para %d símbolos", len(final_pairs))
-
-    await asyncio.sleep(3)
-
-    guaranteed   = [p for p in final_pairs if p in open_symbols]
-    scanner_fill = [p for p in final_pairs if p not in open_symbols][:max(0, MAX_ACTIVE_TRADERS - len(guaranteed))]
-    pairs_to_trade = guaranteed + scanner_fill
-
-    logger.info("\U0001f680 Arrancando %d traders (de %d disponibles): %s",
-                len(pairs_to_trade), len(final_pairs), ", ".join(pairs_to_trade))
-    await start_traders_staggered(pairs_to_trade, _start_single_pair, delay=3.0)
-
-    watchdog_task = asyncio.create_task(kill_switch.run_watchdog(_trader_instances))
-    rotation_task = asyncio.create_task(_idle_rotation_loop(scanner))
-    logger.info("\U0001f415 Kill Switch Watchdog arrancado")
-    logger.info("\U0001f504 Idle Rotation Loop arrancado (rota después de %d ciclos idle)", _IDLE_ROTATE_CYCLES)
-
-    tg_task = setup_telegram_commands()
-    if tg_task:
-        logger.info("\U0001f4f2 Telegram comandos activos (/resetks, /ksstatus)")
-    else:
-        logger.info("\U0001f4f2 Telegram comandos desactivados (sin TELEGRAM_TOKEN)")
-
-    dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
-    await notify_startup(pairs_to_trade, dry_run, top_n)
-
-    try:
-        await scanner.run_scanner_loop(on_pairs_updated)
-    finally:
-        watchdog_task.cancel()
-        rotation_task.cancel()
-        if tg_task:
-            tg_task.cancel()
-        ws_feed.stop()
-        await webhook_runner.cleanup()
+    logger.info("\U0001f7e2 Bot arrancado — esperando señales del scanner...")
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nBot detenido.")
+    asyncio.run(main())
