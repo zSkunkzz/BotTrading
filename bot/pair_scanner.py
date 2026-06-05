@@ -31,6 +31,12 @@ FIX OHLCV (2026-06-05): filtro de liquidez OHLCV antes de activar coins
   - SCANNER_OHLCV_VERIFY=false para deshabilitar (debug).
   - SCANNER_OHLCV_VERIFY_TF=15m para elegir el timeframe de verificación.
   - Resultado: ningún coin sin velas llega al bot.
+
+FIX SCAN-0 (2026-06-05): _info_post con retry+backoff
+  - 3 intentos con espera 2s/5s entre reintentos.
+  - 429 y timeout se reintenta automáticamente.
+  - Log diagnóstico cuando universe sale vacío (muestra tipo y tamaño del payload).
+  - Conteo de filtros pasa de DEBUG a INFO para visibilidad en Railway.
 """
 import logging
 import asyncio
@@ -103,15 +109,58 @@ def _funding_trend(symbol: str, current: float) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# FIX SCAN-0: retry con backoff para absorber 429 y timeouts transitorios
+_INFO_POST_RETRIES = int(os.getenv("SCANNER_INFO_RETRIES", "3"))
+_INFO_POST_RETRY_DELAYS = [2.0, 5.0, 10.0]  # segundos entre reintentos
+
+
 async def _info_post(payload: dict) -> dict:
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            f"{_API_URL}/info",
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as r:
-            return _json.loads(await r.text())
+    """POST a /info con hasta _INFO_POST_RETRIES intentos y backoff exponencial."""
+    last_exc: Exception | None = None
+    for attempt in range(_INFO_POST_RETRIES):
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{_API_URL}/info",
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as r:
+                    if r.status == 429:
+                        wait = _INFO_POST_RETRY_DELAYS[min(attempt, len(_INFO_POST_RETRY_DELAYS) - 1)]
+                        logger.warning(
+                            "[PairScanner] _info_post 429 rate-limit (intento %d/%d) — esperando %.0fs",
+                            attempt + 1, _INFO_POST_RETRIES, wait,
+                        )
+                        await asyncio.sleep(wait)
+                        last_exc = aiohttp.ClientResponseError(
+                            r.request_info, r.history, status=429
+                        )
+                        continue
+                    if r.status >= 500:
+                        body = await r.text()
+                        wait = _INFO_POST_RETRY_DELAYS[min(attempt, len(_INFO_POST_RETRY_DELAYS) - 1)]
+                        logger.warning(
+                            "[PairScanner] _info_post HTTP %d (intento %d/%d) — esperando %.0fs | body=%s",
+                            r.status, attempt + 1, _INFO_POST_RETRIES, wait, body[:200],
+                        )
+                        await asyncio.sleep(wait)
+                        last_exc = aiohttp.ClientResponseError(
+                            r.request_info, r.history, status=r.status
+                        )
+                        continue
+                    return _json.loads(await r.text())
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            wait = _INFO_POST_RETRY_DELAYS[min(attempt, len(_INFO_POST_RETRY_DELAYS) - 1)]
+            logger.warning(
+                "[PairScanner] _info_post error (intento %d/%d): %s — esperando %.0fs",
+                attempt + 1, _INFO_POST_RETRIES, exc, wait,
+            )
+            last_exc = exc
+            if attempt < _INFO_POST_RETRIES - 1:
+                await asyncio.sleep(wait)
+
+    raise last_exc or RuntimeError("_info_post: todos los reintentos fallaron")
 
 
 async def _check_ohlcv_available(
@@ -276,11 +325,30 @@ class PairScanner:
         try:
             data = await _info_post({"type": "metaAndAssetCtxs"})
         except Exception as e:
-            logger.error("[PairScanner] Error fetching metaAndAssetCtxs: %s", e)
+            logger.error("[PairScanner] Error fetching metaAndAssetCtxs tras reintentos: %s", e)
             return []
 
-        universe = data[0].get("universe", []) if isinstance(data, list) and data else []
-        ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
+        # ── Diagnóstico: loguear si el payload no tiene la forma esperada ──────
+        if not isinstance(data, list) or len(data) < 2:
+            logger.error(
+                "[PairScanner] ❌ metaAndAssetCtxs devolvió formato inesperado: "
+                "type=%s len=%s preview=%s",
+                type(data).__name__,
+                len(data) if isinstance(data, (list, dict)) else "N/A",
+                str(data)[:300],
+            )
+            return []
+
+        universe = data[0].get("universe", []) if isinstance(data[0], dict) else []
+        ctxs     = data[1] if isinstance(data[1], list) else []
+
+        if not universe:
+            logger.error(
+                "[PairScanner] ❌ universe vacío — data[0] keys=%s",
+                list(data[0].keys()) if isinstance(data[0], dict) else type(data[0]).__name__,
+            )
+            return []
+        # ──────────────────────────────────────────────────────────────────────
 
         total_seen        = 0
         skipped_blacklist = 0
@@ -353,10 +421,20 @@ class PairScanner:
                 "ai_delta":      0.0,
             })
 
-        logger.debug(
-            "[PairScanner] scan: total=%d | blacklist=%d | lev=%d | vol=%d | change=%d | passed=%d",
-            total_seen, skipped_blacklist, skipped_lev, skipped_volume, skipped_change, len(scored),
+        # FIX SCAN-0: cambiar DEBUG → INFO para visibilidad en Railway
+        logger.info(
+            "[PairScanner] scan: universe=%d | válidos=%d | blacklist=%d | lev=%d | vol=%d | change=%d | passed=%d",
+            len(universe), total_seen, skipped_blacklist, skipped_lev,
+            skipped_volume, skipped_change, len(scored),
         )
+
+        if not scored:
+            logger.warning(
+                "[PairScanner] ⚠️ 0 pares tras filtros — "
+                "considera bajar SCANNER_MIN_VOLUME (actual=%.0f) o SCANNER_MIN_CHANGE (actual=%.2f%%)",
+                self.min_volume_usdt, self.min_price_change_pct,
+            )
+            return []
 
         # ── Filtro IA de noticias ────────────────────────────────────────────────
         if _AI_NEWS_FILTER and scored:
