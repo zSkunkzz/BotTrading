@@ -137,6 +137,17 @@ FIX _set_leverage auto-capping interno (2026-06-05 v7):
   llamar a update_leverage y cappa el valor automáticamente. Si falla
   la consulta, usa el valor solicitado como fallback. Actualiza
   self.leverage con el valor efectivo para que open_order use el real.
+
+FIX start() TradingLoop kwargs (2026-06-05 v8):
+  CAUSA RAÍZ: start() instanciaba TradingLoop(trader=self, symbol=...,
+  signal_fn=...) pero TradingLoop.__init__ solo acepta symbol:str.
+  Además llamaba self._loop.run() sin argumentos, cuando run() requiere
+  (trader, risk, *, global_risk=None).
+  Fix:
+    1. TradingLoop se instancia solo con symbol: TradingLoop(self.symbol).
+    2. run() recibe trader=self y un objeto risk mínimo con usdc_per_trade.
+    3. signal_fn ya no se pasa a TradingLoop — DecisionEngine lo gestiona
+       internamente a través de signal_engine.
 """
 from __future__ import annotations
 
@@ -301,6 +312,20 @@ except ImportError:
     BARS_NEEDED = _OHLCV_BARS
 
 
+class _RiskProxy:
+    """
+    Objeto mínimo compatible con la interfaz que TradingLoop.run() espera
+    de 'risk': solo necesita el atributo usdc_per_trade.
+
+    Se crea en FuturesTrader.start() para no acoplar trader.py a la
+    clase RiskManager concreta de main.py.
+    """
+    __slots__ = ("usdc_per_trade",)
+
+    def __init__(self, usdc_per_trade: float) -> None:
+        self.usdc_per_trade = usdc_per_trade
+
+
 class FuturesTrader:
     """
     Trader asíncrono para un único par en Hyperliquid.
@@ -325,6 +350,7 @@ class FuturesTrader:
         agent_addr:     str  = "",
     ) -> None:
         self.symbol         = symbol
+        self.coin           = symbol          # alias para compatibilidad con trading_loop._init()
         self.leverage       = leverage
         self.usdc_per_trade = usdc_per_trade
         self.signal_fn      = signal_fn
@@ -334,6 +360,7 @@ class FuturesTrader:
         self._private_key = private_key
         self._agent_key   = agent_key
         self._agent_addr  = agent_addr
+        self._agent_mode  = bool(agent_key)   # alias para trading_loop._init()
 
         # Estado de posición
         self.position:    Optional[str]   = None
@@ -362,13 +389,14 @@ class FuturesTrader:
     # ─────────────────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Arranca el TradingLoop en background."""
-        self._loop = TradingLoop(
-            trader    = self,
-            symbol    = self.symbol,
-            signal_fn = self.signal_fn,
-        )
-        await self._loop.run()
+        """Arranca el TradingLoop en background.
+
+        TradingLoop.__init__ solo acepta symbol:str.
+        TradingLoop.run() acepta (trader, risk, *, global_risk=None).
+        """
+        self._loop = TradingLoop(self.symbol)
+        risk = _RiskProxy(self.usdc_per_trade)
+        await self._loop.run(self, risk)
 
     async def stop(self) -> None:
         """Para el TradingLoop limpiamente."""
@@ -381,6 +409,10 @@ class FuturesTrader:
         """Cancela la task del TradingLoop (para parada forzada)."""
         if self._loop:
             self._loop.cancel()
+
+    def get_ohlcv_fn(self):
+        """Devuelve un callable async para obtener OHLCV de este símbolo."""
+        return self.get_ohlcv
 
     # ─────────────────────────────────────────────────────────────────────────
     # Inicialización lazy del SDK
