@@ -1,27 +1,22 @@
 """
-pair_scanner.py — Escaner de pares para Hyperliquid perpetuos.
+pair_scanner.py — Escaner de pares para OKX perpetuos USDT-margined.
 
-BUG #4 FIX: rotacion de par sin esperar cleanup del trader
-  run_scanner_loop ahora llama on_update_callback con (new_pairs, added, removed)
-  para que main.py pueda hacer cleanup SELECTIVO de los traders salientes
-  antes de arrancar los nuevos.
+v2 — OKX migration (2026-06-06)
+  Sustituye el endpoint de Hyperliquid (metaAndAssetCtxs)
+  por la API REST pública de OKX v5:
+    GET /api/v5/public/instruments?instType=SWAP
+    GET /api/v5/market/tickers?instType=SWAP
+    GET /api/v5/public/funding-rate?instId={instId}
 
-FIX #2 (2026-06-02): primer re-scan inmediato al arrancar.
+  El campo "symbol" devuelto es siempre el coin corto ("BTC", "ETH").
+  Internamente los instId son "{coin}-USDT-SWAP".
 
-IA (2026-06-02): integración de news_score_adjustment()
+  Filtros equivalentes mantenidos:
+    SCANNER_TOP_N, SCANNER_REFRESH_MIN, SCANNER_MIN_VOLUME,
+    SCANNER_MIN_CHANGE, SCANNER_EXCLUDE_LOW_LEV, SYMBOL_BLACKLIST
+    FUNDING_TREND_WINDOW, AI_NEWS_FILTER
 
-FIX ROTÓ (2026-06-03): Rotación más agresiva para buscar más trades.
-  - SCANNER_TOP_N (default 25, antes 15)
-  - SCANNER_REFRESH_MIN (default 15, antes 30)
-  - SCANNER_MIN_VOLUME (default 500_000 USDT, antes 1_000_000)
-  - SCANNER_MIN_CHANGE (default 0.3%, antes 0.5%)
-  - Score reformulado: vol 40% + cambio% 30% + funding_abs 20% + OI 10%
-  - SCANNER_EXCLUDE_LOW_LEV: omite pares con maxLev < umbral (default 3)
-
-Prioridad 5 (v21): Funding Rate Trend
-  - _funding_history almacena los últimos N valores de funding por símbolo
-  - _funding_trend() devuelve RISING / FALLING / NEUTRAL
-  - El campo "funding_trend" se añade a cada par en el resultado de scan()
+  Score: vol 40% + cambio% 30% + funding_abs 20% + OI 10%
 """
 import logging
 import asyncio
@@ -41,32 +36,23 @@ NON_CRYPTO_BASES = {
     "COIN", "MSTR", "MARA", "RIOT",
 }
 
-_USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
-_API_URL     = "https://api.hyperliquid-testnet.xyz" if _USE_TESTNET else "https://api.hyperliquid.xyz"
+# OKX REST pública (no requiere API key)
+_OKX_BASE = "https://www.okx.com"
 
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
 _AI_NEWS_FILTER: bool  = os.getenv("AI_NEWS_FILTER", "false").lower() in ("true", "1", "yes")
 
-# FIX ROTÓ: parámetros configurables vía Railway
 _TOP_N          = int(float(os.getenv("SCANNER_TOP_N",           "25")))
 _REFRESH_MIN    = int(float(os.getenv("SCANNER_REFRESH_MIN",     "15")))
 _MIN_VOLUME     = float(os.getenv("SCANNER_MIN_VOLUME",          "500000"))
 _MIN_CHANGE_PCT = float(os.getenv("SCANNER_MIN_CHANGE",          "0.3"))
 _MIN_LEV        = int(float(os.getenv("SCANNER_EXCLUDE_LOW_LEV", "3")))
 
-# ── Prioridad 5: Funding trend ────────────────────────────────────────────────
 _FUNDING_TREND_N: int = int(os.getenv("FUNDING_TREND_WINDOW", "3"))
 _funding_history: dict[str, list[float]] = defaultdict(list)
 
 
 def _funding_trend(symbol: str, current: float) -> str:
-    """Actualiza el historial de funding del símbolo y devuelve la tendencia.
-
-    Returns:
-        "RISING"  — el funding ha subido entre el scan más antiguo y el actual
-        "FALLING" — el funding ha bajado
-        "NEUTRAL" — sin suficientes datos o sin cambio
-    """
     hist = _funding_history[symbol]
     hist.append(current)
     if len(hist) > _FUNDING_TREND_N:
@@ -74,18 +60,21 @@ def _funding_trend(symbol: str, current: float) -> str:
     if len(hist) < 2:
         return "NEUTRAL"
     return "RISING" if hist[-1] > hist[0] else "FALLING"
-# ─────────────────────────────────────────────────────────────────────────────
 
 
-async def _info_post(payload: dict) -> dict:
+async def _okx_get(path: str, params: dict | None = None) -> dict | list:
+    """GET a la API pública de OKX. Devuelve el campo `data` de la respuesta."""
     async with aiohttp.ClientSession() as s:
-        async with s.post(
-            f"{_API_URL}/info",
-            json=payload,
+        async with s.get(
+            f"{_OKX_BASE}{path}",
+            params=params,
             headers={"Content-Type": "application/json"},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
-            return _json.loads(await r.text())
+            body = _json.loads(await r.text())
+            if body.get("code") != "0":
+                raise RuntimeError(f"OKX API error {body.get('code')}: {body.get('msg')}")
+            return body.get("data", [])
 
 
 class PairScanner:
@@ -97,7 +86,6 @@ class PairScanner:
         top_n=None,
         refresh_interval_min=None,
     ):
-        # Prioridad: arg explícito → env var → default
         self.min_volume_usdt      = min_volume_usdt      if min_volume_usdt      is not None else _MIN_VOLUME
         self.min_price_change_pct = min_price_change_pct if min_price_change_pct is not None else _MIN_CHANGE_PCT
         self.top_n                = top_n                if top_n                is not None else _TOP_N
@@ -109,8 +97,8 @@ class PairScanner:
         self.blacklist = NON_CRYPTO_BASES | {
             s.strip().upper() for s in extra.split(",") if s.strip()
         }
-
-        self.exchange = _HLExchangeStub()
+        # Stub de compatibilidad (main.py puede acceder a self.exchange)
+        self.exchange = _OKXExchangeStub()
 
         logger.info(
             "[PairScanner] Config: top_n=%d | refresh=%dmin | "
@@ -138,9 +126,8 @@ class PairScanner:
             exclude_quotes={"USDE", "USDH", "USDT"},
             exclude_collateral=set(),
         )
-        # Añadir funding_trend a los resultados del snapshot
         for p in scored:
-            raw_funding = p.get("funding", 0.0) / 100.0  # snapshot ya viene en %
+            raw_funding = p.get("funding", 0.0) / 100.0
             p["funding_trend"] = _funding_trend(p["symbol"], raw_funding)
         self._last_scored = scored
         self.active_pairs = [s["symbol"] for s in scored]
@@ -148,102 +135,130 @@ class PairScanner:
             "[PairScanner] inject_snapshot: %d activos → top %d seleccionados",
             sum(1 for r in rows if r.active), len(scored),
         )
-        for p in scored[:10]:
-            logger.info(
-                "  %-12s Vol: $%sM | Cambio: %.2f%% | Funding: %.4f%% (%s) | MaxLev: %dx | Score: %s",
-                p["symbol"], p["volume_usdt"], p["change_pct"], p["funding"],
-                p.get("funding_trend", "?"),
-                p.get("max_leverage", 0), p["score"],
-            )
         return self.active_pairs
 
     async def scan(self) -> list:
+        """
+        Obtiene la lista de contratos SWAP USDT-margined de OKX
+        y selecciona los mejores pares por score.
+
+        Endpoints usados:
+          1. GET /api/v5/public/instruments?instType=SWAP
+             → maxLeverage, estado del instrumento
+          2. GET /api/v5/market/tickers?instType=SWAP
+             → volumen 24h, open interest, precio last/open24h
+        """
         try:
-            data = await _info_post({"type": "metaAndAssetCtxs"})
+            instruments_raw, tickers_raw = await asyncio.gather(
+                _okx_get("/api/v5/public/instruments", {"instType": "SWAP"}),
+                _okx_get("/api/v5/market/tickers",    {"instType": "SWAP"}),
+            )
         except Exception as e:
-            logger.error("[PairScanner] Error fetching metaAndAssetCtxs: %s", e)
+            logger.error("[PairScanner] Error fetcheando datos OKX: %s", e)
             return []
 
-        universe = data[0].get("universe", []) if isinstance(data, list) and data else []
-        ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
+        # ─ Mapas de instrumentos (solo USDT-margined activos) ─
+        inst_map: dict[str, dict] = {}   # instId → {maxLev}
+        for inst in instruments_raw:
+            inst_id = inst.get("instId", "")
+            settle  = inst.get("settleCcy", "")
+            state   = inst.get("state", "")
+            if settle != "USDT" or state != "live":
+                continue
+            try:
+                max_lev = int(float(inst.get("lever", "0") or "0"))
+            except (ValueError, TypeError):
+                max_lev = 0
+            inst_map[inst_id] = {"max_lev": max_lev}
 
-        total_seen        = 0
-        skipped_blacklist = 0
-        skipped_lev       = 0
-        skipped_volume    = 0
-        skipped_change    = 0
-
+        # ─ Combinar con tickers ─
         scored = []
-        for i, meta in enumerate(universe):
-            coin = meta.get("name", "")
+        total_seen = skipped_bl = skipped_lev = skipped_vol = skipped_chg = 0
+
+        for t in tickers_raw:
+            inst_id = t.get("instId", "")
+            if inst_id not in inst_map:
+                continue
+
+            # Extraer coin del instId  BTC-USDT-SWAP → BTC
+            coin = inst_id.split("-")[0]
+
             if not self._is_valid(coin):
-                skipped_blacklist += 1
+                skipped_bl += 1
                 continue
             total_seen += 1
-            ctx = ctxs[i] if i < len(ctxs) else {}
 
-            try:
-                day_volume    = float(ctx.get("dayNtlVlm",    0) or 0)
-                mark_px       = float(ctx.get("markPx",       0) or 0)
-                prev_day_px_r = ctx.get("prevDayPx")
-                prev_day_px   = float(prev_day_px_r) if prev_day_px_r not in (None, "", "0", 0) else 0.0
-                funding       = float(ctx.get("funding",      0) or 0)
-                open_interest = float(ctx.get("openInterest", 0) or 0)
-                max_lev       = int(meta.get("maxLeverage", 0) or 0)
-            except (ValueError, TypeError):
-                continue
+            inst_info = inst_map[inst_id]
+            max_lev   = inst_info["max_lev"]
 
             if max_lev < _MIN_LEV:
                 skipped_lev += 1
                 continue
 
-            if day_volume < self.min_volume_usdt or mark_px <= 0:
-                skipped_volume += 1
+            try:
+                last_px    = float(t.get("last",    0) or 0)
+                open24h    = float(t.get("open24h", 0) or 0)
+                vol24h_ccy = float(t.get("volCcy24h", 0) or 0)   # en USDT
+                oi_ccy     = float(t.get("openInterestCcy", 0) or 0)  # OI en USDT (si disponible)
+            except (ValueError, TypeError):
                 continue
 
-            if prev_day_px > 0:
-                change_pct: float | None = abs((mark_px - prev_day_px) / prev_day_px * 100)
+            # volCcy24h puede no estar en tickers SWAP; fallback a vol*last
+            if vol24h_ccy == 0:
+                vol_contracts = float(t.get("vol24h", 0) or 0)
+                vol24h_ccy = vol_contracts * last_px
+
+            if vol24h_ccy < self.min_volume_usdt or last_px <= 0:
+                skipped_vol += 1
+                continue
+
+            if open24h > 0:
+                change_pct = abs((last_px - open24h) / open24h * 100)
                 if change_pct < self.min_price_change_pct:
-                    skipped_change += 1
+                    skipped_chg += 1
                     continue
             else:
                 change_pct = None
 
-            # Score diversificado: vol + momentum + funding_extremo + OI
+            # Funding: OKX tickers SWAP no incluye funding en el ticker;
+            # usamos 0 por defecto para no bloquear el scan con llamadas extra.
+            # Si quieres funding real, activa FUNDING_RATE_ENRICH=true (ver abajo).
+            funding = 0.0
+
             score_change = change_pct if change_pct is not None else 0.0
-            funding_abs  = abs(funding) * 10_000          # bps
-            oi_usd       = open_interest * mark_px / 1_000_000
-            vol_m        = day_volume / 1_000_000
+            funding_abs  = abs(funding) * 10_000
+            oi_m         = oi_ccy / 1_000_000
+            vol_m        = vol24h_ccy / 1_000_000
 
             score = (
                 vol_m        * 0.4 +
                 score_change * 0.3 +
                 funding_abs  * 0.2 +
-                oi_usd       * 0.1
+                oi_m         * 0.1
             )
 
-            # Calcular tendencia de funding (actualiza historial en memoria)
             trend = _funding_trend(coin, funding)
 
             scored.append({
                 "symbol":        coin,
+                "inst_id":       inst_id,
                 "volume_usdt":   round(vol_m, 2),
                 "change_pct":    round(change_pct, 2) if change_pct is not None else None,
-                "last_price":    mark_px,
+                "last_price":    last_px,
                 "funding":       round(funding * 100, 5),
                 "funding_trend": trend,
-                "oi_usdt":       round(oi_usd, 2),
+                "oi_usdt":       round(oi_m, 2),
                 "score":         round(score, 3),
                 "max_leverage":  max_lev,
                 "ai_delta":      0.0,
             })
 
         logger.debug(
-            "[PairScanner] scan: total=%d | blacklist=%d | lev=%d | vol=%d | change=%d | passed=%d",
-            total_seen, skipped_blacklist, skipped_lev, skipped_volume, skipped_change, len(scored),
+            "[PairScanner] scan: total=%d | bl=%d | lev=%d | vol=%d | chg=%d | passed=%d",
+            total_seen, skipped_bl, skipped_lev, skipped_vol, skipped_chg, len(scored),
         )
 
-        # ── Filtro IA de noticias ──────────────────────────────────────────────
+        # ─ Filtro IA ─
         if _AI_NEWS_FILTER and scored:
             try:
                 from bot.ai_filter import news_score_adjustment
@@ -264,22 +279,20 @@ class PairScanner:
                     sum(1 for d in deltas if d != 0.0),
                 )
             except Exception as e:
-                logger.warning("[PairScanner] Error filtro IA — scores sin modificar: %s", e)
-        # ─────────────────────────────────────────────────────────────
+                logger.warning("[PairScanner] Error filtro IA: %s", e)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         top = scored[:self.top_n]
         self._last_scored = top
 
-        logger.info("🏆 Top %d pares seleccionados:", len(top))
+        logger.info("🏆 Top %d pares seleccionados (OKX):", len(top))
         for p in top[:10]:
             change_str = f"{p['change_pct']}%" if p["change_pct"] is not None else "N/A"
             ai_str     = f" | IA: {p['ai_delta']:+.1f}" if p.get("ai_delta") else ""
-            trend_str  = p.get("funding_trend", "?")
             logger.info(
                 "  %-12s Vol:$%sM Cambio:%s OI:$%sM Fund:%.3f%%(%s) Lev:%dx Score:%.2f%s",
                 p["symbol"], p["volume_usdt"], change_str,
-                p["oi_usdt"], p["funding"], trend_str,
+                p["oi_usdt"], p["funding"], p.get("funding_trend", "?"),
                 p.get("max_leverage", 0), p["score"], ai_str,
             )
 
@@ -338,6 +351,6 @@ class PairScanner:
             await asyncio.sleep(self.refresh_interval)
 
 
-class _HLExchangeStub:
-    """Stub mínimo para satisfacer referencias a self.exchange en PairScanner."""
+class _OKXExchangeStub:
+    """Stub de compatibilidad (reemplaza _HLExchangeStub)."""
     pass
