@@ -118,6 +118,12 @@ FIX get_ohlcv_fn ausente (2026-06-05):
   → loop reiniciaba cada 10s sin analizar ningún par.
   Fix: añadir get_ohlcv_fn() que devuelve un callable parcial de get_ohlcv
   listo para ser pasado a signal_engine.analyze_pair como ohlcv_fn.
+
+FIX HLClient.create() firma (2026-06-05):
+  trader.py pasaba 3 args posicionales (api_key, api_secret, coin) pero
+  HLClient.create() solo acepta 1 (symbol). Los credenciales los lee
+  _HLCore directamente desde las env vars HL_API_PRIVATE_KEY / HL_PRIVATE_KEY.
+  Fix: HLClient.create(self.coin) — eliminar api_key y api_secret sobrantes.
 """
 from __future__ import annotations
 
@@ -330,9 +336,9 @@ class FuturesTrader:
             return
         try:
             logger.info("[%s] Inicializando HLClient (async)…", self.symbol)
-            self._hl_client = await HLClient.create(
-                self._api_key, self._api_secret, self.coin
-            )
+            # FIX: HLClient.create() solo acepta symbol — las credenciales
+            # las lee _HLCore directamente desde las env vars.
+            self._hl_client = await HLClient.create(self.coin)
             self._master_addr = getattr(self._hl_client, "master_address", "") or ""
             self._agent_mode  = getattr(self._hl_client, "agent_mode",     False)
             logger.info(
