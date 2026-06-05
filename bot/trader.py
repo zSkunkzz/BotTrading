@@ -88,7 +88,7 @@ FIX OHLCV semáforo (2026-06-03):
   Añadido _OHLCV_SEMAPHORE global (asyncio.Semaphore) que limita los fetch
   de candleSnapshot a max OHLCV_MAX_CONCURRENCY peticiones en paralelo.
   El semáforo se inicializa lazy en get_ohlcv() la primera vez que se llama
-  (dentro del event loop), evitando el error de "attached to a different loop".
+  (dentro del event loop), evitando el error de \"attached to a different loop\".
 
 FIX allMids NoneType — retry + caché último precio (2026-06-04 / 2026-06-05 v2):
   Cuando HL devuelve null en allMids (cold-start o saturación puntual),
@@ -169,7 +169,7 @@ FIX HLClient.create() kwargs + get_max_leverage() signature (2026-06-05 v9):
 FIX _get_positions list vs dict + warning agent_mode=False (2026-06-05 v10):
   CAUSA RAÍZ: HLClient.get_positions() ya devuelve una list[dict] filtrada
   por coin (no un dict con clave 'assetPositions'). El código anterior en
-  _get_positions() hacía data.get("assetPositions", []) sobre esa lista,
+  _get_positions() hacía data.get(\"assetPositions\", []) sobre esa lista,
   lo que lanzaba 'list' object has no attribute 'get' en CADA ciclo de
   todos los traders, paralizando el bot al 100% con error: 4 en decision_engine.
   Esto ocurre especialmente cuando agent_mode=False (wallet directa sin
@@ -188,6 +188,22 @@ FIX _set_leverage AttributeError update_leverage (2026-06-05 v11):
   todos los traders fallaran en init, resultando en agent_mode=False
   y analyze_pair error: 4 en decision_engine — bot completamente inoperativo.
   Fix: renombrar la llamada a hl.set_leverage(effective_leverage).
+
+FIX _master_addr y _agent_mode nunca populados (2026-06-05 v12):
+  CAUSA RAÍZ: self._master_addr = master_addr y self._agent_mode = bool(agent_key)
+  en __init__ siempre quedaban "" / False porque main.py NO pasa esos kwargs —
+  _HLCore ya lee las credenciales de las env vars directamente.
+  Consecuencias:
+    - _get_positions() siempre devolvía [] (guard 'if not self._master_addr').
+    - TradingLoop logueaba siempre 'master=N/A | agent_mode=False'.
+    - balance_svc.init_hl() recibía master_addr="" y nunca se inicializaba.
+  Fix:
+    _get_ccxt(), tras crear HLClient con éxito, sincroniza:
+      self._master_addr = hl._account_addr   (wallet principal de _HLCore)
+      self._agent_addr  = hl._agent_addr
+      self._agent_mode  = hl._agent_mode
+    Así el resto del código (trading_loop, _get_positions, balance_svc)
+    recibe los valores reales leídos de las env vars.
 """
 from __future__ import annotations
 
@@ -396,11 +412,15 @@ class FuturesTrader:
         self.signal_fn      = signal_fn
         self.dry_run        = dry_run
 
+        # Estos valores se mantienen como fallback si main.py los pasa explícitamente,
+        # pero en la práctica siempre quedan "" / False porque _HLCore lee las
+        # credenciales directamente de las env vars.
+        # _get_ccxt() los sobreescribe con los valores reales del HLClient tras crearlo.
         self._master_addr = master_addr
         self._private_key = private_key
         self._agent_key   = agent_key
         self._agent_addr  = agent_addr
-        self._agent_mode  = bool(agent_key)   # alias para trading_loop._init()
+        self._agent_mode  = bool(agent_key)   # se sobreescribe en _get_ccxt()
 
         # Estado de posición
         self.position:    Optional[str]   = None
@@ -469,10 +489,12 @@ class FuturesTrader:
         lee _HLCore directamente de las variables de entorno — NO se pasan
         aquí como argumentos.
 
-        WARNING visible si agent_mode=False: el bot opera con wallet directa
-        sin agente autorizado. Esto puede causar comportamientos distintos en
-        la API de HL (e.g., get_positions devuelve estructura diferente) y
-        significa que el agente pudo haber expirado o sido revocado.
+        FIX v12: tras crear HLClient, sincroniza self._master_addr,
+        self._agent_addr y self._agent_mode desde los atributos reales
+        del HLClient (que a su vez vienen de _HLCore y las env vars).
+        Esto corrige que _get_positions() siempre devolviera [] por el
+        guard 'if not self._master_addr' y que TradingLoop logueara
+        siempre 'master=N/A | agent_mode=False'.
         """
         if self._hl_client is not None:
             return self._hl_client
@@ -480,11 +502,22 @@ class FuturesTrader:
         logger.info("[%s] _get_ccxt: inicializando HLClient...", self.symbol)
         try:
             self._hl_client = await HLClient.create(self.symbol)
-            agent_active = getattr(self._hl_client, "_agent_mode", False)
+
+            # ── FIX v12: sincronizar credenciales desde HLClient ──────────
+            # _HLCore lee HL_API_PRIVATE_KEY / HL_API_WALLET_ADDRESS de las
+            # env vars. Los parámetros del constructor (master_addr, agent_key)
+            # son legacy y siempre llegan vacíos desde main.py actual.
+            # Aquí se sobreescriben con los valores reales para que el resto
+            # del código (trading_loop, _get_positions, balance_svc) funcione.
+            self._master_addr = self._hl_client._account_addr
+            self._agent_addr  = self._hl_client._agent_addr
+            self._agent_mode  = self._hl_client._agent_mode
+
+            agent_active = self._agent_mode
             logger.info(
                 "[%s] _get_ccxt: HLClient listo | addr=%s | agente=%s",
                 self.symbol,
-                (self._master_addr or "")[:12] + "...",
+                self._master_addr[:12] + "..." if self._master_addr else "N/A",
                 agent_active,
             )
             if not agent_active:
@@ -646,7 +679,7 @@ class FuturesTrader:
     ) -> list[dict]:
         """
         Versión de get_ohlcv que lanza excepción en vez de devolver None.
-        Útil para callers que necesitan distinguir "sin datos" de "error".
+        Útil para callers que necesitan distinguir \"sin datos\" de \"error\".
         """
         try:
             result = await self.get_ohlcv(timeframe=timeframe, n=n)
@@ -666,6 +699,10 @@ class FuturesTrader:
         (no un dict — no llamar .get() sobre ella). Si por compatibilidad futura
         la respuesta fuera un dict, se extrae 'assetPositions'. Cualquier otro
         tipo inesperado → WARNING + [].
+
+        NOTA: el guard 'if not self._master_addr' protege contra llamadas antes
+        de que _get_ccxt() haya completado. Tras _get_ccxt(), _master_addr
+        siempre contiene la dirección real leída de HL_API_WALLET_ADDRESS.
         """
         if not self._master_addr:
             return []
