@@ -98,6 +98,20 @@ FIX 429 en _info calls + get_ohlcv endTime vela abierta (2026-06-05 v14):
     FIX: end_ts retrocede 2 intervalos para garantizar que siempre apunta
     a la última vela CERRADA (2 intervalos absorben latencia y skew de reloj).
 
+FIX caché compartido user_state (2026-06-05 v15):
+  CAUSA RAÍZ persistente de 429 en clearinghouseState:
+  Aunque _INFO_SEMAPHORE limita la concurrencia a 3 simultáneos, con 10
+  traders cada uno llamando get_user_state() en su ciclo de ~10s, se
+  generan ~10 llamadas/10s = 1 req/s a clearinghouseState POR CUENTA.
+  La respuesta es idéntica para todos (misma cuenta), así que hacer N
+  llamadas es redundante y agota el rate-limit.
+  FIX: caché singleton en _HLCore (_user_state_cache) compartido entre
+  TODOS los HLClient. TTL configurable con HL_USER_STATE_CACHE_TTL_S
+  (default 3s). get_user_state() devuelve el caché si es reciente,
+  evitando la ráfaga de requests idénticos a clearinghouseState.
+  Lock threading (_USER_STATE_LOCK) para acceso thread-safe desde
+  asyncio.to_thread().
+
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -116,6 +130,7 @@ import asyncio
 import logging
 import math
 import os
+import random
 import threading
 import time
 from typing import Optional
@@ -152,6 +167,14 @@ _EXCHANGE_LOCK = threading.Lock()
 # threading.Semaphore porque se adquiere dentro de asyncio.to_thread() (hilos OS).
 _HL_INFO_CONCURRENCY = int(os.getenv("HL_INFO_CONCURRENCY", "3"))
 _INFO_SEMAPHORE = threading.Semaphore(_HL_INFO_CONCURRENCY)
+
+# ── Caché compartido de user_state (singleton por cuenta) ───────────────────
+# TTL configurable con HL_USER_STATE_CACHE_TTL_S (default 3s).
+# Lock threading para acceso thread-safe desde asyncio.to_thread().
+_USER_STATE_CACHE_TTL = float(os.getenv("HL_USER_STATE_CACHE_TTL_S", "3.0"))
+_USER_STATE_LOCK      = threading.Lock()
+_user_state_cache: dict | list | None = None
+_user_state_cache_ts: float = 0.0
 
 POST_FILL_CONFIRM_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
 POST_FILL_CONFIRM_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
@@ -244,6 +267,55 @@ def _info_call(fn, *args, **kwargs):
                     attempt + 1, _EXCHANGE_RETRIES, delay,
                 )
                 time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+            else:
+                raise
+
+    if last_exc is not None:
+        raise last_exc
+
+
+def _get_user_state_cached(info_obj, account_addr: str):
+    """
+    FIX v15: caché singleton compartido de user_state para toda la cuenta.
+
+    Todos los HLClient de todos los traders comparten el mismo caché porque
+    la respuesta de clearinghouseState es idéntica para todos (misma cuenta).
+    Hacer N llamadas simultáneas es redundante y satura el rate-limit de HL.
+
+    TTL configurable con HL_USER_STATE_CACHE_TTL_S (default 3s).
+    Lock threading para acceso seguro desde asyncio.to_thread().
+    Incluye retry con backoff exponencial + jitter en caso de 429.
+    """
+    global _user_state_cache, _user_state_cache_ts
+
+    now = time.monotonic()
+    with _USER_STATE_LOCK:
+        if _user_state_cache is not None and (now - _user_state_cache_ts) < _USER_STATE_CACHE_TTL:
+            return _user_state_cache
+
+    # Caché expirado o vacío — hacer la request fuera del lock para no bloquear
+    last_exc: Exception | None = None
+    delay = _EXCHANGE_RETRY_DELAY
+
+    for attempt in range(max(1, _EXCHANGE_RETRIES)):
+        try:
+            with _INFO_SEMAPHORE:
+                result = info_obj.user_state(account_addr)
+            with _USER_STATE_LOCK:
+                _user_state_cache    = result
+                _user_state_cache_ts = time.monotonic()
+            return result
+        except Exception as exc:
+            last_exc = exc
+            if _is_429(exc) and attempt < _EXCHANGE_RETRIES - 1:
+                jitter   = random.uniform(0.0, 0.5)
+                sleep_s  = min(delay + jitter, 30.0)
+                logger.warning(
+                    "[UserStateCache] 429 rate-limit (intento %d/%d) — reintentando en %.1fs",
+                    attempt + 1, _EXCHANGE_RETRIES, sleep_s,
+                )
+                time.sleep(sleep_s)
                 delay = min(delay * 2, 30.0)
             else:
                 raise
@@ -534,7 +606,13 @@ class HLClient:
     # ── CONSULTAS INFO (solo lectura, protegidas por _INFO_SEMAPHORE) ────────
 
     def get_user_state(self) -> dict:
-        return _info_call(self._info.user_state, self._account_addr)
+        """
+        FIX v15: usa caché singleton compartido entre todos los traders.
+        Evita N llamadas simultáneas a clearinghouseState (una por trader)
+        que saturaban el rate-limit de Hyperliquid con 429.
+        TTL configurable con HL_USER_STATE_CACHE_TTL_S (default 3s).
+        """
+        return _get_user_state_cached(self._info, self._account_addr)
 
     def get_open_orders(self) -> list:
         return _info_call(self._info.open_orders, self._account_addr)
