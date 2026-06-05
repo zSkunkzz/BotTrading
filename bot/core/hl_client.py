@@ -36,6 +36,25 @@ FIX CRÍTICO (2026-06-01):
 FIX float_to_wire rounding (2026-06-02):
   place_sl / place_tp redondean sz a szDecimals antes de pasarlo al SDK.
 
+FIX duplicate nonce (2026-06-05):
+  CAUSA RAÍZ de 'Invalid nonce: duplicate nonce XXXXXXXXXX':
+  El SDK genera el nonce con time.time_ns() // 1_000_000 (precisión ms).
+  Cuando dos llamadas de escritura (update_leverage, order, cancel...)
+  se despachan desde asyncio.to_thread() con <1ms de diferencia, el
+  OS puede asignarles el mismo timestamp — colisión garantizada.
+  Fix:
+    - _EXCHANGE_LOCK: threading.Lock global (compartido entre todos los
+      HLClient que usan el mismo singleton Exchange).
+    - Todas las llamadas de escritura (place_limit, place_market, place_tp,
+      place_sl, place_bulk, cancel_order, cancel_all_open_tpsl y
+      update_leverage en trader.py) adquieren el lock ANTES de llamar al SDK.
+    - El lock es threading.Lock (no asyncio.Lock) porque las llamadas
+      ocurren dentro de asyncio.to_thread() — en hilos del OS, no en el
+      event loop.
+    - Tras el lock se añade un sleep mínimo de _NONCE_MIN_DELAY_MS ms
+      (default 2ms) para garantizar timestamps distintos incluso si el
+      scheduler del OS reutiliza el hilo inmediatamente.
+
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -54,6 +73,7 @@ import asyncio
 import logging
 import math
 import os
+import threading
 import time
 from typing import Optional
 
@@ -72,6 +92,16 @@ _BASE_URL = (
 
 _MARKET_SLIPPAGE = 0.03
 _TP_LIMIT_BUFFER = 0.001
+
+# Delay mínimo entre llamadas de escritura consecutivas al Exchange.
+# Garantiza timestamps distintos (nonce = time_ns // 1_000_000).
+# Configurable con HL_NONCE_MIN_DELAY_MS (default 2ms).
+_NONCE_MIN_DELAY_MS = float(os.getenv("HL_NONCE_MIN_DELAY_MS", "2")) / 1000.0
+
+# Lock global de escritura al Exchange.
+# threading.Lock (no asyncio.Lock) porque las llamadas ocurren en hilos
+# via asyncio.to_thread(), no en el event loop directamente.
+_EXCHANGE_LOCK = threading.Lock()
 
 POST_FILL_CONFIRM_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
 POST_FILL_CONFIRM_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
@@ -97,6 +127,20 @@ def _round_sz(sz: float, sz_decimals: int) -> float:
     return math.floor(sz * factor) / factor
 
 
+def _exchange_call(fn, *args, **kwargs):
+    """
+    Ejecuta una llamada de escritura al Exchange SDK con lock global.
+    Garantiza que no haya dos llamadas simultáneas que generen el mismo
+    nonce (time.time_ns() // 1_000_000 tiene precisión de 1ms).
+    """
+    with _EXCHANGE_LOCK:
+        result = fn(*args, **kwargs)
+        # Sleep mínimo para que el próximo nonce sea distinto.
+        if _NONCE_MIN_DELAY_MS > 0:
+            time.sleep(_NONCE_MIN_DELAY_MS)
+        return result
+
+
 # ─────────────────────────────────────────────────────────────────
 # _HLCore: singleton que contiene el Exchange + Info compartidos
 # ─────────────────────────────────────────────────────────────────
@@ -113,8 +157,6 @@ class _HLCore:
     """
 
     _instance: "_HLCore | None" = None
-    # Lock para serializar la creación concurrente del singleton.
-    # Se inicializa lazy para evitar problemas si se importa antes de asyncio.run().
     _init_lock: "asyncio.Lock | None" = None
 
     def __init__(self) -> None:
@@ -254,36 +296,14 @@ class _HLCore:
             len(universe),
         )
 
-    # ── Acceso síncrono (SOLO para código que ya corre en un hilo) ────
     @classmethod
     def get(cls) -> "_HLCore":
-        """
-        Acceso SÍNCRONO al singleton. Solo usar desde:
-          - asyncio.to_thread() (ya en hilo separado)
-          - tests síncronos
-        NUNCA llamar directamente desde __init__ de clases que se crean
-        antes del event loop, ni desde corrutinas async.
-        """
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
-    # ── Acceso async (usar siempre desde código async) ────────────────
     @classmethod
     async def get_async(cls) -> "_HLCore":
-        """
-        FIX FREEZE: crea o devuelve el singleton de forma async-safe.
-
-        Si el singleton no existe, lo crea dentro de asyncio.to_thread()
-        para que todas las llamadas HTTP síncronas del SDK (requests)
-        no bloqueen el event loop.
-
-        El asyncio.Lock serializa creaciones concurrentes: si 7 traders
-        llaman get_async() en paralelo, solo el primero crea el singleton;
-        los demás esperan (sin bloquear el event loop) y luego reutilizan
-        la instancia ya creada.
-        """
-        # Inicializar el lock lazy (debe crearse dentro del event loop)
         if cls._init_lock is None:
             cls._init_lock = asyncio.Lock()
 
@@ -291,7 +311,6 @@ class _HLCore:
             return cls._instance
 
         async with cls._init_lock:
-            # Double-check tras adquirir el lock
             if cls._instance is not None:
                 return cls._instance
             logger.info("[HLCore] Inicializando SDK en hilo separado (asyncio.to_thread)...")
@@ -300,7 +319,6 @@ class _HLCore:
 
     @classmethod
     def _create_sync(cls) -> "_HLCore":
-        """Creación síncrona del singleton — solo llamar desde to_thread."""
         return cls()
 
     @staticmethod
@@ -353,17 +371,14 @@ class _HLCore:
 class HLClient:
     """
     Cliente ligero por symbol. Comparte Exchange + Info via _HLCore singleton.
-
-    IMPORTANTE: usar siempre HLClient.create(symbol) (async) para instanciar.
-    El __init__ estándar requiere que _HLCore ya esté inicializado.
+    Todas las llamadas de escritura pasan por _exchange_call() para garantizar
+    nonces únicos (lock global + delay mínimo entre llamadas).
     """
 
     def __init__(self, symbol: str, core: "_HLCore | None" = None):
         self.symbol = symbol
         self.coin   = _norm_coin(symbol)
         if core is None:
-            # Fallback síncrono — solo seguro si _HLCore ya fue creado antes
-            # via get_async(). Si no, lanzará una excepción clara.
             if _HLCore._instance is None:
                 raise RuntimeError(
                     f"[HLClient] {symbol}: _HLCore no inicializado. "
@@ -379,15 +394,10 @@ class HLClient:
 
     @classmethod
     async def create(cls, symbol: str) -> "HLClient":
-        """
-        FIX FREEZE: constructor async-safe.
-        Inicializa _HLCore (si no existe) en un hilo separado via to_thread,
-        luego crea el HLClient ligero sin ninguna llamada HTTP.
-        """
         core = await _HLCore.get_async()
         return cls(symbol, core=core)
 
-    # ── METADATOS ─────────────────────────────────────────────────
+    # ── METADATOS ────────────────────────────────────────────
 
     def _get_meta_asset(self) -> dict:
         try:
@@ -503,7 +513,7 @@ class HLClient:
 
         return px
 
-    # ── ÓRDENES BÁSICAS ─────────────────────────────────────────────
+    # ── ÓRDENES BÁSICAS ─────────────────────────────────────────
 
     def place_limit(
         self,
@@ -515,7 +525,8 @@ class HLClient:
     ) -> dict:
         price = self.round_px(price)
         sz    = self.round_sz(sz)
-        return self._exchange.order(
+        return _exchange_call(
+            self._exchange.order,
             name=self.coin,
             is_buy=is_buy,
             sz=sz,
@@ -549,7 +560,8 @@ class HLClient:
         else:
             slippage_px = 999_999_999.0 if is_buy else 0.000001
 
-        return self._exchange.order(
+        return _exchange_call(
+            self._exchange.order,
             name=self.coin,
             is_buy=is_buy,
             sz=sz,
@@ -558,7 +570,7 @@ class HLClient:
             reduce_only=reduce_only,
         )
 
-    # ── TRIGGER ORDERS — TP / SL ──────────────────────────────────
+    # ── TRIGGER ORDERS — TP / SL ──────────────────────────────
 
     def place_tp(
         self,
@@ -587,7 +599,8 @@ class HLClient:
             f"{entry_px:.6f}" if entry_px else "N/A",
         )
 
-        return self._exchange.order(
+        return _exchange_call(
+            self._exchange.order,
             name=self.coin,
             is_buy=is_buy,
             sz=sz,
@@ -619,7 +632,8 @@ class HLClient:
             f"{entry_px:.6f}" if entry_px else "N/A",
         )
 
-        return self._exchange.order(
+        return _exchange_call(
+            self._exchange.order,
             name=self.coin,
             is_buy=is_buy,
             sz=sz,
@@ -651,9 +665,22 @@ class HLClient:
             if "limit_px" in o and o["limit_px"] is not None:
                 o["limit_px"] = self.round_px(float(o["limit_px"]))
             cleaned.append(o)
-        return self._exchange.bulk_orders(cleaned)
+        # place_bulk es también escritura — serializar con lock.
+        return _exchange_call(self._exchange.bulk_orders, cleaned)
 
-    # ── CONSULTAS INFO ────────────────────────────────────────────────
+    def update_leverage(self, leverage: int, is_cross: bool = False) -> dict:
+        """
+        Configura el leverage con lock global para evitar duplicate nonce.
+        Llamar siempre desde asyncio.to_thread() en trader.py.
+        """
+        return _exchange_call(
+            self._exchange.update_leverage,
+            leverage,
+            self.coin,
+            is_cross,
+        )
+
+    # ── CONSULTAS INFO (solo lectura, sin lock) ───────────────────
 
     def get_user_state(self) -> dict:
         return self._info.user_state(self._account_addr)
@@ -674,7 +701,7 @@ class HLClient:
         return float(state.get("crossMarginSummary", {}).get("accountValue", 0.0))
 
     def cancel_order(self, order_id: int) -> dict:
-        return self._exchange.cancel(self.coin, order_id)
+        return _exchange_call(self._exchange.cancel, self.coin, order_id)
 
     def cancel_all_open_tpsl(self) -> list[dict]:
         orders  = self.get_open_orders()
@@ -696,7 +723,7 @@ class HLClient:
             if is_tpsl:
                 oid = o.get("oid")
                 if oid:
-                    r = self.cancel_order(oid)
+                    r = _exchange_call(self._exchange.cancel, self.coin, oid)
                     results.append(r)
                     logger.info(
                         "[%s] Trigger order cancelada: oid=%s type=%s",
