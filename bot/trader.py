@@ -32,7 +32,7 @@ FIX get_ohlcv None (2026-06-03):
   es demasiado antiguo o el request falla silenciosamente.
   Fixes:
     - Reducir startTime: n = BARS_NEEDED (sin el +20 extra).
-    - Guard: si raw is None, retry 1 vez con ventana aún más corta.
+    - Guard: si raw is None, retry 1 vez con ventana más corta.
     - Log del status HTTP y body truncado cuando no es lista.
 
 FIX _get_positions NoneType (2026-06-03):
@@ -98,6 +98,16 @@ FIX kelly_mult scope + place_tp firma (2026-06-05):
     (not is_buy, qty, tp1_px, None, filled_price) pero la firma real es
     place_tp(is_buy, sz, trigger_px, entry_px) — 4 args. El None extra
     causaba TypeError en runtime. Fix: eliminar el None intermedio.
+
+FIX get_ohlcv backoff exponencial (2026-06-05):
+  Sustituye el retry único con 1 espera fija por un loop de hasta
+  OHLCV_FETCH_RETRIES (default 3) intentos con backoff exponencial
+  2^i + jitter ±_OHLCV_FETCH_JITTER_S (default 0.3s) y nueva sesión
+  aiohttp en cada intento. OHLCV_MAX_CONCURRENCY default 5 → 3.
+
+FIX get_price backoff (2026-06-05):
+  Ampliado de 1 retry a PRICE_FETCH_RETRIES (default 3) con esperas
+  crecientes (0.4s, 0.8s, 1.6s) antes de caer al stale cache.
 """
 from __future__ import annotations
 
@@ -105,6 +115,7 @@ import asyncio
 import json as _json
 import logging
 import os
+import random
 import time
 from typing import Callable, Optional
 
@@ -123,8 +134,12 @@ _API_URL = (
     else "https://api.hyperliquid.xyz"
 )
 
-_OHLCV_BARS = int(os.getenv("BARS_NEEDED", "100"))
-_OHLCV_MAX_CONCURRENCY = int(os.getenv("OHLCV_MAX_CONCURRENCY", "5"))
+_OHLCV_BARS            = int(os.getenv("BARS_NEEDED",            "100"))
+_OHLCV_MAX_CONCURRENCY = int(os.getenv("OHLCV_MAX_CONCURRENCY",  "3"))  # 5 → 3
+_OHLCV_FETCH_RETRIES   = int(os.getenv("OHLCV_FETCH_RETRIES",    "3"))
+_OHLCV_FETCH_JITTER    = float(os.getenv("OHLCV_FETCH_JITTER",   "0.3"))
+
+_PRICE_FETCH_RETRIES   = int(os.getenv("PRICE_FETCH_RETRIES",    "3"))
 
 _TF_MINUTES = {
     "1m":  1,
@@ -332,7 +347,7 @@ class FuturesTrader:
             logger.error("[%s] _get_ccxt: error inicializando HLClient: %s", self.symbol, e)
             raise
 
-    # ── Acceso seguro a _hl_client ────────────────────────────────
+    # ── Acceso seguro a _hl_client ────────────────────────────
 
     def _require_hl(self) -> Optional[HLClient]:
         if self._hl_client is None:
@@ -343,7 +358,7 @@ class FuturesTrader:
             return None
         return self._hl_client
 
-    # ── Métodos que TradingLoop llama sobre el objeto trader ────────
+    # ── Métodos que TradingLoop llama sobre el objeto trader ────────────
 
     async def _fetch_all_mids(self, session: aiohttp.ClientSession) -> Optional[dict]:
         """Llama al endpoint allMids y devuelve el dict o None si falla."""
@@ -372,26 +387,34 @@ class FuturesTrader:
         Obtiene el precio mid de self.coin vía allMids.
 
         Estrategia de resiliencia:
-          1. Intento inicial.
-          2. Si data es None → espera 0.4 s y reintenta 1 vez.
-          3. Si sigue fallando → usa self._last_price (caché del último
+          1. Hasta _PRICE_FETCH_RETRIES intentos con esperas crecientes
+             (0.4s, 0.8s, 1.6s — doble en cada intento fallido).
+          2. Si todos fallan → usa self._last_price (caché del último
              precio válido). Sólo propaga excepción si no hay caché.
-          4. Cada precio válido actualiza self._last_price.
+          3. Cada precio válido actualiza self._last_price.
         """
-        async with aiohttp.ClientSession() as session:
-            data = await self._fetch_all_mids(session)
+        data: Optional[dict] = None
+        delay = 0.4
 
-            if data is None:
-                # Retry único con backoff mínimo
-                await asyncio.sleep(0.4)
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(_PRICE_FETCH_RETRIES):
                 data = await self._fetch_all_mids(session)
+                if data is not None:
+                    break
+                if attempt < _PRICE_FETCH_RETRIES - 1:
+                    logger.debug(
+                        "[%s] get_price: allMids None (intento %d/%d) — retry en %.1fs",
+                        self.symbol, attempt + 1, _PRICE_FETCH_RETRIES, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2  # backoff: 0.4, 0.8, 1.6 ...
 
         if data is None:
             # Fallback a último precio válido conocido
             if self._last_price > 0:
                 logger.warning(
-                    "[%s] allMids falló tras retry — usando último precio válido en caché: %.4f",
-                    self.symbol, self._last_price,
+                    "[%s] allMids falló tras %d intentos — usando último precio válido en caché: %.4f",
+                    self.symbol, _PRICE_FETCH_RETRIES, self._last_price,
                 )
                 return self._last_price
             raise ValueError(
@@ -446,45 +469,62 @@ class FuturesTrader:
         """
         Descarga velas OHLCV para self.coin / timeframe.
 
-        Estrategia de resiliencia (3 fixes 2026-06-05):
-          1. raw se inicializa a None antes del semáforo para evitar
-             NameError si una excepción interrumpe el bloque.
-          2. Si el primer intento devuelve algo que no es lista, espera 1s
-             y reintenta con ventana reducida (n//2) en sesión nueva.
-          3. El format string del except incluye timeframe como segundo arg
-             para que el WARNING sea accionable.
+        Estrategia de resiliencia — backoff exponencial con jitter:
+          - Hasta _OHLCV_FETCH_RETRIES (default 3) intentos.
+          - Espera entre intentos: 2^i + jitter ±_OHLCV_FETCH_JITTER (mín 0.2s).
+          - Cada intento abre una sesión aiohttp nueva (evita reutilizar
+            conexiones degradadas).
+          - raw se inicializa a None fuera del semáforo (safe NameError).
+          - Si todos los intentos devuelven vacío/None → devuelve [] con WARNING.
         """
-        n = _OHLCV_BARS
+        n   = _OHLCV_BARS
         sem = _get_ohlcv_semaphore()
-        raw: Optional[list] = None  # BUG 3 FIX: inicializar antes del bloque
+        raw: Optional[list] = None
 
         try:
             async with sem:
-                async with aiohttp.ClientSession() as session:
-                    raw = await self._fetch_candles(session, timeframe, n)
+                for attempt in range(_OHLCV_FETCH_RETRIES):
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            raw = await self._fetch_candles(session, timeframe, n)
 
-                if raw is None or not isinstance(raw, list):
-                    logger.warning(
-                        "[%s] get_ohlcv(%s) respuesta inesperada (tipo=%s val=%r) — "
-                        "esperando 1s y reintentando con ventana reducida...",
-                        self.symbol, timeframe, type(raw).__name__, raw,
-                    )
-                    # BUG 2 FIX: backoff + nueva sesión para el retry
-                    await asyncio.sleep(1.0)
-                    async with aiohttp.ClientSession() as session2:
-                        raw = await self._fetch_candles(session2, timeframe, n // 2)
+                        if isinstance(raw, list) and len(raw) > 0:
+                            break  # éxito
 
-                if raw is None or not isinstance(raw, list):
-                    logger.warning(
-                        "[%s] get_ohlcv(%s) sigue sin ser lista tras retry (tipo=%s) — "
-                        "devolviendo lista vacía.",
-                        self.symbol, timeframe, type(raw).__name__,
-                    )
-                    return []
+                        logger.warning(
+                            "[%s] get_ohlcv(%s) respuesta vacía/None (intento %d/%d, tipo=%s)",
+                            self.symbol, timeframe,
+                            attempt + 1, _OHLCV_FETCH_RETRIES,
+                            type(raw).__name__,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] get_ohlcv(%s) error (intento %d/%d): %s",
+                            self.symbol, timeframe,
+                            attempt + 1, _OHLCV_FETCH_RETRIES, e,
+                        )
+                        raw = None
+
+                    if attempt < _OHLCV_FETCH_RETRIES - 1:
+                        backoff = (2 ** attempt) + random.uniform(
+                            -_OHLCV_FETCH_JITTER, _OHLCV_FETCH_JITTER
+                        )
+                        backoff = max(0.2, backoff)
+                        logger.debug(
+                            "[%s] get_ohlcv(%s) backoff %.2fs (intento %d → %d)",
+                            self.symbol, timeframe, backoff, attempt + 1, attempt + 2,
+                        )
+                        await asyncio.sleep(backoff)
 
         except Exception as e:
-            # BUG 1 FIX: incluir timeframe en el format string
-            logger.warning("[%s] get_ohlcv(%s) error: %s", self.symbol, timeframe, e)
+            logger.warning("[%s] get_ohlcv(%s) error externo: %s", self.symbol, timeframe, e)
+            return []
+
+        if raw is None or not isinstance(raw, list) or len(raw) == 0:
+            logger.warning(
+                "[%s] get_ohlcv(%s) vacío tras %d intentos — devolviendo [].",
+                self.symbol, timeframe, _OHLCV_FETCH_RETRIES,
+            )
             return []
 
         bars = []
@@ -704,7 +744,7 @@ class FuturesTrader:
 
         return await asyncio.to_thread(_sync_call)
 
-    # ── open_order: entrada al mercado + SL + TP ──────────────────
+    # ── open_order: entrada al mercado + SL + TP ─────────────────
 
     async def open_order(self, signal: dict, risk) -> None:
         hl = self._require_hl()
@@ -725,9 +765,6 @@ class FuturesTrader:
         usdc_base = float(getattr(risk, "usdc_per_trade", 20.0))
 
         # FIX KELLY (#2): aplicar kelly_multiplier al size base.
-        # kelly_mult se inicializa a 1.0 para que siempre esté definida
-        # en el scope del logger final, independientemente de si el bloque
-        # try/except llega a calcular un valor diferente.
         kelly_mult = 1.0
         try:
             from bot.kelly_sizer import kelly_multiplier
@@ -797,7 +834,7 @@ class FuturesTrader:
             self._protection_ok = (sl_px > 0)
             return
 
-        # ── Orden de mercado ──────────────────────────────────────
+        # ── Orden de mercado ──────────────────────────────────
         try:
             result = await asyncio.to_thread(
                 hl.place_market,
@@ -816,7 +853,7 @@ class FuturesTrader:
             logger.error("[%s] open_order: orden rechazada por exchange: %s", self.symbol, result)
             return
 
-        # ── Esperar fill y obtener precio real de entrada ─────────────────
+        # ── Esperar fill y obtener precio real de entrada ───────────────────
         filled_price = ref_price
         for attempt in range(_FILL_RETRIES):
             await asyncio.sleep(_FILL_DELAY)
@@ -835,7 +872,7 @@ class FuturesTrader:
             logger.warning("[%s] open_order: fill no confirmado tras %d intentos — usando ref_price=%.4f",
                            self.symbol, _FILL_RETRIES, ref_price)
 
-        # ── Re-escalar SL/TP al precio real de fill ────────────────────
+        # ── Re-escalar SL/TP al precio real de fill ─────────────────────
         sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, filled_price, ref_price)
 
         tp3_raw = float(signal.get("tp3") or 0)
@@ -848,7 +885,7 @@ class FuturesTrader:
             else:
                 tp3_px = tp3_raw
 
-        # ── Actualizar estado interno ──────────────────────────────
+        # ── Actualizar estado interno ───────────────────────────
         self.position    = "long" if is_long else "short"
         self.entry_price = filled_price
         self.sl          = sl_px  if sl_px  > 0 else None
@@ -861,7 +898,7 @@ class FuturesTrader:
         self._protection_ok = False
         self._tp1_be_done   = False
 
-        # ── Colocar SL ────────────────────────────────────────────
+        # ── Colocar SL ────────────────────────────────────
         if sl_px and sl_px > 0:
             try:
                 sl_result = await asyncio.to_thread(
@@ -876,9 +913,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: error colocando SL: %s", self.symbol, e)
 
-        # ── Colocar TP1 ──────────────────────────────────────────
-        # FIX: firma correcta place_tp(is_buy, sz, trigger_px, entry_px) — 4 args.
-        # Antes se pasaba un None extra entre trigger_px y entry_px → TypeError.
+        # ── Colocar TP1 ────────────────────────────────────
         if tp1_px and tp1_px > 0:
             try:
                 tp_result = await asyncio.to_thread(
@@ -892,7 +927,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: error colocando TP1: %s", self.symbol, e)
 
-        # ── Persistir estado ────────────────────────────────────
+        # ── Persistir estado ────────────────────────────────
         try:
             save_position(self.symbol, {
                 "side":        self.position,
