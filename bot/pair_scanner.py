@@ -31,6 +31,14 @@ FIX OHLCV (2026-06-05): filtro de liquidez OHLCV antes de activar coins
   - SCANNER_OHLCV_VERIFY=false para deshabilitar (debug).
   - SCANNER_OHLCV_VERIFY_TF=15m para elegir el timeframe de verificación.
   - Resultado: ningún coin sin velas llega al bot.
+
+FIX LEVERAGE MAP (2026-06-05): eliminar import circular `main` en run_scanner_loop
+  - Se pasaba _last_scored a main._update_leverage_map() via `import main`
+    que fallaba silenciosamente en Railway (circular import).
+  - Ahora run_scanner_loop pasa scored_data=self._last_scored al callback,
+    y on_pairs_updated() llama _update_leverage_map() antes de arrancar
+    los nuevos traders. Esto corrige el error 'Invalid leverage value' en
+    coins con maxLeverage < LEVERAGE_BASE durante rotaciones.
 """
 import logging
 import asyncio
@@ -443,7 +451,9 @@ class PairScanner:
 
     async def run_scanner_loop(self, on_update_callback):
         import inspect
-        cb_params = len(inspect.signature(on_update_callback).parameters)
+        cb_sig    = inspect.signature(on_update_callback)
+        cb_params = list(cb_sig.parameters.keys())
+        has_scored_data = "scored_data" in cb_params
 
         while True:
             try:
@@ -458,12 +468,6 @@ class PairScanner:
                     added   = set(new_pairs) - set(self.active_pairs)
                     removed = set(self.active_pairs) - set(new_pairs)
 
-                    try:
-                        import main as _main
-                        _main._update_leverage_map(self._last_scored)
-                    except Exception:
-                        pass
-
                     self.active_pairs = new_pairs
 
                     if added:
@@ -472,7 +476,14 @@ class PairScanner:
                         logger.info("➖ Pares eliminados (%d): %s", len(removed), ", ".join(sorted(removed)))
 
                     if added or removed:
-                        if cb_params >= 3:
+                        if has_scored_data:
+                            # Pasar scored_data para que el callback actualice
+                            # _max_leverage_map ANTES de arrancar nuevos traders.
+                            await on_update_callback(
+                                new_pairs, added, removed,
+                                scored_data=self._last_scored,
+                            )
+                        elif len(cb_params) >= 3:
                             await on_update_callback(new_pairs, added, removed)
                         else:
                             logger.warning(

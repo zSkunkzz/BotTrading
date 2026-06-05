@@ -276,6 +276,7 @@ async def _idle_rotation_loop(scanner: "PairScanner") -> None:
                 )
                 await _stop_pair_with_cleanup(sym)
                 await asyncio.sleep(1)
+                # El mapa de leverage ya está actualizado desde el último scan
                 await _start_single_pair(new_sym)
                 ws_feed.update_symbols(list(active_traders.keys()))
         except asyncio.CancelledError:
@@ -284,7 +285,12 @@ async def _idle_rotation_loop(scanner: "PairScanner") -> None:
             logger.error("[IdleRotation] Error: %s", e, exc_info=True)
 
 
-async def on_pairs_updated(new_pairs: list, added: set = None, removed: set = None):
+async def on_pairs_updated(
+    new_pairs: list,
+    added: set = None,
+    removed: set = None,
+    scored_data: list = None,
+):
     open_symbols = set(bot_state._positions.keys())
     for sym, t in _trader_instances.items():
         if getattr(t, "position", None) is not None:
@@ -311,6 +317,12 @@ async def on_pairs_updated(new_pairs: list, added: set = None, removed: set = No
         await asyncio.gather(*[_stop_pair_with_cleanup(s) for s in removed], return_exceptions=True)
 
     if added:
+        # Actualizar el mapa de leverage ANTES de arrancar los nuevos traders.
+        # Esto garantiza que _effective_leverage() devuelva el cap correcto para
+        # coins con maxLeverage < LEVERAGE_BASE (p.ej. AAVE, INJ, TAO con max=10x
+        # cuando LEVERAGE=15x), evitando el error 'Invalid leverage value' en HL.
+        if scored_data:
+            _update_leverage_map(scored_data)
         ws_feed.update_symbols(list(added))
         await start_traders_staggered(list(added), _start_single_pair, delay=3.0)
 
