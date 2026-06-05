@@ -60,8 +60,8 @@ FIX _fetch_candles endTime vela abierta (2026-06-05 v4):
   siempre apunte a la última vela cerrada.
 
 FIX _get_positions NoneType (2026-06-03):
-  Cuando _master_addr está vacío (init incompleto) o HL devuelve error JSON,
-  data es None o un dict sin 'assetPositions'. Fix:
+  Cuando _master_addr está vacío (guard 'if not self._master_addr') o HL
+  devuelve error JSON, data es None o un dict sin 'assetPositions'. Fix:
     - Guard early-return si _master_addr vacío.
     - if data is None: log + return [].
     - try/except TypeError alrededor de data.get().
@@ -199,9 +199,9 @@ FIX _master_addr y _agent_mode nunca populados (2026-06-05 v12):
     - balance_svc.init_hl() recibía master_addr="" y nunca se inicializaba.
   Fix:
     _get_ccxt(), tras crear HLClient con éxito, sincroniza:
-      self._master_addr = hl._account_addr   (wallet principal de _HLCore)
-      self._agent_addr  = hl._agent_addr
-      self._agent_mode  = hl._agent_mode
+      self._master_addr = hl._account      (wallet principal de _HLCore)
+      self._agent_addr  = hl._core.agent_addr
+      self._agent_mode  = hl._core.agent_mode
     Así el resto del código (trading_loop, _get_positions, balance_svc)
     recibe los valores reales leídos de las env vars.
 
@@ -240,6 +240,17 @@ FIX place_market/place_sl/place_tp firmas incorrectas (2026-06-05 v14):
   5. _get_open_trigger_orders_raw: HLClient no expone get_open_trigger_orders.
      Los triggers son open_orders filtrados por tipo. Fix: usar get_open_orders()
      y filtrar in-place por coin y tipo trigger, igual que cancel_all_open_tpsl.
+
+FIX AttributeError _account_addr/_agent_addr/_agent_mode (2026-06-05 v18):
+  CAUSA RAÍZ: _get_ccxt() intentaba leer self._hl_client._account_addr,
+  self._hl_client._agent_addr y self._hl_client._agent_mode, pero HLClient
+  no expone esos atributos con esos nombres exactos:
+    - HLClient._account      (no _account_addr)
+    - HLClient._core.agent_addr  (no _agent_addr directo)
+    - HLClient._core.agent_mode  (no _agent_mode directo)
+  El AttributeError bloqueaba la inicialización de TODOS los traders
+  (los 20 en paralelo), dejando el bot arrancado pero sin trading activo.
+  Fix: usar los nombres de atributo correctos de HLClient/_HLCore.
 """
 from __future__ import annotations
 
@@ -499,9 +510,13 @@ class FuturesTrader:
         try:
             self._hl_client = await HLClient.create(self.symbol)
 
-            self._master_addr = self._hl_client._account_addr
-            self._agent_addr  = self._hl_client._agent_addr
-            self._agent_mode  = self._hl_client._agent_mode
+            # FIX v18: usar los nombres de atributo correctos de HLClient/_HLCore
+            # HLClient expone:
+            #   ._account      → dirección wallet principal (str)
+            #   ._core         → instancia _HLCore con .agent_addr y .agent_mode
+            self._master_addr = self._hl_client._account
+            self._agent_addr  = self._hl_client._core.agent_addr
+            self._agent_mode  = self._hl_client._core.agent_mode
 
             agent_active = self._agent_mode
             logger.info(
