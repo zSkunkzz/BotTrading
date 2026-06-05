@@ -24,6 +24,19 @@ FIX v12 (2026-06-03): PnL real en notify_close para cierre externo
   - El PnL se calculaba siempre como 0.0 (hardcodeado).
   - Ahora se calcula: pnl_pct = (exit - entry) / entry * leverage * ±1
   - El mismo PnL real se pasa a on_position_closed y register_close.
+
+FIX v13 (2026-06-05): corrección de bugs B/C/E en notificaciones Telegram
+  Bug B — datos incorrectos (None, precio/PnL/símbolo mal):
+    - Fallback a signal dict para entry/sl/tp1/size antes de notify_open.
+    - Nunca se pasa None en campos clave del mensaje.
+  Bug C — notificaciones duplicadas:
+    - Flag _open_notified en TradingLoop: guard contra doble notify_open
+      si open_order() se invoca más de una vez (race condition).
+  Bug E — notificación de apertura llega cuando el trade ya cerró:
+    - Verificar _open_notified antes de enviar notify_open.
+    - Reset del flag en cierre externo.
+    - Si cierre externo se detecta y _open_notified=False (apertura nunca
+      notificada), se omite el notify_close huérfano.
 """
 from __future__ import annotations
 
@@ -75,6 +88,8 @@ class TradingLoop:
         self._last_pos_check_at: float = 0.0
         self._iteration_count: int = 0
         self._global_risk = None
+        # FIX v13 Bug C/E: guard para evitar notify_open duplicado o tardío
+        self._open_notified: bool = False
 
     def _build_decision_engine(self, risk):
         from bot import signal_engine
@@ -148,6 +163,10 @@ class TradingLoop:
                         "[%s] _open_qty no se pudo recalcular — TPSL de emergencia deshabilitado.",
                         self.symbol,
                     )
+
+            # Posición restaurada desde disco: marcamos como ya notificada
+            # para no emitir un notify_open falso en el primer ciclo.
+            self._open_notified = True
 
             logger.info(
                 "[%s] Posición restaurada: %s @ %s",
@@ -253,19 +272,31 @@ class TradingLoop:
                             entry_price, exit_price, leverage, pnl_pct,
                         )
 
-                        try:
-                            from bot.telegram_bot import notify_close
-                            await notify_close(
-                                symbol  = self.symbol,
-                                side    = closed_side,
-                                exit_p  = exit_price,
-                                pnl     = pnl_pct,
-                                entry   = round(entry_price, 6),
-                                reason  = "Cierre manual / externo",
-                                dry_run = trader.dry_run,
+                        # FIX v13 Bug E: solo enviar notify_close si la apertura
+                        # fue notificada — evita mensajes huérfanos de cierre sin apertura.
+                        if self._open_notified:
+                            try:
+                                from bot.telegram_bot import notify_close
+                                await notify_close(
+                                    symbol  = self.symbol,
+                                    side    = closed_side,
+                                    exit_p  = exit_price,
+                                    pnl     = pnl_pct,
+                                    entry   = round(entry_price, 6),
+                                    reason  = "Cierre manual / externo",
+                                    dry_run = trader.dry_run,
+                                )
+                            except Exception as _te:
+                                logger.debug("[%s] notify_close error: %s", self.symbol, _te)
+                        else:
+                            logger.info(
+                                "[%s] Cierre externo detectado pero apertura nunca notificada "
+                                "— notify_close omitido.",
+                                self.symbol,
                             )
-                        except Exception as _te:
-                            logger.debug("[%s] notify_close error: %s", self.symbol, _te)
+
+                        # FIX v13 Bug C/E: reset del flag al cerrar posición
+                        self._open_notified = False
 
                         try:
                             trader._hl_client.cancel_all_open_tpsl()
@@ -392,19 +423,31 @@ class TradingLoop:
                 pos_before = trader.position
                 await trader.open_order(signal, risk)
 
-                if trader.position is not None and pos_before is None:
+                # FIX v13 Bug C/E: guard _open_notified para evitar duplicados
+                # y notificaciones tardías (cuando la posición ya cerró antes
+                # de que llegáramos aquí).
+                if trader.position is not None and pos_before is None and not self._open_notified:
+                    # FIX v13 Bug B: fallback a signal dict — nunca pasar None
+                    _entry = trader.entry_price or float(signal.get("entry") or price)
+                    _sl    = trader.sl    or float(signal.get("sl")  or 0) or None
+                    _tp1   = trader.tp1   or float(signal.get("tp1") or 0) or None
+                    _tp2   = trader.tp2   or float(signal.get("tp2") or 0) or None
+                    _tp3   = trader.tp3   or float(signal.get("tp3") or 0) or None
+                    _size  = trader._open_notional or getattr(risk, "usdc_per_trade", None)
+
+                    self._open_notified = True
                     try:
                         from bot.telegram_bot import notify_open
                         await notify_open(
                             symbol     = self.symbol,
                             side       = trader.position,
-                            price      = trader.entry_price,
+                            price      = _entry,
                             leverage   = trader.leverage,
-                            size_usdc  = trader._open_notional,
-                            sl         = trader.sl,
-                            tp1        = trader.tp1,
-                            tp2        = trader.tp2,
-                            tp3        = trader.tp3,
+                            size_usdc  = _size,
+                            sl         = _sl,
+                            tp1        = _tp1,
+                            tp2        = _tp2,
+                            tp3        = _tp3,
                             dry_run    = trader.dry_run,
                             entry_mode = signal.get("entry_mode"),
                         )
