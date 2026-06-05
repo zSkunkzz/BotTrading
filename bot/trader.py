@@ -18,9 +18,11 @@ FIX FREEZE (2026-06-03):
 
   Fixes aplicados:
     1. __init__: _hl_client = None. El SDK jamás se crea aquí.
-    2. _get_ccxt(): crea _hl_client vía HLClient.create() (async) la primera
-       vez que se llama. TradingLoop.run() invoca _get_ccxt() desde _init()
-       dentro del event loop, por lo que es seguro awaitar.
+    2. _get_ccxt(): crea _hl_client vía HLClient.create(symbol) (async) la
+       primera vez que se llama. TradingLoop.run() invoca _get_ccxt() desde
+       _init() dentro del event loop, por lo que es seguro awaitar.
+       Las credenciales NO se pasan — _HLCore las lee de las variables de
+       entorno (HL_API_PRIVATE_KEY, HL_API_WALLET_ADDRESS) directamente.
     3. _set_leverage: asyncio.wait_for con timeout=15s.
     4. Todos los métodos que usan _hl_client verifican que no sea None.
 
@@ -133,10 +135,10 @@ FIX _set_leverage auto-capping interno (2026-06-05 v7):
   nuevos (AAVE, INJ, TAO, DOGE, GRASS) con leverage=15x porque el
   snapshot de maxLeverage no incluía esos coins aún. HL rechaza con
   'Invalid leverage value' porque su maxLeverage real es inferior a 15x.
-  Fix: _set_leverage consulta hl.get_max_leverage(self.coin) antes de
-  llamar a update_leverage y cappa el valor automáticamente. Si falla
-  la consulta, usa el valor solicitado como fallback. Actualiza
-  self.leverage con el valor efectivo para que open_order use el real.
+  Fix: _set_leverage consulta hl.get_max_leverage() antes de llamar a
+  update_leverage y cappa el valor automáticamente. Si falla la consulta,
+  usa el valor solicitado como fallback. Actualiza self.leverage con el
+  valor efectivo para que open_order use el real.
 
 FIX start() TradingLoop kwargs (2026-06-05 v8):
   CAUSA RAÍZ: start() instanciaba TradingLoop(trader=self, symbol=...,
@@ -148,6 +150,21 @@ FIX start() TradingLoop kwargs (2026-06-05 v8):
     2. run() recibe trader=self y un objeto risk mínimo con usdc_per_trade.
     3. signal_fn ya no se pasa a TradingLoop — DecisionEngine lo gestiona
        internamente a través de signal_engine.
+
+FIX HLClient.create() kwargs + get_max_leverage() signature (2026-06-05 v9):
+  CAUSA RAÍZ 1: _get_ccxt() llamaba HLClient.create(master_addr=...,
+  private_key=..., agent_key=..., agent_addr=...) pero la firma real es
+  HLClient.create(symbol: str). Los kwargs no existen — _HLCore lee las
+  credenciales directamente de las variables de entorno. Esto causaba
+  TypeError en cada trader al intentar inicializar el SDK.
+  Fix: llamar simplemente HLClient.create(self.symbol).
+
+  CAUSA RAÍZ 2: _set_leverage() llamaba hl.get_max_leverage(self.symbol)
+  pero get_max_leverage() no acepta argumentos — usa self.coin interno.
+  El TypeError quedaba silenciado por el except: pass y el leverage nunca
+  se capaba, causando 'Invalid leverage value' para AAVE, INJ, TAO, DOGE,
+  GRASS y cualquier coin con maxLev < 15x en rotaciones de PairScanner.
+  Fix: llamar hl.get_max_leverage() sin argumentos.
 """
 from __future__ import annotations
 
@@ -423,18 +440,18 @@ class FuturesTrader:
         Inicializa HLClient la primera vez que se llama.
         Siempre se invoca desde dentro del event loop (a través de _init()),
         por lo que es seguro usar await / asyncio.to_thread aquí.
+
+        IMPORTANTE: HLClient.create() solo acepta symbol:str.
+        Las credenciales (HL_API_PRIVATE_KEY, HL_API_WALLET_ADDRESS) las
+        lee _HLCore directamente de las variables de entorno — NO se pasan
+        aquí como argumentos.
         """
         if self._hl_client is not None:
             return self._hl_client
 
         logger.info("[%s] _get_ccxt: inicializando HLClient...", self.symbol)
         try:
-            self._hl_client = await HLClient.create(
-                master_addr = self._master_addr,
-                private_key = self._private_key,
-                agent_key   = self._agent_key,
-                agent_addr  = self._agent_addr,
-            )
+            self._hl_client = await HLClient.create(self.symbol)
             logger.info(
                 "[%s] _get_ccxt: HLClient listo | addr=%s | agente=%s",
                 self.symbol,
@@ -738,10 +755,11 @@ class FuturesTrader:
         """
         Configura el apalancamiento en el exchange.
 
-        Auto-capping interno: consulta maxLeverage del coin antes de
-        llamar a update_leverage y cappa automáticamente si el leverage
-        solicitado supera el máximo permitido. Actualiza self.leverage
-        con el valor efectivo para que open_order use el real.
+        Auto-capping interno: consulta hl.get_max_leverage() (sin args —
+        usa self.coin internamente) antes de llamar a update_leverage y
+        cappa automáticamente si el leverage solicitado supera el máximo
+        permitido. Actualiza self.leverage con el valor efectivo para que
+        open_order use el real.
         """
         hl = self._require_hl()
         if hl is None:
@@ -749,15 +767,19 @@ class FuturesTrader:
 
         effective_leverage = leverage
         try:
-            max_lev = await asyncio.to_thread(hl.get_max_leverage, self.symbol)
+            max_lev = await asyncio.to_thread(hl.get_max_leverage)
             if max_lev and max_lev < leverage:
                 logger.info(
                     "[%s] _set_leverage: auto-capping %dx → %dx (maxLeverage=%d en HL)",
                     self.symbol, leverage, max_lev, max_lev,
                 )
                 effective_leverage = max_lev
-        except Exception:
-            pass  # Si falla la consulta, intentar con el valor original
+        except Exception as e:
+            logger.warning(
+                "[%s] _set_leverage: no se pudo obtener maxLeverage (%s) — "
+                "usando leverage solicitado %dx como fallback",
+                self.symbol, e, leverage,
+            )
 
         try:
             result = await asyncio.wait_for(
