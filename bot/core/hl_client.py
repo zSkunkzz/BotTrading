@@ -36,6 +36,11 @@ FIX CRÍTICO (2026-06-01):
 FIX float_to_wire rounding (2026-06-02):
   place_sl / place_tp redondean sz a szDecimals antes de pasarlo al SDK.
 
+FIX set_leverage (2026-06-05):
+  Añadido HLClient.set_leverage(coin, leverage, is_cross) que delega en
+  self._exchange.update_leverage() con la firma correcta del SDK HL.
+  trader._set_leverage() usaba update_leverage() que no existía.
+
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -502,6 +507,21 @@ class HLClient:
                     px = round(px - tick, dec)
 
         return px
+
+    # ── LEVERAGE ──────────────────────────────────────────────────
+
+    def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> dict:
+        """
+        Configura el apalancamiento en Hyperliquid.
+
+        FIX (2026-06-05): trader._set_leverage() llamaba update_leverage()
+        que no existe en HLClient. El SDK HL expone:
+          exchange.update_leverage(leverage, coin, is_cross)
+        con esta firma exacta (leverage primero, luego coin).
+
+        is_cross=False → isolated margin (default para futuros perpetuos).
+        """
+        return self._exchange.update_leverage(leverage, coin, is_cross)
 
     # ── ÓRDENES BÁSICAS ─────────────────────────────────────────────
 

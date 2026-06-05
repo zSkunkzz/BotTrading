@@ -46,11 +46,21 @@ FIX NameError aiohttp (2026-06-03):
   _fetch_candles usaba aiohttp.ClientTimeout pero el import estaba solo
   dentro de get_ohlcv (scope distinto). Movido al nivel de módulo.
 
-FIX get_price NoneType (2026-06-03):
-  Si HL devuelve null, un error HTTP, o un body no-dict (e.g. string de error),
-  data.get(self.coin) lanzaba 'NoneType object has no attribute get'.
-  Fix: guard isinstance(data, dict) antes de llamar .get().
-  Si data no es dict → raise ValueError con el body truncado para diagnóstico.
+FIX get_price (2026-06-05):
+  get_price() no existía en FuturesTrader — solo estaba mencionado en el
+  docstring. trading_loop._iteration() lo llama en cada tick → AttributeError
+  → WARNING → cero scans. Implementado con:
+    - allMids vía asyncio.to_thread() (síncrono SDK).
+    - Retry PRICE_FETCH_RETRIES veces con backoff exponencial (0.4s, 0.8s, 1.6s).
+    - Stale fallback a self._last_price si todos los intentos fallan.
+    - Propaga excepción solo si _last_price == 0 (primer arranque sin precio).
+    - Actualiza self._last_price en cada éxito.
+
+FIX _set_leverage / update_leverage (2026-06-05):
+  _set_leverage() llamaba self._hl_client.update_leverage() que no existe
+  en HLClient. Corregido a self._hl_client.set_leverage(coin, leverage)
+  que delega en exchange.update_leverage(leverage, coin, is_cross) con la
+  firma correcta del SDK Hyperliquid.
 
 FIX _ensure_tpsl spam (2026-06-03):
   En Hyperliquid, los SL/TP colocados con place_sl/place_tp son TRIGGER ORDERS
@@ -69,10 +79,9 @@ FIX OHLCV semáforo → ohlcv_cache (2026-06-05):
 FIX allMids NoneType — retry + caché último precio (2026-06-04):
   Cuando HL devuelve null en allMids (cold-start o saturación puntual),
   get_price() ahora:
-    1. Reintenta 1 vez tras 0.4s si data no es dict.
+    1. Reintenta PRICE_FETCH_RETRIES veces con backoff exponencial.
     2. Si sigue fallando, devuelve self._last_price (último precio válido
-       cacheado) en lugar de propagar la excepción — el tick se procesa
-       con el precio anterior y el WARNING queda silenciado.
+       cacheado) en lugar de propagar la excepción.
     3. Si _last_price == 0 (primer arranque y falla) → propaga excepción.
     4. Cada llamada exitosa actualiza self._last_price.
 
@@ -124,13 +133,6 @@ FIX HLClient.create() firma (2026-06-05):
   HLClient.create() solo acepta 1 (symbol). Los credenciales los lee
   _HLCore directamente desde las env vars HL_API_PRIVATE_KEY / HL_PRIVATE_KEY.
   Fix: HLClient.create(self.coin) — eliminar api_key y api_secret sobrantes.
-
-FIX _set_leverage ausente (2026-06-05):
-  trading_loop._init() llama await trader._set_leverage(trader.leverage)
-  pero el método no existía → AttributeError → bucle infinito silenciado,
-  ningún trader llegaba a _iteration().
-  Fix: implementar _set_leverage() con dry_run guard + asyncio.wait_for
-  timeout=SET_LEVERAGE_TIMEOUT_S (default 15s) + WARNING sin bloqueo.
 """
 from __future__ import annotations
 
@@ -165,7 +167,7 @@ _OHLCV_BARS          = int(os.getenv("BARS_NEEDED",           "100"))
 # ohlcv_cache ignora este nombre y usa HL_OHLCV_CONCURRENCY.
 _OHLCV_MAX_CONCURRENCY = int(os.getenv("OHLCV_MAX_CONCURRENCY", "3"))
 
-_PRICE_FETCH_RETRIES = int(os.getenv("PRICE_FETCH_RETRIES",   "3"))
+_PRICE_FETCH_RETRIES    = int(os.getenv("PRICE_FETCH_RETRIES",   "3"))
 _SET_LEVERAGE_TIMEOUT_S = float(os.getenv("SET_LEVERAGE_TIMEOUT_S", "15"))
 
 _TF_MINUTES = {
@@ -347,16 +349,78 @@ class FuturesTrader:
             # FIX: HLClient.create() solo acepta symbol — las credenciales
             # las lee _HLCore directamente desde las env vars.
             self._hl_client = await HLClient.create(self.coin)
-            self._master_addr = getattr(self._hl_client, "master_address", "") or ""
-            self._agent_mode  = getattr(self._hl_client, "agent_mode",     False)
+            self._master_addr = getattr(self._hl_client, "_account_addr", "") or ""
+            self._agent_mode  = getattr(self._hl_client, "_agent_mode",   False)
             logger.info(
                 "[%s] HLClient listo — addr=%s agent=%s",
-                self.symbol, self._master_addr[:10] + "…" if self._master_addr else "N/A",
+                self.symbol,
+                (self._master_addr[:10] + "…") if self._master_addr else "N/A",
                 self._agent_mode,
             )
         except Exception as e:
             logger.error("[%s] _get_ccxt error: %s", self.symbol, e)
             raise
+
+    # ── get_price: precio mid actual via allMids ──────────────────────
+
+    async def get_price(self) -> float:
+        """
+        Devuelve el precio mid de self.coin desde allMids de Hyperliquid.
+
+        FIX (2026-06-05): el método no existía — trading_loop._iteration()
+        lo llama en cada tick. Su ausencia causaba AttributeError → WARNING
+        → cero scans.
+
+        Estrategia:
+          1. Llama self._hl_client._info.all_mids() en asyncio.to_thread().
+          2. Reintenta PRICE_FETCH_RETRIES veces con backoff exponencial
+             (0.4s, 0.8s, 1.6s) si la respuesta no es dict o el coin no
+             está en el resultado.
+          3. Si todos los intentos fallan y self._last_price > 0, devuelve
+             el último precio válido (stale fallback) con WARNING.
+          4. Si _last_price == 0 (primer arranque sin precio) propaga
+             la excepción para que el caller la maneje.
+          5. Actualiza self._last_price en cada éxito.
+        """
+        if self._hl_client is None:
+            if self._last_price > 0:
+                return self._last_price
+            raise RuntimeError(f"[{self.symbol}] get_price: _hl_client no inicializado")
+
+        last_exc: Exception | None = None
+        delays = [0.4 * (2 ** i) for i in range(_PRICE_FETCH_RETRIES)]
+
+        for attempt, delay in enumerate(delays):
+            try:
+                data = await asyncio.to_thread(self._hl_client._info.all_mids)
+                if not isinstance(data, dict):
+                    raise ValueError(f"all_mids devolvió {type(data).__name__}: {str(data)[:80]}")
+                raw = data.get(self.coin)
+                if raw is None:
+                    raise ValueError(f"coin '{self.coin}' no encontrado en allMids")
+                price = float(raw)
+                self._last_price = price
+                return price
+            except Exception as exc:
+                last_exc = exc
+                if attempt < len(delays) - 1:
+                    logger.debug(
+                        "[%s] get_price intento %d/%d fallido (%s) — reintentando en %.1fs",
+                        self.symbol, attempt + 1, _PRICE_FETCH_RETRIES, exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+
+        # Todos los intentos fallaron
+        if self._last_price > 0:
+            logger.warning(
+                "[%s] get_price fallido tras %d intentos (%s) — usando precio stale %.4f",
+                self.symbol, _PRICE_FETCH_RETRIES, last_exc, self._last_price,
+            )
+            return self._last_price
+
+        raise RuntimeError(
+            f"[{self.symbol}] get_price: sin precio tras {_PRICE_FETCH_RETRIES} intentos: {last_exc}"
+        )
 
     # ── _set_leverage: configura apalancamiento en el exchange ────────
 
@@ -365,9 +429,13 @@ class FuturesTrader:
         Configura el apalancamiento para self.coin en Hyperliquid.
 
         - dry_run=True → log informativo sin llamada al SDK.
-        - Llama exchange.update_leverage() en asyncio.to_thread() con
+        - Llama HLClient.set_leverage() en asyncio.to_thread() con
           timeout=SET_LEVERAGE_TIMEOUT_S (default 15s).
         - Timeout o error → WARNING + continúa sin bloquear el bot.
+
+        FIX (2026-06-05): antes llamaba self._hl_client.update_leverage()
+        que no existe en HLClient. Corregido a set_leverage(coin, leverage)
+        que delega en exchange.update_leverage(leverage, coin, is_cross).
         """
         if self.dry_run:
             logger.info(
@@ -387,9 +455,9 @@ class FuturesTrader:
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    self._hl_client.update_leverage,
-                    leverage,
+                    self._hl_client.set_leverage,
                     self.coin,
+                    leverage,
                 ),
                 timeout=_SET_LEVERAGE_TIMEOUT_S,
             )
