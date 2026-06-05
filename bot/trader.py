@@ -127,6 +127,16 @@ FIX duplicate nonce _set_leverage (2026-06-05 v6):
   → colisión de nonce garantizada → HL rechaza con 'duplicate nonce'.
   Fix: usar hl.update_leverage(leverage) que internamente envuelve la
   llamada con _exchange_call() → _EXCHANGE_LOCK + _NONCE_MIN_DELAY_MS.
+
+FIX _set_leverage auto-capping interno (2026-06-05 v7):
+  CAUSA RAÍZ: En rotaciones de PairScanner, BitgetBot arranca traders
+  nuevos (AAVE, INJ, TAO, DOGE, GRASS) con leverage=15x porque el
+  snapshot de maxLeverage no incluía esos coins aún. HL rechaza con
+  'Invalid leverage value' porque su maxLeverage real es inferior a 15x.
+  Fix: _set_leverage consulta hl.get_max_leverage(self.coin) antes de
+  llamar a update_leverage y cappa el valor automáticamente. Si falla
+  la consulta, usa el valor solicitado como fallback. Actualiza
+  self.leverage con el valor efectivo para que open_order use el real.
 """
 from __future__ import annotations
 
@@ -793,6 +803,16 @@ class FuturesTrader:
         return hl.round_sz(qty)
 
     async def _set_leverage(self, leverage: int) -> None:
+        """
+        Configura el leverage en HL con auto-capping interno (v7).
+
+        Antes de llamar a update_leverage, consulta el maxLeverage real
+        del coin en el caché de HLClient. Si el leverage solicitado lo
+        supera, lo cappa automáticamente y actualiza self.leverage con
+        el valor efectivo. Esto garantiza que la llamada nunca falle con
+        'Invalid leverage value', incluso cuando BitgetBot arranca traders
+        nuevos en rotaciones sin snapshot previo para ese coin.
+        """
         hl = self._require_hl()
         if hl is None:
             return
@@ -800,20 +820,41 @@ class FuturesTrader:
         if self.dry_run:
             logger.info("[%s] DRY_RUN: _set_leverage(%d) omitido.", self.symbol, leverage)
             return
+
+        # ── Auto-capping: consultar maxLeverage real del coin ────────────
+        effective_leverage = leverage
         try:
-            # FIX duplicate nonce (2026-06-05 v6):
-            # Usar hl.update_leverage() en lugar de hl._exchange.update_leverage() directamente.
-            # HLClient.update_leverage() envuelve la llamada con _exchange_call() que adquiere
-            # _EXCHANGE_LOCK + sleep de _NONCE_MIN_DELAY_MS, garantizando nonces únicos incluso
-            # cuando varios traders llaman simultáneamente al arranque.
+            max_lev = await asyncio.to_thread(hl.get_max_leverage, self.coin)
+            if max_lev and max_lev > 0 and leverage > max_lev:
+                logger.info(
+                    "[%s] ⚙️  Leverage capado internamente: %dx → %dx (max=%dx, fuente=HLClient cache)",
+                    self.symbol, leverage, max_lev, max_lev,
+                )
+                effective_leverage = max_lev
+        except Exception as e:
+            logger.debug(
+                "[%s] _set_leverage: no se pudo consultar maxLeverage (%s) — usando %dx sin capping",
+                self.symbol, e, leverage,
+            )
+
+        try:
+            # FIX duplicate nonce (v6): usar hl.update_leverage() que envuelve
+            # la llamada con _exchange_call() → _EXCHANGE_LOCK + _NONCE_MIN_DELAY_MS.
             result = await asyncio.wait_for(
                 asyncio.to_thread(
                     hl.update_leverage,
-                    leverage,
+                    effective_leverage,
                 ),
                 timeout=15.0,
             )
-            logger.info("[%s] Leverage configurado a %dx: %s", self.symbol, leverage, result)
+            logger.info("[%s] Leverage configurado a %dx: %s", self.symbol, effective_leverage, result)
+
+            # Actualizar self.leverage con el valor efectivo real para que
+            # open_order calcule el notional correcto.
+            if effective_leverage != self.leverage:
+                self.leverage = effective_leverage
+                self._open_leverage = effective_leverage
+
         except asyncio.TimeoutError:
             logger.warning("[%s] _set_leverage timeout (15s) — continuando sin confirmar leverage.", self.symbol)
         except Exception as e:
