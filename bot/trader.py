@@ -115,9 +115,24 @@ FIX get_ohlcv_fn ausente (2026-06-05):
   trading_loop._iteration() llama trader.get_ohlcv_fn() ANTES del bloque
   try/except de evaluate(). El método no existía en FuturesTrader →
   AttributeError capturado silenciosamente por el except genérico de run()
-  → loop reinicia cada 10s sin analizar ningún par.
+  → loop reiniciaba cada 10s sin analizar ningún par.
   Fix: añadir get_ohlcv_fn() que devuelve un callable parcial de get_ohlcv
   listo para ser pasado a signal_engine.analyze_pair como ohlcv_fn.
+
+FIX HLClient.create() firma (2026-06-05):
+  trader.py pasaba 3 args posicionales (api_key, api_secret, coin) pero
+  HLClient.create() solo acepta 1 (symbol). Los credenciales los lee
+  _HLCore directamente desde las env vars HL_API_PRIVATE_KEY / HL_PRIVATE_KEY.
+  Fix: HLClient.create(self.coin) — eliminar api_key y api_secret sobrantes.
+
+FIX _set_leverage ausente (2026-06-05):
+  CAUSA RAÍZ del enganche tras 'Sin cambios en pares activos':
+  trading_loop._init() llama await trader._set_leverage(leverage) pero el
+  método no existía en FuturesTrader → AttributeError silenciado por el
+  except genérico de run() → loop reinicia cada 10s sin logs → el bot
+  queda enganchado indefinidamente sin llegar nunca a _iteration().
+  Fix: implementar _set_leverage() con asyncio.to_thread + wait_for(15s)
+  y fallback graceful (WARNING + continúa) para no bloquear el bot.
 """
 from __future__ import annotations
 
@@ -154,6 +169,9 @@ _OHLCV_MAX_CONCURRENCY = int(os.getenv("OHLCV_MAX_CONCURRENCY", "3"))
 
 _PRICE_FETCH_RETRIES = int(os.getenv("PRICE_FETCH_RETRIES",   "3"))
 
+# Timeout para _set_leverage — configurable vía Railway env var
+_SET_LEVERAGE_TIMEOUT_S = float(os.getenv("SET_LEVERAGE_TIMEOUT_S", "15"))
+
 _TF_MINUTES = {
     "1m":  1,
     "3m":  3,
@@ -188,8 +206,8 @@ def _check_price_staleness(
 
     if abs_drift > threshold * 2:
         return (
-            f"⚠️ Precio actual ({ref_price:.4f}) se alejó {drift*100:+.2f}% del entry del signal "
-            f"({entry_signal:.4f}) — supera el límite absoluto de ±{threshold*200:.1f}% — entrada cancelada"
+            f"Precio actual ({ref_price:.4f}) se alejo {drift*100:+.2f}% del entry del signal "
+            f"({entry_signal:.4f}) — supera el limite absoluto de +-{threshold*200:.1f}% — entrada cancelada"
         )
 
     if abs_drift <= threshold:
@@ -198,28 +216,28 @@ def _check_price_staleness(
     if is_long:
         if drift > 0:
             return (
-                f"⏫ [LONG] Precio actual ({ref_price:.4f}) subió {drift*100:+.2f}% sobre entry del signal "
+                f"[LONG] Precio actual ({ref_price:.4f}) subio {drift*100:+.2f}% sobre entry del signal "
                 f"({entry_signal:.4f}) — entrada demasiado cara, cancelada "
-                f"(límite: +{threshold*100:.1f}%)"
+                f"(limite: +{threshold*100:.1f}%)"
             )
         else:
             return (
-                f"⏪ [LONG] Precio actual ({ref_price:.4f}) cayó {drift*100:+.2f}% bajo entry del signal "
-                f"({entry_signal:.4f}) — setup roto (precio en caída), cancelado "
-                f"(límite: -{threshold*100:.1f}%)"
+                f"[LONG] Precio actual ({ref_price:.4f}) cayo {drift*100:+.2f}% bajo entry del signal "
+                f"({entry_signal:.4f}) — setup roto (precio en caida), cancelado "
+                f"(limite: -{threshold*100:.1f}%)"
             )
     else:
         if drift < 0:
             return (
-                f"⏪ [SHORT] Precio actual ({ref_price:.4f}) bajó {drift*100:+.2f}% bajo entry del signal "
+                f"[SHORT] Precio actual ({ref_price:.4f}) bajo {drift*100:+.2f}% bajo entry del signal "
                 f"({entry_signal:.4f}) — entrada demasiado barata/cara para short, cancelada "
-                f"(límite: -{threshold*100:.1f}%)"
+                f"(limite: -{threshold*100:.1f}%)"
             )
         else:
             return (
-                f"⏫ [SHORT] Precio actual ({ref_price:.4f}) subió {drift*100:+.2f}% sobre entry del signal "
+                f"[SHORT] Precio actual ({ref_price:.4f}) subio {drift*100:+.2f}% sobre entry del signal "
                 f"({entry_signal:.4f}) — setup roto (precio en subida), cancelado "
-                f"(límite: +{threshold*100:.1f}%)"
+                f"(limite: +{threshold*100:.1f}%)"
             )
 
 
@@ -250,8 +268,8 @@ def _adjust_levels_to_fill(
     tp2_adj = _rescale(tp2_px)
 
     logger.info(
-        "Ajuste SL/TP por desfase de fill: base=%.4f → filled=%.4f (%.2f%%) | "
-        "SL %.4f→%.4f | TP1 %.4f→%.4f | TP2 %.4f→%.4f",
+        "Ajuste SL/TP por desfase de fill: base=%.4f -> filled=%.4f (%.2f%%) | "
+        "SL %.4f->%.4f | TP1 %.4f->%.4f | TP2 %.4f->%.4f",
         base, filled_price, (filled_price - base) / base * 100,
         sl_px, sl_adj, tp1_px, tp1_adj, tp2_px, tp2_adj,
     )
@@ -291,12 +309,12 @@ class FuturesTrader:
         self._open_qty:       float           = 0.0
         self._protection_ok:  bool            = False
         self._tp1_be_done:    bool            = False
-        self._last_price:     float           = 0.0  # caché del último precio válido
+        self._last_price:     float           = 0.0
 
         self._api_key    = api_key or ""
         self._api_secret = api_secret or ""
 
-        # FIX FREEZE: NO crear HLClient aquí (bloquea el event loop).
+        # FIX FREEZE: NO crear HLClient aqui (bloquea el event loop).
         self._hl_client: Optional[HLClient] = None
         self._master_addr: str = ""
         self._agent_mode:  bool = False
@@ -305,7 +323,7 @@ class FuturesTrader:
         self._trading_loop  = TradingLoop(symbol)
         self._ccxt_exchange  = None
 
-    # ── Interfaz pública requerida por main.py ──────────────────
+    # -- Interfaz publica requerida por main.py --
 
     async def run(self, risk, *, global_risk=None) -> None:
         try:
@@ -323,36 +341,91 @@ class FuturesTrader:
             logger.debug("[%s] cleanup ai_trader sessions: %s", self.symbol, e)
         self._stopped_event.set()
 
-    # ── _get_ccxt: crea HLClient la primera vez (async-safe) ──────────
+    # -- _get_ccxt: crea HLClient la primera vez (async-safe) --
 
     async def _get_ccxt(self) -> None:
         if self._hl_client is not None:
             return
         try:
-            logger.info("[%s] Inicializando HLClient (async)…", self.symbol)
-            self._hl_client = await HLClient.create(
-                self._api_key, self._api_secret, self.coin
-            )
+            logger.info("[%s] Inicializando HLClient (async)...", self.symbol)
+            # FIX HLClient.create() firma: solo acepta symbol (1 arg).
+            # Las credenciales las lee _HLCore desde env vars.
+            self._hl_client = await HLClient.create(self.coin)
             self._master_addr = getattr(self._hl_client, "master_address", "") or ""
             self._agent_mode  = getattr(self._hl_client, "agent_mode",     False)
             logger.info(
-                "[%s] HLClient listo — addr=%s agent=%s",
-                self.symbol, self._master_addr[:10] + "…" if self._master_addr else "N/A",
+                "[%s] HLClient listo - addr=%s agent=%s",
+                self.symbol,
+                (self._master_addr[:10] + "...") if self._master_addr else "N/A",
                 self._agent_mode,
             )
         except Exception as e:
             logger.error("[%s] _get_ccxt error: %s", self.symbol, e)
             raise
 
-    # ── OHLCV: delega en ohlcv_cache singleton ────────────────────────
+    # -- _set_leverage: configura apalancamiento en HL (async-safe) --
+
+    async def _set_leverage(self, leverage: int) -> None:
+        """
+        Configura el apalancamiento del simbolo en Hyperliquid.
+
+        FIX (2026-06-05): este metodo no existia — su ausencia causaba
+        AttributeError en trading_loop._init() -> silenciado por el except
+        generico de run() -> bot enganchado indefinidamente tras el scanner.
+
+        - dry_run=True: log informativo, sin llamada al SDK.
+        - Llama exchange.update_leverage() dentro de asyncio.to_thread()
+          (SDK sincrono) con wait_for timeout=SET_LEVERAGE_TIMEOUT_S (15s).
+        - Si falla o timeout: WARNING + continua (no bloquea el bot).
+        """
+        if self.dry_run:
+            logger.info(
+                "[%s] [DRY-RUN] _set_leverage(%dx) - sin llamada al SDK.",
+                self.symbol, leverage,
+            )
+            return
+
+        if self._hl_client is None:
+            logger.warning(
+                "[%s] _set_leverage: _hl_client no inicializado - skip.",
+                self.symbol,
+            )
+            return
+
+        def _call_sdk() -> None:
+            # update_leverage(leverage, coin, is_cross)
+            # is_cross=False -> isolated margin
+            self._hl_client._exchange.update_leverage(
+                leverage,
+                self.coin,
+                False,
+            )
+
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(_call_sdk),
+                timeout=_SET_LEVERAGE_TIMEOUT_S,
+            )
+            logger.info("[%s] Apalancamiento configurado: %dx", self.symbol, leverage)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] _set_leverage timeout (%.0fs) - continuando sin confirmar leverage.",
+                self.symbol, _SET_LEVERAGE_TIMEOUT_S,
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] _set_leverage error (no critico): %s", self.symbol, e
+            )
+
+    # -- OHLCV: delega en ohlcv_cache singleton --
 
     async def get_ohlcv(self, timeframe: str, n: Optional[int] = None) -> list:
         """
         Devuelve barras OHLCV para self.coin/timeframe.
 
         Delega completamente en ohlcv_cache.get() (bot/ohlcv_cache.py) que
-        gestiona semáforo de concurrencia, backoff exponencial con jitter y
-        stale fallback. No se duplica ninguna lógica de retry aquí.
+        gestiona semaforo de concurrencia, backoff exponencial con jitter y
+        stale fallback. No se duplica ninguna logica de retry aqui.
         """
         bars_needed = n or _OHLCV_BARS
 
@@ -363,19 +436,19 @@ class FuturesTrader:
 
     def get_ohlcv_fn(self) -> Callable:
         """
-        Devuelve un callable async(timeframe) → list que signal_engine puede
-        usar como ohlcv_fn.  Evita que trading_loop tenga que conocer la firma
+        Devuelve un callable async(timeframe) -> list que signal_engine puede
+        usar como ohlcv_fn. Evita que trading_loop tenga que conocer la firma
         completa de get_ohlcv.
 
-        FIX (2026-06-05): este método no existía — su ausencia lanzaba
+        FIX (2026-06-05): este metodo no existia — su ausencia lanzaba
         AttributeError en _iteration() antes del bloque try/except de
-        evaluate(), lo que silenciaba todos los scans (0 señales analizadas).
+        evaluate(), silenciando todos los scans (0 senales analizadas).
         """
         return functools.partial(self.get_ohlcv)
 
     async def _fetch_candles(self, timeframe: str, n: int) -> list:
         """
-        Llamada HTTP directa a HL candleSnapshot — sin retry ni semáforo
+        Llamada HTTP directa a HL candleSnapshot — sin retry ni semaforo
         (ohlcv_cache se encarga de ambos).
         """
         tf_min = _TF_MINUTES.get(timeframe, 15)
