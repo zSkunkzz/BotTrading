@@ -1,13 +1,24 @@
 """
 bot/ohlcv_cache.py — Caché de OHLCV con TTL por timeframe y LRU eviction.
 
+v5 — Backoff exponencial + jitter en fetch, semáforo bajado a 3:
+  Con 10 traders × 3 TF = hasta 30 requests OHLCV simultáneas a HL,
+  la API devuelve None de forma masiva (rate limit silencioso no documentado).
+  Cambios respecto a v4:
+  - HL_OHLCV_CONCURRENCY default: 5 → 3 para reducir presión sobre HL.
+  - fetch_fn se llama con backoff exponencial (1s, 2s, 4s) + jitter ±0.3s.
+    Si HL devuelve lista vacía o None en el primer intento, se reintenta
+    hasta OHLCV_FETCH_RETRIES veces antes de declarar fallo.
+  - Si todos los intentos fallan y hay datos expirados en caché, se
+    devuelven con WARNING (stale fallback) en lugar de lista vacía.
+
 v4 — Semáforo global _HL_OHLCV_SEMAPHORE:
   Con 10 traders × 3 TF = hasta 30 requests OHLCV simultáneas a HL,
   la API devuelve None de forma masiva (rate limit silencioso no documentado).
   Se añade asyncio.Semaphore(HL_OHLCV_CONCURRENCY) que limita las requests
   reales en vuelo. Las lecturas del caché caliente NO consumen el semáforo
   (el guard ocurre antes de llamar fetch_fn).
-  Env var: HL_OHLCV_CONCURRENCY (int, default 5)
+  Env var: HL_OHLCV_CONCURRENCY (int, default 3)
 
 v3 — TTL diferenciado por timeframe:
   15m → 12s  (igual que antes, velas de 15m se invalidan rápido)
@@ -28,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -41,10 +53,15 @@ _MAX_CACHE_SYMBOLS = int(os.getenv("MAX_OHLCV_CACHE_SYMBOLS", "20"))
 
 # ── Semáforo global: limita requests OHLCV reales en vuelo ──────────────────
 # Con 10 traders × 3 TF = hasta 30 requests simultáneas → HL devuelve None.
-# HL_OHLCV_CONCURRENCY=5 significa máximo 5 fetch_fn activos a la vez.
-# Las lecturas del caché caliente no consumen el semáforo (guard previo).
-_HL_OHLCV_CONCURRENCY = int(os.getenv("HL_OHLCV_CONCURRENCY", "5"))
+# Bajado de 5 a 3 para reducir la presión sobre HL y evitar None masivos.
+_HL_OHLCV_CONCURRENCY = int(os.getenv("HL_OHLCV_CONCURRENCY", "3"))
 _HL_OHLCV_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+# ── Backoff exponencial: reintentos dentro del semáforo ─────────────────────
+# Si fetch_fn devuelve vacío o lanza excepción, se reintenta hasta este límite.
+# Esperas: 1s, 2s, 4s (× 2^intento) + jitter uniforme ±_OHLCV_FETCH_JITTER_S.
+_OHLCV_FETCH_RETRIES = int(os.getenv("OHLCV_FETCH_RETRIES",  "3"))
+_OHLCV_FETCH_JITTER  = float(os.getenv("OHLCV_FETCH_JITTER", "0.3"))
 
 
 def _get_semaphore() -> asyncio.Semaphore:
@@ -79,7 +96,8 @@ def _ttl_for(tf: str) -> float:
 
 class OHLCVCache:
     """
-    Caché OHLCV con TTL por timeframe + LRU eviction + semáforo de concurrencia.
+    Caché OHLCV con TTL por timeframe + LRU eviction + semáforo de concurrencia
+    + backoff exponencial con jitter en fetch + stale fallback.
     """
 
     def __init__(self, max_symbols: int = _MAX_CACHE_SYMBOLS):
@@ -94,9 +112,17 @@ class OHLCVCache:
         fetch_fn: Callable[[str], Any],
     ) -> list:
         """
-        Devuelve OHLCV desde caché si está fresco (TTL por TF), si no llama fetch_fn.
-        El semáforo global _HL_OHLCV_SEMAPHORE solo se adquiere cuando hay que
-        hacer un fetch real (caché miss o expirado), nunca en lecturas calientes.
+        Devuelve OHLCV desde caché si está fresco (TTL por TF), si no llama
+        fetch_fn con backoff exponencial + jitter.
+
+        Estrategia de resiliencia:
+          1. Lectura caliente del caché — no consume el semáforo.
+          2. Cache miss/expirado → adquirir semáforo y llamar fetch_fn.
+          3. Si fetch_fn devuelve vacío o lanza excepción, se reintenta
+             hasta _OHLCV_FETCH_RETRIES veces con espera 2^i + jitter.
+          4. Si todos los intentos fallan y hay datos expirados en caché,
+             se devuelven como stale fallback con WARNING.
+          5. Si no hay datos en absoluto, devuelve [].
         """
         key = f"{coin}:{tf}"
         ttl = _ttl_for(tf)
@@ -110,22 +136,57 @@ class OHLCVCache:
 
         # Cache miss o expirado → adquirir semáforo antes de fetch
         sem = _get_semaphore()
+        data: list = []
+        last_exc: Optional[Exception] = None
+
         try:
             async with sem:
-                data = await fetch_fn(tf)
+                for attempt in range(_OHLCV_FETCH_RETRIES):
+                    try:
+                        result = await fetch_fn(tf)
+                        if result:  # lista no vacía → éxito
+                            data = result
+                            break
+                        # HL devolvió [] o None — tratar como fallo transitorio
+                        log.warning(
+                            "[OHLCVCache] fetch vacío %s/%s (intento %d/%d)",
+                            coin, tf, attempt + 1, _OHLCV_FETCH_RETRIES,
+                        )
+                    except Exception as e:
+                        last_exc = e
+                        log.warning(
+                            "[OHLCVCache] fetch error %s/%s (intento %d/%d): %s",
+                            coin, tf, attempt + 1, _OHLCV_FETCH_RETRIES, e,
+                        )
+
+                    if attempt < _OHLCV_FETCH_RETRIES - 1:
+                        backoff = (2 ** attempt) + random.uniform(
+                            -_OHLCV_FETCH_JITTER, _OHLCV_FETCH_JITTER
+                        )
+                        backoff = max(0.2, backoff)  # mínimo 0.2s
+                        log.debug(
+                            "[OHLCVCache] backoff %.2fs antes de reintento %d para %s/%s",
+                            backoff, attempt + 2, coin, tf,
+                        )
+                        await asyncio.sleep(backoff)
+
         except Exception as e:
-            log.error("[OHLCVCache] fetch error %s/%s: %s", coin, tf, e)
+            # El semáforo mismo lanzó excepción (improbable)
+            log.error("[OHLCVCache] semáforo/fetch error %s/%s: %s", coin, tf, e)
+
+        if not data:
+            # Stale fallback: devolver datos expirados si los hay
             async with self._lock:
                 entry = self._cache.get(key)
                 if entry:
+                    stale_age = time.monotonic() - entry["ts"]
                     log.warning(
-                        "[OHLCVCache] Devolviendo datos expirados para %s/%s (fetch falló)",
-                        coin, tf,
+                        "[OHLCVCache] Devolviendo datos STALE para %s/%s "
+                        "(edad=%.1fs, ttl=%.1fs) — fetch falló%s",
+                        coin, tf, stale_age, ttl,
+                        f": {last_exc}" if last_exc else " (vacío)",
                     )
                     return entry["data"]
-            return []
-
-        if not data:
             return []
 
         async with self._lock:
