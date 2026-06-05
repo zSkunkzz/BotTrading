@@ -578,6 +578,13 @@ def format_signal_block(signal) -> str:
 MIN_SCORE: int = 1
 
 
+# ─── Alias público: get_signal → analyze_pair ────────────────────────────────
+# main.py importa `get_signal`; este alias evita el ImportError sin cambiar
+# la lógica existente de analyze_pair.
+
+get_signal = analyze_pair
+
+
 # ─── SignalFlipGuard ──────────────────────────────────────────────────────────
 
 class SignalFlipGuard:
