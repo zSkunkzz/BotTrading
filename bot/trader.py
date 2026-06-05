@@ -74,6 +74,20 @@ FIX allMids NoneType — retry + caché último precio (2026-06-04):
        con el precio anterior y el WARNING queda silenciado.
     3. Si _last_price == 0 (primer arranque y falla) → propaga excepción.
     4. Cada llamada exitosa actualiza self._last_price.
+
+FIX get_ohlcv 3 bugs (2026-06-05):
+  Bug 1 — except arg faltante: logger.warning tenía self.symbol y e pero
+    faltaba timeframe como segundo %s → el timeframe se perdía y el error
+    real quedaba sin contexto. Corregido el format string.
+  Bug 2 — retry sin backoff: el segundo intento (n//2) se lanzaba
+    inmediatamente con la misma sesión abierta. Si HL está saturado el
+    segundo intento falla igual. Ahora espera 1s con asyncio.sleep antes
+    del retry y abre una nueva sesión aiohttp.
+  Bug 3 — raw scope inseguro: raw se asignaba dentro del bloque
+    `async with sem` pero se usaba fuera. Si una excepción interrumpía
+    el bloque antes de asignar raw, el código posterior lanzaba NameError.
+    Ahora raw se inicializa a None antes del bloque y el bloque de parseo
+    queda dentro del try/except con early-return [] si raw no es lista.
 """
 from __future__ import annotations
 
@@ -420,32 +434,48 @@ class FuturesTrader:
                 return None
 
     async def get_ohlcv(self, timeframe: str) -> list:
+        """
+        Descarga velas OHLCV para self.coin / timeframe.
+
+        Estrategia de resiliencia (3 fixes 2026-06-05):
+          1. raw se inicializa a None antes del semáforo para evitar
+             NameError si una excepción interrumpe el bloque.
+          2. Si el primer intento devuelve algo que no es lista, espera 1s
+             y reintenta con ventana reducida (n//2) en sesión nueva.
+          3. El format string del except incluye timeframe como segundo arg
+             para que el WARNING sea accionable.
+        """
         n = _OHLCV_BARS
         sem = _get_ohlcv_semaphore()
+        raw: Optional[list] = None  # BUG 3 FIX: inicializar antes del bloque
 
         try:
             async with sem:
                 async with aiohttp.ClientSession() as session:
                     raw = await self._fetch_candles(session, timeframe, n)
 
-                    if raw is None or not isinstance(raw, list):
-                        logger.warning(
-                            "[%s] get_ohlcv(%s) respuesta inesperada (tipo=%s val=%r) — "
-                            "reintentando con ventana reducida...",
-                            self.symbol, timeframe, type(raw).__name__, raw,
-                        )
-                        raw = await self._fetch_candles(session, timeframe, n // 2)
+                if raw is None or not isinstance(raw, list):
+                    logger.warning(
+                        "[%s] get_ohlcv(%s) respuesta inesperada (tipo=%s val=%r) — "
+                        "esperando 1s y reintentando con ventana reducida...",
+                        self.symbol, timeframe, type(raw).__name__, raw,
+                    )
+                    # BUG 2 FIX: backoff + nueva sesión para el retry
+                    await asyncio.sleep(1.0)
+                    async with aiohttp.ClientSession() as session2:
+                        raw = await self._fetch_candles(session2, timeframe, n // 2)
 
-                    if raw is None or not isinstance(raw, list):
-                        logger.warning(
-                            "[%s] get_ohlcv(%s) sigue sin ser lista tras retry (tipo=%s) — "
-                            "devolviendo lista vacía.",
-                            self.symbol, timeframe, type(raw).__name__,
-                        )
-                        return []
+                if raw is None or not isinstance(raw, list):
+                    logger.warning(
+                        "[%s] get_ohlcv(%s) sigue sin ser lista tras retry (tipo=%s) — "
+                        "devolviendo lista vacía.",
+                        self.symbol, timeframe, type(raw).__name__,
+                    )
+                    return []
 
         except Exception as e:
-            logger.warning("[%s] get_ohlcv(%s) error: %s", self.symbol, e)
+            # BUG 1 FIX: incluir timeframe en el format string
+            logger.warning("[%s] get_ohlcv(%s) error: %s", self.symbol, timeframe, e)
             return []
 
         bars = []
