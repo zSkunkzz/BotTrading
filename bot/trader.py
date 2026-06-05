@@ -18,50 +18,26 @@ FIX FREEZE (2026-06-03):
 
   Fixes aplicados:
     1. __init__: _hl_client = None. El SDK jamás se crea aquí.
-    2. _get_ccxt(): crea _hl_client vía HLClient.create(symbol) (async) la
-       primera vez que se llama. TradingLoop.run() invoca _get_ccxt() desde
-       _init() dentro del event loop, por lo que es seguro awaitar.
-       Las credenciales NO se pasan — _HLCore las lee de las variables de
-       entorno (HL_API_PRIVATE_KEY, HL_API_WALLET_ADDRESS) directamente.
+    2. _get_ccxt(): crea _hl_client vía HLClient.create() (async) la primera
+       vez que se llama. TradingLoop.run() invoca _get_ccxt() desde _init()
+       dentro del event loop, por lo que es seguro awaitar.
     3. _set_leverage: asyncio.wait_for con timeout=15s.
     4. Todos los métodos que usan _hl_client verifican que no sea None.
 
 FIX DEADLOCK (2026-06-03 anterior):
   Todas las llamadas al SDK síncrono se envuelven en asyncio.to_thread().
 
-FIX get_ohlcv None (2026-06-03 / 2026-06-05 v2):
+FIX get_ohlcv None (2026-06-03):
   Hyperliquid candleSnapshot devuelve null (Python None) cuando startTime
   es demasiado antiguo o el request falla silenciosamente.
   Fixes:
     - Reducir startTime: n = BARS_NEEDED (sin el +20 extra).
-    - Guard: si raw is None, retry exponencial (hasta 3 intentos con
-      ventana reducida: 100% → 66% → 33%).
+    - Guard: si raw is None, retry 1 vez con ventana aún más corta.
     - Log del status HTTP y body truncado cuando no es lista.
-    - CORRECCIÓN BUG: faltaba 'timeframe' como argumento en logger del except.
-    - WARNING de retry → DEBUG (es comportamiento normal intermitente).
-
-FIX get_ohlcv WARNING spam (2026-06-05 v3):
-  Coins sin datos OHLCV (ZEC y otras poco líquidas) emitían un WARNING
-  en CADA ciclo de scan (~cada 10s), creando spam masivo en los logs.
-  Fix:
-    - _OHLCV_NO_DATA_COINS: set global que registra coins que fallaron
-      los 3 intentos de get_ohlcv().
-    - Primera vez que un coin entra en el set → WARNING (aviso único).
-    - Fallos subsiguientes del mismo coin → DEBUG (sin spam).
-    - El set se resetea cada _OHLCV_NO_DATA_RESET_INTERVAL segundos
-      (default 1800s = 30 min) para reintentar coins que puedan haber
-      ganado liquidez.
-
-FIX _fetch_candles endTime vela abierta (2026-06-05 v4):
-  CAUSA RAÍZ de candleSnapshot devolviendo [] para coins con datos:
-  endTime = now() caía dentro de la vela actual (aún no cerrada).
-  Hyperliquid devuelve [] silenciosamente cuando endTime está en una
-  vela abierta. Fix: endTime retrocede 1 intervalo completo para que
-  siempre apunte a la última vela cerrada.
 
 FIX _get_positions NoneType (2026-06-03):
-  Cuando _master_addr está vacío (guard 'if not self._master_addr') o HL
-  devuelve error JSON, data es None o un dict sin 'assetPositions'. Fix:
+  Cuando _master_addr está vacío (init incompleto) o HL devuelve error JSON,
+  data es None o un dict sin 'assetPositions'. Fix:
     - Guard early-return si _master_addr vacío.
     - if data is None: log + return [].
     - try/except TypeError alrededor de data.get().
@@ -70,12 +46,11 @@ FIX NameError aiohttp (2026-06-03):
   _fetch_candles usaba aiohttp.ClientTimeout pero el import estaba solo
   dentro de get_ohlcv (scope distinto). Movido al nivel de módulo.
 
-FIX get_price NoneType (2026-06-03 / 2026-06-05 v2):
+FIX get_price NoneType (2026-06-03):
   Si HL devuelve null, un error HTTP, o un body no-dict (e.g. string de error),
   data.get(self.coin) lanzaba 'NoneType object has no attribute get'.
   Fix: guard isinstance(data, dict) antes de llamar .get().
   Si data no es dict → raise ValueError con el body truncado para diagnóstico.
-  v2: WARNING → DEBUG cuando hay caché válida; WARNING solo en cold-start sin precio.
 
 FIX _ensure_tpsl spam (2026-06-03):
   En Hyperliquid, los SL/TP colocados con place_sl/place_tp son TRIGGER ORDERS
@@ -90,178 +65,15 @@ FIX OHLCV semáforo (2026-06-03):
   El semáforo se inicializa lazy en get_ohlcv() la primera vez que se llama
   (dentro del event loop), evitando el error de "attached to a different loop".
 
-FIX allMids NoneType — retry + caché último precio (2026-06-04 / 2026-06-05 v2):
+FIX allMids NoneType — retry + caché último precio (2026-06-04):
   Cuando HL devuelve null en allMids (cold-start o saturación puntual),
   get_price() ahora:
     1. Reintenta 1 vez tras 0.4s si data no es dict.
     2. Si sigue fallando, devuelve self._last_price (último precio válido
        cacheado) en lugar de propagar la excepción — el tick se procesa
-       con el precio anterior.
+       con el precio anterior y el WARNING queda silenciado.
     3. Si _last_price == 0 (primer arranque y falla) → propaga excepción.
     4. Cada llamada exitosa actualiza self._last_price.
-    5. v2: los logs de uso de caché son DEBUG, no WARNING, para evitar
-       spam en operación normal con pequeñas interrupciones de red.
-
-FIX semáforo global HL + jitter anti-thundering-herd (2026-06-05 v5):
-  CAUSA RAÍZ de los null en clearinghouseState y candleSnapshot:
-  Todos los traders hacían sus llamadas a /info en paralelo sin ningún
-  límite global — el semáforo previo solo cubría get_ohlcv(), dejando
-  _get_positions, _get_open_orders_raw, _get_open_trigger_orders_raw
-  e _info_post completamente sin restricción.
-  Con N traders × M endpoints simultáneos, HL devuelve null en vez de 429.
-  Fixes:
-    1. _HL_SEMAPHORE: semáforo GLOBAL que cubre TODAS las llamadas a /info.
-       Límite configurable via HL_CONCURRENCY (default 4).
-       get_ohlcv() pasa a usar este semáforo global en vez del antiguo
-       _OHLCV_SEMAPHORE (OHLCV_MAX_CONCURRENCY queda como alias retrocompat).
-    2. Jitter en TradingLoop._init(): cada trader espera un retardo
-       aleatorio de 0–HL_JITTER_MAX_S (default 3s) antes de empezar
-       su primer ciclo. Evita que todos los loops arranquen en t=0
-       y hagan poll simultáneo en el mismo segundo.
-    3. Los WARNING de respuesta null en _get_positions pasan a DEBUG
-       cuando el semáforo global está activo (son esperables bajo carga).
-
-FIX duplicate nonce _set_leverage (2026-06-05 v6):
-  CAUSA RAÍZ: _set_leverage llamaba hl._exchange.update_leverage()
-  directamente via asyncio.to_thread(), sin pasar por _exchange_call()
-  ni adquirir _EXCHANGE_LOCK. Con 7 traders terminando _get_ccxt() en
-  el mismo milisegundo, todos llamaban update_leverage simultáneamente
-  → colisión de nonce garantizada → HL rechaza con 'duplicate nonce'.
-  Fix: usar hl.update_leverage(leverage) que internamente envuelve la
-  llamada con _exchange_call() → _EXCHANGE_LOCK + _NONCE_MIN_DELAY_MS.
-
-FIX _set_leverage auto-capping interno (2026-06-05 v7):
-  CAUSA RAÍZ: En rotaciones de PairScanner, BitgetBot arranca traders
-  nuevos (AAVE, INJ, TAO, DOGE, GRASS) con leverage=15x porque el
-  snapshot de maxLeverage no incluía esos coins aún. HL rechaza con
-  'Invalid leverage value' porque su maxLeverage real es inferior a 15x.
-  Fix: _set_leverage consulta hl.get_max_leverage() antes de llamar a
-  update_leverage y cappa el valor automáticamente. Si falla la consulta,
-  usa el valor solicitado como fallback. Actualiza self.leverage con el
-  valor efectivo para que open_order use el real.
-
-FIX start() TradingLoop kwargs (2026-06-05 v8):
-  CAUSA RAÍZ: start() instanciaba TradingLoop(trader=self, symbol=...,
-  signal_fn=...) pero TradingLoop.__init__ solo acepta symbol:str.
-  Además llamaba self._loop.run() sin argumentos, cuando run() requiere
-  (trader, risk, *, global_risk=None).
-  Fix:
-    1. TradingLoop se instancia solo con symbol: TradingLoop(self.symbol).
-    2. run() recibe trader=self y un objeto risk mínimo con usdc_per_trade.
-    3. signal_fn ya no se pasa a TradingLoop — DecisionEngine lo gestiona
-       internamente a través de signal_engine.
-
-FIX HLClient.create() kwargs + get_max_leverage() signature (2026-06-05 v9):
-  CAUSA RAÍZ 1: _get_ccxt() llamaba HLClient.create(master_addr=...,
-  private_key=..., agent_key=..., agent_addr=...) pero la firma real es
-  HLClient.create(symbol: str). Los kwargs no existen — _HLCore lee las
-  credenciales directamente de las variables de entorno. Esto causaba
-  TypeError en cada trader al intentar inicializar el SDK.
-  Fix: llamar simplemente HLClient.create(self.symbol).
-
-  CAUSA RAÍZ 2: _set_leverage() llamaba hl.get_max_leverage(self.symbol)
-  pero get_max_leverage() no acepta argumentos — usa self.coin interno.
-  El TypeError quedaba silenciado por el except: pass y el leverage nunca
-  se capaba, causando 'Invalid leverage value' para AAVE, INJ, TAO, DOGE,
-  GRASS y cualquier coin con maxLev < 15x en rotaciones de PairScanner.
-  Fix: llamar hl.get_max_leverage() sin argumentos.
-
-FIX _get_positions list vs dict + warning agent_mode=False (2026-06-05 v10):
-  CAUSA RAÍZ: HLClient.get_positions() ya devuelve una list[dict] filtrada
-  por coin (no un dict con clave 'assetPositions'). El código anterior en
-  _get_positions() hacía data.get("assetPositions", []) sobre esa lista,
-  lo que lanzaba 'list' object has no attribute 'get' en CADA ciclo de
-  todos los traders, paralizando el bot al 100% con error: 4 en decision_engine.
-  Esto ocurre especialmente cuando agent_mode=False (wallet directa sin
-  agente autorizado), donde el SDK puede comportarse de forma distinta.
-  Fixes:
-    1. _get_positions(): simplifica la lógica — hl.get_positions() ya
-       devuelve list directamente. Si por compatibilidad futura recibe
-       un dict, extrae assetPositions. Cualquier otro tipo → WARNING + [].
-    2. _get_ccxt(): loguea WARNING visible si agent_mode=False para alertar
-       que el bot opera sin agente Hyperliquid activo — facilita diagnóstico
-       de expiración o revocación del agente wallet.
-
-FIX _set_leverage AttributeError update_leverage (2026-06-05 v11):
-  CAUSA RAÍZ: _set_leverage llamaba hl.set_leverage() pero HLClient
-  expone el método como update_leverage(). Renombrado correctamente.
-
-FIX _master_addr y _agent_mode nunca populados (2026-06-05 v12):
-  CAUSA RAÍZ: self._master_addr = master_addr y self._agent_mode = bool(agent_key)
-  en __init__ siempre quedaban "" / False porque main.py NO pasa esos kwargs —
-  _HLCore ya lee las credenciales de las env vars directamente.
-  Consecuencias:
-    - _get_positions() siempre devolvía [] (guard 'if not self._master_addr').
-    - TradingLoop logueaba siempre 'master=N/A | agent_mode=False'.
-    - balance_svc.init_hl() recibía master_addr="" y nunca se inicializaba.
-  Fix:
-    _get_ccxt(), tras crear HLClient con éxito, sincroniza:
-      self._master_addr = hl._account      (wallet principal de _HLCore)
-      self._agent_addr  = hl._core.agent_addr
-      self._agent_mode  = hl._core.agent_mode
-    Así el resto del código (trading_loop, _get_positions, balance_svc)
-    recibe los valores reales leídos de las env vars.
-
-FIX get_ohlcv dict→lista (2026-06-05 v13) — BUG RAÍZ de error: 4:
-  CAUSA RAÍZ: candleSnapshot de Hyperliquid devuelve velas como dicts:
-    {"t": <ms>, "o": "...", "h": "...", "l": "...", "c": "...", "v": "..."}
-  signal_engine._clean_bars() itera las claves del dict (no los valores),
-  por lo que todas las velas pasan el filtro. Luego _compute_indicators()
-  hace float(b[4]), float(b[2])... sobre índices enteros → KeyError: 4,
-  que decision_engine captura y loguea como 'analyze_pair error: 4'.
-  Fix: _hl_candle_to_list() convierte cada vela al formato estándar
-  [ts_ms, open, high, low, close, volume] antes de devolver.
-  get_ohlcv() aplica la conversión al resultado antes de retornarlo.
-
-FIX place_market/place_sl/place_tp firmas incorrectas (2026-06-05 v14):
-  CAUSA RAÍZ: trader.py llamaba place_market, place_sl, place_tp con tipos
-  incorrectos respecto a las firmas reales de HLClient:
-
-  1. place_market(is_buy: bool, sz) — se pasaba string "buy"/"sell" en vez
-     de bool. Fix: pasar is_buy directamente (True/False).
-
-  2. place_sl(is_buy: bool, sz, sl_price, entry_price=None) — se pasaba
-     string en vez de bool, y sl_px/filled_price INVERTIDOS.
-     Fix: is_long bool, orden correcto (sl_px primero, filled_price como entry).
-
-  3. place_tp(is_buy: bool, sz, tp_price, limit_price, entry_price=None) —
-     se pasaba string en vez de bool, args invertidos, None en posición errónea.
-     Fix: is_long bool, tp1_px, limit_price=None, filled_price como entry.
-
-  4. _place_tpsl: mismos bugs. Corregidos igual.
-
-  5. _get_open_trigger_orders_raw: HLClient no expone get_open_trigger_orders.
-     Fix: usar get_open_orders() y filtrar in-place.
-
-FIX round_sz → _round_qty (2026-06-05 v19):
-  CAUSA RAÍZ: trader.py llamaba hl.round_sz() pero HLClient no expone ese
-  método público. El nombre real es hl._round_qty(). Corregido en open_order
-  y en el método helper _round_qty de FuturesTrader.
-
-FIX set_leverage → update_leverage (2026-06-05 v19):
-  CAUSA RAÍZ: _set_leverage llamaba hl.set_leverage() que no existe en HLClient.
-  El método real es hl.update_leverage(leverage, is_cross=False).
-  Corregido en _set_leverage.
-
-FIX AttributeError _account_addr/_agent_addr/_agent_mode (2026-06-05 v18):
-  CAUSA RAÍZ: _get_ccxt() intentaba leer self._hl_client._account_addr,
-  self._hl_client._agent_addr y self._hl_client._agent_mode, pero HLClient
-  no expone esos atributos con esos nombres exactos:
-    - HLClient._account      (no _account_addr)
-    - HLClient._core.agent_addr  (no _agent_addr directo)
-    - HLClient._core.agent_mode  (no _agent_mode directo)
-  El AttributeError bloqueaba la inicialización de TODOS los traders
-  (los 20 en paralelo), dejando el bot arrancado pero sin trading activo.
-  Fix: usar los nombres de atributo correctos de HLClient/_HLCore.
-
-FIX is_buy invertido en place_sl/place_tp (2026-06-05 v27) — BUG RAÍZ de SL/TP:
-  CAUSA RAÍZ: place_sl y place_tp reciben is_buy como el lado de la ORDEN
-  DE CIERRE, no el lado de la posición abierta.
-    - LONG abierto → el cierre es una VENTA → is_buy=False (not is_long)
-    - SHORT abierto → el cierre es una COMPRA → is_buy=True (not is_long)
-  Se pasaba is_long directamente → HL colocaba la orden en el lado equivocado
-  → las órdenes eran rechazadas o ignoradas silenciosamente → sin SL ni TP.
-  Fix: pasar not is_long en place_sl y place_tp en open_order() y _place_tpsl().
 """
 from __future__ import annotations
 
@@ -269,7 +81,6 @@ import asyncio
 import json as _json
 import logging
 import os
-import random
 import time
 from typing import Callable, Optional
 
@@ -289,26 +100,7 @@ _API_URL = (
 )
 
 _OHLCV_BARS = int(os.getenv("BARS_NEEDED", "100"))
-
-# ── Semáforo GLOBAL para TODAS las llamadas a /info ─────────────────────────
-_HL_CONCURRENCY = int(
-    os.getenv("OHLCV_MAX_CONCURRENCY",  # alias retrocompat
-    os.getenv("HL_CONCURRENCY", "4"))
-)
-_OHLCV_MAX_CONCURRENCY = _HL_CONCURRENCY
-
-_HL_JITTER_MAX_S = float(os.getenv("HL_JITTER_MAX_S", "3.0"))
-
-_OHLCV_RETRY_DELAYS_RAW = os.getenv("OHLCV_RETRY_DELAYS", "0.5,1.5")
-try:
-    _OHLCV_RETRY_DELAYS = [float(x) for x in _OHLCV_RETRY_DELAYS_RAW.split(",") if x.strip()]
-except Exception:
-    _OHLCV_RETRY_DELAYS = [0.5, 1.5]
-
-# ── Supresión de spam WARNING para coins sin datos OHLCV ────────────────────
-_OHLCV_NO_DATA_COINS: set[str] = set()
-_OHLCV_NO_DATA_RESET_INTERVAL = float(os.getenv("OHLCV_NO_DATA_RESET_INTERVAL", "1800"))
-_OHLCV_NO_DATA_LAST_RESET: float = time.monotonic()
+_OHLCV_MAX_CONCURRENCY = int(os.getenv("OHLCV_MAX_CONCURRENCY", "5"))
 
 _TF_MINUTES = {
     "1m":  1,
@@ -328,79 +120,73 @@ _FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "2.0"))
 
 _MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "3.0")) / 100.0
 
-_HL_SEMAPHORE: Optional[asyncio.Semaphore] = None
+# Semáforo OHLCV — inicializado lazy dentro del event loop la primera vez
+# que get_ohlcv() se llama. No se crea a nivel de módulo para evitar el error
+# "got Future attached to a different loop" en Python <3.10.
 _OHLCV_SEMAPHORE: Optional[asyncio.Semaphore] = None
+_OHLCV_SEM_LOCK = asyncio.Lock.__new__(asyncio.Lock)  # placeholder, se crea lazy
 
 
-def _get_hl_semaphore() -> asyncio.Semaphore:
-    global _HL_SEMAPHORE, _OHLCV_SEMAPHORE
-    if _HL_SEMAPHORE is None:
-        _HL_SEMAPHORE = asyncio.Semaphore(_HL_CONCURRENCY)
-        _OHLCV_SEMAPHORE = _HL_SEMAPHORE
+def _get_ohlcv_semaphore() -> asyncio.Semaphore:
+    """Devuelve el semáforo OHLCV global, creándolo la primera vez."""
+    global _OHLCV_SEMAPHORE
+    if _OHLCV_SEMAPHORE is None:
+        _OHLCV_SEMAPHORE = asyncio.Semaphore(_OHLCV_MAX_CONCURRENCY)
         logger.info(
-            "[HLSemaphore] Inicializado: max_concurrency=%d "
-            "(cubre get_ohlcv + _get_positions + get_price + orders)",
-            _HL_CONCURRENCY,
+            "[OHLCVSemaphore] Inicializado: max_concurrency=%d (env OHLCV_MAX_CONCURRENCY)",
+            _OHLCV_MAX_CONCURRENCY,
         )
-    return _HL_SEMAPHORE
+    return _OHLCV_SEMAPHORE
 
 
-_get_ohlcv_semaphore = _get_hl_semaphore
-
-
-# ── FIX v13: conversión vela HL dict → lista estándar OHLCV ─────────────────
-
-def _hl_candle_to_list(candle) -> Optional[list]:
-    """
-    Convierte una vela de Hyperliquid al formato estándar [ts, open, high, low, close, vol].
-
-    Hyperliquid candleSnapshot devuelve dicts:
-      {"t": <ms_epoch>, "o": "precio", "h": "precio", "l": "precio",
-       "c": "precio", "v": "volumen"}
-
-    signal_engine espera listas accedidas por índice:
-      b[0]=ts  b[1]=open  b[2]=high  b[3]=low  b[4]=close  b[5]=vol
-
-    Si la vela ya es una lista (formato ya convertido), se devuelve tal cual.
-    Si es un dict con claves HL, se convierte.
-    Si no se puede convertir, devuelve None (será filtrado por _clean_bars).
-    """
-    if isinstance(candle, (list, tuple)):
-        return list(candle)
-    if isinstance(candle, dict):
-        try:
-            return [
-                int(candle["t"]),
-                float(candle["o"]),
-                float(candle["h"]),
-                float(candle["l"]),
-                float(candle["c"]),
-                float(candle["v"]),
-            ]
-        except (KeyError, TypeError, ValueError):
-            return None
-    return None
-
-
-def _check_price_staleness(signal: dict, ref_price: float, is_long: bool) -> str | None:
+def _check_price_staleness(
+    signal: dict,
+    ref_price: float,
+    is_long: bool,
+) -> Optional[str]:
     entry_signal = float(signal.get("entry") or 0)
-    if entry_signal <= 0 or ref_price <= 0:
+    if entry_signal <= 0:
         return None
 
     drift = (ref_price - entry_signal) / entry_signal
-    if is_long and drift < -_MAX_ENTRY_DRIFT_PCT:
+    abs_drift = abs(drift)
+    threshold = _MAX_ENTRY_DRIFT_PCT
+
+    if abs_drift > threshold * 2:
         return (
-            f"precio cayó {drift*100:.2f}% vs señal "
-            f"(ref={ref_price:.4f} entry_signal={entry_signal:.4f} "
-            f"threshold={-_MAX_ENTRY_DRIFT_PCT*100:.1f}%)"
+            f"⚠️ Precio actual ({ref_price:.4f}) se alejó {drift*100:+.2f}% del entry del signal "
+            f"({entry_signal:.4f}) — supera el límite absoluto de ±{threshold*200:.1f}% — entrada cancelada"
         )
-    if not is_long and drift > _MAX_ENTRY_DRIFT_PCT:
-        return (
-            f"precio subió {drift*100:.2f}% vs señal "
-            f"(ref={ref_price:.4f} entry_signal={entry_signal:.4f} "
-            f"threshold=+{_MAX_ENTRY_DRIFT_PCT*100:.1f}%)"
-        )
-    return None
+
+    if abs_drift <= threshold:
+        return None
+
+    if is_long:
+        if drift > 0:
+            return (
+                f"⏫ [LONG] Precio actual ({ref_price:.4f}) subió {drift*100:+.2f}% sobre entry del signal "
+                f"({entry_signal:.4f}) — entrada demasiado cara, cancelada "
+                f"(límite: +{threshold*100:.1f}%)"
+            )
+        else:
+            return (
+                f"⏪ [LONG] Precio actual ({ref_price:.4f}) cayó {drift*100:+.2f}% bajo entry del signal "
+                f"({entry_signal:.4f}) — setup roto (precio en caída), cancelado "
+                f"(límite: -{threshold*100:.1f}%)"
+            )
+    else:
+        if drift < 0:
+            return (
+                f"⏪ [SHORT] Precio actual ({ref_price:.4f}) bajó {drift*100:+.2f}% bajo entry del signal "
+                f"({entry_signal:.4f}) — entrada demasiado barata/cara para short, cancelada "
+                f"(límite: -{threshold*100:.1f}%)"
+            )
+        else:
+            return (
+                f"⏫ [SHORT] Precio actual ({ref_price:.4f}) subió {drift*100:+.2f}% sobre entry del signal "
+                f"({entry_signal:.4f}) — setup roto (precio en subida), cancelado "
+                f"(límite: +{threshold*100:.1f}%)"
+            )
 
 
 def _adjust_levels_to_fill(
@@ -408,537 +194,478 @@ def _adjust_levels_to_fill(
     filled_price: float,
     ref_price: float,
 ) -> tuple[float, float, float]:
-    base_px = float(signal.get("entry") or ref_price)
-    sl_raw  = float(signal.get("sl")  or 0)
-    tp1_raw = float(signal.get("tp1") or 0)
-    tp2_raw = float(signal.get("tp2") or 0)
+    sl_px  = float(signal.get("sl")  or 0)
+    tp1_px = float(signal.get("tp1") or 0)
+    tp2_px = float(signal.get("tp2") or 0)
 
-    if base_px <= 0 or filled_price <= 0:
-        return sl_raw, tp1_raw, tp2_raw
+    base = float(signal.get("entry") or 0)
+    if base <= 0:
+        base = ref_price
 
-    drift = abs(filled_price - base_px) / base_px
-    if drift < 0.0005:
-        return sl_raw, tp1_raw, tp2_raw
+    if abs(filled_price - base) / base < 0.0005:
+        return sl_px, tp1_px, tp2_px
 
-    def scale(level: float) -> float:
+    def _rescale(level: float) -> float:
         if level <= 0:
-            return 0.0
-        pct = (level - base_px) / base_px
+            return level
+        pct = (level - base) / base
         return filled_price * (1.0 + pct)
 
-    return scale(sl_raw), scale(tp1_raw), scale(tp2_raw)
+    sl_adj  = _rescale(sl_px)
+    tp1_adj = _rescale(tp1_px)
+    tp2_adj = _rescale(tp2_px)
 
-
-try:
-    from bot.config import BARS_NEEDED
-except ImportError:
-    BARS_NEEDED = _OHLCV_BARS
-
-
-class _RiskProxy:
-    __slots__ = ("usdc_per_trade",)
-
-    def __init__(self, usdc_per_trade: float) -> None:
-        self.usdc_per_trade = usdc_per_trade
+    logger.info(
+        "Ajuste SL/TP por desfase de fill: base=%.4f → filled=%.4f (%.2f%%) | "
+        "SL %.4f→%.4f | TP1 %.4f→%.4f | TP2 %.4f→%.4f",
+        base, filled_price, (filled_price - base) / base * 100,
+        sl_px, sl_adj, tp1_px, tp1_adj, tp2_px, tp2_adj,
+    )
+    return sl_adj, tp1_adj, tp2_adj
 
 
 class FuturesTrader:
+    """
+    Orquestador principal de un par de trading en Hyperliquid.
+    """
 
     def __init__(
         self,
-        symbol:         str,
-        leverage:       int,
-        usdc_per_trade: float,
-        signal_fn:      Callable,
-        dry_run:        bool = False,
-        master_addr:    str  = "",
-        private_key:    str  = "",
-        agent_key:      str  = "",
-        agent_addr:     str  = "",
+        api_key: Optional[str],
+        api_secret: str,
+        passphrase: Optional[str],
+        symbol: str,
+        leverage: int = 5,
+        margin_mode: str = "isolated",
+        dry_run: bool = True,
     ) -> None:
-        self.symbol         = symbol
-        self.coin           = symbol
-        self.leverage       = leverage
-        self.usdc_per_trade = usdc_per_trade
-        self.signal_fn      = signal_fn
-        self.dry_run        = dry_run
+        self.symbol      = symbol
+        self.coin        = _norm_coin(symbol)
+        self.leverage    = leverage
+        self.margin_mode = margin_mode
+        self.dry_run     = dry_run
 
-        self._master_addr = master_addr
-        self._private_key = private_key
-        self._agent_key   = agent_key
-        self._agent_addr  = agent_addr
-        self._agent_mode  = bool(agent_key)
+        self.position:        Optional[str]   = None
+        self.entry_price:     Optional[float] = None
+        self.sl:              Optional[float] = None
+        self.tp1:             Optional[float] = None
+        self.tp2:             Optional[float] = None
+        self.tp3:             Optional[float] = None
+        self.tp2_hit:         bool            = False
+        self._open_notional:  float           = 0.0
+        self._open_leverage:  int             = leverage
+        self._open_qty:       float           = 0.0
+        self._protection_ok:  bool            = False
+        self._tp1_be_done:    bool            = False
+        self._last_price:     float           = 0.0  # caché del último precio válido
 
-        self.position:    Optional[str]   = None
-        self.entry_price: float           = 0.0
-        self.sl:          Optional[float] = None
-        self.tp1:         Optional[float] = None
-        self.tp2:         Optional[float] = None
-        self.tp3:         Optional[float] = None
-        self.tp2_hit:     bool            = False
-        self._open_notional: float        = 0.0
-        self._open_leverage: int          = leverage
-        self._open_qty:      float        = 0.0
-        self._protection_ok: bool         = False
-        self._tp1_be_done:   bool         = False
-        self._last_price:    float        = 0.0
+        self._api_key    = api_key or ""
+        self._api_secret = api_secret or ""
 
+        # FIX FREEZE: NO crear HLClient aquí (bloquea el event loop).
         self._hl_client: Optional[HLClient] = None
-        self._loop: Optional[TradingLoop] = None
+        self._master_addr: str = ""
+        self._agent_mode:  bool = False
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Ciclo de vida
-    # ─────────────────────────────────────────────────────────────────────────
+        self._stopped_event = asyncio.Event()
+        self._trading_loop  = TradingLoop(symbol)
+        self._ccxt_exchange  = None
 
-    async def start(self) -> None:
-        self._loop = TradingLoop(self.symbol)
-        risk = _RiskProxy(self.usdc_per_trade)
-        await self._loop.run(self, risk)
+    # ── Interfaz pública requerida por main.py ──────────────────
 
-    async def stop(self) -> None:
-        if self._loop:
-            await self._loop.stop()
-            self._loop = None
-            logger.info("[%s] Trader parado limpiamente.", self.symbol)
-
-    def cancel(self) -> None:
-        if self._loop:
-            self._loop.cancel()
-
-    def get_ohlcv_fn(self):
-        """Devuelve un callable async para obtener OHLCV de este símbolo."""
-        return self.get_ohlcv
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Inicialización lazy del SDK
-    # ─────────────────────────────────────────────────────────────────────────
-
-    async def _get_ccxt(self) -> Optional[HLClient]:
-        if self._hl_client is not None:
-            return self._hl_client
-
-        logger.info("[%s] _get_ccxt: inicializando HLClient...", self.symbol)
+    async def run(self, risk, *, global_risk=None) -> None:
         try:
+            await self._trading_loop.run(self, risk, global_risk=global_risk)
+        except asyncio.CancelledError:
+            logger.info("[%s] FuturesTrader cancelado.", self.symbol)
+        finally:
+            self._stopped_event.set()
+
+    async def cleanup(self) -> None:
+        try:
+            from bot.ai_trader import close_sessions
+            await close_sessions()
+        except Exception as e:
+            logger.debug("[%s] cleanup ai_trader sessions: %s", self.symbol, e)
+        self._stopped_event.set()
+
+    # ── _get_ccxt: crea HLClient la primera vez (async-safe) ──────────
+
+    async def _get_ccxt(self) -> None:
+        if self._hl_client is not None:
+            return
+        try:
+            logger.info("[%s] _get_ccxt: inicializando HLClient...", self.symbol)
             self._hl_client = await HLClient.create(self.symbol)
-
-            # FIX v18: usar los nombres de atributo correctos de HLClient/_HLCore
-            # HLClient expone:
-            #   ._account      → dirección wallet principal (str)
-            #   ._core         → instancia _HLCore con .agent_addr y .agent_mode
-            self._master_addr = self._hl_client._account
-            self._agent_addr  = self._hl_client._core.agent_addr
-            self._agent_mode  = self._hl_client._core.agent_mode
-
-            agent_active = self._agent_mode
+            self._master_addr = self._hl_client._account_addr
+            self._agent_mode  = self._hl_client._agent_mode
             logger.info(
                 "[%s] _get_ccxt: HLClient listo | addr=%s | agente=%s",
                 self.symbol,
-                self._master_addr[:12] + "..." if self._master_addr else "N/A",
-                agent_active,
+                self._master_addr[:10] + "..." if self._master_addr else "N/A",
+                self._agent_mode,
             )
-            if not agent_active:
-                logger.warning(
-                    "[%s] ⚠️  AGENTE INACTIVO — operando con master wallet directamente. "
-                    "Verificar que el agente esté autorizado en app.hyperliquid.xyz "
-                    "(clave puede haber expirado o sido revocada).",
-                    self.symbol,
-                )
         except Exception as e:
-            logger.error("[%s] _get_ccxt: error inicializando HLClient: %s", self.symbol, e, exc_info=True)
+            logger.error("[%s] _get_ccxt: error inicializando HLClient: %s", self.symbol, e)
             raise
 
-        return self._hl_client
+    # ── Acceso seguro a _hl_client ────────────────────────────────
 
     def _require_hl(self) -> Optional[HLClient]:
+        if self._hl_client is None:
+            logger.error(
+                "[%s] _hl_client no inicializado. ¿Se llamó _get_ccxt() antes?",
+                self.symbol,
+            )
+            return None
         return self._hl_client
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Métodos de acceso al exchange
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Métodos que TradingLoop llama sobre el objeto trader ────────
 
-    async def _fetch_candles(
-        self,
-        coin:      str,
-        timeframe: str,
-        n:         int,
-    ) -> list[dict]:
-        tf_min = _TF_MINUTES.get(timeframe)
-        if tf_min is None:
-            raise ValueError(f"Timeframe desconocido: {timeframe!r}")
+    async def _fetch_all_mids(self, session: aiohttp.ClientSession) -> Optional[dict]:
+        """Llama al endpoint allMids y devuelve el dict o None si falla."""
+        try:
+            async with session.post(
+                f"{_API_URL}/info",
+                json={"type": "allMids"},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                text = await resp.text()
+            data = _json.loads(text)
+            if isinstance(data, dict):
+                return data
+            logger.warning(
+                "[%s] allMids devolvió tipo inesperado (%s): %s",
+                self.symbol, type(data).__name__, text[:120],
+            )
+            return None
+        except Exception as e:
+            logger.warning("[%s] allMids error: %s", self.symbol, e)
+            return None
 
-        interval_ms = tf_min * 60 * 1000
-        end_ms   = int(time.time() * 1000) - interval_ms
-        start_ms = end_ms - n * interval_ms
+    async def get_price(self) -> float:
+        """
+        Obtiene el precio mid de self.coin vía allMids.
+
+        Estrategia de resiliencia:
+          1. Intento inicial.
+          2. Si data es None → espera 0.4 s y reintenta 1 vez.
+          3. Si sigue fallando → usa self._last_price (caché del último
+             precio válido). Sólo propaga excepción si no hay caché.
+          4. Cada precio válido actualiza self._last_price.
+        """
+        async with aiohttp.ClientSession() as session:
+            data = await self._fetch_all_mids(session)
+
+            if data is None:
+                # Retry único con backoff mínimo
+                await asyncio.sleep(0.4)
+                data = await self._fetch_all_mids(session)
+
+        if data is None:
+            # Fallback a último precio válido conocido
+            if self._last_price > 0:
+                logger.warning(
+                    "[%s] allMids falló tras retry — usando último precio válido en caché: %.4f",
+                    self.symbol, self._last_price,
+                )
+                return self._last_price
+            raise ValueError(
+                f"[{self.symbol}] allMids devolvió tipo inesperado (NoneType): null"
+            )
+
+        price = data.get(self.coin)
+        if price is None:
+            if self._last_price > 0:
+                logger.warning(
+                    "[%s] Precio no encontrado en allMids — usando caché: %.4f",
+                    self.symbol, self._last_price,
+                )
+                return self._last_price
+            raise ValueError(f"[{self.symbol}] Precio no encontrado en allMids")
+
+        result = float(price)
+        self._last_price = result  # actualizar caché
+        return result
+
+    async def _fetch_candles(self, session, timeframe: str, n_bars: int):
+        interval = _TF_MINUTES.get(timeframe, 15)
+        end_ms   = int(time.time() * 1000)
+        start_ms = end_ms - (n_bars * interval * 60 * 1000)
 
         payload = {
             "type": "candleSnapshot",
             "req": {
-                "coin":      _norm_coin(coin),
+                "coin":      self.coin,
                 "interval":  timeframe,
                 "startTime": start_ms,
                 "endTime":   end_ms,
             },
         }
-
-        timeout = aiohttp.ClientTimeout(total=12)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"{_API_URL}/info",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            ) as resp:
-                status = resp.status
-                raw = await resp.json(content_type=None)
-
-        if raw is None:
-            raise ValueError(
-                f"candleSnapshot devolvió null (status={status}) "
-                f"coin={coin} tf={timeframe}"
-            )
-        if not isinstance(raw, list):
-            body_preview = str(raw)[:200]
-            raise ValueError(
-                f"candleSnapshot respuesta inesperada (status={status}, "
-                f"tipo={type(raw).__name__}): {body_preview}"
-            )
-        return raw
-
-    async def get_ohlcv(
-        self,
-        timeframe: str = "15m",
-        n:         int = 100,
-    ) -> Optional[list]:
-        """
-        Devuelve las últimas n velas OHLCV en formato estándar
-        [ts_ms, open, high, low, close, volume] o None si no hay datos.
-
-        FIX v13: convierte las velas del formato dict de Hyperliquid
-        {"t","o","h","l","c","v"} al formato lista indexado que espera
-        signal_engine. Sin esta conversión, signal_engine hacía float(b[4])
-        sobre un dict → KeyError: 4, logueado como 'error: 4'.
-        """
-        global _OHLCV_NO_DATA_LAST_RESET, _OHLCV_NO_DATA_COINS
-
-        now = time.monotonic()
-        if now - _OHLCV_NO_DATA_LAST_RESET > _OHLCV_NO_DATA_RESET_INTERVAL:
-            if _OHLCV_NO_DATA_COINS:
-                logger.debug(
-                    "[get_ohlcv] Reseteando lista de coins sin datos OHLCV "
-                    "(%d coins) — reintentando.",
-                    len(_OHLCV_NO_DATA_COINS),
-                )
-            _OHLCV_NO_DATA_COINS = set()
-            _OHLCV_NO_DATA_LAST_RESET = now
-
-        coin = _norm_coin(self.symbol)
-        sem  = _get_hl_semaphore()
-
-        multipliers = [1.0, 0.66, 0.33]
-        last_err: Optional[Exception] = None
-
-        for attempt, mult in enumerate(multipliers, start=1):
-            n_req = max(1, int(n * mult))
+        async with session.post(
+            f"{_API_URL}/info",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            text = await resp.text()
             try:
-                async with sem:
-                    candles_raw = await self._fetch_candles(coin, timeframe, n_req)
-                if candles_raw:
-                    # ── FIX v13: convertir dicts HL → listas estándar OHLCV ──
-                    candles = [_hl_candle_to_list(c) for c in candles_raw]
-                    candles = [c for c in candles if c is not None]
-                    if candles:
-                        _OHLCV_NO_DATA_COINS.discard(coin)
-                        return candles
-                    # Si todos fallaron la conversión (formato inesperado)
-                    last_err = ValueError(
-                        f"todas las velas fallaron conversión dict→lista "
-                        f"(attempt={attempt} n_req={n_req} ejemplo={candles_raw[0] if candles_raw else 'N/A'})"
-                    )
-                    logger.warning(
-                        "[%s] get_ohlcv(%s) velas con formato inesperado (attempt=%d/%d): %s",
-                        self.symbol, timeframe, attempt, len(multipliers), last_err,
-                    )
-                else:
-                    last_err = ValueError(f"lista vacía (attempt={attempt} n_req={n_req})")
-                    logger.debug(
-                        "[%s] get_ohlcv(%s) lista vacía (attempt=%d/%d, n=%d) — reintentando...",
-                        self.symbol, timeframe, attempt, len(multipliers), n_req,
-                    )
-            except Exception as exc:
-                last_err = exc
-                logger.debug(
-                    "[%s] get_ohlcv(%s) attempt %d/%d falló: %s",
-                    self.symbol, timeframe, attempt, len(multipliers), exc,
+                return _json.loads(text)
+            except Exception:
+                logger.warning(
+                    "[%s] get_ohlcv(%s): respuesta no-JSON (status=%s): %s",
+                    self.symbol, timeframe, resp.status, text[:200],
                 )
+                return None
 
-            if attempt < len(multipliers):
-                delay_idx = attempt - 1
-                delay = _OHLCV_RETRY_DELAYS[delay_idx] if delay_idx < len(_OHLCV_RETRY_DELAYS) else 1.0
-                await asyncio.sleep(delay)
+    async def get_ohlcv(self, timeframe: str) -> list:
+        n = _OHLCV_BARS
+        sem = _get_ohlcv_semaphore()
 
-        first_time = coin not in _OHLCV_NO_DATA_COINS
-        _OHLCV_NO_DATA_COINS.add(coin)
-
-        log_fn = logger.warning if first_time else logger.debug
-        log_fn(
-            "[%s] get_ohlcv(%s) sin datos tras %d intentos — "
-            "coin posiblemente sin liquidez en HL. "
-            "Próximos fallos silenciados (DEBUG) durante %g min.",
-            self.symbol, timeframe, len(multipliers),
-            _OHLCV_NO_DATA_RESET_INTERVAL / 60,
-        )
-        return None
-
-    async def get_ohlcv_exc(
-        self,
-        timeframe: str = "15m",
-        n:         int = 100,
-    ) -> list:
         try:
-            result = await self.get_ohlcv(timeframe=timeframe, n=n)
+            async with sem:
+                async with aiohttp.ClientSession() as session:
+                    raw = await self._fetch_candles(session, timeframe, n)
+
+                    if raw is None or not isinstance(raw, list):
+                        logger.warning(
+                            "[%s] get_ohlcv(%s) respuesta inesperada (tipo=%s val=%r) — "
+                            "reintentando con ventana reducida...",
+                            self.symbol, timeframe, type(raw).__name__, raw,
+                        )
+                        raw = await self._fetch_candles(session, timeframe, n // 2)
+
+                    if raw is None or not isinstance(raw, list):
+                        logger.warning(
+                            "[%s] get_ohlcv(%s) sigue sin ser lista tras retry (tipo=%s) — "
+                            "devolviendo lista vacía.",
+                            self.symbol, timeframe, type(raw).__name__,
+                        )
+                        return []
+
         except Exception as e:
-            logger.warning("[%s] get_ohlcv(%s) excepción inesperada: %s", self.symbol, timeframe, e, exc_info=True)
+            logger.warning("[%s] get_ohlcv(%s) error: %s", self.symbol, e)
             return []
-        if result is None:
-            return []
-        return result
+
+        bars = []
+        for candle in raw:
+            try:
+                bars.append([
+                    int(candle["t"]),
+                    float(candle["o"]),
+                    float(candle["h"]),
+                    float(candle["l"]),
+                    float(candle["c"]),
+                    float(candle["v"]),
+                ])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        logger.debug(
+            "[%s] get_ohlcv(%s): %d velas descargadas",
+            self.symbol, timeframe, len(bars),
+        )
+        return bars
+
+    def get_ohlcv_fn(self) -> Callable:
+        async def _fn(tf: str) -> list:
+            return await self.get_ohlcv(tf)
+        return _fn
 
     async def _get_positions(self) -> list[dict]:
         if not self._master_addr:
+            logger.debug("[%s] _get_positions: _master_addr vacío — skip.", self.symbol)
             return []
 
-        hl = self._require_hl()
-        if hl is None:
-            return []
-
-        sem = _get_hl_semaphore()
         try:
-            async with sem:
-                raw = await asyncio.to_thread(hl.get_positions)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{_API_URL}/info",
+                    json={"type": "clearinghouseState", "user": self._master_addr},
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = _json.loads(await resp.text())
         except Exception as e:
-            logger.warning("[%s] _get_positions error: %s", self.symbol, e, exc_info=True)
+            logger.warning("[%s] _get_positions error: %s", self.symbol, e)
             return []
 
-        if isinstance(raw, list):
-            positions_raw = raw
-        elif isinstance(raw, dict):
-            positions_raw = raw.get("assetPositions", [])
-        elif raw is None:
-            logger.debug("[%s] _get_positions: HL devolvió null.", self.symbol)
+        if data is None:
+            logger.warning("[%s] _get_positions: respuesta null de HL API.", self.symbol)
             return []
-        else:
-            logger.warning(
-                "[%s] _get_positions: respuesta inesperada (tipo=%s): %s",
-                self.symbol, type(raw).__name__, str(raw)[:200],
-            )
+
+        try:
+            asset_positions = data.get("assetPositions", [])
+        except (TypeError, AttributeError) as e:
+            logger.warning("[%s] _get_positions: respuesta inesperada (tipo=%s): %s",
+                           self.symbol, type(data).__name__, e)
             return []
 
         result = []
-        for item in positions_raw:
+        for p in asset_positions:
             try:
-                pos = item.get("position", item) if isinstance(item, dict) else {}
-                coin = pos.get("coin", "")
-                szi  = float(pos.get("szi", 0))
-                if szi == 0:
+                pos = p.get("position", {})
+                if pos.get("coin", "").upper() != self.coin.upper():
+                    continue
+                szi = float(pos.get("szi", 0) or 0)
+                if abs(szi) == 0:
                     continue
                 result.append({
-                    "coin":    coin,
                     "side":    "long" if szi > 0 else "short",
-                    "szi":     abs(szi),
+                    "size":    abs(szi),
                     "entryPx": float(pos.get("entryPx") or 0),
+                    "coin":    pos.get("coin", ""),
                 })
             except (TypeError, AttributeError, ValueError) as e:
                 logger.debug("[%s] _get_positions: error parseando posición: %s", self.symbol, e)
                 continue
+
         return result
 
     async def _get_open_orders_raw(self) -> list[dict]:
-        if not self._master_addr or not self._hl_client:
+        """Órdenes normales (limit/market). NO contiene SL/TP trigger orders."""
+        if not self._master_addr:
             return []
-        sem = _get_hl_semaphore()
         try:
-            async with sem:
-                data = await asyncio.to_thread(self._hl_client.get_open_orders)
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{_API_URL}/info",
+                    json={"type": "openOrders", "user": self._master_addr},
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = _json.loads(await resp.text())
         except Exception as e:
-            logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e, exc_info=True)
+            logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e)
             return []
+
         if not isinstance(data, list):
             logger.warning("[%s] _get_open_orders_raw respuesta inesperada: %s", self.symbol, type(data))
             return []
+
         return data
 
     async def _get_open_trigger_orders_raw(self) -> list[dict]:
         """
-        FIX v14: HLClient no tiene get_open_trigger_orders().
-        Los triggers son open_orders filtrados por tipo trigger/tpsl.
-        Reutilizamos _get_open_orders_raw() y filtramos in-place.
+        FIX _ensure_tpsl spam: En Hyperliquid, place_sl / place_tp crean
+        TRIGGER ORDERS que viven en el endpoint 'frontendOpenOrders', no en
+        'openOrders'. Este método los obtiene para que _ensure_tpsl los detecte
+        correctamente y no los recoloque en bucle.
+
+        Endpoint: POST /info {"type": "frontendOpenOrders", "user": addr}
+        La respuesta incluye orderType.trigger.tpsl = "sl" | "tp".
         """
-        all_orders = await self._get_open_orders_raw()
-        result = []
-        coin = _norm_coin(self.symbol)
-        for o in all_orders:
-            if o.get("coin") != coin:
-                continue
-            ot = o.get("orderType", "")
-            is_trigger = False
-            if isinstance(ot, dict):
-                trigger  = ot.get("trigger", {})
-                tpsl_val = trigger.get("tpsl", "")
-                is_trigger = tpsl_val in ("tp", "sl")
-            elif isinstance(ot, str):
-                is_trigger = any(
-                    kw in ot
-                    for kw in ("Trigger", "Stop", "Take Profit", "trigger", "stop", "tp", "sl")
-                )
-            if is_trigger:
-                result.append(o)
-        return result
+        if not self._master_addr:
+            return []
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{_API_URL}/info",
+                    json={"type": "frontendOpenOrders", "user": self._master_addr},
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = _json.loads(await resp.text())
+        except Exception as e:
+            logger.warning("[%s] _get_open_trigger_orders_raw error: %s", self.symbol, e)
+            return []
+
+        if not isinstance(data, list):
+            logger.debug(
+                "[%s] _get_open_trigger_orders_raw respuesta inesperada tipo=%s",
+                self.symbol, type(data).__name__,
+            )
+            return []
+
+        return data
 
     async def _place_tpsl(
         self,
-        is_long:   bool,
-        qty:       float,
-        sl_price:  Optional[float],
-        tp_price:  Optional[float],
-        ref_price: float,
+        qty: float,
+        sl_price: Optional[float],
+        tp_price: Optional[float],
+        is_long: bool,
+        reduce_only: bool = True,
     ) -> None:
-        """
-        FIX v27: place_sl y place_tp reciben is_buy como el lado de la ORDEN
-        DE CIERRE, no el lado de la posición abierta.
-          - LONG abierto → cierre es VENTA → is_buy = not is_long = False
-          - SHORT abierto → cierre es COMPRA → is_buy = not is_long = True
-        """
         hl = self._require_hl()
         if hl is None:
             return
 
-        # is_buy para órdenes de cierre es el OPUESTO de la posición abierta
-        close_side = not is_long
+        if self.dry_run:
+            logger.info(
+                "[%s] DRY_RUN: _place_tpsl sl=%.4f tp=%.4f omitido.",
+                self.symbol, sl_price or 0, tp_price or 0,
+            )
+            return
 
         if sl_price and sl_price > 0:
             try:
-                await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     hl.place_sl,
-                    close_side,  # is_buy: bool (opuesto a la posición)
-                    qty,
-                    sl_price,    # sl_price
-                    ref_price,   # entry_price (opcional)
+                    is_buy=not is_long,
+                    sz=qty,
+                    trigger_px=sl_price,
+                    entry_px=self.entry_price or sl_price,
                 )
+                logger.info("[%s] _place_tpsl SL=%.4f: %s", self.symbol, sl_price, result)
             except Exception as e:
-                logger.error("[%s] _place_tpsl SL error: %s", self.symbol, e, exc_info=True)
+                logger.error("[%s] _place_tpsl SL error: %s", self.symbol, e)
 
         if tp_price and tp_price > 0:
             try:
-                await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     hl.place_tp,
-                    close_side,  # is_buy: bool (opuesto a la posición)
-                    qty,
-                    tp_price,    # tp_price
-                    None,        # limit_price (None = calcular automáticamente)
-                    ref_price,   # entry_price (opcional)
+                    is_buy=not is_long,
+                    sz=qty,
+                    trigger_px=tp_price,
+                    entry_px=self.entry_price or tp_price,
                 )
+                logger.info("[%s] _place_tpsl TP=%.4f: %s", self.symbol, tp_price, result)
             except Exception as e:
-                logger.error("[%s] _place_tpsl TP error: %s", self.symbol, e, exc_info=True)
+                logger.error("[%s] _place_tpsl TP error: %s", self.symbol, e)
 
     def _round_qty(self, qty: float) -> float:
-        # FIX v19: el método real de HLClient es _round_qty, no round_sz
         hl = self._require_hl()
         if hl is None:
             return qty
-        return hl._round_qty(qty)
+        return hl.round_sz(qty)
 
     async def _set_leverage(self, leverage: int) -> None:
         hl = self._require_hl()
         if hl is None:
             return
 
-        effective_leverage = leverage
+        if self.dry_run:
+            logger.info("[%s] DRY_RUN: _set_leverage(%d) omitido.", self.symbol, leverage)
+            return
         try:
-            max_lev = await asyncio.to_thread(hl.get_max_leverage)
-            if max_lev and max_lev < leverage:
-                logger.info(
-                    "[%s] _set_leverage: auto-capping %dx → %dx (maxLeverage=%d en HL)",
-                    self.symbol, leverage, max_lev, max_lev,
-                )
-                effective_leverage = max_lev
-        except Exception as e:
-            logger.warning(
-                "[%s] _set_leverage: no se pudo obtener maxLeverage (%s) — "
-                "usando leverage solicitado %dx como fallback",
-                self.symbol, e, leverage,
-            )
-
-        try:
-            # FIX v19: el método real es update_leverage(leverage, is_cross=False)
             result = await asyncio.wait_for(
-                asyncio.to_thread(hl.update_leverage, effective_leverage),
+                asyncio.to_thread(
+                    hl._exchange.update_leverage,
+                    leverage, self.coin, False,
+                ),
                 timeout=15.0,
             )
-            logger.info(
-                "[%s] Leverage configurado a %dx: %s",
-                self.symbol, effective_leverage, result,
-            )
-            self.leverage = effective_leverage
+            logger.info("[%s] Leverage configurado a %dx: %s", self.symbol, leverage, result)
         except asyncio.TimeoutError:
             logger.warning("[%s] _set_leverage timeout (15s) — continuando sin confirmar leverage.", self.symbol)
         except Exception as e:
-            logger.warning("[%s] No se pudo configurar leverage: %s", self.symbol, e, exc_info=True)
+            logger.warning("[%s] No se pudo configurar leverage: %s", self.symbol, e)
 
-    async def _info_post(self, payload: dict) -> Optional[dict]:
-        sem = _get_hl_semaphore()
-        timeout = aiohttp.ClientTimeout(total=10)
-        try:
-            async with sem:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(
-                        f"{_API_URL}/info",
-                        json=payload,
-                        headers={"Content-Type": "application/json"},
-                    ) as resp:
-                        return await resp.json(content_type=None)
-        except Exception:
-            return None
+    async def _info_post(self, payload: dict) -> dict:
+        hl = self._require_hl()
+        if hl is None:
+            return {}
 
-    async def get_price(self) -> float:
-        coin = _norm_coin(self.symbol)
-        sem  = _get_hl_semaphore()
+        def _sync_call() -> dict:
+            return hl._info._session.post(
+                f"{_API_URL}/info", json=payload
+            ).json()
 
-        for attempt in range(2):
-            try:
-                async with sem:
-                    data = await self._info_post({"type": "allMids"})
+        return await asyncio.to_thread(_sync_call)
 
-                if not isinstance(data, dict):
-                    raise ValueError(f"allMids respuesta inesperada: {str(data)[:100]}")
-
-                raw = data.get(coin)
-                if raw is None:
-                    raise ValueError(f"coin {coin!r} no encontrado en allMids")
-
-                price = float(raw)
-                self._last_price = price
-                return price
-
-            except Exception as exc:
-                if attempt == 0:
-                    logger.debug(
-                        "[%s] get_price intento 1 falló (%s) — reintentando en 0.4s...",
-                        self.symbol, exc,
-                    )
-                    await asyncio.sleep(0.4)
-                else:
-                    if self._last_price > 0:
-                        logger.debug(
-                            "[%s] get_price falló ambos intentos (%s) — usando caché %.4f",
-                            self.symbol, exc, self._last_price,
-                        )
-                        return self._last_price
-                    raise
-
-        raise RuntimeError("get_price: bucle terminó sin devolver precio")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Gestión de posiciones
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── open_order: entrada al mercado + SL + TP ──────────────────
 
     async def open_order(self, signal: dict, risk) -> None:
         hl = self._require_hl()
@@ -956,9 +683,10 @@ class FuturesTrader:
         is_long = (action == "BUY" or side == "long")
         is_buy  = is_long
 
-        usdc_base  = float(getattr(risk, "usdc_per_trade", 20.0))
-        kelly_mult = 1.0
+        usdc_base = float(getattr(risk, "usdc_per_trade", 20.0))
 
+        # FIX KELLY (#2): aplicar kelly_multiplier al size base
+        # kelly_mult=1.0 si no hay historial suficiente (<KELLY_MIN_TRADES)
         try:
             from bot.kelly_sizer import kelly_multiplier
             entry_mode = signal.get("entry_mode") or "NORMAL"
@@ -971,7 +699,7 @@ class FuturesTrader:
                     self.symbol, usdc_base, kelly_mult, entry_mode, rr_val, usdc_per_trade,
                 )
         except Exception as e:
-            logger.warning("[%s] Kelly sizer error (%s) — usando base sin ajuste", self.symbol, e, exc_info=True)
+            logger.warning("[%s] Kelly sizer error (%s) — usando base sin ajuste", self.symbol, e)
             usdc_per_trade = usdc_base
 
         notional = usdc_per_trade * self.leverage
@@ -979,7 +707,7 @@ class FuturesTrader:
         try:
             ref_price = await self.get_price()
         except Exception as e:
-            logger.error("[%s] open_order: no se pudo obtener precio — abortando. %s", self.symbol, e, exc_info=True)
+            logger.error("[%s] open_order: no se pudo obtener precio — abortando. %s", self.symbol, e)
             return
 
         if ref_price <= 0:
@@ -992,8 +720,7 @@ class FuturesTrader:
             return
 
         qty = notional / ref_price
-        # FIX v19: método real es _round_qty, no round_sz
-        qty = hl._round_qty(qty)
+        qty = hl.round_sz(qty)
 
         if qty <= 0:
             logger.error("[%s] open_order: qty calculada = 0 (notional=%.2f ref_price=%.4f) — abortando.",
@@ -1028,16 +755,18 @@ class FuturesTrader:
             self._protection_ok = (sl_px > 0)
             return
 
-        # ── FIX v19: place_market(is_buy: bool, sz) — pasar bool, no string ──
+        # ── Orden de mercado ──────────────────────────────────────
         try:
             result = await asyncio.to_thread(
                 hl.place_market,
-                is_buy,  # bool: True=compra, False=venta
+                is_buy,
                 qty,
+                False,
+                ref_price,
             )
             logger.info("[%s] Orden de mercado enviada: %s", self.symbol, result)
         except Exception as e:
-            logger.error("[%s] open_order: error al enviar orden de mercado: %s", self.symbol, e, exc_info=True)
+            logger.error("[%s] open_order: error al enviar orden de mercado: %s", self.symbol, e)
             return
 
         status = (result or {}).get("status", "")
@@ -1045,6 +774,7 @@ class FuturesTrader:
             logger.error("[%s] open_order: orden rechazada por exchange: %s", self.symbol, result)
             return
 
+        # ── Esperar fill y obtener precio real de entrada ─────────────────
         filled_price = ref_price
         for attempt in range(_FILL_RETRIES):
             await asyncio.sleep(_FILL_DELAY)
@@ -1058,11 +788,12 @@ class FuturesTrader:
                     )
                     break
             except Exception as e:
-                logger.warning("[%s] open_order: error confirmando fill: %s", self.symbol, e, exc_info=True)
+                logger.warning("[%s] open_order: error confirmando fill: %s", self.symbol, e)
         else:
             logger.warning("[%s] open_order: fill no confirmado tras %d intentos — usando ref_price=%.4f",
                            self.symbol, _FILL_RETRIES, ref_price)
 
+        # ── Re-escalar SL/TP al precio real de fill ────────────────────
         sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, filled_price, ref_price)
 
         tp3_raw = float(signal.get("tp3") or 0)
@@ -1075,6 +806,7 @@ class FuturesTrader:
             else:
                 tp3_px = tp3_raw
 
+        # ── Actualizar estado interno ──────────────────────────────
         self.position    = "long" if is_long else "short"
         self.entry_price = filled_price
         self.sl          = sl_px  if sl_px  > 0 else None
@@ -1087,39 +819,37 @@ class FuturesTrader:
         self._protection_ok = False
         self._tp1_be_done   = False
 
-        # ── FIX v27: is_buy para órdenes de cierre = not is_long ──────────────
-        # LONG abierto → SL/TP cierran vendiendo → is_buy=False (not is_long)
-        # SHORT abierto → SL/TP cierran comprando → is_buy=True (not is_long)
-        close_side = not is_long
-
+        # ── Colocar SL ────────────────────────────────────────────
         if sl_px and sl_px > 0:
             try:
                 sl_result = await asyncio.to_thread(
                     hl.place_sl,
-                    close_side,     # is_buy: bool (opuesto a la posición)
+                    not is_buy,
                     qty,
-                    sl_px,          # sl_price
-                    filled_price,   # entry_price (opcional, para validación)
+                    sl_px,
+                    filled_price,
                 )
                 logger.info("[%s] SL colocado en %.4f: %s", self.symbol, sl_px, sl_result)
                 self._protection_ok = True
             except Exception as e:
-                logger.error("[%s] open_order: error colocando SL: %s", self.symbol, e, exc_info=True)
+                logger.error("[%s] open_order: error colocando SL: %s", self.symbol, e)
 
+        # ── Colocar TP1 ──────────────────────────────────────────
         if tp1_px and tp1_px > 0:
             try:
                 tp_result = await asyncio.to_thread(
                     hl.place_tp,
-                    close_side,     # is_buy: bool (opuesto a la posición)
+                    not is_buy,
                     qty,
-                    tp1_px,         # tp_price
-                    None,           # limit_price (None = buffer automático)
-                    filled_price,   # entry_price (opcional, para validación)
+                    tp1_px,
+                    None,
+                    filled_price,
                 )
                 logger.info("[%s] TP1 colocado en %.4f: %s", self.symbol, tp1_px, tp_result)
             except Exception as e:
-                logger.error("[%s] open_order: error colocando TP1: %s", self.symbol, e, exc_info=True)
+                logger.error("[%s] open_order: error colocando TP1: %s", self.symbol, e)
 
+        # ── Persistir estado ────────────────────────────────────
         try:
             save_position(self.symbol, {
                 "side":        self.position,
@@ -1134,7 +864,7 @@ class FuturesTrader:
                 "qty":         self._open_qty,
             })
         except Exception as e:
-            logger.warning("[%s] open_order: no se pudo persistir estado: %s", self.symbol, e, exc_info=True)
+            logger.warning("[%s] open_order: no se pudo persistir estado: %s", self.symbol, e)
 
         logger.info(
             "[%s] ✅ Posición abierta: %s @ %.4f | SL=%.4f | TP1=%.4f | Kelly=%.2fx",
@@ -1143,7 +873,7 @@ class FuturesTrader:
             self.entry_price,
             self.sl or 0,
             self.tp1 or 0,
-            kelly_mult,
+            kelly_mult if 'kelly_mult' in dir() else 1.0,
         )
 
 

@@ -29,19 +29,14 @@ def macd(closes, fast=12, slow=26, signal=9):
         return 0.0, 0.0, 0.0
     ema_fast = ema(closes, fast)
     ema_slow = ema(closes, slow)
-    # ema_fast tiene (slow - fast) elementos más que ema_slow.
-    # Recortamos el inicio de ema_fast para que ambas listas
-    # correspondan a las mismas velas (alineación temporal correcta).
-    offset = len(ema_fast) - len(ema_slow)
-    macd_line = [ema_fast[offset + i] - ema_slow[i] for i in range(len(ema_slow))]
+    min_len = min(len(ema_fast), len(ema_slow))
+    macd_line = [ema_fast[-(min_len-i)] - ema_slow[-(min_len-i)] for i in range(min_len)]
     signal_line = ema(macd_line, signal)
     if not signal_line:
         return 0.0, 0.0, 0.0
-    # Alinear macd_line con signal_line (signal_line es más corta)
-    sig_offset = len(macd_line) - len(signal_line)
-    m = round(macd_line[sig_offset + len(signal_line) - 1], 8)
-    s = round(signal_line[-1], 8)
-    return m, s, round(m - s, 8)
+    m = round(macd_line[-1], 6)
+    s = round(signal_line[-1], 6)
+    return m, s, round(m - s, 6)
 
 def atr(highs, lows, closes, period=14):
     trs = []
@@ -66,50 +61,24 @@ def supertrend(highs, lows, closes, period=10, factor=3.0):
         atr_vals.append(tr)
     if len(atr_vals) < period:
         return 1, closes[-1]
-    smoothed = [sum(atr_vals[:period]) / period]
+    smoothed = [sum(atr_vals[:period])/period]
     for v in atr_vals[period:]:
-        smoothed.append((smoothed[-1] * (period - 1) + v) / period)
-
+        smoothed.append((smoothed[-1]*(period-1)+v)/period)
     direction = 1
-    prev_upper = None
-    prev_lower = None
     st = closes[-1]
-
     for i in range(len(smoothed)):
         idx = i + period
         if idx >= len(closes):
             break
         mid = (highs[idx] + lows[idx]) / 2
-        basic_upper = mid + factor * smoothed[i]
-        basic_lower = mid - factor * smoothed[i]
-
-        # Sticky bands: la banda solo se ajusta si es más favorable que la anterior
-        if prev_upper is None or basic_upper < prev_upper or closes[idx - 1] > prev_upper:
-            upper = basic_upper
-        else:
-            upper = prev_upper
-
-        if prev_lower is None or basic_lower > prev_lower or closes[idx - 1] < prev_lower:
-            lower = basic_lower
-        else:
-            lower = prev_lower
-
-        if direction == 1:
-            if closes[idx] < lower:
-                direction = -1
-                st = upper
-            else:
-                st = lower
-        else:
-            if closes[idx] > upper:
-                direction = 1
-                st = lower
-            else:
-                st = upper
-
-        prev_upper = upper
-        prev_lower = lower
-
+        upper = mid + factor * smoothed[i]
+        lower = mid - factor * smoothed[i]
+        if closes[idx] > upper:
+            direction = 1
+            st = lower
+        elif closes[idx] < lower:
+            direction = -1
+            st = upper
     return direction, round(st, 6)
 
 

@@ -22,26 +22,10 @@ Prioridad 5 (v21): Funding Rate Trend
   - _funding_history almacena los últimos N valores de funding por símbolo
   - _funding_trend() devuelve RISING / FALLING / NEUTRAL
   - El campo "funding_trend" se añade a cada par en el resultado de scan()
-
-FIX OHLCV (2026-06-05): filtro de liquidez OHLCV antes de activar coins
-  - _check_ohlcv_available(): petición rápida de 20 velas para verificar
-    que HL tiene datos OHLCV para el coin en el timeframe de referencia.
-  - scan(): tras calcular el top, descarta coins sin datos OHLCV en
-    paralelo (respetando OHLCV_MAX_CONCURRENCY).
-  - SCANNER_OHLCV_VERIFY=false para deshabilitar (debug).
-  - SCANNER_OHLCV_VERIFY_TF=15m para elegir el timeframe de verificación.
-  - Resultado: ningún coin sin velas llega al bot.
-
-FIX SCAN-0 (2026-06-05): _info_post con retry+backoff
-  - 3 intentos con espera 2s/5s entre reintentos.
-  - 429 y timeout se reintenta automáticamente.
-  - Log diagnóstico cuando universe sale vacío (muestra tipo y tamaño del payload).
-  - Conteo de filtros pasa de DEBUG a INFO para visibilidad en Railway.
 """
 import logging
 import asyncio
 import os
-import time
 import aiohttp
 import json as _json
 from collections import defaultdict
@@ -70,24 +54,8 @@ _MIN_VOLUME     = float(os.getenv("SCANNER_MIN_VOLUME",          "500000"))
 _MIN_CHANGE_PCT = float(os.getenv("SCANNER_MIN_CHANGE",          "0.3"))
 _MIN_LEV        = int(float(os.getenv("SCANNER_EXCLUDE_LOW_LEV", "3")))
 
-# FIX OHLCV: verificación de liquidez OHLCV antes de activar coins
-_OHLCV_VERIFY         = os.getenv("SCANNER_OHLCV_VERIFY", "true").lower() not in ("false", "0", "no")
-_OHLCV_VERIFY_TF      = os.getenv("SCANNER_OHLCV_VERIFY_TF", "15m")
-_OHLCV_MAX_CONCURRENT = int(os.getenv("OHLCV_MAX_CONCURRENCY", "5"))
-
-# Cache de coins conocidos como sin datos OHLCV para evitar re-verificar siempre
-# Se resetea cada _OHLCV_NO_DATA_RESET_S segundos
-_OHLCV_NO_DATA_CACHE: set[str] = set()
-_OHLCV_NO_DATA_RESET_S = float(os.getenv("OHLCV_NO_DATA_RESET_INTERVAL", "1800"))
-_OHLCV_NO_DATA_LAST_RESET: float = 0.0
-
-_TF_MINUTES = {
-    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
-    "1h": 60, "2h": 120, "4h": 240, "8h": 480, "1d": 1440,
-}
-
-# ── Prioridad 5: Funding trend ─────────────────────────────────────────────
-FUNDING_TREND_N: int = int(os.getenv("FUNDING_TREND_WINDOW", "3"))
+# ── Prioridad 5: Funding trend ────────────────────────────────────────────────
+_FUNDING_TREND_N: int = int(os.getenv("FUNDING_TREND_WINDOW", "3"))
 _funding_history: dict[str, list[float]] = defaultdict(list)
 
 
@@ -101,153 +69,23 @@ def _funding_trend(symbol: str, current: float) -> str:
     """
     hist = _funding_history[symbol]
     hist.append(current)
-    if len(hist) > FUNDING_TREND_N:
+    if len(hist) > _FUNDING_TREND_N:
         hist.pop(0)
     if len(hist) < 2:
         return "NEUTRAL"
     return "RISING" if hist[-1] > hist[0] else "FALLING"
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-# FIX SCAN-0: retry con backoff para absorber 429 y timeouts transitorios
-_INFO_POST_RETRIES = int(os.getenv("SCANNER_INFO_RETRIES", "3"))
-_INFO_POST_RETRY_DELAYS = [2.0, 5.0, 10.0]  # segundos entre reintentos
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 async def _info_post(payload: dict) -> dict:
-    """POST a /info con hasta _INFO_POST_RETRIES intentos y backoff exponencial."""
-    last_exc: Exception | None = None
-    for attempt in range(_INFO_POST_RETRIES):
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    f"{_API_URL}/info",
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as r:
-                    if r.status == 429:
-                        wait = _INFO_POST_RETRY_DELAYS[min(attempt, len(_INFO_POST_RETRY_DELAYS) - 1)]
-                        logger.warning(
-                            "[PairScanner] _info_post 429 rate-limit (intento %d/%d) — esperando %.0fs",
-                            attempt + 1, _INFO_POST_RETRIES, wait,
-                        )
-                        await asyncio.sleep(wait)
-                        last_exc = aiohttp.ClientResponseError(
-                            r.request_info, r.history, status=429
-                        )
-                        continue
-                    if r.status >= 500:
-                        body = await r.text()
-                        wait = _INFO_POST_RETRY_DELAYS[min(attempt, len(_INFO_POST_RETRY_DELAYS) - 1)]
-                        logger.warning(
-                            "[PairScanner] _info_post HTTP %d (intento %d/%d) — esperando %.0fs | body=%s",
-                            r.status, attempt + 1, _INFO_POST_RETRIES, wait, body[:200],
-                        )
-                        await asyncio.sleep(wait)
-                        last_exc = aiohttp.ClientResponseError(
-                            r.request_info, r.history, status=r.status
-                        )
-                        continue
-                    return _json.loads(await r.text())
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            wait = _INFO_POST_RETRY_DELAYS[min(attempt, len(_INFO_POST_RETRY_DELAYS) - 1)]
-            logger.warning(
-                "[PairScanner] _info_post error (intento %d/%d): %s — esperando %.0fs",
-                attempt + 1, _INFO_POST_RETRIES, exc, wait,
-            )
-            last_exc = exc
-            if attempt < _INFO_POST_RETRIES - 1:
-                await asyncio.sleep(wait)
-
-    raise last_exc or RuntimeError("_info_post: todos los reintentos fallaron")
-
-
-async def _check_ohlcv_available(
-    session: aiohttp.ClientSession,
-    coin: str,
-    timeframe: str = "15m",
-    n_bars: int = 20,
-) -> bool:
-    """
-    Verifica rápidamente si HL tiene datos OHLCV para el coin.
-    Hace una sola petición candleSnapshot con 20 barras.
-    Devuelve True si hay al menos 1 vela, False en caso contrario.
-    """
-    interval_min = _TF_MINUTES.get(timeframe, 15)
-    end_ms   = int(time.time() * 1000)
-    start_ms = end_ms - (n_bars * interval_min * 60 * 1000)
-
-    try:
-        async with session.post(
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
             f"{_API_URL}/info",
-            json={
-                "type": "candleSnapshot",
-                "req": {
-                    "coin":      coin,
-                    "interval":  timeframe,
-                    "startTime": start_ms,
-                    "endTime":   end_ms,
-                },
-            },
+            json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            raw = _json.loads(await resp.text())
-            return isinstance(raw, list) and len(raw) > 0
-    except Exception:
-        return False
-
-
-async def _verify_ohlcv_batch(coins: list[str], timeframe: str) -> tuple[list[str], list[str]]:
-    """
-    Verifica en paralelo qué coins tienen datos OHLCV disponibles.
-    Respeta OHLCV_MAX_CONCURRENCY para no saturar la API.
-
-    Returns:
-        (valid_coins, invalid_coins)
-    """
-    global _OHLCV_NO_DATA_CACHE, _OHLCV_NO_DATA_LAST_RESET
-
-    # Reset periódico del cache de coins sin datos
-    now = time.monotonic()
-    if now - _OHLCV_NO_DATA_LAST_RESET > _OHLCV_NO_DATA_RESET_S:
-        if _OHLCV_NO_DATA_CACHE:
-            logger.info(
-                "[PairScanner] Reset cache OHLCV sin datos (interval=%.0fs): %s",
-                _OHLCV_NO_DATA_RESET_S,
-                ", ".join(sorted(_OHLCV_NO_DATA_CACHE)),
-            )
-        _OHLCV_NO_DATA_CACHE = set()
-        _OHLCV_NO_DATA_LAST_RESET = now
-
-    # Separar coins ya conocidas como inválidas (no re-verificar)
-    to_verify = [c for c in coins if c not in _OHLCV_NO_DATA_CACHE]
-    already_invalid = [c for c in coins if c in _OHLCV_NO_DATA_CACHE]
-
-    if not to_verify:
-        return [], already_invalid
-
-    sem = asyncio.Semaphore(_OHLCV_MAX_CONCURRENT)
-    valid: list[str]   = []
-    invalid: list[str] = list(already_invalid)
-
-    async def _check_one(coin: str) -> tuple[str, bool]:
-        async with sem:
-            async with aiohttp.ClientSession() as session:
-                ok = await _check_ohlcv_available(session, coin, timeframe)
-                return coin, ok
-
-    results = await asyncio.gather(*[_check_one(c) for c in to_verify])
-
-    for coin, ok in results:
-        if ok:
-            valid.append(coin)
-        else:
-            invalid.append(coin)
-            _OHLCV_NO_DATA_CACHE.add(coin)
-
-    return valid, invalid
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            return _json.loads(await r.text())
 
 
 class PairScanner:
@@ -276,12 +114,10 @@ class PairScanner:
 
         logger.info(
             "[PairScanner] Config: top_n=%d | refresh=%dmin | "
-            "min_vol=$%s | min_change=%.1f%% | min_lev=%dx | funding_trend_n=%d | "
-            "ohlcv_verify=%s (tf=%s)",
+            "min_vol=$%s | min_change=%.1f%% | min_lev=%dx | funding_trend_n=%d",
             self.top_n, self.refresh_interval // 60,
             f"{self.min_volume_usdt:,.0f}", self.min_price_change_pct,
-            _MIN_LEV, FUNDING_TREND_N,
-            _OHLCV_VERIFY, _OHLCV_VERIFY_TF,
+            _MIN_LEV, _FUNDING_TREND_N,
         )
 
     def _is_valid(self, coin: str) -> bool:
@@ -325,30 +161,11 @@ class PairScanner:
         try:
             data = await _info_post({"type": "metaAndAssetCtxs"})
         except Exception as e:
-            logger.error("[PairScanner] Error fetching metaAndAssetCtxs tras reintentos: %s", e)
+            logger.error("[PairScanner] Error fetching metaAndAssetCtxs: %s", e)
             return []
 
-        # ── Diagnóstico: loguear si el payload no tiene la forma esperada ──────
-        if not isinstance(data, list) or len(data) < 2:
-            logger.error(
-                "[PairScanner] ❌ metaAndAssetCtxs devolvió formato inesperado: "
-                "type=%s len=%s preview=%s",
-                type(data).__name__,
-                len(data) if isinstance(data, (list, dict)) else "N/A",
-                str(data)[:300],
-            )
-            return []
-
-        universe = data[0].get("universe", []) if isinstance(data[0], dict) else []
-        ctxs     = data[1] if isinstance(data[1], list) else []
-
-        if not universe:
-            logger.error(
-                "[PairScanner] ❌ universe vacío — data[0] keys=%s",
-                list(data[0].keys()) if isinstance(data[0], dict) else type(data[0]).__name__,
-            )
-            return []
-        # ──────────────────────────────────────────────────────────────────────
+        universe = data[0].get("universe", []) if isinstance(data, list) and data else []
+        ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
 
         total_seen        = 0
         skipped_blacklist = 0
@@ -421,22 +238,12 @@ class PairScanner:
                 "ai_delta":      0.0,
             })
 
-        # FIX SCAN-0: cambiar DEBUG → INFO para visibilidad en Railway
-        logger.info(
-            "[PairScanner] scan: universe=%d | válidos=%d | blacklist=%d | lev=%d | vol=%d | change=%d | passed=%d",
-            len(universe), total_seen, skipped_blacklist, skipped_lev,
-            skipped_volume, skipped_change, len(scored),
+        logger.debug(
+            "[PairScanner] scan: total=%d | blacklist=%d | lev=%d | vol=%d | change=%d | passed=%d",
+            total_seen, skipped_blacklist, skipped_lev, skipped_volume, skipped_change, len(scored),
         )
 
-        if not scored:
-            logger.warning(
-                "[PairScanner] ⚠️ 0 pares tras filtros — "
-                "considera bajar SCANNER_MIN_VOLUME (actual=%.0f) o SCANNER_MIN_CHANGE (actual=%.2f%%)",
-                self.min_volume_usdt, self.min_price_change_pct,
-            )
-            return []
-
-        # ── Filtro IA de noticias ────────────────────────────────────────────────
+        # ── Filtro IA de noticias ──────────────────────────────────────────────
         if _AI_NEWS_FILTER and scored:
             try:
                 from bot.ai_filter import news_score_adjustment
@@ -458,48 +265,10 @@ class PairScanner:
                 )
             except Exception as e:
                 logger.warning("[PairScanner] Error filtro IA — scores sin modificar: %s", e)
-        # ─────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────────────
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         top = scored[:self.top_n]
-
-        # ── FIX OHLCV: verificar liquidez de velas antes de activar ───────────
-        if _OHLCV_VERIFY and top:
-            top_coins = [p["symbol"] for p in top]
-            valid_coins, invalid_coins = await _verify_ohlcv_batch(top_coins, _OHLCV_VERIFY_TF)
-
-            if invalid_coins:
-                logger.warning(
-                    "[PairScanner] ⚠️ %d coin(s) sin datos OHLCV en HL — excluidos: %s",
-                    len(invalid_coins), ", ".join(sorted(invalid_coins)),
-                )
-                # Filtrar top para excluir coins sin datos
-                valid_set = set(valid_coins)
-                top = [p for p in top if p["symbol"] in valid_set]
-
-                # Rellenar con los siguientes del ranking si hay hueco
-                remaining = [p for p in scored[self.top_n:] if p["symbol"] not in valid_set]
-                if remaining:
-                    extra_coins = [p["symbol"] for p in remaining]
-                    extra_valid, extra_invalid = await _verify_ohlcv_batch(extra_coins, _OHLCV_VERIFY_TF)
-                    if extra_invalid:
-                        logger.debug(
-                            "[PairScanner] Candidatos de relleno también sin OHLCV: %s",
-                            ", ".join(sorted(extra_invalid)),
-                        )
-                    extra_valid_set = set(extra_valid)
-                    for p in remaining:
-                        if len(top) >= self.top_n:
-                            break
-                        if p["symbol"] in extra_valid_set:
-                            top.append(p)
-
-            logger.info(
-                "[PairScanner] Verificación OHLCV: %d/%d coins con datos (tf=%s)",
-                len(top), len(top_coins), _OHLCV_VERIFY_TF,
-            )
-        # ───────────────────────────────────────────────────────────
-
         self._last_scored = top
 
         logger.info("🏆 Top %d pares seleccionados:", len(top))

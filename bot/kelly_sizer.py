@@ -86,12 +86,9 @@ def kelly_multiplier(entry_mode: str, rr: float) -> float:
         f_full = (p * b - q) / b
         f = f_full * KELLY_FRACTION
 
-        # Edge negativo → sizing mínimo defensivo directamente
-        if f_full <= 0:
-            mult = KELLY_MIN_MULT
-        else:
-            mult = 1.0 + f
-            mult = max(KELLY_MIN_MULT, min(KELLY_MAX_MULT, mult))
+        # f negativo → edge negativo para este modo → usar mínimo
+        mult = 1.0 + f
+        mult = max(KELLY_MIN_MULT, min(KELLY_MAX_MULT, mult))
 
         log.info(
             "[kelly] %s: p=%.2f b=%.2f f_full=%.3f f=%.3f → mult=%.2f",

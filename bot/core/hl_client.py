@@ -36,145 +36,6 @@ FIX CRÍTICO (2026-06-01):
 FIX float_to_wire rounding (2026-06-02):
   place_sl / place_tp redondean sz a szDecimals antes de pasarlo al SDK.
 
-FIX duplicate nonce (2026-06-05):
-  CAUSA RAÍZ de 'Invalid nonce: duplicate nonce XXXXXXXXXX':
-  El SDK genera el nonce con time.time_ns() // 1_000_000 (precisión ms).
-  Cuando dos llamadas de escritura (update_leverage, order, cancel...)
-  se despachan desde asyncio.to_thread() con <1ms de diferencia, el
-  OS puede asignarles el mismo timestamp — colisión garantizada.
-  Fix:
-    - _EXCHANGE_LOCK: threading.Lock global.
-    - Todas las llamadas de escritura adquieren el lock ANTES de llamar al SDK.
-    - El lock es threading.Lock (no asyncio.Lock) porque las llamadas
-      ocurren dentro de asyncio.to_thread() — en hilos del OS.
-    - Tras el lock se añade un sleep mínimo de _NONCE_MIN_DELAY_MS (50ms).
-
-FIX 429 en update_leverage (2026-06-05 v7):
-  _NONCE_MIN_DELAY_MS: 2ms → 50ms. _exchange_call con retry backoff en 429.
-
-FIX get_positions / get_balance_usdc (2026-06-05):
-  isinstance check para manejar dict y list en user_state().
-
-FIX 429 en _info calls + get_ohlcv endTime vela abierta (2026-06-05 v14):
-  _INFO_SEMAPHORE threading (concurrencia=3). end_ts retrocede 2 intervalos.
-
-FIX caché compartido user_state (2026-06-05 v15):
-  _get_user_state_cached() con TTL=5s compartido entre todos los traders.
-
-FIX round_px tick alignment + triggerPx float (2026-06-05 v16):
-  math.floor(price/tick+0.5)*tick. trigger_px como float.
-
-FIX SyntaxError _warm_cache (2026-06-05 v17):
-  Completar línea truncada en _warm_cache.
-
-FIX get_positions usa caché compartida (2026-06-05 v20):
-  get_positions() usa _get_user_state_cached() en vez de _info_call().
-
-FIX double-checked locking en _get_user_state_cached (2026-06-05 v21):
-  CAUSA RAÍZ de 429 persistentes con caché ya implementado:
-  El caché vacío + 20 traders simultáneos → todos leen _user_state_cache=None
-  ANTES de que ninguno actualice → 20 user_state() concurrentes → 429.
-
-  Fix: patrón double-checked locking:
-    1. Lectura rápida sin lock (fast path — caso normal, caché caliente)
-    2. Si miss → adquirir lock → re-verificar caché dentro del lock
-    3. Solo si sigue siendo miss → hacer el fetch real a HL
-    4. Actualizar caché dentro del lock
-  Resultado: con 20 traders, solo 1 thread hace el fetch real.
-  Los otros 19 esperan el lock y al adquirirlo encuentran caché fresco.
-
-FIX _build_exchange/info_with_retry reintentos insuficientes (2026-06-05 v22):
-  retries 3 → 8, delay inicial 2s → 5s. Ventana total ~155s.
-
-FIX monkey-patch requests.Session para retry 429 interno al SDK (2026-06-05 v23):
-  CAUSA RAÍZ confirmada: Exchange.__init__() del SDK llama internamente a
-  spotMeta via requests. Esa llamada HTTP ocurre DENTRO del constructor y
-  no pasa por nuestros wrappers (_exchange_call / _info_call). Por eso
-  _build_exchange_with_retry reintentaba el constructor entero pero cada
-  intento fallaba inmediatamente — el 429 lo lanzaba requests dentro del SDK,
-  no nuestro código.
-
-  Fix: _install_requests_retry_patch() instala un monkey-patch en
-  requests.Session.send() ANTES de instanciar Exchange o Info. El patch:
-    - Intercepta toda respuesta HTTP con status 429 o 503.
-    - Aplica backoff exponencial con jitter: 2s, 4s, 8s, ... cap 60s.
-    - Número de reintentos configurable vía HL_HTTP_RETRY_ON_429 (default 8).
-    - Se instala una sola vez (flag _REQUESTS_PATCH_INSTALLED).
-    - Llama al send() original en cada reintento para no romper la sesión.
-    - Loguea cada reintento con nivel WARNING.
-
-  Resultado: cualquier llamada HTTP del SDK (Exchange.__init__, Info.__init__,
-  user_state, meta, candles...) que reciba 429 se reintenta automáticamente
-  sin que nuestro código tenga que envolverla explícitamente.
-
-FIX backoff fuera del semáforo en _info_call + _get_user_state_cached (2026-06-05 v24):
-  CAUSA RAÍZ de get_price() timeout (10.0s) en cascada:
-  El time.sleep(delay) del backoff en 429 ocurría DENTRO del bloque
-  «with _INFO_SEMAPHORE», manteniendo ocupada una ranura del semáforo
-  durante todo el tiempo de espera (hasta 19s en intento 4).
-  Con semáforo de concurrencia=3, basta que 3 threads estén en backoff
-  para que TODO el resto (incluido get_price → all_mids) se bloquee
-  esperando una ranura libre → avalancha de timeout 10s en todos los traders.
-
-  Fix:
-    - _info_call: capturar la excepción, LIBERAR el semáforo (salir del with),
-      y LUEGO hacer time.sleep(delay) fuera del semáforo.
-    - _get_user_state_cached: mismo patrón — liberar _USER_STATE_LOCK e
-      _INFO_SEMAPHORE antes de dormir en backoff.
-  Resultado: el backoff no bloquea ranuras del semáforo. Otros traders
-  pueden seguir llamando a get_price/all_mids mientras se espera el retry.
-
-FIX RAÍZ asyncio.Semaphore para _info_call (2026-06-05 v25):
-  CAUSA RAÍZ REAL confirmada: el monkey-patch en requests.Session.send()
-  hace time.sleep() DENTRO del hilo que ejecuta la llamada HTTP. Ese hilo
-  es el mismo que tiene adquirida la ranura del threading.Semaphore porque
-  asyncio.to_thread() despacha toda la llamada (incluyendo reintentos del
-  patch) en UN SOLO hilo OS. Aunque v24 liberó el semáforo «después» de la
-  excepción, el patch reintenta ANTES de lanzar cualquier excepción — el
-  sleep ocurre DENTRO del with _INFO_SEMAPHORE, bloqueando la ranura.
-
-  Fix definitivo:
-    - _INFO_SEMAPHORE: threading.Semaphore → asyncio.Semaphore (nivel asyncio).
-    - _info_call_async(): nueva corrutina que adquiere el asyncio.Semaphore
-      SOLO mientras dura la llamada HTTP real (sin incluir el sleep del patch).
-      El sleep del patch ocurre en el hilo del OS con el semáforo YA liberado.
-    - _info_call(): wrapper síncrono que usa asyncio.get_event_loop().run_until_complete()
-      cuando hay un event loop activo, o asyncio.run() en caso contrario.
-    - Backoff a nivel asyncio con asyncio.sleep() (no bloquea el event loop).
-    - _get_user_state_cached_async(): misma refactorización para user_state.
-    - Concurrencia default aumentada: 3 → 6 (más margen con semáforo limpio).
-
-  Resultado: con 20 traders, los sleeps del backoff 429 nunca bloquean
-  ranuras del semáforo. get_price/all_mids siempre tienen ranuras disponibles.
-
-FIX get_ohlcv usa OHLCVCache + _USER_STATE_LOCK → asyncio.Lock (2026-06-05 v26):
-  CAUSA RAÍZ de 'sin datos tras 3 intentos' en cascada:
-  HLClient.get_ohlcv() llamaba _info_call(candles_snapshot) directamente,
-  ignorando por completo el OHLCVCache que ya existe en ohlcv_cache.py.
-  Con 20 traders × 3 TF = hasta 60 requests OHLCV simultáneas → HL
-  devuelve [] silenciosamente o con 429.
-
-  Fix A — get_ohlcv() enruta por OHLCVCache:
-    - get_ohlcv() es ahora async y llama ohlcv_cache.get().
-    - El semáforo _HL_OHLCV_SEMAPHORE (concurrencia=5) del OHLCVCache
-      throttlea los fetches reales automáticamente.
-    - TTL por timeframe: 15m→12s, 1h→60s, 4h→180s.
-      Con 20 traders los fetches reales bajan de ~300/ciclo a ~20/ciclo.
-
-  Fix B — _USER_STATE_LOCK threading.Lock → asyncio.Lock:
-    threading.Lock.acquire() bloquea el hilo OS del event loop cuando se
-    llama desde una corrutina asyncio. Con 20 traders esperando el lock,
-    el event loop se congela durante el tiempo del fetch real (hasta 10s).
-    Fix: _USER_STATE_LOCK = asyncio.Lock()
-    _get_user_state_cached_async usa 'async with _USER_STATE_LOCK'.
-
-  Fix C — sem fuera del async with lock en _get_user_state_cached_async:
-    El asyncio.Semaphore se adquiría DENTRO del async with _USER_STATE_LOCK.
-    Si el semáforo estaba agotado, el lock quedaba retenido bloqueando a
-    todos los traders que intentaban verificar el caché.
-    Fix: adquirir lock → verificar caché → liberar lock → adquirir sem →
-    fetch → adquirir lock → escribir caché → liberar lock.
-
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -193,17 +54,12 @@ import asyncio
 import logging
 import math
 import os
-import random
-import threading
 import time
 from typing import Optional
 
-import requests
 from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
-
-from bot.ohlcv_cache import ohlcv_cache
 
 logger = logging.getLogger("HLClient")
 
@@ -216,104 +72,6 @@ _BASE_URL = (
 
 _MARKET_SLIPPAGE = 0.03
 _TP_LIMIT_BUFFER = 0.001
-
-# Delay mínimo entre llamadas de escritura consecutivas al Exchange.
-_NONCE_MIN_DELAY_MS = float(os.getenv("HL_NONCE_MIN_DELAY_MS", "50")) / 1000.0
-
-# Reintentos automáticos en _exchange_call / _info_call cuando HL responde 429.
-_EXCHANGE_RETRIES     = int(float(os.getenv("HL_EXCHANGE_RETRIES", "3")))
-_EXCHANGE_RETRY_DELAY = float(os.getenv("HL_EXCHANGE_RETRY_DELAY_S", "2.0"))
-
-# Reintentos para la inicialización del SDK (Exchange.__init__ / Info.__init__).
-_SDK_INIT_RETRIES = int(float(os.getenv("HL_SDK_INIT_RETRIES", "8")))
-_SDK_INIT_DELAY_S = float(os.getenv("HL_SDK_INIT_DELAY_S", "5.0"))
-
-# ── Monkey-patch requests.Session para retry 429/503 a nivel HTTP ────────────
-_HTTP_RETRY_ON_429    = int(float(os.getenv("HL_HTTP_RETRY_ON_429", "8")))
-_HTTP_RETRY_DELAY_S   = float(os.getenv("HL_HTTP_RETRY_DELAY_S", "2.0"))
-_REQUESTS_PATCH_LOCK  = threading.Lock()
-_REQUESTS_PATCH_INSTALLED = False
-
-
-def _install_requests_retry_patch() -> None:
-    global _REQUESTS_PATCH_INSTALLED
-    with _REQUESTS_PATCH_LOCK:
-        if _REQUESTS_PATCH_INSTALLED:
-            return
-        _original_send = requests.Session.send
-
-        def _patched_send(self, request, **kwargs):
-            retries = _HTTP_RETRY_ON_429
-            delay   = _HTTP_RETRY_DELAY_S
-            for attempt in range(retries + 1):
-                response = _original_send(self, request, **kwargs)
-                if response.status_code in (429, 503) and attempt < retries:
-                    jitter  = random.uniform(0.0, delay * 0.25)
-                    sleep_s = min(delay + jitter, 60.0)
-                    logger.warning(
-                        "[HTTPPatch] %d en %s (intento %d/%d) — reintentando en %.1fs",
-                        response.status_code,
-                        request.url,
-                        attempt + 1,
-                        retries,
-                        sleep_s,
-                    )
-                    time.sleep(sleep_s)
-                    delay = min(delay * 2, 60.0)
-                    continue
-                return response
-            return response
-
-        requests.Session.send = _patched_send
-        _REQUESTS_PATCH_INSTALLED = True
-        logger.info(
-            "[HTTPPatch] requests.Session.send parchado — retry automático en 429/503 "
-            "(max %d reintentos, delay inicial %.1fs)",
-            _HTTP_RETRY_ON_429,
-            _HTTP_RETRY_DELAY_S,
-        )
-
-
-_install_requests_retry_patch()
-
-# Lock global de escritura al Exchange (threading porque va en to_thread).
-_EXCHANGE_LOCK = threading.Lock()
-
-# ── Semáforo ASYNCIO para llamadas de LECTURA a _info ───────────────────────
-_HL_INFO_CONCURRENCY = int(os.getenv("HL_INFO_CONCURRENCY", "6"))
-_INFO_SEMAPHORE: asyncio.Semaphore | None = None
-_INFO_SEMAPHORE_LOCK = threading.Lock()
-
-
-def _get_info_semaphore() -> asyncio.Semaphore:
-    global _INFO_SEMAPHORE
-    if _INFO_SEMAPHORE is None:
-        with _INFO_SEMAPHORE_LOCK:
-            if _INFO_SEMAPHORE is None:
-                _INFO_SEMAPHORE = asyncio.Semaphore(_HL_INFO_CONCURRENCY)
-    return _INFO_SEMAPHORE
-
-
-# ── Caché compartido de user_state ───────────────────────────────────────────
-# FIX v26: _USER_STATE_LOCK threading.Lock → asyncio.Lock
-# threading.Lock.acquire() desde una corrutina bloquea el hilo OS del event
-# loop. Con 20 traders esperando, el loop se congela hasta 10s por fetch.
-_USER_STATE_CACHE_TTL = float(os.getenv("HL_USER_STATE_CACHE_TTL_S", "5.0"))
-# Lock creado en primera llamada async (necesita event loop activo).
-_USER_STATE_LOCK: asyncio.Lock | None = None
-_USER_STATE_LOCK_MUTEX = threading.Lock()   # solo para la creación lazy del Lock
-_user_state_cache: dict | list | None = None
-_user_state_cache_ts: float = 0.0
-
-
-def _get_user_state_lock() -> asyncio.Lock:
-    global _USER_STATE_LOCK
-    if _USER_STATE_LOCK is None:
-        with _USER_STATE_LOCK_MUTEX:
-            if _USER_STATE_LOCK is None:
-                _USER_STATE_LOCK = asyncio.Lock()
-    return _USER_STATE_LOCK
-
 
 POST_FILL_CONFIRM_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
 POST_FILL_CONFIRM_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
@@ -339,165 +97,24 @@ def _round_sz(sz: float, sz_decimals: int) -> float:
     return math.floor(sz * factor) / factor
 
 
-def _is_429(exc: Exception) -> bool:
-    err = str(exc)
-    if "429" in err:
-        return True
-    if exc.args and isinstance(exc.args[0], int) and exc.args[0] == 429:
-        return True
-    return False
-
-
-def _exchange_call(fn, *args, **kwargs):
-    last_exc: Exception | None = None
-    delay = _EXCHANGE_RETRY_DELAY
-
-    for attempt in range(max(1, _EXCHANGE_RETRIES)):
-        try:
-            with _EXCHANGE_LOCK:
-                result = fn(*args, **kwargs)
-                if _NONCE_MIN_DELAY_MS > 0:
-                    time.sleep(_NONCE_MIN_DELAY_MS)
-                return result
-        except Exception as exc:
-            last_exc = exc
-            if _is_429(exc) and attempt < _EXCHANGE_RETRIES - 1:
-                logger.warning(
-                    "[ExchangeCall] 429 rate-limit (intento %d/%d) — reintentando en %.1fs: %s",
-                    attempt + 1, _EXCHANGE_RETRIES, delay, exc,
-                )
-                time.sleep(delay)
-                delay = min(delay * 2, 30.0)
-            else:
-                raise
-
-    if last_exc is not None:
-        raise last_exc
-
-
-async def _info_call_async(fn, *args, **kwargs):
-    sem = _get_info_semaphore()
-    last_exc: Exception | None = None
-    delay = _EXCHANGE_RETRY_DELAY
-
-    for attempt in range(max(1, _EXCHANGE_RETRIES)):
-        try:
-            async with sem:
-                result = await asyncio.to_thread(fn, *args, **kwargs)
-            return result
-        except Exception as exc:
-            last_exc = exc
-            if _is_429(exc) and attempt < _EXCHANGE_RETRIES - 1:
-                jitter  = random.uniform(0.0, delay * 0.25)
-                sleep_s = min(delay + jitter, 30.0)
-                logger.warning(
-                    "[InfoCall] 429 rate-limit (intento %d/%d) — reintentando en %.1fs",
-                    attempt + 1, _EXCHANGE_RETRIES, sleep_s,
-                )
-                await asyncio.sleep(sleep_s)
-                delay = min(delay * 2, 30.0)
-            else:
-                raise exc
-
-    if last_exc is not None:
-        raise last_exc
-
-
-def _info_call(fn, *args, **kwargs):
-    try:
-        loop = asyncio.get_running_loop()
-        import concurrent.futures
-        fut = asyncio.run_coroutine_threadsafe(
-            _info_call_async(fn, *args, **kwargs), loop
-        )
-        return fut.result()
-    except RuntimeError:
-        return asyncio.run(_info_call_async(fn, *args, **kwargs))
-
-
-# ── _get_user_state_cached ───────────────────────────────────────────────────
-
-async def _get_user_state_cached_async(info_obj, account_addr: str):
-    """
-    FIX v26: _USER_STATE_LOCK es ahora asyncio.Lock.
-    Patrón correcto:
-      1. Fast path sin lock.
-      2. Slow path: adquirir lock → re-verificar → si sigue frío:
-         a. LIBERAR lock
-         b. Adquirir sem (puede esperar sin bloquear nadie)
-         c. Fetch real
-         d. Adquirir lock → escribir caché → liberar lock
-    Con esto el lock nunca retiene el semáforo ni viceversa.
-    """
-    global _user_state_cache, _user_state_cache_ts
-
-    # ── FAST PATH ────────────────────────────────────────────────────────────
-    now = time.monotonic()
-    if _user_state_cache is not None and (now - _user_state_cache_ts) < _USER_STATE_CACHE_TTL:
-        return _user_state_cache
-
-    lock = _get_user_state_lock()
-    sem  = _get_info_semaphore()
-
-    # ── SLOW PATH: verificar bajo lock ───────────────────────────────────────
-    async with lock:
-        now2 = time.monotonic()
-        if _user_state_cache is not None and (now2 - _user_state_cache_ts) < _USER_STATE_CACHE_TTL:
-            return _user_state_cache
-        # Caché frío — necesitamos fetch. Salimos del lock antes de adquirir sem.
-        # (El flag se setea implícitamente al salir del async with)
-
-    # ── FETCH: sem fuera del lock ─────────────────────────────────────────────
-    last_exc: Exception | None = None
-    delay = _EXCHANGE_RETRY_DELAY
-
-    for attempt in range(max(1, _EXCHANGE_RETRIES)):
-        try:
-            async with sem:
-                result = await asyncio.to_thread(info_obj.user_state, account_addr)
-
-            # Escribir caché bajo lock
-            async with lock:
-                _user_state_cache    = result
-                _user_state_cache_ts = time.monotonic()
-            return result
-
-        except Exception as exc:
-            last_exc = exc
-            if _is_429(exc) and attempt < _EXCHANGE_RETRIES - 1:
-                jitter  = random.uniform(0.0, 0.5)
-                sleep_s = min(delay + jitter, 30.0)
-                logger.warning(
-                    "[UserStateCache] 429 rate-limit (intento %d/%d) — reintentando en %.1fs",
-                    attempt + 1, _EXCHANGE_RETRIES, sleep_s,
-                )
-                await asyncio.sleep(sleep_s)
-                delay = min(delay * 2, 30.0)
-            else:
-                raise exc
-
-    if last_exc is not None:
-        raise last_exc
-
-
-def _get_user_state_cached(info_obj, account_addr: str):
-    try:
-        loop = asyncio.get_running_loop()
-        import concurrent.futures
-        fut = asyncio.run_coroutine_threadsafe(
-            _get_user_state_cached_async(info_obj, account_addr), loop
-        )
-        return fut.result()
-    except RuntimeError:
-        return asyncio.run(_get_user_state_cached_async(info_obj, account_addr))
-
-
 # ─────────────────────────────────────────────────────────────────
 # _HLCore: singleton que contiene el Exchange + Info compartidos
 # ─────────────────────────────────────────────────────────────────
 
 class _HLCore:
+    """
+    Singleton que mantiene UNA instancia de Exchange + Info.
+    Pre-carga szDecimals, pxDecimals y maxLeverage al arrancar.
+
+    IMPORTANTE: la creación debe hacerse SIEMPRE mediante get_async()
+    desde código async (dentro del event loop). Nunca llamar get()
+    directamente desde __init__ de clases que se instancian antes de
+    que asyncio.run() esté activo.
+    """
+
     _instance: "_HLCore | None" = None
+    # Lock para serializar la creación concurrente del singleton.
+    # Se inicializa lazy para evitar problemas si se importa antes de asyncio.run().
     _init_lock: "asyncio.Lock | None" = None
 
     def __init__(self) -> None:
@@ -524,9 +141,6 @@ class _HLCore:
             self.agent_mode    = False
             exchange_wallet    = wallet
             exchange_kwargs    = {}
-            logger.warning(
-                "⚠️  [HLCore] AGENTE INACTIVO — operando con master wallet directamente."
-            )
 
         self.exchange = self._build_exchange_with_retry(exchange_wallet, exchange_kwargs)
         self.info     = self._build_info_with_retry()
@@ -549,256 +163,442 @@ class _HLCore:
         )
 
     def _warm_cache(self) -> None:
+        """
+        Pre-carga szDecimals, pxDecimals, tick_size y maxLeverage.
+        NOTA: este método es síncrono y bloqueante — debe llamarse SIEMPRE
+        desde asyncio.to_thread() (via get_async()), nunca directamente
+        desde código async o desde __init__ de clases raíz.
+        """
         try:
             meta     = self.info.meta()
             universe = meta.get("universe", [])
         except Exception as exc:
-            logger.warning("[HLCore] _warm_cache meta() falló: %s", exc)
-            universe = []
+            logger.warning("[HLCore] No se pudo obtener meta para caché: %s", exc)
+            return
 
+        mid_prices: dict[str, float] = {}
         try:
-            _, ctxs = self.info.meta_and_asset_ctxs()
+            mids = self.info.all_mids()
+            mid_prices = {k: float(v) for k, v in mids.items()}
         except Exception as exc:
-            logger.warning("[HLCore] _warm_cache meta_and_asset_ctxs() falló: %s", exc)
-            ctxs = []
+            logger.debug("[HLCore] all_mids no disponible: %s", exc)
 
-        for i, asset in enumerate(universe):
-            name = asset.get("name", "")
-            if not name:
+        perp_ctx: dict[str, dict] = {}
+        try:
+            ctxs = self.info.meta_and_asset_ctxs()
+            if isinstance(ctxs, (list, tuple)) and len(ctxs) == 2:
+                ctx_list = ctxs[1]
+                for i, asset in enumerate(universe):
+                    coin = asset.get("name", "")
+                    if coin and i < len(ctx_list):
+                        perp_ctx[coin] = ctx_list[i] or {}
+        except Exception as exc:
+            logger.debug("[HLCore] meta_and_asset_ctxs no disponible: %s", exc)
+
+        for asset in universe:
+            coin = asset.get("name", "")
+            if not coin:
                 continue
-            self._sz_decimals_cache[name]  = asset.get("szDecimals", 4)
-            self._max_leverage_cache[name] = asset.get("maxLeverage", 20)
 
-            ctx = ctxs[i] if i < len(ctxs) else {}
-            raw_tick = ctx.get("minTick") if isinstance(ctx, dict) else None
-            if raw_tick is not None:
+            self._sz_decimals_cache[coin] = int(asset.get("szDecimals", 4))
+
+            raw_lev = asset.get("maxLeverage") or asset.get("leverage", {}).get("max") or 20
+            self._max_leverage_cache[coin] = int(raw_lev)
+
+            if "maxDecimals" in asset:
+                px_dec = int(asset["maxDecimals"])
+                self._px_decimals_cache[coin] = px_dec
+                self._tick_size_cache[coin]   = 10 ** (-px_dec)
+                continue
+
+            ctx = perp_ctx.get(coin, {})
+            mark_px_str = str(ctx.get("markPx") or ctx.get("mark_px") or "")
+            if mark_px_str and mark_px_str not in ("None", ""):
                 try:
-                    tick = float(raw_tick)
-                    self._tick_size_cache[name]   = tick
-                    self._px_decimals_cache[name] = _px_decimals_from_tick(tick)
-                except Exception as exc:
-                    logger.warning("[HLCore] _warm_cache tick parse falló para %s: %s", name, exc)
+                    float(mark_px_str)
+                    if "." in mark_px_str:
+                        dec_part = mark_px_str.rstrip("0").split(".")[1]
+                        px_dec   = len(dec_part) if dec_part else 0
+                    else:
+                        px_dec = 0
+                    mid = mid_prices.get(coin, 0.0)
+                    if mid < 100 and px_dec < 2:
+                        px_dec = 2
+                    if mid < 10 and px_dec < 3:
+                        px_dec = 3
+                    self._px_decimals_cache[coin] = px_dec
+                    self._tick_size_cache[coin]   = 10 ** (-px_dec)
+                    continue
+                except Exception:
+                    pass
 
-    def _build_exchange_with_retry(self, wallet, kwargs: dict) -> Exchange:
-        retries = _SDK_INIT_RETRIES
-        delay   = _SDK_INIT_DELAY_S
-        last_exc: Exception | None = None
-        for attempt in range(retries):
-            try:
-                return Exchange(wallet, _BASE_URL, **kwargs)
-            except Exception as exc:
-                last_exc = exc
-                logger.warning(
-                    "[HLCore] Exchange init intento %d/%d falló: %s — reintentando en %.1fs",
-                    attempt + 1, retries, exc, delay,
-                )
-                time.sleep(delay)
-                delay = min(delay * 2, 30.0)
-        raise RuntimeError(f"No se pudo inicializar Exchange tras {retries} intentos") from last_exc
+            mid = mid_prices.get(coin, 0.0)
+            if mid >= 10_000:
+                px_dec = 1
+            elif mid >= 1_000:
+                px_dec = 2
+            elif mid >= 100:
+                px_dec = 3
+            elif mid >= 10:
+                px_dec = 4
+            elif mid >= 1:
+                px_dec = 4
+            else:
+                px_dec = 5
 
-    def _build_info_with_retry(self) -> Info:
-        retries = _SDK_INIT_RETRIES
-        delay   = _SDK_INIT_DELAY_S
-        last_exc: Exception | None = None
-        for attempt in range(retries):
-            try:
-                return Info(_BASE_URL, skip_ws=True)
-            except Exception as exc:
-                last_exc = exc
-                logger.warning(
-                    "[HLCore] Info init intento %d/%d falló: %s — reintentando en %.1fs",
-                    attempt + 1, retries, exc, delay,
-                )
-                time.sleep(delay)
-                delay = min(delay * 2, 30.0)
-        raise RuntimeError(f"No se pudo inicializar Info tras {retries} intentos") from last_exc
+            self._px_decimals_cache[coin] = px_dec
+            self._tick_size_cache[coin]   = 10 ** (-px_dec)
 
-    @classmethod
-    async def get_async(cls) -> "_HLCore":
-        if cls._init_lock is None:
-            cls._init_lock = asyncio.Lock()
-        async with cls._init_lock:
-            if cls._instance is None:
-                cls._instance = await asyncio.to_thread(cls)
-        return cls._instance
+        logger.info(
+            "[HLCore] Caché pre-cargado: %d coins (szDecimals + pxDecimals + maxLeverage listos)",
+            len(universe),
+        )
 
+    # ── Acceso síncrono (SOLO para código que ya corre en un hilo) ────
     @classmethod
     def get(cls) -> "_HLCore":
+        """
+        Acceso SÍNCRONO al singleton. Solo usar desde:
+          - asyncio.to_thread() (ya en hilo separado)
+          - tests síncronos
+        NUNCA llamar directamente desde __init__ de clases que se crean
+        antes del event loop, ni desde corrutinas async.
+        """
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
+    # ── Acceso async (usar siempre desde código async) ────────────────
+    @classmethod
+    async def get_async(cls) -> "_HLCore":
+        """
+        FIX FREEZE: crea o devuelve el singleton de forma async-safe.
+
+        Si el singleton no existe, lo crea dentro de asyncio.to_thread()
+        para que todas las llamadas HTTP síncronas del SDK (requests)
+        no bloqueen el event loop.
+
+        El asyncio.Lock serializa creaciones concurrentes: si 7 traders
+        llaman get_async() en paralelo, solo el primero crea el singleton;
+        los demás esperan (sin bloquear el event loop) y luego reutilizan
+        la instancia ya creada.
+        """
+        # Inicializar el lock lazy (debe crearse dentro del event loop)
+        if cls._init_lock is None:
+            cls._init_lock = asyncio.Lock()
+
+        if cls._instance is not None:
+            return cls._instance
+
+        async with cls._init_lock:
+            # Double-check tras adquirir el lock
+            if cls._instance is not None:
+                return cls._instance
+            logger.info("[HLCore] Inicializando SDK en hilo separado (asyncio.to_thread)...")
+            cls._instance = await asyncio.to_thread(cls._create_sync)
+            return cls._instance
+
+    @classmethod
+    def _create_sync(cls) -> "_HLCore":
+        """Creación síncrona del singleton — solo llamar desde to_thread."""
+        return cls()
+
+    @staticmethod
+    def _build_exchange_with_retry(wallet, kwargs: dict, retries: int = 6) -> Exchange:
+        delay = 2.0
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            try:
+                return Exchange(wallet=wallet, base_url=_BASE_URL, **kwargs)
+            except Exception as exc:
+                err = str(exc)
+                if "429" in err or "ClientError" in type(exc).__name__:
+                    logger.warning(
+                        "[HLCore] Exchange init 429 (intento %d/%d) — reintentando en %.1fs",
+                        attempt + 1, retries, delay,
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30.0)
+                    last_exc = exc
+                else:
+                    raise
+        raise RuntimeError(f"[HLCore] No se pudo inicializar Exchange tras {retries} intentos") from last_exc
+
+    @staticmethod
+    def _build_info_with_retry(retries: int = 6) -> Info:
+        delay = 2.0
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            try:
+                return Info(base_url=_BASE_URL, skip_ws=True)
+            except Exception as exc:
+                err = str(exc)
+                if "429" in err or "ClientError" in type(exc).__name__:
+                    logger.warning(
+                        "[HLCore] Info init 429 (intento %d/%d) — reintentando en %.1fs",
+                        attempt + 1, retries, delay,
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30.0)
+                    last_exc = exc
+                else:
+                    raise
+        raise RuntimeError(f"[HLCore] No se pudo inicializar Info tras {retries} intentos") from last_exc
+
 
 # ─────────────────────────────────────────────────────────────────
-# HLClient: wrapper por símbolo sobre _HLCore
+# HLClient: un cliente ligero por symbol, comparte _HLCore
 # ─────────────────────────────────────────────────────────────────
 
 class HLClient:
-    def __init__(self, core: _HLCore, symbol: str) -> None:
-        self._core     = core
-        self._symbol   = symbol
-        self._coin     = _norm_coin(symbol)
-        self._info     = core.info
-        self._exchange = core.exchange
-        self._account  = core.account_addr
+    """
+    Cliente ligero por symbol. Comparte Exchange + Info via _HLCore singleton.
+
+    IMPORTANTE: usar siempre HLClient.create(symbol) (async) para instanciar.
+    El __init__ estándar requiere que _HLCore ya esté inicializado.
+    """
+
+    def __init__(self, symbol: str, core: "_HLCore | None" = None):
+        self.symbol = symbol
+        self.coin   = _norm_coin(symbol)
+        if core is None:
+            # Fallback síncrono — solo seguro si _HLCore ya fue creado antes
+            # via get_async(). Si no, lanzará una excepción clara.
+            if _HLCore._instance is None:
+                raise RuntimeError(
+                    f"[HLClient] {symbol}: _HLCore no inicializado. "
+                    "Usar HLClient.create(symbol) (async) en lugar de HLClient(symbol)."
+                )
+            core = _HLCore._instance
+        self._exchange     = core.exchange
+        self._info         = core.info
+        self._account_addr = core.account_addr
+        self._agent_addr   = core.agent_addr
+        self._agent_mode   = core.agent_mode
+        self._core         = core
 
     @classmethod
     async def create(cls, symbol: str) -> "HLClient":
+        """
+        FIX FREEZE: constructor async-safe.
+        Inicializa _HLCore (si no existe) en un hilo separado via to_thread,
+        luego crea el HLClient ligero sin ninguna llamada HTTP.
+        """
         core = await _HLCore.get_async()
-        return cls(core, symbol)
+        return cls(symbol, core=core)
 
-    # ── Propiedades de mercado ────────────────────────────────────────────────
+    # ── METADATOS ─────────────────────────────────────────────────
+
+    def _get_meta_asset(self) -> dict:
+        try:
+            meta = self._info.meta()
+            for asset in meta.get("universe", []):
+                if asset.get("name") == self.coin:
+                    return asset
+        except Exception as exc:
+            logger.warning("[%s] No se pudo obtener meta: %s", self.coin, exc)
+        return {}
 
     def get_sz_decimals(self) -> int:
-        return self._core._sz_decimals_cache.get(self._coin, 4)
+        cache = self._core._sz_decimals_cache
+        if self.coin in cache:
+            return cache[self.coin]
+        asset = self._get_meta_asset()
+        dec = int(asset.get("szDecimals", 4))
+        cache[self.coin] = dec
+        return dec
 
     def get_px_decimals(self) -> int:
-        return self._core._px_decimals_cache.get(self._coin, 4)
+        cache = self._core._px_decimals_cache
+        if self.coin in cache:
+            return cache[self.coin]
+        dec = self._infer_px_decimals_from_l2()
+        cache[self.coin] = dec
+        return dec
+
+    def _infer_px_decimals_from_l2(self) -> int:
+        try:
+            l2   = self._info.l2_snapshot(self.coin)
+            bids = l2.get("levels", [[], []])[0]
+            asks = l2.get("levels", [[], []])[1]
+            all_px = [float(p["px"]) for p in (bids[:5] + asks[:5]) if "px" in p]
+            if len(all_px) >= 2:
+                all_px_sorted = sorted(set(all_px))
+                diffs = [
+                    abs(all_px_sorted[i+1] - all_px_sorted[i])
+                    for i in range(len(all_px_sorted) - 1)
+                    if all_px_sorted[i+1] - all_px_sorted[i] > 1e-9
+                ]
+                if diffs:
+                    tick = min(diffs)
+                    dec  = _px_decimals_from_tick(tick)
+                    self._core._tick_size_cache[self.coin] = tick
+                    logger.debug("[%s] pxDecimals=%d (tick=%.8f desde L2)", self.coin, dec, tick)
+                    return dec
+            if all_px:
+                px_str = str(bids[0]["px"]) if bids else str(asks[0]["px"])
+                if "." in px_str:
+                    return max(1, len(px_str.rstrip("0").split(".")[1]))
+        except Exception as exc:
+            logger.warning("[%s] No se pudo inferir pxDecimals desde L2: %s", self.coin, exc)
+        return 4
 
     def get_tick_size(self) -> float:
-        return self._core._tick_size_cache.get(self._coin, 0.0)
+        cache = self._core._tick_size_cache
+        if self.coin in cache:
+            return cache[self.coin]
+        dec  = self.get_px_decimals()
+        tick = 10 ** (-dec)
+        cache[self.coin] = tick
+        return tick
 
     def get_max_leverage(self) -> int:
-        return self._core._max_leverage_cache.get(self._coin, 20)
-
-    # ── Redondeo ──────────────────────────────────────────────────────────────
+        cache = self._core._max_leverage_cache
+        if self.coin in cache:
+            return cache[self.coin]
+        asset = self._get_meta_asset()
+        lev = int(
+            asset.get("maxLeverage")
+            or asset.get("leverage", {}).get("max")
+            or 20
+        )
+        cache[self.coin] = lev
+        return lev
 
     def round_px(self, price: float) -> float:
+        dec = self.get_px_decimals()
+        return round(price, dec)
+
+    def round_sz(self, sz: float) -> float:
+        dec = self.get_sz_decimals()
+        return _round_sz(sz, dec)
+
+    def _adjust_sl_px(self, trigger_px: float, entry_px: Optional[float], is_long: bool) -> float:
+        dec  = self.get_px_decimals()
         tick = self.get_tick_size()
-        if tick > 0:
-            return math.floor(price / tick + 0.5) * tick
-        px_dec = self.get_px_decimals()
-        factor = 10 ** px_dec
-        return math.floor(price * factor + 0.5) / factor
+        px   = round(trigger_px, dec)
 
-    def _round_qty(self, qty: float) -> float:
-        sz_dec = self.get_sz_decimals()
-        return _round_sz(qty, sz_dec)
+        if entry_px and entry_px > 0:
+            if is_long:
+                while px >= entry_px:
+                    px = round(px - tick, dec)
+            else:
+                while px <= entry_px:
+                    px = round(px + tick, dec)
 
-    # ── Estado de cuenta ──────────────────────────────────────────────────────
+        return px
 
-    def get_user_state(self) -> dict | list:
-        return _get_user_state_cached(self._info, self._account)
+    def _adjust_tp_px(self, trigger_px: float, entry_px: Optional[float], is_long: bool) -> float:
+        dec  = self.get_px_decimals()
+        tick = self.get_tick_size()
+        px   = round(trigger_px, dec)
 
-    def get_positions(self) -> list[dict]:
-        state = _get_user_state_cached(self._info, self._account)
-        if isinstance(state, dict):
-            asset_positions = state.get("assetPositions", [])
-        elif isinstance(state, list):
-            logger.warning(
-                "[HLClient] get_positions: user_state devolvió list (agente inactivo?). "
-                "Devolviendo lista vacía."
-            )
-            return []
-        else:
-            logger.warning(
-                "[HLClient] get_positions: respuesta inesperada (tipo=%s). Devolviendo [].",
-                type(state).__name__,
-            )
-            return []
-        return [p["position"] for p in asset_positions if "position" in p]
+        if entry_px and entry_px > 0:
+            if is_long:
+                while px <= entry_px:
+                    px = round(px + tick, dec)
+            else:
+                while px >= entry_px:
+                    px = round(px - tick, dec)
 
-    def get_balance_usdc(self) -> float:
-        state = _get_user_state_cached(self._info, self._account)
-        if isinstance(state, dict):
-            return float(state.get("marginSummary", {}).get("accountValue", 0.0))
-        logger.warning("[HLClient] get_balance_usdc: user_state inesperado (tipo=%s) → 0.0", type(state).__name__)
-        return 0.0
+        return px
 
-    def get_open_orders(self) -> list[dict]:
-        return _info_call(self._info.open_orders, self._account) or []
+    # ── ÓRDENES BÁSICAS ─────────────────────────────────────────────
 
-    def get_frontend_open_orders(self) -> list[dict]:
-        try:
-            return _info_call(self._info.frontend_open_orders, self._account) or []
-        except Exception as exc:
-            logger.warning("[HLClient] get_frontend_open_orders falló: %s", exc)
-            return []
+    def place_limit(
+        self,
+        is_buy: bool,
+        sz: float,
+        price: float,
+        reduce_only: bool = False,
+        tif: str = "Gtc",
+    ) -> dict:
+        price = self.round_px(price)
+        sz    = self.round_sz(sz)
+        return self._exchange.order(
+            name=self.coin,
+            is_buy=is_buy,
+            sz=sz,
+            limit_px=price,
+            order_type={"limit": {"tif": tif}},
+            reduce_only=reduce_only,
+        )
 
-    async def get_ohlcv(self, interval: str = "15m", limit: int = 100) -> list:
-        """
-        FIX v26: enruta por OHLCVCache con semáforo propio (concurrencia=5).
-        TTL diferenciado: 15m→12s, 1h→60s, 4h→180s.
-        Con 20 traders los fetches reales bajan de ~300/ciclo a ~20/ciclo.
-        """
-        interval_ms = {
-            "1m": 60_000, "3m": 180_000, "5m": 300_000,
-            "15m": 900_000, "30m": 1_800_000,
-            "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
-            "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
-        }
-
-        coin  = self._coin
-        info  = self._info
-
-        async def _fetch(tf: str) -> list:
-            ms       = interval_ms.get(tf, 900_000)
-            end_ts   = int(time.time() * 1000) - 2 * ms
-            start_ts = end_ts - limit * ms
+    def place_market(
+        self,
+        is_buy: bool,
+        sz: float,
+        reduce_only: bool = False,
+        ref_price: Optional[float] = None,
+    ) -> dict:
+        sz = self.round_sz(sz)
+        if ref_price is None or ref_price <= 0:
             try:
-                candles = await _info_call_async(
-                    info.candles_snapshot, coin, tf, start_ts, end_ts
-                )
-                return candles or []
-            except Exception as exc:
-                logger.warning("[HLClient] get_ohlcv fetch %s/%s falló: %s", coin, tf, exc)
-                return []
+                l2 = self._info.l2_snapshot(self.coin)
+                best_ask = float(l2["levels"][1][0]["px"])
+                best_bid = float(l2["levels"][0][0]["px"])
+                ref_price = (best_ask + best_bid) / 2
+            except Exception:
+                ref_price = 0.0
 
-        return await ohlcv_cache.get(coin, interval, _fetch)
+        if ref_price and ref_price > 0:
+            if is_buy:
+                slippage_px = self.round_px(ref_price * (1 + _MARKET_SLIPPAGE))
+            else:
+                slippage_px = self.round_px(ref_price * (1 - _MARKET_SLIPPAGE))
+        else:
+            slippage_px = 999_999_999.0 if is_buy else 0.000001
 
-    # ── Órdenes de escritura ──────────────────────────────────────────────────
-
-    def place_limit(self, is_buy: bool, sz: float, px: float, reduce_only: bool = False) -> dict:
-        sz = self._round_qty(sz)
-        px = self.round_px(px)
-        order_type = {"limit": {"tif": "Gtc"}}
-        return _exchange_call(
-            self._exchange.order,
-            self._coin, is_buy, sz, px, order_type,
+        return self._exchange.order(
+            name=self.coin,
+            is_buy=is_buy,
+            sz=sz,
+            limit_px=slippage_px,
+            order_type={"limit": {"tif": "Ioc"}},
             reduce_only=reduce_only,
         )
 
-    def place_market(self, is_buy: bool, sz: float, reduce_only: bool = False) -> dict:
-        sz   = self._round_qty(sz)
-        mids = _info_call(self._info.all_mids)
-        mid  = float(mids.get(self._coin, 0))
-        px   = mid * (1 + _MARKET_SLIPPAGE) if is_buy else mid * (1 - _MARKET_SLIPPAGE)
-        px   = self.round_px(px)
-        order_type = {"limit": {"tif": "Ioc"}}
-        return _exchange_call(
-            self._exchange.order,
-            self._coin, is_buy, sz, px, order_type,
-            reduce_only=reduce_only,
-        )
+    # ── TRIGGER ORDERS — TP / SL ──────────────────────────────────
 
     def place_tp(
         self,
         is_buy: bool,
         sz: float,
-        tp_price: float,
-        limit_price: Optional[float],
-        entry_price: Optional[float] = None,
+        trigger_px: float,
+        limit_px:  Optional[float] = None,
+        entry_px:  Optional[float] = None,
     ) -> dict:
-        sz         = self._round_qty(sz)
-        tp_price   = float(tp_price)
-        trigger_px = self.round_px(tp_price)
+        sz         = self.round_sz(sz)
+        is_long    = not is_buy
+        trigger_px = self._adjust_tp_px(trigger_px, entry_px, is_long)
+        is_market  = limit_px is None
 
-        if limit_price is not None:
-            lim_px = self.round_px(float(limit_price))
+        if is_market:
+            effective_limit_px = trigger_px
         else:
-            buf    = _TP_LIMIT_BUFFER
-            lim_px = self.round_px(trigger_px * (1 - buf) if is_buy else trigger_px * (1 + buf))
+            if not is_buy:
+                effective_limit_px = self.round_px(trigger_px * (1 - _TP_LIMIT_BUFFER))
+            else:
+                effective_limit_px = self.round_px(trigger_px * (1 + _TP_LIMIT_BUFFER))
 
-        order_type = {
-            "trigger": {
-                "triggerPx": trigger_px,
-                "isMarket":  False,
-                "tpsl":      "tp",
-            }
-        }
-        return _exchange_call(
-            self._exchange.order,
-            self._coin, is_buy, sz, lim_px, order_type,
+        logger.debug(
+            "[%s] place_tp: is_buy=%s sz=%.6f trigger=%.6f limit=%.6f entry=%s",
+            self.coin, is_buy, sz, trigger_px, effective_limit_px,
+            f"{entry_px:.6f}" if entry_px else "N/A",
+        )
+
+        return self._exchange.order(
+            name=self.coin,
+            is_buy=is_buy,
+            sz=sz,
+            limit_px=effective_limit_px,
+            order_type={
+                "trigger": {
+                    "triggerPx": trigger_px,
+                    "isMarket":  is_market,
+                    "tpsl":      "tp",
+                }
+            },
             reduce_only=True,
         )
 
@@ -806,78 +606,100 @@ class HLClient:
         self,
         is_buy: bool,
         sz: float,
-        sl_price: float,
-        entry_price: Optional[float] = None,
+        trigger_px: float,
+        entry_px:   Optional[float] = None,
     ) -> dict:
-        sz         = self._round_qty(sz)
-        sl_price   = float(sl_price)
-        trigger_px = self.round_px(sl_price)
+        sz         = self.round_sz(sz)
+        is_long    = not is_buy
+        trigger_px = self._adjust_sl_px(trigger_px, entry_px, is_long)
 
-        order_type = {
-            "trigger": {
-                "triggerPx": trigger_px,
-                "isMarket":  True,
-                "tpsl":      "sl",
-            }
-        }
-        return _exchange_call(
-            self._exchange.order,
-            self._coin, is_buy, sz, trigger_px, order_type,
+        logger.debug(
+            "[%s] place_sl: is_buy=%s sz=%.6f trigger=%.6f entry=%s",
+            self.coin, is_buy, sz, trigger_px,
+            f"{entry_px:.6f}" if entry_px else "N/A",
+        )
+
+        return self._exchange.order(
+            name=self.coin,
+            is_buy=is_buy,
+            sz=sz,
+            limit_px=trigger_px,
+            order_type={
+                "trigger": {
+                    "triggerPx": trigger_px,
+                    "isMarket":  True,
+                    "tpsl":      "sl",
+                }
+            },
             reduce_only=True,
         )
 
     def place_bulk(self, orders: list[dict]) -> dict:
-        return _exchange_call(self._exchange.bulk_orders, orders)
+        cleaned = []
+        for o in orders:
+            o  = dict(o)
+            if "sz" in o:
+                o["sz"] = self.round_sz(float(o["sz"]))
+            ot = o.get("order_type", {})
+            if isinstance(ot, dict) and "trigger" in ot:
+                trig = dict(ot["trigger"])
+                if "triggerPx" in trig:
+                    trig["triggerPx"] = self.round_px(float(trig["triggerPx"]))
+                ot = dict(ot)
+                ot["trigger"] = trig
+                o["order_type"] = ot
+            if "limit_px" in o and o["limit_px"] is not None:
+                o["limit_px"] = self.round_px(float(o["limit_px"]))
+            cleaned.append(o)
+        return self._exchange.bulk_orders(cleaned)
 
-    def cancel_order(self, oid: int) -> dict:
-        return _exchange_call(self._exchange.cancel, self._coin, oid)
+    # ── CONSULTAS INFO ────────────────────────────────────────────────
 
-    def cancel_all_open_tpsl(self) -> None:
-        orders = self.get_frontend_open_orders()
-        coin_orders = [o for o in orders if str(o.get("coin", "")).upper() == self._coin]
-        for o in coin_orders:
-            oid = o.get("oid")
-            if oid:
-                try:
-                    _exchange_call(self._exchange.cancel, self._coin, oid)
-                except Exception as exc:
-                    logger.warning("[HLClient] cancel_all_open_tpsl: error cancelando oid=%s: %s", oid, exc)
+    def get_user_state(self) -> dict:
+        return self._info.user_state(self._account_addr)
 
-    def update_leverage(self, leverage: int, is_cross: bool = False) -> dict:
-        return _exchange_call(
-            self._exchange.update_leverage,
-            leverage, self._coin, is_cross,
-        )
+    def get_open_orders(self) -> list:
+        return self._info.open_orders(self._account_addr)
 
-    def confirm_fill(self, order_result: dict, timeout: float = POST_FILL_CONFIRM_RETRIES * POST_FILL_CONFIRM_DELAY) -> bool:
-        oid = None
-        try:
-            statuses = order_result.get("response", {}).get("data", {}).get("statuses", [])
-            for s in statuses:
-                if "resting" in s:
-                    oid = s["resting"].get("oid")
-                elif "filled" in s:
-                    return True
-        except Exception:
-            pass
+    def get_positions(self) -> list:
+        state = self.get_user_state()
+        return [
+            p for p in state.get("assetPositions", [])
+            if p.get("position", {}).get("coin") == self.coin
+               and float(p.get("position", {}).get("szi", 0)) != 0
+        ]
 
-        if oid is None:
-            return True
+    def get_balance_usdc(self) -> float:
+        state = self.get_user_state()
+        return float(state.get("crossMarginSummary", {}).get("accountValue", 0.0))
 
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                orders = self.get_open_orders()
-                oids = {o.get("oid") for o in orders}
-                if oid not in oids:
-                    return True
-            except Exception:
-                pass
-            time.sleep(POST_FILL_CONFIRM_DELAY)
+    def cancel_order(self, order_id: int) -> dict:
+        return self._exchange.cancel(self.coin, order_id)
 
-        logger.warning("[HLClient] confirm_fill: oid=%s no se llenó en %.1fs", oid, timeout)
-        return False
-
-
-# ── Alias público ──────────────────────────────────────────────────────────────
-norm_coin = _norm_coin
+    def cancel_all_open_tpsl(self) -> list[dict]:
+        orders  = self.get_open_orders()
+        results = []
+        for o in orders:
+            if o.get("coin") != self.coin:
+                continue
+            ot = o.get("orderType", "")
+            is_tpsl = False
+            if isinstance(ot, dict):
+                trigger  = ot.get("trigger", {})
+                tpsl_val = trigger.get("tpsl", "")
+                is_tpsl  = tpsl_val in ("tp", "sl")
+            elif isinstance(ot, str):
+                is_tpsl = any(
+                    kw in ot
+                    for kw in ("Trigger", "Stop", "Take Profit", "trigger", "stop", "tp", "sl")
+                )
+            if is_tpsl:
+                oid = o.get("oid")
+                if oid:
+                    r = self.cancel_order(oid)
+                    results.append(r)
+                    logger.info(
+                        "[%s] Trigger order cancelada: oid=%s type=%s",
+                        self.coin, oid, ot,
+                    )
+        return results

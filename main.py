@@ -26,7 +26,7 @@ active_traders: dict = {}
 global_risk: GlobalRisk = None
 _trader_instances: dict = {}
 
-MAX_ACTIVE_TRADERS     = int(os.getenv("MAX_ACTIVE_TRADERS", "10"))
+MAX_ACTIVE_TRADERS     = int(os.getenv("MAX_ACTIVE_TRADERS", "10"))   # era 5
 _LEVERAGE_BASE         = int(os.getenv("LEVERAGE", "5"))
 _max_leverage_map: dict[str, int] = {}
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
@@ -94,33 +94,22 @@ async def _start_single_pair(symbol: str):
         "\U0001f680 Iniciando trader: %s (leverage=%dx | usdc_per_trade=%.2f)",
         symbol, _effective_leverage(symbol), _USDC_PER_TRADE,
     )
-
-    master_addr = (
-        os.getenv("HL_API_WALLET_ADDRESS", "").strip()
-        or os.getenv("HL_ACCOUNT_ADDR", "").strip()
-    )
     private_key = (
         os.getenv("HL_API_PRIVATE_KEY", "").strip()
         or os.getenv("HL_PRIVATE_KEY", "").strip()
     )
-    agent_key  = os.getenv("HL_AGENT_PRIVATE_KEY", "").strip()
-    agent_addr = os.getenv("HL_AGENT_ADDRESS", "").strip()
-
-    from bot.signal_engine import get_signal
     trader = FuturesTrader(
+        api_key=os.getenv("HL_API_WALLET_ADDRESS", "").strip() or None,
+        api_secret=private_key,
+        passphrase=None,
         symbol=symbol,
         leverage=_effective_leverage(symbol),
-        usdc_per_trade=_USDC_PER_TRADE,
-        signal_fn=get_signal,
+        margin_mode=os.getenv("MARGIN_MODE", "isolated"),
         dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
-        master_addr=master_addr,
-        private_key=private_key,
-        agent_key=agent_key,
-        agent_addr=agent_addr,
     )
     _trader_instances[symbol] = trader
     register_traders(_trader_instances)
-    task = asyncio.create_task(trader.start())
+    task = asyncio.create_task(trader.run(make_risk(), global_risk=global_risk))
     active_traders[symbol] = task
     _idle_cycles[symbol] = 0
 
@@ -133,19 +122,10 @@ async def stop_pair(symbol: str):
     if symbol not in active_traders:
         return
     task = active_traders.pop(symbol)
-    trader = _trader_instances.pop(symbol, None)
+    _trader_instances.pop(symbol, None)
     _idle_cycles.pop(symbol, None)
     register_traders(_trader_instances)
-    if trader is not None:
-        try:
-            await asyncio.wait_for(trader.stop(), timeout=_TRADER_STOP_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            task.cancel()
-            logger.warning("[%s] stop() timeout — cancelando task.", symbol)
-        except Exception as e:
-            logger.debug("[%s] stop() error: %s", symbol, e)
-    else:
-        task.cancel()
+    task.cancel()
     logger.info("\u23f9 Trader detenido: %s", symbol)
 
 
@@ -166,22 +146,19 @@ async def _stop_pair_with_cleanup(symbol: str) -> None:
     trader = _trader_instances.pop(symbol, None)
     _idle_cycles.pop(symbol, None)
     register_traders(_trader_instances)
-
+    if task and not task.done():
+        task.cancel()
     if trader is not None:
         try:
-            await asyncio.wait_for(trader.stop(), timeout=_TRADER_STOP_TIMEOUT_S)
+            await asyncio.wait_for(trader._stopped_event.wait(), timeout=_TRADER_STOP_TIMEOUT_S)
             logger.info("[%s] Trader parado limpiamente.", symbol)
         except asyncio.TimeoutError:
-            if task and not task.done():
-                task.cancel()
-            logger.warning("[%s] Trader no paró en %.0fs — cancelando task.", symbol, _TRADER_STOP_TIMEOUT_S)
+            logger.warning("[%s] Trader no paró en %.0fs — continuando.", symbol, _TRADER_STOP_TIMEOUT_S)
+        try:
+            await trader.cleanup()
         except Exception as e:
-            logger.debug("[%s] stop() error secundario: %s", symbol, e)
-            if task and not task.done():
-                task.cancel()
+            logger.debug("[%s] cleanup() secundario: %s", symbol, e)
     else:
-        if task and not task.done():
-            task.cancel()
         logger.info("\u23f9 Trader detenido: %s", symbol)
 
 
@@ -355,12 +332,15 @@ async def main():
 
     webhook_runner = await start_webhook_server()
 
+    # TOP_PAIRS = MAX_ACTIVE_TRADERS * 3 para tener suficientes candidatos en rotación
     top_n = int(os.getenv("TOP_PAIRS", str(MAX_ACTIVE_TRADERS * 3)))
     logger.info(
         "\u2699\ufe0f  MAX_ACTIVE_TRADERS=%d | TOP_PAIRS=%d | LEVERAGE_BASE=%dx | IDLE_ROTATE_CYCLES=%d",
         MAX_ACTIVE_TRADERS, top_n, _LEVERAGE_BASE, _IDLE_ROTATE_CYCLES,
     )
 
+    # PairScanner sin args explícitos: hereda SCANNER_TOP_N, SCANNER_REFRESH_MIN,
+    # SCANNER_MIN_VOLUME, SCANNER_MIN_CHANGE de env vars (defaults en pair_scanner.py)
     scanner = PairScanner(top_n=top_n)
 
     logger.info("\U0001f50d Escaneando mercado Hyperliquid inicial...")
