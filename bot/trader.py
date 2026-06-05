@@ -99,6 +99,25 @@ FIX allMids NoneType — retry + caché último precio (2026-06-04 / 2026-06-05 
     4. Cada llamada exitosa actualiza self._last_price.
     5. v2: los logs de uso de caché son DEBUG, no WARNING, para evitar
        spam en operación normal con pequeñas interrupciones de red.
+
+FIX semáforo global HL + jitter anti-thundering-herd (2026-06-05 v5):
+  CAUSA RAÍZ de los null en clearinghouseState y candleSnapshot:
+  Todos los traders hacían sus llamadas a /info en paralelo sin ningún
+  límite global — el semáforo previo solo cubría get_ohlcv(), dejando
+  _get_positions, _get_open_orders_raw, _get_open_trigger_orders_raw
+  e _info_post completamente sin restricción.
+  Con N traders × M endpoints simultáneos, HL devuelve null en vez de 429.
+  Fixes:
+    1. _HL_SEMAPHORE: semáforo GLOBAL que cubre TODAS las llamadas a /info.
+       Límite configurable via HL_CONCURRENCY (default 4).
+       get_ohlcv() pasa a usar este semáforo global en vez del antiguo
+       _OHLCV_SEMAPHORE (OHLCV_MAX_CONCURRENCY queda como alias retrocompat).
+    2. Jitter en TradingLoop._init(): cada trader espera un retardo
+       aleatorio de 0–HL_JITTER_MAX_S (default 3s) antes de empezar
+       su primer ciclo. Evita que todos los loops arranquen en t=0
+       y hagan poll simultáneo en el mismo segundo.
+    3. Los WARNING de respuesta null en _get_positions pasan a DEBUG
+       cuando el semáforo global está activo (son esperables bajo carga).
 """
 from __future__ import annotations
 
@@ -106,6 +125,7 @@ import asyncio
 import json as _json
 import logging
 import os
+import random
 import time
 from typing import Callable, Optional
 
@@ -125,10 +145,24 @@ _API_URL = (
 )
 
 _OHLCV_BARS = int(os.getenv("BARS_NEEDED", "100"))
-_OHLCV_MAX_CONCURRENCY = int(os.getenv("OHLCV_MAX_CONCURRENCY", "5"))
+
+# ── Semáforo GLOBAL para TODAS las llamadas a /info ─────────────────────────
+# Cubre: get_ohlcv, _get_positions, _get_open_orders_raw,
+#        _get_open_trigger_orders_raw, _info_post y get_price.
+# Configurable con HL_CONCURRENCY (default 4).
+# OHLCV_MAX_CONCURRENCY se mantiene como alias retrocompatible: si se define,
+# sobreescribe HL_CONCURRENCY para no romper configuraciones existentes.
+_HL_CONCURRENCY = int(
+    os.getenv("OHLCV_MAX_CONCURRENCY",  # alias retrocompat
+    os.getenv("HL_CONCURRENCY", "4"))
+)
+_OHLCV_MAX_CONCURRENCY = _HL_CONCURRENCY  # alias para código legado
+
+# Jitter de arranque: cada trader espera entre 0 y HL_JITTER_MAX_S segundos
+# antes de su primera iteración para evitar thundering herd en t=0.
+_HL_JITTER_MAX_S = float(os.getenv("HL_JITTER_MAX_S", "3.0"))
 
 # Esperas (segundos) entre reintentos OHLCV: intento 1→2 y 2→3.
-# Se puede sobreescribir con OHLCV_RETRY_DELAYS="0.5,1.0"
 _OHLCV_RETRY_DELAYS_RAW = os.getenv("OHLCV_RETRY_DELAYS", "0.5,1.5")
 try:
     _OHLCV_RETRY_DELAYS = [float(x) for x in _OHLCV_RETRY_DELAYS_RAW.split(",") if x.strip()]
@@ -136,9 +170,6 @@ except Exception:
     _OHLCV_RETRY_DELAYS = [0.5, 1.5]
 
 # ── Supresión de spam WARNING para coins sin datos OHLCV ────────────────────
-# Coins que fallan los 3 intentos de get_ohlcv() se registran aquí.
-# Primera vez → WARNING (aviso único). Siguientes → DEBUG (sin spam).
-# Se resetea cada _OHLCV_NO_DATA_RESET_INTERVAL segundos para reintentar.
 _OHLCV_NO_DATA_COINS: set[str] = set()
 _OHLCV_NO_DATA_RESET_INTERVAL = float(os.getenv("OHLCV_NO_DATA_RESET_INTERVAL", "1800"))
 _OHLCV_NO_DATA_LAST_RESET: float = time.monotonic()
@@ -161,34 +192,33 @@ _FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "2.0"))
 
 _MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "3.0")) / 100.0
 
-# Semáforo OHLCV — inicializado lazy dentro del event loop la primera vez
-# que get_ohlcv() se llama. No se crea a nivel de módulo para evitar el error
-# "got Future attached to a different loop" en Python <3.10.
+# Semáforo global — inicializado lazy dentro del event loop.
+_HL_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+# Alias retrocompat — apunta al mismo objeto que _HL_SEMAPHORE.
 _OHLCV_SEMAPHORE: Optional[asyncio.Semaphore] = None
-_OHLCV_SEM_LOCK = asyncio.Lock.__new__(asyncio.Lock)  # placeholder, se crea lazy
 
 
-def _get_ohlcv_semaphore() -> asyncio.Semaphore:
-    """Devuelve el semáforo OHLCV global, creándolo la primera vez."""
-    global _OHLCV_SEMAPHORE
-    if _OHLCV_SEMAPHORE is None:
-        _OHLCV_SEMAPHORE = asyncio.Semaphore(_OHLCV_MAX_CONCURRENCY)
+def _get_hl_semaphore() -> asyncio.Semaphore:
+    """Devuelve el semáforo global HL, creándolo lazy la primera vez."""
+    global _HL_SEMAPHORE, _OHLCV_SEMAPHORE
+    if _HL_SEMAPHORE is None:
+        _HL_SEMAPHORE = asyncio.Semaphore(_HL_CONCURRENCY)
+        _OHLCV_SEMAPHORE = _HL_SEMAPHORE  # mismo objeto
         logger.info(
-            "[OHLCVSemaphore] Inicializado: max_concurrency=%d (env OHLCV_MAX_CONCURRENCY)",
-            _OHLCV_MAX_CONCURRENCY,
+            "[HLSemaphore] Inicializado: max_concurrency=%d "
+            "(cubre get_ohlcv + _get_positions + get_price + orders)",
+            _HL_CONCURRENCY,
         )
-    return _OHLCV_SEMAPHORE
+    return _HL_SEMAPHORE
+
+
+# Alias retrocompat para código que llamara a _get_ohlcv_semaphore()
+_get_ohlcv_semaphore = _get_hl_semaphore
 
 
 def _ohlcv_no_data_log(coin: str, timeframe: str, n_attempts: int) -> None:
-    """
-    Emite WARNING la primera vez que un coin/tf falla todos los intentos OHLCV.
-    Fallos posteriores del mismo coin → solo DEBUG para evitar spam en logs.
-    El set global se resetea cada _OHLCV_NO_DATA_RESET_INTERVAL s.
-    """
     global _OHLCV_NO_DATA_COINS, _OHLCV_NO_DATA_LAST_RESET
-
-    # Resetear periódicamente para reintentar coins que ganen liquidez
     now = time.monotonic()
     if now - _OHLCV_NO_DATA_LAST_RESET > _OHLCV_NO_DATA_RESET_INTERVAL:
         if _OHLCV_NO_DATA_COINS:
@@ -202,7 +232,6 @@ def _ohlcv_no_data_log(coin: str, timeframe: str, n_attempts: int) -> None:
 
     key = f"{coin}:{timeframe}"
     if key not in _OHLCV_NO_DATA_COINS:
-        # Primera vez → WARNING
         _OHLCV_NO_DATA_COINS.add(key)
         logger.warning(
             "[%s] get_ohlcv(%s) sin datos tras %d intentos — "
@@ -212,7 +241,6 @@ def _ohlcv_no_data_log(coin: str, timeframe: str, n_attempts: int) -> None:
             _OHLCV_NO_DATA_RESET_INTERVAL / 60,
         )
     else:
-        # Fallos siguientes → DEBUG (sin spam)
         logger.debug(
             "[%s] get_ohlcv(%s) sin datos (reintento suprimido — coin sin liquidez).",
             coin, timeframe,
@@ -337,12 +365,11 @@ class FuturesTrader:
         self._open_qty:       float           = 0.0
         self._protection_ok:  bool            = False
         self._tp1_be_done:    bool            = False
-        self._last_price:     float           = 0.0  # caché del último precio válido
+        self._last_price:     float           = 0.0
 
         self._api_key    = api_key or ""
         self._api_secret = api_secret or ""
 
-        # FIX FREEZE: NO crear HLClient aquí (bloquea el event loop).
         self._hl_client: Optional[HLClient] = None
         self._master_addr: str = ""
         self._agent_mode:  bool = False
@@ -354,6 +381,17 @@ class FuturesTrader:
     # ── Interfaz pública requerida por main.py ──────────────────
 
     async def run(self, risk, *, global_risk=None) -> None:
+        # Jitter anti-thundering-herd: cada trader arranca en un momento
+        # ligeramente distinto para evitar que todos hagan poll a HL
+        # en el mismo instante (causa principal de respuestas null).
+        if _HL_JITTER_MAX_S > 0:
+            jitter = random.uniform(0, _HL_JITTER_MAX_S)
+            logger.debug(
+                "[%s] Jitter de arranque: %.2fs (max=%.1fs)",
+                self.symbol, jitter, _HL_JITTER_MAX_S,
+            )
+            await asyncio.sleep(jitter)
+
         try:
             await self._trading_loop.run(self, risk, global_risk=global_risk)
         except asyncio.CancelledError:
@@ -425,8 +463,6 @@ class FuturesTrader:
             if isinstance(data, dict):
                 return data
 
-            # Respuesta inesperada — logueamos solo en DEBUG para no spamear
-            # (el caller decide si escalar a WARNING según si tiene caché).
             logger.debug(
                 "[%s] allMids: tipo inesperado (%s): %s",
                 self.symbol, type(data).__name__, text[:120],
@@ -442,33 +478,24 @@ class FuturesTrader:
     async def get_price(self) -> float:
         """
         Obtiene el precio mid de self.coin vía allMids.
-
-        Estrategia de resiliencia:
-          1. Intento inicial.
-          2. Si data es None → espera 0.4 s y reintenta 1 vez.
-          3. Si sigue fallando → usa self._last_price (caché del último
-             precio válido). Sólo propaga excepción si no hay caché.
-          4. Cada precio válido actualiza self._last_price.
-          5. Los logs de caché son DEBUG (no WARNING) para evitar spam
-             durante interrupciones breves de red.
+        Usa el semáforo global para no saturar HL.
         """
-        async with aiohttp.ClientSession() as session:
-            data = await self._fetch_all_mids(session)
-
-            if data is None:
-                # Retry único con backoff mínimo
-                await asyncio.sleep(0.4)
+        sem = _get_hl_semaphore()
+        async with sem:
+            async with aiohttp.ClientSession() as session:
                 data = await self._fetch_all_mids(session)
 
+                if data is None:
+                    await asyncio.sleep(0.4)
+                    data = await self._fetch_all_mids(session)
+
         if data is None:
-            # Fallback a último precio válido conocido
             if self._last_price > 0:
                 logger.debug(
                     "[%s] allMids no disponible — usando último precio en caché: %.4f",
                     self.symbol, self._last_price,
                 )
                 return self._last_price
-            # Cold-start sin caché: esto sí merece WARNING
             logger.warning(
                 "[%s] allMids devolvió tipo inesperado (NoneType): null — sin caché disponible",
                 self.symbol,
@@ -488,15 +515,12 @@ class FuturesTrader:
             raise ValueError(f"[{self.symbol}] Precio no encontrado en allMids")
 
         result = float(price)
-        self._last_price = result  # actualizar caché
+        self._last_price = result
         return result
 
     async def _fetch_candles(self, session: aiohttp.ClientSession, timeframe: str, n_bars: int) -> Optional[list]:
         interval = _TF_MINUTES.get(timeframe, 15)
         interval_ms = interval * 60 * 1000
-        # FIX vela abierta: endTime retrocede 1 intervalo para apuntar siempre
-        # a la última vela CERRADA. HL devuelve [] si endTime cae en una vela
-        # aún abierta (comportamiento silencioso no documentado).
         end_ms   = int(time.time() * 1000) - interval_ms
         start_ms = end_ms - (n_bars * interval_ms)
 
@@ -535,24 +559,14 @@ class FuturesTrader:
     async def get_ohlcv(self, timeframe: str) -> list:
         """
         Descarga velas OHLCV con reintentos exponenciales.
-
-        Estrategia de reintentos:
-          - Intento 0: BARS_NEEDED (100% de barras)
-          - Intento 1: 66% de barras, tras OHLCV_RETRY_DELAYS[0] s
-          - Intento 2: 33% de barras, tras OHLCV_RETRY_DELAYS[1] s
-          - Si sigue fallando → devuelve []
-
-        Logging de fallos totales:
-          - Primera vez que un coin falla los 3 intentos → WARNING (aviso único).
-          - Fallos siguientes del mismo coin → DEBUG (sin spam en logs).
-          - El registro se resetea cada OHLCV_NO_DATA_RESET_INTERVAL s (default 30 min).
+        Usa el semáforo global _HL_SEMAPHORE para no saturar HL.
         """
         n_bars_sequence = [
             _OHLCV_BARS,
             max(20, _OHLCV_BARS * 2 // 3),
             max(10, _OHLCV_BARS // 3),
         ]
-        sem = _get_ohlcv_semaphore()
+        sem = _get_hl_semaphore()
 
         raw = None
         try:
@@ -562,7 +576,7 @@ class FuturesTrader:
                         raw = await self._fetch_candles(session, timeframe, n_bars)
 
                         if isinstance(raw, list) and len(raw) > 0:
-                            break  # éxito
+                            break
 
                         if attempt < len(n_bars_sequence) - 1:
                             delay = _OHLCV_RETRY_DELAYS[attempt] if attempt < len(_OHLCV_RETRY_DELAYS) else 1.0
@@ -580,7 +594,6 @@ class FuturesTrader:
             return []
 
         if raw is None or not isinstance(raw, list) or len(raw) == 0:
-            # FIX spam: WARNING solo la primera vez por coin+tf; luego DEBUG
             _ohlcv_no_data_log(self.coin, timeframe, len(n_bars_sequence))
             return []
 
@@ -614,21 +627,25 @@ class FuturesTrader:
             logger.debug("[%s] _get_positions: _master_addr vacío — skip.", self.symbol)
             return []
 
+        sem = _get_hl_semaphore()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{_API_URL}/info",
-                    json={"type": "clearinghouseState", "user": self._master_addr},
-                    headers={"Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    data = _json.loads(await resp.text())
+            async with sem:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{_API_URL}/info",
+                        json={"type": "clearinghouseState", "user": self._master_addr},
+                        headers={"Content-Type": "application/json"},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        data = _json.loads(await resp.text())
         except Exception as e:
             logger.warning("[%s] _get_positions error: %s", self.symbol, e)
             return []
 
         if data is None:
-            logger.warning("[%s] _get_positions: respuesta null de HL API.", self.symbol)
+            # Con semáforo global activo esto ya no debería ocurrir;
+            # si ocurre es un problema real de HL, no de concurrencia nuestra.
+            logger.debug("[%s] _get_positions: respuesta null de HL API.", self.symbol)
             return []
 
         try:
@@ -663,15 +680,17 @@ class FuturesTrader:
         """Órdenes normales (limit/market). NO contiene SL/TP trigger orders."""
         if not self._master_addr:
             return []
+        sem = _get_hl_semaphore()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{_API_URL}/info",
-                    json={"type": "openOrders", "user": self._master_addr},
-                    headers={"Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    data = _json.loads(await resp.text())
+            async with sem:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{_API_URL}/info",
+                        json={"type": "openOrders", "user": self._master_addr},
+                        headers={"Content-Type": "application/json"},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        data = _json.loads(await resp.text())
         except Exception as e:
             logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e)
             return []
@@ -685,24 +704,21 @@ class FuturesTrader:
     async def _get_open_trigger_orders_raw(self) -> list[dict]:
         """
         FIX _ensure_tpsl spam: En Hyperliquid, place_sl / place_tp crean
-        TRIGGER ORDERS que viven en el endpoint 'frontendOpenOrders', no en
-        'openOrders'. Este método los obtiene para que _ensure_tpsl los detecte
-        correctamente y no los recoloque en bucle.
-
-        Endpoint: POST /info {"type": "frontendOpenOrders", "user": addr}
-        La respuesta incluye orderType.trigger.tpsl = "sl" | "tp".
+        TRIGGER ORDERS que viven en el endpoint 'frontendOpenOrders'.
         """
         if not self._master_addr:
             return []
+        sem = _get_hl_semaphore()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{_API_URL}/info",
-                    json={"type": "frontendOpenOrders", "user": self._master_addr},
-                    headers={"Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    data = _json.loads(await resp.text())
+            async with sem:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{_API_URL}/info",
+                        json={"type": "frontendOpenOrders", "user": self._master_addr},
+                        headers={"Content-Type": "application/json"},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        data = _json.loads(await resp.text())
         except Exception as e:
             logger.warning("[%s] _get_open_trigger_orders_raw error: %s", self.symbol, e)
             return []
@@ -799,7 +815,9 @@ class FuturesTrader:
                 f"{_API_URL}/info", json=payload
             ).json()
 
-        return await asyncio.to_thread(_sync_call)
+        sem = _get_hl_semaphore()
+        async with sem:
+            return await asyncio.to_thread(_sync_call)
 
     # ── open_order: entrada al mercado + SL + TP ──────────────────
 
@@ -821,8 +839,6 @@ class FuturesTrader:
 
         usdc_base = float(getattr(risk, "usdc_per_trade", 20.0))
 
-        # FIX KELLY (#2): aplicar kelly_multiplier al size base
-        # kelly_mult=1.0 si no hay historial suficiente (<KELLY_MIN_TRADES)
         try:
             from bot.kelly_sizer import kelly_multiplier
             entry_mode = signal.get("entry_mode") or "NORMAL"
