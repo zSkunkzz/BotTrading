@@ -107,6 +107,23 @@ FIX monkey-patch requests.Session para retry 429 interno al SDK (2026-06-05 v23)
   user_state, meta, candles...) que reciba 429 se reintenta automáticamente
   sin que nuestro código tenga que envolverla explícitamente.
 
+FIX backoff fuera del semáforo en _info_call + _get_user_state_cached (2026-06-05 v24):
+  CAUSA RAÍZ de get_price() timeout (10.0s) en cascada:
+  El time.sleep(delay) del backoff en 429 ocurría DENTRO del bloque
+  «with _INFO_SEMAPHORE», manteniendo ocupada una ranura del semáforo
+  durante todo el tiempo de espera (hasta 19s en intento 4).
+  Con semáforo de concurrencia=3, basta que 3 threads estén en backoff
+  para que TODO el resto (incluido get_price → all_mids) se bloquee
+  esperando una ranura libre → avalancha de timeout 10s en todos los traders.
+
+  Fix:
+    - _info_call: capturar la excepción, LIBERAR el semáforo (salir del with),
+      y LUEGO hacer time.sleep(delay) fuera del semáforo.
+    - _get_user_state_cached: mismo patrón — liberar _USER_STATE_LOCK e
+      _INFO_SEMAPHORE antes de dormir en backoff.
+  Resultado: el backoff no bloquea ranuras del semáforo. Otros traders
+  pueden seguir llamando a get_price/all_mids mientras se espera el retry.
+
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -298,26 +315,38 @@ def _exchange_call(fn, *args, **kwargs):
 def _info_call(fn, *args, **kwargs):
     """
     Ejecuta una llamada de LECTURA al SDK Info con semáforo threading global.
-    Incluye retry automático con backoff en caso de 429.
+
+    FIX v24: el backoff en 429 ocurre FUERA del semáforo para no bloquear
+    ranuras mientras se espera el retry. Patrón:
+      1. Adquirir semáforo → ejecutar la llamada → liberar semáforo.
+      2. Si 429 → semáforo ya liberado → dormir → reintentar.
+    Así otros traders pueden seguir usando all_mids/get_price mientras
+    este hilo espera su ventana de retry.
     """
     last_exc: Exception | None = None
     delay = _EXCHANGE_RETRY_DELAY
 
     for attempt in range(max(1, _EXCHANGE_RETRIES)):
+        exc_caught: Exception | None = None
         try:
             with _INFO_SEMAPHORE:
                 return fn(*args, **kwargs)
         except Exception as exc:
-            last_exc = exc
-            if _is_429(exc) and attempt < _EXCHANGE_RETRIES - 1:
-                logger.warning(
-                    "[InfoCall] 429 rate-limit (intento %d/%d) — reintentando en %.1fs",
-                    attempt + 1, _EXCHANGE_RETRIES, delay,
-                )
-                time.sleep(delay)
-                delay = min(delay * 2, 30.0)
-            else:
-                raise
+            exc_caught = exc
+
+        # ── Fuera del semáforo ──────────────────────────────────────────────
+        last_exc = exc_caught
+        if _is_429(exc_caught) and attempt < _EXCHANGE_RETRIES - 1:
+            jitter  = random.uniform(0.0, delay * 0.25)
+            sleep_s = min(delay + jitter, 30.0)
+            logger.warning(
+                "[InfoCall] 429 rate-limit (intento %d/%d) — reintentando en %.1fs",
+                attempt + 1, _EXCHANGE_RETRIES, sleep_s,
+            )
+            time.sleep(sleep_s)   # ← FUERA del semáforo: no bloquea otras llamadas
+            delay = min(delay * 2, 30.0)
+        else:
+            raise exc_caught
 
     if last_exc is not None:
         raise last_exc
@@ -326,11 +355,16 @@ def _info_call(fn, *args, **kwargs):
 def _get_user_state_cached(info_obj, account_addr: str):
     """
     FIX v21: double-checked locking para caché singleton de user_state.
+    FIX v24: el backoff en 429 ocurre FUERA de _USER_STATE_LOCK e
+             _INFO_SEMAPHORE para no bloquear a otros traders.
 
     Con 20 traders llegando simultáneamente a caché vacío:
       - Thread 1 adquiere el lock, ve miss, hace fetch, escribe caché.
       - Threads 2-20 esperan el lock. Al adquirirlo, ven caché fresco → retornan.
       - Resultado: 1 sola request real a clearinghouseState por ciclo de 5s.
+
+    Si el fetch falla con 429, el thread libera ambos locks antes de dormir,
+    permitiendo que otros traders accedan a all_mids/get_price sin bloqueo.
     """
     global _user_state_cache, _user_state_cache_ts
 
@@ -346,12 +380,14 @@ def _get_user_state_cached(info_obj, account_addr: str):
     delay = _EXCHANGE_RETRY_DELAY
 
     for attempt in range(max(1, _EXCHANGE_RETRIES)):
+        exc_caught: Exception | None = None
         try:
             with _USER_STATE_LOCK:
                 now2 = time.monotonic()
                 if _user_state_cache is not None and (now2 - _user_state_cache_ts) < _USER_STATE_CACHE_TTL:
                     return _user_state_cache
 
+                # Fetch real — adquirir semáforo DENTRO del lock de caché
                 with _INFO_SEMAPHORE:
                     result = info_obj.user_state(account_addr)
 
@@ -360,18 +396,21 @@ def _get_user_state_cached(info_obj, account_addr: str):
                 return result
 
         except Exception as exc:
-            last_exc = exc
-            if _is_429(exc) and attempt < _EXCHANGE_RETRIES - 1:
-                jitter  = random.uniform(0.0, 0.5)
-                sleep_s = min(delay + jitter, 30.0)
-                logger.warning(
-                    "[UserStateCache] 429 rate-limit (intento %d/%d) — reintentando en %.1fs",
-                    attempt + 1, _EXCHANGE_RETRIES, sleep_s,
-                )
-                time.sleep(sleep_s)
-                delay = min(delay * 2, 30.0)
-            else:
-                raise
+            exc_caught = exc
+
+        # ── Fuera de ambos locks ─────────────────────────────────────────────
+        last_exc = exc_caught
+        if _is_429(exc_caught) and attempt < _EXCHANGE_RETRIES - 1:
+            jitter  = random.uniform(0.0, 0.5)
+            sleep_s = min(delay + jitter, 30.0)
+            logger.warning(
+                "[UserStateCache] 429 rate-limit (intento %d/%d) — reintentando en %.1fs",
+                attempt + 1, _EXCHANGE_RETRIES, sleep_s,
+            )
+            time.sleep(sleep_s)   # ← FUERA de los locks: no bloquea otras llamadas
+            delay = min(delay * 2, 30.0)
+        else:
+            raise exc_caught
 
     if last_exc is not None:
         raise last_exc
