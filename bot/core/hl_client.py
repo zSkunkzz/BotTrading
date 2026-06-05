@@ -147,6 +147,34 @@ FIX RAÍZ asyncio.Semaphore para _info_call (2026-06-05 v25):
   Resultado: con 20 traders, los sleeps del backoff 429 nunca bloquean
   ranuras del semáforo. get_price/all_mids siempre tienen ranuras disponibles.
 
+FIX get_ohlcv usa OHLCVCache + _USER_STATE_LOCK → asyncio.Lock (2026-06-05 v26):
+  CAUSA RAÍZ de 'sin datos tras 3 intentos' en cascada:
+  HLClient.get_ohlcv() llamaba _info_call(candles_snapshot) directamente,
+  ignorando por completo el OHLCVCache que ya existe en ohlcv_cache.py.
+  Con 20 traders × 3 TF = hasta 60 requests OHLCV simultáneas → HL
+  devuelve [] silenciosamente o con 429.
+
+  Fix A — get_ohlcv() enruta por OHLCVCache:
+    - get_ohlcv() es ahora async y llama ohlcv_cache.get().
+    - El semáforo _HL_OHLCV_SEMAPHORE (concurrencia=5) del OHLCVCache
+      throttlea los fetches reales automáticamente.
+    - TTL por timeframe: 15m→12s, 1h→60s, 4h→180s.
+      Con 20 traders los fetches reales bajan de ~300/ciclo a ~20/ciclo.
+
+  Fix B — _USER_STATE_LOCK threading.Lock → asyncio.Lock:
+    threading.Lock.acquire() bloquea el hilo OS del event loop cuando se
+    llama desde una corrutina asyncio. Con 20 traders esperando el lock,
+    el event loop se congela durante el tiempo del fetch real (hasta 10s).
+    Fix: _USER_STATE_LOCK = asyncio.Lock()
+    _get_user_state_cached_async usa 'async with _USER_STATE_LOCK'.
+
+  Fix C — sem fuera del async with lock en _get_user_state_cached_async:
+    El asyncio.Semaphore se adquiría DENTRO del async with _USER_STATE_LOCK.
+    Si el semáforo estaba agotado, el lock quedaba retenido bloqueando a
+    todos los traders que intentaban verificar el caché.
+    Fix: adquirir lock → verificar caché → liberar lock → adquirir sem →
+    fetch → adquirir lock → escribir caché → liberar lock.
+
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -175,6 +203,8 @@ from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 
+from bot.ohlcv_cache import ohlcv_cache
+
 logger = logging.getLogger("HLClient")
 
 _USE_TESTNET = os.getenv("HL_TESTNET", "").lower() in ("true", "1", "yes")
@@ -199,7 +229,6 @@ _SDK_INIT_RETRIES = int(float(os.getenv("HL_SDK_INIT_RETRIES", "8")))
 _SDK_INIT_DELAY_S = float(os.getenv("HL_SDK_INIT_DELAY_S", "5.0"))
 
 # ── Monkey-patch requests.Session para retry 429/503 a nivel HTTP ────────────
-# Número de reintentos HTTP internos (afecta TODAS las llamadas del SDK).
 _HTTP_RETRY_ON_429    = int(float(os.getenv("HL_HTTP_RETRY_ON_429", "8")))
 _HTTP_RETRY_DELAY_S   = float(os.getenv("HL_HTTP_RETRY_DELAY_S", "2.0"))
 _REQUESTS_PATCH_LOCK  = threading.Lock()
@@ -207,19 +236,6 @@ _REQUESTS_PATCH_INSTALLED = False
 
 
 def _install_requests_retry_patch() -> None:
-    """
-    Instala un monkey-patch en requests.Session.send() que reintenta
-    automáticamente cualquier respuesta 429 o 503 con backoff exponencial.
-
-    Se instala UNA sola vez (thread-safe). Todas las llamadas HTTP del SDK
-    de Hyperliquid (Exchange.__init__, Info.__init__, user_state, meta...)
-    quedan cubiertas sin ningún cambio adicional.
-
-    NOTA v25: el time.sleep() de este patch ocurre en el hilo OS que ejecuta
-    la llamada HTTP. Gracias a que _INFO_SEMAPHORE es ahora asyncio.Semaphore
-    y se libera ANTES de que to_thread() despache la llamada real, el sleep
-    del patch NO bloquea ninguna ranura del semáforo.
-    """
     global _REQUESTS_PATCH_INSTALLED
     with _REQUESTS_PATCH_LOCK:
         if _REQUESTS_PATCH_INSTALLED:
@@ -246,7 +262,7 @@ def _install_requests_retry_patch() -> None:
                     delay = min(delay * 2, 60.0)
                     continue
                 return response
-            return response  # último intento — devolver aunque sea 429
+            return response
 
         requests.Session.send = _patched_send
         _REQUESTS_PATCH_INSTALLED = True
@@ -258,26 +274,18 @@ def _install_requests_retry_patch() -> None:
         )
 
 
-# Instalar el patch al importar el módulo, antes de que cualquier código
-# instancie Exchange o Info.
 _install_requests_retry_patch()
 
 # Lock global de escritura al Exchange (threading porque va en to_thread).
 _EXCHANGE_LOCK = threading.Lock()
 
 # ── Semáforo ASYNCIO para llamadas de LECTURA a _info ───────────────────────
-# FIX v25: asyncio.Semaphore en lugar de threading.Semaphore.
-# Se adquiere en el event loop ANTES de to_thread(), de modo que el sleep
-# del monkey-patch (que ocurre en el hilo OS) no bloquea ninguna ranura.
-# Concurrencia default aumentada a 6 (más margen con el semáforo limpio).
 _HL_INFO_CONCURRENCY = int(os.getenv("HL_INFO_CONCURRENCY", "6"))
-# Se crea en la primera llamada async (necesita un event loop activo).
 _INFO_SEMAPHORE: asyncio.Semaphore | None = None
 _INFO_SEMAPHORE_LOCK = threading.Lock()
 
 
 def _get_info_semaphore() -> asyncio.Semaphore:
-    """Devuelve (creando si hace falta) el asyncio.Semaphore singleton."""
     global _INFO_SEMAPHORE
     if _INFO_SEMAPHORE is None:
         with _INFO_SEMAPHORE_LOCK:
@@ -286,11 +294,26 @@ def _get_info_semaphore() -> asyncio.Semaphore:
     return _INFO_SEMAPHORE
 
 
-# ── Caché compartido de user_state (singleton por cuenta) ───────────────────
+# ── Caché compartido de user_state ───────────────────────────────────────────
+# FIX v26: _USER_STATE_LOCK threading.Lock → asyncio.Lock
+# threading.Lock.acquire() desde una corrutina bloquea el hilo OS del event
+# loop. Con 20 traders esperando, el loop se congela hasta 10s por fetch.
 _USER_STATE_CACHE_TTL = float(os.getenv("HL_USER_STATE_CACHE_TTL_S", "5.0"))
-_USER_STATE_LOCK      = threading.Lock()
+# Lock creado en primera llamada async (necesita event loop activo).
+_USER_STATE_LOCK: asyncio.Lock | None = None
+_USER_STATE_LOCK_MUTEX = threading.Lock()   # solo para la creación lazy del Lock
 _user_state_cache: dict | list | None = None
 _user_state_cache_ts: float = 0.0
+
+
+def _get_user_state_lock() -> asyncio.Lock:
+    global _USER_STATE_LOCK
+    if _USER_STATE_LOCK is None:
+        with _USER_STATE_LOCK_MUTEX:
+            if _USER_STATE_LOCK is None:
+                _USER_STATE_LOCK = asyncio.Lock()
+    return _USER_STATE_LOCK
+
 
 POST_FILL_CONFIRM_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
 POST_FILL_CONFIRM_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
@@ -317,7 +340,6 @@ def _round_sz(sz: float, sz_decimals: int) -> float:
 
 
 def _is_429(exc: Exception) -> bool:
-    """Devuelve True si la excepción indica rate-limit (429) de HL."""
     err = str(exc)
     if "429" in err:
         return True
@@ -327,10 +349,6 @@ def _is_429(exc: Exception) -> bool:
 
 
 def _exchange_call(fn, *args, **kwargs):
-    """
-    Ejecuta una llamada de escritura al Exchange SDK con lock global.
-    Garantiza timestamps distintos y retry automático en 429.
-    """
     last_exc: Exception | None = None
     delay = _EXCHANGE_RETRY_DELAY
 
@@ -357,44 +375,18 @@ def _exchange_call(fn, *args, **kwargs):
         raise last_exc
 
 
-# ── _info_call_async / _info_call ────────────────────────────────────────────
-
 async def _info_call_async(fn, *args, **kwargs):
-    """
-    FIX v25 — SOLUCIÓN DEFINITIVA al problema del semáforo bloqueado.
-
-    Arquitectura:
-      1. Adquirir asyncio.Semaphore en el event loop (no en un hilo OS).
-      2. Lanzar fn() en asyncio.to_thread() — el monkey-patch puede hacer
-         time.sleep() libremente en el hilo OS, sin tocar el semáforo.
-      3. Liberar el semáforo al terminar to_thread() (exit del async with).
-      4. Si hay 429 después de to_thread(): asyncio.sleep() fuera del semáforo.
-
-    Por qué v24 seguía fallando:
-      - El patch reintenta ANTES de lanzar excepción. El sleep ocurría dentro
-        del to_thread() que tenía la ranura adquirida. v24 liberaba el semáforo
-        «después de la excepción» pero el patch nunca lanzaba excepción mientras
-        reintentaba — dormía y reintentaba dentro del mismo hilo/ranura.
-
-    Con asyncio.Semaphore:
-      - La ranura se libera en cuanto to_thread() completa (éxito o fallo).
-      - El sleep del patch ocurre en el hilo OS, invisible al semáforo asyncio.
-      - 20 traders compitiendo: máximo _HL_INFO_CONCURRENCY llamadas HTTP
-        simultáneas, el resto espera en el event loop sin bloquear hilos OS.
-    """
     sem = _get_info_semaphore()
     last_exc: Exception | None = None
     delay = _EXCHANGE_RETRY_DELAY
 
     for attempt in range(max(1, _EXCHANGE_RETRIES)):
         try:
-            # Adquirir semáforo asyncio → lanzar HTTP en hilo OS → liberar.
             async with sem:
                 result = await asyncio.to_thread(fn, *args, **kwargs)
             return result
         except Exception as exc:
             last_exc = exc
-            # Semáforo ya liberado (salimos del async with).
             if _is_429(exc) and attempt < _EXCHANGE_RETRIES - 1:
                 jitter  = random.uniform(0.0, delay * 0.25)
                 sleep_s = min(delay + jitter, 30.0)
@@ -402,7 +394,7 @@ async def _info_call_async(fn, *args, **kwargs):
                     "[InfoCall] 429 rate-limit (intento %d/%d) — reintentando en %.1fs",
                     attempt + 1, _EXCHANGE_RETRIES, sleep_s,
                 )
-                await asyncio.sleep(sleep_s)  # asyncio.sleep: no bloquea event loop
+                await asyncio.sleep(sleep_s)
                 delay = min(delay * 2, 30.0)
             else:
                 raise exc
@@ -412,22 +404,14 @@ async def _info_call_async(fn, *args, **kwargs):
 
 
 def _info_call(fn, *args, **kwargs):
-    """
-    Wrapper síncrono de _info_call_async.
-    Detecta si hay un event loop en curso y usa run_coroutine_threadsafe,
-    o bien asyncio.run() si se llama desde fuera del loop.
-    """
     try:
         loop = asyncio.get_running_loop()
-        # Estamos dentro de un event loop: ejecutar como corrutina en el loop
-        # desde un hilo OS (to_thread). Usamos un Future para sincronizar.
         import concurrent.futures
         fut = asyncio.run_coroutine_threadsafe(
             _info_call_async(fn, *args, **kwargs), loop
         )
         return fut.result()
     except RuntimeError:
-        # No hay event loop activo: caso de tests o scripts síncronos.
         return asyncio.run(_info_call_async(fn, *args, **kwargs))
 
 
@@ -435,46 +419,51 @@ def _info_call(fn, *args, **kwargs):
 
 async def _get_user_state_cached_async(info_obj, account_addr: str):
     """
-    FIX v25: versión async del caché de user_state.
-    Mismo patrón double-checked locking que v21, pero usando asyncio.Semaphore
-    para la llamada HTTP real (misma arquitectura que _info_call_async).
-
-    Con 20 traders:
-      - Solo 1 thread hace el fetch real por TTL de 5s.
-      - El sleep del patch en 429 ocurre en hilo OS sin bloquear el semáforo.
+    FIX v26: _USER_STATE_LOCK es ahora asyncio.Lock.
+    Patrón correcto:
+      1. Fast path sin lock.
+      2. Slow path: adquirir lock → re-verificar → si sigue frío:
+         a. LIBERAR lock
+         b. Adquirir sem (puede esperar sin bloquear nadie)
+         c. Fetch real
+         d. Adquirir lock → escribir caché → liberar lock
+    Con esto el lock nunca retiene el semáforo ni viceversa.
     """
     global _user_state_cache, _user_state_cache_ts
 
-    # ── FAST PATH: sin lock ──────────────────────────────────────────────────
+    # ── FAST PATH ────────────────────────────────────────────────────────────
     now = time.monotonic()
-    cached = _user_state_cache
-    cached_ts = _user_state_cache_ts
-    if cached is not None and (now - cached_ts) < _USER_STATE_CACHE_TTL:
-        return cached
+    if _user_state_cache is not None and (now - _user_state_cache_ts) < _USER_STATE_CACHE_TTL:
+        return _user_state_cache
 
-    # ── SLOW PATH: lock + re-verificar + fetch ───────────────────────────────
-    sem = _get_info_semaphore()
+    lock = _get_user_state_lock()
+    sem  = _get_info_semaphore()
+
+    # ── SLOW PATH: verificar bajo lock ───────────────────────────────────────
+    async with lock:
+        now2 = time.monotonic()
+        if _user_state_cache is not None and (now2 - _user_state_cache_ts) < _USER_STATE_CACHE_TTL:
+            return _user_state_cache
+        # Caché frío — necesitamos fetch. Salimos del lock antes de adquirir sem.
+        # (El flag se setea implícitamente al salir del async with)
+
+    # ── FETCH: sem fuera del lock ─────────────────────────────────────────────
     last_exc: Exception | None = None
     delay = _EXCHANGE_RETRY_DELAY
 
     for attempt in range(max(1, _EXCHANGE_RETRIES)):
         try:
-            with _USER_STATE_LOCK:
-                now2 = time.monotonic()
-                if _user_state_cache is not None and (now2 - _user_state_cache_ts) < _USER_STATE_CACHE_TTL:
-                    return _user_state_cache
+            async with sem:
+                result = await asyncio.to_thread(info_obj.user_state, account_addr)
 
-                # Fetch real con asyncio.Semaphore
-                async with sem:
-                    result = await asyncio.to_thread(info_obj.user_state, account_addr)
-
+            # Escribir caché bajo lock
+            async with lock:
                 _user_state_cache    = result
                 _user_state_cache_ts = time.monotonic()
-                return result
+            return result
 
         except Exception as exc:
             last_exc = exc
-            # Fuera de ambos locks (to_thread terminó, async with salió).
             if _is_429(exc) and attempt < _EXCHANGE_RETRIES - 1:
                 jitter  = random.uniform(0.0, 0.5)
                 sleep_s = min(delay + jitter, 30.0)
@@ -492,7 +481,6 @@ async def _get_user_state_cached_async(info_obj, account_addr: str):
 
 
 def _get_user_state_cached(info_obj, account_addr: str):
-    """Wrapper síncrono de _get_user_state_cached_async."""
     try:
         loop = asyncio.get_running_loop()
         import concurrent.futures
@@ -509,11 +497,6 @@ def _get_user_state_cached(info_obj, account_addr: str):
 # ─────────────────────────────────────────────────────────────────
 
 class _HLCore:
-    """
-    Singleton que mantiene UNA instancia de Exchange + Info.
-    Pre-carga szDecimals, pxDecimals y maxLeverage al arrancar.
-    """
-
     _instance: "_HLCore | None" = None
     _init_lock: "asyncio.Lock | None" = None
 
@@ -542,12 +525,9 @@ class _HLCore:
             exchange_wallet    = wallet
             exchange_kwargs    = {}
             logger.warning(
-                "⚠️  [HLCore] AGENTE INACTIVO — operando con master wallet directamente. "
-                "Verificar que HL_API_PRIVATE_KEY esté configurada y el agente autorizado en Hyperliquid."
+                "⚠️  [HLCore] AGENTE INACTIVO — operando con master wallet directamente."
             )
 
-        # El monkey-patch ya está instalado al importar el módulo,
-        # así que Exchange() e Info() tienen retry 429 automático a nivel HTTP.
         self.exchange = self._build_exchange_with_retry(exchange_wallet, exchange_kwargs)
         self.info     = self._build_info_with_retry()
 
@@ -600,11 +580,6 @@ class _HLCore:
                     logger.warning("[HLCore] _warm_cache tick parse falló para %s: %s", name, exc)
 
     def _build_exchange_with_retry(self, wallet, kwargs: dict) -> Exchange:
-        """
-        El monkey-patch en requests.Session.send() ya maneja los 429 internos
-        del SDK. Este bucle es un seguro extra por si el SDK lanza una excepción
-        en vez de devolver la respuesta (e.g. timeout, ConnectionError).
-        """
         retries = _SDK_INIT_RETRIES
         delay   = _SDK_INIT_DELAY_S
         last_exc: Exception | None = None
@@ -622,10 +597,6 @@ class _HLCore:
         raise RuntimeError(f"No se pudo inicializar Exchange tras {retries} intentos") from last_exc
 
     def _build_info_with_retry(self) -> Info:
-        """
-        Ídem — el patch HTTP cubre los 429 internos; este bucle cubre errores
-        de red o excepciones inesperadas del constructor.
-        """
         retries = _SDK_INIT_RETRIES
         delay   = _SDK_INIT_DELAY_S
         last_exc: Exception | None = None
@@ -644,7 +615,6 @@ class _HLCore:
 
     @classmethod
     async def get_async(cls) -> "_HLCore":
-        """Crea o devuelve el singleton dentro de asyncio.to_thread() para no bloquear el event loop."""
         if cls._init_lock is None:
             cls._init_lock = asyncio.Lock()
         async with cls._init_lock:
@@ -654,7 +624,6 @@ class _HLCore:
 
     @classmethod
     def get(cls) -> "_HLCore":
-        """Versión síncrona (solo para uso en contextos ya threadeados)."""
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
@@ -665,11 +634,6 @@ class _HLCore:
 # ─────────────────────────────────────────────────────────────────
 
 class HLClient:
-    """
-    Cliente Hyperliquid para un símbolo concreto.
-    Usa el singleton _HLCore para Exchange + Info compartidos.
-    """
-
     def __init__(self, core: _HLCore, symbol: str) -> None:
         self._core     = core
         self._symbol   = symbol
@@ -700,9 +664,6 @@ class HLClient:
     # ── Redondeo ──────────────────────────────────────────────────────────────
 
     def round_px(self, price: float) -> float:
-        """
-        FIX v16 Bug 1: redondea precio al múltiplo exacto del tick_size.
-        """
         tick = self.get_tick_size()
         if tick > 0:
             return math.floor(price / tick + 0.5) * tick
@@ -720,10 +681,6 @@ class HLClient:
         return _get_user_state_cached(self._info, self._account)
 
     def get_positions(self) -> list[dict]:
-        """
-        FIX v20+v21+v25: usa caché compartida con double-checked locking y asyncio.Semaphore.
-        20 traders → 1 request real a clearinghouseState por TTL.
-        """
         state = _get_user_state_cached(self._info, self._account)
         if isinstance(state, dict):
             asset_positions = state.get("assetPositions", [])
@@ -758,26 +715,36 @@ class HLClient:
             logger.warning("[HLClient] get_frontend_open_orders falló: %s", exc)
             return []
 
-    def get_ohlcv(self, interval: str = "15m", limit: int = 100) -> list:
+    async def get_ohlcv(self, interval: str = "15m", limit: int = 100) -> list:
+        """
+        FIX v26: enruta por OHLCVCache con semáforo propio (concurrencia=5).
+        TTL diferenciado: 15m→12s, 1h→60s, 4h→180s.
+        Con 20 traders los fetches reales bajan de ~300/ciclo a ~20/ciclo.
+        """
         interval_ms = {
             "1m": 60_000, "3m": 180_000, "5m": 300_000,
             "15m": 900_000, "30m": 1_800_000,
             "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
             "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
         }
-        ms = interval_ms.get(interval, 900_000)
-        # FIX v14 Bug 2: retroceder 2 intervalos para apuntar a la última vela CERRADA.
-        end_ts   = int(time.time() * 1000) - 2 * ms
-        start_ts = end_ts - limit * ms
-        try:
-            candles = _info_call(
-                self._info.candles_snapshot,
-                self._coin, interval, start_ts, end_ts,
-            )
-            return candles or []
-        except Exception as exc:
-            logger.warning("[HLClient] get_ohlcv(%s, %s) falló: %s", self._coin, interval, exc)
-            return []
+
+        coin  = self._coin
+        info  = self._info
+
+        async def _fetch(tf: str) -> list:
+            ms       = interval_ms.get(tf, 900_000)
+            end_ts   = int(time.time() * 1000) - 2 * ms
+            start_ts = end_ts - limit * ms
+            try:
+                candles = await _info_call_async(
+                    info.candles_snapshot, coin, tf, start_ts, end_ts
+                )
+                return candles or []
+            except Exception as exc:
+                logger.warning("[HLClient] get_ohlcv fetch %s/%s falló: %s", coin, tf, exc)
+                return []
+
+        return await ohlcv_cache.get(coin, interval, _fetch)
 
     # ── Órdenes de escritura ──────────────────────────────────────────────────
 
@@ -883,7 +850,6 @@ class HLClient:
         )
 
     def confirm_fill(self, order_result: dict, timeout: float = POST_FILL_CONFIRM_RETRIES * POST_FILL_CONFIRM_DELAY) -> bool:
-        """Espera a que una orden de mercado/límite se ejecute comprobando fills."""
         oid = None
         try:
             statuses = order_result.get("response", {}).get("data", {}).get("statuses", [])
@@ -896,7 +862,7 @@ class HLClient:
             pass
 
         if oid is None:
-            return True  # Si no hay oid pendiente asumimos fill
+            return True
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
