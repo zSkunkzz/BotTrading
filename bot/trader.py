@@ -109,10 +109,20 @@ FIX get_ohlcv backoff exponencial (2026-06-05):
 FIX get_price backoff (2026-06-05):
   Ampliado de 1 retry a PRICE_FETCH_RETRIES (default 3) con esperas
   crecientes (0.4s, 0.8s, 1.6s) antes de caer al stale cache.
+
+FIX get_ohlcv_fn ausente (2026-06-05):
+  CAUSA RAÍZ del «0 señales analizadas» tras el scanner:
+  trading_loop._iteration() llama trader.get_ohlcv_fn() ANTES del bloque
+  try/except de evaluate(). El método no existía en FuturesTrader →
+  AttributeError capturado silenciosamente por el except genérico de run()
+  → loop reiniciaba cada 10s sin analizar ningún par.
+  Fix: añadir get_ohlcv_fn() que devuelve un callable parcial de get_ohlcv
+  listo para ser pasado a signal_engine.analyze_pair como ohlcv_fn.
 """
 from __future__ import annotations
 
 import asyncio
+import functools
 import json as _json
 import logging
 import os
@@ -350,6 +360,18 @@ class FuturesTrader:
             return await self._fetch_candles(tf, bars_needed)
 
         return await ohlcv_cache.get(self.coin, timeframe, _fetch)
+
+    def get_ohlcv_fn(self) -> Callable:
+        """
+        Devuelve un callable async(timeframe) → list que signal_engine puede
+        usar como ohlcv_fn. Evita que trading_loop tenga que conocer la firma
+        completa de get_ohlcv.
+
+        FIX (2026-06-05): este método no existía — su ausencia lanzaba
+        AttributeError en _iteration() antes del bloque try/except de
+        evaluate(), silenciando todos los scans (0 señales analizadas).
+        """
+        return functools.partial(self.get_ohlcv)
 
     async def _fetch_candles(self, timeframe: str, n: int) -> list:
         """
