@@ -165,6 +165,22 @@ FIX HLClient.create() kwargs + get_max_leverage() signature (2026-06-05 v9):
   se capaba, causando 'Invalid leverage value' para AAVE, INJ, TAO, DOGE,
   GRASS y cualquier coin con maxLev < 15x en rotaciones de PairScanner.
   Fix: llamar hl.get_max_leverage() sin argumentos.
+
+FIX _get_positions list vs dict + warning agent_mode=False (2026-06-05 v10):
+  CAUSA RAÍZ: HLClient.get_positions() ya devuelve una list[dict] filtrada
+  por coin (no un dict con clave 'assetPositions'). El código anterior en
+  _get_positions() hacía data.get("assetPositions", []) sobre esa lista,
+  lo que lanzaba 'list' object has no attribute 'get' en CADA ciclo de
+  todos los traders, paralizando el bot al 100% con error: 4 en decision_engine.
+  Esto ocurre especialmente cuando agent_mode=False (wallet directa sin
+  agente autorizado), donde el SDK puede comportarse de forma distinta.
+  Fixes:
+    1. _get_positions(): simplifica la lógica — hl.get_positions() ya
+       devuelve list directamente. Si por compatibilidad futura recibe
+       un dict, extrae assetPositions. Cualquier otro tipo → WARNING + [].
+    2. _get_ccxt(): loguea WARNING visible si agent_mode=False para alertar
+       que el bot opera sin agente Hyperliquid activo — facilita diagnóstico
+       de expiración o revocación del agente wallet.
 """
 from __future__ import annotations
 
@@ -445,6 +461,11 @@ class FuturesTrader:
         Las credenciales (HL_API_PRIVATE_KEY, HL_API_WALLET_ADDRESS) las
         lee _HLCore directamente de las variables de entorno — NO se pasan
         aquí como argumentos.
+
+        WARNING visible si agent_mode=False: el bot opera con wallet directa
+        sin agente autorizado. Esto puede causar comportamientos distintos en
+        la API de HL (e.g., get_positions devuelve estructura diferente) y
+        significa que el agente pudo haber expirado o sido revocado.
         """
         if self._hl_client is not None:
             return self._hl_client
@@ -452,12 +473,20 @@ class FuturesTrader:
         logger.info("[%s] _get_ccxt: inicializando HLClient...", self.symbol)
         try:
             self._hl_client = await HLClient.create(self.symbol)
+            agent_active = getattr(self._hl_client, "_agent_mode", False)
             logger.info(
                 "[%s] _get_ccxt: HLClient listo | addr=%s | agente=%s",
                 self.symbol,
                 (self._master_addr or "")[:12] + "...",
-                bool(self._agent_key),
+                agent_active,
             )
+            if not agent_active:
+                logger.warning(
+                    "[%s] ⚠️  AGENTE INACTIVO — operando con master wallet directamente. "
+                    "Verificar que el agente esté autorizado en app.hyperliquid.xyz "
+                    "(clave puede haber expirado o sido revocada).",
+                    self.symbol,
+                )
         except Exception as e:
             logger.error("[%s] _get_ccxt: error inicializando HLClient: %s", self.symbol, e, exc_info=True)
             raise
@@ -625,41 +654,50 @@ class FuturesTrader:
         """
         Obtiene posiciones abiertas del exchange.
         Devuelve lista de dicts con 'coin', 'side', 'entryPx', 'szi', etc.
+
+        HLClient.get_positions() ya devuelve una list[dict] filtrada por coin
+        (no un dict — no llamar .get() sobre ella). Si por compatibilidad futura
+        la respuesta fuera un dict, se extrae 'assetPositions'. Cualquier otro
+        tipo inesperado → WARNING + [].
         """
         if not self._master_addr:
+            return []
+
+        hl = self._require_hl()
+        if hl is None:
             return []
 
         sem = _get_hl_semaphore()
         try:
             async with sem:
-                data = await asyncio.to_thread(
-                    self._hl_client.get_positions
-                    if self._hl_client
-                    else lambda: None
-                )
+                raw = await asyncio.to_thread(hl.get_positions)
         except Exception as e:
             logger.warning("[%s] _get_positions error: %s", self.symbol, e, exc_info=True)
             return []
 
-        if data is None:
+        # Normalizar la respuesta — HL puede devolver list o dict según contexto
+        if isinstance(raw, list):
+            positions_raw = raw
+        elif isinstance(raw, dict):
+            positions_raw = raw.get("assetPositions", [])
+        elif raw is None:
             logger.debug("[%s] _get_positions: HL devolvió null.", self.symbol)
             return []
-
-        try:
-            positions = data.get("assetPositions", [])
-        except (TypeError, AttributeError) as e:
-            logger.warning("[%s] _get_positions: respuesta inesperada (tipo=%s): %s",
-                           self.symbol, type(data).__name__, e)
+        else:
+            logger.warning(
+                "[%s] _get_positions: respuesta inesperada (tipo=%s): %s",
+                self.symbol, type(raw).__name__, str(raw)[:200],
+            )
             return []
 
         result = []
-        for pos_wrapper in positions:
+        for item in positions_raw:
             try:
-                pos = pos_wrapper.get("position", {})
+                # HLClient.get_positions() ya filtra por coin y szi != 0,
+                # pero si llega el wrapper completo, extraemos el inner dict.
+                pos = item.get("position", item) if isinstance(item, dict) else {}
                 coin = pos.get("coin", "")
-                if _norm_coin(coin) != _norm_coin(self.symbol):
-                    continue
-                szi = float(pos.get("szi", 0))
+                szi  = float(pos.get("szi", 0))
                 if szi == 0:
                     continue
                 result.append({
