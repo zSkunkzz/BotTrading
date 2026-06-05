@@ -118,6 +118,15 @@ FIX semáforo global HL + jitter anti-thundering-herd (2026-06-05 v5):
        y hagan poll simultáneo en el mismo segundo.
     3. Los WARNING de respuesta null en _get_positions pasan a DEBUG
        cuando el semáforo global está activo (son esperables bajo carga).
+
+FIX duplicate nonce _set_leverage (2026-06-05 v6):
+  CAUSA RAÍZ: _set_leverage llamaba hl._exchange.update_leverage()
+  directamente via asyncio.to_thread(), sin pasar por _exchange_call()
+  ni adquirir _EXCHANGE_LOCK. Con 7 traders terminando _get_ccxt() en
+  el mismo milisegundo, todos llamaban update_leverage simultáneamente
+  → colisión de nonce garantizada → HL rechaza con 'duplicate nonce'.
+  Fix: usar hl.update_leverage(leverage) que internamente envuelve la
+  llamada con _exchange_call() → _EXCHANGE_LOCK + _NONCE_MIN_DELAY_MS.
 """
 from __future__ import annotations
 
@@ -792,10 +801,15 @@ class FuturesTrader:
             logger.info("[%s] DRY_RUN: _set_leverage(%d) omitido.", self.symbol, leverage)
             return
         try:
+            # FIX duplicate nonce (2026-06-05 v6):
+            # Usar hl.update_leverage() en lugar de hl._exchange.update_leverage() directamente.
+            # HLClient.update_leverage() envuelve la llamada con _exchange_call() que adquiere
+            # _EXCHANGE_LOCK + sleep de _NONCE_MIN_DELAY_MS, garantizando nonces únicos incluso
+            # cuando varios traders llaman simultáneamente al arranque.
             result = await asyncio.wait_for(
                 asyncio.to_thread(
-                    hl._exchange.update_leverage,
-                    leverage, self.coin, False,
+                    hl.update_leverage,
+                    leverage,
                 ),
                 timeout=15.0,
             )
