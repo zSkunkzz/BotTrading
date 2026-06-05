@@ -124,6 +124,13 @@ FIX HLClient.create() firma (2026-06-05):
   HLClient.create() solo acepta 1 (symbol). Los credenciales los lee
   _HLCore directamente desde las env vars HL_API_PRIVATE_KEY / HL_PRIVATE_KEY.
   Fix: HLClient.create(self.coin) — eliminar api_key y api_secret sobrantes.
+
+FIX _set_leverage ausente (2026-06-05):
+  trading_loop._init() llama await trader._set_leverage(trader.leverage)
+  pero el método no existía → AttributeError → bucle infinito silenciado,
+  ningún trader llegaba a _iteration().
+  Fix: implementar _set_leverage() con dry_run guard + asyncio.wait_for
+  timeout=SET_LEVERAGE_TIMEOUT_S (default 15s) + WARNING sin bloqueo.
 """
 from __future__ import annotations
 
@@ -159,6 +166,7 @@ _OHLCV_BARS          = int(os.getenv("BARS_NEEDED",           "100"))
 _OHLCV_MAX_CONCURRENCY = int(os.getenv("OHLCV_MAX_CONCURRENCY", "3"))
 
 _PRICE_FETCH_RETRIES = int(os.getenv("PRICE_FETCH_RETRIES",   "3"))
+_SET_LEVERAGE_TIMEOUT_S = float(os.getenv("SET_LEVERAGE_TIMEOUT_S", "15"))
 
 _TF_MINUTES = {
     "1m":  1,
@@ -349,6 +357,57 @@ class FuturesTrader:
         except Exception as e:
             logger.error("[%s] _get_ccxt error: %s", self.symbol, e)
             raise
+
+    # ── _set_leverage: configura apalancamiento en el exchange ────────
+
+    async def _set_leverage(self, leverage: int) -> None:
+        """
+        Configura el apalancamiento para self.coin en Hyperliquid.
+
+        - dry_run=True → log informativo sin llamada al SDK.
+        - Llama exchange.update_leverage() en asyncio.to_thread() con
+          timeout=SET_LEVERAGE_TIMEOUT_S (default 15s).
+        - Timeout o error → WARNING + continúa sin bloquear el bot.
+        """
+        if self.dry_run:
+            logger.info(
+                "[%s] [DRY-RUN] _set_leverage(%dx) — sin llamada al SDK.",
+                self.symbol, leverage,
+            )
+            self._open_leverage = leverage
+            return
+
+        if self._hl_client is None:
+            logger.warning(
+                "[%s] _set_leverage: _hl_client no inicializado — skip.",
+                self.symbol,
+            )
+            return
+
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._hl_client.update_leverage,
+                    leverage,
+                    self.coin,
+                ),
+                timeout=_SET_LEVERAGE_TIMEOUT_S,
+            )
+            self._open_leverage = leverage
+            logger.info(
+                "[%s] Apalancamiento configurado: %dx",
+                self.symbol, leverage,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] _set_leverage timeout (%ss) — continuando con leverage no confirmado.",
+                self.symbol, _SET_LEVERAGE_TIMEOUT_S,
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] _set_leverage error: %s — continuando.",
+                self.symbol, e,
+            )
 
     # ── OHLCV: delega en ohlcv_cache singleton ────────────────────────
 
