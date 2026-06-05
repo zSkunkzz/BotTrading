@@ -133,6 +133,15 @@ FIX HLClient.create() firma (2026-06-05):
   HLClient.create() solo acepta 1 (symbol). Los credenciales los lee
   _HLCore directamente desde las env vars HL_API_PRIVATE_KEY / HL_PRIVATE_KEY.
   Fix: HLClient.create(self.coin) — eliminar api_key y api_secret sobrantes.
+
+FIX _get_positions ausente (2026-06-05):
+  TradingLoop._iteration() llama trader._get_positions() cada
+  POS_CHECK_INTERVAL_S segundos para sincronizar posiciones abiertas.
+  El método no existía en FuturesTrader → AttributeError → el bot operaba
+  ciego a posiciones externas/manuales.
+  Fix: implementar _get_positions() delegando en HLClient.get_positions()
+  (que ya existe, filtra por self.coin y descarta szi==0) y normalizando
+  la respuesta al contrato {side, entryPx, size} que espera trading_loop.
 """
 from __future__ import annotations
 
@@ -505,6 +514,51 @@ class FuturesTrader:
         evaluate(), silenciando todos los scans (0 señales analizadas).
         """
         return functools.partial(self.get_ohlcv)
+
+    # ── _get_positions: sincroniza posiciones abiertas con el exchange ─
+
+    async def _get_positions(self) -> list[dict]:
+        """
+        Devuelve las posiciones abiertas para self.coin en el exchange.
+
+        FIX (2026-06-05): TradingLoop._iteration() llama este método cada
+        POS_CHECK_INTERVAL_S segundos para detectar cierres externos y
+        sincronizar _open_qty. El método no existía → AttributeError →
+        el bot operaba ciego a posiciones abiertas externas/manuales.
+
+        Delega en HLClient.get_positions() que ya filtra por self.coin
+        y descarta posiciones con szi==0. Normaliza al contrato que
+        espera trading_loop: {"side", "entryPx", "size"}.
+
+        Contrato de retorno:
+          [] si no hay posición abierta o si falla el fetch.
+          [{"side": "long"|"short", "entryPx": float, "size": float}]
+          si hay posición activa.
+        """
+        if self._hl_client is None:
+            return []
+
+        try:
+            raw_positions = await asyncio.to_thread(self._hl_client.get_positions)
+        except Exception as e:
+            logger.warning("[%s] _get_positions fetch error: %s", self.symbol, e)
+            return []
+
+        result = []
+        for p in raw_positions:
+            pos = p.get("position", {})
+            szi = float(pos.get("szi", 0))
+            if szi == 0:
+                continue
+            side = "long" if szi > 0 else "short"
+            entry_px = float(pos.get("entryPx") or 0)
+            result.append({
+                "side":    side,
+                "entryPx": entry_px,
+                "size":    abs(szi),
+            })
+
+        return result
 
     async def _fetch_candles(self, timeframe: str, n: int) -> list:
         """
