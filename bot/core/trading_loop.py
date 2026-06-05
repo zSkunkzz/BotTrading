@@ -24,12 +24,21 @@ FIX v12 (2026-06-03): PnL real en notify_close para cierre externo
   - El PnL se calculaba siempre como 0.0 (hardcodeado).
   - Ahora se calcula: pnl_pct = (exit - entry) / entry * leverage * ±1
   - El mismo PnL real se pasa a on_position_closed y register_close.
+
+FIX v13 (2026-06-05): jitter per-trader en sleep del loop
+  CAUSA RAÍZ: con N traders, todos llaman get_ohlcv() en el mismo
+  segundo porque LOOP_SLEEP es idéntico para todos — thundering herd.
+  Fix: await asyncio.sleep(LOOP_SLEEP + random.uniform(0, _LOOP_JITTER_S))
+  Cada iteración duerme entre LOOP_SLEEP y LOOP_SLEEP+_LOOP_JITTER_S,
+  desincronizando los fetch de candleSnapshot entre traders.
+  Configurable via LOOP_JITTER_S (default 2.0s).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import random
 import time
 
 from bot.state import load_position, clear_position, save_cooldown, get_cooldown_remaining
@@ -41,6 +50,7 @@ from bot.position_manager import PositionManager
 logger = logging.getLogger("TradingLoop")
 
 LOOP_SLEEP              = float(os.getenv("LOOP_SLEEP", "10"))
+_LOOP_JITTER_S          = float(os.getenv("LOOP_JITTER_S", "2.0"))
 _POS_CHECK_INTERVAL_S   = int(os.getenv("POS_CHECK_INTERVAL_S", "30"))
 _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
 _EXTERNAL_CLOSE_COOLDOWN_S = int(os.getenv("EXTERNAL_CLOSE_COOLDOWN_S", "600"))
@@ -107,7 +117,9 @@ class TradingLoop:
                 raise
             except Exception as e:
                 logger.error("[%s] Error en iteración: %s", self.symbol, e, exc_info=True)
-            await asyncio.sleep(LOOP_SLEEP)
+            # FIX v13: jitter per-trader para desincronizar fetch OHLCV
+            sleep_s = LOOP_SLEEP + random.uniform(0, _LOOP_JITTER_S)
+            await asyncio.sleep(sleep_s)
 
     async def _init(self, trader, usdc_per_trade: float) -> None:
         await trader._get_ccxt()
