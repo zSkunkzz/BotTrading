@@ -28,6 +28,14 @@ Variables de entorno:
   GROQ_MODEL              — modelo (default: llama-3.1-8b-instant)
   AI_NEWS_HOURS_LOOKBACK  — horas hacia atras para buscar noticias (default: 6)
   AI_NEWS_CACHE_TTL_H     — horas de validez del cache por simbolo (default: 2)
+
+CAMBIOS v22 (mejora cache de noticias):
+  - El cache ahora distingue entre deltas negativos y positivos.
+  - Si el delta cacheado es negativo y llega un delta fresco >= NEWS_POSITIVE_MIN
+    (default +2.0), se actualiza el cache y se devuelve el valor positivo.
+    Esto permite que noticias muy positivas refuercen la entrada incluso si
+    había un delta negativo cacheado previamente.
+  - NEWS_POSITIVE_MIN es configurable via env para ajustar la sensibilidad.
 """
 
 import asyncio
@@ -52,6 +60,9 @@ _CACHE_TTL_S    = float(os.getenv("AI_NEWS_CACHE_TTL_H", "2")) * 3600
 _SCORE_MIN      = -2.0
 _SCORE_MAX      =  2.0
 _BOUNDARY_THRESHOLD = 4  # Tickers de <= 4 chars usan word-boundary
+
+# v22: umbral para que una noticia positiva fresca override un cache negativo
+_NEWS_POSITIVE_MIN = float(os.getenv("NEWS_POSITIVE_MIN", "2.0"))
 
 RSS_FEEDS = [
     "https://cointelegraph.com/rss",
@@ -374,28 +385,59 @@ async def news_score_adjustment(symbol: str) -> float:
     Crea UNA sola ClientSession para toda la operacion y la cierra correctamente.
 
     Flujo:
-      1. Cache       → devuelve sin llamadas si vigente.
+      1. Cache       → devuelve sin llamadas si vigente Y no hay override positivo.
       2. CoinGecko   → resuelve nombre completo del ticker (cache 24h).
       3. RSS (gratis)→ busca titulares con ticker + nombre.
       4. Sin titulares → 0.0 SIN llamar a Groq.
       5. Con titulares → llama a Groq para analizar sentimiento.
+
+    v22 — override positivo:
+      Si hay un delta cacheado NEGATIVO y el delta fresco >= NEWS_POSITIVE_MIN,
+      el cache se actualiza con el valor positivo y se devuelve ese valor.
+      Esto evita que una noticia negativa cacheada bloquee una entrada cuando
+      llega una noticia muy alcista posterior dentro de la misma ventana.
     """
     base = symbol.replace("USDT", "").replace("USDC", "").replace("-PERP", "").upper()
 
     cached = _get_cached(base)
-    if cached is not None:
-        logger.debug("[AIFilter] %s — cache hit, score_delta=%+.1f", base, cached)
+
+    # Si no hay cache o es positivo, comportamiento normal
+    if cached is not None and cached >= 0:
+        logger.debug("[AIFilter] %s — cache hit (positivo/neutro), score_delta=%+.1f", base, cached)
         return cached
 
+    # Si hay cache negativo, aún así consultamos para ver si llegó algo muy positivo
     async with aiohttp.ClientSession() as session:
         headlines = await _fetch_recent_headlines(session, base, _HOURS_LOOKBACK)
 
         if not headlines:
-            logger.debug("[AIFilter] %s — sin noticias, score_delta=0", base)
+            if cached is not None:
+                # Mantener cache negativo — sin noticias nuevas
+                logger.debug("[AIFilter] %s — cache negativo mantenido (%+.1f), sin titulares nuevos", base, cached)
+                return cached
             _set_cached(base, 0.0)
             return 0.0
 
         delta = await _groq_analyze(session, base, headlines)
+
+    # v22: si el delta fresco es fuertemente positivo, override el cache negativo
+    if cached is not None and cached < 0 and delta >= _NEWS_POSITIVE_MIN:
+        logger.info(
+            "[AIFilter] %s — override positivo: cache=%+.1f fresco=%+.1f >= %.1f → actualizando",
+            base, cached, delta, _NEWS_POSITIVE_MIN,
+        )
+        _set_cached(base, delta)
+        return delta
+
+    # Si el cache era negativo y el delta fresco no es suficientemente positivo,
+    # usar el peor de los dos (más conservador)
+    if cached is not None and cached < 0:
+        combined = min(cached, delta)
+        logger.debug(
+            "[AIFilter] %s — cache negativo (%+.1f) + fresco (%+.1f) → usando min=%+.1f",
+            base, cached, delta, combined,
+        )
+        return combined
 
     _set_cached(base, delta)
     return delta

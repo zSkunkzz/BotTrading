@@ -15,6 +15,17 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 11 desde v21-P3):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v22 (mejoras de calidad):
+  1. MTF bias filter: si el bias de 1h va contra la señal de 15m, se
+     requiere score >= MTF_BLOCK_SCORE_OVERRIDE (default=10) para pasar.
+     Añade campo extra["mtf_aligned"] True/False en SignalResult.
+  2. R/R mínimo dinámico por régimen (MIN_RR_REGIME_*):
+     TRENDING  → 1.6 (tendencia ayuda)
+     RANGING   → 2.0 (más incertidumbre)
+     VOLATILE  → 2.2 (ruido alto)
+     Si no se pasa régimen, usa MIN_RR (env) como antes.
+  El régimen se pasa como parámetro opcional `regime` a analyze_pair.
+
 CAMBIOS v21 (Prioridades 1, 2 y 3):
   P1 — OHLCV robustos:
   - _clean_bars(): elimina barras con None en cualquier campo OHLCV antes
@@ -74,6 +85,28 @@ log = logging.getLogger(__name__)
 
 MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "7"))
 MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
+
+# ── v22: R/R dinámico por régimen ──────────────────────────────────────────
+_MIN_RR_TRENDING  = float(os.getenv("MIN_RR_TRENDING",  "1.6"))
+_MIN_RR_RANGING   = float(os.getenv("MIN_RR_RANGING",   "2.0"))
+_MIN_RR_VOLATILE  = float(os.getenv("MIN_RR_VOLATILE",  "2.2"))
+
+def _min_rr_for_regime(regime: Optional[str]) -> float:
+    """Devuelve el R/R mínimo según el régimen de mercado."""
+    if not regime:
+        return MIN_RR
+    r = regime.upper()
+    if "TREND" in r:
+        return _MIN_RR_TRENDING
+    if "RANG" in r:
+        return _MIN_RR_RANGING
+    if "VOL" in r:
+        return _MIN_RR_VOLATILE
+    return MIN_RR
+
+# ── v22: MTF bias filter ────────────────────────────────────────────────────
+# Si el bias 1h va contra la señal 15m, se requiere score >= este umbral.
+_MTF_BLOCK_SCORE_OVERRIDE = int(os.getenv("MTF_BLOCK_SCORE_OVERRIDE", "10"))
 
 _FAST_ENTRY_MIN_SCORE = int(os.getenv("FAST_ENTRY_MIN_SCORE", "9"))
 _FAST_ENTRY_MIN_RR    = float(os.getenv("FAST_ENTRY_MIN_RR", "1.2"))
@@ -194,11 +227,25 @@ def _structure_sl(
     return sl_atr
 
 
+# ── v22: MTF bias helper ─────────────────────────────────────────────────────
+
+def _mtf_bias(ind_1h: dict) -> Optional[str]:
+    """Devuelve 'LONG', 'SHORT' o None según el bias de 1h (EMA21 vs EMA50)."""
+    if not ind_1h:
+        return None
+    if ind_1h.get("ema_bull"):
+        return "LONG"
+    if ind_1h.get("ema_bear"):
+        return "SHORT"
+    return None
+
+
 async def analyze_pair(
     exch,
     symbol: str,
     ohlcv_fn: Optional[Callable] = None,
     funding_rate: float = 0.0,
+    regime: Optional[str] = None,          # v22: régimen de mercado
 ) -> SignalResult:
     try:
         if ohlcv_fn is not None:
@@ -256,6 +303,21 @@ async def analyze_pair(
 
     if signal_str == "NEUTRAL" or setup_type is None:
         return _hold_result(symbol, f"NEUTRAL ({', '.join(reasons[-3:])})")
+
+    # ── v22: MTF bias filter ─────────────────────────────────────────────────
+    bias_1h = _mtf_bias(ind_1h)
+    mtf_aligned = (bias_1h is None) or (bias_1h == signal_str)
+    if not mtf_aligned:
+        if score < _MTF_BLOCK_SCORE_OVERRIDE:
+            return _hold_result(
+                symbol,
+                f"MTF bloqueado: señal 15m={signal_str} vs bias 1h={bias_1h} "
+                f"(score={score} < {_MTF_BLOCK_SCORE_OVERRIDE})",
+            )
+        log.warning(
+            "[signal_engine] %s MTF desalineado (%s vs 1h=%s) — PERMITIDO por score alto (%d)",
+            symbol, signal_str, bias_1h, score,
+        )
 
     from bot.session_filter import check_session
     session_block = check_session(setup_type)
@@ -330,19 +392,24 @@ async def analyze_pair(
     else:
         suggested_lev = max(1, int(_MAX_LEV * _EARLY_LEV_FACTOR))
 
+    # ── v22: R/R mínimo dinámico por régimen ────────────────────────────────
+    effective_min_rr = _min_rr_for_regime(regime)
+
     is_fast_valid = (
         entry_mode in ("FAST", "STRONG")
         and score >= _FAST_ENTRY_MIN_SCORE
         and rr >= _FAST_ENTRY_MIN_RR
     )
-    is_valid = (score >= MIN_SCORE and rr >= MIN_RR) or is_fast_valid
+    is_valid = (score >= MIN_SCORE and rr >= effective_min_rr) or is_fast_valid
 
     log.info(
-        "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f entry=%.6f sl=%.6f tp1=%.6f "
-        "tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s vwap=%.6f funding=%.4f%% | %s",
-        symbol, signal_str, setup_type, score, max_score, rr,
+        "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f(min=%.2f) entry=%.6f sl=%.6f "
+        "tp1=%.6f tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s vwap=%.6f "
+        "funding=%.4f%% mtf_aligned=%s regime=%s | %s",
+        symbol, signal_str, setup_type, score, max_score, rr, effective_min_rr,
         entry, sl, tp1, tp2, atr_val, suggested_lev, entry_mode, is_valid,
         ind_15m.get("vwap", 0.0), funding_rate * 100,
+        mtf_aligned, regime or "none",
         " · ".join(reasons),
     )
 
@@ -361,9 +428,21 @@ async def analyze_pair(
         suggested_lev=suggested_lev,
         indicators=indicators,
         is_valid=is_valid,
-        reason="" if is_valid else f"[{setup_type}] score={score}/{max_score} rr={rr:.2f} (min {MIN_RR})",
-        extra={"setup_type": setup_type, "sl_atr": sl_atr, "sl_used": sl,
-               "is_fast": is_fast_valid, "funding_rate": funding_rate},
+        reason="" if is_valid else (
+            f"[{setup_type}] score={score}/{max_score} rr={rr:.2f} "
+            f"(min_rr={effective_min_rr:.2f} regime={regime or 'none'})"
+        ),
+        extra={
+            "setup_type":    setup_type,
+            "sl_atr":        sl_atr,
+            "sl_used":       sl,
+            "is_fast":       is_fast_valid,
+            "funding_rate":  funding_rate,
+            "mtf_aligned":   mtf_aligned,
+            "bias_1h":       bias_1h,
+            "regime":        regime,
+            "effective_min_rr": effective_min_rr,
+        },
     )
 
 
@@ -703,8 +782,9 @@ def format_signal_block(signal) -> str:
     mode = signal.extra.get("setup_type", signal.entry_mode)
     sl_note   = " [struct]" if signal.extra.get("sl_atr") and signal.extra.get("sl_used") != signal.extra.get("sl_atr") else ""
     fast_note = " ⚡FAST" if signal.extra.get("is_fast") else ""
+    mtf_note  = "" if signal.extra.get("mtf_aligned", True) else " ⚠️MTF"
     lines = [
-        f"**{signal.symbol}** · {arrow} [{mode}]{fast_note}",
+        f"**{signal.symbol}** · {arrow} [{mode}]{fast_note}{mtf_note}",
         f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
     ]
     if signal.entry:
