@@ -43,105 +43,49 @@ FIX duplicate nonce (2026-06-05):
   se despachan desde asyncio.to_thread() con <1ms de diferencia, el
   OS puede asignarles el mismo timestamp — colisión garantizada.
   Fix:
-    - _EXCHANGE_LOCK: threading.Lock global (compartido entre todos los
-      HLClient que usan el mismo singleton Exchange).
-    - Todas las llamadas de escritura (place_limit, place_market, place_tp,
-      place_sl, place_bulk, cancel_order, cancel_all_open_tpsl y
-      update_leverage en trader.py) adquieren el lock ANTES de llamar al SDK.
+    - _EXCHANGE_LOCK: threading.Lock global.
+    - Todas las llamadas de escritura adquieren el lock ANTES de llamar al SDK.
     - El lock es threading.Lock (no asyncio.Lock) porque las llamadas
-      ocurren dentro de asyncio.to_thread() — en hilos del OS, no en el
-      event loop.
-    - Tras el lock se añade un sleep mínimo de _NONCE_MIN_DELAY_MS ms
-      (default 50ms) para garantizar timestamps distintos incluso si el
-      scheduler del OS reutiliza el hilo inmediatamente.
+      ocurren dentro de asyncio.to_thread() — en hilos del OS.
+    - Tras el lock se añade un sleep mínimo de _NONCE_MIN_DELAY_MS (50ms).
 
 FIX 429 en update_leverage (2026-06-05 v7):
-  CAUSA RAÍZ: con 7 traders serializados por _EXCHANGE_LOCK pero solo 2ms
-  de delay entre llamadas, HL recibe ~7 update_leverage en ráfaga rápida
-  al arranque → responde 429 (rate limit de CloudFront/nginx).
-  Fixes:
-    1. _NONCE_MIN_DELAY_MS: default 2ms → 50ms (configurable con
-       HL_NONCE_MIN_DELAY_MS). Con 7 traders = ~350ms total en arranque.
-    2. _exchange_call: retry automático con backoff exponencial cuando
-       HL responde 429. Hasta HL_EXCHANGE_RETRIES intentos (default 3)
-       con espera inicial de HL_EXCHANGE_RETRY_DELAY_S (default 2s),
-       duplicando en cada intento hasta máx 30s.
+  _NONCE_MIN_DELAY_MS: 2ms → 50ms. _exchange_call con retry backoff en 429.
 
 FIX get_positions / get_balance_usdc (2026-06-05):
-  CAUSA RAÍZ de '_get_positions: respuesta inesperada (tipo=list)' y
-  parálisis total con error:4 en decision_engine:
-  Cuando agent_mode=False (agente expirado/revocado), user_state() del SDK
-  puede devolver directamente una list en vez del dict {assetPositions:[...]}.
-  get_positions() llamaba .get() sobre la list → AttributeError inmediato.
-  Fixes:
-    1. get_positions(): isinstance check — maneja dict y list correctamente.
-    2. get_balance_usdc(): mismo isinstance guard defensivo.
-    3. Warning visible en startup cuando agent_mode=False para detectar
-       inmediatamente agente expirado/no configurado.
+  isinstance check para manejar dict y list en user_state().
 
 FIX 429 en _info calls + get_ohlcv endTime vela abierta (2026-06-05 v14):
-  BUG 1 — 429 en _get_positions (clearinghouseState):
-    CAUSA RAÍZ: get_positions() llama self._info.user_state() que usa el
-    SDK síncrono requests. Al ejecutarse via asyncio.to_thread(), el
-    semáforo _HL_SEMAPHORE de trader.py (aiohttp) NO lo cubre.
-    Con 10 traders llamando get_positions() simultáneamente en su
-    primer ciclo → 10 requests a clearinghouseState en ráfaga → 429.
-    FIX: _INFO_SEMAPHORE = threading.Semaphore(HL_INFO_CONCURRENCY, default 3)
-    Todas las llamadas a self._info.* que van a /info adquieren este
-    semáforo. Al ser threading.Semaphore funciona dentro de
-    asyncio.to_thread() (hilos OS, no event loop).
-
-  BUG 2 — get_ohlcv sin datos para BTC, HYPE y otros coins principales:
-    CAUSA RAÍZ: end_ts = int(time.time() * 1000) apunta al instante actual,
-    dentro de la vela abierta (aún no cerrada). HL devuelve [] silenciosamente
-    cuando endTime está en una vela abierta.
-    FIX: end_ts retrocede 2 intervalos para garantizar que siempre apunta
-    a la última vela CERRADA (2 intervalos absorben latencia y skew de reloj).
+  _INFO_SEMAPHORE threading (concurrencia=3). end_ts retrocede 2 intervalos.
 
 FIX caché compartido user_state (2026-06-05 v15):
-  CAUSA RAÍZ persistente de 429 en clearinghouseState:
-  Aunque _INFO_SEMAPHORE limita la concurrencia a 3 simultáneos, con 10
-  traders cada uno llamando get_user_state() en su ciclo de ~10s, se
-  generan ~10 llamadas/10s = 1 req/s a clearinghouseState POR CUENTA.
-  La respuesta es idéntica para todos (misma cuenta), así que hacer N
-  llamadas es redundante y agota el rate-limit.
-  FIX: caché singleton en _HLCore (_user_state_cache) compartido entre
-  TODOS los HLClient. TTL configurable con HL_USER_STATE_CACHE_TTL_S
-  (default 5s). get_user_state() devuelve el caché si es reciente,
-  evitando la ráfaga de requests idénticos a clearinghouseState.
-  Lock threading (_USER_STATE_LOCK) para acceso thread-safe desde
-  asyncio.to_thread().
+  _get_user_state_cached() con TTL=5s compartido entre todos los traders.
 
 FIX round_px tick alignment + triggerPx float (2026-06-05 v16):
-  BUG 1 — round_px usaba round() con pxDecimals.
-    HL exige múltiplos EXACTOS del tick_size (e.g. SOL tick=0.001).
-    round() podía generar 0.0013 → 'Price must be divisible by tick size'.
-    Fix: math.floor(price / tick + 0.5) * tick cuando tick > 0.
-
-  BUG 2 — place_tp / place_sl pasaban triggerPx como str(trigger_px).
-    El SDK float_to_wire() espera float →
-    ValueError: 'Unknown format code f for object of type str'.
-    Fix: trigger_px ya es float tras round_px(); pasar directamente.
-    También se fuerza float() sobre entry_price, tp_price, sl_price
-    para tolerar valores que lleguen como string desde state.json.
+  math.floor(price/tick+0.5)*tick. trigger_px como float.
 
 FIX SyntaxError _warm_cache (2026-06-05 v17):
-  CAUSA RAÍZ: el commit v16 (c919e593) dejó el bloque try de _warm_cache
-  incompleto — self._tick_size_cache[name] = ti (línea truncada, faltaba 'ck')
-  y sin except → SyntaxError: expected 'except' or 'finally' block.
-  El bot crasheaba en bucle desde las 13:06 UTC sin poder arrancar.
-  Fix: completar la línea y añadir except Exception con log de warning.
+  Completar línea truncada en _warm_cache.
 
-FIX get_positions caché compartida (2026-06-05 v20):
-  CAUSA RAÍZ de 429 persistentes en clearinghouseState con 20 traders:
-  get_positions() llamaba _info_call(self._info.user_state, ...) DIRECTAMENTE,
-  ignorando _get_user_state_cached(). Con 20 traders en su primer ciclo,
-  el _INFO_SEMAPHORE(3) serializaba de 3 en 3, pero aún generaba hasta 20
-  requests reales a clearinghouseState en ráfaga → 429 masivo.
-  Fix: get_positions() ahora llama _get_user_state_cached() igual que
-  get_user_state() y get_balance_usdc() — los 20 traders comparten UNA
-  sola llamada real a HL por TTL (default ahora 5s, antes 3s).
-  Resultado: 20 traders × clearinghouseState → máx 1 req cada 5s.
+FIX get_positions usa caché compartida (2026-06-05 v20):
+  get_positions() usa _get_user_state_cached() en vez de _info_call().
+
+FIX double-checked locking en _get_user_state_cached (2026-06-05 v21):
+  CAUSA RAÍZ de 429 persistentes con caché ya implementado:
+  El caché vacío + 20 traders simultáneos → todos leen _user_state_cache=None
+  ANTES de que ninguno actualice → 20 user_state() concurrentes → 429.
+
+  El lock anterior solo protegía la LECTURA del caché. El fetch ocurría
+  FUERA del lock → ventana de carrera abierta para los 20 threads.
+
+  Fix: patrón double-checked locking:
+    1. Lectura rápida sin lock (fast path — caso normal, caché caliente)
+    2. Si miss → adquirir lock → re-verificar caché (otro thread pudo
+       haber rellenado el caché mientras esperábamos el lock)
+    3. Solo si sigue siendo miss → hacer el fetch real a HL
+    4. Actualizar caché dentro del lock
+  Resultado: con 20 traders, solo 1 thread hace el fetch real.
+  Los otros 19 esperan el lock y al adquirirlo encuentran caché fresco.
 
 Autenticación soportada:
   Opción A (recomendada): API Wallet
@@ -187,7 +131,7 @@ _NONCE_MIN_DELAY_MS = float(os.getenv("HL_NONCE_MIN_DELAY_MS", "50")) / 1000.0
 
 # Reintentos automáticos en _exchange_call cuando HL responde 429.
 _EXCHANGE_RETRIES     = int(float(os.getenv("HL_EXCHANGE_RETRIES", "3")))
-_EXCHANGE_RETRY_DELAY = float(os.getenv("HL_EXCHANGE_RETRY_DELAY_S", "2.0"))
+_EXCHANGE_RETRY_DELAY = float(os.getenv("HL_EXCHANGE_RETRY_DELAY_S", "2.0"))  
 
 # Lock global de escritura al Exchange (threading porque va en to_thread).
 _EXCHANGE_LOCK = threading.Lock()
@@ -197,9 +141,8 @@ _HL_INFO_CONCURRENCY = int(os.getenv("HL_INFO_CONCURRENCY", "3"))
 _INFO_SEMAPHORE = threading.Semaphore(_HL_INFO_CONCURRENCY)
 
 # ── Caché compartido de user_state (singleton por cuenta) ───────────────────
-# FIX v20: TTL subido de 3s → 5s. Con 20 traders ciclo ~10s el TTL de 3s
-# era marginal; 5s garantiza que un burst de 20 traders en el mismo ciclo
-# comparta exactamente 1 request real a clearinghouseState.
+# FIX v21: TTL 5s. El fetch está protegido por double-checked locking para
+# garantizar que solo 1 thread haga el request real aunque 20 lleguen juntos.
 _USER_STATE_CACHE_TTL = float(os.getenv("HL_USER_STATE_CACHE_TTL_S", "5.0"))
 _USER_STATE_LOCK      = threading.Lock()
 _user_state_cache: dict | list | None = None
@@ -300,38 +243,57 @@ def _info_call(fn, *args, **kwargs):
 
 def _get_user_state_cached(info_obj, account_addr: str):
     """
-    FIX v15/v20: caché singleton compartido de user_state para toda la cuenta.
-    TTL configurable con HL_USER_STATE_CACHE_TTL_S (default 5s).
-    Lock threading para acceso seguro desde asyncio.to_thread().
-    Incluye retry con backoff exponencial + jitter en caso de 429.
+    FIX v21: double-checked locking para caché singleton de user_state.
 
-    Con 20 traders llamando get_positions() en el mismo ciclo, este caché
-    garantiza que solo se hace 1 request real a clearinghouseState cada 5s,
-    independientemente de cuántos traders soliciten el estado simultáneamente.
+    Patrón:
+      1. Fast path: leer caché sin lock (caso normal — caché caliente).
+         Si está fresco, retornar inmediatamente sin contención.
+      2. Si miss: adquirir lock → re-verificar caché dentro del lock.
+         (Otro thread puede haber rellenado el caché mientras esperábamos.)
+      3. Solo si sigue siendo miss dentro del lock: hacer fetch real a HL.
+      4. Escribir resultado en caché dentro del lock antes de liberarlo.
+
+    Con 20 traders llegando simultáneamente a caché vacío:
+      - Thread 1 adquiere el lock, ve miss, hace fetch, escribe caché.
+      - Threads 2-20 esperan el lock. Al adquirirlo, ven caché fresco → retornan.
+      - Resultado: 1 sola request real a clearinghouseState por ciclo de 5s.
     """
     global _user_state_cache, _user_state_cache_ts
 
+    # ── FAST PATH: sin lock ──────────────────────────────────────────────────
+    # Lectura no atómica pero segura en CPython (GIL) para el caso caliente.
     now = time.monotonic()
-    with _USER_STATE_LOCK:
-        if _user_state_cache is not None and (now - _user_state_cache_ts) < _USER_STATE_CACHE_TTL:
-            return _user_state_cache
+    cached = _user_state_cache
+    cached_ts = _user_state_cache_ts
+    if cached is not None and (now - cached_ts) < _USER_STATE_CACHE_TTL:
+        return cached
 
+    # ── SLOW PATH: adquirir lock y re-verificar ──────────────────────────────
     last_exc: Exception | None = None
     delay = _EXCHANGE_RETRY_DELAY
 
     for attempt in range(max(1, _EXCHANGE_RETRIES)):
         try:
-            with _INFO_SEMAPHORE:
-                result = info_obj.user_state(account_addr)
             with _USER_STATE_LOCK:
+                # Double-check dentro del lock: otro thread puede haber
+                # actualizado el caché mientras esperábamos el lock.
+                now2 = time.monotonic()
+                if _user_state_cache is not None and (now2 - _user_state_cache_ts) < _USER_STATE_CACHE_TTL:
+                    return _user_state_cache
+
+                # Fetch real — solo 1 thread llega aquí por ventana TTL.
+                with _INFO_SEMAPHORE:
+                    result = info_obj.user_state(account_addr)
+
                 _user_state_cache    = result
                 _user_state_cache_ts = time.monotonic()
-            return result
+                return result
+
         except Exception as exc:
             last_exc = exc
             if _is_429(exc) and attempt < _EXCHANGE_RETRIES - 1:
-                jitter   = random.uniform(0.0, 0.5)
-                sleep_s  = min(delay + jitter, 30.0)
+                jitter  = random.uniform(0.0, 0.5)
+                sleep_s = min(delay + jitter, 30.0)
                 logger.warning(
                     "[UserStateCache] 429 rate-limit (intento %d/%d) — reintentando en %.1fs",
                     attempt + 1, _EXCHANGE_RETRIES, sleep_s,
@@ -499,12 +461,12 @@ class HLClient:
     """
 
     def __init__(self, core: _HLCore, symbol: str) -> None:
-        self._core    = core
-        self._symbol  = symbol
-        self._coin    = _norm_coin(symbol)
-        self._info    = core.info
+        self._core     = core
+        self._symbol   = symbol
+        self._coin     = _norm_coin(symbol)
+        self._info     = core.info
         self._exchange = core.exchange
-        self._account = core.account_addr
+        self._account  = core.account_addr
 
     @classmethod
     async def create(cls, symbol: str) -> "HLClient":
@@ -530,14 +492,10 @@ class HLClient:
     def round_px(self, price: float) -> float:
         """
         FIX v16 Bug 1: redondea precio al múltiplo exacto del tick_size.
-        HL exige múltiplos EXACTOS (e.g. SOL tick=0.001 → 0.001, 0.002...).
-        round() con decimales podía generar 0.0013 → 'Price must be divisible by tick size'.
-        Fix: math.floor(price / tick + 0.5) * tick cuando tick > 0.
         """
         tick = self.get_tick_size()
         if tick > 0:
             return math.floor(price / tick + 0.5) * tick
-        # Fallback: redondear a px_decimals si no hay tick en caché
         px_dec = self.get_px_decimals()
         factor = 10 ** px_dec
         return math.floor(price * factor + 0.5) / factor
@@ -553,14 +511,8 @@ class HLClient:
 
     def get_positions(self) -> list[dict]:
         """
-        FIX v20: usa _get_user_state_cached() en vez de _info_call() directo.
-        Con 20 traders en el mismo ciclo, esto reduce N requests a HL a 1
-        request real por TTL (5s), eliminando los 429 en clearinghouseState.
-
-        Antes: _info_call(self._info.user_state, self._account)
-               → hasta 20 requests simultáneos → 429 masivo
-        Ahora: _get_user_state_cached(self._info, self._account)
-               → 1 request compartido entre todos los traders por TTL
+        FIX v20+v21: usa caché compartida con double-checked locking.
+        20 traders → 1 request real a clearinghouseState por TTL.
         """
         state = _get_user_state_cached(self._info, self._account)
         if isinstance(state, dict):
@@ -630,12 +582,11 @@ class HLClient:
         )
 
     def place_market(self, is_buy: bool, sz: float, reduce_only: bool = False) -> dict:
-        sz  = self._round_qty(sz)
+        sz   = self._round_qty(sz)
         mids = _info_call(self._info.all_mids)
         mid  = float(mids.get(self._coin, 0))
-        slippage = _MARKET_SLIPPAGE
-        px = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
-        px = self.round_px(px)
+        px   = mid * (1 + _MARKET_SLIPPAGE) if is_buy else mid * (1 - _MARKET_SLIPPAGE)
+        px   = self.round_px(px)
         order_type = {"limit": {"tif": "Ioc"}}
         return _exchange_call(
             self._exchange.order,
@@ -651,12 +602,9 @@ class HLClient:
         limit_price: Optional[float],
         entry_price: Optional[float] = None,
     ) -> dict:
-        """
-        FIX v16 Bug 2: trigger_px y limit_px se pasan como float, no str.
-        """
-        sz          = self._round_qty(sz)
-        tp_price    = float(tp_price)
-        trigger_px  = self.round_px(tp_price)
+        sz         = self._round_qty(sz)
+        tp_price   = float(tp_price)
+        trigger_px = self.round_px(tp_price)
 
         if limit_price is not None:
             lim_px = self.round_px(float(limit_price))
@@ -684,9 +632,6 @@ class HLClient:
         sl_price: float,
         entry_price: Optional[float] = None,
     ) -> dict:
-        """
-        FIX v16 Bug 2: trigger_px se pasa como float, no str.
-        """
         sz         = self._round_qty(sz)
         sl_price   = float(sl_price)
         trigger_px = self.round_px(sl_price)
