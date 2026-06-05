@@ -26,7 +26,7 @@ active_traders: dict = {}
 global_risk: GlobalRisk = None
 _trader_instances: dict = {}
 
-MAX_ACTIVE_TRADERS     = int(os.getenv("MAX_ACTIVE_TRADERS", "10"))   # era 5
+MAX_ACTIVE_TRADERS     = int(os.getenv("MAX_ACTIVE_TRADERS", "10"))
 _LEVERAGE_BASE         = int(os.getenv("LEVERAGE", "5"))
 _max_leverage_map: dict[str, int] = {}
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
@@ -120,7 +120,7 @@ async def _start_single_pair(symbol: str):
     )
     _trader_instances[symbol] = trader
     register_traders(_trader_instances)
-    task = asyncio.create_task(trader.run(make_risk(), global_risk=global_risk))
+    task = asyncio.create_task(trader.start())
     active_traders[symbol] = task
     _idle_cycles[symbol] = 0
 
@@ -133,10 +133,19 @@ async def stop_pair(symbol: str):
     if symbol not in active_traders:
         return
     task = active_traders.pop(symbol)
-    _trader_instances.pop(symbol, None)
+    trader = _trader_instances.pop(symbol, None)
     _idle_cycles.pop(symbol, None)
     register_traders(_trader_instances)
-    task.cancel()
+    if trader is not None:
+        try:
+            await asyncio.wait_for(trader.stop(), timeout=_TRADER_STOP_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            task.cancel()
+            logger.warning("[%s] stop() timeout — cancelando task.", symbol)
+        except Exception as e:
+            logger.debug("[%s] stop() error: %s", symbol, e)
+    else:
+        task.cancel()
     logger.info("\u23f9 Trader detenido: %s", symbol)
 
 
@@ -157,19 +166,22 @@ async def _stop_pair_with_cleanup(symbol: str) -> None:
     trader = _trader_instances.pop(symbol, None)
     _idle_cycles.pop(symbol, None)
     register_traders(_trader_instances)
-    if task and not task.done():
-        task.cancel()
+
     if trader is not None:
         try:
-            await asyncio.wait_for(trader._stopped_event.wait(), timeout=_TRADER_STOP_TIMEOUT_S)
+            await asyncio.wait_for(trader.stop(), timeout=_TRADER_STOP_TIMEOUT_S)
             logger.info("[%s] Trader parado limpiamente.", symbol)
         except asyncio.TimeoutError:
-            logger.warning("[%s] Trader no paró en %.0fs — continuando.", symbol, _TRADER_STOP_TIMEOUT_S)
-        try:
-            await trader.cleanup()
+            if task and not task.done():
+                task.cancel()
+            logger.warning("[%s] Trader no paró en %.0fs — cancelando task.", symbol, _TRADER_STOP_TIMEOUT_S)
         except Exception as e:
-            logger.debug("[%s] cleanup() secundario: %s", symbol, e)
+            logger.debug("[%s] stop() error secundario: %s", symbol, e)
+            if task and not task.done():
+                task.cancel()
     else:
+        if task and not task.done():
+            task.cancel()
         logger.info("\u23f9 Trader detenido: %s", symbol)
 
 
@@ -343,15 +355,12 @@ async def main():
 
     webhook_runner = await start_webhook_server()
 
-    # TOP_PAIRS = MAX_ACTIVE_TRADERS * 3 para tener suficientes candidatos en rotación
     top_n = int(os.getenv("TOP_PAIRS", str(MAX_ACTIVE_TRADERS * 3)))
     logger.info(
         "\u2699\ufe0f  MAX_ACTIVE_TRADERS=%d | TOP_PAIRS=%d | LEVERAGE_BASE=%dx | IDLE_ROTATE_CYCLES=%d",
         MAX_ACTIVE_TRADERS, top_n, _LEVERAGE_BASE, _IDLE_ROTATE_CYCLES,
     )
 
-    # PairScanner sin args explícitos: hereda SCANNER_TOP_N, SCANNER_REFRESH_MIN,
-    # SCANNER_MIN_VOLUME, SCANNER_MIN_CHANGE de env vars (defaults en pair_scanner.py)
     scanner = PairScanner(top_n=top_n)
 
     logger.info("\U0001f50d Escaneando mercado Hyperliquid inicial...")
