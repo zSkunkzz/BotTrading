@@ -41,6 +41,14 @@ FIX set_leverage (2026-06-05):
   self._exchange.update_leverage() con la firma correcta del SDK HL.
   trader._set_leverage() usaba update_leverage() que no existía.
 
+FIX semáforo info (2026-06-05):
+  Con 12 traders llamando all_mids() y user_state() en paralelo sin semáforo
+  → hasta 24 requests SDK simultáneas → CloudFront/HL devuelve 429 masivos.
+  _HLCore._info_semaphore: asyncio.Semaphore(HL_INFO_CONCURRENCY, default 4)
+  inicializado lazy dentro del event loop via get_info_semaphore().
+  trader.get_price() y trader._get_positions() adquieren este semáforo antes
+  de cualquier llamada a self._info.*
+
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -52,6 +60,7 @@ Autenticación soportada:
 
 Opcionales:
   HL_TESTNET             — «true» para testnet
+  HL_INFO_CONCURRENCY    — máx. requests info simultáneas (default 4)
 """
 from __future__ import annotations
 
@@ -80,6 +89,11 @@ _TP_LIMIT_BUFFER = 0.001
 
 POST_FILL_CONFIRM_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "6"))
 POST_FILL_CONFIRM_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "3.0"))
+
+# ── Semáforo global para llamadas info (all_mids, user_state, etc.) ──────────
+# Limita requests SDK síncronos simultáneos que no son OHLCV.
+# Con 12 traders × 2 llamadas/ciclo = 24 simultáneas → 429. Default 4.
+_HL_INFO_CONCURRENCY = int(os.getenv("HL_INFO_CONCURRENCY", "4"))
 
 
 def _norm_coin(symbol: str) -> str:
@@ -118,9 +132,9 @@ class _HLCore:
     """
 
     _instance: "_HLCore | None" = None
-    # Lock para serializar la creación concurrente del singleton.
-    # Se inicializa lazy para evitar problemas si se importa antes de asyncio.run().
-    _init_lock: "asyncio.Lock | None" = None
+    # Locks/semáforos lazy para evitar problemas si se importa antes de asyncio.run().
+    _init_lock:       "asyncio.Lock | None"      = None
+    _info_semaphore:  "asyncio.Semaphore | None" = None
 
     def __init__(self) -> None:
         api_pk     = os.getenv("HL_API_PRIVATE_KEY", "").strip()
@@ -262,13 +276,6 @@ class _HLCore:
     # ── Acceso síncrono (SOLO para código que ya corre en un hilo) ────
     @classmethod
     def get(cls) -> "_HLCore":
-        """
-        Acceso SÍNCRONO al singleton. Solo usar desde:
-          - asyncio.to_thread() (ya en hilo separado)
-          - tests síncronos
-        NUNCA llamar directamente desde __init__ de clases que se crean
-        antes del event loop, ni desde corrutinas async.
-        """
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
@@ -276,19 +283,6 @@ class _HLCore:
     # ── Acceso async (usar siempre desde código async) ────────────────
     @classmethod
     async def get_async(cls) -> "_HLCore":
-        """
-        FIX FREEZE: crea o devuelve el singleton de forma async-safe.
-
-        Si el singleton no existe, lo crea dentro de asyncio.to_thread()
-        para que todas las llamadas HTTP síncronas del SDK (requests)
-        no bloqueen el event loop.
-
-        El asyncio.Lock serializa creaciones concurrentes: si 7 traders
-        llaman get_async() en paralelo, solo el primero crea el singleton;
-        los demás esperan (sin bloquear el event loop) y luego reutilizan
-        la instancia ya creada.
-        """
-        # Inicializar el lock lazy (debe crearse dentro del event loop)
         if cls._init_lock is None:
             cls._init_lock = asyncio.Lock()
 
@@ -296,7 +290,6 @@ class _HLCore:
             return cls._instance
 
         async with cls._init_lock:
-            # Double-check tras adquirir el lock
             if cls._instance is not None:
                 return cls._instance
             logger.info("[HLCore] Inicializando SDK en hilo separado (asyncio.to_thread)...")
@@ -305,8 +298,23 @@ class _HLCore:
 
     @classmethod
     def _create_sync(cls) -> "_HLCore":
-        """Creación síncrona del singleton — solo llamar desde to_thread."""
         return cls()
+
+    # ── Semáforo para llamadas info (all_mids, user_state, etc.) ─────
+    @classmethod
+    def get_info_semaphore(cls) -> asyncio.Semaphore:
+        """
+        Lazy-init del semáforo de concurrencia para llamadas info.
+        Limita all_mids() + user_state() simultáneos a HL_INFO_CONCURRENCY
+        (default 4) para evitar 429 cuando hay 12+ traders en paralelo.
+        """
+        if cls._info_semaphore is None:
+            cls._info_semaphore = asyncio.Semaphore(_HL_INFO_CONCURRENCY)
+            logger.info(
+                "[HLCore] Semáforo info inicializado: max_concurrency=%d (env HL_INFO_CONCURRENCY)",
+                _HL_INFO_CONCURRENCY,
+            )
+        return cls._info_semaphore
 
     @staticmethod
     def _build_exchange_with_retry(wallet, kwargs: dict, retries: int = 6) -> Exchange:
@@ -367,8 +375,6 @@ class HLClient:
         self.symbol = symbol
         self.coin   = _norm_coin(symbol)
         if core is None:
-            # Fallback síncrono — solo seguro si _HLCore ya fue creado antes
-            # via get_async(). Si no, lanzará una excepción clara.
             if _HLCore._instance is None:
                 raise RuntimeError(
                     f"[HLClient] {symbol}: _HLCore no inicializado. "
@@ -384,11 +390,6 @@ class HLClient:
 
     @classmethod
     async def create(cls, symbol: str) -> "HLClient":
-        """
-        FIX FREEZE: constructor async-safe.
-        Inicializa _HLCore (si no existe) en un hilo separado via to_thread,
-        luego crea el HLClient ligero sin ninguna llamada HTTP.
-        """
         core = await _HLCore.get_async()
         return cls(symbol, core=core)
 
@@ -512,14 +513,8 @@ class HLClient:
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> dict:
         """
-        Configura el apalancamiento en Hyperliquid.
-
-        FIX (2026-06-05): trader._set_leverage() llamaba update_leverage()
-        que no existe en HLClient. El SDK HL expone:
+        FIX (2026-06-05): firma correcta del SDK HL:
           exchange.update_leverage(leverage, coin, is_cross)
-        con esta firma exacta (leverage primero, luego coin).
-
-        is_cross=False → isolated margin (default para futuros perpetuos).
         """
         return self._exchange.update_leverage(leverage, coin, is_cross)
 
@@ -719,7 +714,7 @@ class HLClient:
                     r = self.cancel_order(oid)
                     results.append(r)
                     logger.info(
-                        "[%s] Trigger order cancelada: oid=%s type=%s",
-                        self.coin, oid, ot,
+                        "[%s] Cancelada orden TPSL oid=%s",
+                        self.coin, oid,
                     )
         return results
