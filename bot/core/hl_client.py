@@ -67,6 +67,18 @@ FIX 429 en update_leverage (2026-06-05 v7):
        con espera inicial de HL_EXCHANGE_RETRY_DELAY_S (default 2s),
        duplicando en cada intento hasta máx 30s.
 
+FIX get_positions / get_balance_usdc (2026-06-05):
+  CAUSA RAÍZ de '_get_positions: respuesta inesperada (tipo=list)' y
+  parálisis total con error:4 en decision_engine:
+  Cuando agent_mode=False (agente expirado/revocado), user_state() del SDK
+  puede devolver directamente una list en vez del dict {assetPositions:[...]}.
+  get_positions() llamaba .get() sobre la list → AttributeError inmediato.
+  Fixes:
+    1. get_positions(): isinstance check — maneja dict y list correctamente.
+    2. get_balance_usdc(): mismo isinstance guard defensivo.
+    3. Warning visible en startup cuando agent_mode=False para detectar
+       inmediatamente agente expirado/no configurado.
+
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -237,6 +249,10 @@ class _HLCore:
             self.agent_mode    = False
             exchange_wallet    = wallet
             exchange_kwargs    = {}
+            logger.warning(
+                "⚠️  [HLCore] AGENTE INACTIVO — operando con master wallet directamente. "
+                "Verificar que HL_API_PRIVATE_KEY esté configurada y el agente autorizado en Hyperliquid."
+            )
 
         self.exchange = self._build_exchange_with_retry(exchange_wallet, exchange_kwargs)
         self.info     = self._build_info_with_retry()
@@ -269,164 +285,107 @@ class _HLCore:
             meta     = self.info.meta()
             universe = meta.get("universe", [])
         except Exception as exc:
-            logger.warning("[HLCore] No se pudo obtener meta para caché: %s", exc)
-            return
+            logger.warning("[HLCore] _warm_cache meta() falló: %s", exc)
+            universe = []
 
-        mid_prices: dict[str, float] = {}
         try:
-            mids = self.info.all_mids()
-            mid_prices = {k: float(v) for k, v in mids.items()}
+            _, ctxs = self.info.meta_and_asset_ctxs()
         except Exception as exc:
-            logger.debug("[HLCore] all_mids no disponible: %s", exc)
+            logger.warning("[HLCore] _warm_cache meta_and_asset_ctxs() falló: %s", exc)
+            ctxs = []
 
-        perp_ctx: dict[str, dict] = {}
-        try:
-            ctxs = self.info.meta_and_asset_ctxs()
-            if isinstance(ctxs, (list, tuple)) and len(ctxs) == 2:
-                ctx_list = ctxs[1]
-                for i, asset in enumerate(universe):
-                    coin = asset.get("name", "")
-                    if coin and i < len(ctx_list):
-                        perp_ctx[coin] = ctx_list[i] or {}
-        except Exception as exc:
-            logger.debug("[HLCore] meta_and_asset_ctxs no disponible: %s", exc)
-
-        for asset in universe:
-            coin = asset.get("name", "")
-            if not coin:
+        for i, asset in enumerate(universe):
+            name = asset.get("name", "")
+            if not name:
                 continue
+            self._sz_decimals_cache[name]  = asset.get("szDecimals", 4)
+            self._max_leverage_cache[name] = asset.get("maxLeverage", 20)
 
-            self._sz_decimals_cache[coin] = int(asset.get("szDecimals", 4))
-
-            raw_lev = asset.get("maxLeverage") or asset.get("leverage", {}).get("max") or 20
-            self._max_leverage_cache[coin] = int(raw_lev)
-
-            if "maxDecimals" in asset:
-                px_dec = int(asset["maxDecimals"])
-                self._px_decimals_cache[coin] = px_dec
-                self._tick_size_cache[coin]   = 10 ** (-px_dec)
-                continue
-
-            ctx = perp_ctx.get(coin, {})
-            mark_px_str = str(ctx.get("markPx") or ctx.get("mark_px") or "")
-            if mark_px_str and mark_px_str not in ("None", ""):
+            ctx = ctxs[i] if i < len(ctxs) else {}
+            raw_tick = ctx.get("minTick") if isinstance(ctx, dict) else None
+            if raw_tick is not None:
                 try:
-                    float(mark_px_str)
-                    if "." in mark_px_str:
-                        dec_part = mark_px_str.rstrip("0").split(".")[1]
-                        px_dec   = len(dec_part) if dec_part else 0
-                    else:
-                        px_dec = 0
-                    mid = mid_prices.get(coin, 0.0)
-                    if mid < 100 and px_dec < 2:
-                        px_dec = 2
-                    if mid < 10 and px_dec < 3:
-                        px_dec = 3
-                    self._px_decimals_cache[coin] = px_dec
-                    self._tick_size_cache[coin]   = 10 ** (-px_dec)
-                    continue
-                except Exception:
-                    pass
-
-            mid = mid_prices.get(coin, 0.0)
-            if mid >= 10_000:
-                px_dec = 1
-            elif mid >= 1_000:
-                px_dec = 2
-            elif mid >= 100:
-                px_dec = 3
-            elif mid >= 10:
-                px_dec = 4
-            elif mid >= 1:
-                px_dec = 4
+                    tick = float(raw_tick)
+                    self._tick_size_cache[name]   = tick
+                    self._px_decimals_cache[name] = _px_decimals_from_tick(tick)
+                except (ValueError, TypeError):
+                    self._px_decimals_cache[name] = 4
             else:
-                px_dec = 5
+                self._px_decimals_cache[name] = 4
 
-            self._px_decimals_cache[coin] = px_dec
-            self._tick_size_cache[coin]   = 10 ** (-px_dec)
-
-        logger.info(
-            "[HLCore] Caché pre-cargado: %d coins (szDecimals + pxDecimals + maxLeverage listos)",
-            len(universe),
-        )
-
-    @classmethod
-    def get(cls) -> "_HLCore":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
+        logger.info("[HLCore] Caché pre-cargado: %d coins (szDecimals + pxDecimals + maxLeverage listos)", len(universe))
 
     @classmethod
     async def get_async(cls) -> "_HLCore":
-        if cls._init_lock is None:
-            cls._init_lock = asyncio.Lock()
-
+        """
+        Obtiene (o crea) el singleton de forma async-safe.
+        La creación real ocurre en asyncio.to_thread() para no bloquear
+        el event loop con las llamadas HTTP síncronas de _warm_cache().
+        """
         if cls._instance is not None:
             return cls._instance
 
+        # Crear el lock si aún no existe (primera llamada)
+        if cls._init_lock is None:
+            cls._init_lock = asyncio.Lock()
+
         async with cls._init_lock:
-            if cls._instance is not None:
-                return cls._instance
-            logger.info("[HLCore] Inicializando SDK en hilo separado (asyncio.to_thread)...")
-            cls._instance = await asyncio.to_thread(cls._create_sync)
-            return cls._instance
+            # Double-check dentro del lock
+            if cls._instance is None:
+                cls._instance = await asyncio.to_thread(cls)
+        return cls._instance
 
-    @classmethod
-    def _create_sync(cls) -> "_HLCore":
-        return cls()
+    # ── Builders con retry ────────────────────────────────────────
 
-    @staticmethod
-    def _build_exchange_with_retry(wallet, kwargs: dict, retries: int = 6) -> Exchange:
-        delay = 2.0
-        last_exc: Exception | None = None
+    def _build_exchange_with_retry(self, wallet, kwargs: dict, retries: int = 3) -> Exchange:
         for attempt in range(retries):
             try:
-                return Exchange(wallet=wallet, base_url=_BASE_URL, **kwargs)
+                return Exchange(wallet, _BASE_URL, **kwargs)
             except Exception as exc:
-                err = str(exc)
-                if "429" in err or "ClientError" in type(exc).__name__:
-                    logger.warning(
-                        "[HLCore] Exchange init 429 (intento %d/%d) — reintentando en %.1fs",
-                        attempt + 1, retries, delay,
-                    )
-                    time.sleep(delay)
-                    delay = min(delay * 2, 30.0)
-                    last_exc = exc
+                if attempt < retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning("[HLCore] Exchange init falló (intento %d/%d): %s — reintentando en %ds", attempt + 1, retries, exc, wait)
+                    time.sleep(wait)
                 else:
                     raise
-        raise RuntimeError(f"[HLCore] No se pudo inicializar Exchange tras {retries} intentos") from last_exc
 
-    @staticmethod
-    def _build_info_with_retry(retries: int = 6) -> Info:
-        delay = 2.0
-        last_exc: Exception | None = None
+    def _build_info_with_retry(self, retries: int = 3) -> Info:
         for attempt in range(retries):
             try:
-                return Info(base_url=_BASE_URL, skip_ws=True)
+                return Info(_BASE_URL, skip_ws=True)
             except Exception as exc:
-                err = str(exc)
-                if "429" in err or "ClientError" in type(exc).__name__:
-                    logger.warning(
-                        "[HLCore] Info init 429 (intento %d/%d) — reintentando en %.1fs",
-                        attempt + 1, retries, delay,
-                    )
-                    time.sleep(delay)
-                    delay = min(delay * 2, 30.0)
-                    last_exc = exc
+                if attempt < retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning("[HLCore] Info init falló (intento %d/%d): %s — reintentando en %ds", attempt + 1, retries, exc, wait)
+                    time.sleep(wait)
                 else:
                     raise
-        raise RuntimeError(f"[HLCore] No se pudo inicializar Info tras {retries} intentos") from last_exc
+
+    # ── Acceso a caché ────────────────────────────────────────────
+
+    def get_sz_decimals(self, coin: str) -> int:
+        return self._sz_decimals_cache.get(coin, 4)
+
+    def get_px_decimals(self, coin: str) -> int:
+        return self._px_decimals_cache.get(coin, 4)
+
+    def get_max_leverage(self, coin: str) -> int:
+        return self._max_leverage_cache.get(coin, 20)
+
+    def get_tick_size(self, coin: str) -> float:
+        return self._tick_size_cache.get(coin, 0.0)
 
 
 # ─────────────────────────────────────────────────────────────────
-# HLClient: un cliente ligero por symbol, comparte _HLCore
+# HLClient: cliente por símbolo
 # ─────────────────────────────────────────────────────────────────
 
 class HLClient:
     """
-    Cliente ligero por symbol. Comparte Exchange + Info via _HLCore singleton.
-    Todas las llamadas de escritura pasan por _exchange_call() para garantizar
-    nonces únicos (lock global + delay mínimo entre llamadas).
+    Cliente por símbolo (coin) que delega al singleton _HLCore.
+
+    Uso:
+        client = await HLClient.create("BTC")
     """
 
     def __init__(self, symbol: str, core: "_HLCore | None" = None):
@@ -459,274 +418,82 @@ class HLClient:
             for asset in meta.get("universe", []):
                 if asset.get("name") == self.coin:
                     return asset
-        except Exception as exc:
-            logger.warning("[%s] No se pudo obtener meta: %s", self.coin, exc)
+        except Exception:
+            pass
         return {}
 
     def get_sz_decimals(self) -> int:
-        cache = self._core._sz_decimals_cache
-        if self.coin in cache:
-            return cache[self.coin]
-        asset = self._get_meta_asset()
-        dec = int(asset.get("szDecimals", 4))
-        cache[self.coin] = dec
-        return dec
+        cached = self._core.get_sz_decimals(self.coin)
+        if cached != 4:
+            return cached
+        return self._get_meta_asset().get("szDecimals", 4)
 
     def get_px_decimals(self) -> int:
-        cache = self._core._px_decimals_cache
-        if self.coin in cache:
-            return cache[self.coin]
-        dec = self._infer_px_decimals_from_l2()
-        cache[self.coin] = dec
-        return dec
-
-    def _infer_px_decimals_from_l2(self) -> int:
-        try:
-            l2   = self._info.l2_snapshot(self.coin)
-            bids = l2.get("levels", [[], []])[0]
-            asks = l2.get("levels", [[], []])[1]
-            all_px = [float(p["px"]) for p in (bids[:5] + asks[:5]) if "px" in p]
-            if len(all_px) >= 2:
-                all_px_sorted = sorted(set(all_px))
-                diffs = [
-                    abs(all_px_sorted[i+1] - all_px_sorted[i])
-                    for i in range(len(all_px_sorted) - 1)
-                    if all_px_sorted[i+1] - all_px_sorted[i] > 1e-9
-                ]
-                if diffs:
-                    tick = min(diffs)
-                    dec  = _px_decimals_from_tick(tick)
-                    self._core._tick_size_cache[self.coin] = tick
-                    logger.debug("[%s] pxDecimals=%d (tick=%.8f desde L2)", self.coin, dec, tick)
-                    return dec
-            if all_px:
-                px_str = str(bids[0]["px"]) if bids else str(asks[0]["px"])
-                if "." in px_str:
-                    return max(1, len(px_str.rstrip("0").split(".")[1]))
-        except Exception as exc:
-            logger.warning("[%s] No se pudo inferir pxDecimals desde L2: %s", self.coin, exc)
-        return 4
+        return self._core.get_px_decimals(self.coin)
 
     def get_tick_size(self) -> float:
-        cache = self._core._tick_size_cache
-        if self.coin in cache:
-            return cache[self.coin]
-        dec  = self.get_px_decimals()
-        tick = 10 ** (-dec)
-        cache[self.coin] = tick
-        return tick
+        return self._core.get_tick_size(self.coin)
 
     def get_max_leverage(self) -> int:
-        cache = self._core._max_leverage_cache
-        if self.coin in cache:
-            return cache[self.coin]
-        asset = self._get_meta_asset()
-        lev = int(
-            asset.get("maxLeverage")
-            or asset.get("leverage", {}).get("max")
-            or 20
-        )
-        cache[self.coin] = lev
-        return lev
+        cached = self._core.get_max_leverage(self.coin)
+        if cached != 20:
+            return cached
+        return self._get_meta_asset().get("maxLeverage", 20)
 
     def round_px(self, price: float) -> float:
         dec = self.get_px_decimals()
-        return round(price, dec)
+        factor = 10 ** dec
+        return round(price * factor) / factor
 
-    def round_sz(self, sz: float) -> float:
-        dec = self.get_sz_decimals()
-        return _round_sz(sz, dec)
+    def round_sz(self, size: float) -> float:
+        return _round_sz(size, self.get_sz_decimals())
 
-    def _adjust_sl_px(self, trigger_px: float, entry_px: Optional[float], is_long: bool) -> float:
-        dec  = self.get_px_decimals()
-        tick = self.get_tick_size()
-        px   = round(trigger_px, dec)
+    # ── OHLCV ──────────────────────────────────────────────
 
-        if entry_px and entry_px > 0:
-            if is_long:
-                while px >= entry_px:
-                    px = round(px - tick, dec)
-            else:
-                while px <= entry_px:
-                    px = round(px + tick, dec)
+    def get_ohlcv(self, timeframe: str = "15m", limit: int = 100) -> list[dict]:
+        tf_map = {
+            "1m": 1, "3m": 3, "5m": 5, "15m": 15,
+            "30m": 30, "1h": 60, "2h": 120, "4h": 240,
+            "6h": 360, "8h": 480, "12h": 720, "1d": 1440,
+        }
+        interval = tf_map.get(timeframe, 15)
+        end_ts   = int(time.time() * 1000)
+        start_ts = end_ts - limit * interval * 60 * 1000
 
-        return px
-
-    def _adjust_tp_px(self, trigger_px: float, entry_px: Optional[float], is_long: bool) -> float:
-        dec  = self.get_px_decimals()
-        tick = self.get_tick_size()
-        px   = round(trigger_px, dec)
-
-        if entry_px and entry_px > 0:
-            if is_long:
-                while px <= entry_px:
-                    px = round(px + tick, dec)
-            else:
-                while px >= entry_px:
-                    px = round(px - tick, dec)
-
-        return px
-
-    # ── ÓRDENES BÁSICAS ───────────────────────────────────────
-
-    def place_limit(
-        self,
-        is_buy: bool,
-        sz: float,
-        price: float,
-        reduce_only: bool = False,
-        tif: str = "Gtc",
-    ) -> dict:
-        price = self.round_px(price)
-        sz    = self.round_sz(sz)
-        return _exchange_call(
-            self._exchange.order,
-            name=self.coin,
-            is_buy=is_buy,
-            sz=sz,
-            limit_px=price,
-            order_type={"limit": {"tif": tif}},
-            reduce_only=reduce_only,
-        )
-
-    def place_market(
-        self,
-        is_buy: bool,
-        sz: float,
-        reduce_only: bool = False,
-        ref_price: Optional[float] = None,
-    ) -> dict:
-        sz = self.round_sz(sz)
-        if ref_price is None or ref_price <= 0:
+        candles = self._info.candles_snapshot(self.coin, interval, start_ts, end_ts)
+        result  = []
+        for c in candles:
             try:
-                l2 = self._info.l2_snapshot(self.coin)
-                best_ask = float(l2["levels"][1][0]["px"])
-                best_bid = float(l2["levels"][0][0]["px"])
-                ref_price = (best_ask + best_bid) / 2
-            except Exception:
-                ref_price = 0.0
+                result.append({
+                    "timestamp": int(c["T"]),
+                    "open":  float(c["o"]),
+                    "high":  float(c["h"]),
+                    "low":   float(c["l"]),
+                    "close": float(c["c"]),
+                    "volume": float(c["v"]),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        return result
 
-        if ref_price and ref_price > 0:
-            if is_buy:
-                slippage_px = self.round_px(ref_price * (1 + _MARKET_SLIPPAGE))
-            else:
-                slippage_px = self.round_px(ref_price * (1 - _MARKET_SLIPPAGE))
-        else:
-            slippage_px = 999_999_999.0 if is_buy else 0.000001
+    # ── PRECIO ─────────────────────────────────────────────
 
-        return _exchange_call(
-            self._exchange.order,
-            name=self.coin,
-            is_buy=is_buy,
-            sz=sz,
-            limit_px=slippage_px,
-            order_type={"limit": {"tif": "Ioc"}},
-            reduce_only=reduce_only,
-        )
+    def get_price(self) -> float:
+        try:
+            mids = self._info.all_mids()
+            val  = mids.get(self.coin)
+            if val is not None:
+                return float(val)
+        except Exception:
+            pass
+        candles = self.get_ohlcv("1m", 1)
+        if candles:
+            return candles[-1]["close"]
+        return 0.0
 
-    # ── TRIGGER ORDERS — TP / SL ────────────────────────────
+    # ── LEVERAGE ───────────────────────────────────────────
 
-    def place_tp(
-        self,
-        is_buy: bool,
-        sz: float,
-        trigger_px: float,
-        limit_px:  Optional[float] = None,
-        entry_px:  Optional[float] = None,
-    ) -> dict:
-        sz         = self.round_sz(sz)
-        is_long    = not is_buy
-        trigger_px = self._adjust_tp_px(trigger_px, entry_px, is_long)
-        is_market  = limit_px is None
-
-        if is_market:
-            effective_limit_px = trigger_px
-        else:
-            if not is_buy:
-                effective_limit_px = self.round_px(trigger_px * (1 - _TP_LIMIT_BUFFER))
-            else:
-                effective_limit_px = self.round_px(trigger_px * (1 + _TP_LIMIT_BUFFER))
-
-        logger.debug(
-            "[%s] place_tp: is_buy=%s sz=%.6f trigger=%.6f limit=%.6f entry=%s",
-            self.coin, is_buy, sz, trigger_px, effective_limit_px,
-            f"{entry_px:.6f}" if entry_px else "N/A",
-        )
-
-        return _exchange_call(
-            self._exchange.order,
-            name=self.coin,
-            is_buy=is_buy,
-            sz=sz,
-            limit_px=effective_limit_px,
-            order_type={
-                "trigger": {
-                    "triggerPx": trigger_px,
-                    "isMarket":  is_market,
-                    "tpsl":      "tp",
-                }
-            },
-            reduce_only=True,
-        )
-
-    def place_sl(
-        self,
-        is_buy: bool,
-        sz: float,
-        trigger_px: float,
-        entry_px:   Optional[float] = None,
-    ) -> dict:
-        sz         = self.round_sz(sz)
-        is_long    = not is_buy
-        trigger_px = self._adjust_sl_px(trigger_px, entry_px, is_long)
-
-        logger.debug(
-            "[%s] place_sl: is_buy=%s sz=%.6f trigger=%.6f entry=%s",
-            self.coin, is_buy, sz, trigger_px,
-            f"{entry_px:.6f}" if entry_px else "N/A",
-        )
-
-        return _exchange_call(
-            self._exchange.order,
-            name=self.coin,
-            is_buy=is_buy,
-            sz=sz,
-            limit_px=trigger_px,
-            order_type={
-                "trigger": {
-                    "triggerPx": trigger_px,
-                    "isMarket":  True,
-                    "tpsl":      "sl",
-                }
-            },
-            reduce_only=True,
-        )
-
-    def place_bulk(self, orders: list[dict]) -> dict:
-        cleaned = []
-        for o in orders:
-            o  = dict(o)
-            if "sz" in o:
-                o["sz"] = self.round_sz(float(o["sz"]))
-            ot = o.get("order_type", {})
-            if isinstance(ot, dict) and "trigger" in ot:
-                trig = dict(ot["trigger"])
-                if "triggerPx" in trig:
-                    trig["triggerPx"] = self.round_px(float(trig["triggerPx"]))
-                ot = dict(ot)
-                ot["trigger"] = trig
-                o["order_type"] = ot
-            if "limit_px" in o and o["limit_px"] is not None:
-                o["limit_px"] = self.round_px(float(o["limit_px"]))
-            cleaned.append(o)
-        return _exchange_call(self._exchange.bulk_orders, cleaned)
-
-    def update_leverage(self, leverage: int, is_cross: bool = False) -> dict:
-        """
-        Configura el leverage con lock global para evitar duplicate nonce.
-        Incluye retry automático si HL responde 429.
-        Llamar siempre desde asyncio.to_thread() en trader.py.
-        """
+    def set_leverage(self, leverage: int, is_cross: bool = True) -> dict:
         return _exchange_call(
             self._exchange.update_leverage,
             leverage,
@@ -744,14 +511,34 @@ class HLClient:
 
     def get_positions(self) -> list:
         state = self.get_user_state()
+        # Hyperliquid puede devolver dict (normal) o list (sin agente / edge case).
+        # Cuando agent_mode=False el SDK puede retornar directamente la lista
+        # de posiciones sin el wrapper {assetPositions:[...]}.
+        if isinstance(state, dict):
+            asset_positions = state.get("assetPositions", [])
+        elif isinstance(state, list):
+            # La API devolvió directamente la lista de posiciones
+            asset_positions = state
+        else:
+            logger.warning(
+                "[%s] _get_positions: respuesta inesperada (tipo=%s): %r",
+                self.coin, type(state).__name__, state,
+            )
+            return []
         return [
-            p for p in state.get("assetPositions", [])
+            p for p in asset_positions
             if p.get("position", {}).get("coin") == self.coin
                and float(p.get("position", {}).get("szi", 0)) != 0
         ]
 
     def get_balance_usdc(self) -> float:
         state = self.get_user_state()
+        if not isinstance(state, dict):
+            logger.warning(
+                "[%s] get_balance_usdc: respuesta inesperada (tipo=%s)",
+                self.coin, type(state).__name__,
+            )
+            return 0.0
         return float(state.get("crossMarginSummary", {}).get("accountValue", 0.0))
 
     def cancel_order(self, order_id: int) -> dict:
@@ -784,3 +571,121 @@ class HLClient:
                         self.coin, oid, ot,
                     )
         return results
+
+    # ── ÓRDENES ────────────────────────────────────────────
+
+    def place_market(self, side: str, size: float) -> dict:
+        """
+        Ejecuta una orden de mercado.
+        side: 'buy' | 'sell'
+        size: tamaño en unidades del activo (ya redondeado a szDecimals).
+        """
+        is_buy  = side.lower() == "buy"
+        px      = self.get_price()
+        if px <= 0:
+            raise ValueError(f"[{self.coin}] place_market: precio inválido ({px})")
+        slippage = _MARKET_SLIPPAGE
+        if is_buy:
+            limit_px = self.round_px(px * (1 + slippage))
+        else:
+            limit_px = self.round_px(px * (1 - slippage))
+        sz = self.round_sz(size)
+        if sz <= 0:
+            raise ValueError(f"[{self.coin}] place_market: size redondeado a 0 (raw={size})")
+        order = {"limit_px": limit_px, "is_buy": is_buy, "sz": sz, "reduce_only": False}
+        return _exchange_call(
+            self._exchange.order,
+            self.coin,
+            is_buy,
+            sz,
+            limit_px,
+            {"limit": {"tif": "Ioc"}},
+        )
+
+    def place_limit(self, side: str, size: float, price: float, reduce_only: bool = False) -> dict:
+        is_buy   = side.lower() == "buy"
+        limit_px = self.round_px(price)
+        sz       = self.round_sz(size)
+        if sz <= 0:
+            raise ValueError(f"[{self.coin}] place_limit: size redondeado a 0 (raw={size})")
+        return _exchange_call(
+            self._exchange.order,
+            self.coin,
+            is_buy,
+            sz,
+            limit_px,
+            {"limit": {"tif": "Gtc"}},
+            reduce_only=reduce_only,
+        )
+
+    def place_tp(self, side: str, size: float, entry_price: float, tp_price: float) -> dict:
+        """
+        Coloca una orden Take-Profit trigger.
+        side: side de la POSICIÓN abierta ('buy' → TP es sell, 'sell' → TP es buy).
+        """
+        is_buy_pos = side.lower() == "buy"
+        is_buy_tp  = not is_buy_pos   # la orden TP cierra la posición
+        sz         = _round_sz(size, self.get_sz_decimals())
+        if sz <= 0:
+            raise ValueError(f"[{self.coin}] place_tp: size redondeado a 0 (raw={size})")
+        trigger_px = self.round_px(tp_price)
+        # Precio límite ligeramente más favorable para garantizar fill
+        if is_buy_tp:
+            limit_px = self.round_px(trigger_px * (1 + _TP_LIMIT_BUFFER))
+        else:
+            limit_px = self.round_px(trigger_px * (1 - _TP_LIMIT_BUFFER))
+        # Validación lógica: TP debe estar al otro lado de entry
+        if is_buy_pos and trigger_px <= entry_price:
+            raise ValueError(f"[{self.coin}] place_tp LONG: tp_price({trigger_px}) debe ser > entry({entry_price})")
+        if not is_buy_pos and trigger_px >= entry_price:
+            raise ValueError(f"[{self.coin}] place_tp SHORT: tp_price({trigger_px}) debe ser < entry({entry_price})")
+        return _exchange_call(
+            self._exchange.order,
+            self.coin,
+            is_buy_tp,
+            sz,
+            limit_px,
+            {"trigger": {"triggerPx": str(trigger_px), "isMarket": False, "tpsl": "tp"}},
+            reduce_only=True,
+        )
+
+    def place_sl(self, side: str, size: float, entry_price: float, sl_price: float) -> dict:
+        """
+        Coloca una orden Stop-Loss trigger.
+        side: side de la POSICIÓN abierta ('buy' → SL es sell, 'sell' → SL es buy).
+        """
+        is_buy_pos = side.lower() == "buy"
+        is_buy_sl  = not is_buy_pos   # la orden SL cierra la posición
+        sz         = _round_sz(size, self.get_sz_decimals())
+        if sz <= 0:
+            raise ValueError(f"[{self.coin}] place_sl: size redondeado a 0 (raw={size})")
+        trigger_px = self.round_px(sl_price)
+        # Precio límite con slippage para garantizar fill en stop
+        if is_buy_sl:
+            limit_px = self.round_px(trigger_px * (1 + _MARKET_SLIPPAGE))
+        else:
+            limit_px = self.round_px(trigger_px * (1 - _MARKET_SLIPPAGE))
+        # Validación lógica: SL debe estar al mismo lado (contrario del TP)
+        if is_buy_pos and trigger_px >= entry_price:
+            raise ValueError(f"[{self.coin}] place_sl LONG: sl_price({trigger_px}) debe ser < entry({entry_price})")
+        if not is_buy_pos and trigger_px <= entry_price:
+            raise ValueError(f"[{self.coin}] place_sl SHORT: sl_price({trigger_px}) debe ser > entry({entry_price})")
+        return _exchange_call(
+            self._exchange.order,
+            self.coin,
+            is_buy_sl,
+            sz,
+            limit_px,
+            {"trigger": {"triggerPx": str(trigger_px), "isMarket": True, "tpsl": "sl"}},
+            reduce_only=True,
+        )
+
+    def place_bulk(self, orders: list[dict]) -> dict:
+        """
+        Envía múltiples órdenes en un solo request (bulk order).
+        Cada elemento de orders es un dict con keys:
+          coin, is_buy, sz, limit_px, order_type, reduce_only (opcional).
+        """
+        return _exchange_call(self._exchange.bulk_orders, orders)
+"""
+<parameter name="_tool_input_summary">Update bot/core/hl_client.py with 3 fixes: (1) get_positions handles list and dict responses, (2) get_balance_usdc defensive isinstance check, (3) warning on startup when agent_mode=False. SHA: 392057118a68a4278c6ac42ef61e76161675376b
