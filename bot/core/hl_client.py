@@ -52,8 +52,20 @@ FIX duplicate nonce (2026-06-05):
       ocurren dentro de asyncio.to_thread() — en hilos del OS, no en el
       event loop.
     - Tras el lock se añade un sleep mínimo de _NONCE_MIN_DELAY_MS ms
-      (default 2ms) para garantizar timestamps distintos incluso si el
+      (default 50ms) para garantizar timestamps distintos incluso si el
       scheduler del OS reutiliza el hilo inmediatamente.
+
+FIX 429 en update_leverage (2026-06-05 v7):
+  CAUSA RAÍZ: con 7 traders serializados por _EXCHANGE_LOCK pero solo 2ms
+  de delay entre llamadas, HL recibe ~7 update_leverage en ráfaga rápida
+  al arranque → responde 429 (rate limit de CloudFront/nginx).
+  Fixes:
+    1. _NONCE_MIN_DELAY_MS: default 2ms → 50ms (configurable con
+       HL_NONCE_MIN_DELAY_MS). Con 7 traders = ~350ms total en arranque.
+    2. _exchange_call: retry automático con backoff exponencial cuando
+       HL responde 429. Hasta HL_EXCHANGE_RETRIES intentos (default 3)
+       con espera inicial de HL_EXCHANGE_RETRY_DELAY_S (default 2s),
+       duplicando en cada intento hasta máx 30s.
 
 Autenticación soportada:
   Opción A (recomendada): API Wallet
@@ -94,9 +106,16 @@ _MARKET_SLIPPAGE = 0.03
 _TP_LIMIT_BUFFER = 0.001
 
 # Delay mínimo entre llamadas de escritura consecutivas al Exchange.
-# Garantiza timestamps distintos (nonce = time_ns // 1_000_000).
-# Configurable con HL_NONCE_MIN_DELAY_MS (default 2ms).
-_NONCE_MIN_DELAY_MS = float(os.getenv("HL_NONCE_MIN_DELAY_MS", "2")) / 1000.0
+# Garantiza timestamps distintos (nonce = time_ns // 1_000_000) y reduce
+# el riesgo de 429 por rate-limit de HL en arranques con muchos traders.
+# Configurable con HL_NONCE_MIN_DELAY_MS (default 50ms).
+_NONCE_MIN_DELAY_MS = float(os.getenv("HL_NONCE_MIN_DELAY_MS", "50")) / 1000.0
+
+# Reintentos automáticos en _exchange_call cuando HL responde 429.
+# Configurable con HL_EXCHANGE_RETRIES (default 3) y
+# HL_EXCHANGE_RETRY_DELAY_S (espera inicial en segundos, default 2.0).
+_EXCHANGE_RETRIES     = int(float(os.getenv("HL_EXCHANGE_RETRIES", "3")))
+_EXCHANGE_RETRY_DELAY = float(os.getenv("HL_EXCHANGE_RETRY_DELAY_S", "2.0"))
 
 # Lock global de escritura al Exchange.
 # threading.Lock (no asyncio.Lock) porque las llamadas ocurren en hilos
@@ -127,18 +146,53 @@ def _round_sz(sz: float, sz_decimals: int) -> float:
     return math.floor(sz * factor) / factor
 
 
+def _is_429(exc: Exception) -> bool:
+    """Devuelve True si la excepción indica rate-limit (429) de HL."""
+    err = str(exc)
+    # El SDK lanza una tupla/list con el status como primer elemento.
+    # También puede venir como string "429" en el mensaje.
+    if "429" in err:
+        return True
+    # Formato tuple del SDK: (status_code, ...) — primer arg int
+    if exc.args and isinstance(exc.args[0], int) and exc.args[0] == 429:
+        return True
+    return False
+
+
 def _exchange_call(fn, *args, **kwargs):
     """
     Ejecuta una llamada de escritura al Exchange SDK con lock global.
-    Garantiza que no haya dos llamadas simultáneas que generen el mismo
-    nonce (time.time_ns() // 1_000_000 tiene precisión de 1ms).
+
+    Garantiza:
+      1. Solo una llamada activa al SDK a la vez (_EXCHANGE_LOCK).
+      2. Timestamps distintos entre llamadas consecutivas (_NONCE_MIN_DELAY_MS).
+      3. Retry automático con backoff exponencial si HL responde 429.
     """
-    with _EXCHANGE_LOCK:
-        result = fn(*args, **kwargs)
-        # Sleep mínimo para que el próximo nonce sea distinto.
-        if _NONCE_MIN_DELAY_MS > 0:
-            time.sleep(_NONCE_MIN_DELAY_MS)
-        return result
+    last_exc: Exception | None = None
+    delay = _EXCHANGE_RETRY_DELAY
+
+    for attempt in range(max(1, _EXCHANGE_RETRIES)):
+        try:
+            with _EXCHANGE_LOCK:
+                result = fn(*args, **kwargs)
+                if _NONCE_MIN_DELAY_MS > 0:
+                    time.sleep(_NONCE_MIN_DELAY_MS)
+                return result
+        except Exception as exc:
+            last_exc = exc
+            if _is_429(exc) and attempt < _EXCHANGE_RETRIES - 1:
+                logger.warning(
+                    "[ExchangeCall] 429 rate-limit (intento %d/%d) — reintentando en %.1fs: %s",
+                    attempt + 1, _EXCHANGE_RETRIES, delay, exc,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+            else:
+                raise
+
+    # Solo llega aquí si _EXCHANGE_RETRIES == 0 (misconfiguración)
+    if last_exc is not None:
+        raise last_exc
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -397,7 +451,7 @@ class HLClient:
         core = await _HLCore.get_async()
         return cls(symbol, core=core)
 
-    # ── METADATOS ────────────────────────────────────────────
+    # ── METADATOS ──────────────────────────────────────────
 
     def _get_meta_asset(self) -> dict:
         try:
@@ -513,7 +567,7 @@ class HLClient:
 
         return px
 
-    # ── ÓRDENES BÁSICAS ─────────────────────────────────────────
+    # ── ÓRDENES BÁSICAS ───────────────────────────────────────
 
     def place_limit(
         self,
@@ -570,7 +624,7 @@ class HLClient:
             reduce_only=reduce_only,
         )
 
-    # ── TRIGGER ORDERS — TP / SL ──────────────────────────────
+    # ── TRIGGER ORDERS — TP / SL ────────────────────────────
 
     def place_tp(
         self,
@@ -665,12 +719,12 @@ class HLClient:
             if "limit_px" in o and o["limit_px"] is not None:
                 o["limit_px"] = self.round_px(float(o["limit_px"]))
             cleaned.append(o)
-        # place_bulk es también escritura — serializar con lock.
         return _exchange_call(self._exchange.bulk_orders, cleaned)
 
     def update_leverage(self, leverage: int, is_cross: bool = False) -> dict:
         """
         Configura el leverage con lock global para evitar duplicate nonce.
+        Incluye retry automático si HL responde 429.
         Llamar siempre desde asyncio.to_thread() en trader.py.
         """
         return _exchange_call(
