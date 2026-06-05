@@ -94,18 +94,29 @@ async def _start_single_pair(symbol: str):
         "\U0001f680 Iniciando trader: %s (leverage=%dx | usdc_per_trade=%.2f)",
         symbol, _effective_leverage(symbol), _USDC_PER_TRADE,
     )
+
+    master_addr = (
+        os.getenv("HL_API_WALLET_ADDRESS", "").strip()
+        or os.getenv("HL_ACCOUNT_ADDR", "").strip()
+    )
     private_key = (
         os.getenv("HL_API_PRIVATE_KEY", "").strip()
         or os.getenv("HL_PRIVATE_KEY", "").strip()
     )
+    agent_key  = os.getenv("HL_AGENT_PRIVATE_KEY", "").strip()
+    agent_addr = os.getenv("HL_AGENT_ADDRESS", "").strip()
+
+    from bot.signal_engine import get_signal
     trader = FuturesTrader(
-        api_key=os.getenv("HL_API_WALLET_ADDRESS", "").strip() or None,
-        api_secret=private_key,
-        passphrase=None,
         symbol=symbol,
         leverage=_effective_leverage(symbol),
-        margin_mode=os.getenv("MARGIN_MODE", "isolated"),
+        usdc_per_trade=_USDC_PER_TRADE,
+        signal_fn=get_signal,
         dry_run=os.getenv("DRY_RUN", "true").lower() == "true",
+        master_addr=master_addr,
+        private_key=private_key,
+        agent_key=agent_key,
+        agent_addr=agent_addr,
     )
     _trader_instances[symbol] = trader
     register_traders(_trader_instances)
