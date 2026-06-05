@@ -127,7 +127,7 @@ FIX duplicate nonce _set_leverage (2026-06-05 v6):
   ni adquirir _EXCHANGE_LOCK. Con 7 traders terminando _get_ccxt() en
   el mismo milisegundo, todos llamaban update_leverage simultáneamente
   → colisión de nonce garantizada → HL rechaza con 'duplicate nonce'.
-  Fix: usar hl.update_leverage(leverage) que internamente envuelve la
+  Fix: usar hl.set_leverage(leverage) que internamente envuelve la
   llamada con _exchange_call() → _EXCHANGE_LOCK + _NONCE_MIN_DELAY_MS.
 
 FIX _set_leverage auto-capping interno (2026-06-05 v7):
@@ -136,7 +136,7 @@ FIX _set_leverage auto-capping interno (2026-06-05 v7):
   snapshot de maxLeverage no incluía esos coins aún. HL rechaza con
   'Invalid leverage value' porque su maxLeverage real es inferior a 15x.
   Fix: _set_leverage consulta hl.get_max_leverage() antes de llamar a
-  update_leverage y cappa el valor automáticamente. Si falla la consulta,
+  set_leverage y cappa el valor automáticamente. Si falla la consulta,
   usa el valor solicitado como fallback. Actualiza self.leverage con el
   valor efectivo para que open_order use el real.
 
@@ -181,6 +181,13 @@ FIX _get_positions list vs dict + warning agent_mode=False (2026-06-05 v10):
     2. _get_ccxt(): loguea WARNING visible si agent_mode=False para alertar
        que el bot opera sin agente Hyperliquid activo — facilita diagnóstico
        de expiración o revocación del agente wallet.
+
+FIX _set_leverage AttributeError update_leverage (2026-06-05 v11):
+  CAUSA RAÍZ: _set_leverage llamaba hl.update_leverage() pero HLClient
+  expone el método como set_leverage(). El AttributeError causaba que
+  todos los traders fallaran en init, resultando en agent_mode=False
+  y analyze_pair error: 4 en decision_engine — bot completamente inoperativo.
+  Fix: renombrar la llamada a hl.set_leverage(effective_leverage).
 """
 from __future__ import annotations
 
@@ -794,7 +801,7 @@ class FuturesTrader:
         Configura el apalancamiento en el exchange.
 
         Auto-capping interno: consulta hl.get_max_leverage() (sin args —
-        usa self.coin internamente) antes de llamar a update_leverage y
+        usa self.coin internamente) antes de llamar a set_leverage y
         cappa automáticamente si el leverage solicitado supera el máximo
         permitido. Actualiza self.leverage con el valor efectivo para que
         open_order use el real.
@@ -821,7 +828,7 @@ class FuturesTrader:
 
         try:
             result = await asyncio.wait_for(
-                asyncio.to_thread(hl.update_leverage, effective_leverage),
+                asyncio.to_thread(hl.set_leverage, effective_leverage),  # FIX v11: era update_leverage
                 timeout=15.0,
             )
             logger.info(
