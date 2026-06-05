@@ -71,7 +71,7 @@ FIX get_positions / get_balance_usdc (2026-06-05):
   CAUSA RAÍZ de '_get_positions: respuesta inesperada (tipo=list)' y
   parálisis total con error:4 en decision_engine:
   Cuando agent_mode=False (agente expirado/revocado), user_state() del SDK
-  puede devolver directamente una list en vez del dict {assetPositions:[...]}. 
+  puede devolver directamente una list en vez del dict {assetPositions:[...]}.
   get_positions() llamaba .get() sobre la list → AttributeError inmediato.
   Fixes:
     1. get_positions(): isinstance check — maneja dict y list correctamente.
@@ -125,6 +125,13 @@ FIX round_px tick alignment + triggerPx float (2026-06-05 v16):
     También se fuerza float() sobre entry_price, tp_price, sl_price
     para tolerar valores que lleguen como string desde state.json.
 
+FIX SyntaxError _warm_cache (2026-06-05 v17):
+  CAUSA RAÍZ: el commit v16 (c919e593) dejó el bloque try de _warm_cache
+  incompleto — self._tick_size_cache[name] = ti (línea truncada, faltaba 'ck')
+  y sin except → SyntaxError: expected 'except' or 'finally' block.
+  El bot crasheaba en bucle desde las 13:06 UTC sin poder arrancar.
+  Fix: completar la línea y añadir except Exception con log de warning.
+
 Autenticación soportada:
   Opción A (recomendada): API Wallet
     HL_API_PRIVATE_KEY     — private key del agente aprobado en app.hyperliquid.xyz
@@ -175,15 +182,10 @@ _EXCHANGE_RETRY_DELAY = float(os.getenv("HL_EXCHANGE_RETRY_DELAY_S", "2.0"))
 _EXCHANGE_LOCK = threading.Lock()
 
 # ── Semáforo threading para llamadas de LECTURA a _info (SDK síncrono) ──────────
-# Limita la concurrencia de user_state / open_orders / candles_snapshot
-# que usan requests internamente y NO pasan por el semáforo aiohttp de trader.py.
-# threading.Semaphore porque se adquiere dentro de asyncio.to_thread() (hilos OS).
 _HL_INFO_CONCURRENCY = int(os.getenv("HL_INFO_CONCURRENCY", "3"))
 _INFO_SEMAPHORE = threading.Semaphore(_HL_INFO_CONCURRENCY)
 
 # ── Caché compartido de user_state (singleton por cuenta) ───────────────────
-# TTL configurable con HL_USER_STATE_CACHE_TTL_S (default 3s).
-# Lock threading para acceso thread-safe desde asyncio.to_thread().
 _USER_STATE_CACHE_TTL = float(os.getenv("HL_USER_STATE_CACHE_TTL_S", "3.0"))
 _USER_STATE_LOCK      = threading.Lock()
 _user_state_cache: dict | list | None = None
@@ -257,12 +259,6 @@ def _exchange_call(fn, *args, **kwargs):
 def _info_call(fn, *args, **kwargs):
     """
     Ejecuta una llamada de LECTURA al SDK Info con semáforo threading global.
-
-    FIX v14: protege user_state(), open_orders(), candles_snapshot() y
-    cualquier otra llamada a self._info.* contra concurrencia excesiva.
-    Sin este semáforo, 10 traders llamando get_positions() al mismo tiempo
-    lanzan 10 requests síncronos a /info en ráfaga => HL responde 429.
-
     Incluye retry automático con backoff en caso de 429.
     """
     last_exc: Exception | None = None
@@ -291,11 +287,6 @@ def _info_call(fn, *args, **kwargs):
 def _get_user_state_cached(info_obj, account_addr: str):
     """
     FIX v15: caché singleton compartido de user_state para toda la cuenta.
-
-    Todos los HLClient de todos los traders comparten el mismo caché porque
-    la respuesta de clearinghouseState es idéntica para todos (misma cuenta).
-    Hacer N llamadas simultáneas es redundante y satura el rate-limit de HL.
-
     TTL configurable con HL_USER_STATE_CACHE_TTL_S (default 3s).
     Lock threading para acceso seguro desde asyncio.to_thread().
     Incluye retry con backoff exponencial + jitter en caso de 429.
@@ -307,7 +298,6 @@ def _get_user_state_cached(info_obj, account_addr: str):
         if _user_state_cache is not None and (now - _user_state_cache_ts) < _USER_STATE_CACHE_TTL:
             return _user_state_cache
 
-    # Caché expirado o vacío — hacer la request fuera del lock para no bloquear
     last_exc: Exception | None = None
     delay = _EXCHANGE_RETRY_DELAY
 
@@ -425,4 +415,320 @@ class _HLCore:
             if raw_tick is not None:
                 try:
                     tick = float(raw_tick)
-                    self._tick_size_cache[name]   = ti
+                    self._tick_size_cache[name]   = tick
+                    self._px_decimals_cache[name] = _px_decimals_from_tick(tick)
+                except Exception as exc:
+                    logger.warning("[HLCore] _warm_cache tick parse falló para %s: %s", name, exc)
+
+    def _build_exchange_with_retry(self, wallet, kwargs: dict, retries: int = 3) -> Exchange:
+        delay = 2.0
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            try:
+                return Exchange(wallet, _BASE_URL, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "[HLCore] Exchange init intento %d/%d falló: %s — reintentando en %.1fs",
+                    attempt + 1, retries, exc, delay,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+        raise RuntimeError(f"No se pudo inicializar Exchange tras {retries} intentos") from last_exc
+
+    def _build_info_with_retry(self, retries: int = 3) -> Info:
+        delay = 2.0
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            try:
+                return Info(_BASE_URL, skip_ws=True)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "[HLCore] Info init intento %d/%d falló: %s — reintentando en %.1fs",
+                    attempt + 1, retries, exc, delay,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+        raise RuntimeError(f"No se pudo inicializar Info tras {retries} intentos") from last_exc
+
+    @classmethod
+    async def get_async(cls) -> "_HLCore":
+        """Crea o devuelve el singleton dentro de asyncio.to_thread() para no bloquear el event loop."""
+        if cls._init_lock is None:
+            cls._init_lock = asyncio.Lock()
+        async with cls._init_lock:
+            if cls._instance is None:
+                cls._instance = await asyncio.to_thread(cls)
+        return cls._instance
+
+    @classmethod
+    def get(cls) -> "_HLCore":
+        """Versión síncrona (solo para uso en contextos ya threadeados)."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+
+# ─────────────────────────────────────────────────────────────────
+# HLClient: wrapper por símbolo sobre _HLCore
+# ─────────────────────────────────────────────────────────────────
+
+class HLClient:
+    """
+    Cliente Hyperliquid para un símbolo concreto.
+    Usa el singleton _HLCore para Exchange + Info compartidos.
+    """
+
+    def __init__(self, core: _HLCore, symbol: str) -> None:
+        self._core    = core
+        self._symbol  = symbol
+        self._coin    = _norm_coin(symbol)
+        self._info    = core.info
+        self._exchange = core.exchange
+        self._account = core.account_addr
+
+    @classmethod
+    async def create(cls, symbol: str) -> "HLClient":
+        core = await _HLCore.get_async()
+        return cls(core, symbol)
+
+    # ── Propiedades de mercado ────────────────────────────────────────────────
+
+    def get_sz_decimals(self) -> int:
+        return self._core._sz_decimals_cache.get(self._coin, 4)
+
+    def get_px_decimals(self) -> int:
+        return self._core._px_decimals_cache.get(self._coin, 4)
+
+    def get_tick_size(self) -> float:
+        return self._core._tick_size_cache.get(self._coin, 0.0)
+
+    def get_max_leverage(self) -> int:
+        return self._core._max_leverage_cache.get(self._coin, 20)
+
+    # ── Redondeo ──────────────────────────────────────────────────────────────
+
+    def round_px(self, price: float) -> float:
+        """
+        FIX v16 Bug 1: redondea precio al múltiplo exacto del tick_size.
+        HL exige múltiplos EXACTOS (e.g. SOL tick=0.001 → 0.001, 0.002...).
+        round() con decimales podía generar 0.0013 → 'Price must be divisible by tick size'.
+        Fix: math.floor(price / tick + 0.5) * tick cuando tick > 0.
+        """
+        tick = self.get_tick_size()
+        if tick > 0:
+            return math.floor(price / tick + 0.5) * tick
+        # Fallback: redondear a px_decimals si no hay tick en caché
+        px_dec = self.get_px_decimals()
+        factor = 10 ** px_dec
+        return math.floor(price * factor + 0.5) / factor
+
+    def _round_qty(self, qty: float) -> float:
+        sz_dec = self.get_sz_decimals()
+        return _round_sz(qty, sz_dec)
+
+    # ── Estado de cuenta ──────────────────────────────────────────────────────
+
+    def get_user_state(self) -> dict | list:
+        return _get_user_state_cached(self._info, self._account)
+
+    def get_positions(self) -> list[dict]:
+        state = _info_call(self._info.user_state, self._account)
+        if isinstance(state, dict):
+            asset_positions = state.get("assetPositions", [])
+        elif isinstance(state, list):
+            logger.warning(
+                "[HLClient] get_positions: user_state devolvió list (agente inactivo?). "
+                "Devolviendo lista vacía."
+            )
+            return []
+        else:
+            logger.warning(
+                "[HLClient] get_positions: respuesta inesperada (tipo=%s). Devolviendo [].",
+                type(state).__name__,
+            )
+            return []
+        return [p["position"] for p in asset_positions if "position" in p]
+
+    def get_balance_usdc(self) -> float:
+        state = _info_call(self._info.user_state, self._account)
+        if isinstance(state, dict):
+            return float(state.get("marginSummary", {}).get("accountValue", 0.0))
+        logger.warning("[HLClient] get_balance_usdc: user_state inesperado (tipo=%s) → 0.0", type(state).__name__)
+        return 0.0
+
+    def get_open_orders(self) -> list[dict]:
+        return _info_call(self._info.open_orders, self._account) or []
+
+    def get_frontend_open_orders(self) -> list[dict]:
+        try:
+            return _info_call(self._info.frontend_open_orders, self._account) or []
+        except Exception as exc:
+            logger.warning("[HLClient] get_frontend_open_orders falló: %s", exc)
+            return []
+
+    def get_ohlcv(self, interval: str = "15m", limit: int = 100) -> list:
+        interval_ms = {
+            "1m": 60_000, "3m": 180_000, "5m": 300_000,
+            "15m": 900_000, "30m": 1_800_000,
+            "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+            "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
+        }
+        ms = interval_ms.get(interval, 900_000)
+        # FIX v14 Bug 2: retroceder 2 intervalos para apuntar a la última vela CERRADA.
+        end_ts   = int(time.time() * 1000) - 2 * ms
+        start_ts = end_ts - limit * ms
+        try:
+            candles = _info_call(
+                self._info.candles_snapshot,
+                self._coin, interval, start_ts, end_ts,
+            )
+            return candles or []
+        except Exception as exc:
+            logger.warning("[HLClient] get_ohlcv(%s, %s) falló: %s", self._coin, interval, exc)
+            return []
+
+    # ── Órdenes de escritura ──────────────────────────────────────────────────
+
+    def place_limit(self, is_buy: bool, sz: float, px: float, reduce_only: bool = False) -> dict:
+        sz = self._round_qty(sz)
+        px = self.round_px(px)
+        order_type = {"limit": {"tif": "Gtc"}}
+        return _exchange_call(
+            self._exchange.order,
+            self._coin, is_buy, sz, px, order_type,
+            reduce_only=reduce_only,
+        )
+
+    def place_market(self, is_buy: bool, sz: float, reduce_only: bool = False) -> dict:
+        sz  = self._round_qty(sz)
+        mids = _info_call(self._info.all_mids)
+        mid  = float(mids.get(self._coin, 0))
+        slippage = _MARKET_SLIPPAGE
+        px = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
+        px = self.round_px(px)
+        order_type = {"limit": {"tif": "Ioc"}}
+        return _exchange_call(
+            self._exchange.order,
+            self._coin, is_buy, sz, px, order_type,
+            reduce_only=reduce_only,
+        )
+
+    def place_tp(
+        self,
+        is_buy: bool,
+        sz: float,
+        tp_price: float,
+        limit_price: Optional[float],
+        entry_price: Optional[float] = None,
+    ) -> dict:
+        """
+        FIX v16 Bug 2: trigger_px y limit_px se pasan como float, no str.
+        """
+        sz          = self._round_qty(sz)
+        tp_price    = float(tp_price)
+        trigger_px  = self.round_px(tp_price)
+
+        if limit_price is not None:
+            lim_px = self.round_px(float(limit_price))
+        else:
+            buf    = _TP_LIMIT_BUFFER
+            lim_px = self.round_px(trigger_px * (1 - buf) if is_buy else trigger_px * (1 + buf))
+
+        order_type = {
+            "trigger": {
+                "triggerPx": trigger_px,
+                "isMarket":  False,
+                "tpsl":      "tp",
+            }
+        }
+        return _exchange_call(
+            self._exchange.order,
+            self._coin, is_buy, sz, lim_px, order_type,
+            reduce_only=True,
+        )
+
+    def place_sl(
+        self,
+        is_buy: bool,
+        sz: float,
+        sl_price: float,
+        entry_price: Optional[float] = None,
+    ) -> dict:
+        """
+        FIX v16 Bug 2: trigger_px se pasa como float, no str.
+        """
+        sz         = self._round_qty(sz)
+        sl_price   = float(sl_price)
+        trigger_px = self.round_px(sl_price)
+
+        order_type = {
+            "trigger": {
+                "triggerPx": trigger_px,
+                "isMarket":  True,
+                "tpsl":      "sl",
+            }
+        }
+        return _exchange_call(
+            self._exchange.order,
+            self._coin, is_buy, sz, trigger_px, order_type,
+            reduce_only=True,
+        )
+
+    def place_bulk(self, orders: list[dict]) -> dict:
+        return _exchange_call(self._exchange.bulk_orders, orders)
+
+    def cancel_order(self, oid: int) -> dict:
+        return _exchange_call(self._exchange.cancel, self._coin, oid)
+
+    def cancel_all_open_tpsl(self) -> None:
+        orders = self.get_frontend_open_orders()
+        coin_orders = [o for o in orders if str(o.get("coin", "")).upper() == self._coin]
+        for o in coin_orders:
+            oid = o.get("oid")
+            if oid:
+                try:
+                    _exchange_call(self._exchange.cancel, self._coin, oid)
+                except Exception as exc:
+                    logger.warning("[HLClient] cancel_all_open_tpsl: error cancelando oid=%s: %s", oid, exc)
+
+    def update_leverage(self, leverage: int, is_cross: bool = False) -> dict:
+        return _exchange_call(
+            self._exchange.update_leverage,
+            leverage, self._coin, is_cross,
+        )
+
+    def confirm_fill(self, order_result: dict, timeout: float = POST_FILL_CONFIRM_RETRIES * POST_FILL_CONFIRM_DELAY) -> bool:
+        """Espera a que una orden de mercado/límite se ejecute comprobando fills."""
+        oid = None
+        try:
+            statuses = order_result.get("response", {}).get("data", {}).get("statuses", [])
+            for s in statuses:
+                if "resting" in s:
+                    oid = s["resting"].get("oid")
+                elif "filled" in s:
+                    return True
+        except Exception:
+            pass
+
+        if oid is None:
+            return True  # Si no hay oid pendiente asumimos fill
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                orders = self.get_open_orders()
+                oids = {o.get("oid") for o in orders}
+                if oid not in oids:
+                    return True
+            except Exception:
+                pass
+            time.sleep(POST_FILL_CONFIRM_DELAY)
+
+        logger.warning("[HLClient] confirm_fill: oid=%s no se llenó en %.1fs", oid, timeout)
+        return False
+
+
+# ── Alias público ──────────────────────────────────────────────────────────────
+norm_coin = _norm_coin
