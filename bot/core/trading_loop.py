@@ -4,39 +4,14 @@ trading_loop.py — Loop principal de trading para un símbolo.
 FIX v8 (2026-06-02): notificaciones Telegram + cooldown post-cierre externo
 FIX v9 (2026-06-03): on_position_closed + global_risk en cierre externo
 FIX v10 (2026-06-03): timeout en evaluate() + logs de diagnóstico
-  BUG: el loop se pillaba silenciosamente tras «TradingLoop iniciado».
-  Ningún log de _iteration() aparecía tras el init — la primera llamada
-  a evaluate() o get_price() bloqueaba el event loop sin ningún log.
-  Fixes:
-    1. asyncio.wait_for(evaluate(), timeout=60s): si analyze_pair se
-       cuelga, lanza TimeoutError en vez de congelar para siempre.
-    2. asyncio.wait_for(get_price(), timeout=10s).
-    3. asyncio.wait_for(_get_positions(), timeout=15s).
-    4. Logs de diagnóstico al inicio de cada _iteration() y en puntos
-       clave para saber exactamente dónde se cuelga.
-
 FIX v11 (2026-06-03): logs INFO visibles en cada scan
-  - Cada iteración sin posición loguea precio + score en INFO.
-  - Con posición abierta loguea precio actual + PnL% en INFO.
-  - Cada 6 iteraciones (~60s) muestra un heartbeat de todos los traders.
-
 FIX v12 (2026-06-03): PnL real en notify_close para cierre externo
-  - El PnL se calculaba siempre como 0.0 (hardcodeado).
-  - Ahora se calcula: pnl_pct = (exit - entry) / entry * leverage * ±1
-  - El mismo PnL real se pasa a on_position_closed y register_close.
-
 FIX v13 (2026-06-05): corrección de bugs B/C/E en notificaciones Telegram
-  Bug B — datos incorrectos (None, precio/PnL/símbolo mal):
-    - Fallback a signal dict para entry/sl/tp1/size antes de notify_open.
-    - Nunca se pasa None en campos clave del mensaje.
-  Bug C — notificaciones duplicadas:
-    - Flag _open_notified en TradingLoop: guard contra doble notify_open
-      si open_order() se invoca más de una vez (race condition).
-  Bug E — notificación de apertura llega cuando el trade ya cerró:
-    - Verificar _open_notified antes de enviar notify_open.
-    - Reset del flag en cierre externo.
-    - Si cierre externo se detecta y _open_notified=False (apertura nunca
-      notificada), se omite el notify_close huérfano.
+FIX v14 (2026-06-05): corregir AttributeError trader._info_post en _init()
+  balance_svc ya está inicializado en main() antes de arrancar traders.
+  La llamada redundante balance_svc.init_hl(trader._info_post) lanzaba
+  AttributeError porque FuturesTrader no tiene ese atributo.
+  FIX: guardar el init_hl con is_ready() check — si ya está listo, skip.
 """
 from __future__ import annotations
 
@@ -58,21 +33,14 @@ _POS_CHECK_INTERVAL_S   = int(os.getenv("POS_CHECK_INTERVAL_S", "30"))
 _TPSL_VERIFY_INTERVAL_S = int(os.getenv("TPSL_VERIFY_INTERVAL_S", "120"))
 _EXTERNAL_CLOSE_COOLDOWN_S = int(os.getenv("EXTERNAL_CLOSE_COOLDOWN_S", "600"))
 
-# Timeouts para operaciones que pueden bloquearse
 _GET_PRICE_TIMEOUT_S    = float(os.getenv("GET_PRICE_TIMEOUT_S",    "10"))
 _GET_POS_TIMEOUT_S      = float(os.getenv("GET_POS_TIMEOUT_S",      "15"))
 _EVALUATE_TIMEOUT_S     = float(os.getenv("EVALUATE_TIMEOUT_S",     "60"))
 
-# Cada cuántas iteraciones mostrar el log de scan visible (default: cada 1 = siempre)
 _SCAN_LOG_EVERY         = int(os.getenv("SCAN_LOG_EVERY", "1"))
 
 
 def _calc_pnl_pct(entry: float, exit_p: float, is_long: bool, leverage: int) -> float:
-    """
-    Calcula el PnL% real con apalancamiento.
-    LONG:  (exit - entry) / entry * leverage * 100
-    SHORT: (entry - exit) / entry * leverage * 100
-    """
     if not entry or entry <= 0:
         return 0.0
     raw = (exit_p - entry) / entry if is_long else (entry - exit_p) / entry
@@ -88,7 +56,6 @@ class TradingLoop:
         self._last_pos_check_at: float = 0.0
         self._iteration_count: int = 0
         self._global_risk = None
-        # FIX v13 Bug C/E: guard para evitar notify_open duplicado o tardío
         self._open_notified: bool = False
 
     def _build_decision_engine(self, risk):
@@ -125,7 +92,9 @@ class TradingLoop:
             await asyncio.sleep(LOOP_SLEEP)
 
     async def _init(self, trader, usdc_per_trade: float) -> None:
+        # _HLCore ya fue pre-calentado en main() — esta llamada es instantánea.
         await trader._get_ccxt()
+
         saved = load_position(self.symbol)
         if saved:
             trader.position       = saved["side"]
@@ -164,10 +133,7 @@ class TradingLoop:
                         self.symbol,
                     )
 
-            # Posición restaurada desde disco: marcamos como ya notificada
-            # para no emitir un notify_open falso en el primer ciclo.
             self._open_notified = True
-
             logger.info(
                 "[%s] Posición restaurada: %s @ %s",
                 self.symbol, trader.position, trader.entry_price,
@@ -180,8 +146,14 @@ class TradingLoop:
                 self.symbol, remaining,
             )
 
+        # FIX v14: balance_svc ya inicializado en main() — no llamar de nuevo.
+        # La llamada anterior usaba trader._info_post (atributo inexistente)
+        # y lanzaba AttributeError silenciado por el except de run().
         if not balance_svc.is_ready():
-            balance_svc.init_hl(trader._master_addr, trader._info_post)
+            logger.warning(
+                "[%s] balance_svc no listo en _init — se esperaba init en main().",
+                self.symbol,
+            )
 
         await trader._set_leverage(trader.leverage)
         logger.info(
@@ -201,7 +173,6 @@ class TradingLoop:
             logger.debug("[%s] Kill switch activo — skip.", self.symbol)
             return
 
-        # ── Precio ─────────────────────────────────────────────────────────────────
         try:
             price = await asyncio.wait_for(
                 trader.get_price(),
@@ -217,7 +188,6 @@ class TradingLoop:
 
         logger.debug("[%s] #%d precio=%.4f", self.symbol, n, price)
 
-        # ── Sincronización periódica con exchange ──────────────────────────────────
         now = time.monotonic()
         if now - self._last_pos_check_at >= _POS_CHECK_INTERVAL_S:
             try:
@@ -262,7 +232,6 @@ class TradingLoop:
                         is_long      = closed_side == "long"
                         exit_price   = round(price, 6)
 
-                        # — PnL real con apalancamiento —
                         pnl_pct = _calc_pnl_pct(entry_price, exit_price, is_long, leverage)
 
                         logger.info(
@@ -272,8 +241,6 @@ class TradingLoop:
                             entry_price, exit_price, leverage, pnl_pct,
                         )
 
-                        # FIX v13 Bug E: solo enviar notify_close si la apertura
-                        # fue notificada — evita mensajes huérfanos de cierre sin apertura.
                         if self._open_notified:
                             try:
                                 from bot.telegram_bot import notify_close
@@ -295,7 +262,6 @@ class TradingLoop:
                                 self.symbol,
                             )
 
-                        # FIX v13 Bug C/E: reset del flag al cerrar posición
                         self._open_notified = False
 
                         try:
@@ -350,11 +316,9 @@ class TradingLoop:
                         trader._open_qty   = 0.0
                         clear_position(self.symbol)
 
-        # ── Gestionar posición abierta o evaluar nueva entrada ───────────────────
         if trader.position is not None:
             trader._last_price = price
 
-            # Log visible de posición activa con PnL en tiempo real
             if n % max(1, _SCAN_LOG_EVERY) == 0:
                 entry = trader.entry_price or price
                 pnl_pct = ((price - entry) / entry * 100) if trader.position == "long" \
@@ -381,10 +345,9 @@ class TradingLoop:
                     )
                 return
 
-            # Log visible de scan activo
             if n % max(1, _SCAN_LOG_EVERY) == 0:
                 logger.info(
-                    "[%s] \U0001f50d Scan #%d | precio=%.4f | buscando se\u00f1al...",
+                    "[%s] \U0001f50d Scan #%d | precio=%.4f | buscando señal...",
                     self.symbol, n, price,
                 )
 
@@ -411,7 +374,7 @@ class TradingLoop:
                 score = signal.get("score", signal.get("strength", "?"))
                 mode  = signal.get("mode", signal.get("entry_mode", "?"))
                 logger.info(
-                    "[%s] \u2705 Se\u00f1al aceptada por DecisionEngine: action=%s side=%s "
+                    "[%s] \u2705 Señal aceptada por DecisionEngine: action=%s side=%s "
                     "score=%s mode=%s entry=%.4f sl=%.4f tp1=%.4f",
                     self.symbol,
                     signal.get("action"), signal.get("side"),
@@ -423,11 +386,7 @@ class TradingLoop:
                 pos_before = trader.position
                 await trader.open_order(signal, risk)
 
-                # FIX v13 Bug C/E: guard _open_notified para evitar duplicados
-                # y notificaciones tardías (cuando la posición ya cerró antes
-                # de que llegáramos aquí).
                 if trader.position is not None and pos_before is None and not self._open_notified:
-                    # FIX v13 Bug B: fallback a signal dict — nunca pasar None
                     _entry = trader.entry_price or float(signal.get("entry") or price)
                     _sl    = trader.sl    or float(signal.get("sl")  or 0) or None
                     _tp1   = trader.tp1   or float(signal.get("tp1") or 0) or None
@@ -454,9 +413,8 @@ class TradingLoop:
                     except Exception as _te:
                         logger.debug("[%s] notify_open error: %s", self.symbol, _te)
             else:
-                # Sin señal — log del resultado del scan
                 if n % max(1, _SCAN_LOG_EVERY) == 0:
                     logger.info(
-                        "[%s] \u2b1c Sin se\u00f1al | precio=%.4f",
+                        "[%s] \u2b1c Sin señal | precio=%.4f",
                         self.symbol, price,
                     )

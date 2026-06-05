@@ -26,7 +26,7 @@ active_traders: dict = {}
 global_risk: GlobalRisk = None
 _trader_instances: dict = {}
 
-MAX_ACTIVE_TRADERS     = int(os.getenv("MAX_ACTIVE_TRADERS", "10"))   # era 5
+MAX_ACTIVE_TRADERS     = int(os.getenv("MAX_ACTIVE_TRADERS", "10"))
 _LEVERAGE_BASE         = int(os.getenv("LEVERAGE", "5"))
 _max_leverage_map: dict[str, int] = {}
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
@@ -332,15 +332,27 @@ async def main():
 
     webhook_runner = await start_webhook_server()
 
-    # TOP_PAIRS = MAX_ACTIVE_TRADERS * 3 para tener suficientes candidatos en rotación
+    # ── PRE-WARM _HLCore UNA SOLA VEZ ────────────────────────────────────────
+    # FIX FREEZE: inicializar el SDK (Exchange + Info + _warm_cache) ANTES de
+    # lanzar cualquier trader. Así cuando los N traders llamen _get_ccxt() →
+    # HLClient.create() → _HLCore.get_async(), el singleton ya existe y
+    # retornan instantáneamente sin bloquear el event loop.
+    logger.info("\U0001f504 Pre-inicializando SDK Hyperliquid (Exchange + Info)...")
+    try:
+        from bot.core.hl_client import _HLCore
+        await _HLCore.get_async()
+        logger.info("\u2705 SDK Hyperliquid listo — traders arrancarán sin bloqueo.")
+    except Exception as _sdk_err:
+        logger.error("\u274c Error pre-inicializando SDK: %s — abortando.", _sdk_err)
+        raise
+    # ─────────────────────────────────────────────────────────────────────────
+
     top_n = int(os.getenv("TOP_PAIRS", str(MAX_ACTIVE_TRADERS * 3)))
     logger.info(
         "\u2699\ufe0f  MAX_ACTIVE_TRADERS=%d | TOP_PAIRS=%d | LEVERAGE_BASE=%dx | IDLE_ROTATE_CYCLES=%d",
         MAX_ACTIVE_TRADERS, top_n, _LEVERAGE_BASE, _IDLE_ROTATE_CYCLES,
     )
 
-    # PairScanner sin args explícitos: hereda SCANNER_TOP_N, SCANNER_REFRESH_MIN,
-    # SCANNER_MIN_VOLUME, SCANNER_MIN_CHANGE de env vars (defaults en pair_scanner.py)
     scanner = PairScanner(top_n=top_n)
 
     logger.info("\U0001f50d Escaneando mercado Hyperliquid inicial...")
