@@ -75,32 +75,37 @@ FIX double-checked locking en _get_user_state_cached (2026-06-05 v21):
   El caché vacío + 20 traders simultáneos → todos leen _user_state_cache=None
   ANTES de que ninguno actualice → 20 user_state() concurrentes → 429.
 
-  El lock anterior solo protegía la LECTURA del caché. El fetch ocurría
-  FUERA del lock → ventana de carrera abierta para los 20 threads.
-
   Fix: patrón double-checked locking:
     1. Lectura rápida sin lock (fast path — caso normal, caché caliente)
-    2. Si miss → adquirir lock → re-verificar caché (otro thread pudo
-       haber rellenado el caché mientras esperábamos el lock)
+    2. Si miss → adquirir lock → re-verificar caché dentro del lock
     3. Solo si sigue siendo miss → hacer el fetch real a HL
     4. Actualizar caché dentro del lock
   Resultado: con 20 traders, solo 1 thread hace el fetch real.
   Los otros 19 esperan el lock y al adquirirlo encuentran caché fresco.
 
 FIX _build_exchange/info_with_retry reintentos insuficientes (2026-06-05 v22):
-  CAUSA RAÍZ: BTC fue el primer trader en construir el singleton justo cuando
-  HL estaba throttleando a nivel de Exchange.__init__() (spotMeta interna).
-  Con solo 3 reintentos (~14s de ventana total) los intentos se agotaban antes
-  de que HL dejara de devolver 429. El resto de traders reutilizaban el
-  singleton ya construido, así que solo BTC (el primero) fallaba.
+  retries 3 → 8, delay inicial 2s → 5s. Ventana total ~155s.
 
-  Fix:
-    - _build_exchange_with_retry: retries 3 → 8, delay inicial 2s → 5s.
-    - _build_info_with_retry:     retries 3 → 8, delay inicial 2s → 5s.
-    - Ventana total máxima con backoff x2 cap 30s: ~5+10+20+30+30+30+30 = 155s.
-    - Suficiente para sobrevivir cualquier pico de 429 al arrancar Railway.
-    - Configurable vía HL_SDK_INIT_RETRIES y HL_SDK_INIT_DELAY_S si se necesita
-      ajustar sin tocar código.
+FIX monkey-patch requests.Session para retry 429 interno al SDK (2026-06-05 v23):
+  CAUSA RAÍZ confirmada: Exchange.__init__() del SDK llama internamente a
+  spotMeta via requests. Esa llamada HTTP ocurre DENTRO del constructor y
+  no pasa por nuestros wrappers (_exchange_call / _info_call). Por eso
+  _build_exchange_with_retry reintentaba el constructor entero pero cada
+  intento fallaba inmediatamente — el 429 lo lanzaba requests dentro del SDK,
+  no nuestro código.
+
+  Fix: _install_requests_retry_patch() instala un monkey-patch en
+  requests.Session.send() ANTES de instanciar Exchange o Info. El patch:
+    - Intercepta toda respuesta HTTP con status 429 o 503.
+    - Aplica backoff exponencial con jitter: 2s, 4s, 8s, ... cap 60s.
+    - Número de reintentos configurable vía HL_HTTP_RETRY_ON_429 (default 8).
+    - Se instala una sola vez (flag _REQUESTS_PATCH_INSTALLED).
+    - Llama al send() original en cada reintento para no romper la sesión.
+    - Loguea cada reintento con nivel WARNING.
+
+  Resultado: cualquier llamada HTTP del SDK (Exchange.__init__, Info.__init__,
+  user_state, meta, candles...) que reciba 429 se reintenta automáticamente
+  sin que nuestro código tenga que envolverla explícitamente.
 
 Autenticación soportada:
   Opción A (recomendada): API Wallet
@@ -125,6 +130,7 @@ import threading
 import time
 from typing import Optional
 
+import requests
 from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
@@ -144,15 +150,72 @@ _TP_LIMIT_BUFFER = 0.001
 # Delay mínimo entre llamadas de escritura consecutivas al Exchange.
 _NONCE_MIN_DELAY_MS = float(os.getenv("HL_NONCE_MIN_DELAY_MS", "50")) / 1000.0
 
-# Reintentos automáticos en _exchange_call cuando HL responde 429.
+# Reintentos automáticos en _exchange_call / _info_call cuando HL responde 429.
 _EXCHANGE_RETRIES     = int(float(os.getenv("HL_EXCHANGE_RETRIES", "3")))
 _EXCHANGE_RETRY_DELAY = float(os.getenv("HL_EXCHANGE_RETRY_DELAY_S", "2.0"))
 
 # Reintentos para la inicialización del SDK (Exchange.__init__ / Info.__init__).
-# FIX v22: subidos de 3 → 8 y delay inicial de 2s → 5s para sobrevivir picos
-# de 429 en el primer arranque del singleton (ventana total ~155s con backoff).
 _SDK_INIT_RETRIES = int(float(os.getenv("HL_SDK_INIT_RETRIES", "8")))
 _SDK_INIT_DELAY_S = float(os.getenv("HL_SDK_INIT_DELAY_S", "5.0"))
+
+# ── Monkey-patch requests.Session para retry 429/503 a nivel HTTP ────────────
+# Número de reintentos HTTP internos (afecta TODAS las llamadas del SDK).
+_HTTP_RETRY_ON_429    = int(float(os.getenv("HL_HTTP_RETRY_ON_429", "8")))
+_HTTP_RETRY_DELAY_S   = float(os.getenv("HL_HTTP_RETRY_DELAY_S", "2.0"))
+_REQUESTS_PATCH_LOCK  = threading.Lock()
+_REQUESTS_PATCH_INSTALLED = False
+
+
+def _install_requests_retry_patch() -> None:
+    """
+    Instala un monkey-patch en requests.Session.send() que reintenta
+    automáticamente cualquier respuesta 429 o 503 con backoff exponencial.
+
+    Se instala UNA sola vez (thread-safe). Todas las llamadas HTTP del SDK
+    de Hyperliquid (Exchange.__init__, Info.__init__, user_state, meta...)
+    quedan cubiertas sin ningún cambio adicional.
+    """
+    global _REQUESTS_PATCH_INSTALLED
+    with _REQUESTS_PATCH_LOCK:
+        if _REQUESTS_PATCH_INSTALLED:
+            return
+        _original_send = requests.Session.send
+
+        def _patched_send(self, request, **kwargs):
+            retries = _HTTP_RETRY_ON_429
+            delay   = _HTTP_RETRY_DELAY_S
+            for attempt in range(retries + 1):
+                response = _original_send(self, request, **kwargs)
+                if response.status_code in (429, 503) and attempt < retries:
+                    jitter  = random.uniform(0.0, delay * 0.25)
+                    sleep_s = min(delay + jitter, 60.0)
+                    logger.warning(
+                        "[HTTPPatch] %d en %s (intento %d/%d) — reintentando en %.1fs",
+                        response.status_code,
+                        request.url,
+                        attempt + 1,
+                        retries,
+                        sleep_s,
+                    )
+                    time.sleep(sleep_s)
+                    delay = min(delay * 2, 60.0)
+                    continue
+                return response
+            return response  # último intento — devolver aunque sea 429
+
+        requests.Session.send = _patched_send
+        _REQUESTS_PATCH_INSTALLED = True
+        logger.info(
+            "[HTTPPatch] requests.Session.send parchado — retry automático en 429/503 "
+            "(max %d reintentos, delay inicial %.1fs)",
+            _HTTP_RETRY_ON_429,
+            _HTTP_RETRY_DELAY_S,
+        )
+
+
+# Instalar el patch al importar el módulo, antes de que cualquier código
+# instancie Exchange o Info.
+_install_requests_retry_patch()
 
 # Lock global de escritura al Exchange (threading porque va en to_thread).
 _EXCHANGE_LOCK = threading.Lock()
@@ -162,8 +225,6 @@ _HL_INFO_CONCURRENCY = int(os.getenv("HL_INFO_CONCURRENCY", "3"))
 _INFO_SEMAPHORE = threading.Semaphore(_HL_INFO_CONCURRENCY)
 
 # ── Caché compartido de user_state (singleton por cuenta) ───────────────────
-# FIX v21: TTL 5s. El fetch está protegido por double-checked locking para
-# garantizar que solo 1 thread haga el request real aunque 20 lleguen juntos.
 _USER_STATE_CACHE_TTL = float(os.getenv("HL_USER_STATE_CACHE_TTL_S", "5.0"))
 _USER_STATE_LOCK      = threading.Lock()
 _user_state_cache: dict | list | None = None
@@ -266,14 +327,6 @@ def _get_user_state_cached(info_obj, account_addr: str):
     """
     FIX v21: double-checked locking para caché singleton de user_state.
 
-    Patrón:
-      1. Fast path: leer caché sin lock (caso normal — caché caliente).
-         Si está fresco, retornar inmediatamente sin contención.
-      2. Si miss: adquirir lock → re-verificar caché dentro del lock.
-         (Otro thread puede haber rellenado el caché mientras esperábamos.)
-      3. Solo si sigue siendo miss dentro del lock: hacer fetch real a HL.
-      4. Escribir resultado en caché dentro del lock antes de liberarlo.
-
     Con 20 traders llegando simultáneamente a caché vacío:
       - Thread 1 adquiere el lock, ve miss, hace fetch, escribe caché.
       - Threads 2-20 esperan el lock. Al adquirirlo, ven caché fresco → retornan.
@@ -282,7 +335,6 @@ def _get_user_state_cached(info_obj, account_addr: str):
     global _user_state_cache, _user_state_cache_ts
 
     # ── FAST PATH: sin lock ──────────────────────────────────────────────────
-    # Lectura no atómica pero segura en CPython (GIL) para el caso caliente.
     now = time.monotonic()
     cached = _user_state_cache
     cached_ts = _user_state_cache_ts
@@ -296,13 +348,10 @@ def _get_user_state_cached(info_obj, account_addr: str):
     for attempt in range(max(1, _EXCHANGE_RETRIES)):
         try:
             with _USER_STATE_LOCK:
-                # Double-check dentro del lock: otro thread puede haber
-                # actualizado el caché mientras esperábamos el lock.
                 now2 = time.monotonic()
                 if _user_state_cache is not None and (now2 - _user_state_cache_ts) < _USER_STATE_CACHE_TTL:
                     return _user_state_cache
 
-                # Fetch real — solo 1 thread llega aquí por ventana TTL.
                 with _INFO_SEMAPHORE:
                     result = info_obj.user_state(account_addr)
 
@@ -370,6 +419,8 @@ class _HLCore:
                 "Verificar que HL_API_PRIVATE_KEY esté configurada y el agente autorizado en Hyperliquid."
             )
 
+        # El monkey-patch ya está instalado al importar el módulo,
+        # así que Exchange() e Info() tienen retry 429 automático a nivel HTTP.
         self.exchange = self._build_exchange_with_retry(exchange_wallet, exchange_kwargs)
         self.info     = self._build_info_with_retry()
 
@@ -423,10 +474,9 @@ class _HLCore:
 
     def _build_exchange_with_retry(self, wallet, kwargs: dict) -> Exchange:
         """
-        FIX v22: reintentos 3 → 8, delay inicial 2s → 5s.
-        Ventana total ~155s con backoff x2 cap 30s — sobrevive picos de 429
-        al construir el singleton por primera vez en Railway.
-        Configurable con HL_SDK_INIT_RETRIES y HL_SDK_INIT_DELAY_S.
+        El monkey-patch en requests.Session.send() ya maneja los 429 internos
+        del SDK. Este bucle es un seguro extra por si el SDK lanza una excepción
+        en vez de devolver la respuesta (e.g. timeout, ConnectionError).
         """
         retries = _SDK_INIT_RETRIES
         delay   = _SDK_INIT_DELAY_S
@@ -446,8 +496,8 @@ class _HLCore:
 
     def _build_info_with_retry(self) -> Info:
         """
-        FIX v22: reintentos 3 → 8, delay inicial 2s → 5s.
-        Configurable con HL_SDK_INIT_RETRIES y HL_SDK_INIT_DELAY_S.
+        Ídem — el patch HTTP cubre los 429 internos; este bucle cubre errores
+        de red o excepciones inesperadas del constructor.
         """
         retries = _SDK_INIT_RETRIES
         delay   = _SDK_INIT_DELAY_S
