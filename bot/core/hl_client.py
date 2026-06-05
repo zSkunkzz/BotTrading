@@ -107,7 +107,7 @@ FIX caché compartido user_state (2026-06-05 v15):
   llamadas es redundante y agota el rate-limit.
   FIX: caché singleton en _HLCore (_user_state_cache) compartido entre
   TODOS los HLClient. TTL configurable con HL_USER_STATE_CACHE_TTL_S
-  (default 3s). get_user_state() devuelve el caché si es reciente,
+  (default 5s). get_user_state() devuelve el caché si es reciente,
   evitando la ráfaga de requests idénticos a clearinghouseState.
   Lock threading (_USER_STATE_LOCK) para acceso thread-safe desde
   asyncio.to_thread().
@@ -131,6 +131,17 @@ FIX SyntaxError _warm_cache (2026-06-05 v17):
   y sin except → SyntaxError: expected 'except' or 'finally' block.
   El bot crasheaba en bucle desde las 13:06 UTC sin poder arrancar.
   Fix: completar la línea y añadir except Exception con log de warning.
+
+FIX get_positions caché compartida (2026-06-05 v20):
+  CAUSA RAÍZ de 429 persistentes en clearinghouseState con 20 traders:
+  get_positions() llamaba _info_call(self._info.user_state, ...) DIRECTAMENTE,
+  ignorando _get_user_state_cached(). Con 20 traders en su primer ciclo,
+  el _INFO_SEMAPHORE(3) serializaba de 3 en 3, pero aún generaba hasta 20
+  requests reales a clearinghouseState en ráfaga → 429 masivo.
+  Fix: get_positions() ahora llama _get_user_state_cached() igual que
+  get_user_state() y get_balance_usdc() — los 20 traders comparten UNA
+  sola llamada real a HL por TTL (default ahora 5s, antes 3s).
+  Resultado: 20 traders × clearinghouseState → máx 1 req cada 5s.
 
 Autenticación soportada:
   Opción A (recomendada): API Wallet
@@ -186,7 +197,10 @@ _HL_INFO_CONCURRENCY = int(os.getenv("HL_INFO_CONCURRENCY", "3"))
 _INFO_SEMAPHORE = threading.Semaphore(_HL_INFO_CONCURRENCY)
 
 # ── Caché compartido de user_state (singleton por cuenta) ───────────────────
-_USER_STATE_CACHE_TTL = float(os.getenv("HL_USER_STATE_CACHE_TTL_S", "3.0"))
+# FIX v20: TTL subido de 3s → 5s. Con 20 traders ciclo ~10s el TTL de 3s
+# era marginal; 5s garantiza que un burst de 20 traders en el mismo ciclo
+# comparta exactamente 1 request real a clearinghouseState.
+_USER_STATE_CACHE_TTL = float(os.getenv("HL_USER_STATE_CACHE_TTL_S", "5.0"))
 _USER_STATE_LOCK      = threading.Lock()
 _user_state_cache: dict | list | None = None
 _user_state_cache_ts: float = 0.0
@@ -286,10 +300,14 @@ def _info_call(fn, *args, **kwargs):
 
 def _get_user_state_cached(info_obj, account_addr: str):
     """
-    FIX v15: caché singleton compartido de user_state para toda la cuenta.
-    TTL configurable con HL_USER_STATE_CACHE_TTL_S (default 3s).
+    FIX v15/v20: caché singleton compartido de user_state para toda la cuenta.
+    TTL configurable con HL_USER_STATE_CACHE_TTL_S (default 5s).
     Lock threading para acceso seguro desde asyncio.to_thread().
     Incluye retry con backoff exponencial + jitter en caso de 429.
+
+    Con 20 traders llamando get_positions() en el mismo ciclo, este caché
+    garantiza que solo se hace 1 request real a clearinghouseState cada 5s,
+    independientemente de cuántos traders soliciten el estado simultáneamente.
     """
     global _user_state_cache, _user_state_cache_ts
 
@@ -534,7 +552,17 @@ class HLClient:
         return _get_user_state_cached(self._info, self._account)
 
     def get_positions(self) -> list[dict]:
-        state = _info_call(self._info.user_state, self._account)
+        """
+        FIX v20: usa _get_user_state_cached() en vez de _info_call() directo.
+        Con 20 traders en el mismo ciclo, esto reduce N requests a HL a 1
+        request real por TTL (5s), eliminando los 429 en clearinghouseState.
+
+        Antes: _info_call(self._info.user_state, self._account)
+               → hasta 20 requests simultáneos → 429 masivo
+        Ahora: _get_user_state_cached(self._info, self._account)
+               → 1 request compartido entre todos los traders por TTL
+        """
+        state = _get_user_state_cached(self._info, self._account)
         if isinstance(state, dict):
             asset_positions = state.get("assetPositions", [])
         elif isinstance(state, list):
@@ -552,7 +580,7 @@ class HLClient:
         return [p["position"] for p in asset_positions if "position" in p]
 
     def get_balance_usdc(self) -> float:
-        state = _info_call(self._info.user_state, self._account)
+        state = _get_user_state_cached(self._info, self._account)
         if isinstance(state, dict):
             return float(state.get("marginSummary", {}).get("accountValue", 0.0))
         logger.warning("[HLClient] get_balance_usdc: user_state inesperado (tipo=%s) → 0.0", type(state).__name__)
