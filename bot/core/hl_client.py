@@ -71,7 +71,7 @@ FIX get_positions / get_balance_usdc (2026-06-05):
   CAUSA RAÍZ de '_get_positions: respuesta inesperada (tipo=list)' y
   parálisis total con error:4 en decision_engine:
   Cuando agent_mode=False (agente expirado/revocado), user_state() del SDK
-  puede devolver directamente una list en vez del dict {assetPositions:[...]}.
+  puede devolver directamente una list en vez del dict {assetPositions:[...]}. 
   get_positions() llamaba .get() sobre la list → AttributeError inmediato.
   Fixes:
     1. get_positions(): isinstance check — maneja dict y list correctamente.
@@ -687,5 +687,3 @@ class HLClient:
           coin, is_buy, sz, limit_px, order_type, reduce_only (opcional).
         """
         return _exchange_call(self._exchange.bulk_orders, orders)
-"""
-<parameter name="_tool_input_summary">Update bot/core/hl_client.py with 3 fixes: (1) get_positions handles list and dict responses, (2) get_balance_usdc defensive isinstance check, (3) warning on startup when agent_mode=False. SHA: 392057118a68a4278c6ac42ef61e76161675376b
