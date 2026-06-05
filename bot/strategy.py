@@ -15,44 +15,39 @@ Flujo (sin IA para el caso normal):
     3. Si hay >= NEWS_AI_THRESHOLD noticias relevantes → consulta IA solo para noticias
        El score_delta de la IA se cachea (NEWS_SCORE_TTL_MINUTES, default 30 min).
        En ciclos siguientes dentro del TTL se reutiliza el score más alto
-       entre el fresco y el cacheado — evita que una noticia negativa se olvide.
+       entre el fresco y el cacheado — evita que una noticia negativa/positiva se olvide.
     4. Si la IA de noticias dice HOLD con alta confianza → respeta
     5. Si no hay noticias relevantes o la IA confirma → entra
 
 FIX 5 (REVISADO): Fallback cuando fetch_enriched_context falla:
   - enriched=None por error → SIEMPRE HOLD. No se entra sin datos externos.
-  - Esto evita entradas en señales técnicas débiles sin validación externa.
 
 FIX 6: Propagar ef_penalty al decision_engine (v4.4)
 
-FIX 7 (MEJORADO): market_regime gate por tipo de setup:
-  - RANGING: bloquea TENDENCIA y BREAKOUT. Solo REVERSAL permitido.
-    Ratio de fakeout en breakout/tendencia durante RANGING es muy alto.
-  - TRENDING: bloquea REVERSAL (buscar reversal contra tendencia fuerte falla).
-  - VOLATILE: eleva MIN_SIGNAL_SCORE (ya estaba, mantenido).
-  - EARLY bloqueado en RANGING EXCEPTO para REVERSAL (v17: fix)
-  Config Railway:
-    REGIME_BLOCK_TREND_ON_RANGING    → default true
-    REGIME_BLOCK_REVERSAL_ON_TRENDING → default true
-    RANGING_MIN_SCORE   → default 9
-    VOLATILE_MIN_SCORE  → default 8
-    RANGING_BLOCK_EARLY → default true
+FIX 7 (MEJORADO): market_regime gate por tipo de setup.
 
 FIX 8: price_direction robusto + momentum guard en fallback
 
 FIX 9 (AI filter orden): fetch_enriched_context se mueve tras el check
-  score >= AI_CALL_MIN_SCORE. Señales que no superan ese umbral ya no
-  consumen llamadas HTTP al enricher (F&G, funding, OI, etc.).
+  score >= AI_CALL_MIN_SCORE.
 
-v17: RANGING_BLOCK_EARLY excluye REVERSAL — los reversals en rango son
-  precisamente el setup correcto para mercado lateral. Antes se bloqueaban
-  por error aunque el regime_gate ya permitía REVERSAL en RANGING.
+v17: RANGING_BLOCK_EARLY excluye REVERSAL.
 
 v21-P4: cache TTL para score_delta de noticias.
   NEWS_SCORE_TTL_MINUTES (default 30): tiempo en minutos que se retiene
-  el score_delta de noticias aunque la señal técnica no llegue a disparar
-  la IA. _get_news_score() devuelve el peor (más alto en absoluto) entre
-  fresco y cacheado — la noticia negativa más fuerte manda.
+  el score_delta de noticias.
+
+v23 — A+B+C:
+  A — regime se obtiene en decide() y se pasa a analyze_pair().
+      Activa MTF bias filter y R/R dinámico por régimen en signal_engine.
+  B — _regime también se pasa a enriched_filter.apply().
+      RANGING: funding umbral más estricto, OI+caída sin umbral.
+      VOLATILE: penalty +1 extra si momentum contrario.
+      TRENDING: RSI_OVERBOUGHT sube a 72.
+  C — cache noticias bidireccional: _get_news_score() no sobreescribe
+      el cache con fresh_score=0.0 cuando la IA no fue consultada.
+      Preserva scores tanto negativos (malas noticias) como positivos
+      (buenas noticias) entre ciclos.
 
 Variables de entorno:
   MIN_SIGNAL_SCORE             (default: 8)
@@ -107,6 +102,7 @@ _AI_NEWS_COOLDOWN_S = int(os.getenv("AI_NEWS_COOLDOWN_S", "300"))
 _last_ai_news_call: dict[str, float] = {}
 
 # v21-P4: cache TTL para score_delta de noticias
+# v23-C: bidireccional — preserva scores positivos Y negativos entre ciclos
 # Estructura: symbol → (score_delta: float, expires_ts: float)
 _news_score_cache: dict[str, tuple[float, float]] = {}
 _NEWS_SCORE_TTL = float(os.getenv("NEWS_SCORE_TTL_MINUTES", "30")) * 60  # segundos
@@ -115,19 +111,30 @@ _NEWS_SCORE_TTL = float(os.getenv("NEWS_SCORE_TTL_MINUTES", "30")) * 60  # segun
 def _get_news_score(symbol: str, fresh_score: float) -> float:
     """Devuelve el score_delta de noticias más representativo.
 
-    Lógica:
-    - Si hay un valor cacheado no expirado, devuelve el de mayor
-      valor absoluto (la noticia más fuerte manda).
-    - Actualiza el cache solo si el fresh_score tiene mayor absoluto
-      que el cacheado (no se sobreescribe con señales más débiles).
-    - Si el cache expiró, usa fresh_score directamente y lo almacena.
+    v23-C (bidireccional):
+    - Si fresh_score == 0.0 (IA no consultada este ciclo) Y hay cache válido,
+      se devuelve el cacheado SIN sobreescribirlo. Esto preserva tanto
+      noticias negativas como positivas entre ciclos donde la IA no se llama.
+    - Si fresh_score != 0.0, se compara con el cacheado por valor absoluto:
+      el de mayor peso manda y se almacena.
+    - Si el cache expiró, se usa fresh_score directamente.
 
-    El resultado es que una noticia muy negativa recibida en ciclo N
-    sigue bloqueando entradas en ciclos N+1, N+2… hasta que el TTL
-    expire, aunque en esos ciclos la IA no haya sido consultada.
+    El resultado es que una noticia muy positiva/negativa recibida en ciclo N
+    sigue influenciando entradas en ciclos N+1, N+2… hasta que el TTL expire,
+    aunque en esos ciclos la IA no haya sido consultada.
     """
     now = time.time()
     cached_score, expires = _news_score_cache.get(symbol, (0.0, 0.0))
+
+    # v23-C: si la IA no fue consultada (fresh=0.0), devolver cache si válido
+    if fresh_score == 0.0:
+        if now < expires and cached_score != 0.0:
+            log.debug(
+                "[strategy] %s news_cache devuelto (IA no consultada): %.3f (expira en %.0fs)",
+                symbol, cached_score, expires - now,
+            )
+            return cached_score
+        return 0.0
 
     if now < expires:
         # Cache válido: elegir el score de mayor peso absoluto
@@ -147,12 +154,11 @@ def _get_news_score(symbol: str, fresh_score: float) -> float:
     else:
         # Cache expirado o vacío: usar fresh y almacenar
         best = fresh_score
-        if fresh_score != 0.0:
-            _news_score_cache[symbol] = (fresh_score, now + _NEWS_SCORE_TTL)
-            log.debug(
-                "[strategy] %s news_cache nuevo: %.3f (TTL %.0fs)",
-                symbol, fresh_score, _NEWS_SCORE_TTL,
-            )
+        _news_score_cache[symbol] = (fresh_score, now + _NEWS_SCORE_TTL)
+        log.debug(
+            "[strategy] %s news_cache nuevo: %.3f (TTL %.0fs)",
+            symbol, fresh_score, _NEWS_SCORE_TTL,
+        )
 
     return best
 
@@ -230,20 +236,16 @@ def _apply_regime_gate(signal: SignalResult, symbol: str) -> Optional[dict]:
 
     RANGING:
       - TENDENCIA y BREAKOUT bloqueados (fakeout rate muy alto en rango)
-      - REVERSAL permitido (busca agotamiento de movimientos en rango)
-      - EARLY bloqueado en RANGING EXCEPTO para REVERSAL (v17):
-        Los reversals en rango en modo EARLY son el setup correcto para
-        mercados laterales. Bloquearlos era contradictorio con permitir REVERSAL.
+      - REVERSAL permitido
+      - EARLY bloqueado en RANGING EXCEPTO para REVERSAL (v17)
       - Score mínimo elevado a RANGING_MIN_SCORE
 
     TRENDING:
-      - REVERSAL bloqueado (buscar reversión contra tendencia fuerte tiene
-        win rate muy bajo; el setup correcto en TRENDING es TENDENCIA)
+      - REVERSAL bloqueado
       - TENDENCIA y BREAKOUT permitidos
 
     VOLATILE:
       - Solo eleva score mínimo a VOLATILE_MIN_SCORE
-      - Ningún setup bloqueado por tipo (volatilidad es oportunidad)
     """
     try:
         from bot.market_regime import market_regime, MARKET_REGIME_GATE
@@ -253,9 +255,7 @@ def _apply_regime_gate(signal: SignalResult, symbol: str) -> Optional[dict]:
         regime_raw = market_regime.regime_raw()
         setup_type = signal.extra.get("setup_type", "")
 
-        # ── RANGING ─────────────────────────────────────────────────
         if regime_raw == "RANGING":
-            # v17: REVERSAL en EARLY está permitido en RANGING — es el setup correcto
             if _RANGING_BLOCK_EARLY and signal.entry_mode == "EARLY" and setup_type != "REVERSAL":
                 return _result(
                     "HOLD", signal, False,
@@ -277,7 +277,6 @@ def _apply_regime_gate(signal: SignalResult, symbol: str) -> Optional[dict]:
                 symbol, setup_type, signal.score, _RANGING_MIN_SCORE,
             )
 
-        # ── TRENDING ─────────────────────────────────────────────────
         elif regime_raw == "TRENDING":
             if _REGIME_BLOCK_REVERSAL_ON_TRENDING and setup_type == "REVERSAL":
                 return _result(
@@ -286,7 +285,6 @@ def _apply_regime_gate(signal: SignalResult, symbol: str) -> Optional[dict]:
                     f"(win rate bajo reversando contra tendencia fuerte — usa TENDENCIA)",
                 )
 
-        # ── VOLATILE ─────────────────────────────────────────────────
         elif regime_raw == "VOLATILE":
             if signal.score < _VOLATILE_MIN_SCORE:
                 return _result(
@@ -323,237 +321,175 @@ async def decide(
     if has_open_position:
         return _result("HOLD", None, False, "Posición ya abierta — esperando cierre")
 
+    # v23-A: obtener régimen UNA vez y reutilizarlo en todo el flujo
+    _regime: Optional[str] = None
     try:
-        signal: SignalResult = await analyze_pair(exch, symbol, ohlcv_fn=ohlcv_fn)
+        from bot.market_regime import market_regime, MARKET_REGIME_GATE
+        if MARKET_REGIME_GATE:
+            _regime = market_regime.regime_raw()
+    except Exception as e:
+        log.debug("[strategy] regime lookup error (ignorado): %s", e)
+
+    try:
+        # v23-A: pasar regime → activa MTF bias filter y R/R dinámico en signal_engine
+        signal: SignalResult = await analyze_pair(
+            exch, symbol, ohlcv_fn=ohlcv_fn, regime=_regime
+        )
     except Exception as e:
         log.error(f"[strategy] analyze_pair error: {e}")
         return _result("HOLD", None, False, f"Error en análisis técnico: {e}")
 
     log.info(
         f"[strategy] {symbol} · score={signal.score}/{signal.max_score} · mode={signal.entry_mode} "
-        f"· {signal.signal} · RR={signal.rr} · lev={signal.suggested_lev}x"
+        f"· {signal.signal} · RR={signal.rr} · lev={signal.suggested_lev}x · regime={_regime or 'none'}"
     )
 
-    if not signal.is_valid:
+    if signal.signal == "NEUTRAL" or not signal.is_valid:
+        return _result("HOLD", signal, False, signal.reason or "Señal no válida")
+
+    if signal.score < MIN_SIGNAL_SCORE:
         return _result(
             "HOLD", signal, False,
-            f"Sin modo de entrada válido (score={signal.score}/{signal.max_score}, mode={signal.entry_mode})"
+            f"Score {signal.score} < mínimo {MIN_SIGNAL_SCORE}"
         )
 
     if signal.rr < MIN_RR_REQUIRED:
         return _result(
             "HOLD", signal, False,
-            f"R/R insuficiente ({signal.rr:.1f} < {MIN_RR_REQUIRED})"
+            f"RR {signal.rr:.2f} < mínimo {MIN_RR_REQUIRED}"
         )
 
-    if signal.signal == "NEUTRAL":
-        return _result("HOLD", signal, False, "Señal técnica neutral")
+    gate_result = _apply_regime_gate(signal, symbol)
+    if gate_result is not None:
+        return gate_result
 
-    # FIX 7 + v17: gate de régimen por tipo de setup
-    regime_block = _apply_regime_gate(signal, symbol)
-    if regime_block is not None:
-        return regime_block
-
-    if signal.entry_mode == "STRONG" and SKIP_AI_ON_STRONG:
-        action = "BUY" if signal.signal == "LONG" else "SELL"
-        return _result(
-            action, signal, False,
-            f"💥 STRONG entry directo · score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x"
-        )
-
-    # FIX 9: score check ANTES de fetch_enriched_context
     if signal.score < AI_CALL_MIN_SCORE:
         return _result(
             "HOLD", signal, False,
-            f"⏭️ score={signal.score}/{signal.max_score} < {AI_CALL_MIN_SCORE} → HOLD"
+            f"Score {signal.score} < AI_CALL_MIN_SCORE {AI_CALL_MIN_SCORE} — señal insuficiente"
         )
 
-    # FIX 8: calcular price_direction una sola vez, con fallback robusto
-    price_dir = _compute_price_direction(signal, ohlcv_fn)
-    effective_price_dir = _conservative_price_dir(signal.signal, price_dir)
-    if price_dir is None:
-        log.debug(
-            "[strategy] %s price_direction desconocido → usando conservador '%s' para %s",
-            symbol, effective_price_dir, signal.signal,
-        )
-
-    # ── Paso 1: enriquecer contexto externo ──────────────────────────────────────
-    from bot.data_enricher import fetch_enriched_context
-    from bot.enriched_filter import apply as ef_apply
-
+    # ── Enriched context ──────────────────────────────────────────────────────
     enriched = None
-    enriched_failed = False
     try:
+        from bot.data_enricher import fetch_enriched_context
         enriched = await fetch_enriched_context(symbol)
     except Exception as e:
-        log.warning(f"[strategy] fetch_enriched_context error: {e} — bloqueando entrada (FIX: no entrar sin datos externos)")
-        enriched_failed = True
+        log.warning(f"[strategy] fetch_enriched_context error: {e}")
 
-    if enriched_failed:
-        log.warning(
-            f"[strategy] {symbol} ⛔ HOLD — datos externos no disponibles (error de red). "
-            f"No se abre posición sin validación de F&G/funding/OI."
-        )
+    if enriched is None:
+        fallback = _momentum_guard_fallback(signal, _compute_price_direction(signal, ohlcv_fn))
+        if fallback:
+            return fallback
         return _result(
             "HOLD", signal, False,
-            f"⛔ Sin datos externos (error de red) — entrada bloqueada para protección"
+            "enriched=None — HOLD por política de seguridad (sin datos externos)"
         )
 
-    # ── Paso 2: filtro determinista ──────────────────────────────────────────────
-    action_if_pass = "BUY" if signal.signal == "LONG" else "SELL"
+    # ── Enriched filter (v23-B: pasa regime) ─────────────────────────────────
+    from bot.enriched_filter import apply as ef_apply
+    price_dir = _compute_price_direction(signal, ohlcv_fn)
+    i15 = signal.indicators.get("15m", {})
+    ef_result = ef_apply(
+        signal=signal.signal,
+        enriched=enriched,
+        rsi=i15.get("rsi_val"),
+        vol_ratio=i15.get("vol_ratio"),
+        price_direction=price_dir,
+        regime=_regime,   # v23-B
+    )
+    ef_penalty = ef_result.penalty
 
-    if enriched is not None:
-        i15       = signal.indicators.get("15m", {})
-        rsi_val   = i15.get("rsi_val")
-        vol_ratio = i15.get("vol_ratio")
-
-        ef_result = ef_apply(
-            signal=signal.signal,
-            enriched=enriched,
-            rsi=rsi_val,
-            vol_ratio=vol_ratio,
-            price_direction=effective_price_dir,
+    if not ef_result.allowed:
+        return _result(
+            "HOLD", signal, False,
+            f"🚫 enriched_filter: {ef_result.reason}",
+            ef_penalty=ef_penalty,
         )
 
-        if not ef_result.allowed:
-            return _result(
-                "HOLD", signal, False,
-                f"🚫 EnrichedFilter bloqueó: {ef_result.reason}"
-            )
+    # ── IA de noticias (v23-C: _get_news_score corregido) ────────────────────
+    ai_confidence = 0
+    ai_reason     = ""
+    ai_used       = False
+    score_delta   = 0.0
 
-        base_confidence = max(5, signal.score - ef_result.penalty)
-
-        # ── Paso 3: IA solo si hay noticias relevantes ────────────────────────
-        if USE_AI_FOR_NEWS and ef_result.news_ai_needed:
-            now = time.monotonic()
-            cooldown_remaining = _AI_NEWS_COOLDOWN_S - (now - _last_ai_news_call.get(symbol, 0))
-            if cooldown_remaining > 0:
-                log.debug(
-                    f"[strategy] {symbol} IA news cooldown activo ({cooldown_remaining:.0f}s restantes)"
-                )
-            else:
-                log.info(
-                    f"[strategy] {symbol} 📰 Consultando IA solo para análisis de noticias "
-                    f"(score={signal.score}, {len(enriched.news)} noticias relevantes)"
+    if USE_AI_FOR_NEWS and ef_result.news_ai_needed:
+        now = time.time()
+        last_call = _last_ai_news_call.get(symbol, 0.0)
+        if now - last_call >= _AI_NEWS_COOLDOWN_S:
+            try:
+                ai_result = await ai_decide_fn(
+                    symbol=symbol,
+                    signal=signal.signal,
+                    enriched=enriched,
                 )
                 _last_ai_news_call[symbol] = now
+                ai_used       = True
+                ai_confidence = ai_result.get("confidence", 0)
+                ai_reason     = ai_result.get("reason", "")
+                score_delta   = float(ai_result.get("score_delta", 0.0))
 
-                news_context = {
-                    "symbol":     symbol,
-                    "signal":     signal.signal,
-                    "score":      signal.score,
-                    "max_score":  signal.max_score,
-                    "rr":         signal.rr,
-                    "entry":      signal.entry,
-                    "sl":         signal.sl,
-                    "tp1":        signal.tp1,
-                    "tp2":        signal.tp2,
-                    "atr":        signal.atr,
-                    "suggested_lev": signal.suggested_lev,
-                    "task":       "news_sentiment_only",
-                    "external":   _format_news_only(enriched),
-                }
+                log.info(
+                    "[strategy] %s IA noticias → confidence=%d score_delta=%.2f reason=%s",
+                    symbol, ai_confidence, score_delta, ai_reason[:80],
+                )
+            except Exception as e:
+                log.warning("[strategy] ai_decide_fn error: %s", e)
+        else:
+            log.debug(
+                "[strategy] %s AI noticias en cooldown (%.0fs restantes)",
+                symbol, _AI_NEWS_COOLDOWN_S - (now - last_call),
+            )
 
-                try:
-                    ai_result = await ai_decide_fn(
-                        symbol, [], None, None, signal.suggested_lev,
-                        context_override=news_context,
-                    )
-                    ai_action     = str(ai_result.get("action", "HOLD")).upper().strip()
-                    ai_confidence = ai_result.get("confidence", 0)
-                    ai_reason     = ai_result.get("reason", ai_result.get("reasoning", ""))
-                    # v21-P4: extraer score_delta de la respuesta IA y cachearlo
-                    ai_score_delta = float(ai_result.get("score_delta", 0.0))
-                    cached_delta   = _get_news_score(symbol, ai_score_delta)
+    # v23-C: _get_news_score ya no sobreescribe cache con 0.0 cuando IA no se consultó
+    effective_score_delta = _get_news_score(symbol, score_delta)
 
-                    if ai_action not in ("BUY", "SELL"):
-                        ai_action = "HOLD"
+    adjusted_score = signal.score + effective_score_delta
+    if ai_used and ai_confidence >= AI_HIGH_CONFIDENCE_THRESHOLD:
+        if ai_result.get("action", "").upper() == "HOLD":
+            return _result(
+                "HOLD", signal, ai_used,
+                f"🤖 IA noticias HOLD (conf={ai_confidence}): {ai_reason}",
+                ai_confidence=ai_confidence,
+                ai_reason=ai_reason,
+                ef_penalty=ef_penalty,
+            )
 
-                    # v21-P4: usar el cached_delta para decisión si es más pesado
-                    effective_confidence = ai_confidence
-                    if cached_delta != ai_score_delta:
-                        log.info(
-                            "[strategy] %s 📰 score_delta cacheado %.3f vs fresco %.3f — "
-                            "usando el de mayor peso para la decisión",
-                            symbol, cached_delta, ai_score_delta,
-                        )
-                        # Si el delta cacheado era bloqueante y el fresco no, mantener HOLD
-                        if ai_action != "HOLD" and abs(cached_delta) > abs(ai_score_delta):
-                            ai_action = "HOLD"
-                            effective_confidence = AI_HIGH_CONFIDENCE_THRESHOLD
-                            ai_reason = f"[cache news TTL] score_delta cacheado={cached_delta:.3f} | {ai_reason}"
-
-                    if ai_action == "HOLD" and effective_confidence >= AI_HIGH_CONFIDENCE_THRESHOLD:
-                        return _result(
-                            "HOLD", signal, True,
-                            f"📰 IA news→HOLD ({effective_confidence}/10) bloqueó entrada | {ai_reason}",
-                            ai_confidence=effective_confidence,
-                            ai_reason=ai_reason,
-                        )
-
-                    if ai_action == "HOLD" and signal.score >= AI_HOLD_OVERRIDE_SCORE:
-                        log.info(
-                            f"[strategy] {symbol} 🔁 IA news→HOLD (conf={effective_confidence}) "
-                            f"pero score={signal.score}>={AI_HOLD_OVERRIDE_SCORE} → override"
-                        )
-                        return _result(
-                            action_if_pass, signal, True,
-                            f"🔁 Override técnico (score={signal.score}) · IA news dudó (conf={effective_confidence}/10) | {ai_reason}",
-                            ai_confidence=effective_confidence,
-                            ai_reason=ai_reason,
-                            ef_penalty=ef_result.penalty,
-                        )
-
-                except Exception as e:
-                    log.warning(f"[strategy] IA noticias falló: {e} — ignorando")
-
-        # ── Paso 4: entrada (filtro determinista pasado) ──────────────────────
+    if adjusted_score < AI_HOLD_OVERRIDE_SCORE:
         return _result(
-            action_if_pass, signal, False,
-            f"✅ EnrichedFilter OK · {ef_result.reason} · "
-            f"score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x",
-            ef_penalty=ef_result.penalty,
+            "HOLD", signal, ai_used,
+            f"Score ajustado {adjusted_score:.1f} < {AI_HOLD_OVERRIDE_SCORE} (delta noticias={effective_score_delta:+.1f})",
+            ai_confidence=ai_confidence,
+            ai_reason=ai_reason,
+            ef_penalty=ef_penalty,
         )
 
-    # Path técnico puro (enriched=None sin error)
-    momentum_block = _momentum_guard_fallback(signal, price_dir)
-    if momentum_block is not None:
-        return momentum_block
-
-    log.info(f"[strategy] {symbol} Sin datos externos (None limpio) — decisión técnica pura con momentum guard")
+    action = "BUY" if signal.signal == "LONG" else "SELL"
     return _result(
-        action_if_pass, signal, False,
-        f"⚡ Técnico (sin datos externos) · score={signal.score}/{signal.max_score} · lev={signal.suggested_lev}x"
+        action, signal, ai_used,
+        ef_result.reason,
+        ai_confidence=ai_confidence,
+        ai_reason=ai_reason,
+        ef_penalty=ef_penalty,
     )
-
-
-def _format_news_only(enriched) -> str:
-    lines = []
-    if enriched.news:
-        lines.append("Recent news (your only job is to evaluate these):")
-        for item in enriched.news:
-            icon = "📈" if item.sentiment == "bullish" else "📉" if item.sentiment == "bearish" else "📰"
-            lines.append(f"  {icon} [{item.sentiment}] {item.title}")
-    else:
-        lines.append("Recent news: none")
-    return "\n".join(lines)
 
 
 def _result(
     action: str,
-    signal,
+    signal: Optional[SignalResult],
     ai_used: bool,
     reason: str,
     ai_confidence: int = 0,
     ai_reason: str = "",
     ef_penalty: int = 0,
 ) -> dict:
+    sb = format_signal_block(signal) if signal else ""
     return {
         "action":        action,
         "signal":        signal,
         "ai_used":       ai_used,
         "reason":        reason,
-        "signal_block":  format_signal_block(signal) if signal else "",
+        "signal_block":  sb,
         "ai_confidence": ai_confidence,
         "ai_reason":     ai_reason,
         "ef_penalty":    ef_penalty,
