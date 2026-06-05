@@ -253,6 +253,15 @@ FIX AttributeError _account_addr/_agent_addr/_agent_mode (2026-06-05 v18):
   El AttributeError bloqueaba la inicialización de TODOS los traders
   (los 20 en paralelo), dejando el bot arrancado pero sin trading activo.
   Fix: usar los nombres de atributo correctos de HLClient/_HLCore.
+
+FIX is_buy invertido en place_sl/place_tp (2026-06-05 v27) — BUG RAÍZ de SL/TP:
+  CAUSA RAÍZ: place_sl y place_tp reciben is_buy como el lado de la ORDEN
+  DE CIERRE, no el lado de la posición abierta.
+    - LONG abierto → el cierre es una VENTA → is_buy=False (not is_long)
+    - SHORT abierto → el cierre es una COMPRA → is_buy=True (not is_long)
+  Se pasaba is_long directamente → HL colocaba la orden en el lado equivocado
+  → las órdenes eran rechazadas o ignoradas silenciosamente → sin SL ni TP.
+  Fix: pasar not is_long en place_sl y place_tp en open_order() y _place_tpsl().
 """
 from __future__ import annotations
 
@@ -793,23 +802,26 @@ class FuturesTrader:
         ref_price: float,
     ) -> None:
         """
-        FIX v19: place_sl y place_tp reciben is_buy como bool (no string).
-        Firmas reales de HLClient:
-          place_sl(is_buy: bool, sz, sl_price, entry_price=None)
-          place_tp(is_buy: bool, sz, tp_price, limit_price, entry_price=None)
+        FIX v27: place_sl y place_tp reciben is_buy como el lado de la ORDEN
+        DE CIERRE, no el lado de la posición abierta.
+          - LONG abierto → cierre es VENTA → is_buy = not is_long = False
+          - SHORT abierto → cierre es COMPRA → is_buy = not is_long = True
         """
         hl = self._require_hl()
         if hl is None:
             return
 
+        # is_buy para órdenes de cierre es el OPUESTO de la posición abierta
+        close_side = not is_long
+
         if sl_price and sl_price > 0:
             try:
                 await asyncio.to_thread(
                     hl.place_sl,
-                    is_long,    # is_buy: bool
+                    close_side,  # is_buy: bool (opuesto a la posición)
                     qty,
-                    sl_price,   # sl_price
-                    ref_price,  # entry_price (opcional)
+                    sl_price,    # sl_price
+                    ref_price,   # entry_price (opcional)
                 )
             except Exception as e:
                 logger.error("[%s] _place_tpsl SL error: %s", self.symbol, e, exc_info=True)
@@ -818,11 +830,11 @@ class FuturesTrader:
             try:
                 await asyncio.to_thread(
                     hl.place_tp,
-                    is_long,    # is_buy: bool
+                    close_side,  # is_buy: bool (opuesto a la posición)
                     qty,
-                    tp_price,   # tp_price
-                    None,       # limit_price (None = calcular automáticamente)
-                    ref_price,  # entry_price (opcional)
+                    tp_price,    # tp_price
+                    None,        # limit_price (None = calcular automáticamente)
+                    ref_price,   # entry_price (opcional)
                 )
             except Exception as e:
                 logger.error("[%s] _place_tpsl TP error: %s", self.symbol, e, exc_info=True)
@@ -1075,13 +1087,16 @@ class FuturesTrader:
         self._protection_ok = False
         self._tp1_be_done   = False
 
-        # ── FIX v19: place_sl(is_buy: bool, sz, sl_price, entry_price=None) ──
-        # is_buy = True si es posición LONG (compramos para cerrar si cae)
+        # ── FIX v27: is_buy para órdenes de cierre = not is_long ──────────────
+        # LONG abierto → SL/TP cierran vendiendo → is_buy=False (not is_long)
+        # SHORT abierto → SL/TP cierran comprando → is_buy=True (not is_long)
+        close_side = not is_long
+
         if sl_px and sl_px > 0:
             try:
                 sl_result = await asyncio.to_thread(
                     hl.place_sl,
-                    is_long,        # is_buy: bool
+                    close_side,     # is_buy: bool (opuesto a la posición)
                     qty,
                     sl_px,          # sl_price
                     filled_price,   # entry_price (opcional, para validación)
@@ -1091,12 +1106,11 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: error colocando SL: %s", self.symbol, e, exc_info=True)
 
-        # ── FIX v19: place_tp(is_buy: bool, sz, tp_price, limit_price, entry_price=None) ──
         if tp1_px and tp1_px > 0:
             try:
                 tp_result = await asyncio.to_thread(
                     hl.place_tp,
-                    is_long,        # is_buy: bool
+                    close_side,     # is_buy: bool (opuesto a la posición)
                     qty,
                     tp1_px,         # tp_price
                     None,           # limit_price (None = buffer automático)
