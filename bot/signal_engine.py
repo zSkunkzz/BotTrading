@@ -192,10 +192,41 @@ def _to_ccxt_symbol(symbol: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v21 P1: limpieza OHLCV
+# Normalización OHLCV: acepta tanto listas/tuplas como dicts
 # ─────────────────────────────────────────────────────────────────────────────
+def _bar_val(b, idx: int, key: str):
+    """Obtiene un campo OHLCV de una barra, sea lista/tupla o dict."""
+    if isinstance(b, dict):
+        return b[key]
+    return b[idx]
+
+def _b_ts(b):    return _bar_val(b, 0, "timestamp")
+def _b_open(b):  return _bar_val(b, 1, "open")
+def _b_high(b):  return _bar_val(b, 2, "high")
+def _b_low(b):   return _bar_val(b, 3, "low")
+def _b_close(b): return _bar_val(b, 4, "close")
+def _b_vol(b):   return _bar_val(b, 5, "volume")
+
+def _normalize_bar(b) -> list:
+    """Convierte cualquier formato de barra a lista [ts, open, high, low, close, vol]."""
+    if isinstance(b, dict):
+        return [
+            b.get("timestamp", b.get("ts", 0)),
+            b["open"], b["high"], b["low"], b["close"], b["volume"],
+        ]
+    return list(b)
+
+# ── v21 P1: limpieza OHLCV ───────────────────────────────────────────────────
 def _clean_bars(bars: list) -> list:
-    return [b for b in (bars or []) if b is not None and all(v is not None for v in b)]
+    """Limpia y normaliza barras: elimina nulos y convierte dicts a listas."""
+    cleaned = []
+    for b in (bars or []):
+        if b is None:
+            continue
+        nb = _normalize_bar(b)
+        if all(v is not None for v in nb):
+            cleaned.append(nb)
+    return cleaned
 
 
 @dataclass
@@ -402,7 +433,7 @@ async def _analyze_pair_inner(
 
     indicators = {
         "15m": ind_15m, "1h": ind_1h, "4h": ind_4h,
-        "_closes_15m": [b[4] for b in bars_15m[-5:]],
+        "_closes_15m": [float(_b_close(b)) for b in bars_15m[-5:]],
     }
 
     vol_ratio_15m = ind_15m.get("vol_ratio", 1.0)
@@ -410,8 +441,8 @@ async def _analyze_pair_inner(
         return _hold_result(symbol, f"Vol={vol_ratio_15m:.2f}x — mercado dormido (min {_VOL_MIN_GLOBAL}x)")
 
     if len(bars_15m) >= _VOL_AVG_WINDOW + 1:
-        vol_last    = float(bars_15m[-1][5])
-        vol_avg_ref = sum(float(b[5]) for b in bars_15m[-_VOL_AVG_WINDOW - 1:-1]) / _VOL_AVG_WINDOW
+        vol_last    = float(_b_vol(bars_15m[-1]))
+        vol_avg_ref = sum(float(_b_vol(b)) for b in bars_15m[-_VOL_AVG_WINDOW - 1:-1]) / _VOL_AVG_WINDOW
         vol_signal  = round(vol_last / vol_avg_ref, 3) if vol_avg_ref > 0 else 1.0
         if vol_signal < _VOL_SIGNAL_MIN:
             return _hold_result(symbol, f"Vol señal {vol_signal:.2f}x < {_VOL_SIGNAL_MIN}x (vela sin convicción)")
@@ -450,10 +481,10 @@ async def _analyze_pair_inner(
         return _hold_result(symbol, f"Funding {funding_rate:.4%} < {_FUNDING_SHORT_MIN:.4%} → no SHORT")
 
     last_bar    = bars_15m[-1]
-    close_price = float(last_bar[4])
-    high_price  = float(last_bar[2])
-    low_price   = float(last_bar[3])
-    open_price  = float(last_bar[1])
+    close_price = float(_b_close(last_bar))
+    high_price  = float(_b_high(last_bar))
+    low_price   = float(_b_low(last_bar))
+    open_price  = float(_b_open(last_bar))
     entry = close_price
 
     # v25: filtro vela doji
@@ -731,9 +762,9 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
     reasons.append("MACD15m en favor +1")
 
     # v27: ADX + slope EMA21_15m — filtro de tendencia real
-    closes_15m = [float(b[4]) for b in bars_15m]
-    highs_15m  = [float(b[2]) for b in bars_15m]
-    lows_15m   = [float(b[3]) for b in bars_15m]
+    closes_15m = [float(_b_close(b)) for b in bars_15m]
+    highs_15m  = [float(_b_high(b))  for b in bars_15m]
+    lows_15m   = [float(_b_low(b))   for b in bars_15m]
     adx_val = _adx_simple(highs_15m, lows_15m, closes_15m, 14)
     ema21_series = i15.get("_ema21_series", [])
     slope = _ema_slope(ema21_series, lookback=3) if ema21_series else 0.0
@@ -755,9 +786,9 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
     if ema21_15m and close_15m:
         recent_bars = bars_15m[-(_PULLBACK_LOOKBACK + 1):-1]
         for bar in recent_bars:
-            bar_low  = float(bar[3])
-            bar_high = float(bar[2])
-            bar_vol  = float(bar[5])
+            bar_low  = float(_b_low(bar))
+            bar_high = float(_b_high(bar))
+            bar_vol  = float(_b_vol(bar))
             if direction == "LONG":
                 if bar_low <= ema21_15m * (1 + _PULLBACK_TOLERANCE):
                     pullback_detected = True
@@ -827,7 +858,7 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
 
     # v25: estructura HH/HL (LONG) o LL/LH (SHORT) en los últimos cierres 15m
     if len(bars_15m) >= 4:
-        closes_recent = [float(b[4]) for b in bars_15m[-4:]]
+        closes_recent = [float(_b_close(b)) for b in bars_15m[-4:]]
         if direction == "LONG":
             hh_hl = closes_recent[-1] > closes_recent[-2] > closes_recent[-3]
             if hh_hl:
@@ -859,9 +890,9 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         return "BREAKOUT", "NEUTRAL", 0, MAX, ["Velas insuficientes para breakout"]
 
     window = bars_15m[-(_BREAKOUT_WINDOW + 1):-1]
-    range_high = max(b[2] for b in window)
-    range_low  = min(b[3] for b in window)
-    current_close = float(bars_15m[-1][4])
+    range_high = max(float(_b_high(b)) for b in window)
+    range_low  = min(float(_b_low(b))  for b in window)
+    current_close = float(_b_close(bars_15m[-1]))
     vol_ratio = i15.get("vol_ratio", 1.0)
     atr_val = float(i15.get("atr", 0) or 0)
     breakout_pad = atr_val * _BREAKOUT_ATR_CONFIRM
@@ -883,9 +914,9 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
     # squeeze filter (v25 fix)
     if atr_val > 0 and len(bars_15m) >= _BREAKOUT_WINDOW * 2:
-        hist_highs  = [float(b[2]) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
-        hist_lows   = [float(b[3]) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
-        hist_closes = [float(b[4]) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
+        hist_highs  = [float(_b_high(b))  for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
+        hist_lows   = [float(_b_low(b))   for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
+        hist_closes = [float(_b_close(b)) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
         hist_atr = calc_atr(hist_highs, hist_lows, hist_closes, min(14, len(hist_closes) - 1))
         if hist_atr > 0:
             squeeze_threshold = hist_atr * (1.0 - _BREAKOUT_SQUEEZE_PCT / 100.0)
@@ -991,8 +1022,8 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     else:
         reasons.append("MACD15m no disponible")
 
-    last_open  = float(bars_15m[-1][1])
-    last_close = float(bars_15m[-1][4])
+    last_open  = float(_b_open(bars_15m[-1]))
+    last_close = float(_b_close(bars_15m[-1]))
     if (is_long and last_close > last_open) or (is_short and last_close < last_open):
         score += 1; reasons.append("Vela de giro confirmada +1")
     else:
@@ -1089,10 +1120,10 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 def _compute_indicators(bars: list) -> dict:
     if not bars or len(bars) < 10:
         return {}
-    closes = [b[4] for b in bars]
-    highs  = [b[2] for b in bars]
-    lows   = [b[3] for b in bars]
-    vols   = [b[5] for b in bars]
+    closes = [float(_b_close(b)) for b in bars]
+    highs  = [float(_b_high(b))  for b in bars]
+    lows   = [float(_b_low(b))   for b in bars]
+    vols   = [float(_b_vol(b))   for b in bars]
     ema21_series = ema(closes, 21)
     ema50_series = ema(closes, 50)
     ema21 = ema21_series[-1] if ema21_series else None
