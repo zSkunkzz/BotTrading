@@ -9,7 +9,7 @@ Expone exactamente la misma interfaz pública:
 
   Métodos de orden:
     place_market(is_buy, sz, reduce_only, ref_price)
-    place_market_with_tpsl(is_buy, sz, sl_px, tp_px, ref_price)  ← NUEVO v6
+    place_market_with_tpsl(is_buy, sz, sl_px, tp_px, ref_price)
     place_limit(is_buy, sz, price, reduce_only, tif)
     place_tp(is_buy, sz, trigger_px, limit_px, entry_px)
     place_sl(is_buy, sz, trigger_px, entry_px)
@@ -38,55 +38,41 @@ Opcionales:
   BINGX_TESTNET=true         (usa open-api-vst.bingx.com)
   BINGX_DEFAULT_LEVERAGE=10
   BINGX_MARGIN_MODE=isolated|cross
+  BINGX_POSITION_MODE=hedge  (fuerza hedge mode sin consultar la API)
 
-Notas BingX vs OKX:
-  - BingX perpetuos USDT-M: 1 contrato = 1 unidad del coin base (ctVal=1 siempre).
-  - instId es "{COIN}-USDT", no "{COIN}-USDT-SWAP".
-  - positionSide en ONE-WAY MODE:
-      * Siempre "BOTH" — tanto apertura como cierre.
-      * "LONG"/"SHORT" solo aplican en HEDGE MODE.
-    Ref: BingX swap-trade SKILL.md — positionSide: LONG | SHORT | BOTH
-    Ref: BingX one-way mode doc — BOTH para cualquier orden en one-way.
+Notas positionSide:
+  - ONE-WAY MODE:  positionSide="BOTH" en todas las órdenes.
+  - HEDGE MODE:    positionSide="LONG" (BUY) o "SHORT" (SELL).
+  _BingXCore detecta automáticamente el modo al inicializar consultando
+  /openApi/swap/v1/positionSide/dual. La variable de entorno
+  BINGX_POSITION_MODE=hedge permite forzarlo sin llamada API.
+
+Fixes (2026-06-06 v7) — soporte Hedge Mode:
+
+  Fix #11 — positionSide dinámico según modo de cuenta (🔴 CRÍTICO)
+    BingX devuelve "In the Hedge mode, the 'PositionSide' field can only
+    be set to LONG or SHORT." cuando la cuenta está en HEDGE MODE y se
+    envía positionSide=BOTH.
+    _BingXCore detecta el modo (hedge_mode flag) al inicializar.
+    Todos los métodos de orden usan _pos_side(is_buy) que devuelve:
+      - "BOTH"  en one-way mode
+      - "LONG"  en hedge mode si is_buy=True
+      - "SHORT" en hedge mode si is_buy=False
+    En hedge mode, reduce_only se omite (no compatible) y las órdenes
+    de cierre usan el positionSide opuesto a la posición.
+    Ref: BingX docs — positionSide: LONG | SHORT | BOTH
 
 Fixes (2026-06-06 v6) — re-auditoría doc oficial BingX (bingx-api/api-ai-skills):
 
   Fix #8 — domain fallback .pro obligatorio (🔴 CRÍTICO)
-    Doc oficial BingX SKILL.md fetchSigned:
-      BASE = { "prod-live": ["https://open-api.bingx.com", "https://open-api.bingx.pro"] }
-      "Domain priority: .com is mandatory primary; .pro is fallback for
-      network/timeout errors ONLY."
-    _BingXCore implementa _request() con loop de dominios idéntico al
-    fetchSigned oficial: intenta .com primero, si falla con error de red/timeout
-    reintenta con .pro. Aplicado a _get, _post, _delete.
-    Ref: bingx-api/api-ai-skills fetchSigned — isNetworkOrTimeout check.
-
   Fix #9 — stopLoss/takeProfit embebidos en MARKET (🔴 CRÍTICO)
-    Doc oficial BingX:
-      "stopLoss/takeProfit objects are ONLY supported on MARKET or LIMIT order types."
-      Estructura: {"type":"STOP_MARKET","stopPrice":X,"workingType":"MARK_PRICE"}
-    Nuevo método place_market_with_tpsl() adjunta SL y TP a la orden MARKET
-    en una sola llamada API, eliminando la race condition de órdenes separadas.
-    Los objetos JSON se URL-encodean correctamente en el body POST.
-    place_sl()/place_tp() se mantienen para compatibilidad con flujos existentes.
-    Ref: bingx-api/api-ai-skills — Stop-Loss/Take-Profit Object Structure.
-
   Fix #10 — get_user_state usa v3 (🟡 IMPORTANTE)
-    get_user_state() usaba /v2/user/balance en lugar del endpoint actual.
-    Ahora usa /openApi/swap/v3/user/balance (igual que get_balance_usdc).
-    Ref: bingx-api/api-ai-skills swap-account — /openApi/swap/v3/user/balance.
 
 Fixes (2026-06-06 v5) — re-auditoría doc oficial BingX (bingx-api/api-ai-skills):
 
   Fix #5 — positionSide en one-way mode: siempre BOTH (🔴 CRÍTICO)
-    En ONE-WAY MODE: usar BOTH en TODAS las órdenes (apertura y cierre).
-    LONG/SHORT solo aplican en HEDGE MODE.
-    BingX devuelve error 80014 si envías LONG/SHORT en one-way mode.
-
   Fix #6 — X-SOURCE-KEY header obligatorio (🔴 CRÍTICO)
-    SKILL.md: "MUST include X-SOURCE-KEY: BX-AI-SKILL header on every request".
-
   Fix #7 — timestamp incluido en sort() correctamente (🟡 IMPORTANTE)
-    fetchSigned oficial: sort con timestamp incluido antes del join.
 
 Fixes (2026-06-06 v4):
   Fix #1 — sign → signature (🔴 CRÍTICO)
@@ -122,12 +108,9 @@ _API_SECRET   = os.getenv("BINGX_API_SECRET", "").strip()
 _USE_TESTNET  = os.getenv("BINGX_TESTNET",   "").lower() in ("true", "1", "yes")
 _DEFAULT_LEV  = int(os.getenv("BINGX_DEFAULT_LEVERAGE", "10"))
 _MARGIN_MODE  = os.getenv("BINGX_MARGIN_MODE", "isolated").strip().lower()
+# BINGX_POSITION_MODE=hedge fuerza hedge mode sin consultar la API.
+_FORCE_HEDGE  = os.getenv("BINGX_POSITION_MODE", "").strip().lower() == "hedge"
 
-# Fix #8 (v6): domain fallback .pro — doc oficial BingX SKILL.md fetchSigned:
-# "Domain priority: .com is mandatory primary; .pro is fallback for
-# network/timeout errors ONLY."
-# BASE["prod-live"] = ["https://open-api.bingx.com", "https://open-api.bingx.pro"]
-# BASE["prod-vst"]  = ["https://open-api-vst.bingx.com", "https://open-api-vst.bingx.pro"]
 if _USE_TESTNET:
     _BASE_URLS = [
         "https://open-api-vst.bingx.com",
@@ -141,13 +124,6 @@ else:
 
 
 def _is_network_error(exc: Exception) -> bool:
-    """
-    Fix #8 (v6): detecta errores de red/timeout para activar fallback .pro.
-    Ref: bingx-api/api-ai-skills fetchSigned — isNetworkOrTimeout:
-      if (e instanceof TypeError) return true;      // network failure
-      if (e instanceof DOMException && e.name === "AbortError") return true;  // abort
-      if (e instanceof Error && e.name === "TimeoutError") return true;        // timeout
-    """
     if isinstance(exc, (requests.exceptions.ConnectionError,
                         requests.exceptions.Timeout,
                         requests.exceptions.ConnectTimeout,
@@ -174,10 +150,6 @@ def _to_symbol(symbol: str) -> str:
 # ── Firma HMAC-SHA256 ─────────────────────────────────────────────────────────
 
 def _hmac_sign(qs: str, secret: str) -> str:
-    """
-    Firma HMAC-SHA256. Usa hmac.HMAC() explícito (hmac.new es alias no
-    documentado). Ref: Python docs — hmac.HMAC(key, msg, digestmod).
-    """
     return _hmac.HMAC(
         secret.encode(),
         qs.encode(),
@@ -186,17 +158,6 @@ def _hmac_sign(qs: str, secret: str) -> str:
 
 
 def _build_signed_qs(params: dict, secret: str) -> str:
-    """
-    Construye la query string firmada para GET y DELETE.
-
-    Fix #1 (v4): campo de firma es 'signature', no 'sign'.
-    Fix #7 (v5): timestamp incluido en el sort() igual que fetchSigned oficial.
-    Ref: bingx-api/api-ai-skills fetchSigned:
-      const all = { ...params, timestamp: Date.now() };
-      const qs = Object.keys(all).sort().map(k => `${k}=${all[k]}`).join("&");
-      const sig = crypto.createHmac("sha256", secretKey).update(qs).digest("hex");
-      const signed = `${qs}&signature=${sig}`;
-    """
     p = {**params, "timestamp": str(int(time.time() * 1000))}
     qs  = "&".join(f"{k}={v}" for k, v in sorted(p.items()))
     sig = _hmac_sign(qs, secret)
@@ -204,17 +165,6 @@ def _build_signed_qs(params: dict, secret: str) -> str:
 
 
 def _build_signed_body(params: dict, secret: str) -> str:
-    """
-    Construye la query string firmada para enviar en el BODY de un POST.
-
-    Fix #1 (v4): campo de firma es 'signature', no 'sign'.
-    Fix #7 (v5): timestamp incluido en el sort(), idéntico a fetchSigned oficial.
-    Fix #9 (v6): los valores que sean dict/list se serializan como JSON string
-    antes de incluirlos en la query string. Esto permite enviar objetos
-    stopLoss/takeProfit embebidos según el formato oficial BingX.
-    Ref: bingx-api/api-ai-skills fetchSigned body + Stop-Loss/TP Object Structure.
-    """
-    # Serializar valores que sean dict/list a JSON string
     serialized: dict = {}
     for k, v in params.items():
         if isinstance(v, (dict, list)):
@@ -242,8 +192,6 @@ class _BingXCore:
         self._session = requests.Session()
         self._session.headers.update({
             "X-BX-APIKEY":  _API_KEY,
-            # Fix #6 (v5): header obligatorio según doc oficial BingX ai-skills.
-            # SKILL.md: "MUST include X-SOURCE-KEY: BX-AI-SKILL header on every request"
             "X-SOURCE-KEY": "BX-AI-SKILL",
         })
 
@@ -253,7 +201,40 @@ class _BingXCore:
         self._sz_decimals_cache:  dict[str, int]   = {}
         self._max_leverage_cache: dict[str, int]   = {}
 
+        # Fix #11 (v7): detectar hedge mode al inicializar.
+        # En hedge mode positionSide debe ser LONG o SHORT, nunca BOTH.
+        self.hedge_mode: bool = self._detect_hedge_mode()
+
         self._warm_cache()
+
+    def _detect_hedge_mode(self) -> bool:
+        """
+        Fix #11 (v7): consulta /openApi/swap/v1/positionSide/dual para
+        determinar si la cuenta está en HEDGE MODE (dualSidePosition=true)
+        o ONE-WAY MODE (dualSidePosition=false).
+
+        La variable de entorno BINGX_POSITION_MODE=hedge permite forzarlo
+        sin llamada API (útil si el endpoint no está disponible).
+
+        Ref: BingX docs — GET /openApi/swap/v1/positionSide/dual
+        """
+        if _FORCE_HEDGE:
+            logger.info("[BingXCore] Hedge mode FORZADO por BINGX_POSITION_MODE=hedge")
+            return True
+        try:
+            resp = self._request("GET", "/openApi/swap/v1/positionSide/dual", {})
+            dual = resp.get("data", {}).get("dualSidePosition", False)
+            mode = "HEDGE" if dual else "ONE-WAY"
+            logger.info("[BingXCore] Modo de posición detectado: %s", mode)
+            return bool(dual)
+        except Exception as exc:
+            logger.warning(
+                "[BingXCore] No se pudo detectar position mode (%s). "
+                "Asumiendo ONE-WAY. Si la cuenta está en hedge mode, "
+                "establece BINGX_POSITION_MODE=hedge.",
+                exc,
+            )
+            return False
 
     def _warm_cache(self) -> None:
         """Carga tick sizes, step sizes y max leverage de todos los contratos."""
@@ -270,8 +251,7 @@ class _BingXCore:
                 continue
             try:
                 tick_sz = float(c.get("pricePrecision") or 0.01)
-                # pricePrecision en BingX es un entero (número de decimales)
-                if tick_sz >= 1:  # es número de decimales, convertir
+                if tick_sz >= 1:
                     px_dec  = int(tick_sz)
                     tick_sz = 10 ** (-px_dec)
                 else:
@@ -310,17 +290,6 @@ class _BingXCore:
         params: dict,
         body: Optional[str] = None,
     ) -> dict:
-        """
-        Fix #8 (v6): ejecuta la petición HTTP con fallback .pro.
-        Loop idéntico al fetchSigned oficial:
-          for (const base of urls) {
-            try { ... }
-            catch (e) {
-              if (!isNetworkOrTimeout(e) || base === urls[urls.length-1]) throw e;
-            }
-          }
-        Ref: bingx-api/api-ai-skills fetchSigned — domain fallback loop.
-        """
         last_exc: Optional[Exception] = None
         for i, base_url in enumerate(_BASE_URLS):
             is_last = (i == len(_BASE_URLS) - 1)
@@ -360,18 +329,15 @@ class _BingXCore:
                     exc,
                 )
 
-        raise last_exc  # nunca debería llegar aquí
+        raise last_exc
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        """GET firmado con domain fallback."""
         return self._request("GET", path, params or {})
 
     def _post(self, path: str, params: dict, body: Optional[str] = None) -> dict:
-        """POST firmado con domain fallback."""
         return self._request("POST", path, params, body=body)
 
     def _delete(self, path: str, params: dict) -> dict:
-        """DELETE firmado con domain fallback."""
         return self._request("DELETE", path, params)
 
     @classmethod
@@ -398,6 +364,7 @@ class BingXClient:
     """
     Cliente BingX Perpetuos USDT-M.
     Interfaz idéntica a OKXClient para ser drop-in replacement.
+    Soporta ONE-WAY MODE y HEDGE MODE automáticamente.
     """
 
     def __init__(self, symbol: str, core: "_BingXCore | None" = None) -> None:
@@ -419,6 +386,37 @@ class BingXClient:
         core = await _BingXCore.get_async()
         return cls(symbol, core=core)
 
+    # ── Fix #11 (v7): helper positionSide dinámico ────────────────────────
+
+    def _pos_side(self, is_buy: bool) -> str:
+        """
+        Devuelve el valor correcto de positionSide según el modo de la cuenta:
+          - ONE-WAY MODE: "BOTH" (siempre)
+          - HEDGE MODE:   "LONG" si is_buy=True, "SHORT" si is_buy=False
+
+        Para órdenes de CIERRE en hedge mode el caller debe pasar
+        is_buy=False para long positions (SELL cierra LONG) y
+        is_buy=True para short positions (BUY cierra SHORT).
+        La lógica de cierre ya lo hace correctamente porque reduce_only
+        invierte el side.
+        """
+        if self._core.hedge_mode:
+            return "LONG" if is_buy else "SHORT"
+        return "BOTH"
+
+    def _pos_side_close(self, is_buy: bool) -> str:
+        """
+        positionSide para órdenes de CIERRE en hedge mode.
+        Para cerrar una LONG se envía SELL → positionSide="LONG".
+        Para cerrar una SHORT se envía BUY  → positionSide="SHORT".
+        En one-way mode devuelve "BOTH" igual que _pos_side.
+        """
+        if self._core.hedge_mode:
+            # is_buy=True → cerrando SHORT → positionSide=SHORT
+            # is_buy=False → cerrando LONG  → positionSide=LONG
+            return "SHORT" if is_buy else "LONG"
+        return "BOTH"
+
     # ── Metadatos ─────────────────────────────────────────────────────────
 
     def get_sz_decimals(self) -> int:
@@ -431,14 +429,9 @@ class BingXClient:
         return self._core._tick_size_cache.get(self.inst_id, 0.01)
 
     def get_max_leverage(self) -> int:
-        """
-        Usa _max_leverage_cache populado en warm_cache desde /quote/contracts
-        (campo maxLeverage). Solo hace HTTP fallback si el símbolo no está en caché.
-        """
         cached = self._core._max_leverage_cache.get(self.inst_id)
         if cached:
             return cached
-        # Fallback HTTP si warm_cache no tenía el símbolo
         try:
             resp = self._core._get(
                 "/openApi/swap/v2/trade/leverage",
@@ -466,7 +459,6 @@ class BingXClient:
         return math.floor(sz * factor) / factor
 
     def usdc_to_contracts(self, usdc: float, price: float) -> float:
-        """BingX: contratos = USDT / precio (ct_val=1)."""
         if price <= 0:
             return 0.0
         return usdc / price
@@ -501,14 +493,6 @@ class BingXClient:
     # ── Leverage ──────────────────────────────────────────────────────────
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> dict:
-        """
-        Establece el leverage para el símbolo.
-
-        Fix #3 (v4): La doc oficial BingX usa side='LONG' y side='SHORT',
-        NO 'BOTH'. Se llama dos veces (LONG + SHORT) para cubrir ambos lados
-        en one-way mode. El issue ccxt #22237 confirma error 109400 con 'BOTH'.
-        Ref: bingx-api/api-ai-skills — Set leverage example: side='LONG'.
-        """
         results = {}
         for side in ("LONG", "SHORT"):
             try:
@@ -528,18 +512,15 @@ class BingXClient:
             except Exception as exc:
                 logger.warning("[%s] set_leverage side=%s error: %s", self.inst_id, side, exc)
                 results[side] = {}
-        # Devolver el resultado de LONG como representativo (mismo formato que antes)
         return results.get("LONG", {})
 
     # ── Helpers respuesta BingX ───────────────────────────────────────────
 
     @staticmethod
     def _bx_ok(resp: dict) -> bool:
-        """BingX devuelve code=0 en éxito."""
         return str(resp.get("code", "-1")) == "0"
 
     def _wrap(self, resp: dict) -> dict:
-        """Convierte respuesta BingX al formato OKX esperado por execution_engine."""
         if self._bx_ok(resp):
             data = resp.get("data", {})
             order_id = (
@@ -560,7 +541,6 @@ class BingXClient:
         }
 
     def _wrap_algo(self, resp: dict, order_id: str = "") -> dict:
-        """Wrapper para SL/TP — reutiliza campo algoId mapeado desde orderId."""
         if self._bx_ok(resp):
             data = resp.get("data", {})
             oid  = (
@@ -591,27 +571,33 @@ class BingXClient:
     ) -> dict:
         """
         Orden MARKET en BingX.
-
-        Fix #5 (v5): positionSide siempre "BOTH" en one-way mode.
-        Doc oficial BingX: en one-way mode, BOTH es el valor correcto
-        para cualquier orden (apertura y cierre). LONG/SHORT solo en hedge mode.
-        Refs: BingX swap-trade SKILL.md params, BingX one-way mode docs.
+        Fix #11 (v7): positionSide dinámico según modo de cuenta.
+          - ONE-WAY: BOTH + reduceOnly
+          - HEDGE:   LONG/SHORT según is_buy; reduceOnly omitido
+            (en hedge mode el cierre se indica via positionSide opuesto).
         """
         sz_r = self.round_sz(sz)
         side = "BUY" if is_buy else "SELL"
-        params = {
+        # En hedge mode con reduce_only, el cierre usa positionSide opuesto.
+        if self._core.hedge_mode and reduce_only:
+            pos_side = self._pos_side_close(is_buy)
+        else:
+            pos_side = self._pos_side(is_buy)
+        params: dict = {
             "symbol":       self.inst_id,
             "side":         side,
-            "positionSide": "BOTH",
+            "positionSide": pos_side,
             "type":         "MARKET",
             "quantity":     str(sz_r),
-            "reduceOnly":   "true" if reduce_only else "false",
         }
+        # reduceOnly solo en one-way mode (hedge mode lo ignora / da error)
+        if not self._core.hedge_mode:
+            params["reduceOnly"] = "true" if reduce_only else "false"
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
-                "[%s] place_market: %s positionSide=BOTH %.6f reduceOnly=%s",
-                self.inst_id, side, sz_r, reduce_only,
+                "[%s] place_market: %s positionSide=%s %.6f reduceOnly=%s",
+                self.inst_id, side, pos_side, sz_r, reduce_only,
             )
             return self._wrap(resp)
         except Exception as exc:
@@ -627,46 +613,38 @@ class BingXClient:
         ref_price: Optional[float] = None,
     ) -> dict:
         """
-        Fix #9 (v6): Orden MARKET con SL y TP embebidos en una sola llamada API.
-
-        Doc oficial BingX:
-          "stopLoss/takeProfit objects are ONLY supported on MARKET or LIMIT order types."
-          Estructura:
-            stopLoss:   {"type": "STOP_MARKET",       "stopPrice": X, "workingType": "MARK_PRICE"}
-            takeProfit: {"type": "TAKE_PROFIT_MARKET", "stopPrice": X, "workingType": "MARK_PRICE"}
-          Ventaja: atómica — elimina la race condition de órdenes separadas.
-        Ref: bingx-api/api-ai-skills swap-trade — Stop-Loss/Take-Profit Object Structure.
-
-        Los objetos JSON se URL-encodean en el body POST via _build_signed_body.
+        Orden MARKET con SL y TP embebidos en una sola llamada API.
+        Fix #11 (v7): positionSide dinámico según modo de cuenta.
         """
-        sz_r = self.round_sz(sz)
-        side = "BUY" if is_buy else "SELL"
+        sz_r     = self.round_sz(sz)
+        side     = "BUY" if is_buy else "SELL"
+        pos_side = self._pos_side(is_buy)
         params: dict = {
             "symbol":       self.inst_id,
             "side":         side,
-            "positionSide": "BOTH",
+            "positionSide": pos_side,
             "type":         "MARKET",
             "quantity":     str(sz_r),
         }
         if sl_px is not None:
             params["stopLoss"] = {
-                "type":        "STOP_MARKET",
-                "stopPrice":   self.round_px(sl_px),
-                "workingType": "MARK_PRICE",
+                "type":           "STOP_MARKET",
+                "stopPrice":      self.round_px(sl_px),
+                "workingType":    "MARK_PRICE",
                 "stopGuaranteed": False,
             }
         if tp_px is not None:
             params["takeProfit"] = {
-                "type":        "TAKE_PROFIT_MARKET",
-                "stopPrice":   self.round_px(tp_px),
-                "workingType": "MARK_PRICE",
+                "type":           "TAKE_PROFIT_MARKET",
+                "stopPrice":      self.round_px(tp_px),
+                "workingType":    "MARK_PRICE",
                 "stopGuaranteed": False,
             }
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
-                "[%s] place_market_with_tpsl: %s positionSide=BOTH %.6f sl=%s tp=%s",
-                self.inst_id, side, sz_r,
+                "[%s] place_market_with_tpsl: %s positionSide=%s %.6f sl=%s tp=%s",
+                self.inst_id, side, pos_side, sz_r,
                 self.round_px(sl_px) if sl_px else None,
                 self.round_px(tp_px) if tp_px else None,
             )
@@ -685,27 +663,31 @@ class BingXClient:
     ) -> dict:
         """
         Orden LIMIT en BingX.
-
-        Fix #5 (v5): positionSide siempre "BOTH" en one-way mode.
+        Fix #11 (v7): positionSide dinámico según modo de cuenta.
         """
         sz_r = self.round_sz(sz)
         px_r = self.round_px(price)
         side = "BUY" if is_buy else "SELL"
-        params = {
+        if self._core.hedge_mode and reduce_only:
+            pos_side = self._pos_side_close(is_buy)
+        else:
+            pos_side = self._pos_side(is_buy)
+        params: dict = {
             "symbol":       self.inst_id,
             "side":         side,
-            "positionSide": "BOTH",
+            "positionSide": pos_side,
             "type":         "LIMIT",
             "quantity":     str(sz_r),
             "price":        str(px_r),
             "timeInForce":  tif.upper(),
-            "reduceOnly":   "true" if reduce_only else "false",
         }
+        if not self._core.hedge_mode:
+            params["reduceOnly"] = "true" if reduce_only else "false"
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
-                "[%s] place_limit: %s positionSide=BOTH %.6f @ %.6f (%s)",
-                self.inst_id, side, sz_r, px_r, tif,
+                "[%s] place_limit: %s positionSide=%s %.6f @ %.6f (%s)",
+                self.inst_id, side, pos_side, sz_r, px_r, tif,
             )
             return self._wrap(resp)
         except Exception as exc:
@@ -721,35 +703,33 @@ class BingXClient:
         entry_px:   Optional[float] = None,
     ) -> dict:
         """
-        Coloca una orden Take Profit independiente en BingX.
-
-        Nota: para nuevas posiciones, preferir place_market_with_tpsl() que
-        adjunta el TP de forma atómica junto a la orden de entrada (Fix #9 v6).
-        Este método se mantiene para TP adicionales sobre posiciones ya abiertas.
-
-        - Siempre usa TAKE_PROFIT_MARKET.
-        - positionSide="BOTH": correcto para one-way mode (fix #5 v5).
-        - workingType=MARK_PRICE: trigger usa precio de marca, evita spikes.
-        Ref: BingX swap trade docs — TAKE_PROFIT_MARKET con reduceOnly=true.
+        Take Profit independiente.
+        Fix #11 (v7): positionSide dinámico.
+        En hedge mode, el TP cierra la posición opuesta al side de entrada:
+          - TP de LONG (is_buy=True): orden SELL → positionSide=LONG
+          - TP de SHORT (is_buy=False): orden BUY → positionSide=SHORT
         """
-        sz_r  = self.round_sz(sz)
-        tpx   = self.round_px(trigger_px)
-        side  = "BUY" if is_buy else "SELL"
+        sz_r     = self.round_sz(sz)
+        tpx      = self.round_px(trigger_px)
+        side     = "BUY" if is_buy else "SELL"
+        # El TP cierra la posición → positionSide del lado que se está cerrando
+        pos_side = self._pos_side_close(is_buy) if self._core.hedge_mode else "BOTH"
         params: dict = {
             "symbol":       self.inst_id,
             "side":         side,
-            "positionSide": "BOTH",
+            "positionSide": pos_side,
             "type":         "TAKE_PROFIT_MARKET",
             "quantity":     str(sz_r),
             "stopPrice":    str(tpx),
             "workingType":  "MARK_PRICE",
-            "reduceOnly":   "true",
         }
+        if not self._core.hedge_mode:
+            params["reduceOnly"] = "true"
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
-                "[%s] place_tp: %s %.6f @ trigger=%.6f (MARK_PRICE)",
-                self.inst_id, side, sz_r, tpx,
+                "[%s] place_tp: %s positionSide=%s %.6f @ trigger=%.6f",
+                self.inst_id, side, pos_side, sz_r, tpx,
             )
             return self._wrap_algo(resp)
         except Exception as exc:
@@ -764,34 +744,30 @@ class BingXClient:
         entry_px:   Optional[float] = None,
     ) -> dict:
         """
-        Coloca una orden Stop Loss independiente en BingX.
-
-        Nota: para nuevas posiciones, preferir place_market_with_tpsl() que
-        adjunta el SL de forma atómica junto a la orden de entrada (Fix #9 v6).
-        Este método se mantiene para SL adicionales sobre posiciones ya abiertas.
-
-        - positionSide="BOTH": correcto para one-way mode (fix #5 v5).
-        - workingType=MARK_PRICE: evita activaciones prematuras.
-        Ref: BingX swap trade docs — STOP_MARKET con reduceOnly=true.
+        Stop Loss independiente.
+        Fix #11 (v7): positionSide dinámico.
+        En hedge mode, el SL cierra la posición opuesta (mismo que TP).
         """
-        sz_r  = self.round_sz(sz)
-        tpx   = self.round_px(trigger_px)
-        side  = "BUY" if is_buy else "SELL"
-        params = {
+        sz_r     = self.round_sz(sz)
+        tpx      = self.round_px(trigger_px)
+        side     = "BUY" if is_buy else "SELL"
+        pos_side = self._pos_side_close(is_buy) if self._core.hedge_mode else "BOTH"
+        params: dict = {
             "symbol":       self.inst_id,
             "side":         side,
-            "positionSide": "BOTH",
+            "positionSide": pos_side,
             "type":         "STOP_MARKET",
             "quantity":     str(sz_r),
             "stopPrice":    str(tpx),
             "workingType":  "MARK_PRICE",
-            "reduceOnly":   "true",
         }
+        if not self._core.hedge_mode:
+            params["reduceOnly"] = "true"
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
-                "[%s] place_sl: %s %.6f @ trigger=%.6f (MARK_PRICE)",
-                self.inst_id, side, sz_r, tpx,
+                "[%s] place_sl: %s positionSide=%s %.6f @ trigger=%.6f",
+                self.inst_id, side, pos_side, sz_r, tpx,
             )
             return self._wrap_algo(resp)
         except Exception as exc:
@@ -804,12 +780,6 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────
 
     def get_user_state(self) -> dict:
-        """
-        Fix #10 (v6): usa /openApi/swap/v3/user/balance (endpoint actual).
-        Antes usaba v2 por error. v3 es el endpoint correcto según
-        bingx-api/api-ai-skills swap-account Quick Reference.
-        Ref: /openApi/swap/v3/user/balance — "Account balance, equity, margin info".
-        """
         try:
             return self._core._get("/openApi/swap/v3/user/balance") or {}
         except Exception as exc:
@@ -817,14 +787,6 @@ class BingXClient:
             return {}
 
     def get_balance_usdc(self) -> float:
-        """
-        Devuelve el balance disponible en USDT.
-
-        Fix #4 (v4): usa /openApi/swap/v3/user/balance (endpoint actual según
-        doc oficial bingx-api/api-ai-skills) con fallback a v2 si falla.
-        Campo: data.balance.availableMargin.
-        Ref: bingx-api/api-ai-skills swap-account — balance endpoint.
-        """
         for version in ("v3", "v2"):
             try:
                 resp = self._core._get(f"/openApi/swap/{version}/user/balance")
@@ -844,10 +806,6 @@ class BingXClient:
         return 0.0
 
     def get_positions(self) -> list[dict]:
-        """
-        Consulta posiciones abiertas.
-        Ref: bingx-api/api-ai-skills swap-account — /openApi/swap/v2/user/positions.
-        """
         try:
             resp = self._core._get(
                 "/openApi/swap/v2/user/positions",
@@ -879,7 +837,6 @@ class BingXClient:
                 {"symbol": self.inst_id},
             )
             orders = resp.get("data", {}).get("orders", []) or resp.get("data", [])
-            # Normalizar al formato OKX esperado por execution_engine (campo ordId)
             return [
                 {"ordId": str(o.get("orderId", "")), **o}
                 for o in orders
@@ -900,11 +857,6 @@ class BingXClient:
             return {"code": "-1", "msg": str(exc), "data": []}
 
     def cancel_all_open_tpsl(self) -> list[dict]:
-        """
-        Cancela todas las órdenes abiertas del símbolo usando el endpoint
-        batch DELETE /allOpenOrders (atómico, una sola llamada API).
-        Ref: BingX — DELETE /openApi/swap/v2/trade/allOpenOrders.
-        """
         try:
             resp = self._core._delete(
                 "/openApi/swap/v2/trade/allOpenOrders",
