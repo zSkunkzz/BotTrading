@@ -48,17 +48,29 @@ v18 — reentry_guard integration:
   registrado y el score no supera REENTRY_MIN_SCORE, el capital arriesgado
   se multiplica por REENTRY_SIZE_PCT (default 0.50 → 50% del size normal).
   El ajuste se logea con nivel INFO para trazabilidad.
+
+Fix analyze_pair error logging (2026-06-07):
+  El warning "analyze_pair error: 4" no mostraba el traceback real.
+  Fix: añadido exc_info=True para ver la causa raíz completa.
+  Además se añade warm-up guard: si analyze_pair retorna None por datos
+  insuficientes (warm-up transitorio), se loguea a DEBUG en lugar de WARNING
+  para evitar ruido en los primeros ciclos del bot.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 if TYPE_CHECKING:
     pass
 
 log = logging.getLogger(__name__)
+
+# Número de errores consecutivos de analyze_pair antes de elevar a WARNING.
+# Permite que los primeros ciclos de warm-up sean silenciosos (DEBUG).
+_ANALYZE_PAIR_WARMUP_THRESHOLD = 3
 
 
 class DecisionEngine:
@@ -68,6 +80,9 @@ class DecisionEngine:
         self._pretrade     = pretrade_risk
         self._signal       = signal_engine
         self._cooldown     = cooldown
+        # Contador de errores consecutivos de analyze_pair por símbolo.
+        # Se resetea cuando el par evalúa correctamente (result no None).
+        self._analyze_error_count: dict[str, int] = {}
 
     # ── Evaluación de señal ───────────────────────────────────────────────────
 
@@ -135,8 +150,28 @@ class DecisionEngine:
             from bot.signal_engine import analyze_pair
             result = await analyze_pair(exch=None, symbol=symbol, ohlcv_fn=ohlcv_fn)
         except Exception as e:
-            log.warning("[%s] evaluate: analyze_pair error: %s", symbol, e)
+            err_count = self._analyze_error_count.get(symbol, 0) + 1
+            self._analyze_error_count[symbol] = err_count
+
+            if err_count <= _ANALYZE_PAIR_WARMUP_THRESHOLD:
+                # Primeros N errores: DEBUG silencioso (warm-up transitorio esperado)
+                log.debug(
+                    "[%s] evaluate: analyze_pair error (warm-up #%d/%d): %s",
+                    symbol, err_count, _ANALYZE_PAIR_WARMUP_THRESHOLD, e,
+                )
+            else:
+                # A partir del umbral: WARNING con traceback completo para diagnóstico real
+                log.warning(
+                    "[%s] evaluate: analyze_pair error persistente (#%d): %s\n%s",
+                    symbol, err_count, e, traceback.format_exc(),
+                )
             return None
+
+        # Reset contador de errores al evaluar correctamente
+        if symbol in self._analyze_error_count:
+            prev = self._analyze_error_count.pop(symbol)
+            if prev > 0:
+                log.info("[%s] evaluate: analyze_pair recuperado tras %d errores", symbol, prev)
 
         if result is None or not result.is_valid:
             log.debug("[%s] evaluate: señal inválida — %s", symbol, getattr(result, 'reason', ''))
