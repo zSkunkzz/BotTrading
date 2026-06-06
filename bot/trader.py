@@ -2,35 +2,27 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
-v17 — Fix get_ohlcv_fn + _get_positions (2026-06-07):
-  - Añade get_ohlcv_fn(): retorna un callable que TradingLoop puede invocar
-    para obtener datos OHLCV desde BingX. Internamente usa _fetch_candles().
-  - Añade _get_positions(): consulta posiciones abiertas en BingX y retorna
-    lista de dicts normalizados con symbol, side, qty, entry_price, pnl.
-    Filtra posiciones con qty == 0 (cerradas).
+v18 — Fix CRÍTICO: añade open_order() (2026-06-07):
+  - trading_loop.py llama a trader.open_order(signal, risk) en línea 553
+    pero el método no existía → AttributeError bloqueaba TODA ejecución de órdenes.
+  - open_order() implementa el flujo completo:
+      1. Extrae side, entry, sl, tp1/tp2/tp3 del signal dict.
+      2. Calcula qty = (usdc_per_trade * leverage) / entry_price.
+      3. Comprueba staleness del precio (reutiliza _check_price_staleness).
+      4. En dry_run: simula apertura y actualiza estado en memoria.
+      5. En live: llama _set_leverage(), luego place_market_with_tpsl()
+         (atómico); si falla, fallback a place_market() + _place_tpsl().
+      6. Confirma fill con get_price() (retries), ajusta SL/TP al precio
+         real de fill (_adjust_levels_to_fill), persiste en state.py.
+      7. Coloca TP2/TP3 con _place_tpsl() si vienen en el signal.
+      8. Sets self._pending_order = True/False como bracket para que
+         _stop_pair_with_cleanup() en main.py espere el vuelo.
 
-v16 — Fix #14 leverage cap interno (2026-06-06):
-  - _set_leverage() ahora consulta _bingx_client.get_max_leverage() antes
-    de enviar la llamada al exchange. Si el valor configurado supera el
-    máximo real del par, se capea en silencio (log INFO). Elimina el error
-    "Invalid leverage value" que ocurría cuando LEVERAGE > max del par.
-
-v15 — Fix leverage no aplicado (2026-06-06):
-  - open_order ahora llama _set_leverage(leverage) antes de enviar la orden
-    de mercado. Sin esta llamada, BingX usaba el leverage por defecto del
-    contrato (5x) ignorando la variable LEVERAGE de Railway.
-
-v14 — open_order atómico con place_market_with_tpsl (2026-06-06):
-  - open_order usa place_market_with_tpsl() para adjuntar SL+TP1 en una
-    única llamada API, eliminando la race condition que existía con la
-    secuencia place_market() + _place_tpsl() separadas (Fix #9 bingx_client v6).
-  - Si place_market_with_tpsl falla, fallback automático a place_market
-    + _place_tpsl para no perder la entrada.
-  - _place_tpsl se mantiene para TP2/TP3 y re-colocación de stops.
-
-v13 — Fix #4 (2026-06-06):
-  - _release_pretrade_margin: elimina kwarg redundante notional_or_margin=0.0.
-
+v17 — Fix get_ohlcv_fn + _get_positions (2026-06-07).
+v16 — Fix #14 leverage cap interno (2026-06-06).
+v15 — Fix leverage no aplicado (2026-06-06).
+v14 — open_order atómico con place_market_with_tpsl (2026-06-06).
+v13 — Fix #4 (2026-06-06).
 v12 — Fix _fetch_candles() BingX klines v3 (2026-06-06).
 v11 — Migración OKX → BingX (2026-06-06).
 """
@@ -39,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import math
 import os
 import time
 from typing import Callable, Optional
@@ -495,3 +488,500 @@ class FuturesTrader:
                 "[%s] _set_leverage error (%s) — continuando sin cambiar leverage.",
                 self.symbol, e,
             )
+
+    # ── open_order ────────────────────────────────────────────────────────────────────
+    # v18 FIX CRÍTICO: trading_loop.py línea 553 llama trader.open_order(signal, risk).
+    # Este método no existía → AttributeError bloqueaba toda ejecución de órdenes.
+
+    async def open_order(self, signal: dict, risk) -> None:
+        """
+        Abre una posición de mercado en BingX a partir de un signal dict.
+
+        signal esperado:
+          {
+            "side":   "long" | "short",
+            "action": "BUY"  | "SELL",
+            "entry":  float,   # precio de referencia de la señal
+            "sl":     float,
+            "tp1":    float,
+            "tp2":    float | None,
+            "tp3":    float | None,
+          }
+
+        risk debe tener .usdc_per_trade (float).
+        """
+        if self.position is not None:
+            logger.info(
+                "[%s] open_order: ya hay posición abierta (%s) — ignorando señal.",
+                self.symbol, self.position,
+            )
+            return
+
+        self._pending_order = True
+        try:
+            await self._do_open_order(signal, risk)
+        finally:
+            self._pending_order = False
+
+    async def _do_open_order(self, signal: dict, risk) -> None:
+        """Lógica interna de open_order (separada para el bracket _pending_order)."""
+
+        # ── 1. Extraer parámetros del signal ─────────────────────────────
+        raw_side = str(signal.get("side") or signal.get("action") or "").lower()
+        is_long  = raw_side in ("long", "buy")
+        side_str = "long" if is_long else "short"
+
+        sl_price  = float(signal.get("sl")  or 0) or None
+        tp1_price = float(signal.get("tp1") or 0) or None
+        tp2_price = float(signal.get("tp2") or 0) or None
+        tp3_price = float(signal.get("tp3") or 0) or None
+
+        usdc_per_trade = float(getattr(risk, "usdc_per_trade", 20.0))
+        leverage       = int(getattr(risk, "leverage", self.leverage) or self.leverage)
+
+        # ── 2. Obtener precio de referencia ───────────────────────────────
+        try:
+            ref_price = await self.get_price()
+        except Exception as e:
+            logger.error("[%s] open_order: no se pudo obtener precio: %s — abortando.", self.symbol, e)
+            return
+
+        # ── 3. Validar staleness ──────────────────────────────────────────
+        stale_msg = _check_price_staleness(signal, ref_price, is_long)
+        if stale_msg:
+            logger.warning("[%s] open_order cancelado: %s", self.symbol, stale_msg)
+            return
+
+        # ── 4. Calcular qty ───────────────────────────────────────────────
+        notional = usdc_per_trade * leverage
+        raw_qty  = notional / ref_price
+        # Redondear a 4 decimales como mínimo seguro; BingXClient refina si expone sz_decimals
+        qty = round(raw_qty, 4)
+        if hasattr(self._bingx_client, "get_sz_decimals"):
+            try:
+                dec = self._bingx_client.get_sz_decimals()
+                if dec == 0:
+                    qty = float(math.floor(raw_qty))
+                else:
+                    factor = 10 ** dec
+                    qty = math.floor(raw_qty * factor) / factor
+            except Exception:
+                pass
+
+        if qty <= 0:
+            logger.error(
+                "[%s] open_order: qty calculado es 0 (usdc=%.2f lev=%dx price=%.4f) — abortando.",
+                self.symbol, usdc_per_trade, leverage, ref_price,
+            )
+            return
+
+        logger.info(
+            "[%s] 🚀 open_order: %s | price=%.4f | qty=%.6f | "
+            "notional=%.2f USDC | lev=%dx | SL=%.4f | TP1=%.4f",
+            self.symbol, side_str.upper(), ref_price, qty,
+            usdc_per_trade, leverage,
+            sl_price or 0, tp1_price or 0,
+        )
+
+        # ── 5. DRY-RUN: simular apertura ──────────────────────────────────
+        if self.dry_run:
+            self.position       = side_str
+            self.entry_price    = ref_price
+            self.sl             = sl_price
+            self.tp1            = tp1_price
+            self.tp2            = tp2_price
+            self.tp3            = tp3_price
+            self._open_qty      = qty
+            self._open_notional = usdc_per_trade
+            self._open_leverage = leverage
+            self._protection_ok = True
+            self._tp1_be_done   = False
+            save_position(
+                self.symbol,
+                side=side_str,
+                entry=ref_price,
+                sl=sl_price,
+                tp1=tp1_price,
+                tp2=tp2_price,
+                tp3=tp3_price,
+                qty=qty,
+                usdc_amount=usdc_per_trade,
+                leverage=leverage,
+            )
+            logger.info(
+                "[%s] [DRY-RUN] Posición simulada: %s @ %.4f (qty=%.6f)",
+                self.symbol, side_str.upper(), ref_price, qty,
+            )
+            return
+
+        # ── 6. LIVE: set leverage + colocar orden ─────────────────────────
+        if self._bingx_client is None:
+            await self._get_ccxt()
+
+        await self._set_leverage(leverage)
+
+        filled_price: Optional[float] = None
+
+        # Intento atómico: place_market_with_tpsl (SL+TP1 en una sola llamada)
+        if (
+            hasattr(self._bingx_client, "place_market_with_tpsl")
+            and sl_price
+            and tp1_price
+        ):
+            try:
+                result = await asyncio.to_thread(
+                    self._bingx_client.place_market_with_tpsl,
+                    is_buy=is_long,
+                    qty=qty,
+                    sl_price=sl_price,
+                    tp_price=tp1_price,
+                )
+                if result and result.get("code") in (0, "0", None):
+                    logger.info(
+                        "[%s] place_market_with_tpsl OK: %s",
+                        self.symbol, result,
+                    )
+                    filled_price = float(
+                        (result.get("data") or {}).get("price")
+                        or (result.get("data") or {}).get("avgPrice")
+                        or ref_price
+                    )
+                    self._protection_ok = True
+                else:
+                    err = (result or {}).get("msg", "sin respuesta")
+                    raise RuntimeError(f"place_market_with_tpsl rechazado: {err}")
+            except Exception as e:
+                logger.warning(
+                    "[%s] place_market_with_tpsl falló (%s) — usando fallback place_market.",
+                    self.symbol, e,
+                )
+                filled_price = None
+
+        # Fallback: place_market separado + _place_tpsl
+        if filled_price is None:
+            try:
+                result = await asyncio.to_thread(
+                    self._bingx_client.place_market,
+                    is_buy=is_long,
+                    qty=qty,
+                )
+                if result and result.get("code") in (0, "0", None):
+                    filled_price = float(
+                        (result.get("data") or {}).get("price")
+                        or (result.get("data") or {}).get("avgPrice")
+                        or ref_price
+                    )
+                    logger.info(
+                        "[%s] place_market OK: filled_price=%.4f",
+                        self.symbol, filled_price,
+                    )
+                else:
+                    err = (result or {}).get("msg", "sin respuesta")
+                    logger.error(
+                        "[%s] open_order: place_market rechazado: %s — abortando.",
+                        self.symbol, err,
+                    )
+                    return
+            except Exception as e:
+                logger.error("[%s] open_order: place_market error: %s — abortando.", self.symbol, e)
+                return
+
+            # Confirmar fill con retries
+            for attempt in range(_FILL_RETRIES):
+                try:
+                    confirmed = await self.get_price()
+                    if confirmed > 0:
+                        filled_price = confirmed
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(_FILL_DELAY)
+
+            # Colocar SL+TP1 separados
+            if sl_price or tp1_price:
+                await self._place_tpsl(
+                    qty=qty,
+                    sl_price=sl_price,
+                    tp_price=tp1_price,
+                    is_long=is_long,
+                    reduce_only=True,
+                )
+                self._protection_ok = True
+
+        # ── 7. Ajustar niveles al fill real ───────────────────────────────
+        sl_adj, tp1_adj, tp2_adj = _adjust_levels_to_fill(signal, filled_price, ref_price)
+        if sl_adj:
+            sl_price  = sl_adj
+        if tp1_adj:
+            tp1_price = tp1_adj
+        if tp2_adj and tp2_price:
+            tp2_price = tp2_adj
+
+        # ── 8. Actualizar estado ──────────────────────────────────────────
+        self.position       = side_str
+        self.entry_price    = filled_price
+        self.sl             = sl_price
+        self.tp1            = tp1_price
+        self.tp2            = tp2_price
+        self.tp3            = tp3_price
+        self._open_qty      = qty
+        self._open_notional = usdc_per_trade
+        self._open_leverage = leverage
+        self._tp1_be_done   = False
+        self._last_price    = filled_price
+
+        save_position(
+            self.symbol,
+            side=side_str,
+            entry=filled_price,
+            sl=sl_price,
+            tp1=tp1_price,
+            tp2=tp2_price,
+            tp3=tp3_price,
+            qty=qty,
+            usdc_amount=usdc_per_trade,
+            leverage=leverage,
+        )
+
+        logger.info(
+            "[%s] ✅ Posición abierta: %s @ %.4f | SL=%.4f | TP1=%.4f | qty=%.6f",
+            self.symbol, side_str.upper(), filled_price,
+            sl_price or 0, tp1_price or 0, qty,
+        )
+
+        # ── 9. Colocar TP2/TP3 adicionales ───────────────────────────────
+        if tp2_price:
+            try:
+                await self._place_tpsl(
+                    qty=qty,
+                    sl_price=None,
+                    tp_price=tp2_price,
+                    is_long=is_long,
+                    reduce_only=True,
+                )
+                logger.info("[%s] TP2 colocado: %.4f", self.symbol, tp2_price)
+            except Exception as e:
+                logger.warning("[%s] TP2 no colocado: %s", self.symbol, e)
+
+        if tp3_price:
+            try:
+                await self._place_tpsl(
+                    qty=qty,
+                    sl_price=None,
+                    tp_price=tp3_price,
+                    is_long=is_long,
+                    reduce_only=True,
+                )
+                logger.info("[%s] TP3 colocado: %.4f", self.symbol, tp3_price)
+            except Exception as e:
+                logger.warning("[%s] TP3 no colocado: %s", self.symbol, e)
+
+    # ── _place_tpsl ───────────────────────────────────────────────────────────────────
+
+    async def _place_tpsl(
+        self,
+        qty: float,
+        sl_price: Optional[float],
+        tp_price: Optional[float],
+        is_long: bool,
+        reduce_only: bool = True,
+    ) -> None:
+        """
+        Coloca SL y/o TP como órdenes separadas usando BingXClient.
+        Usado para TP2/TP3, re-colocación de stops y fallback de open_order.
+        """
+        if self.dry_run:
+            logger.info(
+                "[%s] [DRY-RUN] _place_tpsl: SL=%.4f TP=%.4f qty=%.6f",
+                self.symbol, sl_price or 0, tp_price or 0, qty,
+            )
+            return
+
+        if self._bingx_client is None:
+            logger.warning("[%s] _place_tpsl: BingXClient no inicializado — skip.", self.symbol)
+            return
+
+        if sl_price and sl_price > 0:
+            try:
+                result = await asyncio.to_thread(
+                    self._bingx_client.place_sl,
+                    is_buy=not is_long,
+                    sz=qty,
+                    trigger_px=sl_price,
+                    entry_px=self.entry_price or sl_price,
+                )
+                code = (result or {}).get("code", -1)
+                if code in (0, "0", None):
+                    logger.info("[%s] SL colocado: %.4f", self.symbol, sl_price)
+                else:
+                    logger.warning(
+                        "[%s] SL rechazado (code=%s): %s",
+                        self.symbol, code, (result or {}).get("msg", ""),
+                    )
+            except Exception as e:
+                logger.warning("[%s] _place_tpsl SL error: %s", self.symbol, e)
+
+        if tp_price and tp_price > 0:
+            try:
+                result = await asyncio.to_thread(
+                    self._bingx_client.place_tp,
+                    is_buy=not is_long,
+                    sz=qty,
+                    trigger_px=tp_price,
+                    limit_px=tp_price,
+                    entry_px=self.entry_price or tp_price,
+                )
+                code = (result or {}).get("code", -1)
+                if code in (0, "0", None):
+                    logger.info("[%s] TP colocado: %.4f", self.symbol, tp_price)
+                else:
+                    logger.warning(
+                        "[%s] TP rechazado (code=%s): %s",
+                        self.symbol, code, (result or {}).get("msg", ""),
+                    )
+            except Exception as e:
+                logger.warning("[%s] _place_tpsl TP error: %s", self.symbol, e)
+
+    # ── _set_leverage ─────────────────────────────────────────────────────────────────
+
+    async def _get_open_orders_raw(self) -> list[dict]:
+        """
+        Retorna las órdenes pendientes activas para este símbolo desde BingX.
+        Usado por PositionManager._ensure_tpsl().
+        """
+        if self._bingx_client is None:
+            return []
+        try:
+            import requests as _req
+            import hmac, hashlib, time as _time
+
+            api_key    = self._api_key
+            api_secret = self._api_secret
+            ts         = str(int(_time.time() * 1000))
+            params_raw = f"symbol={self.inst_id}&timestamp={ts}"
+            signature  = hmac.new(
+                api_secret.encode(), params_raw.encode(), hashlib.sha256
+            ).hexdigest()
+
+            resp = await asyncio.to_thread(
+                lambda: _req.get(
+                    f"{_BASE_URL}/openApi/swap/v2/trade/openOrders",
+                    params={
+                        "symbol":    self.inst_id,
+                        "timestamp": ts,
+                        "signature": signature,
+                    },
+                    headers={"X-BX-APIKEY": api_key},
+                    timeout=10,
+                ).json()
+            )
+            data = resp.get("data") or {}
+            orders = data.get("orders") or data if isinstance(data, list) else []
+            return list(orders)
+        except Exception as e:
+            logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e)
+            return []
+
+    async def _get_open_trigger_orders_raw(self) -> list[dict]:
+        """
+        Retorna las trigger orders (SL/TP algo-orders) pendientes para este símbolo.
+        Usado por PositionManager._ensure_tpsl().
+        """
+        if self._bingx_client is None:
+            return []
+        try:
+            import requests as _req
+            import hmac, hashlib, time as _time
+
+            api_key    = self._api_key
+            api_secret = self._api_secret
+            ts         = str(int(_time.time() * 1000))
+            params_raw = f"symbol={self.inst_id}&timestamp={ts}"
+            signature  = hmac.new(
+                api_secret.encode(), params_raw.encode(), hashlib.sha256
+            ).hexdigest()
+
+            resp = await asyncio.to_thread(
+                lambda: _req.get(
+                    f"{_BASE_URL}/openApi/swap/v2/trade/openStopOrders",
+                    params={
+                        "symbol":    self.inst_id,
+                        "timestamp": ts,
+                        "signature": signature,
+                    },
+                    headers={"X-BX-APIKEY": api_key},
+                    timeout=10,
+                ).json()
+            )
+            data = resp.get("data") or {}
+            orders = data.get("stopOrders") or data if isinstance(data, list) else []
+            # Normalizar a formato compatible con _get_tpsl_type() de position_manager
+            normalized = []
+            for o in orders:
+                o_norm = dict(o)
+                otype = str(o.get("type") or o.get("orderType") or "").upper()
+                if "STOP" in otype or "SL" in otype:
+                    o_norm["algoType"] = "sl"
+                elif "TAKE_PROFIT" in otype or "TP" in otype:
+                    o_norm["algoType"] = "tp"
+                normalized.append(o_norm)
+            return normalized
+        except Exception as e:
+            logger.warning("[%s] _get_open_trigger_orders_raw error: %s", self.symbol, e)
+            return []
+
+    async def close_position(self, reason: str = "MANUAL") -> None:
+        """
+        Cierra la posición abierta con una orden de mercado en BingX.
+        Llamado por PositionManager._emergency_close() y externamente.
+        """
+        if self.position is None:
+            logger.info("[%s] close_position: no hay posición abierta.", self.symbol)
+            return
+
+        side_str = self.position
+        is_long  = side_str == "long"
+        qty      = self._open_qty
+
+        logger.warning(
+            "[%s] close_position: cerrando %s (qty=%.6f) — reason=%s",
+            self.symbol, side_str.upper(), qty, reason,
+        )
+
+        if self.dry_run:
+            logger.info("[%s] [DRY-RUN] close_position simulado.", self.symbol)
+        else:
+            if self._bingx_client is None:
+                await self._get_ccxt()
+            if qty > 0 and hasattr(self._bingx_client, "place_market"):
+                try:
+                    result = await asyncio.to_thread(
+                        self._bingx_client.place_market,
+                        is_buy=not is_long,   # cierre = lado opuesto
+                        qty=qty,
+                        reduce_only=True,
+                    )
+                    code = (result or {}).get("code", -1)
+                    if code in (0, "0", None):
+                        logger.info("[%s] Posición cerrada en exchange.", self.symbol)
+                    else:
+                        logger.error(
+                            "[%s] close_position rechazado (code=%s): %s",
+                            self.symbol, code, (result or {}).get("msg", ""),
+                        )
+                except Exception as e:
+                    logger.error("[%s] close_position error: %s", self.symbol, e)
+
+        # Limpiar estado local
+        from bot.state import clear_position as _clear
+        self.position       = None
+        self.entry_price    = None
+        self.sl             = None
+        self.tp1            = None
+        self.tp2            = None
+        self.tp3            = None
+        self._open_qty      = 0.0
+        self._open_notional = 0.0
+        self._protection_ok = False
+        self._tp1_be_done   = False
+        _clear(self.symbol)
