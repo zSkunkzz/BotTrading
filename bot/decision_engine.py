@@ -41,6 +41,13 @@ Fix Bug R (2026-06-03) — BUG RAÍZ:
   pretrade_risk._open_margin_by_symbol.get(symbol) antes de liberarlo,
   o pasar usdc_per_trade del risk_manager como aproximación.
   También: tp3 ahora se incluye en el signal dict que se devuelve.
+
+v18 — reentry_guard integration:
+  evaluate() aplica reentry_guard.size_factor(symbol, score) al margin
+  efectivo justo antes de confirmar la orden. Si el par tiene un SL reciente
+  registrado y el score no supera REENTRY_MIN_SCORE, el capital arriesgado
+  se multiplica por REENTRY_SIZE_PCT (default 0.50 → 50% del size normal).
+  El ajuste se logea con nivel INFO para trazabilidad.
 """
 from __future__ import annotations
 
@@ -139,28 +146,45 @@ class DecisionEngine:
             log.debug("[%s] evaluate: señal NEUTRAL/HOLD — sin entrada", symbol)
             return None
 
+        # v18: aplicar reentry_guard ANTES de confirmar la orden
+        # Si el par tuvo un SL reciente y el score no es suficientemente alto,
+        # se reduce el margin efectivo al REENTRY_SIZE_PCT configurado.
+        confirm_margin = effective_margin
+        try:
+            from bot.reentry_guard import reentry_guard
+            factor, rg_reason = reentry_guard.size_factor(symbol, result.score)
+            if factor < 1.0:
+                confirm_margin = effective_margin * factor
+                log.info(
+                    "[%s] evaluate: reentry_guard — margin %.2f → %.2f (factor=%.0f%%) | %s",
+                    symbol, effective_margin, confirm_margin, factor * 100, rg_reason,
+                )
+        except Exception as _rge:
+            log.debug("[%s] evaluate: reentry_guard.size_factor error (ignorado): %s", symbol, _rge)
+
         # Registrar el margin usado para poder liberarlo exactamente al cerrar
         try:
-            self._pretrade.confirm_order(symbol=symbol, notional_or_margin=effective_margin)
+            self._pretrade.confirm_order(symbol=symbol, notional_or_margin=confirm_margin)
         except Exception as e:
             log.warning("[%s] evaluate: pretrade confirm_order error: %s", symbol, e)
 
         signal = {
-            "action":      "BUY" if result.signal == "LONG" else "SELL",
-            "side":        "long" if result.signal == "LONG" else "short",
-            "entry_mode":  result.entry_mode,
-            "entry":       result.entry,
-            "sl":          result.sl,
-            "tp1":         result.tp1,
-            "tp2":         result.tp2,
-            "tp3":         getattr(result, "tp3", None),  # incluir tp3 si existe
-            "atr":         result.atr,
-            "rr":          result.rr,
-            "score":       result.score,
-            "max_score":   result.max_score,
-            "leverage":    result.suggested_lev,
-            "indicators":  result.indicators,
-            "reason":      result.reason,
+            "action":        "BUY" if result.signal == "LONG" else "SELL",
+            "side":          "long" if result.signal == "LONG" else "short",
+            "entry_mode":    result.entry_mode,
+            "entry":         result.entry,
+            "sl":            result.sl,
+            "tp1":           result.tp1,
+            "tp2":           result.tp2,
+            "tp3":           getattr(result, "tp3", None),
+            "atr":           result.atr,
+            "rr":            result.rr,
+            "score":         result.score,
+            "max_score":     result.max_score,
+            "leverage":      result.suggested_lev,
+            "indicators":    result.indicators,
+            "reason":        result.reason,
+            "reentry_factor": confirm_margin / effective_margin if effective_margin > 0 else 1.0,
         }
 
         log.info(
@@ -211,10 +235,6 @@ class DecisionEngine:
             )
 
         # FIX Bug R (BUG RAÍZ): liberar el margin REAL reservado para este symbol.
-        # Antes se pasaba 0.0, lo que causaba que _open_margin nunca bajara
-        # y Gate 2 bloqueara todas las señales futuras.
-        # pretrade_risk.register_close() usa _open_margin_by_symbol.pop(symbol)
-        # internamente, así que podemos pasar 0 — usa el valor registrado.
         try:
             self._pretrade.register_close_safe(symbol=symbol, notional_or_margin=0.0)
             log.info(

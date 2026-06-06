@@ -1,6 +1,16 @@
 """
 trading_loop.py — Loop principal de trading para un símbolo.
 
+FIX v18 (2026-06-06): reentry_guard hook en cierre externo
+  - Cuando se detecta que la posición fue cerrada externamente (exchange
+    posición = 0 pero trader.position != None), se comprueba si el precio
+    de salida está dentro del 2% del SL registrado para ese par.
+  - Si la distancia al SL es ≤ 2%, se interpreta como liquidación por SL
+    y se llama reentry_guard.register_sl(symbol) para activar la reducción
+    de size en el siguiente re-entry.
+  - Si el SL no estaba seteado o el precio está más lejos, se asume cierre
+    manual/TP y NO se registra en reentry_guard.
+
 FIX v17 (2026-06-06): Issue #15 — OHLCV fail-streak → force idle rotation
   - TradingLoop mantiene _ohlcv_fail_streak. Tras OHLCV_FAIL_STREAK_MAX
     (env, default 10) fallos consecutivos de evaluate() SIN posición
@@ -49,6 +59,10 @@ _SCAN_LOG_EVERY         = int(os.getenv("SCAN_LOG_EVERY", "1"))
 
 # Fix #15: número de fallos consecutivos de evaluate() para forzar rotación.
 _OHLCV_FAIL_STREAK_MAX  = int(os.getenv("OHLCV_FAIL_STREAK_MAX", "10"))
+
+# v18: tolerancia de precio para detectar cierre por SL vs cierre manual/TP
+# Si |exit_price - sl| / sl <= _SL_CLOSE_TOLERANCE → se registra como SL
+_SL_CLOSE_TOLERANCE = float(os.getenv("SL_CLOSE_TOLERANCE", "0.02"))  # 2%
 
 
 def _calc_pnl_pct(entry: float, exit_p: float, is_long: bool, leverage: int) -> float:
@@ -135,6 +149,16 @@ def _normalize_position(ep: dict) -> dict:
             out["size"] = 0.0
 
     return out
+
+
+def _is_sl_close(exit_price: float, sl_price, tolerance: float = _SL_CLOSE_TOLERANCE) -> bool:
+    """
+    v18: True si exit_price está dentro del `tolerance` porcentual del sl_price.
+    Indica que el cierre fue probablemente por SL ejecutado en el exchange.
+    """
+    if not sl_price or sl_price <= 0 or exit_price <= 0:
+        return False
+    return abs(exit_price - sl_price) / sl_price <= tolerance
 
 
 class TradingLoop:
@@ -324,6 +348,34 @@ class TradingLoop:
                             entry_price, exit_price, leverage, pnl_pct,
                         )
 
+                        # v18: detectar si el cierre fue por SL ejecutado en el exchange
+                        sl_registered = trader.sl
+                        if _is_sl_close(exit_price, sl_registered):
+                            try:
+                                from bot.reentry_guard import reentry_guard
+                                reentry_guard.register_sl(self.symbol)
+                                logger.info(
+                                    "[%s] Cierre externo interpretado como SL "
+                                    "(exit=%.4f ≈ sl=%.4f, tol=%.0f%%) — "
+                                    "reentry_guard activado",
+                                    self.symbol, exit_price,
+                                    sl_registered or 0,
+                                    _SL_CLOSE_TOLERANCE * 100,
+                                )
+                            except Exception as _rge:
+                                logger.debug(
+                                    "[%s] reentry_guard.register_sl error en cierre externo: %s",
+                                    self.symbol, _rge,
+                                )
+                        else:
+                            logger.info(
+                                "[%s] Cierre externo: precio %.4f alejado del SL %.4f "
+                                "(> %.0f%%) — interpretado como cierre manual / TP",
+                                self.symbol, exit_price,
+                                sl_registered or 0,
+                                _SL_CLOSE_TOLERANCE * 100,
+                            )
+
                         if self._open_notified:
                             try:
                                 from bot.telegram_bot import notify_close
@@ -413,7 +465,7 @@ class TradingLoop:
                 sl_dist = abs(price - trader.sl) / price * 100 if trader.sl else 0
                 tp_dist = abs(trader.tp1 - price) / price * 100 if trader.tp1 else 0
                 logger.info(
-                    "[%s] \U0001f4ca %s @ %.4f | entry=%.4f | PnL=%+.2f%% | "
+                    "[%s] 📊 %s @ %.4f | entry=%.4f | PnL=%+.2f%% | "
                     "SL=%.4f (%.2f%%) | TP1=%.4f (%.2f%%)",
                     self.symbol, trader.position.upper(), price,
                     entry, pnl_pct,
@@ -427,14 +479,14 @@ class TradingLoop:
             if remaining > 0:
                 if n % max(1, _SCAN_LOG_EVERY) == 0:
                     logger.info(
-                        "[%s] \u23f3 Cooldown activo — %.0f s restantes.",
+                        "[%s] ⏳ Cooldown activo — %.0f s restantes.",
                         self.symbol, remaining,
                     )
                 return
 
             if n % max(1, _SCAN_LOG_EVERY) == 0:
                 logger.info(
-                    "[%s] \U0001f50d Scan #%d | precio=%.4f | buscando señal...",
+                    "[%s] 🔍 Scan #%d | precio=%.4f | buscando señal...",
                     self.symbol, n, price,
                 )
 
@@ -488,7 +540,7 @@ class TradingLoop:
                 score = signal.get("score", signal.get("strength", "?"))
                 mode  = signal.get("mode", signal.get("entry_mode", "?"))
                 logger.info(
-                    "[%s] \u2705 Señal aceptada por DecisionEngine: action=%s side=%s "
+                    "[%s] ✅ Señal aceptada por DecisionEngine: action=%s side=%s "
                     "score=%s mode=%s entry=%.4f sl=%.4f tp1=%.4f",
                     self.symbol,
                     signal.get("action"), signal.get("side"),
@@ -529,7 +581,7 @@ class TradingLoop:
             else:
                 if n % max(1, _SCAN_LOG_EVERY) == 0:
                     logger.info(
-                        "[%s] \u2b1c Sin señal | precio=%.4f",
+                        "[%s] ⬛ Sin señal | precio=%.4f",
                         self.symbol, price,
                     )
 

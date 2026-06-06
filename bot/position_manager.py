@@ -34,6 +34,11 @@ FEAT BE (Break-Even) — Cuando el precio se aleja de la entrada un porcentaje
     BE_OFFSET_PCT   (default 0.0) — offset sobre entry (0 = BE exacto, >0 = pequeño beneficio)
   El BE solo se activa una vez por posición (_tp1_be_done). Una vez activado,
   cancela el SL antiguo del exchange y coloca uno nuevo en entry+offset.
+
+v18 — reentry_guard hook:
+  _emergency_close ahora llama reentry_guard.register_sl(symbol) cuando
+  reason contiene 'SL'. Esto activa la reducción de size en el siguiente
+  re-entry sobre el mismo par durante la ventana REENTRY_WINDOW_S.
 """
 from __future__ import annotations
 
@@ -520,9 +525,25 @@ class PositionManager:
 
         Se intenta close_position primero (FuturesTrader OKX), luego _close_position
         como fallback (compatibilidad con traders legacy).
+
+        v18: llama reentry_guard.register_sl(symbol) cuando reason contiene 'SL'
+        para activar la reducción de size en el siguiente re-entry.
         """
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
+
+        # v18: registrar la liquidación por SL antes de cerrar
+        if "SL" in reason.upper():
+            try:
+                from bot.reentry_guard import reentry_guard
+                reentry_guard.register_sl(symbol)
+                log.info(
+                    "[%s] reentry_guard.register_sl llamado (reason=%s) — "
+                    "size reducido en próximo re-entry",
+                    symbol, reason,
+                )
+            except Exception as _e:
+                log.debug("[%s] reentry_guard.register_sl error (ignorado): %s", symbol, _e)
 
         # Intentar primero el método público de FuturesTrader OKX
         close_fn = getattr(trader, "close_position", None)
