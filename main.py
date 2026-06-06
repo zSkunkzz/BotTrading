@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OKXBot v2.0 — IA + Scanner + Telegram + Webhook + Balance Service + Kill Switch"""
+"""BingXBot v1.0 — IA + Scanner + Telegram + Webhook + Balance Service + Kill Switch"""
 
 import asyncio
 import logging
@@ -32,12 +32,10 @@ _max_leverage_map: dict[str, int] = {}
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
 _USDC_PER_TRADE        = float(os.getenv("USDC_PER_TRADE", "20"))
 
-# ── Credenciales OKX ─────────────────────────────────────────────
-_OKX_API_KEY    = os.getenv("OKX_API_KEY",    "")
-_OKX_API_SECRET = os.getenv("OKX_API_SECRET", "")
-_OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
-_USE_DEMO       = os.getenv("OKX_DEMO", "false").lower() in ("true", "1", "yes")
-_FLAG           = "1" if _USE_DEMO else "0"  # 1=demo, 0=live
+# ── Credenciales BingX ──────────────────────────────────────────────────────
+_BINGX_API_KEY    = os.getenv("BINGX_API_KEY",    "")
+_BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
+_USE_TESTNET      = os.getenv("BINGX_TESTNET", "false").lower() in ("true", "1", "yes")
 
 _IDLE_ROTATE_CYCLES = int(os.getenv("IDLE_ROTATE_CYCLES", "30"))
 _idle_cycles: dict[str, int] = {}
@@ -83,9 +81,9 @@ async def _start_single_pair(symbol: str):
         symbol, _effective_leverage(symbol), _USDC_PER_TRADE,
     )
     trader = FuturesTrader(
-        api_key=_OKX_API_KEY   or None,
-        api_secret=_OKX_API_SECRET,
-        passphrase=_OKX_PASSPHRASE or None,
+        api_key=_BINGX_API_KEY    or None,
+        api_secret=_BINGX_API_SECRET,
+        passphrase=None,                          # BingX no usa passphrase
         symbol=symbol,
         leverage=_effective_leverage(symbol),
         margin_mode=os.getenv("MARGIN_MODE", "isolated"),
@@ -148,37 +146,58 @@ async def _stop_pair_with_cleanup(symbol: str) -> None:
 
 async def _purge_stale_state() -> set:
     """
-    Compara el state local contra las posiciones reales en OKX.
+    Compara el state local contra las posiciones reales en BingX.
     Elimina del state los símbolos que ya no tienen posición abierta.
     """
     saved_symbols = set(bot_state._positions.keys())
     if not saved_symbols:
         return set()
 
-    if not _OKX_API_KEY:
-        logger.warning("\u26a0\ufe0f  No hay credenciales OKX — no se puede verificar state.")
+    if not _BINGX_API_KEY:
+        logger.warning("\u26a0\ufe0f  No hay credenciales BingX — no se puede verificar state.")
         return saved_symbols
 
     try:
-        import okx.Account as Account
-        account_api = Account.AccountAPI(
-            _OKX_API_KEY, _OKX_API_SECRET, _OKX_PASSPHRASE, False, _FLAG
+        import hashlib
+        import hmac
+        import time
+        import urllib.parse
+        import requests
+
+        ts     = str(int(time.time() * 1000))
+        params = {"timestamp": ts}
+        qs     = urllib.parse.urlencode(sorted(params.items()))
+        sign   = hmac.new(
+            _BINGX_API_SECRET.encode(), qs.encode(), hashlib.sha256
+        ).hexdigest()
+        params["sign"] = sign
+
+        base = (
+            "https://open-api-vst.bingx.com"
+            if _USE_TESTNET
+            else "https://open-api.bingx.com"
         )
-        data = await asyncio.to_thread(account_api.get_positions)
-        positions = data.get("data", [])
+        resp = await asyncio.to_thread(
+            lambda: requests.get(
+                f"{base}/openApi/swap/v2/user/positions",
+                params=params,
+                headers={"X-BX-APIKEY": _BINGX_API_KEY},
+                timeout=10,
+            ).json()
+        )
+        positions = resp.get("data", []) or []
     except Exception as e:
         logger.warning(
-            "\u26a0\ufe0f  No se pudo consultar OKX para purge stale state: %s — conservando state.", e
+            "\u26a0\ufe0f  No se pudo consultar BingX para purge stale state: %s — conservando state.", e
         )
         return saved_symbols
 
     real_positions: set = set()
     for p in positions:
-        inst_id = p.get("instId", "")
-        pos_qty = float(p.get("pos") or 0)
-        if abs(pos_qty) > 0:
-            # inst_id es 'BTC-USDT-SWAP' → extraer 'BTC'
-            coin = inst_id.split("-")[0].upper()
+        sym     = p.get("symbol", "")           # e.g. "BTC-USDT"
+        pos_amt = float(p.get("positionAmt") or 0)
+        if abs(pos_amt) > 0:
+            coin = sym.replace("-USDT", "").upper()
             real_positions.add(coin)
 
     stale = saved_symbols - real_positions
@@ -186,7 +205,7 @@ async def _purge_stale_state() -> set:
         for sym in stale:
             clear_position(sym)
             logger.warning(
-                "\U0001f9f9 STALE STATE: '%s' estaba en state local pero NO en OKX — eliminado.", sym
+                "\U0001f9f9 STALE STATE: '%s' estaba en state local pero NO en BingX — eliminado.", sym
             )
         logger.info(
             "\U0001f9f9 State purgado: %d fantasmas eliminados (%s). Posiciones reales: %s",
@@ -195,7 +214,7 @@ async def _purge_stale_state() -> set:
         )
     else:
         logger.info(
-            "\u2705 State OK: todas las posiciones guardadas existen en OKX (%s).",
+            "\u2705 State OK: todas las posiciones guardadas existen en BingX (%s).",
             ", ".join(saved_symbols),
         )
     return real_positions
@@ -285,27 +304,29 @@ async def main():
     global global_risk
 
     logger.info("=" * 60)
-    logger.info("  OKXBot v2.0 — IA + Scanner + Telegram + KS")
+    logger.info("  BingXBot v1.0 — IA + Scanner + Telegram + KS")
     logger.info("=" * 60)
-    logger.info("\U0001f4b0 Sizing: USDC_PER_TRADE=%.2f USDT | LEVERAGE=%dx | DEMO=%s",
-                _USDC_PER_TRADE, _LEVERAGE_BASE, _USE_DEMO)
+    logger.info("\U0001f4b0 Sizing: USDC_PER_TRADE=%.2f USDT | LEVERAGE=%dx | TESTNET=%s",
+                _USDC_PER_TRADE, _LEVERAGE_BASE, _USE_TESTNET)
 
-    if not _OKX_API_KEY:
-        logger.warning("\u26a0\ufe0f  OKX_API_KEY no configurado — operando en DRY-RUN.")
+    if not _BINGX_API_KEY:
+        logger.warning("\u26a0\ufe0f  BINGX_API_KEY no configurado — operando en DRY-RUN.")
 
-    # ── Balance service ──────────────────────────────────────────
+    # ── Balance service ─────────────────────────────────────────────────
     try:
-        import okx.Account as Account
-        _account_api = Account.AccountAPI(
-            _OKX_API_KEY, _OKX_API_SECRET, _OKX_PASSPHRASE, False, _FLAG
-        )
-        balance_svc.init_okx(_account_api)
-        logger.info("\u2705 Balance service inicializado (OKX, demo=%s)", _USE_DEMO)
+        # BingXClient ya está inicializado por el primer FuturesTrader.
+        # balance_svc.init_bingx() acepta la API key/secret para consultar
+        # el balance vía REST independientemente del ciclo de trading.
+        balance_svc.init_bingx(_BINGX_API_KEY, _BINGX_API_SECRET, testnet=_USE_TESTNET)
+        logger.info("\u2705 Balance service inicializado (BingX, testnet=%s)", _USE_TESTNET)
+    except AttributeError:
+        # balance_svc aún no tiene init_bingx — se actualizará en siguiente PR
+        logger.warning("\u26a0\ufe0f  balance_svc.init_bingx() no disponible — balance service desactivado.")
     except Exception as e:
         logger.warning("\u26a0\ufe0f  Balance service no pudo inicializarse: %s", e)
 
-    # ── Purge stale state ────────────────────────────────────────
-    logger.info("\U0001f50d Verificando state local contra OKX...")
+    # ── Purge stale state ───────────────────────────────────────────────
+    logger.info("\U0001f50d Verificando state local contra BingX...")
     real_open_symbols = await _purge_stale_state()
 
     global_risk = GlobalRisk(
@@ -323,20 +344,18 @@ async def main():
     asyncio.create_task(kill_switch.run())
     asyncio.create_task(_idle_rotation_loop(scanner))
 
-    # FIX: setup_telegram_commands no es async y no acepta parámetros
     setup_telegram_commands()
 
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     top_n   = MAX_ACTIVE_TRADERS
 
-    # FIX: notify_startup acepta (pairs, dry_run, top_n) — no leverage/usdc_per_trade
     await notify_startup(
         pairs=list(active_traders.keys()),
         dry_run=dry_run,
         top_n=top_n,
     )
 
-    logger.info("\U0001f7e2 Bot arrancado — esperando señales del scanner...")
+    logger.info("\U0001f7e2 Bot arrancado — esperando se\u00f1ales del scanner...")
     await asyncio.Event().wait()
 
 
