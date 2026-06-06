@@ -2,69 +2,18 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
-v2 — OKX migration (2026-06-06):
-  Sustituye HLClient / _HLCore por python-okx:
-    - okx.Trade.TradeAPI      → open_order / close_order
-    - okx.Account.AccountAPI  → _set_leverage / _get_positions
-    - okx.PublicData          → get_price via tickers
-    - okx.MarketData          → get_ohlcv via candles
+v9 — Unificación sobre OKXClient (2026-06-06):
+  Problema raíz: trader.py tenía sus propias instancias de okx.Trade /
+  Account / MarketData creadas en _init_okx_apis() con import lazy.
+  Cuando open_order llamaba OKXClient.create() en paralelo, _OKXCore
+  todavfa no había terminado asyncio.to_thread → _instance era None
+  → ImportError silenciado como "python-okx no encontrado".
+  Además okx.MarketData NO existe: el módulo correcto es okx.Market.
 
-  Formato de instrumento OKX: {COIN}-USDT-SWAP  (ej. BTC-USDT-SWAP)
-  Los símbolos que llegan del scanner (ej. "BTC") se convierten
-  internamente con _to_inst_id().
-
-v3 — OKX Bug 3 fix (2026-06-06):
-  Añadidos métodos requeridos por PositionManager:
-    - _get_open_orders_raw()         → GET /api/v5/trade/orders-pending
-    - _get_open_trigger_orders_raw() → GET /api/v5/trade/orders-algo-pending
-      (donde viven los TP/SL algo-orders en OKX)
-    - _place_tpsl()                  → coloca SL o TP via OKXClient
-
-v4 — get_price fix (2026-06-06):
-  - Corregido IndexError cuando OKX devuelve data=[] (instrumento no
-    disponible en demo: OPN, MON, PENGU, TURBO, MEME, NEIRO, etc.)
-  - Añadida validación explícita de lista vacía antes de acceder a [0]
-  - Traders con instrumento inválido en demo se marcan como skip silencioso
-
-v5 — _fetch_candles fix (2026-06-06):
-  - Problema: _fetch_candles capturaba "Server disconnected" y devolvía []
-    silenciosamente. OHLCVCache no lo ve como excepción sino como "fetch
-    vacío" y no registra last_exc — el backoff exponencial no reíntenta
-    correctamente ni el stale fallback muestra la causa real.
-  - Fix: re-raise de la excepción en vez de retornar [] cuando falla la
-    llamada HTTP a get_candlesticks. OHLCVCache ahora recibe la excepción,
-    la registra como last_exc, hace backoff 1s/2s/4s real, y si agota los
-    reintentos devuelve datos stale con el error visible en el WARNING.
-  - Solo los errores de parseo de velas individuales (IndexError, TypeError,
-    ValueError) siguen siendo silenciados con continue — son datos corruptos
-    puntuales, no errores de red.
-
-v6 — open_order / close_position (2026-06-06):
-  - BUG: trading_loop.py llamaba trader.open_order(signal, risk) pero el
-    método nunca fue añadido a FuturesTrader durante la migración OKX.
-  - Añadido open_order(signal, risk): orquesta apertura completa.
-  - Añadido close_position(reason): cierre market completo de la posición
-    activa con cancelación de TP/SL huérfanos.
-
-v7 — bug fixes (2026-06-06):
-  BUG1 FIX: save_position(symbol, data_dict) — se pasaba como kwargs
-    individuales; corregido construyendo el dict explícitamente.
-  BUG2 FIX: _cancel_tpsl_safe es coroutine async — se awaita directamente
-    en lugar de envolvería en asyncio.to_thread(lambda: ...) que solo
-    devolvería la coroutine sin ejecutarla.
-  BUG3 FIX: OKXClient.create() se llamaba dos veces en open_order (una
-    para ctVal/sz_dec y otra para place_market). Ahora se crea una sola
-    instancia y se reutiliza en todo el flujo.
-  BUG4 FIX: place_market en close_position no pasaba ref_price. Añadido
-    get_price() antes del market-close y pasado como ref_price.
-
-v8 — bug fix (2026-06-06):
-  BUG FIX: _cancel_tpsl_safe (en trading_loop.py) es una función SÍNCRONA
-    que llama a self._trade_api directamente (sin await). En v7 se documentó
-    incorrectamente como "async" y se awaita directamente, lo que silencia
-    la cancelación (awaitar una función síncrona devuelve None sin ejecutarla).
-    Corregido: usar asyncio.to_thread(_cancel_tpsl_safe, self) en
-    close_position para ejecutarla correctamente en un thread.
+  Fix: eliminar _init_okx_apis() y todas las APIs propias del trader.
+  Todos los métodos delegan en self._okx_client (OKXClient singleton).
+  _get_ccxt() inicializa self._okx_client una sola vez y de forma
+  thread-safe mediante OKXClient.create().
 """
 from __future__ import annotations
 
@@ -82,7 +31,6 @@ from bot.state import save_position
 logger = logging.getLogger("FuturesTrader")
 
 _USE_DEMO           = os.getenv("OKX_DEMO", "false").lower() in ("true", "1", "yes")
-_FLAG               = "1" if _USE_DEMO else "0"   # 1=demo, 0=live
 
 _OHLCV_BARS             = int(os.getenv("BARS_NEEDED",            "100"))
 _PRICE_FETCH_RETRIES    = int(os.getenv("PRICE_FETCH_RETRIES",    "3"))
@@ -179,8 +127,8 @@ class FuturesTrader:
         dry_run: bool = True,
     ) -> None:
         self.symbol      = symbol
-        self.inst_id     = _to_inst_id(symbol)   # ej. BTC-USDT-SWAP
-        self.coin        = symbol.upper().split("-")[0]  # ej. BTC
+        self.inst_id     = _to_inst_id(symbol)
+        self.coin        = symbol.upper().split("-")[0]
         self.leverage    = leverage
         self.margin_mode = margin_mode
         self.dry_run     = dry_run
@@ -198,23 +146,20 @@ class FuturesTrader:
         self._protection_ok: bool            = False
         self._tp1_be_done:   bool            = False
         self._last_price:    float           = 0.0
-
-        # Marca el instrumento como no disponible en demo para skip silencioso
         self._instrument_unavailable: bool   = False
 
+        # Credenciales (usadas solo para pasarlas a OKXClient)
         self._api_key    = api_key    or os.getenv("OKX_API_KEY",    "")
         self._api_secret = api_secret or os.getenv("OKX_API_SECRET", "")
         self._passphrase = passphrase or os.getenv("OKX_PASSPHRASE",  "")
 
-        # APIs python-okx (se crean en _init_okx_apis)
-        self._trade_api:   object = None
-        self._account_api: object = None
-        self._market_api:  object = None
+        # Cliente OKX unificado — se inicializa en _get_ccxt()
+        self._okx_client = None
 
         self._stopped_event = asyncio.Event()
         self._trading_loop  = TradingLoop(symbol)
 
-    # ── Interfaz pública ──────────────────────────────────────────
+    # ── Interfaz pública ────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None) -> None:
         try:
@@ -232,49 +177,52 @@ class FuturesTrader:
             logger.debug("[%s] cleanup ai_trader sessions: %s", self.symbol, e)
         self._stopped_event.set()
 
-    # ── Init OKX APIs ─────────────────────────────────────────────
+    # ── Init OKX (unificado en OKXClient) ─────────────────────────────
 
     async def _get_ccxt(self) -> None:
-        """Inicializa las APIs de OKX (equivale al antiguo _get_ccxt de HL)."""
-        if self._trade_api is not None:
+        """
+        Inicializa self._okx_client (OKXClient) una única vez.
+        Es thread-safe: OKXClient.create() delega en _OKXCore.get_async()
+        que usa asyncio.Lock internamente.
+        """
+        if self._okx_client is not None:
             return
         try:
-            logger.info("[%s] Inicializando OKX APIs (inst=%s, demo=%s)…",
+            from bot.core.okx_client import OKXClient
+            logger.info("[%s] Inicializando OKXClient (inst=%s, demo=%s)…",
                         self.symbol, self.inst_id, _USE_DEMO)
-            await asyncio.to_thread(self._init_okx_apis)
-            logger.info("[%s] OKX APIs listas.", self.symbol)
+            self._okx_client = await OKXClient.create(
+                self.symbol, margin_mode=self.margin_mode
+            )
+            logger.info("[%s] OKXClient listo.", self.symbol)
         except Exception as e:
-            logger.error("[%s] _get_ccxt (OKX init) error: %s", self.symbol, e)
+            logger.error("[%s] _get_ccxt error: %s", self.symbol, e)
             raise
 
-    def _init_okx_apis(self) -> None:
-        """Síncrono — llamar siempre desde asyncio.to_thread."""
-        import okx.Trade      as Trade
-        import okx.Account    as Account
-        import okx.MarketData as MarketData
+    # ── Alias para compatibilidad con PositionManager / TradingLoop ────
+    # Algunos módulos acceden a self._trade_api / _account_api / _market_api
+    # directamente. Exponemos propiedades que los redirigen al cliente.
 
-        self._trade_api   = Trade.TradeAPI(
-            self._api_key, self._api_secret, self._passphrase,
-            False, _FLAG,
-        )
-        self._account_api = Account.AccountAPI(
-            self._api_key, self._api_secret, self._passphrase,
-            False, _FLAG,
-        )
-        self._market_api  = MarketData.MarketAPI(
-            self._api_key, self._api_secret, self._passphrase,
-            False, _FLAG,
-        )
+    @property
+    def _trade_api(self):
+        return self._okx_client._trade if self._okx_client else None
 
-    # ── get_price ─────────────────────────────────────────────────
+    @property
+    def _account_api(self):
+        return self._okx_client._account if self._okx_client else None
+
+    @property
+    def _market_api(self):
+        return self._okx_client._market if self._okx_client else None
+
+    # ── get_price ────────────────────────────────────────────────────
 
     async def get_price(self) -> float:
-        if self._market_api is None:
+        if self._okx_client is None:
             if self._last_price > 0:
                 return self._last_price
-            raise RuntimeError(f"[{self.symbol}] get_price: APIs no inicializadas")
+            raise RuntimeError(f"[{self.symbol}] get_price: OKXClient no inicializado")
 
-        # Si el instrumento ya fue marcado como no disponible, no reintentar
         if self._instrument_unavailable:
             raise RuntimeError(
                 f"[{self.symbol}] get_price: instrumento {self.inst_id} "
@@ -287,19 +235,15 @@ class FuturesTrader:
         for attempt, delay in enumerate(delays):
             try:
                 resp = await asyncio.to_thread(
-                    self._market_api.get_ticker, self.inst_id
+                    self._okx_client._market.get_ticker, self.inst_id
                 )
-                data = resp.get("data", [])
-
-                # FIX v4: OKX devuelve data=[] cuando el instrumento no existe
-                # en el entorno demo (OPN, MON, PENGU, TURBO, MEME, NEIRO, etc.)
+                data = (resp or {}).get("data", [])
                 if not data:
                     self._instrument_unavailable = True
                     raise ValueError(
                         f"{self.inst_id} no disponible en OKX "
                         f"{'demo' if _USE_DEMO else 'live'} (data=[])"
                     )
-
                 ticker = data[0]
                 price  = float(ticker.get("last") or ticker.get("askPx") or 0)
                 if price <= 0:
@@ -328,30 +272,28 @@ class FuturesTrader:
             f"[{self.symbol}] get_price: sin precio tras {_PRICE_FETCH_RETRIES} intentos: {last_exc}"
         )
 
-    # ── _set_leverage ─────────────────────────────────────────────
+    # ── _set_leverage ───────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int) -> None:
         if self.dry_run:
             logger.info("[%s] [DRY-RUN] _set_leverage(%dx)", self.symbol, leverage)
             self._open_leverage = leverage
             return
-        if self._account_api is None:
-            logger.warning("[%s] _set_leverage: account_api no inicializado — skip.", self.symbol)
+        if self._okx_client is None:
+            logger.warning("[%s] _set_leverage: OKXClient no inicializado — skip.", self.symbol)
             return
-        mgnMode = "isolated" if self.margin_mode == "isolated" else "cross"
+        is_cross = self.margin_mode == "cross"
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    self._account_api.set_leverage,
-                    lever=str(leverage),
-                    mgnMode=mgnMode,
-                    instId=self.inst_id,
+                    self._okx_client.set_leverage,
+                    coin=self.coin,
+                    leverage=leverage,
+                    is_cross=is_cross,
                 ),
                 timeout=_SET_LEVERAGE_TIMEOUT_S,
             )
             self._open_leverage = leverage
-            logger.info("[%s] Apalancamiento configurado: %dx (%s)",
-                        self.symbol, leverage, mgnMode)
         except asyncio.TimeoutError:
             logger.warning("[%s] _set_leverage timeout (%ss)",
                            self.symbol, _SET_LEVERAGE_TIMEOUT_S)
@@ -372,51 +314,29 @@ class FuturesTrader:
     # ── _get_positions ────────────────────────────────────────────
 
     async def _get_positions(self) -> list[dict]:
-        if self._account_api is None:
+        if self._okx_client is None:
             return []
         try:
-            resp = await asyncio.to_thread(
-                self._account_api.get_positions, instId=self.inst_id
+            positions_raw = await asyncio.to_thread(
+                self._okx_client.get_positions
             )
-            positions = resp.get("data", [])
+            return positions_raw
         except Exception as e:
-            logger.warning("[%s] _get_positions fetch error: %s", self.symbol, e)
+            logger.warning("[%s] _get_positions error: %s", self.symbol, e)
             return []
 
-        result = []
-        for p in positions:
-            pos_side = p.get("posSide", "")   # long / short / net
-            pos_qty  = float(p.get("pos") or 0)
-            if pos_qty == 0:
-                continue
-            if pos_side == "net":
-                side = "long" if pos_qty > 0 else "short"
-            else:
-                side = pos_side
-            result.append({
-                "side":    side,
-                "entryPx": float(p.get("avgPx") or 0),
-                "size":    abs(pos_qty),
-            })
-        return result
-
-    # ── _get_open_orders_raw ──────────────────────────────────────
+    # ── _get_open_orders_raw ───────────────────────────────────────
 
     async def _get_open_orders_raw(self) -> list[dict]:
-        """
-        Devuelve las órdenes limit/market pendientes de este instrumento.
-        Consulta GET /api/v5/trade/orders-pending via python-okx TradeAPI.
-        Requerido por PositionManager._ensure_tpsl().
-        """
-        if self._trade_api is None:
+        if self._okx_client is None:
             return []
         try:
             resp = await asyncio.to_thread(
-                self._trade_api.get_order_list,
+                self._okx_client._trade.get_order_list,
                 instType="SWAP",
                 instId=self.inst_id,
             )
-            return resp.get("data", []) or []
+            return (resp or {}).get("data", []) or []
         except Exception as e:
             logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e)
             return []
@@ -424,22 +344,16 @@ class FuturesTrader:
     # ── _get_open_trigger_orders_raw ──────────────────────────────
 
     async def _get_open_trigger_orders_raw(self) -> list[dict]:
-        """
-        Devuelve las algo-orders (TP/SL) pendientes de este instrumento.
-        Consulta GET /api/v5/trade/orders-algo-pending via python-okx TradeAPI.
-        En OKX los SL/TP son 'conditional' algo-orders — viven aquí, NO en
-        orders-pending. Requerido por PositionManager._ensure_tpsl().
-        """
-        if self._trade_api is None:
+        if self._okx_client is None:
             return []
         try:
             resp = await asyncio.to_thread(
-                self._trade_api.get_algo_order_list,
+                self._okx_client._trade.get_algo_order_list,
                 ordType="conditional",
                 instType="SWAP",
                 instId=self.inst_id,
             )
-            return resp.get("data", []) or []
+            return (resp or {}).get("data", []) or []
         except Exception as e:
             logger.warning("[%s] _get_open_trigger_orders_raw error: %s", self.symbol, e)
             return []
@@ -454,18 +368,15 @@ class FuturesTrader:
         is_long: bool,
         reduce_only: bool = True,
     ) -> None:
-        """
-        Coloca SL y/o TP como algo-orders en OKX via OKXClient.
-        Requerido por PositionManager._place_emergency_sl_tp().
-        """
-        from bot.core.okx_client import OKXClient
-        client = await OKXClient.create(self.symbol)
+        if self._okx_client is None:
+            logger.error("[%s] _place_tpsl: OKXClient no inicializado", self.symbol)
+            return
         entry_px = self.entry_price
 
         if sl_price and sl_price > 0:
             try:
                 result = await asyncio.to_thread(
-                    client.place_sl,
+                    self._okx_client.place_sl,
                     is_buy=not is_long,
                     sz=qty,
                     trigger_px=sl_price,
@@ -483,7 +394,7 @@ class FuturesTrader:
         if tp_price and tp_price > 0:
             try:
                 result = await asyncio.to_thread(
-                    client.place_tp,
+                    self._okx_client.place_tp,
                     is_buy=not is_long,
                     sz=qty,
                     trigger_px=tp_price,
@@ -499,30 +410,35 @@ class FuturesTrader:
                 logger.error("[%s] _place_tpsl: TP exception: %s", self.symbol, e)
                 raise
 
-    # ── open_order ────────────────────────────────────────────────
+    # ── open_order ──────────────────────────────────────────────────
 
     async def open_order(self, signal: dict, risk) -> None:
         """
         Abre una posición en OKX según la señal del DecisionEngine.
 
         Flujo:
-          1. Staleness check: aborta si el precio se alejó demasiado del entry.
-          2. Cálculo de qty en contratos OKX:
-               contratos = (usdc_per_trade * leverage) / (price * ctVal)
-          3. place_market() via OKXClient — orden market de apertura.
-          4. Confirm fill: reintenta _get_positions hasta encontrar la posición
-             abierta (max _FILL_RETRIES intentos con delay _FILL_DELAY).
-          5. Ajusta SL/TP al filled_price real si difiere del entry señal.
+          1. Staleness check.
+          2. Cálculo de qty en contratos OKX.
+          3. place_market() via self._okx_client.
+          4. Confirm fill: reintenta _get_positions.
+          5. Ajusta SL/TP al filled_price real.
           6. place_sl / place_tp via _place_tpsl().
-          7. Actualiza estado interno del trader.
-          8. Persiste posición en disco (save_position).
-
-        En dry_run=True: simula todo sin llamar a la API de órdenes.
+          7. Actualiza estado interno.
+          8. Persiste posición en disco.
         """
         is_long = signal.get("side") == "long"
         action  = signal.get("action", "BUY" if is_long else "SELL")
 
-        # ── 1. Precio actual y staleness check ────────────────────
+        # Garantizar que el cliente esté listo antes de cualquier operación
+        if self._okx_client is None:
+            try:
+                await self._get_ccxt()
+            except Exception as e:
+                logger.error("[%s] open_order: no se pudo inicializar OKXClient: %s",
+                             self.symbol, e)
+                return
+
+        # ── 1. Precio actual y staleness check ─────────────────────
         try:
             ref_price = await self.get_price()
         except Exception as e:
@@ -534,23 +450,13 @@ class FuturesTrader:
             logger.warning("[%s] open_order cancelado: %s", self.symbol, stale_reason)
             return
 
-        # ── 2. Calcular qty en contratos ──────────────────────────
+        # ── 2. Calcular qty en contratos ───────────────────────────
         usdc_per_trade = float(getattr(risk, "usdc_per_trade", 0) or 0)
         leverage       = self.leverage
         notional_usdc  = usdc_per_trade * leverage
 
-        # BUG3 FIX: crear OKXClient UNA sola vez y reutilizarlo en todo el flujo
-        try:
-            from bot.core.okx_client import OKXClient
-            _client = await OKXClient.create(self.symbol)
-            ct_val  = _client.get_ct_val()
-            sz_dec  = _client.get_sz_decimals()
-        except Exception as e:
-            logger.warning("[%s] open_order: error obteniendo ctVal: %s — usando 1.0",
-                           self.symbol, e)
-            _client = None
-            ct_val = 1.0
-            sz_dec = 0
+        ct_val = self._okx_client.get_ct_val()
+        sz_dec = self._okx_client.get_sz_decimals()
 
         if ref_price > 0 and ct_val > 0:
             raw_qty = notional_usdc / (ref_price * ct_val)
@@ -559,7 +465,6 @@ class FuturesTrader:
                          self.symbol, ref_price, ct_val)
             return
 
-        # Redondeo al lotSz
         import math as _math
         if sz_dec == 0:
             qty = float(_math.floor(raw_qty))
@@ -582,19 +487,16 @@ class FuturesTrader:
             ref_price, ct_val, self.dry_run,
         )
 
-        # ── 3. place_market ───────────────────────────────────────
-        filled_price = ref_price  # fallback antes del confirm
+        # ── 3. place_market ──────────────────────────────────────
+        filled_price = ref_price
 
         if self.dry_run:
             logger.info("[%s] [DRY-RUN] open_order: simulando place_market %s %.6f @ %.4f",
                         self.symbol, action, qty, ref_price)
         else:
-            if _client is None:
-                logger.error("[%s] open_order: OKXClient no disponible — abortando.", self.symbol)
-                return
             try:
                 place_resp = await asyncio.to_thread(
-                    _client.place_market,
+                    self._okx_client.place_market,
                     is_buy=is_long,
                     sz=qty,
                     reduce_only=False,
@@ -656,14 +558,13 @@ class FuturesTrader:
                 )
             except Exception as e:
                 logger.error("[%s] open_order: _place_tpsl error: %s", self.symbol, e)
-                # No abortar — la posición ya está abierta, el PM se encargará
         else:
             if sl_px > 0:
                 logger.info("[%s] [DRY-RUN] SL simulado @ %.4f", self.symbol, sl_px)
             if tp1_px > 0:
                 logger.info("[%s] [DRY-RUN] TP1 simulado @ %.4f", self.symbol, tp1_px)
 
-        # ── 7. Actualizar estado ──────────────────────────────────
+        # ── 7. Actualizar estado ───────────────────────────────────
         self.position       = "long" if is_long else "short"
         self.entry_price    = filled_price
         self.sl             = sl_px  if sl_px  > 0 else None
@@ -678,8 +579,6 @@ class FuturesTrader:
         self._tp1_be_done   = False
 
         # ── 8. Persistir en disco ─────────────────────────────────
-        # BUG1 FIX: save_position(symbol, data_dict) — se construye el dict
-        # explícitamente en lugar de pasar kwargs que no acepta la función.
         try:
             save_position(
                 self.symbol,
@@ -708,11 +607,6 @@ class FuturesTrader:
     # ── close_position ────────────────────────────────────────────
 
     async def close_position(self, reason: str = "manual") -> None:
-        """
-        Cierra la posición activa con una orden market de reducción.
-        Cancela primero todas las algo-orders (TP/SL) huérfanas.
-        Compatible con PositionManager y kill_switch.
-        """
         if self.position is None:
             logger.debug("[%s] close_position: sin posición activa.", self.symbol)
             return
@@ -727,52 +621,46 @@ class FuturesTrader:
         )
 
         if not self.dry_run and qty > 0:
-            # v8 BUG FIX: _cancel_tpsl_safe (en trading_loop.py) es SÍNCRONA —
-            # NO se puede awaitar directamente (devolvería None sin ejecutarse).
-            # Usar asyncio.to_thread para ejecutarla correctamente en un thread.
             try:
                 from bot.core.trading_loop import _cancel_tpsl_safe
                 await asyncio.to_thread(_cancel_tpsl_safe, self)
             except Exception as e:
                 logger.warning("[%s] close_position: cancel_tpsl error: %s", self.symbol, e)
 
-            # BUG4 FIX: place_market requiere ref_price — obtener precio actual
-            # antes de emitir la orden de cierre.
             try:
                 close_ref_price = await self.get_price()
             except Exception as e:
                 logger.warning(
-                    "[%s] close_position: no se pudo obtener precio para cierre (%s) "
-                    "— usando last_price=%.4f",
+                    "[%s] close_position: no se pudo obtener precio (%s) — usando %.4f",
                     self.symbol, e, self._last_price,
                 )
                 close_ref_price = self._last_price
 
-            try:
-                from bot.core.okx_client import OKXClient
-                _client = await OKXClient.create(self.symbol)
-                resp = await asyncio.to_thread(
-                    _client.place_market,
-                    is_buy=not is_long,
-                    sz=qty,
-                    reduce_only=True,
-                    ref_price=close_ref_price,
-                )
-                code = (resp or {}).get("code", "-1")
-                if str(code) == "0":
-                    logger.info("[%s] close_position: market close OK.", self.symbol)
-                else:
-                    msg = (resp or {}).get("msg", str(resp))
-                    logger.error("[%s] close_position: rechazado: %s", self.symbol, msg)
-            except Exception as e:
-                logger.error("[%s] close_position: excepción: %s", self.symbol, e)
+            if self._okx_client is None:
+                logger.error("[%s] close_position: OKXClient no disponible.", self.symbol)
+            else:
+                try:
+                    resp = await asyncio.to_thread(
+                        self._okx_client.place_market,
+                        is_buy=not is_long,
+                        sz=qty,
+                        reduce_only=True,
+                        ref_price=close_ref_price,
+                    )
+                    code = (resp or {}).get("code", "-1")
+                    if str(code) == "0":
+                        logger.info("[%s] close_position: market close OK.", self.symbol)
+                    else:
+                        msg = (resp or {}).get("msg", str(resp))
+                        logger.error("[%s] close_position: rechazado: %s", self.symbol, msg)
+                except Exception as e:
+                    logger.error("[%s] close_position: excepción: %s", self.symbol, e)
         else:
             if self.dry_run:
                 logger.info("[%s] [DRY-RUN] close_position simulado.", self.symbol)
             elif qty <= 0:
                 logger.warning("[%s] close_position: qty=0, skip market order.", self.symbol)
 
-        # Limpiar estado independientemente del resultado de la API
         self.position    = None
         self.entry_price = None
         self.sl          = None
@@ -791,26 +679,19 @@ class FuturesTrader:
     # ── _fetch_candles ────────────────────────────────────────────
 
     async def _fetch_candles(self, timeframe: str, n: int) -> list:
-        """
-        Obtiene velas OHLCV de OKX via MarketData.get_candlesticks.
-
-        FIX v5: Las excepciones de red (ServerDisconnectedError, TimeoutError,
-        aiohttp.ClientError, etc.) se re-lanzan en lugar de devolverse como []
-        silenciosamente.
-        """
-        if self._market_api is None:
+        if self._okx_client is None:
             return []
 
         bar = _TF_OKX.get(timeframe, timeframe)
 
         resp = await asyncio.to_thread(
-            self._market_api.get_candlesticks,
+            self._okx_client._market.get_candlesticks,
             instId=self.inst_id,
             bar=bar,
             limit=str(min(n, 300)),
         )
 
-        raw = resp.get("data", [])
+        raw = (resp or {}).get("data", [])
         result = []
         for c in raw:
             try:
