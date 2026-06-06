@@ -42,17 +42,21 @@ v5 — _fetch_candles fix (2026-06-06):
 v6 — open_order / close_position (2026-06-06):
   - BUG: trading_loop.py llamaba trader.open_order(signal, risk) pero el
     método nunca fue añadido a FuturesTrader durante la migración OKX.
-  - Añadido open_order(signal, risk): orquesta apertura completa:
-      1. Staleness check del precio
-      2. Cálculo de qty en contratos OKX (notional*leverage / price / ctVal)
-      3. place_market() vía OKXClient
-      4. Confirm fill con reintento
-      5. Ajuste SL/TP al filled price
-      6. place_sl / place_tp vía OKXClient
-      7. Actualiza trader.position / entry_price / sl / tp1 / tp2 / tp3
-      8. Persiste posición en disco (save_position)
+  - Añadido open_order(signal, risk): orquesta apertura completa.
   - Añadido close_position(reason): cierre market completo de la posición
     activa con cancelación de TP/SL huérfanos.
+
+v7 — bug fixes (2026-06-06):
+  BUG1 FIX: save_position(symbol, data_dict) — se pasaba como kwargs
+    individuales; corregido construyendo el dict explícitamente.
+  BUG2 FIX: _cancel_tpsl_safe es coroutine async — se awaita directamente
+    en lugar de envolvería en asyncio.to_thread(lambda: ...) que solo
+    devolvería la coroutine sin ejecutarla.
+  BUG3 FIX: OKXClient.create() se llamaba dos veces en open_order (una
+    para ctVal/sz_dec y otra para place_market). Ahora se crea una sola
+    instancia y se reutiliza en todo el flujo.
+  BUG4 FIX: place_market en close_position no pasaba ref_price. Añadido
+    get_price() antes del market-close y pasado como ref_price.
 """
 from __future__ import annotations
 
@@ -527,7 +531,7 @@ class FuturesTrader:
         leverage       = self.leverage
         notional_usdc  = usdc_per_trade * leverage
 
-        # ctVal: valor en coin base de 1 contrato (ej. BTC=0.001, HOME=1.0)
+        # BUG3 FIX: crear OKXClient UNA sola vez y reutilizarlo en todo el flujo
         try:
             from bot.core.okx_client import OKXClient
             _client = await OKXClient.create(self.symbol)
@@ -536,6 +540,7 @@ class FuturesTrader:
         except Exception as e:
             logger.warning("[%s] open_order: error obteniendo ctVal: %s — usando 1.0",
                            self.symbol, e)
+            _client = None
             ct_val = 1.0
             sz_dec = 0
 
@@ -576,6 +581,9 @@ class FuturesTrader:
             logger.info("[%s] [DRY-RUN] open_order: simulando place_market %s %.6f @ %.4f",
                         self.symbol, action, qty, ref_price)
         else:
+            if _client is None:
+                logger.error("[%s] open_order: OKXClient no disponible — abortando.", self.symbol)
+                return
             try:
                 place_resp = await asyncio.to_thread(
                     _client.place_market,
@@ -662,18 +670,22 @@ class FuturesTrader:
         self._tp1_be_done   = False
 
         # ── 8. Persistir en disco ─────────────────────────────────
+        # BUG1 FIX: save_position(symbol, data_dict) — se construye el dict
+        # explícitamente en lugar de pasar kwargs que no acepta la función.
         try:
             save_position(
-                symbol=self.symbol,
-                side=self.position,
-                entry=filled_price,
-                sl=self.sl,
-                tp1=self.tp1,
-                tp2=self.tp2,
-                tp3=self.tp3,
-                leverage=leverage,
-                usdc_amount=usdc_per_trade,
-                qty=qty,
+                self.symbol,
+                {
+                    "side":        self.position,
+                    "entry":       filled_price,
+                    "sl":          self.sl,
+                    "tp1":         self.tp1,
+                    "tp2":         self.tp2,
+                    "tp3":         self.tp3,
+                    "leverage":    leverage,
+                    "usdc_amount": usdc_per_trade,
+                    "qty":         qty,
+                },
             )
         except Exception as e:
             logger.warning("[%s] open_order: save_position error: %s", self.symbol, e)
@@ -707,12 +719,26 @@ class FuturesTrader:
         )
 
         if not self.dry_run and qty > 0:
-            # Cancelar TP/SL primero para evitar doble-close
+            # BUG2 FIX: _cancel_tpsl_safe es async — se awaita directamente,
+            # NO se envuelve en asyncio.to_thread(lambda: ...) que solo
+            # devolvería la coroutine sin ejecutarla.
             try:
                 from bot.core.trading_loop import _cancel_tpsl_safe
-                await asyncio.to_thread(lambda: _cancel_tpsl_safe(self))
+                await _cancel_tpsl_safe(self)
             except Exception as e:
                 logger.warning("[%s] close_position: cancel_tpsl error: %s", self.symbol, e)
+
+            # BUG4 FIX: place_market requiere ref_price — obtener precio actual
+            # antes de emitir la orden de cierre.
+            try:
+                close_ref_price = await self.get_price()
+            except Exception as e:
+                logger.warning(
+                    "[%s] close_position: no se pudo obtener precio para cierre (%s) "
+                    "— usando last_price=%.4f",
+                    self.symbol, e, self._last_price,
+                )
+                close_ref_price = self._last_price
 
             try:
                 from bot.core.okx_client import OKXClient
@@ -722,6 +748,7 @@ class FuturesTrader:
                     is_buy=not is_long,
                     sz=qty,
                     reduce_only=True,
+                    ref_price=close_ref_price,
                 )
                 code = (resp or {}).get("code", "-1")
                 if str(code) == "0":
