@@ -47,6 +47,18 @@ Notas positionSide:
   /openApi/swap/v1/positionSide/dual. La variable de entorno
   BINGX_POSITION_MODE=hedge permite forzarlo sin llamada API.
 
+Fixes (2026-06-06 v8) — set_leverage robusto:
+
+  Fix #12 — set_leverage: lanza RuntimeError si BingX rechaza el cambio (🔴 CRÍTICO)
+    Anteriormente set_leverage capturaba todos los errores en except y los
+    logueaba como WARNING, de modo que si BingX rechazaba la llamada (e.g.
+    "leverage out of range", error de firma, etc.) el bot continuaba con el
+    leverage por defecto del contrato (5x) sin ningún aviso claro.
+    Ahora:
+      - Si AMBOS sides (LONG y SHORT) fallan → lanza RuntimeError.
+      - Si solo uno falla → loguea ERROR (no lanza, para no bloquear one-way mode).
+      - Loguea el leverage confirmado por BingX desde la respuesta.
+
 Fixes (2026-06-06 v7) — soporte Hedge Mode:
 
   Fix #11 — positionSide dinámico según modo de cuenta (🔴 CRÍTICO)
@@ -493,26 +505,67 @@ class BingXClient:
     # ── Leverage ──────────────────────────────────────────────────────────
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> dict:
-        results = {}
+        """
+        Fix #12 (v8): ahora lanza RuntimeError si BingX rechaza el cambio
+        de leverage en AMBOS sides (LONG y SHORT), de modo que _set_leverage
+        en trader.py pueda loguearlo como ERROR y el operador lo vea claramente.
+
+        Si solo uno de los sides falla (raro, pero posible en one-way mode),
+        se loguea como ERROR pero no lanza para no bloquear la operativa.
+
+        Loguea el leverage confirmado por BingX desde la respuesta si está
+        disponible (campo data.leverage).
+        """
+        errors: dict[str, str] = {}
+        ok_sides: list[str] = []
+
         for side in ("LONG", "SHORT"):
             try:
                 resp = self._core._post(
                     "/openApi/swap/v2/trade/leverage",
                     {"symbol": self.inst_id, "side": side, "leverage": str(leverage)},
                 )
-                results[side] = resp
-                if str(resp.get("code", "-1")) == "0":
-                    logger.info(
-                        "[%s] Leverage %dx seteado (side=%s)", self.inst_id, leverage, side
+                code = str(resp.get("code", "-1"))
+                if code == "0":
+                    confirmed_lev = (
+                        resp.get("data", {}).get("leverage")
+                        or resp.get("data", {}).get("longLeverage")
+                        or resp.get("data", {}).get("shortLeverage")
                     )
+                    if confirmed_lev:
+                        logger.info(
+                            "[%s] set_leverage side=%s: OK — leverage confirmado por BingX: %sx",
+                            self.inst_id, side, confirmed_lev,
+                        )
+                    else:
+                        logger.info(
+                            "[%s] set_leverage side=%s: OK (code=0, lev=%dx solicitado)",
+                            self.inst_id, side, leverage,
+                        )
+                    ok_sides.append(side)
                 else:
-                    logger.warning(
-                        "[%s] set_leverage side=%s: %s", self.inst_id, side, resp.get("msg", "")
+                    msg = resp.get("msg", f"code={code}")
+                    logger.error(
+                        "[%s] set_leverage side=%s RECHAZADO por BingX: %s "
+                        "(leverage=%dx — verifica que el leverage sea válido para este contrato)",
+                        self.inst_id, side, msg, leverage,
                     )
+                    errors[side] = msg
             except Exception as exc:
-                logger.warning("[%s] set_leverage side=%s error: %s", self.inst_id, side, exc)
-                results[side] = {}
-        return results.get("LONG", {})
+                logger.error(
+                    "[%s] set_leverage side=%s excepción: %s",
+                    self.inst_id, side, exc,
+                )
+                errors[side] = str(exc)
+
+        if not ok_sides:
+            # Ambos sides fallaron → lanzar para que trader.py lo maneje
+            raise RuntimeError(
+                f"[{self.inst_id}] set_leverage({leverage}x) falló en ambos sides: "
+                f"LONG={errors.get('LONG', '?')} / SHORT={errors.get('SHORT', '?')}"
+            )
+
+        return {}
 
     # ── Helpers respuesta BingX ───────────────────────────────────────────
 
@@ -786,93 +839,4 @@ class BingXClient:
             logger.warning("[%s] get_user_state error: %s", self.inst_id, exc)
             return {}
 
-    def get_balance_usdc(self) -> float:
-        for version in ("v3", "v2"):
-            try:
-                resp = self._core._get(f"/openApi/swap/{version}/user/balance")
-                data = resp.get("data", {}).get("balance", {})
-                equity = float(
-                    data.get("availableMargin")
-                    or data.get("equity")
-                    or data.get("balance")
-                    or 0
-                )
-                if equity > 0 or version == "v2":
-                    return equity
-            except Exception as exc:
-                logger.warning(
-                    "[%s] get_balance_usdc (%s) error: %s", self.inst_id, version, exc
-                )
-        return 0.0
-
-    def get_positions(self) -> list[dict]:
-        try:
-            resp = self._core._get(
-                "/openApi/swap/v2/user/positions",
-                {"symbol": self.inst_id},
-            )
-            raw = resp.get("data", [])
-        except Exception as exc:
-            logger.warning("[%s] get_positions error: %s", self.inst_id, exc)
-            return []
-        result = []
-        for p in raw:
-            pos_amt = float(p.get("positionAmt", 0) or 0)
-            if pos_amt == 0:
-                continue
-            side = "long" if pos_amt > 0 else "short"
-            result.append({
-                "side":          side,
-                "entryPx":       float(p.get("avgPrice", 0) or 0),
-                "size":          abs(pos_amt),
-                "unrealizedPnl": float(p.get("unrealizedProfit", 0) or 0),
-                "lever":         int(float(p.get("leverage", 0) or 0)),
-            })
-        return result
-
-    def get_open_orders(self) -> list:
-        try:
-            resp = self._core._get(
-                "/openApi/swap/v2/trade/openOrders",
-                {"symbol": self.inst_id},
-            )
-            orders = resp.get("data", {}).get("orders", []) or resp.get("data", [])
-            return [
-                {"ordId": str(o.get("orderId", "")), **o}
-                for o in orders
-            ]
-        except Exception as exc:
-            logger.warning("[%s] get_open_orders error: %s", self.inst_id, exc)
-            return []
-
-    def cancel_order(self, order_id) -> dict:
-        try:
-            resp = self._core._delete(
-                "/openApi/swap/v2/trade/order",
-                {"symbol": self.inst_id, "orderId": str(order_id)},
-            )
-            return self._wrap(resp)
-        except Exception as exc:
-            logger.warning("[%s] cancel_order %s error: %s", self.inst_id, order_id, exc)
-            return {"code": "-1", "msg": str(exc), "data": []}
-
-    def cancel_all_open_tpsl(self) -> list[dict]:
-        try:
-            resp = self._core._delete(
-                "/openApi/swap/v2/trade/allOpenOrders",
-                {"symbol": self.inst_id},
-            )
-            if self._bx_ok(resp):
-                logger.info(
-                    "[%s] cancel_all_open_tpsl: todas las órdenes canceladas (batch).",
-                    self.inst_id,
-                )
-            else:
-                logger.warning(
-                    "[%s] cancel_all_open_tpsl: respuesta inesperada: %s",
-                    self.inst_id, resp,
-                )
-            return [resp]
-        except Exception as exc:
-            logger.warning("[%s] cancel_all_open_tpsl error: %s", self.inst_id, exc)
-            return []
+    def get_balance_usdc(s
