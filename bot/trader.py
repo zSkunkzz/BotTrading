@@ -12,6 +12,13 @@ v2 — OKX migration (2026-06-06):
   Formato de instrumento OKX: {COIN}-USDT-SWAP  (ej. BTC-USDT-SWAP)
   Los símbolos que llegan del scanner (ej. "BTC") se convierten
   internamente con _to_inst_id().
+
+v3 — OKX Bug 3 fix (2026-06-06):
+  Añadidos métodos requeridos por PositionManager:
+    - _get_open_orders_raw()         → GET /api/v5/trade/orders-pending
+    - _get_open_trigger_orders_raw() → GET /api/v5/trade/orders-algo-pending
+      (donde viven los TP/SL algo-orders en OKX)
+    - _place_tpsl()                  → coloca SL o TP via OKXClient
 """
 from __future__ import annotations
 
@@ -323,6 +330,108 @@ class FuturesTrader:
                 "size":    abs(pos_qty),
             })
         return result
+
+    # ── _get_open_orders_raw ──────────────────────────────────────
+
+    async def _get_open_orders_raw(self) -> list[dict]:
+        """
+        Devuelve las órdenes limit/market pendientes de este instrumento.
+        Consulta GET /api/v5/trade/orders-pending via python-okx TradeAPI.
+        Requerido por PositionManager._ensure_tpsl().
+        """
+        if self._trade_api is None:
+            return []
+        try:
+            resp = await asyncio.to_thread(
+                self._trade_api.get_order_list,
+                instType="SWAP",
+                instId=self.inst_id,
+            )
+            return resp.get("data", []) or []
+        except Exception as e:
+            logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e)
+            return []
+
+    # ── _get_open_trigger_orders_raw ──────────────────────────────
+
+    async def _get_open_trigger_orders_raw(self) -> list[dict]:
+        """
+        Devuelve las algo-orders (TP/SL) pendientes de este instrumento.
+        Consulta GET /api/v5/trade/orders-algo-pending via python-okx TradeAPI.
+        En OKX los SL/TP son 'conditional' algo-orders — viven aquí, NO en
+        orders-pending. Requerido por PositionManager._ensure_tpsl().
+
+        Cada item tiene campos:
+          algoId, instId, algoType ('sl' | 'tp'), triggerPx, sz, posSide, ...
+        """
+        if self._trade_api is None:
+            return []
+        try:
+            resp = await asyncio.to_thread(
+                self._trade_api.get_algo_order_list,
+                ordType="conditional",
+                instType="SWAP",
+                instId=self.inst_id,
+            )
+            return resp.get("data", []) or []
+        except Exception as e:
+            logger.warning("[%s] _get_open_trigger_orders_raw error: %s", self.symbol, e)
+            return []
+
+    # ── _place_tpsl ───────────────────────────────────────────────
+
+    async def _place_tpsl(
+        self,
+        qty: float,
+        sl_price: Optional[float],
+        tp_price: Optional[float],
+        is_long: bool,
+        reduce_only: bool = True,
+    ) -> None:
+        """
+        Coloca SL y/o TP como algo-orders en OKX via OKXClient.
+        Requerido por PositionManager._place_emergency_sl_tp().
+        """
+        from bot.core.okx_client import OKXClient
+        client = await OKXClient.create(self.symbol)
+        entry_px = self.entry_price
+
+        if sl_price and sl_price > 0:
+            try:
+                result = await asyncio.to_thread(
+                    client.place_sl,
+                    is_buy=not is_long,
+                    sz=qty,
+                    trigger_px=sl_price,
+                    entry_px=entry_px,
+                )
+                if result and result.get("code") == "0":
+                    logger.info("[%s] _place_tpsl: SL=%.5f colocado.", self.symbol, sl_price)
+                else:
+                    err = (result or {}).get("msg", "error")
+                    logger.error("[%s] _place_tpsl: SL rechazado: %s", self.symbol, err)
+            except Exception as e:
+                logger.error("[%s] _place_tpsl: SL exception: %s", self.symbol, e)
+                raise
+
+        if tp_price and tp_price > 0:
+            try:
+                result = await asyncio.to_thread(
+                    client.place_tp,
+                    is_buy=not is_long,
+                    sz=qty,
+                    trigger_px=tp_price,
+                    limit_px=tp_price,
+                    entry_px=entry_px,
+                )
+                if result and result.get("code") == "0":
+                    logger.info("[%s] _place_tpsl: TP=%.5f colocado.", self.symbol, tp_price)
+                else:
+                    err = (result or {}).get("msg", "error")
+                    logger.error("[%s] _place_tpsl: TP rechazado: %s", self.symbol, err)
+            except Exception as e:
+                logger.error("[%s] _place_tpsl: TP exception: %s", self.symbol, e)
+                raise
 
     # ── _fetch_candles ────────────────────────────────────────────
 
