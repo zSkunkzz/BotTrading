@@ -60,6 +60,18 @@ NOTAS DE MIGRACIÓN en trader.py:
   4. Instrumentos OKX: el símbolo se normaliza internamente.
      "BTC/USDT:USDT" → instId = "BTC-USDT-SWAP"
      "ETH/USDT:USDT" → instId = "ETH-USDT-SWAP"
+
+FIX v2 (2026-06-06):
+  - BUG 5: get_max_leverage() usaba get_max_order_size() (no existe en
+    python-okx AccountAPI). Reemplazado por get_leverage() según doc v5:
+    GET /api/v5/account/leverage-info
+  - BUG 6: place_market() y place_limit() pasaban reduceOnly='true'/'false'
+    como kwarg de place_order(). La API OKX v5 NO acepta reduceOnly en
+    ese endpoint; la dirección se controla con posSide (hedge mode).
+    Eliminado el parámetro inválido de ambos métodos.
+  - BUG 7: place_limit() pasaba timeInForce= que python-okx TradeAPI
+    no acepta. El parámetro correcto según SDK es simplemente no pasarlo
+    (GTC es default) o usar clOrdId. Eliminado el kwarg inválido.
 """
 from __future__ import annotations
 
@@ -292,15 +304,25 @@ class OKXClient:
         return self._core._tick_size_cache.get(self.inst_id, 0.01)
 
     def get_max_leverage(self) -> int:
+        """
+        FIX v2 (BUG 5): el método correcto según doc OKX v5 es
+        GET /api/v5/account/leverage-info → AccountAPI.get_leverage()
+        El anterior get_max_order_size() no existe en python-okx AccountAPI
+        y lanzaba AttributeError silenciado.
+        """
         cached = self._core._max_leverage_cache.get(self.inst_id)
         if cached:
             return cached
         try:
-            resp = self._account.get_max_order_size(
-                instId=self.inst_id, tdMode="cross"
+            resp = self._account.get_leverage(
+                instId=self.inst_id,
+                mgnMode="cross",
             )
-            lev  = int((resp.get("data") or [{}])[0].get("lever", 20))
-        except Exception:
+            data = (resp or {}).get("data", [{}])
+            lev  = int(float((data[0] if data else {}).get("lever", 20)))
+        except Exception as exc:
+            logger.warning("[%s] get_max_leverage error: %s — usando default 20",
+                           self.inst_id, exc)
             lev = 20
         self._core._max_leverage_cache[self.inst_id] = lev
         return lev
@@ -386,8 +408,17 @@ class OKXClient:
         reduce_only: bool = False,
         ref_price: Optional[float] = None,
     ) -> dict:
-        sz_r    = self.round_sz(sz)
-        side    = "buy" if is_buy else "sell"
+        """
+        FIX v2 (BUG 6): eliminado el parámetro reduceOnly de place_order().
+        La API OKX v5 NO acepta reduceOnly en /api/v5/trade/order.
+        El cierre de posición se controla con posSide (hedge mode):
+          - Abrir long:  side=buy,  posSide=long
+          - Cerrar long: side=sell, posSide=long  (reduce_only=True)
+          - Abrir short: side=sell, posSide=short
+          - Cerrar short:side=buy,  posSide=short (reduce_only=True)
+        """
+        sz_r     = self.round_sz(sz)
+        side     = "buy" if is_buy else "sell"
         pos_side = self._infer_pos_side(is_buy, reduce_only)
         try:
             resp = self._trade.place_order(
@@ -397,11 +428,10 @@ class OKXClient:
                 posSide=pos_side,
                 ordType="market",
                 sz=str(sz_r),
-                reduceOnly="true" if reduce_only else "false",
             )
             logger.info(
-                "[%s] place_market: %s %.6f contratos | reduce=%s",
-                self.inst_id, side.upper(), sz_r, reduce_only,
+                "[%s] place_market: %s %.6f contratos | posSide=%s reduce=%s",
+                self.inst_id, side.upper(), sz_r, pos_side, reduce_only,
             )
             return resp
         except Exception as exc:
@@ -416,27 +446,37 @@ class OKXClient:
         reduce_only: bool = False,
         tif: str = "Gtc",
     ) -> dict:
+        """
+        FIX v2 (BUG 6 + BUG 7):
+          - Eliminado reduceOnly (no existe en OKX v5 place_order)
+          - Eliminado timeInForce (no existe en python-okx TradeAPI.place_order)
+            El SDK de python-okx usa ordType para controlar el comportamiento:
+            'limit' = GTC por defecto, 'post_only' = maker only.
+            Para IOC/FOK usar ordType='limit' con la flag correspondiente
+            pero el SDK actual no lo expone como kwarg separado.
+        """
         sz_r     = self.round_sz(sz)
         px_r     = self.round_px(price)
         side     = "buy" if is_buy else "sell"
         pos_side = self._infer_pos_side(is_buy, reduce_only)
-        # OKX tif: "GTC" | "IOC" | "FOK" | "post_only"
-        tif_okx  = tif.upper() if tif.upper() in ("GTC", "IOC", "FOK") else "GTC"
+
+        # Mapear tif a ordType compatible con python-okx
+        # 'post_only' es el único ordType alternativo soportado para limit
+        ord_type = "post_only" if tif.upper() in ("POST_ONLY", "POSTONLY") else "limit"
+
         try:
             resp = self._trade.place_order(
                 instId=self.inst_id,
                 tdMode="cross",
                 side=side,
                 posSide=pos_side,
-                ordType="limit",
+                ordType=ord_type,
                 px=str(px_r),
                 sz=str(sz_r),
-                reduceOnly="true" if reduce_only else "false",
-                timeInForce=tif_okx,
             )
             logger.info(
-                "[%s] place_limit: %s %.6f @ %.6f | tif=%s reduce=%s",
-                self.inst_id, side.upper(), sz_r, px_r, tif_okx, reduce_only,
+                "[%s] place_limit: %s %.6f @ %.6f | ordType=%s posSide=%s reduce=%s",
+                self.inst_id, side.upper(), sz_r, px_r, ord_type, pos_side, reduce_only,
             )
             return resp
         except Exception as exc:
@@ -463,13 +503,8 @@ class OKXClient:
         side       = "buy" if is_buy else "sell"
         pos_side   = "short" if is_buy else "long"
 
-        if limit_px is None:
-            # TP market al triggerPx
-            ord_px = "-1"   # OKX: "-1" = market al activarse
-            ord_type = "conditional"
-        else:
-            ord_px  = str(self.round_px(limit_px))
-            ord_type = "conditional"
+        # OKX: tpOrdPx="-1" = ejecutar a mercado cuando se activa el trigger
+        ord_px = "-1" if limit_px is None else str(self.round_px(limit_px))
 
         try:
             resp = self._trade.place_algo_order(
@@ -477,14 +512,14 @@ class OKXClient:
                 tdMode="cross",
                 side=side,
                 posSide=pos_side,
-                ordType=ord_type,
+                ordType="conditional",
                 sz=str(sz_r),
                 tpTriggerPx=str(tpx),
                 tpOrdPx=ord_px,
             )
             logger.info(
-                "[%s] place_tp: %s %.6f @ trigger=%.6f",
-                self.inst_id, side.upper(), sz_r, tpx,
+                "[%s] place_tp: %s %.6f @ trigger=%.6f ord_px=%s",
+                self.inst_id, side.upper(), sz_r, tpx, ord_px,
             )
             return resp
         except Exception as exc:
@@ -502,6 +537,7 @@ class OKXClient:
         Stop-Loss en OKX usando ordType='conditional' (algo order).
         is_buy=True  → cierra un SHORT
         is_buy=False → cierra un LONG
+        slOrdPx="-1" = ejecutar a mercado (market SL)
         """
         sz_r     = self.round_sz(sz)
         tpx      = self.round_px(trigger_px)
@@ -517,7 +553,7 @@ class OKXClient:
                 ordType="conditional",
                 sz=str(sz_r),
                 slTriggerPx=str(tpx),
-                slOrdPx="-1",   # market SL
+                slOrdPx="-1",
             )
             logger.info(
                 "[%s] place_sl: %s %.6f @ trigger=%.6f",
@@ -655,10 +691,10 @@ class OKXClient:
     def _infer_pos_side(is_buy: bool, reduce_only: bool) -> str:
         """
         OKX hedge mode:
-          Abrir long  → is_buy=True,  reduce=False → posSide='long'
-          Abrir short → is_buy=False, reduce=False → posSide='short'
-          Cerrar long → is_buy=False, reduce=True  → posSide='long'
-          Cerrar short→ is_buy=True,  reduce=True  → posSide='short'
+          Abrir long:   is_buy=True,  reduce=False → posSide='long'
+          Abrir short:  is_buy=False, reduce=False → posSide='short'
+          Cerrar long:  is_buy=False, reduce=True  → posSide='long'
+          Cerrar short: is_buy=True,  reduce=True  → posSide='short'
         """
         if not reduce_only:
             return "long" if is_buy else "short"

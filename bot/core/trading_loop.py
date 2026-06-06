@@ -1,22 +1,26 @@
 """
 trading_loop.py — Loop principal de trading para un símbolo.
 
-FIX v8 (2026-06-02): notificaciones Telegram + cooldown post-cierre externo
-FIX v9 (2026-06-03): on_position_closed + global_risk en cierre externo
+FIX v8  (2026-06-02): notificaciones Telegram + cooldown post-cierre externo
+FIX v9  (2026-06-03): on_position_closed + global_risk en cierre externo
 FIX v10 (2026-06-03): timeout en evaluate() + logs de diagnóstico
 FIX v11 (2026-06-03): logs INFO visibles en cada scan
 FIX v12 (2026-06-03): PnL real en notify_close para cierre externo
 FIX v13 (2026-06-05): corrección de bugs B/C/E en notificaciones Telegram
 FIX v14 (2026-06-05): corregir AttributeError trader._info_post en _init()
-  balance_svc ya está inicializado en main() antes de arrancar traders.
-  La llamada redundante balance_svc.init_hl(trader._info_post) lanzaba
-  AttributeError porque FuturesTrader no tiene ese atributo.
-  FIX: guardar el init_hl con is_ready() check — si ya está listo, skip.
+FIX v15 (2026-06-06): corregir referencias a _hl_client / _master_addr / _agent_mode
+  que ya no existen en FuturesTrader OKX y silenciaban el loop entero:
+  - trader._hl_client.round_sz()            → _round_sz(trader, sz)
+  - trader._hl_client.cancel_all_open_tpsl() → trader._cancel_all_tpsl()
+  - trader._master_addr / trader._agent_mode → eliminados del log
+  Estos AttributeError eran capturados por el except genérico de run()
+  y causaban que el loop se reiniciara sin escanear nada visible.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 
@@ -45,6 +49,27 @@ def _calc_pnl_pct(entry: float, exit_p: float, is_long: bool, leverage: int) -> 
         return 0.0
     raw = (exit_p - entry) / entry if is_long else (entry - exit_p) / entry
     return raw * leverage * 100
+
+
+def _round_sz(trader, sz: float) -> float:
+    """
+    FIX v15: helper para redondear sz sin depender de trader._hl_client.
+    FuturesTrader OKX no expone _hl_client; usamos el atributo interno
+    _sz_decimals si existe, o math.floor como fallback seguro.
+    """
+    # Intentar obtener decimales del account_api / market metadata
+    try:
+        # OKXClient expone get_sz_decimals() si el trader usa okx_client
+        if hasattr(trader, "_okx_client") and trader._okx_client is not None:
+            dec = trader._okx_client.get_sz_decimals()
+            if dec == 0:
+                return float(math.floor(sz))
+            factor = 10 ** dec
+            return math.floor(sz * factor) / factor
+    except Exception:
+        pass
+    # Fallback: floor a 6 decimales (seguro para cualquier crypto)
+    return math.floor(sz * 1_000_000) / 1_000_000
 
 
 class TradingLoop:
@@ -92,7 +117,6 @@ class TradingLoop:
             await asyncio.sleep(LOOP_SLEEP)
 
     async def _init(self, trader, usdc_per_trade: float) -> None:
-        # _HLCore ya fue pre-calentado en main() — esta llamada es instantánea.
         await trader._get_ccxt()
 
         saved = load_position(self.symbol)
@@ -112,15 +136,13 @@ class TradingLoop:
             if saved.get("qty") and float(saved["qty"]) > 0:
                 trader._open_qty = float(saved["qty"])
             else:
-                entry_px = float(trader.entry_price or 0)
+                entry_px      = float(trader.entry_price or 0)
                 notional_usdc = float(trader._open_notional or 0)
-                lev = int(trader._open_leverage or trader.leverage or 1)
+                lev           = int(trader._open_leverage or trader.leverage or 1)
                 if entry_px > 0 and notional_usdc > 0:
                     raw_qty = (notional_usdc * lev) / entry_px
-                    try:
-                        trader._open_qty = trader._hl_client.round_sz(raw_qty)
-                    except Exception:
-                        trader._open_qty = raw_qty
+                    # FIX v15: usar helper _round_sz en lugar de trader._hl_client.round_sz
+                    trader._open_qty = _round_sz(trader, raw_qty)
                     logger.info(
                         "[%s] _open_qty recalculado desde disco: %.6f "
                         "(notional=%.2f lev=%dx entry=%.4f)",
@@ -146,9 +168,6 @@ class TradingLoop:
                 self.symbol, remaining,
             )
 
-        # FIX v14: balance_svc ya inicializado en main() — no llamar de nuevo.
-        # La llamada anterior usaba trader._info_post (atributo inexistente)
-        # y lanzaba AttributeError silenciado por el except de run().
         if not balance_svc.is_ready():
             logger.warning(
                 "[%s] balance_svc no listo en _init — se esperaba init en main().",
@@ -156,11 +175,14 @@ class TradingLoop:
             )
 
         await trader._set_leverage(trader.leverage)
+        # FIX v15: eliminados trader._master_addr y trader._agent_mode
+        # que no existen en FuturesTrader OKX y lanzaban AttributeError
         logger.info(
-            "[%s] TradingLoop iniciado | coin=%s | master=%s | agent_mode=%s",
+            "[%s] TradingLoop iniciado | coin=%s | inst=%s | leverage=%dx | dry_run=%s",
             self.symbol, trader.coin,
-            trader._master_addr[:10] + "..." if trader._master_addr else "N/A",
-            trader._agent_mode,
+            getattr(trader, "inst_id", self.symbol),
+            trader.leverage,
+            trader.dry_run,
         )
 
     async def _iteration(self, trader, risk, global_risk) -> None:
@@ -216,10 +238,8 @@ class TradingLoop:
                             self.symbol, trader.position, trader.entry_price,
                         )
                     if trader._open_qty == 0.0 and ep.get("size", 0) > 0:
-                        try:
-                            trader._open_qty = trader._hl_client.round_sz(float(ep["size"]))
-                        except Exception:
-                            trader._open_qty = float(ep["size"])
+                        # FIX v15: usar helper _round_sz en lugar de trader._hl_client.round_sz
+                        trader._open_qty = _round_sz(trader, float(ep["size"]))
                         logger.info(
                             "[%s] _open_qty sincronizado desde exchange: %.6f",
                             self.symbol, trader._open_qty,
@@ -264,8 +284,12 @@ class TradingLoop:
 
                         self._open_notified = False
 
+                        # FIX v15: usar trader._cancel_all_tpsl() en lugar de
+                        # trader._hl_client.cancel_all_open_tpsl() que no existe en OKX trader
                         try:
-                            trader._hl_client.cancel_all_open_tpsl()
+                            await asyncio.to_thread(
+                                lambda: _cancel_tpsl_safe(trader)
+                            )
                             logger.info("[%s] Trigger orders huérfanos cancelados.", self.symbol)
                         except Exception as e:
                             logger.warning(
@@ -362,7 +386,7 @@ class TradingLoop:
             except asyncio.TimeoutError:
                 logger.warning(
                     "[%s] #%d evaluate() timeout (%ss) — posiblemente OHLCV fetch colgado. "
-                    "Verifica conexión a HL API.",
+                    "Verifica conexión a OKX API.",
                     self.symbol, n, _EVALUATE_TIMEOUT_S,
                 )
                 return
@@ -418,3 +442,45 @@ class TradingLoop:
                         "[%s] \u2b1c Sin señal | precio=%.4f",
                         self.symbol, price,
                     )
+
+
+def _cancel_tpsl_safe(trader) -> None:
+    """
+    FIX v15: cancela todas las algo orders (TP/SL) de forma segura
+    sin depender de trader._hl_client (que no existe en FuturesTrader OKX).
+    Intenta varios patrones de acceso según el tipo de trader.
+    """
+    # Patrón 1: FuturesTrader OKX — usa _trade_api directamente
+    if hasattr(trader, "_trade_api") and trader._trade_api is not None:
+        inst_id = getattr(trader, "inst_id", None)
+        if inst_id:
+            try:
+                resp = trader._trade_api.get_algo_order_list(
+                    ordType="conditional", instId=inst_id
+                )
+                algo_orders = (resp or {}).get("data", [])
+                if algo_orders:
+                    cancel_list = [
+                        {"instId": inst_id, "algoId": o["algoId"]}
+                        for o in algo_orders if o.get("algoId")
+                    ]
+                    if cancel_list:
+                        trader._trade_api.cancel_algo_order(cancel_list)
+            except Exception as e:
+                logger.warning("[%s] _cancel_tpsl_safe (_trade_api): %s",
+                               getattr(trader, "symbol", "?"), e)
+            return
+
+    # Patrón 2: OKXClient expuesto como _okx_client
+    if hasattr(trader, "_okx_client") and trader._okx_client is not None:
+        try:
+            trader._okx_client.cancel_all_open_tpsl()
+        except Exception as e:
+            logger.warning("[%s] _cancel_tpsl_safe (_okx_client): %s",
+                           getattr(trader, "symbol", "?"), e)
+        return
+
+    logger.warning(
+        "[%s] _cancel_tpsl_safe: no se encontró API válida para cancelar TP/SL.",
+        getattr(trader, "symbol", "?"),
+    )
