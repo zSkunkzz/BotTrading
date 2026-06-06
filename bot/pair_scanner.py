@@ -1,38 +1,31 @@
 """
 pair_scanner.py — Escaner de pares para BingX perpetuos USDT-margined.
 
+v5 — Fix scores y filtros (2026-06-06)
+  Corrige 3 bugs adicionales descubiertos en los logs de producción:
+
+  BUG #5 — OI en USDT ya venía en USDT pero se multiplicaba por precio.
+    /openInterest devuelve openInterest en USDT (no en base units).
+    Inflaba BTC score a 7,292,149 en vez de ~1,107.
+    FIX: NO multiplicar por lastPrice.
+
+  BUG #6 — change_pct sin cap (BTW=456835% dominaba score).
+    FIX: cap en SCANNER_MAX_CHANGE (default=50%).
+
+  BUG #7 — BTW y pares sintéticos NCCO*/NCSK* sin OHLCV.
+    BingX los lista como activos pero no tienen velas ni precio real.
+    FIX: filtrar por prefijos sintéticos conocidos.
+
 v4 — Fix bugs API real BingX (2026-06-06)
-  Corrige 4 bugs descubiertos comparando el código contra las respuestas
-  reales de la API BingX (verificadas con curl):
-
-  BUG #1 — /contracts no tiene campo maxLeverage (campo inexistente).
-    FIX: usar status==1 + apiStateOpen=='true' para filtrar contratos
-    activos. El filtro SCANNER_EXCLUDE_LOW_LEV se reserva para cuando
-    se añada autenticación (endpoint /trade/leverage requiere firma).
-
-  BUG #2 — /ticker no tiene campo tradeAmount (OI no está en ticker).
-    FIX: OI obtenido de GET /openApi/swap/v2/quote/openInterest
-    (batch paralelo, igual que funding).
-
-  BUG #3 — priceChangePercent ya viene calculado en el ticker.
-    FIX: usar t['priceChangePercent'] directamente en lugar de
-    recalcular (last-open)/open.
-
-  BUG #4 — filtro de estado en contracts usaba lógica de OKX.
-    FIX: BingX usa status==1 (int) y apiStateOpen=='true' (string).
-
-  Endpoints usados (todos públicos, sin firma):
-    GET /openApi/swap/v2/quote/contracts      → activos (status+apiState)
-    GET /openApi/swap/v2/quote/ticker         → vol, precio, cambio%
-    GET /openApi/swap/v2/quote/premiumIndex   → funding rate real
-    GET /openApi/swap/v2/quote/openInterest   → OI en USDT por símbolo
-
-  Formato símbolo BingX: "BTC-USDT".
-  Score: vol 40% + cambio% 30% + funding_abs 20% + OI 10%
+  BUG #1 — /contracts no tiene maxLeverage → usar status+apiStateOpen.
+  BUG #2 — OI no está en /ticker → GET /quote/openInterest por símbolo.
+  BUG #3 — priceChangePercent ya viene en ticker → no recalcular.
+  BUG #4 — filtro estado usaba lógica OKX → BingX: status==1 + apiStateOpen.
 """
 import logging
 import asyncio
 import os
+import re
 import aiohttp
 import json as _json
 from collections import defaultdict
@@ -48,6 +41,11 @@ NON_CRYPTO_BASES = {
     "COIN", "MSTR", "MARA", "RIOT",
 }
 
+# Prefijos de productos sintéticos de BingX (acciones/materias primas trackeadas)
+# Sin datos OHLCV reales, set_leverage falla con 'price not exist'.
+# BUG #7 FIX: filtrar antes de intentar tradear.
+_SYNTHETIC_PREFIXES = ("NCCO", "NCSK", "BTW", "NCS", "NCX")
+
 # BingX REST pública (no requiere API key ni firma)
 _BINGX_BASE = "https://open-api.bingx.com"
 
@@ -58,6 +56,9 @@ _TOP_N                = int(float(os.getenv("SCANNER_TOP_N",           "25")))
 _REFRESH_MIN          = int(float(os.getenv("SCANNER_REFRESH_MIN",     "15")))
 _MIN_VOLUME           = float(os.getenv("SCANNER_MIN_VOLUME",          "500000"))
 _MIN_CHANGE_PCT       = float(os.getenv("SCANNER_MIN_CHANGE",          "0.3"))
+# BUG #6 FIX: cap para evitar que monedas recién listadas con cambio
+# astronómico (BTW=456835%) dominen el score.
+_MAX_CHANGE_PCT       = float(os.getenv("SCANNER_MAX_CHANGE",          "50.0"))
 _FUNDING_ENRICH_BATCH = int(os.getenv("FUNDING_ENRICH_BATCH",          "50"))
 _OI_ENRICH_BATCH      = int(os.getenv("OI_ENRICH_BATCH",               "50"))
 
@@ -123,16 +124,24 @@ class PairScanner:
 
         logger.info(
             "[PairScanner] Config: top_n=%d | refresh=%dmin | "
-            "min_vol=$%s | min_change=%.1f%% | funding_trend_n=%d | "
-            "funding_batch=%d | oi_batch=%d",
+            "min_vol=$%s | min_change=%.1f%% | max_change=%.0f%% | "
+            "funding_trend_n=%d | funding_batch=%d | oi_batch=%d",
             self.top_n, self.refresh_interval // 60,
             f"{self.min_volume_usdt:,.0f}", self.min_price_change_pct,
-            _FUNDING_TREND_N, _FUNDING_ENRICH_BATCH, _OI_ENRICH_BATCH,
+            _MAX_CHANGE_PCT, _FUNDING_TREND_N, _FUNDING_ENRICH_BATCH, _OI_ENRICH_BATCH,
         )
 
     def _is_valid(self, sym: str) -> bool:
-        """Valida símbolo BingX (BTC-USDT): base no en blacklist, longitud ok."""
+        """
+        Valida símbolo BingX (BTC-USDT):
+          - base no en blacklist de non-crypto
+          - no empieza por prefijo sintético (NCCO*, NCSK*, BTW*...)
+          - longitud razonable
+        """
         base = sym.replace("-USDT", "").upper()
+        # BUG #7 FIX: productos sintéticos de BingX sin OHLCV real
+        if base.startswith(_SYNTHETIC_PREFIXES):
+            return False
         if base in self.blacklist:
             return False
         if len(base) < 2 or len(base) > 12:
@@ -188,10 +197,9 @@ class PairScanner:
 
     async def _fetch_open_interests(self, symbols: list[str]) -> dict[str, float]:
         """
-        Open Interest en USDT vía GET /openApi/swap/v2/quote/openInterest.
-        Respuesta: {openInterest (str), symbol, time}
-        openInterest está en moneda base → se multiplica por lastPrice en scan().
-        Aquí devolvemos el valor crudo (base units); scan() lo convierte.
+        Open Interest vía GET /openApi/swap/v2/quote/openInterest.
+        Respuesta: {openInterest (str en USDT), symbol, time}
+        BUG #5 FIX: openInterest YA está en USDT — NO multiplicar por precio.
         Limita a _OI_ENRICH_BATCH pares por ciclo.
         """
         result: dict[str, float] = {}
@@ -203,6 +211,7 @@ class PairScanner:
                     "/openApi/swap/v2/quote/openInterest",
                     {"symbol": sym},
                 )
+                # openInterest está en USDT directamente
                 oi = float(data.get("openInterest", 0) or 0)
                 return sym, oi
             except Exception as e:
@@ -221,13 +230,13 @@ class PairScanner:
           GET /openApi/swap/v2/quote/contracts  → set de símbolos activos
           GET /openApi/swap/v2/quote/ticker     → vol, precio, cambio%
 
-        Paso 2 — Filtrar por volumen y cambio%.
+        Paso 2 — Filtrar: activo + no-sintético + volumen + cambio%.
 
         Paso 3 — Enriquecer en paralelo:
           GET /openApi/swap/v2/quote/premiumIndex  → funding real
-          GET /openApi/swap/v2/quote/openInterest  → OI en base units
+          GET /openApi/swap/v2/quote/openInterest  → OI en USDT
 
-        Paso 4 — Calcular score y ordenar.
+        Paso 4 — Score: vol×0.4 + change_capped×0.3 + funding×0.2 + OI×0.1
         """
         try:
             contracts_raw, tickers_raw = await asyncio.gather(
@@ -238,13 +247,9 @@ class PairScanner:
             logger.error("[PairScanner] Error fetcheando datos BingX: %s", e)
             return []
 
-        # /contracts → lista de dicts
-        # Respuesta real: [{symbol, status (int), apiStateOpen (str), ...}]
         contracts_list: list = contracts_raw if isinstance(contracts_raw, list) else []
 
-        # Construir set de símbolos activos:
-        #   status == 1 (int) AND apiStateOpen == 'true' (string)
-        # BUG #1 FIX: NO existe campo maxLeverage en esta respuesta.
+        # Contratos activos: status==1 AND apiStateOpen=='true'
         active_symbols: set[str] = set()
         for c in contracts_list:
             sym    = c.get("symbol", "")
@@ -259,27 +264,26 @@ class PairScanner:
 
         logger.debug("[PairScanner] Contratos activos USDT: %d", len(active_symbols))
 
-        # /ticker → lista de dicts
-        # Respuesta real campos: symbol, priceChange, priceChangePercent,
-        #   lastPrice, lastQty, highPrice, lowPrice, volume (base),
-        #   quoteVolume (USDT), openPrice, openTime, closeTime,
-        #   askPrice, askQty, bidPrice, bidQty
-        # BUG #2 FIX: NO existe campo tradeAmount (OI no está en ticker).
-        # BUG #3 FIX: priceChangePercent ya viene calculado.
         tickers_list: list = tickers_raw if isinstance(tickers_raw, list) else []
 
-        # ─ Primera pasada: filtrar por volumen / cambio ─
+        # ─ Primera pasada: filtrar ─
         pre_scored = []
-        total_seen = skipped_inactive = skipped_bl = skipped_vol = skipped_chg = 0
+        total_seen = skipped_inactive = skipped_bl = skipped_synth = 0
+        skipped_vol = skipped_chg = 0
 
         for t in tickers_list:
             sym = t.get("symbol", "")
             if not sym.endswith("-USDT"):
                 continue
 
-            # Solo contratos marcados como activos en /contracts
             if sym not in active_symbols:
                 skipped_inactive += 1
+                continue
+
+            base = sym.replace("-USDT", "").upper()
+            # BUG #7 FIX: excluir sintéticos antes de _is_valid
+            if base.startswith(_SYNTHETIC_PREFIXES):
+                skipped_synth += 1
                 continue
 
             if not self._is_valid(sym):
@@ -288,20 +292,16 @@ class PairScanner:
             total_seen += 1
 
             try:
-                last_px = float(t.get("lastPrice", 0) or 0)
-                # quoteVolume = volumen 24h ya en USDT
+                last_px     = float(t.get("lastPrice", 0) or 0)
                 vol24h_usdt = float(t.get("quoteVolume", 0) or 0)
                 if vol24h_usdt == 0:
-                    # Fallback: volume (base) × lastPrice
                     vol_base    = float(t.get("volume", 0) or 0)
                     vol24h_usdt = vol_base * last_px
-                # BUG #3 FIX: usar priceChangePercent directamente
-                pcp_raw    = t.get("priceChangePercent")
+                pcp_raw = t.get("priceChangePercent")
                 if pcp_raw is not None:
                     change_pct = abs(float(pcp_raw))
                 else:
-                    # Fallback manual si el campo falta
-                    open_px = float(t.get("openPrice", 0) or 0)
+                    open_px    = float(t.get("openPrice", 0) or 0)
                     change_pct = abs((last_px - open_px) / open_px * 100) if open_px > 0 else None
             except (ValueError, TypeError):
                 continue
@@ -319,23 +319,24 @@ class PairScanner:
                 "vol24h_usdt": vol24h_usdt,
                 "change_pct":  change_pct,
                 "last_price":  last_px,
-                "oi_base":     0.0,   # se enriquece en paso 3
+                "oi_usdt":     0.0,   # se enriquece en paso 3
                 "funding":     0.0,   # se enriquece en paso 3
             })
 
         logger.debug(
-            "[PairScanner] scan pre-filter: total=%d | inactive=%d | bl=%d | "
-            "vol=%d | chg=%d | passed=%d",
-            total_seen, skipped_inactive, skipped_bl, skipped_vol, skipped_chg,
-            len(pre_scored),
+            "[PairScanner] scan pre-filter: total=%d | inactive=%d | synth=%d | "
+            "bl=%d | vol=%d | chg=%d | passed=%d",
+            total_seen, skipped_inactive, skipped_synth, skipped_bl,
+            skipped_vol, skipped_chg, len(pre_scored),
         )
 
         if not pre_scored:
             logger.warning(
                 "[PairScanner] 0 pares pasaron el pre-filtro "
-                "(activos=%d, seen=%d, vol_skip=%d, chg_skip=%d). "
+                "(activos=%d, seen=%d, synth=%d, vol_skip=%d, chg_skip=%d). "
                 "Revisa SCANNER_MIN_VOLUME (%.0f) y SCANNER_MIN_CHANGE (%.2f%%)",
-                len(active_symbols), total_seen, skipped_vol, skipped_chg,
+                len(active_symbols), total_seen, skipped_synth,
+                skipped_vol, skipped_chg,
                 self.min_volume_usdt, self.min_price_change_pct,
             )
             return []
@@ -347,8 +348,8 @@ class PairScanner:
             self._fetch_open_interests(syms),
         )
         for p in pre_scored:
-            p["funding"] = funding_map.get(p["symbol"], 0.0)
-            p["oi_base"] = oi_map.get(p["symbol"], 0.0)
+            p["funding"]  = funding_map.get(p["symbol"], 0.0)
+            p["oi_usdt"]  = oi_map.get(p["symbol"], 0.0)  # ya en USDT
 
         # ─ Paso 4: calcular score ─
         scored = []
@@ -356,19 +357,21 @@ class PairScanner:
             funding     = p["funding"]
             change_pct  = p["change_pct"] or 0.0
             vol24h_usdt = p["vol24h_usdt"]
-            last_px     = p["last_price"]
-            # OI: base units × lastPrice → USDT
-            oi_usdt     = p["oi_base"] * last_px
+            # BUG #5 FIX: oi_usdt ya está en USDT, NO multiplicar por precio
+            oi_usdt     = p["oi_usdt"]
+            # BUG #6 FIX: cap de cambio para evitar que monedas recién
+            # listadas con ratio absurdo dominen el score
+            change_capped = min(change_pct, _MAX_CHANGE_PCT)
 
             funding_abs = abs(funding) * 10_000
             oi_m        = oi_usdt / 1_000_000
             vol_m       = vol24h_usdt / 1_000_000
 
             score = (
-                vol_m       * 0.4 +
-                change_pct  * 0.3 +
-                funding_abs * 0.2 +
-                oi_m        * 0.1
+                vol_m         * 0.4 +
+                change_capped * 0.3 +
+                funding_abs   * 0.2 +
+                oi_m          * 0.1
             )
 
             trend = _funding_trend(p["symbol"], funding)
@@ -377,7 +380,8 @@ class PairScanner:
                 "symbol":        p["symbol"],
                 "volume_usdt":   round(vol_m, 2),
                 "change_pct":    round(change_pct, 2),
-                "last_price":    last_px,
+                "change_capped": round(change_capped, 2),
+                "last_price":    p["last_price"],
                 "funding":       round(funding * 100, 5),
                 "funding_trend": trend,
                 "oi_usdt":       round(oi_m, 2),
@@ -417,10 +421,10 @@ class PairScanner:
         for p in top[:10]:
             ai_str = f" | IA: {p['ai_delta']:+.1f}" if p.get("ai_delta") else ""
             logger.info(
-                "  %-14s Vol:$%sM Cambio:%.2f%% OI:$%sM Fund:%.4f%%(%s) Score:%.2f%s",
+                "  %-14s Vol:$%sM Cambio:%.2f%%(cap:%.0f%%) OI:$%sM Fund:%.4f%%(%s) Score:%.2f%s",
                 p["symbol"], p["volume_usdt"], p["change_pct"],
-                p["oi_usdt"], p["funding"], p.get("funding_trend", "?"),
-                p["score"], ai_str,
+                p["change_capped"], p["oi_usdt"], p["funding"],
+                p.get("funding_trend", "?"), p["score"], ai_str,
             )
 
         return [p["symbol"] for p in top]
