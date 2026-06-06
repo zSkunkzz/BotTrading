@@ -15,6 +15,11 @@ FIX v15 (2026-06-06): corregir referencias a _hl_client / _master_addr / _agent_
   - trader._master_addr / trader._agent_mode → eliminados del log
   Estos AttributeError eran capturados por el except genérico de run()
   y causaban que el loop se reiniciara sin escanear nada visible.
+FIX v16 (2026-06-06): KeyError 'side' en _get_positions() — normalización defensiva
+  de claves BingX vs OKX en el resultado de _get_positions().
+  BingX puede devolver 'posSide'/'avgPx'/'positionAmt' en lugar de
+  'side'/'entryPx'/'size'. Ahora _normalize_position() unifica ambos formatos
+  antes de acceder a las claves, eliminando el KeyError definitivamente.
 """
 from __future__ import annotations
 
@@ -57,9 +62,7 @@ def _round_sz(trader, sz: float) -> float:
     FuturesTrader OKX no expone _hl_client; usamos el atributo interno
     _sz_decimals si existe, o math.floor como fallback seguro.
     """
-    # Intentar obtener decimales del account_api / market metadata
     try:
-        # OKXClient expone get_sz_decimals() si el trader usa okx_client
         if hasattr(trader, "_okx_client") and trader._okx_client is not None:
             dec = trader._okx_client.get_sz_decimals()
             if dec == 0:
@@ -68,8 +71,77 @@ def _round_sz(trader, sz: float) -> float:
             return math.floor(sz * factor) / factor
     except Exception:
         pass
-    # Fallback: floor a 6 decimales (seguro para cualquier crypto)
     return math.floor(sz * 1_000_000) / 1_000_000
+
+
+def _normalize_position(ep: dict) -> dict:
+    """
+    FIX v16: normaliza un dict de posición para garantizar las claves
+    'side', 'entryPx' y 'size' independientemente de si viene de
+    BingXClient (claves ya normalizadas por Fix #13) o de cualquier
+    implementación de _get_positions() que devuelva claves crudas.
+
+    Mapeo de claves crudas BingX → claves normalizadas:
+      posSide / positionSide → side  ("long" | "short")
+      avgPx / avgPrice / avgCost / entryPrice → entryPx  (float)
+      pos / positionAmt / availableAmt / size → size  (float abs)
+    """
+    out = dict(ep)  # copia para no mutar el original
+
+    # ── 'side' ────────────────────────────────────────────────────────────
+    if "side" not in out or out["side"] is None:
+        raw_side = (
+            out.get("posSide")
+            or out.get("positionSide")
+            or ""
+        )
+        raw_side = str(raw_side).upper()
+        if raw_side in ("LONG", "BUY"):
+            out["side"] = "long"
+        elif raw_side in ("SHORT", "SELL"):
+            out["side"] = "short"
+        else:
+            # ONE-WAY: deducir de positionAmt (positivo=long, negativo=short)
+            amt = float(
+                out.get("positionAmt")
+                or out.get("availableAmt")
+                or out.get("pos")
+                or 0
+            )
+            out["side"] = "long" if amt >= 0 else "short"
+            logger.debug(
+                "_normalize_position: 'side' deducido de positionAmt=%.6f → %s",
+                amt, out["side"],
+            )
+
+    # ── 'entryPx' ─────────────────────────────────────────────────────────
+    if "entryPx" not in out or out["entryPx"] is None:
+        raw_px = (
+            out.get("avgPx")
+            or out.get("avgPrice")
+            or out.get("avgCost")
+            or out.get("entryPrice")
+            or 0
+        )
+        try:
+            out["entryPx"] = float(raw_px)
+        except (TypeError, ValueError):
+            out["entryPx"] = 0.0
+
+    # ── 'size' ────────────────────────────────────────────────────────────
+    if "size" not in out or out["size"] is None:
+        raw_sz = (
+            out.get("pos")
+            or out.get("positionAmt")
+            or out.get("availableAmt")
+            or 0
+        )
+        try:
+            out["size"] = abs(float(raw_sz))
+        except (TypeError, ValueError):
+            out["size"] = 0.0
+
+    return out
 
 
 class TradingLoop:
@@ -141,7 +213,6 @@ class TradingLoop:
                 lev           = int(trader._open_leverage or trader.leverage or 1)
                 if entry_px > 0 and notional_usdc > 0:
                     raw_qty = (notional_usdc * lev) / entry_px
-                    # FIX v15: usar helper _round_sz en lugar de trader._hl_client.round_sz
                     trader._open_qty = _round_sz(trader, raw_qty)
                     logger.info(
                         "[%s] _open_qty recalculado desde disco: %.6f "
@@ -175,8 +246,6 @@ class TradingLoop:
             )
 
         await trader._set_leverage(trader.leverage)
-        # FIX v15: eliminados trader._master_addr y trader._agent_mode
-        # que no existen en FuturesTrader OKX y lanzaban AttributeError
         logger.info(
             "[%s] TradingLoop iniciado | coin=%s | inst=%s | leverage=%dx | dry_run=%s",
             self.symbol, trader.coin,
@@ -229,7 +298,8 @@ class TradingLoop:
 
             if exchange_positions is not None:
                 if exchange_positions:
-                    ep = exchange_positions[0]
+                    # FIX v16: normalizar claves antes de acceder
+                    ep = _normalize_position(exchange_positions[0])
                     if trader.position is None:
                         trader.position    = ep["side"]
                         trader.entry_price = ep["entryPx"]
@@ -238,7 +308,6 @@ class TradingLoop:
                             self.symbol, trader.position, trader.entry_price,
                         )
                     if trader._open_qty == 0.0 and ep.get("size", 0) > 0:
-                        # FIX v15: usar helper _round_sz en lugar de trader._hl_client.round_sz
                         trader._open_qty = _round_sz(trader, float(ep["size"]))
                         logger.info(
                             "[%s] _open_qty sincronizado desde exchange: %.6f",
@@ -284,8 +353,6 @@ class TradingLoop:
 
                         self._open_notified = False
 
-                        # FIX v15: usar trader._cancel_all_tpsl() en lugar de
-                        # trader._hl_client.cancel_all_open_tpsl() que no existe en OKX trader
                         try:
                             await asyncio.to_thread(
                                 lambda: _cancel_tpsl_safe(trader)
@@ -450,7 +517,6 @@ def _cancel_tpsl_safe(trader) -> None:
     sin depender de trader._hl_client (que no existe en FuturesTrader OKX).
     Intenta varios patrones de acceso según el tipo de trader.
     """
-    # Patrón 1: FuturesTrader OKX — usa _trade_api directamente
     if hasattr(trader, "_trade_api") and trader._trade_api is not None:
         inst_id = getattr(trader, "inst_id", None)
         if inst_id:
@@ -471,7 +537,6 @@ def _cancel_tpsl_safe(trader) -> None:
                                getattr(trader, "symbol", "?"), e)
             return
 
-    # Patrón 2: OKXClient expuesto como _okx_client
     if hasattr(trader, "_okx_client") and trader._okx_client is not None:
         try:
             trader._okx_client.cancel_all_open_tpsl()
