@@ -1,17 +1,17 @@
 """
-execution_engine.py — Motor de ejecución OKX Futures Perpetuos.
+execution_engine.py — Motor de ejecución BingX Futures Perpetuos.
 
 Flujo de apertura:
   1. Guardia dura: si trade_side=="open" y falta sl o tp → abortar inmediatamente.
   2. Calcular arrival_price (mid del orderbook o last)
   3. Intentar limit agresiva si spread <= umbral y depth suficiente
-  4. Si llena: colocar SL + TP via place_sl() / place_tp() del OKXClient
+  4. Si llena: colocar SL + TP via place_sl() / place_tp() del BingXClient
   5. Si no llena en timeout: cancelar → fallback market + SL/TP
   6. Registrar telemetría
 
-Respuestas OKX (python-okx v0.1.x):
+Respuestas normalizadas (BingXClient convierte al formato OKX internamente):
   place_order  → {"code":"0", "data":[{"ordId":"...","sCode":"0"}]}
-  place_algo   → {"code":"0", "data":[{"algoId":"...","sCode":"0"}]}
+  place_sl/tp  → {"code":"0", "data":[{"algoId":"...","sCode":"0"}]}
   Normalizado en _okx_ok() → bool y _okx_order_id() → str|None
 
 Variables de entorno (todas opcionales):
@@ -40,7 +40,7 @@ from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from bot.trader import FuturesTrader
 
-from bot.core.okx_client import OKXClient
+from bot.core.bingx_client import BingXClient
 
 logger = logging.getLogger("ExecutionEngine")
 
@@ -51,10 +51,9 @@ def _e(key: str, default: float) -> float:
     return float(os.getenv(key, str(default)))
 
 
-# ── Helpers de respuesta OKX ────────────────────────────────────────────────
+# ── Helpers de respuesta (formato normalizado OKX-compatible) ────────────────
 
 def _okx_ok(resp: dict) -> bool:
-    """Devuelve True si la respuesta de python-okx indica éxito."""
     if not resp or resp.get("code") != "0":
         return False
     data = resp.get("data", [])
@@ -65,13 +64,10 @@ def _okx_ok(resp: dict) -> bool:
 
 
 def _okx_error_msg(resp: dict) -> str:
-    """Extrae el mensaje de error legible de una respuesta OKX."""
     if not resp:
         return "respuesta vacía"
-    # Error a nivel de petición
     if resp.get("code") != "0":
         return resp.get("msg", f"code={resp.get('code')}")
-    # Error a nivel de orden individual
     data = resp.get("data", [])
     if data:
         return data[0].get("sMsg", data[0].get("msg", "error desconocido"))
@@ -79,7 +75,6 @@ def _okx_error_msg(resp: dict) -> str:
 
 
 def _okx_order_id(resp: dict) -> Optional[str]:
-    """Extrae ordId de la respuesta de place_order."""
     data = (resp or {}).get("data", [])
     if data:
         oid = data[0].get("ordId")
@@ -89,7 +84,6 @@ def _okx_order_id(resp: dict) -> Optional[str]:
 
 
 def _okx_algo_id(resp: dict) -> Optional[str]:
-    """Extrae algoId de la respuesta de place_algo_order."""
     data = (resp or {}).get("data", [])
     if data:
         aid = data[0].get("algoId")
@@ -123,9 +117,9 @@ _MAX_RECORDS_PER_SYMBOL = int(os.getenv("EE_MAX_RECORDS_PER_SYMBOL", "500"))
 
 class ExecutionEngine:
     """
-    Motor de ejecución OKX:
-      - Usa OKXClient (bot.core.okx_client)
-      - Coloca TP y SL como algo orders (conditional) via place_sl() / place_tp()
+    Motor de ejecución BingX:
+      - Usa BingXClient (bot.core.bingx_client)
+      - Coloca TP y SL como TAKE_PROFIT_MARKET / STOP_MARKET via place_sl() / place_tp()
       - TP/SL sobreviven reinicios del bot (persisten en el exchange)
       - NUNCA abre una posición sin SL y TP válidos
     """
@@ -141,12 +135,12 @@ class ExecutionEngine:
         self.market_429_retries:     int   = int(_e("EE_MARKET_429_RETRIES",  3))
         self.market_429_delay:       float = _e("EE_MARKET_429_DELAY_S",      2.0)
         self._records: dict[str, list[TradeRecord]] = defaultdict(list)
-        self._okx_clients: dict[str, OKXClient] = {}
+        self._clients: dict[str, BingXClient] = {}
 
-    async def _get_client(self, symbol: str) -> OKXClient:
-        if symbol not in self._okx_clients:
-            self._okx_clients[symbol] = await OKXClient.create(symbol)
-        return self._okx_clients[symbol]
+    async def _get_client(self, symbol: str) -> BingXClient:
+        if symbol not in self._clients:
+            self._clients[symbol] = await BingXClient.create(symbol)
+        return self._clients[symbol]
 
     # ── UTILIDADES ──────────────────────────────────────────────────────
 
@@ -159,7 +153,7 @@ class ExecutionEngine:
 
     async def _place_market_with_retry(
         self,
-        client: OKXClient,
+        client: BingXClient,
         is_buy: bool,
         qty: float,
         reduce_only: bool,
@@ -182,7 +176,6 @@ class ExecutionEngine:
                 if _okx_ok(result):
                     return {"status": "ok", "response": result}
                 err = _okx_error_msg(result)
-                # Reintentar solo si es rate-limit
                 if any(s in err.lower() for s in _RATE_LIMIT_SUBSTRS):
                     last_exc = Exception(err)
                     continue
@@ -245,9 +238,9 @@ class ExecutionEngine:
             try:
                 cancelled = await asyncio.to_thread(client.cancel_all_open_tpsl)
                 if cancelled:
-                    logger.info("[%s] 🗑️ %d algo order(s) canceladas antes del cierre.", sym, len(cancelled))
+                    logger.info("[%s] 🗑️ %d SL/TP canceladas antes del cierre.", sym, len(cancelled))
             except Exception as e:
-                logger.warning("[%s] No se pudieron cancelar algo orders (TP/SL): %s", sym, e)
+                logger.warning("[%s] No se pudieron cancelar SL/TP: %s", sym, e)
 
         spread_bps = self._calc_spread_bps(ask, bid, arrival_price)
         use_limit  = (
@@ -307,11 +300,11 @@ class ExecutionEngine:
         self._finalize_rec(rec, result, side, arrival_price)
         return result
 
-    # ── SL + TP (OKX algo orders) ───────────────────────────────────────────
+    # ── SL + TP ─────────────────────────────────────────────────────────────
 
     async def _place_tpsl(
         self,
-        client: OKXClient,
+        client: BingXClient,
         is_buy: bool,
         qty: float,
         sl: Optional[float],
@@ -333,21 +326,21 @@ class ExecutionEngine:
                 try:
                     result = await asyncio.to_thread(
                         client.place_sl,
-                        is_buy=not is_buy,   # cierre = lado opuesto a la apertura
+                        is_buy=not is_buy,
                         sz=qty,
                         trigger_px=float(sl),
                         entry_px=entry_px,
                     )
                     if _okx_ok(result):
                         algo_id = _okx_algo_id(result)
-                        logger.info("[%s] ✅ SL=%.5f colocado en OKX (algoId=%s)", sym, sl, algo_id)
+                        logger.info("[%s] ✅ SL=%.5f colocado en BingX (orderId=%s)", sym, sl, algo_id)
                         sl_placed = True
                         break
                     err = _okx_error_msg(result)
                     if any(s in err.lower() for s in _RATE_LIMIT_SUBSTRS):
                         logger.warning("[%s] SL rate-limited: %s", sym, err)
                         continue
-                    logger.error("[%s] ❌ SL rechazado por OKX: %s", sym, err)
+                    logger.error("[%s] ❌ SL rechazado por BingX: %s", sym, err)
                     break
                 except Exception as e:
                     if any(s in str(e).lower() for s in _RATE_LIMIT_SUBSTRS):
@@ -378,7 +371,7 @@ class ExecutionEngine:
                 try:
                     result = await asyncio.to_thread(
                         client.place_tp,
-                        is_buy=not is_buy,   # cierre = lado opuesto a la apertura
+                        is_buy=not is_buy,
                         sz=qty,
                         trigger_px=float(tp),
                         limit_px=tp_limit,
@@ -386,14 +379,14 @@ class ExecutionEngine:
                     )
                     if _okx_ok(result):
                         algo_id = _okx_algo_id(result)
-                        logger.info("[%s] ✅ TP=%.5f colocado en OKX (algoId=%s)", sym, tp, algo_id)
+                        logger.info("[%s] ✅ TP=%.5f colocado en BingX (orderId=%s)", sym, tp, algo_id)
                         tp_placed = True
                         break
                     err = _okx_error_msg(result)
                     if any(s in err.lower() for s in _RATE_LIMIT_SUBSTRS):
                         logger.warning("[%s] TP rate-limited: %s", sym, err)
                         continue
-                    logger.error("[%s] ❌ TP rechazado por OKX: %s", sym, err)
+                    logger.error("[%s] ❌ TP rechazado por BingX: %s", sym, err)
                     break
                 except Exception as e:
                     if any(s in str(e).lower() for s in _RATE_LIMIT_SUBSTRS):
@@ -412,7 +405,7 @@ class ExecutionEngine:
 
     async def _try_limit(
         self,
-        client: OKXClient,
+        client: BingXClient,
         is_buy: bool,
         qty: float,
         price: float,
@@ -433,14 +426,12 @@ class ExecutionEngine:
 
         order_id = _okx_order_id(raw)
         if order_id is None:
-            # Sin ordId → asumir fill inmediato (IOC/FOK)
             logger.warning(
                 "[%s] Limit: sin ordId en respuesta — asumiendo fill inmediato. resp=%s",
                 rec.symbol, raw,
             )
             return {"status": "ok", "response": raw}, True
 
-        # Polling hasta fill o timeout
         deadline = time.monotonic() + self.limit_timeout_s
         filled   = False
 
