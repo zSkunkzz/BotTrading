@@ -19,6 +19,12 @@ v3 — OKX Bug 3 fix (2026-06-06):
     - _get_open_trigger_orders_raw() → GET /api/v5/trade/orders-algo-pending
       (donde viven los TP/SL algo-orders en OKX)
     - _place_tpsl()                  → coloca SL o TP via OKXClient
+
+v4 — get_price fix (2026-06-06):
+  - Corregido IndexError cuando OKX devuelve data=[] (instrumento no
+    disponible en demo: OPN, MON, PENGU, TURBO, MEME, NEIRO, etc.)
+  - Añadida validación explícita de lista vacía antes de acceder a [0]
+  - Traders con instrumento inválido en demo se marcan como skip silencioso
 """
 from __future__ import annotations
 
@@ -153,6 +159,9 @@ class FuturesTrader:
         self._tp1_be_done:   bool            = False
         self._last_price:    float           = 0.0
 
+        # Marca el instrumento como no disponible en demo para skip silencioso
+        self._instrument_unavailable: bool   = False
+
         self._api_key    = api_key    or os.getenv("OKX_API_KEY",    "")
         self._api_secret = api_secret or os.getenv("OKX_API_SECRET", "")
         self._passphrase = passphrase or os.getenv("OKX_PASSPHRASE",  "")
@@ -225,6 +234,13 @@ class FuturesTrader:
                 return self._last_price
             raise RuntimeError(f"[{self.symbol}] get_price: APIs no inicializadas")
 
+        # Si el instrumento ya fue marcado como no disponible, no reintentar
+        if self._instrument_unavailable:
+            raise RuntimeError(
+                f"[{self.symbol}] get_price: instrumento {self.inst_id} "
+                f"no disponible en OKX {'demo' if _USE_DEMO else 'live'} — skip"
+            )
+
         last_exc: Exception | None = None
         delays = [0.4 * (2 ** i) for i in range(_PRICE_FETCH_RETRIES)]
 
@@ -233,14 +249,30 @@ class FuturesTrader:
                 resp = await asyncio.to_thread(
                     self._market_api.get_ticker, self.inst_id
                 )
-                ticker = resp.get("data", [{}])[0]
+                data = resp.get("data", [])
+
+                # FIX: OKX devuelve data=[] cuando el instrumento no existe
+                # en el entorno demo (OPN, MON, PENGU, TURBO, MEME, NEIRO, etc.)
+                # El acceso original [0] daba IndexError — ahora validamos explícitamente.
+                if not data:
+                    # Marcar instrumento como no disponible para no seguir reintentando
+                    self._instrument_unavailable = True
+                    raise ValueError(
+                        f"{self.inst_id} no disponible en OKX "
+                        f"{'demo' if _USE_DEMO else 'live'} (data=[])"
+                    )
+
+                ticker = data[0]
                 price  = float(ticker.get("last") or ticker.get("askPx") or 0)
                 if price <= 0:
-                    raise ValueError(f"ticker vacío para {self.inst_id}")
+                    raise ValueError(f"ticker con precio cero para {self.inst_id}")
                 self._last_price = price
                 return price
             except Exception as exc:
                 last_exc = exc
+                # Si el instrumento se marcó como no disponible, salir sin reintentar
+                if self._instrument_unavailable:
+                    break
                 if attempt < len(delays) - 1:
                     logger.debug(
                         "[%s] get_price intento %d/%d fallido (%s) — reintentando en %.1fs",
