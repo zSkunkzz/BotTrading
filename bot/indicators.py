@@ -82,19 +82,37 @@ def supertrend(highs, lows, closes, period=10, factor=3.0):
     return direction, round(st, 6)
 
 
-def vwap(bars: list) -> float:
-    """VWAP acumulado de las barras provistas.
+def vwap(bars: list, reset_daily: bool = True) -> float:
+    """VWAP con reset diario a las 00:00 UTC (por defecto).
+
+    Cuando reset_daily=True (default), solo acumula las barras del
+    dia UTC actual (timestamp >= inicio_dia_utc). Esto produce un
+    VWAP diario real, mucho mas significativo como nivel de precio
+    que el VWAP acumulado de todas las barras del array.
+
+    Cuando reset_daily=False, acumula todas las barras provistas
+    (comportamiento anterior, util para tests o timeframes > 1h).
 
     Usa el Typical Price (H+L+C)/3 ponderado por volumen.
-    Seguro ante barras con v=0 o v=None (las omite sin lanzar excepción).
-    Retorna 0.0 si no hay volumen acumulado válido.
-
-    Uso habitual: pasar bars_15m completas para obtener VWAP intradía
-    referenciado al inicio de la sesión de datos disponibles.
+    Seguro ante barras con v=0 o v=None (las omite sin lanzar excepcion).
+    Retorna 0.0 si no hay volumen acumulado valido.
     """
+    import time as _time
+    if reset_daily:
+        # Inicio del dia UTC en milisegundos
+        now_s = _time.time()
+        day_start_ms = int((now_s - (now_s % 86400)) * 1000)
+        bars_to_use = [b for b in bars if b is not None and len(b) > 0 and b[0] is not None and int(b[0]) >= day_start_ms]
+        # Si el dia acaba de empezar y hay menos de 4 barras, fallback a ultimas 24h
+        if len(bars_to_use) < 4:
+            day_start_ms -= 86400 * 1000
+            bars_to_use = [b for b in bars if b is not None and len(b) > 0 and b[0] is not None and int(b[0]) >= day_start_ms]
+    else:
+        bars_to_use = bars
+
     cum_vol = 0.0
     cum_tpv = 0.0
-    for b in bars:
+    for b in bars_to_use:
         try:
             h = float(b[2])
             l = float(b[3])
@@ -108,3 +126,65 @@ def vwap(bars: list) -> float:
         cum_tpv += tp * v
         cum_vol  += v
     return round(cum_tpv / cum_vol, 6) if cum_vol > 0 else 0.0
+
+
+def rsi_divergence(bars: list, rsi_period: int = 14, lookback: int = 30) -> str:
+    """Detecta divergencias RSI alcistas y bajistas.
+
+    Compara los dos ultimos minimos de precio (divergencia alcista) o
+    los dos ultimos maximos de precio (divergencia bajista) con los
+    valores de RSI correspondientes.
+
+    Retorna:
+      'BULLISH'  — precio hace minimo mas bajo pero RSI hace minimo mas alto
+      'BEARISH'  — precio hace maximo mas alto pero RSI hace maximo mas bajo
+      'NONE'     — sin divergencia detectada
+
+    Requiere al menos lookback+rsi_period+2 barras para ser fiable.
+    """
+    if len(bars) < lookback + rsi_period + 2:
+        return "NONE"
+
+    closes = [float(b[4]) for b in bars]
+    lows   = [float(b[3]) for b in bars]
+    highs  = [float(b[2]) for b in bars]
+
+    # Calcula RSI para cada barra del lookback usando ventana deslizante
+    rsi_vals = []
+    for i in range(len(closes) - lookback, len(closes)):
+        window = closes[max(0, i - rsi_period * 2): i + 1]
+        rsi_vals.append(rsi(window, rsi_period))
+
+    price_lows  = lows[-lookback:]
+    price_highs = highs[-lookback:]
+
+    # Busca los dos ultimos minimos locales de precio
+    def find_local_mins(series, window=3):
+        mins = []
+        for i in range(window, len(series) - window):
+            if series[i] == min(series[i - window: i + window + 1]):
+                mins.append(i)
+        return mins[-2:] if len(mins) >= 2 else []
+
+    def find_local_maxs(series, window=3):
+        maxs = []
+        for i in range(window, len(series) - window):
+            if series[i] == max(series[i - window: i + window + 1]):
+                maxs.append(i)
+        return maxs[-2:] if len(maxs) >= 2 else []
+
+    # Divergencia alcista: precio min mas bajo, RSI min mas alto
+    lmin_idx = find_local_mins(price_lows)
+    if len(lmin_idx) == 2:
+        i1, i2 = lmin_idx
+        if price_lows[i2] < price_lows[i1] and rsi_vals[i2] > rsi_vals[i1]:
+            return "BULLISH"
+
+    # Divergencia bajista: precio max mas alto, RSI max mas bajo
+    hmax_idx = find_local_maxs(price_highs)
+    if len(hmax_idx) == 2:
+        i1, i2 = hmax_idx
+        if price_highs[i2] > price_highs[i1] and rsi_vals[i2] < rsi_vals[i1]:
+            return "BEARISH"
+
+    return "NONE"

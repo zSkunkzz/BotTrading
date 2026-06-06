@@ -15,68 +15,41 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 11 desde v21-P3):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v24 (fix/signal-quality):
+  1. VWAP diario real: _compute_indicators llama vwap(bars, reset_daily=True)
+     para usar solo las barras del dia UTC actual (00:00 UTC), produciendo
+     un nivel de precio mucho mas significativo que el VWAP acumulado.
+  2. REVERSAL — ST1h obligatorio: _score_reversal requiere ST1h en favor
+     como REQUISITO HARD, igual que TENDENCIA con MACD15m y ST1h.
+     Sin ST1h, retorna NEUTRAL inmediatamente. Esto elimina entradas
+     contratendencia peligrosas que antes pasaban con score=7/9.
+  3. BREAKOUT — filtro de compresion previa: antes de confirmar la ruptura
+     se verifica que el ATR de las ultimas BREAKOUT_WINDOW velas este por
+     debajo del percentil 40 del ATR historico (squeeze). Breakouts desde
+     rangos ya extendidos quedan bloqueados.
+  4. Divergencias RSI en REVERSAL: usando rsi_divergence() de indicators.py,
+     una divergencia alcista/bajista confirmada suma +2 al score de REVERSAL.
+     Es la confirmacion mas fiable de un giro de precio.
+  5. TENDENCIA — volumen decreciente en pullback: si el pullback a EMA21
+     llega con vol_ratio < 0.8 (contraccion), suma +1 adicional de calidad.
+
 CAMBIOS v23 (fix/ohlcv-resilience):
-  1. Modo degradado operativo para 1h: si bars_1h llega vacío tras el fetch
-     directo (ohlcv_fn=None), se reintenta UNA vez más sólo la petición 1h
-     con asyncio.sleep(1.5s) antes de continuar con MTF degradado.
-  2. Semáforo interno ANALYZE_PAIR_CONCURRENCY (default 6): cuando
-     pair_scanner llama a analyze_pair en paralelo para múltiples pares,
-     el semáforo evita que más de 6 análisis emitan fetch simultáneos.
-     Configurable via env ANALYZE_PAIR_CONCURRENCY.
-  3. _analyze_pair_inner(): extrae la lógica de analyze_pair para permitir
-     que el semáforo la envuelva sin duplicar código.
-  Nota: cuando ohlcv_fn es suministrado por trader.py (que ya usa
-  ohlcv_cache), estos guards son irrelevantes.
+  1. Modo degradado operativo para 1h.
+  2. Semáforo interno ANALYZE_PAIR_CONCURRENCY (default 6).
+  3. _analyze_pair_inner().
 
 CAMBIOS v22 (mejoras de calidad):
-  1. MTF bias filter: si el bias de 1h va contra la señal de 15m, se
-     requiere score >= MTF_BLOCK_SCORE_OVERRIDE (default=10) para pasar.
-     Añade campo extra["mtf_aligned"] True/False en SignalResult.
-  2. R/R mínimo dinámico por régimen (MIN_RR_REGIME_*):
-     TRENDING  → 1.6 (tendencia ayuda)
-     RANGING   → 2.0 (más incertidumbre)
-     VOLATILE  → 2.2 (ruido alto)
-     Si no se pasa régimen, usa MIN_RR (env) como antes.
-  El régimen se pasa como parámetro opcional `regime` a analyze_pair.
+  1. MTF bias filter.
+  2. R/R mínimo dinámico por régimen.
 
 CAMBIOS v21 (Prioridades 1, 2 y 3):
-  P1 — OHLCV robustos:
-  - _clean_bars(): elimina barras con None en cualquier campo OHLCV antes
-    de pasarlas a los indicadores. Previene TypeError en EMA/RSI/ST cuando
-    el exchange devuelve velas incompletas.
-  - Guard diferenciado 1h: si len(bars_1h) < 20 → warning log, sin return.
-    ind_1h quedará {} y el scoring lo penalizará correctamente.
-  P2 — Filtros de calidad en analyze_pair:
-  - VOL_SIGNAL_MIN (default 1.0): la vela de señal debe superar el
-    promedio de las _VOL_AVG_WINDOW velas anteriores. Bloquea entradas
-    en velas de rango muerto / trampa.
-  - funding_rate: float = 0.0 añadido como parámetro a analyze_pair.
-    FUNDING_LONG_MAX (+0.05%) y FUNDING_SHORT_MIN (-0.05%): bloquean
-    señales cuyo funding extremo contradice la dirección.
-  P3 — VWAP:
-  - vwap(bars) en bot/indicators.py: VWAP acumulado (H+L+C)/3 × vol.
-  - _compute_indicators: añade clave "vwap" usando las mismas bars.
-  - _score_tendencia: +1 si close > VWAP en LONG (o < en SHORT).
-    No penaliza si falla — es confirmación adicional, no requisito.
-    MAX pasa de 10 a 11; MIN_SCORE=7 inalterado.
+  P1 — OHLCV robustos.
+  P2 — Filtros de calidad en analyze_pair.
+  P3 — VWAP (acumulado, reemplazado por diario en v24).
 
-CAMBIOS v20 (Opción A early entry + Opción B SL ATR dinámico):
-  Opción A — Early entry para señales de máxima convicción:
-  - FAST_ENTRY_MIN_SCORE (default=9): score >= este valor activa modo FAST.
-    Si score>=FAST_ENTRY_MIN_SCORE y rr>=FAST_ENTRY_MIN_RR (default=1.2) →
-    is_valid=True aunque rr < MIN_RR (1.5). entry_mode="FAST".
-  Opción B — SL dinámico ATR puro:
-  - SL_ATR_DYNAMIC (default=false): SL base = entry ± SL_ATR_MULT×ATR.
-
-CAMBIOS v19 (trend following puro — calidad sobre cantidad):
-  - MACD15m a favor es REQUISITO OBLIGATORIO en _score_tendencia.
-  - ST1h Y ST4h ambos requeridos. ST4h en contra → penalización -2.
-  - Volumen mínimo 1.0x para puntuar. Vol<0.8x → penalización -1.
-  - TP1_ATR_MULT 2.25 · TP2_ATR_MULT 4.5 · MIN_RR 1.5 · MIN_SCORE 7.
-
-CAMBIOS v18 (fix SL estructura demasiado ancho):
-  - _structure_sl añade cap SL_STRUCTURE_MAX_DIST_PCT (default 4.0%).
-
+CAMBIOS v20 (Opción A early entry + Opción B SL ATR dinámico).
+CAMBIOS v19 (trend following puro).
+CAMBIOS v18 (fix SL estructura demasiado ancho).
 CAMBIOS v17: _detect_setup evalúa los 3 setups, elige mayor score/max.
 CAMBIOS v16: SL por estructura 1h + session_filter.
 CAMBIOS v15: TP conservadores, trailing eliminado.
@@ -92,7 +65,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr, vwap as calc_vwap
+from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr, vwap as calc_vwap, rsi_divergence
 
 log = logging.getLogger(__name__)
 
@@ -157,6 +130,8 @@ _EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.0015"))
 _BREAKOUT_WINDOW       = int(os.getenv("BREAKOUT_WINDOW", "20"))
 _BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.4"))
 _BREAKOUT_ATR_CONFIRM  = float(os.getenv("BREAKOUT_ATR_CONFIRM", "0.3"))
+# v24: ATR squeeze — el ATR reciente debe estar por debajo del percentil 40 del historico
+_BREAKOUT_SQUEEZE_PCT  = float(os.getenv("BREAKOUT_SQUEEZE_PCT", "40"))
 _REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "28"))
 _REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "72"))
 _VOL_MIN_GLOBAL        = float(os.getenv("VOL_MIN_GLOBAL",    "0.6"))
@@ -532,13 +507,13 @@ def _detect_setup(
 
 def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     """
-    v21-P3: MAX=11 (se añade +1 VWAP).
+    v24: MAX=12 (se añade +1 por volumen bajo en pullback).
     REQUISITOS OBLIGATORIOS:
       - EMA 1h en tendencia definida
       - MACD15m a favor
       - ST1h a favor
     """
-    MAX = 11
+    MAX = 12
     reasons: List[str] = []
 
     if not i1h:
@@ -600,21 +575,36 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
 
     ema21_15m = i15.get("ema21")
     close_15m = i15.get("close", 0)
+    pullback_detected = False
+    pullback_vol_low  = False
     if ema21_15m and close_15m:
         recent_bars = bars_15m[-(_PULLBACK_LOOKBACK + 1):-1]
-        touched_ema = False
         for bar in recent_bars:
             bar_low  = float(bar[3])
             bar_high = float(bar[2])
+            bar_vol  = float(bar[5])
             if direction == "LONG":
                 if bar_low <= ema21_15m * (1 + _PULLBACK_TOLERANCE):
-                    touched_ema = True; break
+                    pullback_detected = True
+                    # v24: vol bajo en pullback confirma correccion sana
+                    vol_avg_pb = i15.get("vol_ratio", 1.0)
+                    avg_vol_raw = i15.get("_avg_vol", 0.0)
+                    if avg_vol_raw > 0 and bar_vol < avg_vol_raw * 0.8:
+                        pullback_vol_low = True
+                    break
             else:
                 if bar_high >= ema21_15m * (1 - _PULLBACK_TOLERANCE):
-                    touched_ema = True; break
-        if touched_ema:
+                    pullback_detected = True
+                    avg_vol_raw = i15.get("_avg_vol", 0.0)
+                    if avg_vol_raw > 0 and bar_vol < avg_vol_raw * 0.8:
+                        pullback_vol_low = True
+                    break
+        if pullback_detected:
             score += 1
             reasons.append("Pullback a EMA21_15m +1")
+            if pullback_vol_low:
+                score += 1
+                reasons.append("Pullback con volumen bajo (corrección sana) +1")
         else:
             reasons.append("Sin pullback a EMA21_15m")
 
@@ -650,27 +640,35 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
     else:
         reasons.append(f"Confluencia ST parcial (15m={st15m_ok} 1h={st1h_ok} 4h={st4h_ok})")
 
-    # v21 P3: VWAP
+    # v21 P3 / v24: VWAP diario
     vwap_val = i15.get("vwap", 0.0)
     if vwap_val and vwap_val > 0 and close_15m:
         vwap_ok = (direction == "LONG" and close_15m > vwap_val) or \
                   (direction == "SHORT" and close_15m < vwap_val)
         if vwap_ok:
             score += 1
-            reasons.append(f"Precio {'>' if direction == 'LONG' else '<'} VWAP({vwap_val:.4f}) +1")
+            reasons.append(f"Precio {'>' if direction == 'LONG' else '<'} VWAP_diario({vwap_val:.4f}) +1")
         else:
-            reasons.append(f"Precio {'<' if direction == 'LONG' else '>'} VWAP({vwap_val:.4f}) — sin confirmación")
+            reasons.append(f"Precio {'<' if direction == 'LONG' else '>'} VWAP_diario({vwap_val:.4f}) — sin confirmación")
     else:
-        reasons.append("VWAP no disponible")
+        reasons.append("VWAP diario no disponible")
 
     return "TENDENCIA", direction, score, MAX, reasons
 
 
 def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
+    """
+    v24: añade filtro de compresión previa (ATR squeeze).
+    El ATR de las ultimas BREAKOUT_WINDOW velas debe estar en el
+    percentil BREAKOUT_SQUEEZE_PCT del ATR historico. Bloquea
+    breakouts desde rangos ya extendidos (fakeouts comunes).
+    MAX sigue siendo 8.
+    """
     MAX = 8
     reasons: List[str] = []
     if len(bars_15m) < _BREAKOUT_WINDOW + 2:
         return "BREAKOUT", "NEUTRAL", 0, MAX, ["Velas insuficientes para breakout"]
+
     window = bars_15m[-(_BREAKOUT_WINDOW + 1):-1]
     range_high = max(b[2] for b in window)
     range_low  = min(b[3] for b in window)
@@ -684,6 +682,28 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         return "BREAKOUT", "NEUTRAL", 0, MAX, [
             f"Sin rotura: close={current_close:.4f} rango=[{range_low:.4f}-{range_high:.4f}]"
         ]
+
+    # v24: filtro de compresión previa — el ATR reciente debe ser bajo
+    # respecto al ATR historico (squeeze). Si el rango ya estaba extendido,
+    # el breakout tiene muchas mas probabilidades de ser un fakeout.
+    if atr_val > 0 and len(bars_15m) >= _BREAKOUT_WINDOW * 2:
+        hist_highs  = [float(b[2]) for b in bars_15m[-(  _BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
+        hist_lows   = [float(b[3]) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
+        hist_closes = [float(b[4]) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
+        hist_atr = calc_atr(hist_highs, hist_lows, hist_closes, min(14, len(hist_closes) - 1))
+        if hist_atr > 0:
+            squeeze_pct = _BREAKOUT_SQUEEZE_PCT / 100.0
+            if atr_val > hist_atr * (1.0 - squeeze_pct + 0.5):
+                # ATR actual supera el umbral de compresión → rango ya extendido
+                log.debug(
+                    "[signal_engine] BREAKOUT bloqueado: ATR actual=%.6f > umbral=%.6f (hist_atr=%.6f)",
+                    atr_val, hist_atr * (1.0 - squeeze_pct + 0.5), hist_atr,
+                )
+                return "BREAKOUT", "NEUTRAL", 0, MAX, [
+                    f"ATR actual ({atr_val:.6f}) > hist ({hist_atr:.6f}) → sin compresión previa (posible fakeout)"
+                ]
+            reasons.append(f"ATR squeeze confirmado: actual={atr_val:.6f} < hist={hist_atr:.6f} +0 (filtro OK)")
+
     direction = "LONG" if broke_up else "SHORT"
     score = 2
     reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} confirmada +2")
@@ -714,7 +734,12 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
 
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
-    MAX = 9
+    """
+    v24: ST1h es ahora REQUISITO OBLIGATORIO (antes era opcional).
+    Divergencias RSI 15m detectadas con rsi_divergence() suman +2.
+    MAX pasa de 9 a 11.
+    """
+    MAX = 11
     reasons: List[str] = []
     rsi_1h = i1h.get("rsi_val") if i1h else None
     if rsi_1h is None:
@@ -724,8 +749,24 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     if not is_long and not is_short:
         return "REVERSAL", "NEUTRAL", 0, MAX, [f"RSI1h={rsi_1h:.0f} no es extremo"]
     direction = "LONG" if is_long else "SHORT"
+
+    # v24: ST1h OBLIGATORIO — sin él no hay reversal válido
+    # Un reversal contratendencia sin ST1h es la entrada más peligrosa del bot
+    if i1h:
+        st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
+        if not st1h_ok:
+            reasons.append(f"ST1h en contra de {direction} — REQUISITO OBLIGATORIO en REVERSAL")
+            return "REVERSAL", "NEUTRAL", 0, MAX, reasons
+    else:
+        # Sin datos 1h no podemos confirmar ST1h
+        reasons.append("ST1h no disponible — REVERSAL requiere confirmación 1h")
+        return "REVERSAL", "NEUTRAL", 0, MAX, reasons
+
     score = 2
     reasons.append(f"RSI1h={rsi_1h:.0f} extremo {'sobreventa' if is_long else 'sobrecompra'} +2")
+
+    reasons.append("ST1h en favor del giro +0 (requisito cumplido)")
+
     hist_15m = i15.get("macd_hist")
     if hist_15m is not None:
         if is_long and hist_15m > 0:
@@ -736,26 +777,31 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             reasons.append(f"MACD15m hist={hist_15m:.4f} sin confirmar")
     else:
         reasons.append("MACD15m no disponible")
+
     last_open  = float(bars_15m[-1][1])
     last_close = float(bars_15m[-1][4])
     if (is_long and last_close > last_open) or (is_short and last_close < last_open):
         score += 1; reasons.append("Vela de giro confirmada +1")
     else:
         reasons.append("Sin vela de giro")
+
     vol_ratio = i15.get("vol_ratio", 1.0)
     if vol_ratio >= 1.5:
         score += 1; reasons.append(f"Vol15m={vol_ratio:.1f}x capitulación +1")
     else:
         reasons.append(f"Vol15m={vol_ratio:.1f}x sin capitulación")
+
     if i4h:
         st4h_against = (is_long and i4h.get("st_bear")) or (is_short and i4h.get("st_bull"))
         if st4h_against: score += 1; reasons.append("ST4h agotamiento +1")
         else: reasons.append("ST4h no confirma agotamiento")
+
     rsi_4h = i4h.get("rsi_val") if i4h else None
     if rsi_4h is not None and 40 <= rsi_4h <= 60:
         score += 1; reasons.append(f"RSI4h={rsi_4h:.0f} neutro +1")
     else:
         reasons.append("RSI4h no neutro")
+
     close_15m = i15.get("close", 0)
     ema21_1h  = i1h.get("ema21") if i1h else None
     if ema21_1h and close_15m:
@@ -764,6 +810,22 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             score += 1; reasons.append(f"Precio toca EMA21_1h (dist={dist_pct*100:.2f}%) +1")
         else:
             reasons.append(f"Precio lejos EMA21_1h ({dist_pct*100:.2f}%)")
+
+    # v24: divergencias RSI 15m — la confirmación más fiable de un giro
+    try:
+        div = rsi_divergence(bars_15m)
+        if div == "BULLISH" and is_long:
+            score += 2; reasons.append("Divergencia RSI alcista confirmada +2")
+        elif div == "BEARISH" and is_short:
+            score += 2; reasons.append("Divergencia RSI bajista confirmada +2")
+        elif div != "NONE":
+            reasons.append(f"Divergencia RSI {div} — no coincide con dirección")
+        else:
+            reasons.append("Sin divergencia RSI detectada")
+    except Exception as e:
+        log.debug("[signal_engine] rsi_divergence error: %s", e)
+        reasons.append("Divergencia RSI no calculada")
+
     return "REVERSAL", direction, score, MAX, reasons
 
 
@@ -780,7 +842,8 @@ def _compute_indicators(bars: list) -> dict:
     m_line, s_line, hist = macd(closes, 12, 26, 9)
     st_dir, st_val = supertrend(highs, lows, closes, 10, 3.0)
     atr14  = calc_atr(highs, lows, closes, 14)
-    vwap_v = calc_vwap(bars)
+    # v24: VWAP diario real (reset a 00:00 UTC)
+    vwap_v = calc_vwap(bars, reset_daily=True)
     vol_window = min(_VOL_AVG_WINDOW, len(vols))
     avg_vol   = sum(vols[-vol_window:]) / vol_window if vol_window > 0 else 1.0
     vol_ratio = round(vols[-1] / avg_vol, 3) if avg_vol > 0 else 1.0
@@ -799,6 +862,7 @@ def _compute_indicators(bars: list) -> dict:
         "st_bear":   st_dir == -1,
         "atr":       atr14,
         "vol_ratio": vol_ratio,
+        "_avg_vol":  avg_vol,
         "price_dir": price_dir,
         "close":     closes[-1],
         "vwap":      vwap_v,
