@@ -9,6 +9,7 @@ Expone exactamente la misma interfaz pública:
 
   Métodos de orden:
     place_market(is_buy, sz, reduce_only, ref_price)
+    place_market_with_tpsl(is_buy, sz, sl_px, tp_px, ref_price)  ← NUEVO v6
     place_limit(is_buy, sz, price, reduce_only, tif)
     place_tp(is_buy, sz, trigger_px, limit_px, entry_px)
     place_sl(is_buy, sz, trigger_px, entry_px)
@@ -41,67 +42,69 @@ Opcionales:
 Notas BingX vs OKX:
   - BingX perpetuos USDT-M: 1 contrato = 1 unidad del coin base (ctVal=1 siempre).
   - instId es "{COIN}-USDT", no "{COIN}-USDT-SWAP".
-  - SL/TP son órdenes tipo STOP_MARKET / TAKE_PROFIT_MARKET con stopPrice.
   - positionSide en ONE-WAY MODE:
       * Siempre "BOTH" — tanto apertura como cierre.
       * "LONG"/"SHORT" solo aplican en HEDGE MODE.
     Ref: BingX swap-trade SKILL.md — positionSide: LONG | SHORT | BOTH
     Ref: BingX one-way mode doc — BOTH para cualquier orden en one-way.
 
+Fixes (2026-06-06 v6) — re-auditoría doc oficial BingX (bingx-api/api-ai-skills):
+
+  Fix #8 — domain fallback .pro obligatorio (🔴 CRÍTICO)
+    Doc oficial BingX SKILL.md fetchSigned:
+      BASE = { "prod-live": ["https://open-api.bingx.com", "https://open-api.bingx.pro"] }
+      "Domain priority: .com is mandatory primary; .pro is fallback for
+      network/timeout errors ONLY."
+    _BingXCore implementa _request() con loop de dominios idéntico al
+    fetchSigned oficial: intenta .com primero, si falla con error de red/timeout
+    reintenta con .pro. Aplicado a _get, _post, _delete.
+    Ref: bingx-api/api-ai-skills fetchSigned — isNetworkOrTimeout check.
+
+  Fix #9 — stopLoss/takeProfit embebidos en MARKET (🔴 CRÍTICO)
+    Doc oficial BingX:
+      "stopLoss/takeProfit objects are ONLY supported on MARKET or LIMIT order types."
+      Estructura: {"type":"STOP_MARKET","stopPrice":X,"workingType":"MARK_PRICE"}
+    Nuevo método place_market_with_tpsl() adjunta SL y TP a la orden MARKET
+    en una sola llamada API, eliminando la race condition de órdenes separadas.
+    Los objetos JSON se URL-encodean correctamente en el body POST.
+    place_sl()/place_tp() se mantienen para compatibilidad con flujos existentes.
+    Ref: bingx-api/api-ai-skills — Stop-Loss/Take-Profit Object Structure.
+
+  Fix #10 — get_user_state usa v3 (🟡 IMPORTANTE)
+    get_user_state() usaba /v2/user/balance en lugar del endpoint actual.
+    Ahora usa /openApi/swap/v3/user/balance (igual que get_balance_usdc).
+    Ref: bingx-api/api-ai-skills swap-account — /openApi/swap/v3/user/balance.
+
 Fixes (2026-06-06 v5) — re-auditoría doc oficial BingX (bingx-api/api-ai-skills):
 
   Fix #5 — positionSide en one-way mode: siempre BOTH (🔴 CRÍTICO)
-    El Fix #2 de v4 era incorrecto. La doc BingX:
-      - positionSide parámetros: LONG | SHORT | BOTH
-      - En ONE-WAY MODE: usar BOTH en TODAS las órdenes (apertura y cierre).
-      - LONG/SHORT solo aplican en HEDGE MODE.
-    El ejemplo 'Common Calls' usa LONG porque asume hedge mode.
-    En one-way mode, BingX devuelve error 80014 si envías LONG/SHORT.
-    Revertido: _position_side() ahora devuelve siempre "BOTH".
-    Refs: SKILL.md params, BingX one-way mode docs, ccxt bingx.ts source.
+    En ONE-WAY MODE: usar BOTH en TODAS las órdenes (apertura y cierre).
+    LONG/SHORT solo aplican en HEDGE MODE.
+    BingX devuelve error 80014 si envías LONG/SHORT en one-way mode.
 
   Fix #6 — X-SOURCE-KEY header obligatorio (🔴 CRÍTICO)
-    Doc oficial SKILL.md: "MUST include X-SOURCE-KEY: BX-AI-SKILL header
-    on every request". Añadido a Session.headers en _BingXCore.__init__.
+    SKILL.md: "MUST include X-SOURCE-KEY: BX-AI-SKILL header on every request".
 
   Fix #7 — timestamp incluido en sort() correctamente (🟡 IMPORTANTE)
-    Doc oficial fetchSigned: sort con timestamp incluido antes del join.
-    Refactorizado _build_signed_qs/_build_signed_body para claridad.
+    fetchSigned oficial: sort con timestamp incluido antes del join.
 
-Fixes (2026-06-06 v4) — revisión doc oficial BingX (bingx-api/api-ai-skills):
-
-  Fix #1 — sign → signature (🔴 CRÍTICO, rompía TODAS las peticiones)
-    La doc oficial BingX usa '&signature=<hex>', no '&sign=<hex>'.
-    Con 'sign' el servidor devuelve 401/400 en cada llamada.
-    Corregido en _build_signed_qs y _build_signed_body.
-    Ref: bingx-api/api-ai-skills fetchSigned — qs + '&signature=' + sig.
-
+Fixes (2026-06-06 v4):
+  Fix #1 — sign → signature (🔴 CRÍTICO)
   Fix #3 — set_leverage: side=LONG+SHORT (🟡 IMPORTANTE)
-    La doc oficial muestra side='LONG' y side='SHORT' (no 'BOTH').
-    En one-way mode se llama dos veces para cubrir ambos lados.
-    El issue ccxt #22237 confirma error 109400 al enviar side='BOTH'.
-    Ref: bingx-api/api-ai-skills — Set leverage example.
-
   Fix #4 — get_balance_usdc: v3 con fallback v2 (🟡 IMPORTANTE)
-    /openApi/swap/v3/user/balance es el endpoint actual según doc oficial.
-    Implementado con fallback a v2 si v3 falla.
-    Ref: bingx-api/api-ai-skills swap-account — balance endpoint table.
 
-Fixes anteriores (v3, 2026-06-06):
+Fixes anteriores (v2/v3):
   - hmac.HMAC() explícito.
   - _delete: firma en query string.
-  - _build_signed_qs / _build_signed_body helpers.
-
-Fixes anteriores (v2, 2026-06-06):
   - place_tp: fuerza TAKE_PROFIT_MARKET.
-  - cancel_all_open_tpsl: usa DELETE /allOpenOrders (batch atómico).
-  - get_balance_usdc: usa availableMargin como campo primario.
+  - cancel_all_open_tpsl: DELETE /allOpenOrders (batch atómico).
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import hmac as _hmac
+import json
 import logging
 import math
 import os
@@ -120,11 +123,37 @@ _USE_TESTNET  = os.getenv("BINGX_TESTNET",   "").lower() in ("true", "1", "yes")
 _DEFAULT_LEV  = int(os.getenv("BINGX_DEFAULT_LEVERAGE", "10"))
 _MARGIN_MODE  = os.getenv("BINGX_MARGIN_MODE", "isolated").strip().lower()
 
-_BASE_URL = (
-    "https://open-api-vst.bingx.com"
-    if _USE_TESTNET
-    else "https://open-api.bingx.com"
-)
+# Fix #8 (v6): domain fallback .pro — doc oficial BingX SKILL.md fetchSigned:
+# "Domain priority: .com is mandatory primary; .pro is fallback for
+# network/timeout errors ONLY."
+# BASE["prod-live"] = ["https://open-api.bingx.com", "https://open-api.bingx.pro"]
+# BASE["prod-vst"]  = ["https://open-api-vst.bingx.com", "https://open-api-vst.bingx.pro"]
+if _USE_TESTNET:
+    _BASE_URLS = [
+        "https://open-api-vst.bingx.com",
+        "https://open-api-vst.bingx.pro",
+    ]
+else:
+    _BASE_URLS = [
+        "https://open-api.bingx.com",
+        "https://open-api.bingx.pro",
+    ]
+
+
+def _is_network_error(exc: Exception) -> bool:
+    """
+    Fix #8 (v6): detecta errores de red/timeout para activar fallback .pro.
+    Ref: bingx-api/api-ai-skills fetchSigned — isNetworkOrTimeout:
+      if (e instanceof TypeError) return true;      // network failure
+      if (e instanceof DOMException && e.name === "AbortError") return true;  // abort
+      if (e instanceof Error && e.name === "TimeoutError") return true;        // timeout
+    """
+    if isinstance(exc, (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ConnectTimeout,
+                        requests.exceptions.ReadTimeout)):
+        return True
+    return False
 
 
 # ── Helpers de símbolo ────────────────────────────────────────────────────────
@@ -180,13 +209,22 @@ def _build_signed_body(params: dict, secret: str) -> str:
 
     Fix #1 (v4): campo de firma es 'signature', no 'sign'.
     Fix #7 (v5): timestamp incluido en el sort(), idéntico a fetchSigned oficial.
-    Ref: bingx-api/api-ai-skills fetchSigned:
-      body: method === "POST" ? signed : undefined
-      donde signed = `${qs}&signature=${sig}`
+    Fix #9 (v6): los valores que sean dict/list se serializan como JSON string
+    antes de incluirlos en la query string. Esto permite enviar objetos
+    stopLoss/takeProfit embebidos según el formato oficial BingX.
+    Ref: bingx-api/api-ai-skills fetchSigned body + Stop-Loss/TP Object Structure.
     """
-    p = {**params, "timestamp": str(int(time.time() * 1000))}
-    qs  = "&".join(f"{k}={v}" for k, v in sorted(p.items()))
-    sig = _hmac_sign(qs, secret)
+    # Serializar valores que sean dict/list a JSON string
+    serialized: dict = {}
+    for k, v in params.items():
+        if isinstance(v, (dict, list)):
+            serialized[k] = json.dumps(v, separators=(",", ":"))
+        else:
+            serialized[k] = v
+
+    p = {**serialized, "timestamp": str(int(time.time() * 1000))}
+    qs  = "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}" for k, v in sorted(p.items()))
+    sig = _hmac_sign(qs, _API_SECRET)
     return f"{qs}&signature={sig}"
 
 
@@ -220,11 +258,8 @@ class _BingXCore:
     def _warm_cache(self) -> None:
         """Carga tick sizes, step sizes y max leverage de todos los contratos."""
         try:
-            resp = self._session.get(
-                f"{_BASE_URL}/openApi/swap/v2/quote/contracts",
-                timeout=10,
-            )
-            data = resp.json().get("data", [])
+            resp = self._request("GET", "/openApi/swap/v2/quote/contracts", {})
+            data = resp.get("data", [])
         except Exception as exc:
             logger.warning("[BingXCore] warm_cache falló: %s", exc)
             return
@@ -266,35 +301,78 @@ class _BingXCore:
             len(self._tick_size_cache),
         )
 
-    # ── HTTP firmado ──────────────────────────────────────────────────────
+    # ── HTTP firmado con domain fallback ──────────────────────────────────
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict,
+        body: Optional[str] = None,
+    ) -> dict:
+        """
+        Fix #8 (v6): ejecuta la petición HTTP con fallback .pro.
+        Loop idéntico al fetchSigned oficial:
+          for (const base of urls) {
+            try { ... }
+            catch (e) {
+              if (!isNetworkOrTimeout(e) || base === urls[urls.length-1]) throw e;
+            }
+          }
+        Ref: bingx-api/api-ai-skills fetchSigned — domain fallback loop.
+        """
+        last_exc: Optional[Exception] = None
+        for i, base_url in enumerate(_BASE_URLS):
+            is_last = (i == len(_BASE_URLS) - 1)
+            try:
+                if method == "GET":
+                    signed_qs = _build_signed_qs(params, _API_SECRET)
+                    r = self._session.get(
+                        f"{base_url}{path}?{signed_qs}", timeout=10
+                    )
+                elif method == "POST":
+                    signed_body = body or _build_signed_body(params, _API_SECRET)
+                    r = self._session.post(
+                        f"{base_url}{path}",
+                        data=signed_body,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        timeout=10,
+                    )
+                elif method == "DELETE":
+                    signed_qs = _build_signed_qs(params, _API_SECRET)
+                    r = self._session.delete(
+                        f"{base_url}{path}?{signed_qs}", timeout=10
+                    )
+                else:
+                    raise ValueError(f"Método HTTP no soportado: {method}")
+
+                r.raise_for_status()
+                return r.json()
+
+            except Exception as exc:
+                last_exc = exc
+                if not _is_network_error(exc) or is_last:
+                    raise
+                logger.warning(
+                    "[BingXCore] %s %s — error de red en %s, reintentando con %s: %s",
+                    method, path, base_url,
+                    _BASE_URLS[i + 1] if not is_last else "(último dominio)",
+                    exc,
+                )
+
+        raise last_exc  # nunca debería llegar aquí
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        """GET firmado: parámetros en la query string."""
-        signed_qs = _build_signed_qs(params or {}, _API_SECRET)
-        r = self._session.get(f"{_BASE_URL}{path}?{signed_qs}", timeout=10)
-        r.raise_for_status()
-        return r.json()
+        """GET firmado con domain fallback."""
+        return self._request("GET", path, params or {})
 
-    def _post(self, path: str, params: dict) -> dict:
-        """POST firmado: parámetros firmados en el BODY como
-        application/x-www-form-urlencoded."""
-        body = _build_signed_body(params, _API_SECRET)
-        r = self._session.post(
-            f"{_BASE_URL}{path}",
-            data=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
+    def _post(self, path: str, params: dict, body: Optional[str] = None) -> dict:
+        """POST firmado con domain fallback."""
+        return self._request("POST", path, params, body=body)
 
     def _delete(self, path: str, params: dict) -> dict:
-        """DELETE firmado con parámetros en la QUERY STRING (igual que GET).
-        Ref: BingX auth docs — DELETE usa query params firmados."""
-        signed_qs = _build_signed_qs(params, _API_SECRET)
-        r = self._session.delete(f"{_BASE_URL}{path}?{signed_qs}", timeout=10)
-        r.raise_for_status()
-        return r.json()
+        """DELETE firmado con domain fallback."""
+        return self._request("DELETE", path, params)
 
     @classmethod
     async def get_async(cls) -> "_BingXCore":
@@ -400,11 +478,8 @@ class BingXClient:
 
     def all_mids(self) -> dict[str, float]:
         try:
-            resp    = self._core._session.get(
-                f"{_BASE_URL}/openApi/swap/v2/quote/ticker",
-                timeout=10,
-            )
-            tickers = resp.json().get("data", [])
+            resp    = self._core._get("/openApi/swap/v2/quote/ticker")
+            tickers = resp.get("data", [])
             result  = {}
             for t in tickers:
                 sym = t.get("symbol", "")
@@ -543,6 +618,63 @@ class BingXClient:
             logger.error("[%s] place_market error: %s", self.inst_id, exc)
             return {"code": "-1", "msg": str(exc), "data": []}
 
+    def place_market_with_tpsl(
+        self,
+        is_buy: bool,
+        sz: float,
+        sl_px: Optional[float] = None,
+        tp_px: Optional[float] = None,
+        ref_price: Optional[float] = None,
+    ) -> dict:
+        """
+        Fix #9 (v6): Orden MARKET con SL y TP embebidos en una sola llamada API.
+
+        Doc oficial BingX:
+          "stopLoss/takeProfit objects are ONLY supported on MARKET or LIMIT order types."
+          Estructura:
+            stopLoss:   {"type": "STOP_MARKET",       "stopPrice": X, "workingType": "MARK_PRICE"}
+            takeProfit: {"type": "TAKE_PROFIT_MARKET", "stopPrice": X, "workingType": "MARK_PRICE"}
+          Ventaja: atómica — elimina la race condition de órdenes separadas.
+        Ref: bingx-api/api-ai-skills swap-trade — Stop-Loss/Take-Profit Object Structure.
+
+        Los objetos JSON se URL-encodean en el body POST via _build_signed_body.
+        """
+        sz_r = self.round_sz(sz)
+        side = "BUY" if is_buy else "SELL"
+        params: dict = {
+            "symbol":       self.inst_id,
+            "side":         side,
+            "positionSide": "BOTH",
+            "type":         "MARKET",
+            "quantity":     str(sz_r),
+        }
+        if sl_px is not None:
+            params["stopLoss"] = {
+                "type":        "STOP_MARKET",
+                "stopPrice":   self.round_px(sl_px),
+                "workingType": "MARK_PRICE",
+                "stopGuaranteed": False,
+            }
+        if tp_px is not None:
+            params["takeProfit"] = {
+                "type":        "TAKE_PROFIT_MARKET",
+                "stopPrice":   self.round_px(tp_px),
+                "workingType": "MARK_PRICE",
+                "stopGuaranteed": False,
+            }
+        try:
+            resp = self._core._post("/openApi/swap/v2/trade/order", params)
+            logger.info(
+                "[%s] place_market_with_tpsl: %s positionSide=BOTH %.6f sl=%s tp=%s",
+                self.inst_id, side, sz_r,
+                self.round_px(sl_px) if sl_px else None,
+                self.round_px(tp_px) if tp_px else None,
+            )
+            return self._wrap(resp)
+        except Exception as exc:
+            logger.error("[%s] place_market_with_tpsl error: %s", self.inst_id, exc)
+            return {"code": "-1", "msg": str(exc), "data": []}
+
     def place_limit(
         self,
         is_buy: bool,
@@ -589,11 +721,14 @@ class BingXClient:
         entry_px:   Optional[float] = None,
     ) -> dict:
         """
-        Coloca una orden Take Profit en BingX.
+        Coloca una orden Take Profit independiente en BingX.
+
+        Nota: para nuevas posiciones, preferir place_market_with_tpsl() que
+        adjunta el TP de forma atómica junto a la orden de entrada (Fix #9 v6).
+        Este método se mantiene para TP adicionales sobre posiciones ya abiertas.
 
         - Siempre usa TAKE_PROFIT_MARKET.
-        - positionSide="BOTH": correcto para one-way mode (fix #5 v5 confirma
-          que BOTH es siempre el valor correcto en one-way, incluso para cierres).
+        - positionSide="BOTH": correcto para one-way mode (fix #5 v5).
         - workingType=MARK_PRICE: trigger usa precio de marca, evita spikes.
         Ref: BingX swap trade docs — TAKE_PROFIT_MARKET con reduceOnly=true.
         """
@@ -629,7 +764,11 @@ class BingXClient:
         entry_px:   Optional[float] = None,
     ) -> dict:
         """
-        Coloca una orden Stop Loss en BingX.
+        Coloca una orden Stop Loss independiente en BingX.
+
+        Nota: para nuevas posiciones, preferir place_market_with_tpsl() que
+        adjunta el SL de forma atómica junto a la orden de entrada (Fix #9 v6).
+        Este método se mantiene para SL adicionales sobre posiciones ya abiertas.
 
         - positionSide="BOTH": correcto para one-way mode (fix #5 v5).
         - workingType=MARK_PRICE: evita activaciones prematuras.
@@ -665,8 +804,14 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────
 
     def get_user_state(self) -> dict:
+        """
+        Fix #10 (v6): usa /openApi/swap/v3/user/balance (endpoint actual).
+        Antes usaba v2 por error. v3 es el endpoint correcto según
+        bingx-api/api-ai-skills swap-account Quick Reference.
+        Ref: /openApi/swap/v3/user/balance — "Account balance, equity, margin info".
+        """
         try:
-            return self._core._get("/openApi/swap/v2/user/balance") or {}
+            return self._core._get("/openApi/swap/v3/user/balance") or {}
         except Exception as exc:
             logger.warning("[%s] get_user_state error: %s", self.inst_id, exc)
             return {}
@@ -699,6 +844,10 @@ class BingXClient:
         return 0.0
 
     def get_positions(self) -> list[dict]:
+        """
+        Consulta posiciones abiertas.
+        Ref: bingx-api/api-ai-skills swap-account — /openApi/swap/v2/user/positions.
+        """
         try:
             resp = self._core._get(
                 "/openApi/swap/v2/user/positions",
