@@ -57,6 +57,14 @@ v7 — bug fixes (2026-06-06):
     instancia y se reutiliza en todo el flujo.
   BUG4 FIX: place_market en close_position no pasaba ref_price. Añadido
     get_price() antes del market-close y pasado como ref_price.
+
+v8 — bug fix (2026-06-06):
+  BUG FIX: _cancel_tpsl_safe (en trading_loop.py) es una función SÍNCRONA
+    que llama a self._trade_api directamente (sin await). En v7 se documentó
+    incorrectamente como "async" y se awaita directamente, lo que silencia
+    la cancelación (awaitar una función síncrona devuelve None sin ejecutarla).
+    Corregido: usar asyncio.to_thread(_cancel_tpsl_safe, self) en
+    close_position para ejecutarla correctamente en un thread.
 """
 from __future__ import annotations
 
@@ -719,12 +727,12 @@ class FuturesTrader:
         )
 
         if not self.dry_run and qty > 0:
-            # BUG2 FIX: _cancel_tpsl_safe es async — se awaita directamente,
-            # NO se envuelve en asyncio.to_thread(lambda: ...) que solo
-            # devolvería la coroutine sin ejecutarla.
+            # v8 BUG FIX: _cancel_tpsl_safe (en trading_loop.py) es SÍNCRONA —
+            # NO se puede awaitar directamente (devolvería None sin ejecutarse).
+            # Usar asyncio.to_thread para ejecutarla correctamente en un thread.
             try:
                 from bot.core.trading_loop import _cancel_tpsl_safe
-                await _cancel_tpsl_safe(self)
+                await asyncio.to_thread(_cancel_tpsl_safe, self)
             except Exception as e:
                 logger.warning("[%s] close_position: cancel_tpsl error: %s", self.symbol, e)
 
