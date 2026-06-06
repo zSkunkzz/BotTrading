@@ -214,7 +214,6 @@ class _BingXCore:
         self._max_leverage_cache: dict[str, int]   = {}
 
         # Fix #11 (v7): detectar hedge mode al inicializar.
-        # En hedge mode positionSide debe ser LONG o SHORT, nunca BOTH.
         self.hedge_mode: bool = self._detect_hedge_mode()
 
         self._warm_cache()
@@ -224,11 +223,6 @@ class _BingXCore:
         Fix #11 (v7): consulta /openApi/swap/v1/positionSide/dual para
         determinar si la cuenta está en HEDGE MODE (dualSidePosition=true)
         o ONE-WAY MODE (dualSidePosition=false).
-
-        La variable de entorno BINGX_POSITION_MODE=hedge permite forzarlo
-        sin llamada API (útil si el endpoint no está disponible).
-
-        Ref: BingX docs — GET /openApi/swap/v1/positionSide/dual
         """
         if _FORCE_HEDGE:
             logger.info("[BingXCore] Hedge mode FORZADO por BINGX_POSITION_MODE=hedge")
@@ -405,12 +399,6 @@ class BingXClient:
         Devuelve el valor correcto de positionSide según el modo de la cuenta:
           - ONE-WAY MODE: "BOTH" (siempre)
           - HEDGE MODE:   "LONG" si is_buy=True, "SHORT" si is_buy=False
-
-        Para órdenes de CIERRE en hedge mode el caller debe pasar
-        is_buy=False para long positions (SELL cierra LONG) y
-        is_buy=True para short positions (BUY cierra SHORT).
-        La lógica de cierre ya lo hace correctamente porque reduce_only
-        invierte el side.
         """
         if self._core.hedge_mode:
             return "LONG" if is_buy else "SHORT"
@@ -424,8 +412,6 @@ class BingXClient:
         En one-way mode devuelve "BOTH" igual que _pos_side.
         """
         if self._core.hedge_mode:
-            # is_buy=True → cerrando SHORT → positionSide=SHORT
-            # is_buy=False → cerrando LONG  → positionSide=LONG
             return "SHORT" if is_buy else "LONG"
         return "BOTH"
 
@@ -507,14 +493,12 @@ class BingXClient:
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> dict:
         """
         Fix #12 (v8): ahora lanza RuntimeError si BingX rechaza el cambio
-        de leverage en AMBOS sides (LONG y SHORT), de modo que _set_leverage
-        en trader.py pueda loguearlo como ERROR y el operador lo vea claramente.
+        de leverage en AMBOS sides (LONG y SHORT).
 
-        Si solo uno de los sides falla (raro, pero posible en one-way mode),
-        se loguea como ERROR pero no lanza para no bloquear la operativa.
+        Si solo uno de los sides falla (raro en one-way mode), se loguea
+        como ERROR pero no lanza para no bloquear la operativa.
 
-        Loguea el leverage confirmado por BingX desde la respuesta si está
-        disponible (campo data.leverage).
+        Loguea el leverage confirmado por BingX desde la respuesta.
         """
         errors: dict[str, str] = {}
         ok_sides: list[str] = []
@@ -559,7 +543,6 @@ class BingXClient:
                 errors[side] = str(exc)
 
         if not ok_sides:
-            # Ambos sides fallaron → lanzar para que trader.py lo maneje
             raise RuntimeError(
                 f"[{self.inst_id}] set_leverage({leverage}x) falló en ambos sides: "
                 f"LONG={errors.get('LONG', '?')} / SHORT={errors.get('SHORT', '?')}"
@@ -625,13 +608,9 @@ class BingXClient:
         """
         Orden MARKET en BingX.
         Fix #11 (v7): positionSide dinámico según modo de cuenta.
-          - ONE-WAY: BOTH + reduceOnly
-          - HEDGE:   LONG/SHORT según is_buy; reduceOnly omitido
-            (en hedge mode el cierre se indica via positionSide opuesto).
         """
         sz_r = self.round_sz(sz)
         side = "BUY" if is_buy else "SELL"
-        # En hedge mode con reduce_only, el cierre usa positionSide opuesto.
         if self._core.hedge_mode and reduce_only:
             pos_side = self._pos_side_close(is_buy)
         else:
@@ -643,7 +622,6 @@ class BingXClient:
             "type":         "MARKET",
             "quantity":     str(sz_r),
         }
-        # reduceOnly solo en one-way mode (hedge mode lo ignora / da error)
         if not self._core.hedge_mode:
             params["reduceOnly"] = "true" if reduce_only else "false"
         try:
@@ -758,14 +736,10 @@ class BingXClient:
         """
         Take Profit independiente.
         Fix #11 (v7): positionSide dinámico.
-        En hedge mode, el TP cierra la posición opuesta al side de entrada:
-          - TP de LONG (is_buy=True): orden SELL → positionSide=LONG
-          - TP de SHORT (is_buy=False): orden BUY → positionSide=SHORT
         """
         sz_r     = self.round_sz(sz)
         tpx      = self.round_px(trigger_px)
         side     = "BUY" if is_buy else "SELL"
-        # El TP cierra la posición → positionSide del lado que se está cerrando
         pos_side = self._pos_side_close(is_buy) if self._core.hedge_mode else "BOTH"
         params: dict = {
             "symbol":       self.inst_id,
@@ -799,7 +773,6 @@ class BingXClient:
         """
         Stop Loss independiente.
         Fix #11 (v7): positionSide dinámico.
-        En hedge mode, el SL cierra la posición opuesta (mismo que TP).
         """
         sz_r     = self.round_sz(sz)
         tpx      = self.round_px(trigger_px)
@@ -839,4 +812,112 @@ class BingXClient:
             logger.warning("[%s] get_user_state error: %s", self.inst_id, exc)
             return {}
 
-    def get_balance_usdc(s
+    def get_balance_usdc(self) -> float:
+        """
+        Fix #4 (v4): usa v3 con fallback a v2.
+        Ref: BingX swap-account — /openApi/swap/v3/user/balance
+        """
+        endpoints = [
+            "/openApi/swap/v3/user/balance",
+            "/openApi/swap/v2/user/balance",
+        ]
+        for ep in endpoints:
+            try:
+                resp = self._core._get(ep)
+                data = resp.get("data", {})
+                # v3: data.balance.balance | v2: data[0].balance
+                if isinstance(data, dict):
+                    bal = (
+                        data.get("balance", {}).get("balance")
+                        or data.get("availableMargin")
+                        or data.get("balance")
+                    )
+                elif isinstance(data, list) and data:
+                    bal = data[0].get("balance") or data[0].get("availableMargin")
+                else:
+                    bal = None
+                if bal is not None:
+                    return float(bal)
+            except Exception as exc:
+                logger.warning("[%s] get_balance_usdc %s error: %s", self.inst_id, ep, exc)
+        logger.error("[%s] get_balance_usdc: no se pudo obtener el balance", self.inst_id)
+        return 0.0
+
+    # ── Posiciones ────────────────────────────────────────────────────────
+
+    def get_positions(self) -> list[dict]:
+        try:
+            resp = self._core._get(
+                "/openApi/swap/v2/user/positions",
+                {"symbol": self.inst_id},
+            )
+            raw = resp.get("data", []) or []
+            positions = []
+            for p in raw:
+                size = float(p.get("positionAmt") or p.get("availableAmt") or 0)
+                if size == 0:
+                    continue
+                side = p.get("positionSide", "BOTH")
+                # Normalizar a interfaz OKX-compatible
+                is_long = (side == "LONG") or (side == "BOTH" and size > 0)
+                positions.append({
+                    "instId":       self.inst_id,
+                    "pos":          str(abs(size)),
+                    "posSide":      "long" if is_long else "short",
+                    "avgPx":        str(p.get("avgPrice") or p.get("avgCost") or 0),
+                    "upl":          str(p.get("unrealizedProfit") or 0),
+                    "lever":        str(p.get("leverage") or _DEFAULT_LEV),
+                    "liqPx":        str(p.get("liquidationPrice") or 0),
+                    "margin":       str(p.get("initialMargin") or p.get("margin") or 0),
+                    "mgnMode":      "cross" if p.get("marginType", "").lower() == "cross" else "isolated",
+                    "_raw":         p,
+                })
+            return positions
+        except Exception as exc:
+            logger.warning("[%s] get_positions error: %s", self.inst_id, exc)
+            return []
+
+    # ── Órdenes abiertas ──────────────────────────────────────────────────
+
+    def get_open_orders(self) -> list:
+        try:
+            resp = self._core._get(
+                "/openApi/swap/v2/trade/openOrders",
+                {"symbol": self.inst_id},
+            )
+            return resp.get("data", {}).get("orders", []) or []
+        except Exception as exc:
+            logger.warning("[%s] get_open_orders error: %s", self.inst_id, exc)
+            return []
+
+    def cancel_all_open_tpsl(self) -> list[dict]:
+        """
+        Cancela todas las órdenes abiertas del símbolo (incluyendo SL/TP)
+        usando DELETE /allOpenOrders (operación atómica batch).
+        """
+        try:
+            resp = self._core._delete(
+                "/openApi/swap/v2/trade/allOpenOrders",
+                {"symbol": self.inst_id},
+            )
+            cancelled = resp.get("data", {}).get("orders", []) or []
+            logger.info(
+                "[%s] cancel_all_open_tpsl: %d órdenes canceladas",
+                self.inst_id, len(cancelled),
+            )
+            return cancelled
+        except Exception as exc:
+            logger.error("[%s] cancel_all_open_tpsl error: %s", self.inst_id, exc)
+            return []
+
+    def cancel_order(self, order_id: str) -> dict:
+        try:
+            resp = self._core._delete(
+                "/openApi/swap/v2/trade/order",
+                {"symbol": self.inst_id, "orderId": str(order_id)},
+            )
+            logger.info("[%s] cancel_order %s: %s", self.inst_id, order_id, resp.get("code"))
+            return resp
+        except Exception as exc:
+            logger.error("[%s] cancel_order %s error: %s", self.inst_id, order_id, exc)
+            return {"code": "-1", "msg": str(exc)}
