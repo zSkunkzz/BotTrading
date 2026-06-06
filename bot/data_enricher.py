@@ -90,6 +90,7 @@ class OIData:
     oi_delta_pct: float = 0.0   # % change vs previous snapshot (estimated)
     funding_rate: float = 0.0   # current funding rate as % per 8h
     source: str         = ""    # "okx" | "hyperliquid" | ""
+    liq_usd_1h: float   = 0.0   # USD liquidados (long+short) en la ultima hora
 
 
 @dataclass
@@ -128,9 +129,9 @@ async def _fetch_fear_greed(session: aiohttp.ClientSession) -> FearGreedData:
         return FearGreedData()
 
 
-async def _fetch_oi_okx(session: aiohttp.ClientSession, symbol: str) -> OIData | None:
+async def _fetch_oi_okx(session: aiohttp.ClientSession, symbol: str) -> "OIData | None":
     """
-    Fuente primaria: OKX REST pública (no requiere API key).
+    Fuente primaria: OKX REST publica (no requiere API key).
 
     Endpoints:
       GET /api/v5/public/funding-rate?instId={instId}
@@ -177,8 +178,6 @@ async def _fetch_oi_okx(session: aiohttp.ClientSession, symbol: str) -> OIData |
         oi_usd = 0.0
         if oi_body.get("code") == "0" and oi_body.get("data"):
             od = oi_body["data"][0]
-            # oiCcy = OI en coins; multiplicar por precio de referencia no disponible
-            # aqui usamos oiUsd si existe, si no estimamos con oiCcy (no ideal pero útil)
             oi_usd_raw = od.get("oiUsd") or od.get("oiCcy") or "0"
             try:
                 oi_usd = float(oi_usd_raw)
@@ -203,7 +202,7 @@ async def _fetch_oi_okx(session: aiohttp.ClientSession, symbol: str) -> OIData |
 
 async def _fetch_oi_hyperliquid(session: aiohttp.ClientSession, symbol: str) -> OIData:
     """
-    Fuente fallback: Hyperliquid REST pública.
+    Fuente fallback: Hyperliquid REST publica.
 
     Hyperliquid metaAndAssetCtxs response per asset:
       openInterest  — OI en coin units
@@ -223,7 +222,7 @@ async def _fetch_oi_hyperliquid(session: aiohttp.ClientSession, symbol: str) -> 
             try:
                 data = __import__("json").loads(raw_text)
             except Exception:
-                logger.warning("[enricher] HL metaAndAssetCtxs: JSON inválido raw=%s",
+                logger.warning("[enricher] HL metaAndAssetCtxs: JSON invalido raw=%s",
                                raw_text[:200])
                 return OIData()
 
@@ -279,8 +278,46 @@ async def _fetch_oi(session: aiohttp.ClientSession, symbol: str) -> OIData:
     if okx_result is not None:
         return okx_result
 
-    logger.debug("[enricher] OKX falló para %s — usando Hyperliquid como fallback", symbol)
+    logger.debug("[enricher] OKX fallo para %s — usando Hyperliquid como fallback", symbol)
     return await _fetch_oi_hyperliquid(session, symbol)
+
+
+async def _fetch_liq_okx(session: aiohttp.ClientSession, symbol: str) -> float:
+    """
+    Descarga liquidaciones recientes de OKX (ultima 1h) para el simbolo.
+    Endpoint: GET /api/v5/public/liquidation-orders
+      instType=SWAP, instId=<coin>-USDT-SWAP, state=filled, limit=100
+
+    Devuelve el volumen total liquidado en USD (long+short) de la ultima hora.
+    Devuelve 0.0 si falla o no hay datos.
+    """
+    import time as _time
+    import json as _json
+    inst_id = _norm_inst_id(symbol)
+    since_ms = int((_time.time() - 3600) * 1000)
+    total_usd = 0.0
+    try:
+        async with session.get(
+            f"{OKX_BASE_URL}/api/v5/public/liquidation-orders",
+            params={"instType": "SWAP", "instId": inst_id, "state": "filled", "limit": "100"},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as r:
+            body = _json.loads(await r.text())
+        if body.get("code") != "0" or not body.get("data"):
+            logger.debug("[enricher] OKX liquidations no data para %s: %s", inst_id, body.get("msg"))
+            return 0.0
+        for item in body["data"]:
+            for detail in item.get("details", []):
+                ts = int(detail.get("ts", 0) or 0)
+                if ts < since_ms:
+                    continue
+                sz  = float(detail.get("sz", 0) or 0)
+                bkx = float(detail.get("bkPx", 0) or 0)
+                total_usd += sz * bkx
+        logger.debug("[enricher] OKX liq_usd_1h=%.0f para %s", total_usd, inst_id)
+    except Exception as exc:
+        logger.warning("[enricher] OKX liquidations error para %s: %s", symbol, exc)
+    return round(total_usd, 2)
 
 
 async def _fetch_news(
@@ -363,6 +400,7 @@ async def fetch_enriched_context(symbol: str) -> EnrichedContext:
             _fetch_fear_greed(session),
             _fetch_oi(session, symbol),
             _fetch_news(session, base_currency),
+            _fetch_liq_okx(session, symbol),
             return_exceptions=True,
         )
 
@@ -375,6 +413,9 @@ async def fetch_enriched_context(symbol: str) -> EnrichedContext:
             ctx.oi = result
         elif i == 2:
             ctx.news = result
+        elif i == 3:
+            if isinstance(result, (int, float)):
+                ctx.oi.liq_usd_1h = result
 
     return ctx
 
@@ -414,6 +455,12 @@ def format_context_for_prompt(ctx: EnrichedContext) -> str:
     # Funding rate
     paying = "longs paying" if oi.funding_rate > 0 else "shorts paying"
     lines.append(f"Funding rate (8h): {oi.funding_rate:+.4f}% ({paying}){src_tag}")
+
+    # Liquidaciones 1h
+    liq = ctx.oi.liq_usd_1h
+    if liq > 0:
+        liq_str = f"${liq/1e6:.2f}M" if liq >= 1_000_000 else f"${liq/1_000:.0f}K"
+        lines.append(f"Liquidations (1h): {liq_str}")
 
     # News
     if ctx.news:
