@@ -303,6 +303,10 @@ class PairScanner:
     def normalize(self, symbol: str) -> str:
         return symbol.replace("/", "").replace(":USDT", "").replace("USDT", "").upper()
 
+    async def run(self) -> None:
+        """Alias de run_scanner_loop() — usa self.on_pairs_updated como callback."""
+        await self.run_scanner_loop()
+
     async def run_scanner_loop(self, on_update_callback=None):
         import inspect
         # Usar el callback del __init__ si no se pasa uno explícitamente
