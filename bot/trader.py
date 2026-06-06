@@ -2,6 +2,14 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v19 — Fix CRÍTICO: corregir kwargs qty= → sz= en llamadas a BingXClient (2026-06-07):
+  - BingXClient.place_market firma usa `sz` (no `qty`).
+  - BingXClient.place_market_with_tpsl firma usa `sz`, `sl_px`, `tp_px` (no `qty`, `sl_price`, `tp_price`).
+  - trader.py llamaba todos estos métodos con kwargs incorrectos → TypeError en cada orden.
+  - TODAS las órdenes fallaban silenciosamente (logs: "got an unexpected keyword argument 'qty'").
+  - Fix: renombrar kwargs en _do_open_order() y close_position() para que coincidan
+    con la firma real de BingXClient.
+
 v18 — Fix CRÍTICO: añade open_order() (2026-06-07):
   - trading_loop.py llama a trader.open_order(signal, risk) en línea 553
     pero el método no existía → AttributeError bloqueaba TODA ejecución de órdenes.
@@ -622,6 +630,7 @@ class FuturesTrader:
 
         filled_price: Optional[float] = None
 
+        # v19 FIX: place_market_with_tpsl usa sz= (no qty=) y sl_px=/tp_px= (no sl_price=/tp_price=)
         # Intento atómico: place_market_with_tpsl (SL+TP1 en una sola llamada)
         if (
             hasattr(self._bingx_client, "place_market_with_tpsl")
@@ -631,10 +640,10 @@ class FuturesTrader:
             try:
                 result = await asyncio.to_thread(
                     self._bingx_client.place_market_with_tpsl,
-                    is_buy=is_long,
-                    qty=qty,
-                    sl_price=sl_price,
-                    tp_price=tp1_price,
+                    is_long,          # is_buy (posicional)
+                    qty,              # sz (posicional) — fix v19: era qty=qty
+                    sl_price,         # sl_px (posicional) — fix v19: era sl_price=sl_price
+                    tp1_price,        # tp_px (posicional) — fix v19: era tp_price=tp1_price
                 )
                 if result and result.get("code") in (0, "0", None):
                     logger.info(
@@ -642,8 +651,8 @@ class FuturesTrader:
                         self.symbol, result,
                     )
                     filled_price = float(
-                        (result.get("data") or {}).get("price")
-                        or (result.get("data") or {}).get("avgPrice")
+                        (result.get("data") or [{}])[0].get("price")
+                        or (result.get("data") or [{}])[0].get("avgPrice")
                         or ref_price
                     )
                     self._protection_ok = True
@@ -657,18 +666,19 @@ class FuturesTrader:
                 )
                 filled_price = None
 
+        # v19 FIX: place_market usa sz= (no qty=)
         # Fallback: place_market separado + _place_tpsl
         if filled_price is None:
             try:
                 result = await asyncio.to_thread(
                     self._bingx_client.place_market,
-                    is_buy=is_long,
-                    qty=qty,
+                    is_long,   # is_buy (posicional)
+                    qty,       # sz (posicional) — fix v19: era qty=qty
                 )
                 if result and result.get("code") in (0, "0", None):
                     filled_price = float(
-                        (result.get("data") or {}).get("price")
-                        or (result.get("data") or {}).get("avgPrice")
+                        (result.get("data") or [{}])[0].get("price")
+                        or (result.get("data") or [{}])[0].get("avgPrice")
                         or ref_price
                     )
                     logger.info(
@@ -842,7 +852,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.warning("[%s] _place_tpsl TP error: %s", self.symbol, e)
 
-    # ── _set_leverage ─────────────────────────────────────────────────────────────────
+    # ── _get_open_orders_raw ──────────────────────────────────────────────────────────
 
     async def _get_open_orders_raw(self) -> list[dict]:
         """
@@ -955,11 +965,12 @@ class FuturesTrader:
                 await self._get_ccxt()
             if qty > 0 and hasattr(self._bingx_client, "place_market"):
                 try:
+                    # v19 FIX: place_market usa sz= (no qty=)
                     result = await asyncio.to_thread(
                         self._bingx_client.place_market,
-                        is_buy=not is_long,   # cierre = lado opuesto
-                        qty=qty,
-                        reduce_only=True,
+                        not is_long,   # is_buy (posicional) — cierre = lado opuesto
+                        qty,           # sz (posicional) — fix v19: era qty=qty
+                        True,          # reduce_only (posicional)
                     )
                     code = (result or {}).get("code", -1)
                     if code in (0, "0", None):
