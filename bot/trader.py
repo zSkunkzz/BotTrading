@@ -2,28 +2,15 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
-v9 — Unificación sobre OKXClient (2026-06-06):
-  Problema raíz: trader.py tenía sus propias instancias de okx.Trade /
-  Account / MarketData creadas en _init_okx_apis() con import lazy.
-  Cuando open_order llamaba OKXClient.create() en paralelo, _OKXCore
-  todavfa no había terminado asyncio.to_thread → _instance era None
-  → ImportError silenciado como "python-okx no encontrado".
-  Además okx.MarketData NO existe: el módulo correcto es okx.Market.
-
-  Fix: eliminar _init_okx_apis() y todas las APIs propias del trader.
-  Todos los métodos delegan en self._okx_client (OKXClient singleton).
-  _get_ccxt() inicializa self._okx_client una sola vez y de forma
-  thread-safe mediante OKXClient.create().
-
-v10 — FIX pretrade_risk leak (2026-06-06):
-  DecisionEngine.evaluate() llama confirm_order() ANTES de saber si OKX
-  acepta la orden. Si place_market() es rechazado o la posición no se
-  llega a abrir, el margen queda bloqueado en _open_margin para siempre
-  porque on_position_closed() nunca se invoca (no hay posición que cerrar).
-
-  Fix: en open_order(), si la orden falla O si al terminar trader.position
-  sigue siendo None, llamar pretrade_risk.register_close_safe(symbol) para
-  devolver el margen que confirm_order() ya había reservado.
+v11 — Migración OKX → BingX (2026-06-06):
+  - Eliminadas todas las referencias a OKX_API_KEY / OKX_PASSPHRASE.
+  - _get_ccxt() inicializa BingXClient en lugar de OKXClient.
+  - get_price() usa la API REST de BingX (ticker por símbolo).
+  - _fetch_candles() usa el endpoint de klines de BingX.
+  - Propiedades _trade_api / _account_api / _market_api eliminadas
+    (ya no se necesitan; BingXClient expone la interfaz completa).
+  - Todo lo demás (open_order, close_position, _place_tpsl, etc.)
+    permanece idéntico — BingXClient es drop-in replacement.
 """
 from __future__ import annotations
 
@@ -40,32 +27,38 @@ from bot.state import save_position
 
 logger = logging.getLogger("FuturesTrader")
 
-_USE_DEMO           = os.getenv("OKX_DEMO", "false").lower() in ("true", "1", "yes")
+_USE_TESTNET = os.getenv("BINGX_TESTNET", "false").lower() in ("true", "1", "yes")
 
 _OHLCV_BARS             = int(os.getenv("BARS_NEEDED",            "100"))
 _PRICE_FETCH_RETRIES    = int(os.getenv("PRICE_FETCH_RETRIES",    "3"))
 _SET_LEVERAGE_TIMEOUT_S = float(os.getenv("SET_LEVERAGE_TIMEOUT_S", "15"))
 
-_TF_OKX = {
+# Mapa de timeframe → intervalo BingX (coincide con parámetro "interval")
+_TF_BINGX = {
     "1m":  "1m",  "3m":  "3m",  "5m":  "5m",  "15m": "15m",
-    "30m": "30m", "1h":  "1H",  "2h":  "2H",  "4h":  "4H",
-    "8h":  "8H",  "1d":  "1Dutc",
+    "30m": "30m", "1h":  "1h",  "2h":  "2h",  "4h":  "4h",
+    "6h":  "6h",  "8h":  "8h",  "12h": "12h", "1d":  "1d",
+    "1w":  "1w",  "1M":  "1M",
 }
 
 _FILL_RETRIES        = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "3"))
 _FILL_DELAY          = float(os.getenv("POST_FILL_CONFIRM_DELAY", "2.0"))
 _MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "3.0")) / 100.0
 
+_BASE_URL = (
+    "https://open-api-vst.bingx.com"
+    if _USE_TESTNET
+    else "https://open-api.bingx.com"
+)
+
 
 def _to_inst_id(symbol: str) -> str:
-    """Convierte 'BTC' o 'BTC-USDT' → 'BTC-USDT-SWAP'."""
-    s = symbol.upper().replace("/", "-")
-    if s.endswith("-SWAP"):
-        return s
-    if "-USDT-" in s:
-        return s + "-SWAP" if not s.endswith("-SWAP") else s
+    """Convierte 'BTC' o 'BTC/USDT:USDT' → 'BTC-USDT'."""
+    s = symbol.upper()
+    for rm in ("/USDT:USDT", "-USDT-SWAP", "/USDT"):
+        s = s.replace(rm, "")
     base = s.split("-")[0]
-    return f"{base}-USDT-SWAP"
+    return f"{base}-USDT"
 
 
 def _check_price_staleness(
@@ -124,20 +117,20 @@ def _adjust_levels_to_fill(
 
 
 class FuturesTrader:
-    """Orquestador principal de un par de trading en OKX (perpetuos USDT)."""
+    """Orquestador principal de un par de trading en BingX (perpetuos USDT)."""
 
     def __init__(
         self,
         api_key: Optional[str],
         api_secret: str,
-        passphrase: Optional[str],
-        symbol: str,
+        passphrase: Optional[str] = None,   # ignorado en BingX (sin passphrase)
+        symbol: str = "BTC",
         leverage: int = 5,
         margin_mode: str = "isolated",
         dry_run: bool = True,
     ) -> None:
         self.symbol      = symbol
-        self.inst_id     = _to_inst_id(symbol)
+        self.inst_id     = _to_inst_id(symbol)   # "BTC-USDT"
         self.coin        = symbol.upper().split("-")[0]
         self.leverage    = leverage
         self.margin_mode = margin_mode
@@ -158,13 +151,15 @@ class FuturesTrader:
         self._last_price:    float           = 0.0
         self._instrument_unavailable: bool   = False
 
-        # Credenciales (usadas solo para pasarlas a OKXClient)
-        self._api_key    = api_key    or os.getenv("OKX_API_KEY",    "")
-        self._api_secret = api_secret or os.getenv("OKX_API_SECRET", "")
-        self._passphrase = passphrase or os.getenv("OKX_PASSPHRASE",  "")
+        # BingX no usa passphrase; las credenciales se leen de env vars
+        # en _BingXCore. api_key / api_secret aquí son solo para compatibilidad
+        # con la firma de __init__ (main.py puede seguir pasándolos).
+        # _BingXCore las leerá de BINGX_API_KEY / BINGX_API_SECRET.
+        self._api_key    = api_key    or os.getenv("BINGX_API_KEY",    "")
+        self._api_secret = api_secret or os.getenv("BINGX_API_SECRET", "")
 
-        # Cliente OKX unificado — se inicializa en _get_ccxt()
-        self._okx_client = None
+        # Cliente BingX unificado — se inicializa en _get_ccxt()
+        self._bingx_client = None
 
         self._stopped_event = asyncio.Event()
         self._trading_loop  = TradingLoop(symbol)
@@ -187,56 +182,46 @@ class FuturesTrader:
             logger.debug("[%s] cleanup ai_trader sessions: %s", self.symbol, e)
         self._stopped_event.set()
 
-    # ── Init OKX (unificado en OKXClient) ─────────────────────────────
+    # ── Init BingX ──────────────────────────────────────────────────────
 
     async def _get_ccxt(self) -> None:
         """
-        Inicializa self._okx_client (OKXClient) una única vez.
-        Es thread-safe: OKXClient.create() delega en _OKXCore.get_async()
+        Inicializa self._bingx_client (BingXClient) una única vez.
+        Thread-safe: BingXClient.create() delega en _BingXCore.get_async()
         que usa asyncio.Lock internamente.
         """
-        if self._okx_client is not None:
+        if self._bingx_client is not None:
             return
         try:
-            from bot.core.okx_client import OKXClient
-            logger.info("[%s] Inicializando OKXClient (inst=%s, demo=%s)…",
-                        self.symbol, self.inst_id, _USE_DEMO)
-            self._okx_client = await OKXClient.create(
-                self.symbol, margin_mode=self.margin_mode
-            )
-            logger.info("[%s] OKXClient listo.", self.symbol)
+            from bot.core.bingx_client import BingXClient
+            logger.info("[%s] Inicializando BingXClient (inst=%s, testnet=%s)…",
+                        self.symbol, self.inst_id, _USE_TESTNET)
+            self._bingx_client = await BingXClient.create(self.symbol)
+            logger.info("[%s] BingXClient listo.", self.symbol)
         except Exception as e:
             logger.error("[%s] _get_ccxt error: %s", self.symbol, e)
             raise
 
-    # ── Alias para compatibilidad con PositionManager / TradingLoop ────
-    # Algunos módulos acceden a self._trade_api / _account_api / _market_api
-    # directamente. Exponemos propiedades que los redirigen al cliente.
+    # ── Propiedad de alias para código legacy ────────────────────────────
+    # Algunos submódulos pueden acceder a self._okx_client; redirigimos.
 
     @property
-    def _trade_api(self):
-        return self._okx_client._trade if self._okx_client else None
+    def _okx_client(self):
+        """Alias de compatibilidad: devuelve el BingXClient."""
+        return self._bingx_client
 
-    @property
-    def _account_api(self):
-        return self._okx_client._account if self._okx_client else None
-
-    @property
-    def _market_api(self):
-        return self._okx_client._market if self._okx_client else None
-
-    # ── get_price ────────────────────────────────────────────────────
+    # ── get_price ────────────────────────────────────────────────────────
 
     async def get_price(self) -> float:
-        if self._okx_client is None:
+        if self._bingx_client is None:
             if self._last_price > 0:
                 return self._last_price
-            raise RuntimeError(f"[{self.symbol}] get_price: OKXClient no inicializado")
+            raise RuntimeError(f"[{self.symbol}] get_price: BingXClient no inicializado")
 
         if self._instrument_unavailable:
             raise RuntimeError(
                 f"[{self.symbol}] get_price: instrumento {self.inst_id} "
-                f"no disponible en OKX {'demo' if _USE_DEMO else 'live'} — skip"
+                f"no disponible en BingX {'testnet' if _USE_TESTNET else 'live'} — skip"
             )
 
         last_exc: Exception | None = None
@@ -244,18 +229,28 @@ class FuturesTrader:
 
         for attempt, delay in enumerate(delays):
             try:
+                import requests as _req
                 resp = await asyncio.to_thread(
-                    self._okx_client._market.get_ticker, self.inst_id
+                    lambda: _req.get(
+                        f"{_BASE_URL}/openApi/swap/v2/quote/ticker",
+                        params={"symbol": self.inst_id},
+                        timeout=8,
+                    ).json()
                 )
-                data = (resp or {}).get("data", [])
+                data = resp.get("data", {})
+                # BingX devuelve un dict (no lista) cuando se filtra por símbolo
+                if isinstance(data, list):
+                    data = data[0] if data else {}
                 if not data:
                     self._instrument_unavailable = True
                     raise ValueError(
-                        f"{self.inst_id} no disponible en OKX "
-                        f"{'demo' if _USE_DEMO else 'live'} (data=[])"
+                        f"{self.inst_id} no disponible en BingX "
+                        f"{'testnet' if _USE_TESTNET else 'live'} (data vacía)"
                     )
-                ticker = data[0]
-                price  = float(ticker.get("last") or ticker.get("askPx") or 0)
+                last_p = float(data.get("lastPrice") or data.get("price") or 0)
+                bid    = float(data.get("bidPrice") or 0)
+                ask    = float(data.get("askPrice") or 0)
+                price  = (bid + ask) / 2 if bid > 0 and ask > 0 else last_p
                 if price <= 0:
                     raise ValueError(f"ticker con precio cero para {self.inst_id}")
                 self._last_price = price
@@ -282,21 +277,21 @@ class FuturesTrader:
             f"[{self.symbol}] get_price: sin precio tras {_PRICE_FETCH_RETRIES} intentos: {last_exc}"
         )
 
-    # ── _set_leverage ───────────────────────────────────────────────
+    # ── _set_leverage ───────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int) -> None:
         if self.dry_run:
             logger.info("[%s] [DRY-RUN] _set_leverage(%dx)", self.symbol, leverage)
             self._open_leverage = leverage
             return
-        if self._okx_client is None:
-            logger.warning("[%s] _set_leverage: OKXClient no inicializado — skip.", self.symbol)
+        if self._bingx_client is None:
+            logger.warning("[%s] _set_leverage: BingXClient no inicializado — skip.", self.symbol)
             return
         is_cross = self.margin_mode == "cross"
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    self._okx_client.set_leverage,
+                    self._bingx_client.set_leverage,
                     coin=self.coin,
                     leverage=leverage,
                     is_cross=is_cross,
@@ -310,7 +305,7 @@ class FuturesTrader:
         except Exception as e:
             logger.warning("[%s] _set_leverage error: %s", self.symbol, e)
 
-    # ── OHLCV ─────────────────────────────────────────────────────
+    # ── OHLCV ────────────────────────────────────────────────────────────
 
     async def get_ohlcv(self, timeframe: str, n: Optional[int] = None) -> list:
         bars_needed = n or _OHLCV_BARS
@@ -321,54 +316,36 @@ class FuturesTrader:
     def get_ohlcv_fn(self) -> Callable:
         return functools.partial(self.get_ohlcv)
 
-    # ── _get_positions ────────────────────────────────────────────
+    # ── _get_positions ────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list[dict]:
-        if self._okx_client is None:
+        if self._bingx_client is None:
             return []
         try:
-            positions_raw = await asyncio.to_thread(
-                self._okx_client.get_positions
-            )
-            return positions_raw
+            return await asyncio.to_thread(self._bingx_client.get_positions)
         except Exception as e:
             logger.warning("[%s] _get_positions error: %s", self.symbol, e)
             return []
 
-    # ── _get_open_orders_raw ───────────────────────────────────────
+    # ── _get_open_orders_raw ──────────────────────────────────────────────
 
     async def _get_open_orders_raw(self) -> list[dict]:
-        if self._okx_client is None:
+        if self._bingx_client is None:
             return []
         try:
-            resp = await asyncio.to_thread(
-                self._okx_client._trade.get_order_list,
-                instType="SWAP",
-                instId=self.inst_id,
-            )
-            return (resp or {}).get("data", []) or []
+            return await asyncio.to_thread(self._bingx_client.get_open_orders)
         except Exception as e:
             logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e)
             return []
 
-    # ── _get_open_trigger_orders_raw ──────────────────────────────
+    # ── _get_open_trigger_orders_raw ──────────────────────────────────────
+    # BingX no separa trigger orders del resto; get_open_orders() ya incluye
+    # STOP_MARKET y TAKE_PROFIT_MARKET.
 
     async def _get_open_trigger_orders_raw(self) -> list[dict]:
-        if self._okx_client is None:
-            return []
-        try:
-            resp = await asyncio.to_thread(
-                self._okx_client._trade.get_algo_order_list,
-                ordType="conditional",
-                instType="SWAP",
-                instId=self.inst_id,
-            )
-            return (resp or {}).get("data", []) or []
-        except Exception as e:
-            logger.warning("[%s] _get_open_trigger_orders_raw error: %s", self.symbol, e)
-            return []
+        return await self._get_open_orders_raw()
 
-    # ── _place_tpsl ───────────────────────────────────────────────
+    # ── _place_tpsl ───────────────────────────────────────────────────────
 
     async def _place_tpsl(
         self,
@@ -378,25 +355,25 @@ class FuturesTrader:
         is_long: bool,
         reduce_only: bool = True,
     ) -> None:
-        if self._okx_client is None:
-            logger.error("[%s] _place_tpsl: OKXClient no inicializado", self.symbol)
+        if self._bingx_client is None:
+            logger.error("[%s] _place_tpsl: BingXClient no inicializado", self.symbol)
             return
         entry_px = self.entry_price
 
         if sl_price and sl_price > 0:
             try:
                 result = await asyncio.to_thread(
-                    self._okx_client.place_sl,
+                    self._bingx_client.place_sl,
                     is_buy=not is_long,
                     sz=qty,
                     trigger_px=sl_price,
                     entry_px=entry_px,
                 )
                 if result and result.get("code") == "0":
-                    logger.info("[%s] _place_tpsl: SL=%.5f colocado.", self.symbol, sl_price)
+                    logger.info("[%s] _place_tpsl: SL=%.5f colocado en BingX.", self.symbol, sl_price)
                 else:
                     err = (result or {}).get("msg", "error")
-                    logger.error("[%s] _place_tpsl: SL rechazado: %s", self.symbol, err)
+                    logger.error("[%s] _place_tpsl: SL rechazado por BingX: %s", self.symbol, err)
             except Exception as e:
                 logger.error("[%s] _place_tpsl: SL exception: %s", self.symbol, e)
                 raise
@@ -404,7 +381,7 @@ class FuturesTrader:
         if tp_price and tp_price > 0:
             try:
                 result = await asyncio.to_thread(
-                    self._okx_client.place_tp,
+                    self._bingx_client.place_tp,
                     is_buy=not is_long,
                     sz=qty,
                     trigger_px=tp_price,
@@ -412,45 +389,33 @@ class FuturesTrader:
                     entry_px=entry_px,
                 )
                 if result and result.get("code") == "0":
-                    logger.info("[%s] _place_tpsl: TP=%.5f colocado.", self.symbol, tp_price)
+                    logger.info("[%s] _place_tpsl: TP=%.5f colocado en BingX.", self.symbol, tp_price)
                 else:
                     err = (result or {}).get("msg", "error")
-                    logger.error("[%s] _place_tpsl: TP rechazado: %s", self.symbol, err)
+                    logger.error("[%s] _place_tpsl: TP rechazado por BingX: %s", self.symbol, err)
             except Exception as e:
                 logger.error("[%s] _place_tpsl: TP exception: %s", self.symbol, e)
                 raise
 
-    # ── open_order ──────────────────────────────────────────────────
+    # ── open_order ────────────────────────────────────────────────────────
 
     async def open_order(self, signal: dict, risk) -> None:
         """
-        Abre una posición en OKX según la señal del DecisionEngine.
+        Abre una posición en BingX según la señal del DecisionEngine.
 
-        Flujo:
-          1. Staleness check.
-          2. Cálculo de qty en contratos OKX.
-          3. place_market() via self._okx_client.
-          4. Confirm fill: reintenta _get_positions.
-          5. Ajusta SL/TP al filled_price real.
-          6. place_sl / place_tp via _place_tpsl().
-          7. Actualiza estado interno.
-          8. Persiste posición en disco.
-
-        FIX v10: si la orden falla o la posición no se llega a abrir,
+        FIX v10 (conservado): si la orden falla o la posición no se abre,
         se llama pretrade_risk.register_close_safe(symbol) para liberar
-        el margen que DecisionEngine.evaluate() ya reservó con confirm_order().
-        Sin este release, _open_margin se acumula permanentemente y Gate 2
-        bloquea todas las señales futuras aunque no haya posiciones abiertas.
+        el margen reservado por DecisionEngine.evaluate().
         """
         is_long = signal.get("side") == "long"
         action  = signal.get("action", "BUY" if is_long else "SELL")
 
-        # Garantizar que el cliente esté listo antes de cualquier operación
-        if self._okx_client is None:
+        # Garantizar cliente listo
+        if self._bingx_client is None:
             try:
                 await self._get_ccxt()
             except Exception as e:
-                logger.error("[%s] open_order: no se pudo inicializar OKXClient: %s",
+                logger.error("[%s] open_order: no se pudo inicializar BingXClient: %s",
                              self.symbol, e)
                 self._release_pretrade_margin()
                 return
@@ -474,8 +439,9 @@ class FuturesTrader:
         leverage       = self.leverage
         notional_usdc  = usdc_per_trade * leverage
 
-        ct_val = self._okx_client.get_ct_val()
-        sz_dec = self._okx_client.get_sz_decimals()
+        # BingX: ct_val = 1 (1 contrato = 1 coin base)
+        ct_val = self._bingx_client.get_ct_val()
+        sz_dec = self._bingx_client.get_sz_decimals()
 
         if ref_price > 0 and ct_val > 0:
             raw_qty = notional_usdc / (ref_price * ct_val)
@@ -502,13 +468,13 @@ class FuturesTrader:
             return
 
         logger.info(
-            "[%s] open_order: %s | qty=%.6f contratos | notional=%.2fUSDC | "
-            "lev=%dx | price=%.4f | ctVal=%.6f | dry_run=%s",
+            "[%s] open_order: %s | qty=%.6f | notional=%.2fUSDC | "
+            "lev=%dx | price=%.4f | dry_run=%s",
             self.symbol, action, qty, usdc_per_trade, leverage,
-            ref_price, ct_val, self.dry_run,
+            ref_price, self.dry_run,
         )
 
-        # ── 3. place_market ──────────────────────────────────────
+        # ── 3. place_market ──────────────────────────────────────────
         filled_price = ref_price
 
         if self.dry_run:
@@ -517,7 +483,7 @@ class FuturesTrader:
         else:
             try:
                 place_resp = await asyncio.to_thread(
-                    self._okx_client.place_market,
+                    self._bingx_client.place_market,
                     is_buy=is_long,
                     sz=qty,
                     reduce_only=False,
@@ -526,19 +492,17 @@ class FuturesTrader:
                 code = (place_resp or {}).get("code", "-1")
                 if str(code) != "0":
                     msg = (place_resp or {}).get("msg", str(place_resp))
-                    logger.error("[%s] open_order: place_market rechazado: %s",
+                    logger.error("[%s] open_order: place_market rechazado por BingX: %s",
                                  self.symbol, msg)
-                    # FIX v10: OKX rechazó la orden → liberar el margin reservado
                     self._release_pretrade_margin()
                     return
                 logger.info("[%s] open_order: place_market OK (code=0)", self.symbol)
             except Exception as e:
                 logger.error("[%s] open_order: place_market excepción: %s", self.symbol, e)
-                # FIX v10: excepción al enviar la orden → liberar el margin reservado
                 self._release_pretrade_margin()
                 return
 
-            # ── 4. Confirm fill ───────────────────────────────────
+            # ── 4. Confirm fill ───────────────────────────────────────
             for attempt in range(_FILL_RETRIES):
                 await asyncio.sleep(_FILL_DELAY)
                 try:
@@ -565,14 +529,14 @@ class FuturesTrader:
                 except Exception as e:
                     logger.warning("[%s] open_order: confirm fill error: %s", self.symbol, e)
 
-        # ── 5. Ajustar SL/TP al fill real ─────────────────────────
+        # ── 5. Ajustar SL/TP al fill real ──────────────────────────
         sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, filled_price, ref_price)
         tp3_px = float(signal.get("tp3") or 0)
         if tp3_px > 0 and abs(filled_price - ref_price) / max(ref_price, 1e-9) >= 0.0005:
             base = float(signal.get("entry") or 0) or ref_price
             tp3_px = filled_price * (1.0 + (tp3_px - base) / base) if base > 0 else tp3_px
 
-        # ── 6. Colocar SL y TP1 ───────────────────────────────────
+        # ── 6. Colocar SL y TP1 ────────────────────────────────────
         if not self.dry_run:
             try:
                 await self._place_tpsl(
@@ -589,7 +553,7 @@ class FuturesTrader:
             if tp1_px > 0:
                 logger.info("[%s] [DRY-RUN] TP1 simulado @ %.4f", self.symbol, tp1_px)
 
-        # ── 7. Actualizar estado ───────────────────────────────────
+        # ── 7. Actualizar estado ────────────────────────────────────
         self.position       = "long" if is_long else "short"
         self.entry_price    = filled_price
         self.sl             = sl_px  if sl_px  > 0 else None
@@ -603,7 +567,7 @@ class FuturesTrader:
         self._protection_ok = (sl_px > 0 or tp1_px > 0)
         self._tp1_be_done   = False
 
-        # ── 8. Persistir en disco ─────────────────────────────────
+        # ── 8. Persistir en disco ───────────────────────────────────
         try:
             save_position(
                 self.symbol,
@@ -623,25 +587,16 @@ class FuturesTrader:
             logger.warning("[%s] open_order: save_position error: %s", self.symbol, e)
 
         logger.info(
-            "[%s] ✅ Posición abierta: %s @ %.4f | qty=%.6f | "
+            "[%s] ✅ Posición abierta en BingX: %s @ %.4f | qty=%.6f | "
             "SL=%.4f | TP1=%.4f | TP2=%.4f",
             self.symbol, self.position.upper(), filled_price, qty,
             self.sl or 0, self.tp1 or 0, self.tp2 or 0,
         )
 
-    # ── _release_pretrade_margin ──────────────────────────────────
+    # ── _release_pretrade_margin ──────────────────────────────────────────
 
     def _release_pretrade_margin(self) -> None:
-        """
-        FIX v10: libera el margen reservado por pretrade_risk.confirm_order()
-        cuando open_order() no consigue abrir la posición por cualquier motivo
-        (OKX rechazado, excepción, qty=0, precio stale, etc.).
-
-        DecisionEngine.evaluate() siempre llama confirm_order() ANTES de
-        intentar la orden. Si la orden no prospera y esta función no se llama,
-        _open_margin se acumula permanentemente y Gate 2 bloquea todas las
-        señales futuras aunque no haya posiciones reales abiertas.
-        """
+        """Libera el margen reservado por pretrade_risk cuando la orden no se ejecuta."""
         try:
             from bot.pretrade_risk import pretrade_risk
             pretrade_risk.register_close_safe(self.symbol, notional_or_margin=0.0)
@@ -655,7 +610,7 @@ class FuturesTrader:
                 self.symbol, e,
             )
 
-    # ── close_position ────────────────────────────────────────────
+    # ── close_position ───────────────────────────────────────────────────
 
     async def close_position(self, reason: str = "manual") -> None:
         if self.position is None:
@@ -672,11 +627,17 @@ class FuturesTrader:
         )
 
         if not self.dry_run and qty > 0:
-            try:
-                from bot.core.trading_loop import _cancel_tpsl_safe
-                await asyncio.to_thread(_cancel_tpsl_safe, self)
-            except Exception as e:
-                logger.warning("[%s] close_position: cancel_tpsl error: %s", self.symbol, e)
+            # Cancelar SL/TP activos en BingX antes del cierre
+            if self._bingx_client is not None:
+                try:
+                    cancelled = await asyncio.to_thread(
+                        self._bingx_client.cancel_all_open_tpsl
+                    )
+                    if cancelled:
+                        logger.info("[%s] close_position: %d SL/TP cancelados.",
+                                    self.symbol, len(cancelled))
+                except Exception as e:
+                    logger.warning("[%s] close_position: cancel_tpsl error: %s", self.symbol, e)
 
             try:
                 close_ref_price = await self.get_price()
@@ -687,12 +648,12 @@ class FuturesTrader:
                 )
                 close_ref_price = self._last_price
 
-            if self._okx_client is None:
-                logger.error("[%s] close_position: OKXClient no disponible.", self.symbol)
+            if self._bingx_client is None:
+                logger.error("[%s] close_position: BingXClient no disponible.", self.symbol)
             else:
                 try:
                     resp = await asyncio.to_thread(
-                        self._okx_client.place_market,
+                        self._bingx_client.place_market,
                         is_buy=not is_long,
                         sz=qty,
                         reduce_only=True,
@@ -700,10 +661,10 @@ class FuturesTrader:
                     )
                     code = (resp or {}).get("code", "-1")
                     if str(code) == "0":
-                        logger.info("[%s] close_position: market close OK.", self.symbol)
+                        logger.info("[%s] close_position: market close OK en BingX.", self.symbol)
                     else:
                         msg = (resp or {}).get("msg", str(resp))
-                        logger.error("[%s] close_position: rechazado: %s", self.symbol, msg)
+                        logger.error("[%s] close_position: rechazado por BingX: %s", self.symbol, msg)
                 except Exception as e:
                     logger.error("[%s] close_position: excepción: %s", self.symbol, e)
         else:
@@ -727,25 +688,35 @@ class FuturesTrader:
         except Exception as e:
             logger.warning("[%s] close_position: clear_position error: %s", self.symbol, e)
 
-    # ── _fetch_candles ────────────────────────────────────────────
+    # ── _fetch_candles ───────────────────────────────────────────────────
 
     async def _fetch_candles(self, timeframe: str, n: int) -> list:
-        if self._okx_client is None:
+        """Descarga velas OHLCV de BingX usando el endpoint de klines."""
+        interval = _TF_BINGX.get(timeframe, timeframe)
+        limit    = min(n, 1000)  # BingX permite hasta 1440 por llamada
+
+        try:
+            import requests as _req
+            resp = await asyncio.to_thread(
+                lambda: _req.get(
+                    f"{_BASE_URL}/openApi/swap/v3/quote/klines",
+                    params={
+                        "symbol":   self.inst_id,
+                        "interval": interval,
+                        "limit":    str(limit),
+                    },
+                    timeout=10,
+                ).json()
+            )
+        except Exception as e:
+            logger.warning("[%s] _fetch_candles error: %s", self.symbol, e)
             return []
 
-        bar = _TF_OKX.get(timeframe, timeframe)
-
-        resp = await asyncio.to_thread(
-            self._okx_client._market.get_candlesticks,
-            instId=self.inst_id,
-            bar=bar,
-            limit=str(min(n, 300)),
-        )
-
-        raw = (resp or {}).get("data", [])
+        raw = resp.get("data", [])
         result = []
         for c in raw:
             try:
+                # BingX klines: [time, open, high, low, close, volume, ...]
                 result.append([
                     int(c[0]),
                     float(c[1]),
@@ -756,5 +727,5 @@ class FuturesTrader:
                 ])
             except (IndexError, TypeError, ValueError):
                 continue
-        result.reverse()
+        result.sort(key=lambda x: x[0])  # orden ascendente por timestamp
         return result
