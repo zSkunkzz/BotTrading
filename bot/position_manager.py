@@ -21,6 +21,12 @@ Bug J — TP dinámico cuando trader.tp es None (posiciones restauradas del stat
 Bug 1+2 (OKX) — _update_sl_to_be usaba trader._hl_client que no existe en
   FuturesTrader. Ahora usa OKXClient.create(symbol) igual que ExecutionEngine.
 
+Bug SL-SW (CRÍTICO) — _emergency_close llamaba trader._close_position() que
+  no existe en FuturesTrader OKX. El nombre correcto del método público es
+  close_position(). El SL por software se disparaba pero nunca cerraba la
+  posición porque AttributeError era silenciado por el check callable().
+  Fix: intentar close_position primero, luego _close_position como fallback.
+
 FEAT BE (Break-Even) — Cuando el precio se aleja de la entrada un porcentaje
   configurable hacia el TP, el SL se mueve automáticamente a la entrada.
   Configurable con:
@@ -507,9 +513,24 @@ class PositionManager:
     # ── Cierre de emergencia ───────────────────────────────────────────────────────────────
 
     async def _emergency_close(self, reason: str = "EMERGENCY") -> None:
+        """
+        BUG SL-SW FIX: FuturesTrader OKX expone close_position() (sin guión bajo).
+        El código anterior buscaba _close_position() → callable() devolvía False
+        → el SL por software se disparaba en los logs pero nunca cerraba la posición.
+
+        Se intenta close_position primero (FuturesTrader OKX), luego _close_position
+        como fallback (compatibilidad con traders legacy).
+        """
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
-        close_fn = getattr(trader, "_close_position", None)
+
+        # Intentar primero el método público de FuturesTrader OKX
+        close_fn = getattr(trader, "close_position", None)
+
+        # Fallback: nombre alternativo usado en traders legacy
+        if not callable(close_fn):
+            close_fn = getattr(trader, "_close_position", None)
+
         if callable(close_fn):
             try:
                 log.warning("[%s] Cierre de emergencia: %s", symbol, reason)
@@ -518,6 +539,7 @@ class PositionManager:
                 log.error("[%s] _emergency_close falló: %s", symbol, e)
         else:
             log.error(
-                "[%s] _emergency_close: el trader no tiene _close_position — posición SIN CERRAR",
+                "[%s] _emergency_close: el trader no tiene close_position ni _close_position "
+                "— posición SIN CERRAR",
                 symbol,
             )
