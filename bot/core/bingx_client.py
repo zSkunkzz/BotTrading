@@ -43,6 +43,14 @@ Notas BingX vs OKX:
   - instId es "{COIN}-USDT", no "{COIN}-USDT-SWAP".
   - SL/TP son órdenes tipo STOP_MARKET / TAKE_PROFIT_MARKET con stopPrice.
   - No hay posSide; el lado de cierre se infiere de reduceOnly=True.
+
+Fixes (2026-06-06):
+  - place_tp: fuerza siempre TAKE_PROFIT_MARKET (BingX rechaza TAKE_PROFIT
+    con reduceOnly=true en one-way mode según docs oficiales).
+  - cancel_all_open_tpsl: usa DELETE /allOpenOrders (batch atómico) en lugar
+    de loop orden-a-orden, evitando fallos parciales.
+  - get_balance_usdc: usa availableMargin como campo primario (campo real de
+    la API según docs: data.balance.availableMargin).
 """
 from __future__ import annotations
 
@@ -319,7 +327,6 @@ class BingXClient:
     # ── Leverage ──────────────────────────────────────────────────────────
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> dict:
-        side = "LONG"  # BingX requiere setear por lado
         results = {}
         for s in ("LONG", "SHORT"):
             try:
@@ -450,20 +457,27 @@ class BingXClient:
         limit_px:   Optional[float] = None,
         entry_px:   Optional[float] = None,
     ) -> dict:
+        """
+        Coloca una orden Take Profit en BingX.
+
+        FIX: siempre usa TAKE_PROFIT_MARKET (tipo market al trigger).
+        BingX rechaza TAKE_PROFIT (limit) con reduceOnly=true en one-way mode
+        porque requeriría posSide=LONG/SHORT, que solo existe en hedge mode.
+        Referencia: BingX Perpetual Swap API — Trade Interface docs.
+        """
         sz_r  = self.round_sz(sz)
         tpx   = self.round_px(trigger_px)
         side  = "BUY" if is_buy else "SELL"
-        otype = "TAKE_PROFIT" if limit_px else "TAKE_PROFIT_MARKET"
+        # TAKE_PROFIT_MARKET siempre: BingX one-way mode no admite
+        # TAKE_PROFIT con reduceOnly=true (requiere posSide en hedge mode).
         params: dict = {
             "symbol":     self.inst_id,
             "side":       side,
-            "type":       otype,
+            "type":       "TAKE_PROFIT_MARKET",
             "quantity":   str(sz_r),
             "stopPrice":  str(tpx),
             "reduceOnly": "true",
         }
-        if limit_px:
-            params["price"] = str(self.round_px(limit_px))
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
@@ -517,10 +531,22 @@ class BingXClient:
             return {}
 
     def get_balance_usdc(self) -> float:
+        """
+        Devuelve el balance disponible en USDT.
+
+        FIX: usa availableMargin como campo primario según la respuesta real
+        de /openApi/swap/v2/user/balance:
+          { "data": { "balance": { "availableMargin": "...", "equity": "...", ... } } }
+        """
         try:
-            resp   = self._core._get("/openApi/swap/v2/user/balance")
-            data   = resp.get("data", {}).get("balance", {})
-            equity = float(data.get("equity", 0) or data.get("balance", 0) or 0)
+            resp = self._core._get("/openApi/swap/v2/user/balance")
+            data = resp.get("data", {}).get("balance", {})
+            equity = float(
+                data.get("availableMargin")
+                or data.get("equity")
+                or data.get("balance")
+                or 0
+            )
             return equity
         except Exception as exc:
             logger.warning("[%s] get_balance_usdc error: %s", self.inst_id, exc)
@@ -580,22 +606,29 @@ class BingXClient:
 
     def cancel_all_open_tpsl(self) -> list[dict]:
         """
-        Cancela todas las órdenes abiertas del símbolo que sean SL o TP
-        (STOP_MARKET, TAKE_PROFIT_MARKET, STOP, TAKE_PROFIT).
+        Cancela todas las órdenes abiertas del símbolo usando el endpoint
+        batch DELETE /allOpenOrders (atómico, una sola llamada API).
+
+        FIX: reemplaza el loop orden-a-orden anterior que podía fallar
+        parcialmente y generaba múltiples llamadas. El endpoint
+        DELETE /openApi/swap/v2/trade/allOpenOrders cancela todo de golpe.
         """
-        _sl_tp_types = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"}
         try:
-            orders = self.get_open_orders()
-        except Exception:
+            resp = self._core._delete(
+                "/openApi/swap/v2/trade/allOpenOrders",
+                {"symbol": self.inst_id},
+            )
+            if self._bx_ok(resp):
+                logger.info(
+                    "[%s] cancel_all_open_tpsl: todas las órdenes canceladas (batch).",
+                    self.inst_id,
+                )
+            else:
+                logger.warning(
+                    "[%s] cancel_all_open_tpsl: respuesta inesperada: %s",
+                    self.inst_id, resp,
+                )
+            return [resp]
+        except Exception as exc:
+            logger.warning("[%s] cancel_all_open_tpsl error: %s", self.inst_id, exc)
             return []
-        results = []
-        for o in orders:
-            if o.get("type", "").upper() not in _sl_tp_types:
-                continue
-            oid = o.get("orderId") or o.get("ordId")
-            if not oid:
-                continue
-            r = self.cancel_order(str(oid))
-            results.append(r)
-            logger.info("[%s] Cancelada SL/TP orderId=%s", self.inst_id, oid)
-        return results
