@@ -2,15 +2,16 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
-v11 — Migración OKX → BingX (2026-06-06):
-  - Eliminadas todas las referencias a OKX_API_KEY / OKX_PASSPHRASE.
-  - _get_ccxt() inicializa BingXClient en lugar de OKXClient.
-  - get_price() usa la API REST de BingX (ticker por símbolo).
-  - _fetch_candles() usa el endpoint de klines de BingX.
-  - Propiedades _trade_api / _account_api / _market_api eliminadas
-    (ya no se necesitan; BingXClient expone la interfaz completa).
-  - Todo lo demás (open_order, close_position, _place_tpsl, etc.)
-    permanece idéntico — BingXClient es drop-in replacement.
+v12 — Fix _fetch_candles() BingX klines v3 (2026-06-06):
+  - El endpoint /openApi/swap/v3/quote/klines devuelve cada candle como dict
+    con claves {open, high, low, close, volume, time} — no como lista posicional.
+  - Cuando BingX devuelve error o símbolo no disponible, la respuesta tiene
+    code != 0 y data=null/[]; ahora se loguea correctamente y se devuelve [].
+  - Fix del WARNING ': 0' en OHLCVCache: era causado por que la excepción
+    capturada era el code entero 0 (respuesta vacía), ahora se lanza
+    ValueError con mensaje descriptivo en su lugar.
+
+v11 — Migración OKX → BingX (2026-06-06).
 """
 from __future__ import annotations
 
@@ -75,7 +76,7 @@ def _check_price_staleness(
     if abs_drift > threshold * 2:
         return (
             f"\u26a0\ufe0f Precio actual ({ref_price:.4f}) se alejó {drift*100:+.2f}% del entry "
-            f"({entry_signal:.4f}) — supera ±{threshold*200:.1f}% — entrada cancelada"
+            f"({entry_signal:.4f}) — supera \u00b1{threshold*200:.1f}% — entrada cancelada"
         )
     if abs_drift <= threshold:
         return None
@@ -151,20 +152,15 @@ class FuturesTrader:
         self._last_price:    float           = 0.0
         self._instrument_unavailable: bool   = False
 
-        # BingX no usa passphrase; las credenciales se leen de env vars
-        # en _BingXCore. api_key / api_secret aquí son solo para compatibilidad
-        # con la firma de __init__ (main.py puede seguir pasándolos).
-        # _BingXCore las leerá de BINGX_API_KEY / BINGX_API_SECRET.
         self._api_key    = api_key    or os.getenv("BINGX_API_KEY",    "")
         self._api_secret = api_secret or os.getenv("BINGX_API_SECRET", "")
 
-        # Cliente BingX unificado — se inicializa en _get_ccxt()
         self._bingx_client = None
 
         self._stopped_event = asyncio.Event()
         self._trading_loop  = TradingLoop(symbol)
 
-    # ── Interfaz pública ────────────────────────────────────────────────
+    # ── Interfaz pública ──────────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None) -> None:
         try:
@@ -185,11 +181,6 @@ class FuturesTrader:
     # ── Init BingX ──────────────────────────────────────────────────────
 
     async def _get_ccxt(self) -> None:
-        """
-        Inicializa self._bingx_client (BingXClient) una única vez.
-        Thread-safe: BingXClient.create() delega en _BingXCore.get_async()
-        que usa asyncio.Lock internamente.
-        """
         if self._bingx_client is not None:
             return
         try:
@@ -202,15 +193,12 @@ class FuturesTrader:
             logger.error("[%s] _get_ccxt error: %s", self.symbol, e)
             raise
 
-    # ── Propiedad de alias para código legacy ────────────────────────────
-    # Algunos submódulos pueden acceder a self._okx_client; redirigimos.
-
     @property
     def _okx_client(self):
         """Alias de compatibilidad: devuelve el BingXClient."""
         return self._bingx_client
 
-    # ── get_price ────────────────────────────────────────────────────────
+    # ── get_price ─────────────────────────────────────────────────────────
 
     async def get_price(self) -> float:
         if self._bingx_client is None:
@@ -238,7 +226,6 @@ class FuturesTrader:
                     ).json()
                 )
                 data = resp.get("data", {})
-                # BingX devuelve un dict (no lista) cuando se filtra por símbolo
                 if isinstance(data, list):
                     data = data[0] if data else {}
                 if not data:
@@ -277,7 +264,7 @@ class FuturesTrader:
             f"[{self.symbol}] get_price: sin precio tras {_PRICE_FETCH_RETRIES} intentos: {last_exc}"
         )
 
-    # ── _set_leverage ───────────────────────────────────────────────────
+    # ── _set_leverage ──────────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int) -> None:
         if self.dry_run:
@@ -316,7 +303,94 @@ class FuturesTrader:
     def get_ohlcv_fn(self) -> Callable:
         return functools.partial(self.get_ohlcv)
 
-    # ── _get_positions ────────────────────────────────────────────────────
+    # ── _fetch_candles ────────────────────────────────────────────────────────
+
+    async def _fetch_candles(self, timeframe: str, n: int) -> list:
+        """
+        Descarga velas OHLCV de BingX usando el endpoint de klines v3.
+
+        Formato de respuesta BingX klines v3:
+          { "code": 0, "data": [ {"open": "...", "high": "...", "low": "...",
+            "close": "...", "volume": "...", "time": 1234567890000}, ... ] }
+
+        Notas:
+          - Cuando el símbolo no existe o hay error, BingX devuelve
+            {"code": <non-zero>, "msg": "...", "data": null/[]}.
+          - Se lanza ValueError con mensaje descriptivo para que OHLCVCache
+            loguee el error correctamente (en lugar del código entero).
+          - Si data es lista posicional (formato väld alternativo) se parsea también.
+        """
+        interval = _TF_BINGX.get(timeframe, timeframe)
+        limit    = min(n, 1000)
+
+        try:
+            import requests as _req
+            resp = await asyncio.to_thread(
+                lambda: _req.get(
+                    f"{_BASE_URL}/openApi/swap/v3/quote/klines",
+                    params={
+                        "symbol":   self.inst_id,
+                        "interval": interval,
+                        "limit":    str(limit),
+                    },
+                    timeout=10,
+                ).json()
+            )
+        except Exception as e:
+            raise ValueError(f"_fetch_candles HTTP error {self.symbol}/{timeframe}: {e}") from e
+
+        # Validar respuesta de error de BingX
+        code = resp.get("code", 0)
+        if code != 0:
+            msg = resp.get("msg", "unknown error")
+            raise ValueError(
+                f"_fetch_candles BingX error {self.symbol}/{timeframe}: "
+                f"code={code} msg={msg}"
+            )
+
+        raw = resp.get("data") or []
+        if not raw:
+            raise ValueError(
+                f"_fetch_candles: BingX devolvió data vacía "
+                f"para {self.inst_id}/{interval}"
+            )
+
+        result = []
+        for c in raw:
+            try:
+                if isinstance(c, dict):
+                    # Formato v3 (dict con claves nombradas)
+                    result.append([
+                        int(c.get("time", c.get("openTime", 0))),
+                        float(c["open"]),
+                        float(c["high"]),
+                        float(c["low"]),
+                        float(c["close"]),
+                        float(c.get("volume", 0)),
+                    ])
+                elif isinstance(c, (list, tuple)) and len(c) >= 6:
+                    # Formato alternativo posicional [time, open, high, low, close, vol]
+                    result.append([
+                        int(c[0]),
+                        float(c[1]),
+                        float(c[2]),
+                        float(c[3]),
+                        float(c[4]),
+                        float(c[5]),
+                    ])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+
+        if not result:
+            raise ValueError(
+                f"_fetch_candles: no se pudieron parsear candles "
+                f"para {self.inst_id}/{interval} (raw[0]={raw[0] if raw else 'N/A'})"
+            )
+
+        result.sort(key=lambda x: x[0])
+        return result
+
+    # ── _get_positions ────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list[dict]:
         if self._bingx_client is None:
@@ -327,7 +401,7 @@ class FuturesTrader:
             logger.warning("[%s] _get_positions error: %s", self.symbol, e)
             return []
 
-    # ── _get_open_orders_raw ──────────────────────────────────────────────
+    # ── _get_open_orders_raw ────────────────────────────────────────────────────
 
     async def _get_open_orders_raw(self) -> list[dict]:
         if self._bingx_client is None:
@@ -338,14 +412,12 @@ class FuturesTrader:
             logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e)
             return []
 
-    # ── _get_open_trigger_orders_raw ──────────────────────────────────────
     # BingX no separa trigger orders del resto; get_open_orders() ya incluye
     # STOP_MARKET y TAKE_PROFIT_MARKET.
-
     async def _get_open_trigger_orders_raw(self) -> list[dict]:
         return await self._get_open_orders_raw()
 
-    # ── _place_tpsl ───────────────────────────────────────────────────────
+    # ── _place_tpsl ───────────────────────────────────────────────────────────
 
     async def _place_tpsl(
         self,
@@ -397,20 +469,12 @@ class FuturesTrader:
                 logger.error("[%s] _place_tpsl: TP exception: %s", self.symbol, e)
                 raise
 
-    # ── open_order ────────────────────────────────────────────────────────
+    # ── open_order ───────────────────────────────────────────────────────────
 
     async def open_order(self, signal: dict, risk) -> None:
-        """
-        Abre una posición en BingX según la señal del DecisionEngine.
-
-        FIX v10 (conservado): si la orden falla o la posición no se abre,
-        se llama pretrade_risk.register_close_safe(symbol) para liberar
-        el margen reservado por DecisionEngine.evaluate().
-        """
         is_long = signal.get("side") == "long"
         action  = signal.get("action", "BUY" if is_long else "SELL")
 
-        # Garantizar cliente listo
         if self._bingx_client is None:
             try:
                 await self._get_ccxt()
@@ -420,7 +484,6 @@ class FuturesTrader:
                 self._release_pretrade_margin()
                 return
 
-        # ── 1. Precio actual y staleness check ─────────────────────
         try:
             ref_price = await self.get_price()
         except Exception as e:
@@ -434,12 +497,10 @@ class FuturesTrader:
             self._release_pretrade_margin()
             return
 
-        # ── 2. Calcular qty en contratos ───────────────────────────
         usdc_per_trade = float(getattr(risk, "usdc_per_trade", 0) or 0)
         leverage       = self.leverage
         notional_usdc  = usdc_per_trade * leverage
 
-        # BingX: ct_val = 1 (1 contrato = 1 coin base)
         ct_val = self._bingx_client.get_ct_val()
         sz_dec = self._bingx_client.get_sz_decimals()
 
@@ -474,7 +535,6 @@ class FuturesTrader:
             ref_price, self.dry_run,
         )
 
-        # ── 3. place_market ──────────────────────────────────────────
         filled_price = ref_price
 
         if self.dry_run:
@@ -502,7 +562,6 @@ class FuturesTrader:
                 self._release_pretrade_margin()
                 return
 
-            # ── 4. Confirm fill ───────────────────────────────────────
             for attempt in range(_FILL_RETRIES):
                 await asyncio.sleep(_FILL_DELAY)
                 try:
@@ -529,14 +588,12 @@ class FuturesTrader:
                 except Exception as e:
                     logger.warning("[%s] open_order: confirm fill error: %s", self.symbol, e)
 
-        # ── 5. Ajustar SL/TP al fill real ──────────────────────────
         sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, filled_price, ref_price)
         tp3_px = float(signal.get("tp3") or 0)
         if tp3_px > 0 and abs(filled_price - ref_price) / max(ref_price, 1e-9) >= 0.0005:
             base = float(signal.get("entry") or 0) or ref_price
             tp3_px = filled_price * (1.0 + (tp3_px - base) / base) if base > 0 else tp3_px
 
-        # ── 6. Colocar SL y TP1 ────────────────────────────────────
         if not self.dry_run:
             try:
                 await self._place_tpsl(
@@ -553,7 +610,6 @@ class FuturesTrader:
             if tp1_px > 0:
                 logger.info("[%s] [DRY-RUN] TP1 simulado @ %.4f", self.symbol, tp1_px)
 
-        # ── 7. Actualizar estado ────────────────────────────────────
         self.position       = "long" if is_long else "short"
         self.entry_price    = filled_price
         self.sl             = sl_px  if sl_px  > 0 else None
@@ -567,7 +623,6 @@ class FuturesTrader:
         self._protection_ok = (sl_px > 0 or tp1_px > 0)
         self._tp1_be_done   = False
 
-        # ── 8. Persistir en disco ───────────────────────────────────
         try:
             save_position(
                 self.symbol,
@@ -587,13 +642,13 @@ class FuturesTrader:
             logger.warning("[%s] open_order: save_position error: %s", self.symbol, e)
 
         logger.info(
-            "[%s] ✅ Posición abierta en BingX: %s @ %.4f | qty=%.6f | "
+            "[%s] \u2705 Posición abierta en BingX: %s @ %.4f | qty=%.6f | "
             "SL=%.4f | TP1=%.4f | TP2=%.4f",
             self.symbol, self.position.upper(), filled_price, qty,
             self.sl or 0, self.tp1 or 0, self.tp2 or 0,
         )
 
-    # ── _release_pretrade_margin ──────────────────────────────────────────
+    # ── _release_pretrade_margin ───────────────────────────────────────────────
 
     def _release_pretrade_margin(self) -> None:
         """Libera el margen reservado por pretrade_risk cuando la orden no se ejecuta."""
@@ -610,7 +665,7 @@ class FuturesTrader:
                 self.symbol, e,
             )
 
-    # ── close_position ───────────────────────────────────────────────────
+    # ── close_position ───────────────────────────────────────────────────────────
 
     async def close_position(self, reason: str = "manual") -> None:
         if self.position is None:
@@ -627,7 +682,6 @@ class FuturesTrader:
         )
 
         if not self.dry_run and qty > 0:
-            # Cancelar SL/TP activos en BingX antes del cierre
             if self._bingx_client is not None:
                 try:
                     cancelled = await asyncio.to_thread(
@@ -687,45 +741,3 @@ class FuturesTrader:
             clear_position(self.symbol)
         except Exception as e:
             logger.warning("[%s] close_position: clear_position error: %s", self.symbol, e)
-
-    # ── _fetch_candles ───────────────────────────────────────────────────
-
-    async def _fetch_candles(self, timeframe: str, n: int) -> list:
-        """Descarga velas OHLCV de BingX usando el endpoint de klines."""
-        interval = _TF_BINGX.get(timeframe, timeframe)
-        limit    = min(n, 1000)  # BingX permite hasta 1440 por llamada
-
-        try:
-            import requests as _req
-            resp = await asyncio.to_thread(
-                lambda: _req.get(
-                    f"{_BASE_URL}/openApi/swap/v3/quote/klines",
-                    params={
-                        "symbol":   self.inst_id,
-                        "interval": interval,
-                        "limit":    str(limit),
-                    },
-                    timeout=10,
-                ).json()
-            )
-        except Exception as e:
-            logger.warning("[%s] _fetch_candles error: %s", self.symbol, e)
-            return []
-
-        raw = resp.get("data", [])
-        result = []
-        for c in raw:
-            try:
-                # BingX klines: [time, open, high, low, close, volume, ...]
-                result.append([
-                    int(c[0]),
-                    float(c[1]),
-                    float(c[2]),
-                    float(c[3]),
-                    float(c[4]),
-                    float(c[5]),
-                ])
-            except (IndexError, TypeError, ValueError):
-                continue
-        result.sort(key=lambda x: x[0])  # orden ascendente por timestamp
-        return result
