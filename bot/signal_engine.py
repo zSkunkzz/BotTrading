@@ -15,6 +15,12 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 11 desde v21-P3):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v26 (MIN_SCORE_RATIO):
+  1. MIN_SCORE_RATIO: nuevo filtro que exige que score/max_score >= umbral (default 0.62).
+     Ejemplo: TENDENCIA max=13 → necesita score>=8 Y ratio>=0.62 (≈8/13).
+     Evita que monedas nuevas con max_score bajo entren con scores bajos en absoluto.
+  2. Variable de entorno: MIN_SCORE_RATIO (float, default "0.62").
+
 CAMBIOS v25 (señales premium):
   1. MIN_SCORE: 7→8 — umbral más exigente para filtrar señales mediocres.
   2. PREMIUM_SCORE=10: señales con score>=10 se marcan con ⭐ en Telegram.
@@ -88,6 +94,8 @@ MIN_SCORE: int    = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
 MIN_RR: float     = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
 # v25: umbral premium — señales con score >= PREMIUM_SCORE se marcan con ⭐
 PREMIUM_SCORE: int = int(os.getenv("PREMIUM_SIGNAL_SCORE", "10"))
+# v26: ratio mínimo score/max_score — evita entradas con score bajo en setups de max bajo
+MIN_SCORE_RATIO: float = float(os.getenv("MIN_SCORE_RATIO", "0.62"))
 
 # ── v22: R/R dinámico por régimen ──────────────────────────────────────────
 _MIN_RR_TRENDING  = float(os.getenv("MIN_RR_TRENDING",  "1.6"))
@@ -477,17 +485,22 @@ async def _analyze_pair_inner(
         and rr >= _FAST_ENTRY_MIN_RR
     )
 
+    # v26: ratio score/max_score — filtro de calidad relativa
+    score_ratio = score / max_score if max_score > 0 else 0.0
+    ratio_ok = score_ratio >= MIN_SCORE_RATIO
+
     # v25: EARLY nunca es señal pública válida — baja convicción
     if entry_mode == "EARLY":
         is_valid = False
     else:
-        is_valid = (score >= MIN_SCORE and rr >= effective_min_rr) or is_fast_valid
+        is_valid = (score >= MIN_SCORE and rr >= effective_min_rr and ratio_ok) or is_fast_valid
 
     log.info(
-        "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f(min=%.2f) entry=%.6f sl=%.6f "
+        "[signal_engine] %s %s [%s] score=%d/%d ratio=%.2f(min=%.2f) RR=%.2f(min=%.2f) entry=%.6f sl=%.6f "
         "tp1=%.6f tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s vwap=%.6f "
         "funding=%.4f%% mtf_aligned=%s regime=%s | %s",
-        symbol, signal_str, setup_type, score, max_score, rr, effective_min_rr,
+        symbol, signal_str, setup_type, score, max_score, score_ratio, MIN_SCORE_RATIO,
+        rr, effective_min_rr,
         entry, sl, tp1, tp2, atr_val, suggested_lev, entry_mode, is_valid,
         ind_15m.get("vwap", 0.0), funding_rate * 100,
         mtf_aligned, regime or "none",
@@ -510,9 +523,10 @@ async def _analyze_pair_inner(
         indicators=indicators,
         is_valid=is_valid,
         reason="" if is_valid else (
-            f"[{setup_type}] score={score}/{max_score} rr={rr:.2f} "
-            f"(min_rr={effective_min_rr:.2f} regime={regime or 'none'})"
+            f"[{setup_type}] score={score}/{max_score} ratio={score_ratio:.2f}(min={MIN_SCORE_RATIO:.2f}) "
+            f"rr={rr:.2f}(min_rr={effective_min_rr:.2f} regime={regime or 'none'})"
             + (" [EARLY bloqueado]" if entry_mode == "EARLY" else "")
+            + ("" if ratio_ok else " [RATIO insuficiente]")
         ),
         extra={
             "setup_type":       setup_type,
@@ -525,6 +539,7 @@ async def _analyze_pair_inner(
             "regime":           regime,
             "effective_min_rr": effective_min_rr,
             "is_premium":       score >= PREMIUM_SCORE,
+            "score_ratio":      round(score_ratio, 3),
         },
     )
 
@@ -535,10 +550,12 @@ def _detect_setup(
     candidates = []
     for mode_fn in (_score_tendencia, _score_breakout, _score_reversal):
         setup_type, signal_str, score, max_score, reasons = mode_fn(i15, i1h, i4h, bars_15m)
-        if signal_str != "NEUTRAL" and score >= MIN_SCORE:
+        # v26: aplicar MIN_SCORE_RATIO también en la selección de candidatos
+        score_ratio = score / max_score if max_score > 0 else 0.0
+        if signal_str != "NEUTRAL" and score >= MIN_SCORE and score_ratio >= MIN_SCORE_RATIO:
             candidates.append((setup_type, signal_str, score, max_score, reasons))
     if not candidates:
-        return None, "NEUTRAL", 0, 10, ["Ningún setup alcanzó MIN_SCORE"]
+        return None, "NEUTRAL", 0, 10, ["Ningún setup alcanzó MIN_SCORE o MIN_SCORE_RATIO"]
     best = max(candidates, key=lambda x: x[2] / x[3])
     if len(candidates) > 1:
         log.debug(
