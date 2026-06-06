@@ -1,18 +1,26 @@
 """
-bot/ws_feed.py — WebSocket feed de OKX para precio, OHLCV y Order Book L2.
+bot/ws_feed.py — WebSocket feed de BingX para precio, OHLCV y Order Book L2.
 
-v2 — OKX migration (2026-06-06):
-  Sustituye el WS de Hyperliquid por el WS público de OKX v5:
-    wss://ws.okx.com:8443/ws/v5/public
+v3 — BingX migration (2026-06-06):
+  Sustituye el WS de OKX por el WS público de BingX Perpetuos USDT-M:
+    wss://open-api-ws.bingx.com/market
 
-  Canales suscritos por símbolo activo:
-    • tickers        → precio last/bid/ask en tiempo real
-    • books5         → top-5 bid/ask (order book ligero)
-    • candle15m      → velas 15m
-    • candle1H       → velas 1h
-    • candle4H       → velas 4h
-
-  Instrumento OKX: {COIN}-USDT-SWAP  (perpetuo USDT-margined)
+  Diferencias clave BingX vs OKX:
+  • URL: wss://open-api-ws.bingx.com/market  (no wss://ws.okx.com)
+  • Suscripción: campo 'dataType' (no 'channel'+'instId')
+      {"id":"<uuid>","dataType":"<{SYMBOL}@kline_15m>","reqType":"sub"}
+  • Ping/Pong: BingX envía texto "Ping"; cliente debe responder "Pong".
+      No enviar pings propios basados en tiempo como OKX — solo responder.
+  • Ticker: dataType = "{SYMBOL}@ticker"
+      Payload: {"c": last, "b": bid, "a": ask, ...}
+  • Klines: dataType = "{SYMBOL}@kline_{interval}"
+      Intervalo: 1m | 3m | 5m | 15m | 30m | 1h | 2h | 4h | 6h | 12h | 1d
+      Payload: {"data": {"T": ts_close_ms, "o": open, "h": high, "l": low,
+                          "c": close, "v": volume, "n": is_closed (bool/0/1)}}
+  • Order Book: dataType = "{SYMBOL}@depth20" (5/10/20 niveles disponibles)
+      Payload: {"bids": [[px, qty], ...], "asks": [[px, qty], ...]}
+  • Símbolo BingX: "BTC-USDT" (no "BTC-USDT-SWAP")
+  Ref: BingX WebSocket Market Data API docs.
 
   API pública idéntica a la versión anterior (compatible con signal_engine):
     from bot.ws_feed import ws_feed
@@ -24,9 +32,11 @@ v2 — OKX migration (2026-06-06):
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import time
+import uuid
 from collections import deque
 from typing import Dict, List, Optional
 
@@ -35,18 +45,20 @@ import pandas as pd
 
 log = logging.getLogger("WSFeed")
 
-# OKX WS público (no requiere autenticación para datos de mercado)
-WS_URL         = "wss://ws.okx.com:8443/ws/v5/public"
-PING_INTERVAL  = 25          # OKX requiere ping cada 30s; usamos 25 para margen
-OHLCV_LIMIT    = 200
+# ── BingX WS público perpetuos USDT-M ────────────────────────────────────────
+# Ref: BingX WebSocket Market Data docs.
+WS_URL        = "wss://open-api-ws.bingx.com/market"
+OHLCV_LIMIT   = 200
 RECONNECT_BASE = 2.0
 RECONNECT_MAX  = 60.0
 
-# Mapa TF interno → canal OKX
+# Mapa TF interno → intervalo BingX kline
+# Ref: BingX kline dataType — {SYMBOL}@kline_{interval}
+# Intervalos válidos: 1m | 3m | 5m | 15m | 30m | 1h | 2h | 4h | 6h | 12h | 1d
 TF_MAP: dict[str, str] = {
-    "15m": "candle15m",
-    "1h":  "candle1H",
-    "4h":  "candle4H",
+    "15m": "15m",
+    "1h":  "1h",
+    "4h":  "4h",
 }
 
 _TF_SECS: dict[str, float] = {
@@ -56,11 +68,11 @@ _TF_SECS: dict[str, float] = {
     "12h": 43200, "1d": 86400,
 }
 
-OB_DEPTH = 5  # books5 solo tiene 5 niveles
+OB_DEPTH = 20  # BingX soporta depth5/depth10/depth20; usamos depth20
 
 
 def _norm(symbol: str) -> str:
-    """BTCUSDT / BTC/USDT / BTC-USDT-SWAP → BTC"""
+    """BTCUSDT / BTC/USDT / BTC-USDT → BTC"""
     s = symbol.upper().replace("/", "-")
     if s.endswith("-SWAP"):
         s = s[:-5]
@@ -71,9 +83,12 @@ def _norm(symbol: str) -> str:
     return s.split("-")[0]
 
 
-def _inst_id(coin: str) -> str:
-    """BTC → BTC-USDT-SWAP"""
-    return f"{coin}-USDT-SWAP"
+def _bx_symbol(coin: str) -> str:
+    """
+    BingX usa '{COIN}-USDT' como símbolo en los dataType WS.
+    Ref: BingX WS docs — dataType format: '{symbol}@<channel>'.
+    """
+    return f"{coin}-USDT"
 
 
 class _OrderBookCache:
@@ -86,11 +101,11 @@ class _OrderBookCache:
 
     def update(self, bids: list, asks: list):
         self.bids = sorted(
-            [[float(p), float(s)] for p, s, *_ in bids  if float(s) > 0],
+            [[float(p), float(s)] for p, s in bids  if float(s) > 0],
             key=lambda x: -x[0]
         )[:OB_DEPTH]
         self.asks = sorted(
-            [[float(p), float(s)] for p, s, *_ in asks  if float(s) > 0],
+            [[float(p), float(s)] for p, s in asks  if float(s) > 0],
             key=lambda x:  x[0]
         )[:OB_DEPTH]
         self.ts = time.monotonic()
@@ -131,23 +146,18 @@ class _SymbolCache:
         self.price    = last
         self.price_ts = time.monotonic()
 
-    def update_candle(self, tf: str, candle: list):
-        """candle = [ts_ms, o, h, l, c, vol, ...]"""
+    def update_candle(self, tf: str, ts_ms: int, o: float, h: float,
+                      l: float, c: float, v: float):
         if tf not in self.candles:
             return
-        try:
-            ts  = int(candle[0])
-            row = [ts, float(candle[1]), float(candle[2]),
-                   float(candle[3]), float(candle[4]), float(candle[5])]
-        except (IndexError, ValueError):
-            return
+        row = [ts_ms, o, h, l, c, v]
         dq = self.candles[tf]
-        if dq and dq[-1][0] == ts:
+        if dq and dq[-1][0] == ts_ms:
             dq[-1] = row          # actualizar vela corriente
         else:
             dq.append(row)        # nueva vela
         self.candle_ts[tf]         = time.monotonic()
-        self.candle_open_ts_ms[tf] = ts
+        self.candle_open_ts_ms[tf] = ts_ms
 
     def get_ohlcv_df(self, tf: str) -> pd.DataFrame:
         dq = self.candles.get(tf)
@@ -253,7 +263,7 @@ class WSFeed:
                 self._cache[sym] = _SymbolCache()
         self._running = True
         self._task    = asyncio.ensure_future(self._run_loop())
-        log.info("[WSFeed] Iniciado para %d símbolos (OKX)", len(self._symbols))
+        log.info("[WSFeed] Iniciado para %d símbolos (BingX)", len(self._symbols))
 
     def update_symbols(self, symbols: List[str]):
         new = [_norm(s) for s in symbols if _norm(s) not in self._cache]
@@ -288,59 +298,85 @@ class WSFeed:
                 await asyncio.sleep(delay)
 
     async def _connect_and_listen(self):
+        """
+        BingX WS: los mensajes pueden llegar comprimidos con gzip o como texto plano.
+        Ref: BingX WS docs — "The data format returned from the server is compressed
+        using gzip. The client needs to decompress it."
+        """
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(
                 WS_URL,
-                heartbeat=PING_INTERVAL,
                 receive_timeout=90,
             ) as ws:
-                log.info("[WSFeed] Conectado a OKX WS")
+                log.info("[WSFeed] Conectado a BingX WS")
                 await self._subscribe(ws)
-                ping_task = asyncio.ensure_future(self._ping_loop(ws))
-                try:
-                    async for msg in ws:
-                        if not self._running:
-                            break
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            self._handle_message(msg.data)
-                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                            break
-                finally:
-                    ping_task.cancel()
+                async for msg in ws:
+                    if not self._running:
+                        break
+                    if msg.type == aiohttp.WSMsgType.BINARY:
+                        # BingX envía datos comprimidos en gzip
+                        try:
+                            text = gzip.decompress(msg.data).decode("utf-8")
+                        except Exception:
+                            continue
+                        self._handle_message(ws, text)
+                    elif msg.type == aiohttp.WSMsgType.TEXT:
+                        self._handle_message(ws, msg.data)
+                    elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                        break
 
     async def _subscribe(self, ws):
         """
-        OKX WS v5 — formato de suscripción:
-        {"op": "subscribe", "args": [{"channel": "...", "instId": "..."}]}
+        BingX WS — formato de suscripción:
+          {"id": "<uuid>", "reqType": "sub", "dataType": "<symbol>@<channel>"}
+
+        Canales:
+          - Ticker:     {SYMBOL}@ticker
+          - Kline:      {SYMBOL}@kline_{interval}  (ej. BTC-USDT@kline_15m)
+          - Order Book: {SYMBOL}@depth20
+
+        Ref: BingX WebSocket Market Data API — Subscribe Request Format.
         """
-        args = []
         for coin in self._symbols:
-            inst = _inst_id(coin)
-            args.append({"channel": "tickers",  "instId": inst})
-            args.append({"channel": "books5",    "instId": inst})
-            for okx_channel in TF_MAP.values():
-                args.append({"channel": okx_channel, "instId": inst})
+            sym = _bx_symbol(coin)  # "BTC-USDT"
 
-        # OKX acepta hasta 240 args por mensaje; dividir en chunks si hace falta
-        chunk_size = 100
-        for i in range(0, len(args), chunk_size):
-            await ws.send_str(json.dumps({"op": "subscribe", "args": args[i:i+chunk_size]}))
+            # Ticker → precio en tiempo real
+            await ws.send_str(json.dumps({
+                "id":       str(uuid.uuid4()),
+                "reqType":  "sub",
+                "dataType": f"{sym}@ticker",
+            }))
 
-        log.debug("[WSFeed] Suscripciones enviadas: %d canales para %d símbolos",
-                  len(args), len(self._symbols))
+            # Order Book depth20
+            await ws.send_str(json.dumps({
+                "id":       str(uuid.uuid4()),
+                "reqType":  "sub",
+                "dataType": f"{sym}@depth20",
+            }))
 
-    async def _ping_loop(self, ws):
-        """OKX requiere enviar 'ping' (texto) cada ≤30s."""
-        while self._running:
-            await asyncio.sleep(PING_INTERVAL)
-            try:
-                await ws.send_str("ping")
-            except Exception:
-                break
+            # Klines por cada TF
+            for interval in TF_MAP.values():  # "15m", "1h", "4h"
+                await ws.send_str(json.dumps({
+                    "id":       str(uuid.uuid4()),
+                    "reqType":  "sub",
+                    "dataType": f"{sym}@kline_{interval}",
+                }))
 
-    def _handle_message(self, raw: str):
-        # OKX responde 'pong' al ping
-        if raw == "pong":
+        log.debug(
+            "[WSFeed] Suscripciones BingX enviadas: %d símbolos × %d canales",
+            len(self._symbols), 2 + len(TF_MAP),
+        )
+
+    def _handle_message(self, ws, raw: str):
+        """
+        BingX WS — protocolo Ping/Pong:
+          - El servidor envía el texto 'Ping' periódicamente.
+          - El cliente DEBE responder 'Pong' (texto), si no la conexión se cierra.
+          - NO enviar pings propios; solo responder al servidor.
+          Ref: BingX WS docs — Heartbeat / Ping-Pong.
+        """
+        if raw == "Ping":
+            asyncio.ensure_future(ws.send_str("Pong"))
             return
 
         try:
@@ -348,63 +384,73 @@ class WSFeed:
         except json.JSONDecodeError:
             return
 
-        # Confirmación de suscripción / errores
-        event = msg.get("event")
-        if event == "error":
-            log.warning("[WSFeed] Error OKX: %s", msg.get("msg", msg))
-            return
-        if event in ("subscribe", "unsubscribe"):
+        # Confirmación de suscripción — ignorar
+        if msg.get("code") is not None or msg.get("id") is not None:
+            if msg.get("code") and str(msg.get("code")) != "0":
+                log.warning("[WSFeed] Error suscripción BingX: %s", msg)
             return
 
-        channel = msg.get("arg", {}).get("channel", "")
-        inst_id = msg.get("arg", {}).get("instId", "")
-        data    = msg.get("data", [])
-        if not data:
+        data_type = msg.get("dataType", "")
+        data      = msg.get("data", {})
+        if not data_type or not data:
             return
 
-        # Extraer coin clave ("BTC-USDT-SWAP" → "BTC")
-        coin = inst_id.split("-")[0] if inst_id else ""
+        # Extraer coin del dataType: "BTC-USDT@ticker" → "BTC"
+        try:
+            coin = data_type.split("@")[0].replace("-USDT", "")
+        except Exception:
+            return
         if coin not in self._cache:
             return
 
         # ── Ticker → precio ─────────────────────────────────────────────────
-        if channel == "tickers":
-            d = data[0]
+        # BingX ticker payload:
+        #   {"c": last_price, "b": best_bid, "a": best_ask, "o": open_24h,
+        #    "h": high_24h, "l": low_24h, "v": volume_24h, "t": timestamp_ms}
+        # Ref: BingX WS ticker stream docs.
+        if "@ticker" in data_type:
             try:
-                price = float(d.get("last") or d.get("askPx") or 0)
-                if price > 0:
-                    self._cache[coin].update_price(price)
+                last = float(data.get("c") or data.get("a") or 0)
+                if last > 0:
+                    self._cache[coin].update_price(last)
             except (TypeError, ValueError):
                 pass
 
-        # ── books5 → order book ──────────────────────────────────────────────
-        elif channel == "books5":
-            d = data[0]
-            # OKX books5: {"bids": [[px, sz, ..], ..], "asks": [[px, sz, ..], ..]}
-            bids_raw = d.get("bids", [])
-            asks_raw = d.get("asks", [])
+        # ── Order Book depth20 → spread / imbalance ─────────────────────────
+        # BingX depth payload:
+        #   {"bids": [[price, qty], ...], "asks": [[price, qty], ...]}
+        # Ref: BingX WS depth stream docs.
+        elif "@depth" in data_type:
+            bids_raw = data.get("bids", [])
+            asks_raw = data.get("asks", [])
             if bids_raw and asks_raw:
                 self._cache[coin].ob.update(bids_raw, asks_raw)
 
-        # ── Candles (candle15m, candle1H, candle4H) ──────────────────────────
-        elif channel in TF_MAP.values():
-            # Mapear canal OKX → TF interno
-            tf = next((k for k, v in TF_MAP.items() if v == channel), None)
+        # ── Klines → OHLCV ──────────────────────────────────────────────────
+        # BingX kline payload:
+        #   {"E": event_time, "s": symbol,
+        #    "K": {"t": open_ts_ms, "T": close_ts_ms, "o": open, "h": high,
+        #          "l": low, "c": close, "v": volume, "n": is_closed}}
+        # Nota: en algunos pares BingX envía el payload directamente como
+        # objeto plano sin clave 'K'. Manejamos ambos formatos.
+        # Ref: BingX WS kline stream docs.
+        elif "@kline_" in data_type:
+            interval = data_type.split("@kline_")[-1]  # "15m", "1h", "4h"
+            tf = next((k for k, v in TF_MAP.items() if v == interval), None)
             if tf is None:
                 return
-            # OKX candle data: [[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm], ...]
-            # Procesar todas las velas recibidas (suelen ser 1-2)
-            for raw_candle in data:
-                # Solo guardar velas confirmadas (confirm=="1") o la corriente (=="0")
-                candle = [
-                    int(raw_candle[0]),   # ts ms
-                    float(raw_candle[1]), # open
-                    float(raw_candle[2]), # high
-                    float(raw_candle[3]), # low
-                    float(raw_candle[4]), # close
-                    float(raw_candle[5]), # volume (contratos)
-                ]
-                self._cache[coin].update_candle(tf, candle)
+            try:
+                kline = data.get("K") or data  # soportar ambos formatos
+                ts_ms = int(kline.get("t") or kline.get("T") or 0)
+                o = float(kline.get("o", 0))
+                h = float(kline.get("h", 0))
+                l = float(kline.get("l", 0))
+                c = float(kline.get("c", 0))
+                v = float(kline.get("v", 0))
+                if ts_ms > 0 and c > 0:
+                    self._cache[coin].update_candle(tf, ts_ms, o, h, l, c, v)
+            except (TypeError, ValueError, KeyError):
+                pass
 
 
 # Instancia global
