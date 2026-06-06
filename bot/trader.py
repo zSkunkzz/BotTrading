@@ -14,6 +14,16 @@ v9 — Unificación sobre OKXClient (2026-06-06):
   Todos los métodos delegan en self._okx_client (OKXClient singleton).
   _get_ccxt() inicializa self._okx_client una sola vez y de forma
   thread-safe mediante OKXClient.create().
+
+v10 — FIX pretrade_risk leak (2026-06-06):
+  DecisionEngine.evaluate() llama confirm_order() ANTES de saber si OKX
+  acepta la orden. Si place_market() es rechazado o la posición no se
+  llega a abrir, el margen queda bloqueado en _open_margin para siempre
+  porque on_position_closed() nunca se invoca (no hay posición que cerrar).
+
+  Fix: en open_order(), si la orden falla O si al terminar trader.position
+  sigue siendo None, llamar pretrade_risk.register_close_safe(symbol) para
+  devolver el margen que confirm_order() ya había reservado.
 """
 from __future__ import annotations
 
@@ -425,6 +435,12 @@ class FuturesTrader:
           6. place_sl / place_tp via _place_tpsl().
           7. Actualiza estado interno.
           8. Persiste posición en disco.
+
+        FIX v10: si la orden falla o la posición no se llega a abrir,
+        se llama pretrade_risk.register_close_safe(symbol) para liberar
+        el margen que DecisionEngine.evaluate() ya reservó con confirm_order().
+        Sin este release, _open_margin se acumula permanentemente y Gate 2
+        bloquea todas las señales futuras aunque no haya posiciones abiertas.
         """
         is_long = signal.get("side") == "long"
         action  = signal.get("action", "BUY" if is_long else "SELL")
@@ -436,6 +452,7 @@ class FuturesTrader:
             except Exception as e:
                 logger.error("[%s] open_order: no se pudo inicializar OKXClient: %s",
                              self.symbol, e)
+                self._release_pretrade_margin()
                 return
 
         # ── 1. Precio actual y staleness check ─────────────────────
@@ -443,11 +460,13 @@ class FuturesTrader:
             ref_price = await self.get_price()
         except Exception as e:
             logger.error("[%s] open_order: no se pudo obtener precio: %s", self.symbol, e)
+            self._release_pretrade_margin()
             return
 
         stale_reason = _check_price_staleness(signal, ref_price, is_long)
         if stale_reason:
             logger.warning("[%s] open_order cancelado: %s", self.symbol, stale_reason)
+            self._release_pretrade_margin()
             return
 
         # ── 2. Calcular qty en contratos ───────────────────────────
@@ -463,6 +482,7 @@ class FuturesTrader:
         else:
             logger.error("[%s] open_order: precio o ctVal inválido (price=%.4f ctVal=%.6f)",
                          self.symbol, ref_price, ct_val)
+            self._release_pretrade_margin()
             return
 
         import math as _math
@@ -478,6 +498,7 @@ class FuturesTrader:
                 "(notional=%.2f USDC lev=%dx price=%.4f ctVal=%.6f raw=%.6f) — abortando.",
                 self.symbol, usdc_per_trade, leverage, ref_price, ct_val, raw_qty,
             )
+            self._release_pretrade_margin()
             return
 
         logger.info(
@@ -507,10 +528,14 @@ class FuturesTrader:
                     msg = (place_resp or {}).get("msg", str(place_resp))
                     logger.error("[%s] open_order: place_market rechazado: %s",
                                  self.symbol, msg)
+                    # FIX v10: OKX rechazó la orden → liberar el margin reservado
+                    self._release_pretrade_margin()
                     return
                 logger.info("[%s] open_order: place_market OK (code=0)", self.symbol)
             except Exception as e:
                 logger.error("[%s] open_order: place_market excepción: %s", self.symbol, e)
+                # FIX v10: excepción al enviar la orden → liberar el margin reservado
+                self._release_pretrade_margin()
                 return
 
             # ── 4. Confirm fill ───────────────────────────────────
@@ -603,6 +628,32 @@ class FuturesTrader:
             self.symbol, self.position.upper(), filled_price, qty,
             self.sl or 0, self.tp1 or 0, self.tp2 or 0,
         )
+
+    # ── _release_pretrade_margin ──────────────────────────────────
+
+    def _release_pretrade_margin(self) -> None:
+        """
+        FIX v10: libera el margen reservado por pretrade_risk.confirm_order()
+        cuando open_order() no consigue abrir la posición por cualquier motivo
+        (OKX rechazado, excepción, qty=0, precio stale, etc.).
+
+        DecisionEngine.evaluate() siempre llama confirm_order() ANTES de
+        intentar la orden. Si la orden no prospera y esta función no se llama,
+        _open_margin se acumula permanentemente y Gate 2 bloquea todas las
+        señales futuras aunque no haya posiciones reales abiertas.
+        """
+        try:
+            from bot.pretrade_risk import pretrade_risk
+            pretrade_risk.register_close_safe(self.symbol, notional_or_margin=0.0)
+            logger.info(
+                "[%s] _release_pretrade_margin: margen liberado (orden no ejecutada).",
+                self.symbol,
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] _release_pretrade_margin: error al liberar margen: %s",
+                self.symbol, e,
+            )
 
     # ── close_position ────────────────────────────────────────────
 
