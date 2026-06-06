@@ -41,52 +41,26 @@ Opcionales:
   OKX_INFO_CONCURRENCY — máx. requests simultáneas info (default 4)
 
 Dependencias:
-  pip install python-okx
-  (ya incluido en requirements si lo añades: okx>=0.1.9)
-
-NOTAS DE MIGRACIÓN en trader.py:
-  1. Reemplazar:
-       from bot.core.hl_client import HLClient, _HLCore, _norm_coin
-     Por:
-       from bot.core.okx_client import OKXClient as HLClient, _OKXCore as _HLCore, _norm_coin
-
-  2. En get_price(): cambiar self._hl_client._info.all_mids()
-     por            self._hl_client.all_mids()
-     (OKXClient.all_mids() ya está normalizado)
-
-  3. El semáforo de concurrencia:
-       _HLCore.get_info_semaphore()
-     funciona igual — _OKXCore expone get_info_semaphore().
-
-  4. Instrumentos OKX: el símbolo se normaliza internamente.
-     "BTC/USDT:USDT" → instId = "BTC-USDT-SWAP"
-     "ETH/USDT:USDT" → instId = "ETH-USDT-SWAP"
+  pip install python-okx>=0.2.1
 
 FIX v2 (2026-06-06):
   - BUG 5: get_max_leverage() usaba get_max_order_size() (no existe en
-    python-okx AccountAPI). Reemplazado por get_leverage() según doc v5:
-    GET /api/v5/account/leverage-info
-  - BUG 6: place_market() y place_limit() pasaban reduceOnly='true'/'false'
-    como kwarg de place_order(). La API OKX v5 NO acepta reduceOnly en
-    ese endpoint; la dirección se controla con posSide (hedge mode).
-    Eliminado el parámetro inválido de ambos métodos.
-  - BUG 7: place_limit() pasaba timeInForce= que python-okx TradeAPI
-    no acepta. El parámetro correcto según SDK es simplemente no pasarlo
-    (GTC es default) o usar clOrdId. Eliminado el kwarg inválido.
+    python-okx AccountAPI). Reemplazado por get_leverage().
+  - BUG 6: place_market() y place_limit() pasaban reduceOnly kwarg inválido.
+  - BUG 7: place_limit() pasaba timeInForce kwarg inválido.
 
 FIX v3 (2026-06-06):
-  - BUG A: tdMode hardcodeado a 'cross' en place_market, place_limit,
-    place_tp y place_sl — ignoraba el margin_mode del FuturesTrader
-    (default 'isolated'). OKX rechazaba órdenes o las colocaba en la
-    cuenta equivocada. Ahora OKXClient acepta margin_mode en __init__
-    y create(), lo lee de OKX_MARGIN_MODE como fallback, y lo propaga
-    a tdMode en todos los métodos de orden.
-  - BUG B: _warm_cache llamaba get_instruments(instType="SWAP", uly="",
-    instFamily="") — los kwargs vacíos causaban que la API filtrara y
-    devolviera 0 instrumentos según la versión del SDK. Eliminados.
-  - BUG C: _cancel_algo_order pasaba una lista a cancel_algo_order()
-    en lugar de kwargs individuales. python-okx TradeAPI espera
-    instId= y algoId= como kwargs. Corregido.
+  - BUG A: tdMode hardcodeado a 'cross' — ahora usa self.td_mode.
+  - BUG B: _warm_cache pasaba kwargs vacíos a get_instruments().
+  - BUG C: _cancel_algo_order pasaba kwargs sueltos en vez de lista de dicts.
+
+FIX v4 (2026-06-06):
+  - ImportError mejorado: muestra módulo exacto que falla + versión instalada.
+  - _cancel_algo_order: corregido definitivamente — cancel_algo_order() de
+    python-okx espera una lista [{instId, algoId}], no kwargs sueltos.
+    La v3 usaba instId= algoId= como kwargs, que tampoco es correcto.
+  - get_async(): log del error completo antes de re-raise para Railway logs.
+  - requirements.txt: pin a python-okx>=0.2.1 para garantizar okx.Market.
 """
 from __future__ import annotations
 
@@ -130,6 +104,38 @@ def _to_inst_id(symbol: str) -> str:
     return f"{coin}-USDT-SWAP"
 
 
+def _check_okx_import() -> None:
+    """
+    Verifica que python-okx esté instalado correctamente y muestra
+    diagnóstico detallado si falla.
+    """
+    missing = []
+    for mod in ("okx.Trade", "okx.Account", "okx.Market", "okx.PublicData"):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(mod)
+
+    if not missing:
+        return
+
+    # Intentar obtener versión instalada del paquete
+    version_info = "desconocida"
+    try:
+        import importlib.metadata
+        version_info = importlib.metadata.version("python-okx")
+    except Exception:
+        pass
+
+    raise ImportError(
+        f"Módulo(s) de python-okx no encontrados: {missing}. "
+        f"Versión instalada: {version_info}. "
+        f"Solución: pip install python-okx>=0.2.1  "
+        f"(el paquete PyPI es 'python-okx', el import es 'okx.*'). "
+        f"En Railway: fuerza redeploy limpio o borra el caché de build."
+    )
+
+
 # ── _OKXCore: singleton con los clientes SDK ──────────────────────────────────
 
 class _OKXCore:
@@ -151,18 +157,16 @@ class _OKXCore:
         if not _OKX_API_KEY or not _OKX_API_SECRET or not _OKX_PASSPHRASE:
             raise ValueError(
                 "OKX_API_KEY, OKX_API_SECRET y OKX_PASSPHRASE son obligatorias. "
-                "Defínelas en las variables de entorno."
+                "Defínelas en las variables de entorno de Railway."
             )
 
-        try:
-            import okx.Trade   as _Trade
-            import okx.Account as _Account
-            import okx.Market  as _Market
-            import okx.PublicData as _Public
-        except ImportError as e:
-            raise ImportError(
-                "Módulo 'python-okx' no encontrado. Instálalo con: pip install python-okx"
-            ) from e
+        # FIX v4: verificación explícita con diagnóstico antes de importar
+        _check_okx_import()
+
+        import okx.Trade      as _Trade
+        import okx.Account    as _Account
+        import okx.Market     as _Market
+        import okx.PublicData as _Public
 
         self.trade   = _Trade.TradeAPI(
             _OKX_API_KEY, _OKX_API_SECRET, _OKX_PASSPHRASE, False, _FLAG
@@ -203,20 +207,17 @@ class _OKXCore:
             if not inst_id.endswith("-USDT-SWAP"):
                 continue
 
-            # Tamaño de tick de precio
             try:
                 tick_sz = float(inst.get("tickSz", 0.01))
             except (ValueError, TypeError):
                 tick_sz = 0.01
             px_dec = max(0, min(8, round(-math.log10(tick_sz)))) if tick_sz > 0 else 2
 
-            # Tamaño mínimo de contrato (ctVal = valor en base coin por contrato)
             try:
                 ct_val = float(inst.get("ctVal", 1.0))
             except (ValueError, TypeError):
                 ct_val = 1.0
 
-            # Decimales de cantidad
             try:
                 lot_sz = float(inst.get("lotSz", 1.0))
                 sz_dec = max(0, min(8, round(-math.log10(lot_sz)))) if lot_sz > 0 else 0
@@ -245,7 +246,15 @@ class _OKXCore:
             if cls._instance is not None:
                 return cls._instance
             logger.info("[OKXCore] Inicializando clientes OKX en hilo separado…")
-            cls._instance = await asyncio.to_thread(cls)
+            try:
+                cls._instance = await asyncio.to_thread(cls)
+            except Exception as exc:
+                # FIX v4: log completo antes de re-raise para Railway logs
+                logger.error(
+                    "[OKXCore] Falló la inicialización: %s",
+                    exc, exc_info=True,
+                )
+                raise
             return cls._instance
 
     # ── Semáforo de concurrencia ──────────────────────────────────
@@ -272,12 +281,6 @@ class OKXClient:
     Normalización interna:
       symbol = 'BTC/USDT:USDT'  →  inst_id = 'BTC-USDT-SWAP'
       sz en OKX = número de contratos (cada contrato = ctVal coins base)
-
-    Conversión size ↔ contratos:
-      contracts = usdc_qty / (price * ct_val)
-      Los métodos place_* esperan sz en CONTRATOS (igual que HL espera sz en coins).
-      trader.py ya calcula qty en la unidad base del exchange — ajusta allí si
-      necesitas convertir de USDC a contratos antes de llamar place_market.
     """
 
     def __init__(
@@ -289,8 +292,6 @@ class OKXClient:
         self.symbol     = symbol
         self.coin       = _norm_coin(symbol)
         self.inst_id    = _to_inst_id(symbol)
-        # BUG A FIX: margin_mode se recibe explícitamente en lugar de
-        # hardcodear 'cross' en cada método de orden.
         self.td_mode    = "isolated" if margin_mode == "isolated" else "cross"
 
         if core is None:
@@ -307,7 +308,7 @@ class OKXClient:
         self._public  = core.public
         self._core    = core
 
-        # Alias de compatibilidad con trader.py que accede a self._hl_client._info
+        # Alias de compatibilidad
         self._info = self
 
     @classmethod
@@ -331,12 +332,6 @@ class OKXClient:
         return self._core._tick_size_cache.get(self.inst_id, 0.01)
 
     def get_max_leverage(self) -> int:
-        """
-        FIX v2 (BUG 5): el método correcto según doc OKX v5 es
-        GET /api/v5/account/leverage-info → AccountAPI.get_leverage()
-        El anterior get_max_order_size() no existe en python-okx AccountAPI
-        y lanzaba AttributeError silenciado.
-        """
         cached = self._core._max_leverage_cache.get(self.inst_id)
         if cached:
             return cached
@@ -355,7 +350,6 @@ class OKXClient:
         return lev
 
     def get_ct_val(self) -> float:
-        """Valor en coin base de 1 contrato (e.g. BTC: 0.001, ETH: 0.01)."""
         return self._core._ct_val_cache.get(self.inst_id, 1.0)
 
     def round_px(self, price: float) -> float:
@@ -363,7 +357,6 @@ class OKXClient:
         return round(price, dec)
 
     def round_sz(self, sz: float) -> float:
-        """Redondea sz (contratos) al lotSz del instrumento."""
         dec = self.get_sz_decimals()
         if dec == 0:
             return float(math.floor(sz))
@@ -373,25 +366,19 @@ class OKXClient:
     # ── Conversión USDC ↔ contratos ───────────────────────────────
 
     def usdc_to_contracts(self, usdc: float, price: float) -> float:
-        """Convierte capital en USDC a número de contratos para OKX."""
         ct_val = self.get_ct_val()
         if price <= 0 or ct_val <= 0:
             return 0.0
         return usdc / (price * ct_val)
 
     def contracts_to_usdc(self, contracts: float, price: float) -> float:
-        """Convierte contratos a valor nocional en USDC."""
         return contracts * self.get_ct_val() * price
 
     # ── Precios / all_mids ────────────────────────────────────────
 
     def all_mids(self) -> dict[str, float]:
-        """
-        Retorna un dict {coin: mid_price} para todos los SWAP activos.
-        Compatible con la llamada self._hl_client._info.all_mids() en trader.py.
-        """
         try:
-            resp   = self._market.get_tickers(instType="SWAP")
+            resp    = self._market.get_tickers(instType="SWAP")
             tickers = (resp or {}).get("data", [])
             result  = {}
             for t in tickers:
@@ -435,10 +422,6 @@ class OKXClient:
         reduce_only: bool = False,
         ref_price: Optional[float] = None,
     ) -> dict:
-        """
-        FIX v2 (BUG 6): eliminado el parámetro reduceOnly de place_order().
-        FIX v3 (BUG A): tdMode ahora usa self.td_mode en lugar de 'cross' hardcodeado.
-        """
         sz_r     = self.round_sz(sz)
         side     = "buy" if is_buy else "sell"
         pos_side = self._infer_pos_side(is_buy, reduce_only)
@@ -468,16 +451,11 @@ class OKXClient:
         reduce_only: bool = False,
         tif: str = "Gtc",
     ) -> dict:
-        """
-        FIX v2 (BUG 6 + BUG 7): eliminados reduceOnly y timeInForce.
-        FIX v3 (BUG A): tdMode ahora usa self.td_mode.
-        """
         sz_r     = self.round_sz(sz)
         px_r     = self.round_px(price)
         side     = "buy" if is_buy else "sell"
         pos_side = self._infer_pos_side(is_buy, reduce_only)
         ord_type = "post_only" if tif.upper() in ("POST_ONLY", "POSTONLY") else "limit"
-
         try:
             resp = self._trade.place_order(
                 instId=self.inst_id,
@@ -507,16 +485,11 @@ class OKXClient:
         limit_px:  Optional[float] = None,
         entry_px:  Optional[float] = None,
     ) -> dict:
-        """
-        Take-Profit en OKX usando ordType='conditional' (algo order).
-        FIX v3 (BUG A): tdMode ahora usa self.td_mode.
-        """
         sz_r     = self.round_sz(sz)
         tpx      = self.round_px(trigger_px)
         side     = "buy" if is_buy else "sell"
         pos_side = "short" if is_buy else "long"
         ord_px   = "-1" if limit_px is None else str(self.round_px(limit_px))
-
         try:
             resp = self._trade.place_algo_order(
                 instId=self.inst_id,
@@ -544,15 +517,10 @@ class OKXClient:
         trigger_px: float,
         entry_px:   Optional[float] = None,
     ) -> dict:
-        """
-        Stop-Loss en OKX usando ordType='conditional' (algo order).
-        FIX v3 (BUG A): tdMode ahora usa self.td_mode.
-        """
         sz_r     = self.round_sz(sz)
         tpx      = self.round_px(trigger_px)
         side     = "buy" if is_buy else "sell"
         pos_side = "short" if is_buy else "long"
-
         try:
             resp = self._trade.place_algo_order(
                 instId=self.inst_id,
@@ -582,7 +550,6 @@ class OKXClient:
     # ── Consultas de cuenta ───────────────────────────────────────
 
     def get_user_state(self) -> dict:
-        """Devuelve el estado de la cuenta (compatibilidad con HLClient)."""
         try:
             return self._account.get_account_balance() or {}
         except Exception as exc:
@@ -590,7 +557,6 @@ class OKXClient:
             return {}
 
     def get_balance_usdc(self) -> float:
-        """Balance total de la cuenta en USDT."""
         try:
             resp    = self._account.get_account_balance(ccy="USDT")
             data    = (resp or {}).get("data", [{}])
@@ -603,10 +569,6 @@ class OKXClient:
         return 0.0
 
     def get_positions(self) -> list[dict]:
-        """
-        Posiciones abiertas para self.inst_id.
-        Retorna lista con el mismo schema que HLClient.get_positions().
-        """
         try:
             resp = self._account.get_positions(instId=self.inst_id)
             raw  = (resp or {}).get("data", [])
@@ -633,7 +595,6 @@ class OKXClient:
         return result
 
     def get_open_orders(self) -> list:
-        """Órdenes abiertas normales (no algo) para este instrumento."""
         try:
             resp = self._trade.get_order_list(instId=self.inst_id)
             return (resp or {}).get("data", [])
@@ -642,7 +603,6 @@ class OKXClient:
             return []
 
     def _get_open_algo_orders(self) -> list:
-        """Algo orders (TP/SL conditional) pendientes para este instrumento."""
         try:
             resp = self._trade.get_algo_order_list(
                 ordType="conditional", instId=self.inst_id
@@ -653,7 +613,6 @@ class OKXClient:
             return []
 
     def cancel_order(self, order_id) -> dict:
-        """Cancela una orden normal por ordId."""
         try:
             resp = self._trade.cancel_order(
                 instId=self.inst_id, ordId=str(order_id)
@@ -665,14 +624,13 @@ class OKXClient:
 
     def _cancel_algo_order(self, algo_id: str) -> dict:
         """
-        Cancela una algo order (TP/SL) por algoId.
-        BUG C FIX: python-okx TradeAPI.cancel_algo_order() espera instId= y
-        algoId= como kwargs, no una lista posicional.
+        FIX v4: python-okx TradeAPI.cancel_algo_order() espera una lista
+        de dicts [{"instId": ..., "algoId": ...}], no kwargs sueltos.
+        Ref: https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-cancel-algo-order
         """
         try:
             resp = self._trade.cancel_algo_order(
-                instId=self.inst_id,
-                algoId=algo_id,
+                [{"instId": self.inst_id, "algoId": algo_id}]
             )
             return resp or {}
         except Exception as exc:
@@ -680,10 +638,6 @@ class OKXClient:
             return {"error": str(exc)}
 
     def cancel_all_open_tpsl(self) -> list[dict]:
-        """
-        Cancela todas las algo orders de TP/SL para este instrumento.
-        Equivalente a HLClient.cancel_all_open_tpsl().
-        """
         algo_orders = self._get_open_algo_orders()
         results = []
         for o in algo_orders:
