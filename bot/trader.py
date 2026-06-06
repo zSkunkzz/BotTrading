@@ -25,6 +25,19 @@ v4 — get_price fix (2026-06-06):
     disponible en demo: OPN, MON, PENGU, TURBO, MEME, NEIRO, etc.)
   - Añadida validación explícita de lista vacía antes de acceder a [0]
   - Traders con instrumento inválido en demo se marcan como skip silencioso
+
+v5 — _fetch_candles fix (2026-06-06):
+  - Problema: _fetch_candles capturaba "Server disconnected" y devolvía []
+    silenciosamente. OHLCVCache no lo ve como excepción sino como "fetch
+    vacío" y no registra last_exc — el backoff exponencial no reíntenta
+    correctamente ni el stale fallback muestra la causa real.
+  - Fix: re-raise de la excepción en vez de retornar [] cuando falla la
+    llamada HTTP a get_candlesticks. OHLCVCache ahora recibe la excepción,
+    la registra como last_exc, hace backoff 1s/2s/4s real, y si agota los
+    reintentos devuelve datos stale con el error visible en el WARNING.
+  - Solo los errores de parseo de velas individuales (IndexError, TypeError,
+    ValueError) siguen siendo silenciados con continue — son datos corruptos
+    puntuales, no errores de red.
 """
 from __future__ import annotations
 
@@ -251,11 +264,9 @@ class FuturesTrader:
                 )
                 data = resp.get("data", [])
 
-                # FIX: OKX devuelve data=[] cuando el instrumento no existe
+                # FIX v4: OKX devuelve data=[] cuando el instrumento no existe
                 # en el entorno demo (OPN, MON, PENGU, TURBO, MEME, NEIRO, etc.)
-                # El acceso original [0] daba IndexError — ahora validamos explícitamente.
                 if not data:
-                    # Marcar instrumento como no disponible para no seguir reintentando
                     self._instrument_unavailable = True
                     raise ValueError(
                         f"{self.inst_id} no disponible en OKX "
@@ -270,7 +281,6 @@ class FuturesTrader:
                 return price
             except Exception as exc:
                 last_exc = exc
-                # Si el instrumento se marcó como no disponible, salir sin reintentar
                 if self._instrument_unavailable:
                     break
                 if attempt < len(delays) - 1:
@@ -468,20 +478,33 @@ class FuturesTrader:
     # ── _fetch_candles ────────────────────────────────────────────
 
     async def _fetch_candles(self, timeframe: str, n: int) -> list:
-        """Usa MarketData.get_candlesticks de python-okx."""
+        """
+        Obtiene velas OHLCV de OKX via MarketData.get_candlesticks.
+
+        FIX v5: Las excepciones de red (ServerDisconnectedError, TimeoutError,
+        aiohttp.ClientError, etc.) se re-lanzan en lugar de devolverse como []
+        silenciosamente. Esto permite que OHLCVCache:
+          1. Registre last_exc con el error real visible en los WARNINGs.
+          2. Ejecute el backoff exponencial correcto (1s / 2s / 4s).
+          3. Aplique stale fallback con causa visible si agota los reintentos.
+
+        Solo los errores de parseo de velas individuales (IndexError,
+        TypeError, ValueError en los campos numéricos) se silencian con
+        continue — son datos corruptos puntuales, no errores de red.
+        """
         if self._market_api is None:
             return []
+
         bar = _TF_OKX.get(timeframe, timeframe)
-        try:
-            resp = await asyncio.to_thread(
-                self._market_api.get_candlesticks,
-                instId=self.inst_id,
-                bar=bar,
-                limit=str(min(n, 300)),  # OKX max 300 velas por petición
-            )
-        except Exception as e:
-            logger.warning("[%s] _fetch_candles error: %s", self.symbol, e)
-            return []
+
+        # FIX v5: no capturar la excepción — dejarla propagar al OHLCVCache
+        # para que el backoff exponencial funcione correctamente.
+        resp = await asyncio.to_thread(
+            self._market_api.get_candlesticks,
+            instId=self.inst_id,
+            bar=bar,
+            limit=str(min(n, 300)),  # OKX max 300 velas por petición
+        )
 
         raw = resp.get("data", [])
         result = []
