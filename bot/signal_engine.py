@@ -15,6 +15,20 @@ ARQUITECTURA:
 SISTEMA DE SCORING (max_score = 11 desde v21-P3):
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v25 (señales premium):
+  1. MIN_SCORE: 7→8 — umbral más exigente para filtrar señales mediocres.
+  2. PREMIUM_SCORE=10: señales con score>=10 se marcan con ⭐ en Telegram.
+  3. BREAKOUT — fix squeeze filter: el umbral de compresión se corrige a
+     hist_atr*0.60 (antes era hist_atr*1.1, casi nunca bloqueaba nada).
+  4. TENDENCIA — estructura HH/HL o LL/LH: si los últimos 3 cierres forman
+     estructura de tendencia en 15m, suma +1 de calidad.
+  5. REVERSAL — EMA50_1h como nivel clave: si el precio está dentro del
+     0.3% de la EMA50_1h, suma +1 (confirma entrada en zona de valor).
+  6. Filtro vela doji: bloquea señales cuyo cuerpo sea <20% del rango total
+     (velas de indecisión que generan entradas de baja calidad).
+  7. MIN_RR_REVERSAL=2.0: R/R mínimo más exigente para setups contra-tendencia.
+     EARLY nunca es señal válida pública (is_valid=False).
+
 CAMBIOS v24 (fix/signal-quality):
   1. VWAP diario real: _compute_indicators llama vwap(bars, reset_daily=True)
      para usar solo las barras del dia UTC actual (00:00 UTC), produciendo
@@ -69,13 +83,18 @@ from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr, vwap as 
 
 log = logging.getLogger(__name__)
 
-MIN_SCORE: int  = int(os.getenv("MIN_SIGNAL_SCORE", "7"))
-MIN_RR: float   = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
+# v25: MIN_SCORE subido de 7 a 8 para señales de mayor calidad
+MIN_SCORE: int    = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
+MIN_RR: float     = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
+# v25: umbral premium — señales con score >= PREMIUM_SCORE se marcan con ⭐
+PREMIUM_SCORE: int = int(os.getenv("PREMIUM_SIGNAL_SCORE", "10"))
 
 # ── v22: R/R dinámico por régimen ──────────────────────────────────────────
 _MIN_RR_TRENDING  = float(os.getenv("MIN_RR_TRENDING",  "1.6"))
 _MIN_RR_RANGING   = float(os.getenv("MIN_RR_RANGING",   "2.0"))
 _MIN_RR_VOLATILE  = float(os.getenv("MIN_RR_VOLATILE",  "2.2"))
+# v25: R/R mínimo específico para REVERSAL (más exigente que trending)
+_MIN_RR_REVERSAL  = float(os.getenv("MIN_RR_REVERSAL",  "2.0"))
 
 def _min_rr_for_regime(regime: Optional[str]) -> float:
     """Devuelve el R/R mínimo según el régimen de mercado."""
@@ -131,6 +150,7 @@ _BREAKOUT_WINDOW       = int(os.getenv("BREAKOUT_WINDOW", "20"))
 _BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.4"))
 _BREAKOUT_ATR_CONFIRM  = float(os.getenv("BREAKOUT_ATR_CONFIRM", "0.3"))
 # v24: ATR squeeze — el ATR reciente debe estar por debajo del percentil 40 del historico
+# v25 FIX: umbral corregido a hist_atr * (1 - squeeze_pct/100) → 0.60x (era 1.1x, casi nunca bloqueaba)
 _BREAKOUT_SQUEEZE_PCT  = float(os.getenv("BREAKOUT_SQUEEZE_PCT", "40"))
 _REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "28"))
 _REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "72"))
@@ -139,6 +159,8 @@ _VOL_CONFIRM_MIN       = float(os.getenv("VOL_CONFIRM_MIN",   "1.2"))
 _PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "2"))
 _PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.005"))
 _EARLY_LEV_FACTOR      = float(os.getenv("EARLY_LEV_FACTOR", "0.2"))
+# v25: filtro vela doji — cuerpo mínimo respecto al rango total
+_DOJI_BODY_MIN_PCT     = float(os.getenv("DOJI_BODY_MIN_PCT", "0.20"))
 
 
 def _to_ccxt_symbol(symbol: str) -> str:
@@ -373,7 +395,18 @@ async def _analyze_pair_inner(
     close_price = float(last_bar[4])
     high_price  = float(last_bar[2])
     low_price   = float(last_bar[3])
+    open_price  = float(last_bar[1])
     entry = close_price
+
+    # v25: filtro vela doji — bloquea entradas en velas de indecisión
+    candle_body  = abs(close_price - open_price)
+    candle_range = high_price - low_price
+    if candle_range > 0 and candle_body / candle_range < _DOJI_BODY_MIN_PCT:
+        return _hold_result(
+            symbol,
+            f"Vela indecisa (doji): cuerpo={candle_body/candle_range*100:.0f}% del rango "
+            f"(mín {_DOJI_BODY_MIN_PCT*100:.0f}%)",
+        )
 
     atr_val = float(ind_15m.get("atr", 0) or 0)
     if atr_val <= 0:
@@ -434,12 +467,21 @@ async def _analyze_pair_inner(
     # ── v22: R/R mínimo dinámico por régimen ────────────────────────────────
     effective_min_rr = _min_rr_for_regime(regime)
 
+    # v25: R/R mínimo específico para REVERSAL (siempre más exigente)
+    if setup_type == "REVERSAL":
+        effective_min_rr = max(effective_min_rr, _MIN_RR_REVERSAL)
+
     is_fast_valid = (
         entry_mode in ("FAST", "STRONG")
         and score >= _FAST_ENTRY_MIN_SCORE
         and rr >= _FAST_ENTRY_MIN_RR
     )
-    is_valid = (score >= MIN_SCORE and rr >= effective_min_rr) or is_fast_valid
+
+    # v25: EARLY nunca es señal pública válida — baja convicción
+    if entry_mode == "EARLY":
+        is_valid = False
+    else:
+        is_valid = (score >= MIN_SCORE and rr >= effective_min_rr) or is_fast_valid
 
     log.info(
         "[signal_engine] %s %s [%s] score=%d/%d RR=%.2f(min=%.2f) entry=%.6f sl=%.6f "
@@ -470,6 +512,7 @@ async def _analyze_pair_inner(
         reason="" if is_valid else (
             f"[{setup_type}] score={score}/{max_score} rr={rr:.2f} "
             f"(min_rr={effective_min_rr:.2f} regime={regime or 'none'})"
+            + (" [EARLY bloqueado]" if entry_mode == "EARLY" else "")
         ),
         extra={
             "setup_type":       setup_type,
@@ -481,6 +524,7 @@ async def _analyze_pair_inner(
             "bias_1h":          bias_1h,
             "regime":           regime,
             "effective_min_rr": effective_min_rr,
+            "is_premium":       score >= PREMIUM_SCORE,
         },
     )
 
@@ -507,13 +551,13 @@ def _detect_setup(
 
 def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     """
-    v24: MAX=12 (se añade +1 por volumen bajo en pullback).
+    v25: MAX=13 (se añade +1 por estructura HH/HL o LL/LH en 15m).
     REQUISITOS OBLIGATORIOS:
       - EMA 1h en tendencia definida
       - MACD15m a favor
       - ST1h a favor
     """
-    MAX = 12
+    MAX = 13
     reasons: List[str] = []
 
     if not i1h:
@@ -586,8 +630,6 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
             if direction == "LONG":
                 if bar_low <= ema21_15m * (1 + _PULLBACK_TOLERANCE):
                     pullback_detected = True
-                    # v24: vol bajo en pullback confirma correccion sana
-                    vol_avg_pb = i15.get("vol_ratio", 1.0)
                     avg_vol_raw = i15.get("_avg_vol", 0.0)
                     if avg_vol_raw > 0 and bar_vol < avg_vol_raw * 0.8:
                         pullback_vol_low = True
@@ -653,15 +695,32 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
     else:
         reasons.append("VWAP diario no disponible")
 
+    # v25: estructura HH/HL (LONG) o LL/LH (SHORT) en los últimos cierres 15m
+    if len(bars_15m) >= 4:
+        closes_recent = [float(b[4]) for b in bars_15m[-4:]]
+        if direction == "LONG":
+            hh_hl = closes_recent[-1] > closes_recent[-2] > closes_recent[-3]
+            if hh_hl:
+                score += 1
+                reasons.append("Estructura HH/HL confirmada en 15m +1")
+            else:
+                reasons.append("Sin estructura HH/HL en 15m")
+        else:
+            ll_lh = closes_recent[-1] < closes_recent[-2] < closes_recent[-3]
+            if ll_lh:
+                score += 1
+                reasons.append("Estructura LL/LH confirmada en 15m +1")
+            else:
+                reasons.append("Sin estructura LL/LH en 15m")
+
     return "TENDENCIA", direction, score, MAX, reasons
 
 
 def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     """
-    v24: añade filtro de compresión previa (ATR squeeze).
-    El ATR de las ultimas BREAKOUT_WINDOW velas debe estar en el
-    percentil BREAKOUT_SQUEEZE_PCT del ATR historico. Bloquea
-    breakouts desde rangos ya extendidos (fakeouts comunes).
+    v25: fix del squeeze filter — umbral corregido a hist_atr * (1 - squeeze_pct/100).
+    Con BREAKOUT_SQUEEZE_PCT=40, el ATR actual debe ser < hist_atr * 0.60 para
+    confirmar compresión real. Antes era hist_atr * 1.1 (casi nunca bloqueaba).
     MAX sigue siendo 8.
     """
     MAX = 8
@@ -683,26 +742,29 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             f"Sin rotura: close={current_close:.4f} rango=[{range_low:.4f}-{range_high:.4f}]"
         ]
 
-    # v24: filtro de compresión previa — el ATR reciente debe ser bajo
-    # respecto al ATR historico (squeeze). Si el rango ya estaba extendido,
-    # el breakout tiene muchas mas probabilidades de ser un fakeout.
+    # v25 FIX: squeeze filter corregido — umbral real = hist_atr * (1 - squeeze_pct/100)
+    # Con squeeze_pct=40: ATR actual debe ser < hist_atr * 0.60
+    # (antes era hist_atr * 1.1 — demasiado permisivo, casi nunca bloqueaba)
     if atr_val > 0 and len(bars_15m) >= _BREAKOUT_WINDOW * 2:
-        hist_highs  = [float(b[2]) for b in bars_15m[-(  _BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
+        hist_highs  = [float(b[2]) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
         hist_lows   = [float(b[3]) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
         hist_closes = [float(b[4]) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
         hist_atr = calc_atr(hist_highs, hist_lows, hist_closes, min(14, len(hist_closes) - 1))
         if hist_atr > 0:
-            squeeze_pct = _BREAKOUT_SQUEEZE_PCT / 100.0
-            if atr_val > hist_atr * (1.0 - squeeze_pct + 0.5):
-                # ATR actual supera el umbral de compresión → rango ya extendido
+            squeeze_threshold = hist_atr * (1.0 - _BREAKOUT_SQUEEZE_PCT / 100.0)
+            if atr_val > squeeze_threshold:
                 log.debug(
-                    "[signal_engine] BREAKOUT bloqueado: ATR actual=%.6f > umbral=%.6f (hist_atr=%.6f)",
-                    atr_val, hist_atr * (1.0 - squeeze_pct + 0.5), hist_atr,
+                    "[signal_engine] BREAKOUT bloqueado: ATR actual=%.6f > umbral=%.6f (hist_atr=%.6f, squeeze=%.0f%%)",
+                    atr_val, squeeze_threshold, hist_atr, _BREAKOUT_SQUEEZE_PCT,
                 )
                 return "BREAKOUT", "NEUTRAL", 0, MAX, [
-                    f"ATR actual ({atr_val:.6f}) > hist ({hist_atr:.6f}) → sin compresión previa (posible fakeout)"
+                    f"Sin compresión previa: ATR actual ({atr_val:.6f}) > umbral ({squeeze_threshold:.6f}) "
+                    f"= hist_atr*{1-_BREAKOUT_SQUEEZE_PCT/100:.2f} → posible fakeout"
                 ]
-            reasons.append(f"ATR squeeze confirmado: actual={atr_val:.6f} < hist={hist_atr:.6f} +0 (filtro OK)")
+            reasons.append(
+                f"ATR squeeze OK: actual={atr_val:.6f} < umbral={squeeze_threshold:.6f} "
+                f"(hist={hist_atr:.6f}, squeeze={_BREAKOUT_SQUEEZE_PCT:.0f}%) +0"
+            )
 
     direction = "LONG" if broke_up else "SHORT"
     score = 2
@@ -735,11 +797,11 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     """
-    v24: ST1h es ahora REQUISITO OBLIGATORIO (antes era opcional).
-    Divergencias RSI 15m detectadas con rsi_divergence() suman +2.
-    MAX pasa de 9 a 11.
+    v25: +1 si precio dentro del 0.3% de la EMA50_1h (nivel clave confirmado).
+    MAX pasa de 11 a 12.
+    v24: ST1h es REQUISITO OBLIGATORIO. Divergencias RSI 15m suman +2.
     """
-    MAX = 11
+    MAX = 12
     reasons: List[str] = []
     rsi_1h = i1h.get("rsi_val") if i1h else None
     if rsi_1h is None:
@@ -751,20 +813,17 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     direction = "LONG" if is_long else "SHORT"
 
     # v24: ST1h OBLIGATORIO — sin él no hay reversal válido
-    # Un reversal contratendencia sin ST1h es la entrada más peligrosa del bot
     if i1h:
         st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
         if not st1h_ok:
             reasons.append(f"ST1h en contra de {direction} — REQUISITO OBLIGATORIO en REVERSAL")
             return "REVERSAL", "NEUTRAL", 0, MAX, reasons
     else:
-        # Sin datos 1h no podemos confirmar ST1h
         reasons.append("ST1h no disponible — REVERSAL requiere confirmación 1h")
         return "REVERSAL", "NEUTRAL", 0, MAX, reasons
 
     score = 2
     reasons.append(f"RSI1h={rsi_1h:.0f} extremo {'sobreventa' if is_long else 'sobrecompra'} +2")
-
     reasons.append("ST1h en favor del giro +0 (requisito cumplido)")
 
     hist_15m = i15.get("macd_hist")
@@ -810,6 +869,15 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             score += 1; reasons.append(f"Precio toca EMA21_1h (dist={dist_pct*100:.2f}%) +1")
         else:
             reasons.append(f"Precio lejos EMA21_1h ({dist_pct*100:.2f}%)")
+
+    # v25: EMA50_1h como nivel clave de soporte/resistencia para reversales
+    ema50_1h = i1h.get("ema50") if i1h else None
+    if ema50_1h and close_15m:
+        dist_ema50 = abs(close_15m - ema50_1h) / ema50_1h
+        if dist_ema50 <= 0.003:
+            score += 1; reasons.append(f"Precio en EMA50_1h (dist={dist_ema50*100:.2f}%) nivel clave +1")
+        else:
+            reasons.append(f"Precio lejos EMA50_1h ({dist_ema50*100:.2f}%)")
 
     # v24: divergencias RSI 15m — la confirmación más fiable de un giro
     try:
@@ -895,11 +963,13 @@ def format_signal_block(signal) -> str:
     lev  = f"{signal.suggested_lev}x" if signal.suggested_lev else "—"
     rr   = f"{signal.rr:.2f}" if signal.rr else "—"
     mode = signal.extra.get("setup_type", signal.entry_mode)
-    sl_note   = " [struct]" if signal.extra.get("sl_atr") and signal.extra.get("sl_used") != signal.extra.get("sl_atr") else ""
-    fast_note = " ⚡FAST" if signal.extra.get("is_fast") else ""
-    mtf_note  = "" if signal.extra.get("mtf_aligned", True) else " ⚠️MTF"
+    sl_note    = " [struct]" if signal.extra.get("sl_atr") and signal.extra.get("sl_used") != signal.extra.get("sl_atr") else ""
+    fast_note  = " ⚡FAST" if signal.extra.get("is_fast") else ""
+    mtf_note   = "" if signal.extra.get("mtf_aligned", True) else " ⚠️MTF"
+    # v25: marca premium si score >= PREMIUM_SCORE
+    premium_note = " ⭐PREMIUM" if signal.extra.get("is_premium") else ""
     lines = [
-        f"**{signal.symbol}** · {arrow} [{mode}]{fast_note}{mtf_note}",
+        f"**{signal.symbol}** · {arrow} [{mode}]{fast_note}{premium_note}{mtf_note}",
         f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
     ]
     if signal.entry:
