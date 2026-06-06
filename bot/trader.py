@@ -2,6 +2,13 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v17 — Fix get_ohlcv_fn + _get_positions (2026-06-07):
+  - Añade get_ohlcv_fn(): retorna un callable que TradingLoop puede invocar
+    para obtener datos OHLCV desde BingX. Internamente usa _fetch_candles().
+  - Añade _get_positions(): consulta posiciones abiertas en BingX y retorna
+    lista de dicts normalizados con symbol, side, qty, entry_price, pnl.
+    Filtra posiciones con qty == 0 (cerradas).
+
 v16 — Fix #14 leverage cap interno (2026-06-06):
   - _set_leverage() ahora consulta _bingx_client.get_max_leverage() antes
     de enviar la llamada al exchange. Si el valor configurado supera el
@@ -284,6 +291,145 @@ class FuturesTrader:
         raise RuntimeError(
             f"[{self.symbol}] get_price: sin precio tras {_PRICE_FETCH_RETRIES} intentos: {last_exc}"
         )
+
+    # ── get_ohlcv_fn ────────────────────────────────────────────────────────────────────
+
+    def get_ohlcv_fn(self) -> Callable:
+        """
+        Retorna un callable async que TradingLoop puede invocar para obtener
+        datos OHLCV del exchange.
+
+        Uso en TradingLoop:
+            ohlcv_fn = trader.get_ohlcv_fn()
+            candles  = await ohlcv_fn(timeframe="15m", limit=100)
+
+        Retorna lista de dicts con claves: timestamp, open, high, low, close, volume.
+        Si BingXClient no está inicializado, inicializa antes de la primera llamada.
+        """
+        async def _ohlcv_fn(timeframe: str = "15m", limit: int = _OHLCV_BARS) -> list[dict]:
+            if self._bingx_client is None:
+                await self._get_ccxt()
+
+            interval = _TF_BINGX.get(timeframe, timeframe)
+            try:
+                import requests as _req
+                resp = await asyncio.to_thread(
+                    lambda: _req.get(
+                        f"{_BASE_URL}/openApi/swap/v3/quote/klines",
+                        params={
+                            "symbol": self.inst_id,
+                            "interval": interval,
+                            "limit": limit,
+                        },
+                        timeout=10,
+                    ).json()
+                )
+                raw = resp.get("data") or []
+                candles: list[dict] = []
+                for bar in raw:
+                    candles.append({
+                        "timestamp": int(bar.get("time") or bar.get("t") or 0),
+                        "open":      float(bar.get("open")  or bar.get("o") or 0),
+                        "high":      float(bar.get("high")  or bar.get("h") or 0),
+                        "low":       float(bar.get("low")   or bar.get("l") or 0),
+                        "close":     float(bar.get("close") or bar.get("c") or 0),
+                        "volume":    float(bar.get("volume") or bar.get("v") or 0),
+                    })
+                logger.debug(
+                    "[%s] get_ohlcv_fn: %d barras (%s) recibidas.",
+                    self.symbol, len(candles), timeframe,
+                )
+                return candles
+            except Exception as e:
+                logger.warning("[%s] get_ohlcv_fn error (%s) — retornando lista vacía.", self.symbol, e)
+                return []
+
+        return _ohlcv_fn
+
+    # ── _get_positions ──────────────────────────────────────────────────────────────────
+
+    async def _get_positions(self) -> list[dict]:
+        """
+        Consulta las posiciones abiertas en BingX para este símbolo.
+
+        Retorna lista de dicts normalizados:
+          {
+            "symbol":      str,   # p.ej. "BTC-USDT"
+            "side":        str,   # "long" | "short"
+            "qty":         float, # tamaño en contratos (positivo)
+            "entry_price": float,
+            "mark_price":  float,
+            "pnl":         float, # PnL no realizado en USDT
+            "leverage":    int,
+            "margin_mode": str,   # "isolated" | "cross"
+          }
+
+        Filtra posiciones con qty == 0 (cerradas).
+        Retorna [] si el cliente no está listo o hay error de red.
+        """
+        if self._bingx_client is None:
+            try:
+                await self._get_ccxt()
+            except Exception as e:
+                logger.warning("[%s] _get_positions: no se pudo inicializar BingXClient: %s", self.symbol, e)
+                return []
+
+        try:
+            import requests as _req
+            import hmac, hashlib, time as _time, urllib.parse
+
+            api_key    = self._api_key
+            api_secret = self._api_secret
+            ts         = str(int(_time.time() * 1000))
+            params_raw = f"symbol={self.inst_id}&timestamp={ts}"
+            signature  = hmac.new(
+                api_secret.encode(), params_raw.encode(), hashlib.sha256
+            ).hexdigest()
+
+            resp = await asyncio.to_thread(
+                lambda: _req.get(
+                    f"{_BASE_URL}/openApi/swap/v2/user/positions",
+                    params={
+                        "symbol":    self.inst_id,
+                        "timestamp": ts,
+                        "signature": signature,
+                    },
+                    headers={"X-BX-APIKEY": api_key},
+                    timeout=10,
+                ).json()
+            )
+
+            raw_list = resp.get("data") or []
+            if isinstance(raw_list, dict):
+                raw_list = raw_list.get("positions") or []
+
+            positions: list[dict] = []
+            for p in raw_list:
+                qty = abs(float(p.get("positionAmt") or p.get("availableAmt") or 0))
+                if qty == 0:
+                    continue
+                raw_side = str(p.get("positionSide") or p.get("side") or "").upper()
+                side = "long" if raw_side in ("LONG", "BUY") else "short"
+                positions.append({
+                    "symbol":      self.inst_id,
+                    "side":        side,
+                    "qty":         qty,
+                    "entry_price": float(p.get("avgPrice") or p.get("entryPrice") or 0),
+                    "mark_price":  float(p.get("markPrice") or 0),
+                    "pnl":         float(p.get("unrealizedProfit") or p.get("unrealisedPnl") or 0),
+                    "leverage":    int(float(p.get("leverage") or self._open_leverage)),
+                    "margin_mode": "cross" if str(p.get("marginType") or "").upper() == "CROSSED" else "isolated",
+                })
+
+            logger.debug(
+                "[%s] _get_positions: %d posición(es) abiertas.",
+                self.symbol, len(positions),
+            )
+            return positions
+
+        except Exception as e:
+            logger.warning("[%s] _get_positions error (%s) — retornando [].", self.symbol, e)
+            return []
 
     # ── _set_leverage ─────────────────────────────────────────────────────────────────
 
