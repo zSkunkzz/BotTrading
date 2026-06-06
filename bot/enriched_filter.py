@@ -24,6 +24,11 @@ v23 — B: regime-aware:
   VOLATILE → penalty +1 adicional si momentum contrario
   TRENDING → RSI_OVERBOUGHT sube a 72 (tendencias pueden estar extendidas)
 
+v28 — Cache de noticias con TTL por severidad:
+  NEWS_CACHE_ENABLED  : activar/desactivar cache (default true)
+  NEWS_TTL_STRONG_S   : TTL para noticias bearish/bullish en segundos (default 1800 = 30min)
+  NEWS_TTL_NEUTRAL_S  : TTL para noticias neutrales en segundos (default 600 = 10min)
+
 Retorna:
   FilterResult:
     .allowed  (bool)  — True si la señal pasa el filtro
@@ -35,15 +40,16 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from bot.data_enricher import EnrichedContext
 
 logger = logging.getLogger("EnrichedFilter")
 
-# ── Thresholds ────────────────────────────────────────────────────────────────
+# ── Thresholds ────────────────────────────────────────────────────────────
 FG_FEAR_THRESHOLD    = int(float(os.getenv("EF_FG_FEAR_THRESHOLD",    "20")))
 FG_GREED_THRESHOLD   = int(float(os.getenv("EF_FG_GREED_THRESHOLD",   "80")))
 FUNDING_LONG_MAX     = float(os.getenv("EF_FUNDING_LONG_MAX",  "0.05"))   # % per 8h
@@ -61,6 +67,11 @@ RSI_MOMENTUM_BLOCK   = float(os.getenv("EF_RSI_MOMENTUM_BLOCK", "50"))
 _FUNDING_LONG_MAX_RANGING  = float(os.getenv("EF_FUNDING_LONG_MAX_RANGING",  "0.02"))  # más estricto en rango
 _RSI_OVERBOUGHT_TRENDING   = float(os.getenv("EF_RSI_OVERBOUGHT_TRENDING",   "72"))    # más permisivo en tendencia
 
+# v28 — cache de noticias con TTL por severidad
+_NEWS_CACHE_ENABLED = os.getenv("NEWS_CACHE_ENABLED", "true").lower() != "false"
+_NEWS_TTL_STRONG_S  = float(os.getenv("NEWS_TTL_STRONG_S",  "1800"))  # 30min para bearish/bullish
+_NEWS_TTL_NEUTRAL_S = float(os.getenv("NEWS_TTL_NEUTRAL_S",  "600"))  # 10min para neutral
+
 
 @dataclass
 class FilterResult:
@@ -70,6 +81,84 @@ class FilterResult:
     news_ai_needed: bool = False
 
 
+# ── v28: Cache de noticias con TTL ───────────────────────────────────────────────
+
+@dataclass
+class _NewsEntry:
+    """Noticia con timestamp de ingesta para TTL."""
+    item:        object   # NewsItem original
+    sentiment:   str      # "bullish" | "bearish" | "neutral"
+    ingested_at: float    # time.monotonic() cuando se recibió
+
+
+class _NewsCache:
+    """
+    Cache de noticias por par con TTL diferenciado por severidad.
+
+    La razón de ser: las noticias de data_enricher llegan con timestamp
+    de publicación pero el bot no sabe cuándo las consumió por primera
+    vez. Esta cache registra el momento de ingesta y descarta noticias
+    que han superado su TTL antes de pasarlas al filtro.
+
+    Efecto: noticias neutrales desaparecen en 10min (ruido reducido);
+    noticias fuertes (bullish/bearish) persisten 30min para que el filtro
+    las tenga en cuenta en varios ciclos sin recontarlas como nuevas.
+    """
+
+    def __init__(self) -> None:
+        self._store: Dict[str, List[_NewsEntry]] = {}
+
+    def update(self, symbol: str, news_items: list) -> list:
+        """
+        Actualiza la cache con las noticias nuevas del ciclo actual
+        y devuelve las noticias vigentes (no expiradas).
+
+        Args:
+            symbol     : par (clave de cache)
+            news_items : lista de NewsItem del data_enricher
+
+        Returns:
+            Lista filtrada de NewsItem vigentes según TTL.
+        """
+        if not _NEWS_CACHE_ENABLED:
+            return news_items
+
+        now = time.monotonic()
+        cache = self._store.setdefault(symbol, [])
+
+        # Deduplicar por contenido (título/url si existe, si no repr)
+        existing_reprs = {repr(e.item) for e in cache}
+        for item in news_items:
+            if repr(item) not in existing_reprs:
+                sentiment = getattr(item, "sentiment", "neutral") or "neutral"
+                cache.append(_NewsEntry(
+                    item=item,
+                    sentiment=sentiment,
+                    ingested_at=now,
+                ))
+                existing_reprs.add(repr(item))
+
+        # Limpiar expiradas
+        def _ttl(entry: _NewsEntry) -> float:
+            return _NEWS_TTL_STRONG_S if entry.sentiment in ("bullish", "bearish") else _NEWS_TTL_NEUTRAL_S
+
+        cache[:] = [e for e in cache if now - e.ingested_at < _ttl(e)]
+        self._store[symbol] = cache
+
+        # Devolver sólo los NewsItem (objetos originales)
+        valid = [e.item for e in cache]
+        if len(valid) != len(news_items):
+            logger.debug(
+                "[news_cache] %s: %d noticias recibidas, %d vigentes tras TTL",
+                symbol, len(news_items), len(valid),
+            )
+        return valid
+
+
+# Singleton de cache
+_news_cache = _NewsCache()
+
+
 def apply(
     signal: str,           # "LONG" | "SHORT"
     enriched: "EnrichedContext",
@@ -77,6 +166,7 @@ def apply(
     vol_ratio: float | None = None,
     price_direction: str | None = None,  # "rising" | "falling" | None
     regime: Optional[str] = None,        # v23: régimen de mercado
+    symbol: Optional[str] = None,        # v28: para cache de noticias
 ) -> FilterResult:
     """
     Aplica el conjunto de reglas del SYSTEM_PROMPT de la IA de forma determinista.
@@ -88,6 +178,7 @@ def apply(
         vol_ratio     : relación volumen actual / media (opcional)
         price_direction: tendencia de precio en la vela actual (opcional, para filtro OI y momentum)
         regime        : régimen de mercado ("RANGING"|"TRENDING"|"VOLATILE"|None)
+        symbol        : par (para cache de noticias, v28)
 
     Returns:
         FilterResult — ver docstring del módulo
@@ -98,7 +189,10 @@ def apply(
     fg           = enriched.fear_greed.value  if enriched.fear_greed else 50
     funding      = enriched.oi.funding_rate   if enriched.oi        else 0.0
     oi_delta     = enriched.oi.oi_delta_pct   if enriched.oi        else 0.0
-    news_items   = enriched.news or []
+    raw_news     = enriched.news or []
+
+    # v28: filtrar noticias por TTL antes de usarlas
+    news_items = _news_cache.update(symbol or "_global", raw_news) if _NEWS_CACHE_ENABLED else raw_news
 
     # v23: ajustes de thresholds por régimen
     regime_up = (regime or "").upper()
@@ -123,12 +217,12 @@ def apply(
         if is_short and rsi < RSI_OVERSOLD:
             reasons_block.append(f"RSI={rsi:.1f} < {RSI_OVERSOLD} — sobreventa, no SHORT")
 
-    # ── 2. Volumen ────────────────────────────────────────────────────────────
+    # ── 2. Volumen ─────────────────────────────────────────────────────────
     if vol_ratio is not None and vol_ratio < VOL_RATIO_MIN:
         penalty += 1
         reasons_warn.append(f"vol_ratio={vol_ratio:.2f} < {VOL_RATIO_MIN} — señal débil")
 
-    # ── 3. Fear & Greed ───────────────────────────────────────────────────────
+    # ── 3. Fear & Greed ───────────────────────────────────────────────────
     if is_long:
         if fg < FG_FEAR_THRESHOLD:
             penalty += 1
@@ -143,7 +237,7 @@ def apply(
             penalty += 1
             reasons_warn.append(f"F&G={fg} — pánico, SHORT puede ser tarde")
 
-    # ── 4. Funding rate (v23: umbral reducido en RANGING) ─────────────────────
+    # ── 4. Funding rate (v23: umbral reducido en RANGING) ────────────────────────
     if is_long and funding > effective_funding_long_max:
         reasons_block.append(
             f"Funding={funding:+.4f}% — longs saturados (>{effective_funding_long_max}%)"
@@ -154,7 +248,7 @@ def apply(
             f"Funding={funding:+.4f}% — shorts saturados (<{FUNDING_SHORT_MIN}%)"
         )
 
-    # ── 5. OI delta + dirección precio (v23: RANGING sin umbral) ─────────────
+    # ── 5. OI delta + dirección precio (v23: RANGING sin umbral) ──────────────────
     oi_threshold = 0.0 if _is_ranging else OI_DELTA_STRONG
     if abs(oi_delta) >= oi_threshold:
         if is_long and oi_delta > 0 and price_direction == "falling":
@@ -200,22 +294,22 @@ def apply(
                 + (f" [VOLATILE]") if _is_volatile else ""
             )
 
-    # ── 6. Noticias (keyword, sin IA) ────────────────────────────────────────
-    bearish_count = sum(1 for n in news_items if n.sentiment == "bearish")
-    bullish_count = sum(1 for n in news_items if n.sentiment == "bullish")
+    # ── 6. Noticias (keyword, sin IA) — v28: usa noticias filtradas por TTL ───────
+    bearish_count = sum(1 for n in news_items if getattr(n, "sentiment", "") == "bearish")
+    bullish_count = sum(1 for n in news_items if getattr(n, "sentiment", "") == "bullish")
 
     if is_long and bearish_count >= NEWS_BEARISH_MAX:
         penalty += 1
-        reasons_warn.append(f"{bearish_count} noticias bearish — cautela en LONG")
+        reasons_warn.append(f"{bearish_count} noticias bearish vigentes — cautela en LONG")
     if is_short and bullish_count >= NEWS_BULLISH_MAX:
         penalty += 1
-        reasons_warn.append(f"{bullish_count} noticias bullish — cautela en SHORT")
+        reasons_warn.append(f"{bullish_count} noticias bullish vigentes — cautela en SHORT")
 
-    # ── 7. Decidir si hay suficientes noticias relevantes para consultar IA ──
-    relevant_news = [n for n in news_items if n.sentiment in ("bullish", "bearish")]
+    # ── 7. Decidir si hay suficientes noticias relevantes para consultar IA ──────
+    relevant_news = [n for n in news_items if getattr(n, "sentiment", "") in ("bullish", "bearish")]
     news_ai_needed = len(relevant_news) >= NEWS_AI_THRESHOLD
 
-    # ── Resultado ─────────────────────────────────────────────────────────────
+    # ── Resultado ──────────────────────────────────────────────────────────────
     if reasons_block:
         full_reason = " | ".join(reasons_block)
         if reasons_warn:
@@ -231,6 +325,8 @@ def apply(
     summary = f"F&G={fg} | funding={funding:+.4f}% | OI_delta={oi_delta:+.1f}%"
     if regime:
         summary += f" | regime={regime}"
+    if _NEWS_CACHE_ENABLED:
+        summary += f" | news_vigentes={len(news_items)}/{len(raw_news)}"
     if reasons_warn:
         summary += " | " + " | ".join(reasons_warn)
     logger.debug("[EnrichedFilter] %s OK — %s", signal, summary)
