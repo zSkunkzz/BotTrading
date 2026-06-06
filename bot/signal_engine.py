@@ -12,67 +12,59 @@ ARQUITECTURA:
   strategy      → orquesta: llama analyze_pair + enriched_filter + IA
   trader        → ejecuta órdenes usando strategy.decide()
 
-SISTEMA DE SCORING (max_score = 11 desde v21-P3):
+SISTEMA DE SCORING:
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v27 (señales premium máxima calidad):
+  1. TP DINÁMICO por vol_ratio: cuando vol_ratio > 2.0 los TPs se escalan x1.2
+     (mercado expansivo); cuando vol_ratio < 0.9 el TP1 se reduce x0.85
+     (objetivo conservador en mercados lentos).
+  2. MIN_SCORE_RATIO DINÁMICO por regime: en regímenes BEAR o VOLATILE el
+     umbral sube automáticamente a MIN_SCORE_RATIO_BEAR (default 0.72) para
+     que solo entren las señales más sólidas en mercados adversos.
+  3. BREAKOUT — detección de retesteo: si el precio actual está dentro del
+     0.5% del nivel roto (range_high/range_low) se interpreta como retest y
+     suma +2 adicionales (entrada de mayor calidad y menor riesgo de fakeout).
+  4. REVERSAL — swing levels de estructura: cruza el precio con los
+     swing_low/swing_high reales de structure_analyzer. Si el precio está
+     dentro del 0.5% de un swing histórico suma +2 (más relevante que EMA50).
+  5. TENDENCIA — ADX + slope EMA21_15m: filtra tendencias planas. Requiere
+     que el slope de EMA21_15m sea positivo (LONG) o negativo (SHORT) y que
+     ADX simple (DX proxy) supere un umbral configurable (ADX_MIN, default 20).
+     Un ADX bajo indica rango disfrazado de tendencia → penalización -2.
+  6. TENDENCIA — confluencia 4h extendida: si 4h tiene MACD alcista/bajista
+     además de ST4h en favor, suma +2 adicionales (señal institucional total).
+     MAX de TENDENCIA sube de 13 a 15.
+
 CAMBIOS v26 (MIN_SCORE_RATIO):
-  1. MIN_SCORE_RATIO: nuevo filtro que exige que score/max_score >= umbral (default 0.62).
-     Ejemplo: TENDENCIA max=13 → necesita score>=8 Y ratio>=0.62 (≈8/13).
-     Evita que monedas nuevas con max_score bajo entren con scores bajos en absoluto.
+  1. MIN_SCORE_RATIO: nuevo filtro que exige que score/max_score >= umbral.
   2. Variable de entorno: MIN_SCORE_RATIO (float, default "0.62").
 
 CAMBIOS v25 (señales premium):
-  1. MIN_SCORE: 7→8 — umbral más exigente para filtrar señales mediocres.
-  2. PREMIUM_SCORE=10: señales con score>=10 se marcan con ⭐ en Telegram.
-  3. BREAKOUT — fix squeeze filter: el umbral de compresión se corrige a
-     hist_atr*0.60 (antes era hist_atr*1.1, casi nunca bloqueaba nada).
-  4. TENDENCIA — estructura HH/HL o LL/LH: si los últimos 3 cierres forman
-     estructura de tendencia en 15m, suma +1 de calidad.
-  5. REVERSAL — EMA50_1h como nivel clave: si el precio está dentro del
-     0.3% de la EMA50_1h, suma +1 (confirma entrada en zona de valor).
-  6. Filtro vela doji: bloquea señales cuyo cuerpo sea <20% del rango total
-     (velas de indecisión que generan entradas de baja calidad).
-  7. MIN_RR_REVERSAL=2.0: R/R mínimo más exigente para setups contra-tendencia.
-     EARLY nunca es señal válida pública (is_valid=False).
+  1. MIN_SCORE: 7→8.
+  2. PREMIUM_SCORE=10: señales con score>=10 se marcan con ⭐.
+  3. BREAKOUT — fix squeeze filter: umbral corregido a hist_atr*0.60.
+  4. TENDENCIA — estructura HH/HL o LL/LH: +1 de calidad.
+  5. REVERSAL — EMA50_1h como nivel clave: +1 si dentro del 0.3%.
+  6. Filtro vela doji: bloquea señales cuyo cuerpo sea <20% del rango.
+  7. MIN_RR_REVERSAL=2.0.
 
 CAMBIOS v24 (fix/signal-quality):
-  1. VWAP diario real: _compute_indicators llama vwap(bars, reset_daily=True)
-     para usar solo las barras del dia UTC actual (00:00 UTC), produciendo
-     un nivel de precio mucho mas significativo que el VWAP acumulado.
-  2. REVERSAL — ST1h obligatorio: _score_reversal requiere ST1h en favor
-     como REQUISITO HARD, igual que TENDENCIA con MACD15m y ST1h.
-     Sin ST1h, retorna NEUTRAL inmediatamente. Esto elimina entradas
-     contratendencia peligrosas que antes pasaban con score=7/9.
-  3. BREAKOUT — filtro de compresion previa: antes de confirmar la ruptura
-     se verifica que el ATR de las ultimas BREAKOUT_WINDOW velas este por
-     debajo del percentil 40 del ATR historico (squeeze). Breakouts desde
-     rangos ya extendidos quedan bloqueados.
-  4. Divergencias RSI en REVERSAL: usando rsi_divergence() de indicators.py,
-     una divergencia alcista/bajista confirmada suma +2 al score de REVERSAL.
-     Es la confirmacion mas fiable de un giro de precio.
-  5. TENDENCIA — volumen decreciente en pullback: si el pullback a EMA21
-     llega con vol_ratio < 0.8 (contraccion), suma +1 adicional de calidad.
+  1. VWAP diario real.
+  2. REVERSAL — ST1h obligatorio.
+  3. BREAKOUT — filtro de compresión previa.
+  4. Divergencias RSI en REVERSAL: +2.
+  5. TENDENCIA — volumen decreciente en pullback: +1.
 
 CAMBIOS v23 (fix/ohlcv-resilience):
   1. Modo degradado operativo para 1h.
-  2. Semáforo interno ANALYZE_PAIR_CONCURRENCY (default 6).
+  2. Semáforo interno ANALYZE_PAIR_CONCURRENCY.
   3. _analyze_pair_inner().
 
-CAMBIOS v22 (mejoras de calidad):
-  1. MTF bias filter.
-  2. R/R mínimo dinámico por régimen.
-
-CAMBIOS v21 (Prioridades 1, 2 y 3):
-  P1 — OHLCV robustos.
-  P2 — Filtros de calidad en analyze_pair.
-  P3 — VWAP (acumulado, reemplazado por diario en v24).
-
-CAMBIOS v20 (Opción A early entry + Opción B SL ATR dinámico).
-CAMBIOS v19 (trend following puro).
-CAMBIOS v18 (fix SL estructura demasiado ancho).
-CAMBIOS v17: _detect_setup evalúa los 3 setups, elige mayor score/max.
-CAMBIOS v16: SL por estructura 1h + session_filter.
-CAMBIOS v15: TP conservadores, trailing eliminado.
+CAMBIOS v22: MTF bias filter + R/R dinámico por régimen.
+CAMBIOS v21: OHLCV robustos + VWAP.
+CAMBIOS v20: early entry + SL ATR dinámico.
+CAMBIOS v19: trend following puro.
 """
 from __future__ import annotations
 
@@ -89,23 +81,23 @@ from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr, vwap as 
 
 log = logging.getLogger(__name__)
 
-# v25: MIN_SCORE subido de 7 a 8 para señales de mayor calidad
-MIN_SCORE: int    = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
-MIN_RR: float     = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
-# v25: umbral premium — señales con score >= PREMIUM_SCORE se marcan con ⭐
+# ── Umbrales globales ────────────────────────────────────────────────────────
+MIN_SCORE: int     = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
+MIN_RR: float      = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
 PREMIUM_SCORE: int = int(os.getenv("PREMIUM_SIGNAL_SCORE", "10"))
-# v26: ratio mínimo score/max_score — evita entradas con score bajo en setups de max bajo
-MIN_SCORE_RATIO: float = float(os.getenv("MIN_SCORE_RATIO", "0.62"))
 
-# ── v22: R/R dinámico por régimen ──────────────────────────────────────────
+# v26: ratio mínimo base
+MIN_SCORE_RATIO: float = float(os.getenv("MIN_SCORE_RATIO", "0.62"))
+# v27: ratio elevado para regímenes adversos (BEAR / VOLATILE)
+MIN_SCORE_RATIO_BEAR: float = float(os.getenv("MIN_SCORE_RATIO_BEAR", "0.72"))
+
+# ── v22: R/R dinámico por régimen ────────────────────────────────────────────
 _MIN_RR_TRENDING  = float(os.getenv("MIN_RR_TRENDING",  "1.6"))
 _MIN_RR_RANGING   = float(os.getenv("MIN_RR_RANGING",   "2.0"))
 _MIN_RR_VOLATILE  = float(os.getenv("MIN_RR_VOLATILE",  "2.2"))
-# v25: R/R mínimo específico para REVERSAL (más exigente que trending)
 _MIN_RR_REVERSAL  = float(os.getenv("MIN_RR_REVERSAL",  "2.0"))
 
 def _min_rr_for_regime(regime: Optional[str]) -> float:
-    """Devuelve el R/R mínimo según el régimen de mercado."""
     if not regime:
         return MIN_RR
     r = regime.upper()
@@ -117,10 +109,20 @@ def _min_rr_for_regime(regime: Optional[str]) -> float:
         return _MIN_RR_VOLATILE
     return MIN_RR
 
-# ── v22: MTF bias filter ────────────────────────────────────────────────────
+# v27: ratio efectivo según régimen
+def _min_score_ratio_for_regime(regime: Optional[str]) -> float:
+    """Eleva MIN_SCORE_RATIO en mercados adversos (BEAR o VOLATILE)."""
+    if not regime:
+        return MIN_SCORE_RATIO
+    r = regime.upper()
+    if "BEAR" in r or "VOL" in r:
+        return MIN_SCORE_RATIO_BEAR
+    return MIN_SCORE_RATIO
+
+# ── v22: MTF bias filter ─────────────────────────────────────────────────────
 _MTF_BLOCK_SCORE_OVERRIDE = int(os.getenv("MTF_BLOCK_SCORE_OVERRIDE", "10"))
 
-# ── v23: semáforo interno para fetch paralelo desde pair_scanner ────────────
+# ── v23: semáforo interno ────────────────────────────────────────────────────
 _ANALYZE_PAIR_CONCURRENCY = int(os.getenv("ANALYZE_PAIR_CONCURRENCY", "6"))
 _analyze_pair_sem: Optional[asyncio.Semaphore] = None
 
@@ -128,13 +130,9 @@ def _get_analyze_sem() -> asyncio.Semaphore:
     global _analyze_pair_sem
     if _analyze_pair_sem is None:
         _analyze_pair_sem = asyncio.Semaphore(_ANALYZE_PAIR_CONCURRENCY)
-        log.info(
-            "[signal_engine] Semáforo analyze_pair inicializado: max=%d",
-            _ANALYZE_PAIR_CONCURRENCY,
-        )
+        log.info("[signal_engine] Semáforo analyze_pair inicializado: max=%d", _ANALYZE_PAIR_CONCURRENCY)
     return _analyze_pair_sem
 
-# Tiempo de espera antes del retry de 1h en modo degradado (segundos)
 _1H_RETRY_DELAY_S = float(os.getenv("OHLCV_1H_RETRY_DELAY_S", "1.5"))
 
 _FAST_ENTRY_MIN_SCORE = int(os.getenv("FAST_ENTRY_MIN_SCORE", "9"))
@@ -157,9 +155,9 @@ _EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.0015"))
 _BREAKOUT_WINDOW       = int(os.getenv("BREAKOUT_WINDOW", "20"))
 _BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.4"))
 _BREAKOUT_ATR_CONFIRM  = float(os.getenv("BREAKOUT_ATR_CONFIRM", "0.3"))
-# v24: ATR squeeze — el ATR reciente debe estar por debajo del percentil 40 del historico
-# v25 FIX: umbral corregido a hist_atr * (1 - squeeze_pct/100) → 0.60x (era 1.1x, casi nunca bloqueaba)
 _BREAKOUT_SQUEEZE_PCT  = float(os.getenv("BREAKOUT_SQUEEZE_PCT", "40"))
+# v27: tolerancia para detectar retesteo en BREAKOUT (porcentaje del nivel roto)
+_BREAKOUT_RETEST_TOL   = float(os.getenv("BREAKOUT_RETEST_TOL", "0.005"))
 _REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "28"))
 _REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "72"))
 _VOL_MIN_GLOBAL        = float(os.getenv("VOL_MIN_GLOBAL",    "0.6"))
@@ -167,8 +165,16 @@ _VOL_CONFIRM_MIN       = float(os.getenv("VOL_CONFIRM_MIN",   "1.2"))
 _PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "2"))
 _PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.005"))
 _EARLY_LEV_FACTOR      = float(os.getenv("EARLY_LEV_FACTOR", "0.2"))
-# v25: filtro vela doji — cuerpo mínimo respecto al rango total
 _DOJI_BODY_MIN_PCT     = float(os.getenv("DOJI_BODY_MIN_PCT", "0.20"))
+# v27: umbral ADX mínimo para confirmar tendencia real (evita rangos disfrazados)
+_ADX_MIN               = float(os.getenv("ADX_MIN", "20.0"))
+# v27: tolerancia para detectar swing level en REVERSAL
+_REVERSAL_SWING_TOL    = float(os.getenv("REVERSAL_SWING_TOL", "0.005"))
+# v27: multiplicadores dinámicos de TP por volatilidad
+_TP_VOL_HIGH_THRESHOLD = float(os.getenv("TP_VOL_HIGH_THRESHOLD", "2.0"))
+_TP_VOL_HIGH_MULT      = float(os.getenv("TP_VOL_HIGH_MULT",      "1.2"))
+_TP_VOL_LOW_THRESHOLD  = float(os.getenv("TP_VOL_LOW_THRESHOLD",  "0.9"))
+_TP_VOL_LOW_MULT       = float(os.getenv("TP_VOL_LOW_MULT",       "0.85"))
 
 
 def _to_ccxt_symbol(symbol: str) -> str:
@@ -188,7 +194,6 @@ def _to_ccxt_symbol(symbol: str) -> str:
 # v21 P1: limpieza OHLCV
 # ─────────────────────────────────────────────────────────────────────────────
 def _clean_bars(bars: list) -> list:
-    """Elimina barras con None en cualquier campo OHLCV [t,o,h,l,c,v]."""
     return [b for b in (bars or []) if b is not None and all(v is not None for v in b)]
 
 
@@ -261,10 +266,8 @@ def _structure_sl(
     return sl_atr
 
 
-# ── v22: MTF bias helper ─────────────────────────────────────────────────────
-
+# ── v22: MTF bias helper ──────────────────────────────────────────────────────
 def _mtf_bias(ind_1h: dict) -> Optional[str]:
-    """Devuelve 'LONG', 'SHORT' o None según el bias de 1h (EMA21 vs EMA50)."""
     if not ind_1h:
         return None
     if ind_1h.get("ema_bull"):
@@ -274,6 +277,61 @@ def _mtf_bias(ind_1h: dict) -> Optional[str]:
     return None
 
 
+# ── v27: ADX simple (proxy DX medio) ─────────────────────────────────────────
+def _adx_simple(highs: list, lows: list, closes: list, period: int = 14) -> float:
+    """
+    Calcula un ADX simplificado (media del DX) para period velas.
+    Suficiente para detectar tendencias reales vs rangos disfrazados.
+    Retorna 0.0 si no hay suficientes datos.
+    """
+    if len(closes) < period + 2:
+        return 0.0
+    try:
+        plus_dm, minus_dm, tr_list = [], [], []
+        for i in range(1, len(closes)):
+            h_diff = highs[i] - highs[i - 1]
+            l_diff = lows[i - 1] - lows[i]
+            plus_dm.append(h_diff if h_diff > l_diff and h_diff > 0 else 0.0)
+            minus_dm.append(l_diff if l_diff > h_diff and l_diff > 0 else 0.0)
+            tr_list.append(max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            ))
+        if len(tr_list) < period:
+            return 0.0
+        # Wilder smoothing
+        atr_s  = sum(tr_list[:period])
+        pdm_s  = sum(plus_dm[:period])
+        mdm_s  = sum(minus_dm[:period])
+        dx_vals = []
+        for i in range(period, len(tr_list)):
+            atr_s  = atr_s  - atr_s  / period + tr_list[i]
+            pdm_s  = pdm_s  - pdm_s  / period + plus_dm[i]
+            mdm_s  = mdm_s  - mdm_s  / period + minus_dm[i]
+            pdi = 100 * pdm_s / atr_s if atr_s > 0 else 0.0
+            mdi = 100 * mdm_s / atr_s if atr_s > 0 else 0.0
+            denom = pdi + mdi
+            dx_vals.append(100 * abs(pdi - mdi) / denom if denom > 0 else 0.0)
+        return round(sum(dx_vals[-period:]) / period, 2) if dx_vals else 0.0
+    except Exception:
+        return 0.0
+
+
+# ── v27: slope EMA21 en 15m ───────────────────────────────────────────────────
+def _ema_slope(ema_series: list, lookback: int = 3) -> float:
+    """
+    Retorna el slope normalizado de los últimos `lookback` valores de la EMA.
+    Positivo = tendencia acelerando hacia arriba; negativo = hacia abajo.
+    """
+    if not ema_series or len(ema_series) < lookback + 1:
+        return 0.0
+    tail = ema_series[-(lookback + 1):]
+    delta = tail[-1] - tail[0]
+    base = tail[0]
+    return delta / base if base != 0 else 0.0
+
+
 async def analyze_pair(
     exch,
     symbol: str,
@@ -281,11 +339,6 @@ async def analyze_pair(
     funding_rate: float = 0.0,
     regime: Optional[str] = None,
 ) -> SignalResult:
-    """
-    v23: cuando ohlcv_fn es None (llamada directa sin caché),
-    se usa el semáforo interno _analyze_pair_sem para limitar
-    la concurrencia de fetches directos desde pair_scanner.
-    """
     if ohlcv_fn is not None:
         return await _analyze_pair_inner(exch, symbol, ohlcv_fn, funding_rate, regime)
     async with _get_analyze_sem():
@@ -316,7 +369,6 @@ async def _analyze_pair_inner(
         log.error("[signal_engine] OHLCV fetch error %s: %s", symbol, e)
         return _hold_result(symbol, f"OHLCV error: {e}")
 
-    # v21 P1
     bars_15m = _clean_bars(bars_15m)
     bars_1h  = _clean_bars(bars_1h)
     bars_4h  = _clean_bars(bars_4h)
@@ -324,7 +376,6 @@ async def _analyze_pair_inner(
     if len(bars_15m) < 30:
         return _hold_result(symbol, f"Insuficientes velas 15m ({len(bars_15m)})")
 
-    # v23: modo degradado — retry 1h si llegó vacío y estamos en fetch directo
     if ohlcv_fn is None and len(bars_1h) < 20:
         log.warning(
             "[signal_engine] %s 1h vacío tras fetch inicial (%d velas) — reintentando en %.1fs",
@@ -357,7 +408,6 @@ async def _analyze_pair_inner(
     if vol_ratio_15m < _VOL_MIN_GLOBAL:
         return _hold_result(symbol, f"Vol={vol_ratio_15m:.2f}x — mercado dormido (min {_VOL_MIN_GLOBAL}x)")
 
-    # v21 P2: volumen vela de señal
     if len(bars_15m) >= _VOL_AVG_WINDOW + 1:
         vol_last    = float(bars_15m[-1][5])
         vol_avg_ref = sum(float(b[5]) for b in bars_15m[-_VOL_AVG_WINDOW - 1:-1]) / _VOL_AVG_WINDOW
@@ -367,13 +417,13 @@ async def _analyze_pair_inner(
         log.debug("[signal_engine] %s vol_signal=%.2fx (min %.1fx)", symbol, vol_signal, _VOL_SIGNAL_MIN)
 
     setup_type, signal_str, score, max_score, reasons = _detect_setup(
-        ind_15m, ind_1h, ind_4h, bars_15m
+        ind_15m, ind_1h, ind_4h, bars_15m, regime
     )
 
     if signal_str == "NEUTRAL" or setup_type is None:
         return _hold_result(symbol, f"NEUTRAL ({', '.join(reasons[-3:])})")
 
-    # ── v22: MTF bias filter ─────────────────────────────────────────────────
+    # ── v22: MTF bias filter ──────────────────────────────────────────────────
     bias_1h = _mtf_bias(ind_1h)
     mtf_aligned = (bias_1h is None) or (bias_1h == signal_str)
     if not mtf_aligned:
@@ -393,7 +443,6 @@ async def _analyze_pair_inner(
     if session_block:
         return _hold_result(symbol, session_block)
 
-    # v21 P2: filtro funding
     if signal_str == "LONG" and funding_rate > _FUNDING_LONG_MAX:
         return _hold_result(symbol, f"Funding {funding_rate:.4%} > {_FUNDING_LONG_MAX:.4%} → no LONG")
     if signal_str == "SHORT" and funding_rate < _FUNDING_SHORT_MIN:
@@ -406,7 +455,7 @@ async def _analyze_pair_inner(
     open_price  = float(last_bar[1])
     entry = close_price
 
-    # v25: filtro vela doji — bloquea entradas en velas de indecisión
+    # v25: filtro vela doji
     candle_body  = abs(close_price - open_price)
     candle_range = high_price - low_price
     if candle_range > 0 and candle_body / candle_range < _DOJI_BODY_MIN_PCT:
@@ -435,20 +484,46 @@ async def _analyze_pair_inner(
         tp1_mult = _TP1_ATR_MULT
         tp2_mult = float(os.getenv("TP2_ATR_MULT_TENDENCIA", str(_TP2_ATR_MULT)))
 
+    # ── v27: TP dinámico por vol_ratio ────────────────────────────────────────
+    vol_ratio_now = ind_15m.get("vol_ratio", 1.0)
+    tp_vol_scale = 1.0
+    if vol_ratio_now >= _TP_VOL_HIGH_THRESHOLD:
+        tp_vol_scale = _TP_VOL_HIGH_MULT
+        log.debug(
+            "[signal_engine] %s TP expandido (vol_ratio=%.2fx >= %.1fx) scale=%.2f",
+            symbol, vol_ratio_now, _TP_VOL_HIGH_THRESHOLD, tp_vol_scale,
+        )
+    elif vol_ratio_now < _TP_VOL_LOW_THRESHOLD:
+        # Solo TP1 se comprime; TP2 mantiene para respetar el objetivo largo
+        tp_vol_scale = None  # señal de escala diferenciada
+        log.debug(
+            "[signal_engine] %s TP1 conservador (vol_ratio=%.2fx < %.1fx)",
+            symbol, vol_ratio_now, _TP_VOL_LOW_THRESHOLD,
+        )
+
     if signal_str == "LONG":
         if _SL_ATR_DYNAMIC:
             sl_atr = round(entry - sl_mult * atr_val, 6)
         else:
             sl_atr = round(min(low_price - _atr_buf, entry - sl_mult * atr_val), 6)
-        tp1 = round(entry + tp1_mult * atr_val, 6)
-        tp2 = round(entry + tp2_mult * atr_val, 6)
+        if tp_vol_scale is None:
+            # vol bajo: TP1 conservador, TP2 normal
+            tp1 = round(entry + tp1_mult * atr_val * _TP_VOL_LOW_MULT, 6)
+            tp2 = round(entry + tp2_mult * atr_val, 6)
+        else:
+            tp1 = round(entry + tp1_mult * atr_val * tp_vol_scale, 6)
+            tp2 = round(entry + tp2_mult * atr_val * tp_vol_scale, 6)
     else:
         if _SL_ATR_DYNAMIC:
             sl_atr = round(entry + sl_mult * atr_val, 6)
         else:
             sl_atr = round(max(high_price + _atr_buf, entry + sl_mult * atr_val), 6)
-        tp1 = round(entry - tp1_mult * atr_val, 6)
-        tp2 = round(entry - tp2_mult * atr_val, 6)
+        if tp_vol_scale is None:
+            tp1 = round(entry - tp1_mult * atr_val * _TP_VOL_LOW_MULT, 6)
+            tp2 = round(entry - tp2_mult * atr_val, 6)
+        else:
+            tp1 = round(entry - tp1_mult * atr_val * tp_vol_scale, 6)
+            tp2 = round(entry - tp2_mult * atr_val * tp_vol_scale, 6)
 
     sl = _structure_sl(bars_1h, signal_str, entry, sl_atr, atr_val)
 
@@ -472,12 +547,12 @@ async def _analyze_pair_inner(
     else:
         suggested_lev = max(1, int(_MAX_LEV * _EARLY_LEV_FACTOR))
 
-    # ── v22: R/R mínimo dinámico por régimen ────────────────────────────────
     effective_min_rr = _min_rr_for_regime(regime)
-
-    # v25: R/R mínimo específico para REVERSAL (siempre más exigente)
     if setup_type == "REVERSAL":
         effective_min_rr = max(effective_min_rr, _MIN_RR_REVERSAL)
+
+    # v27: ratio efectivo dinámico según régimen
+    effective_min_ratio = _min_score_ratio_for_regime(regime)
 
     is_fast_valid = (
         entry_mode in ("FAST", "STRONG")
@@ -485,25 +560,29 @@ async def _analyze_pair_inner(
         and rr >= _FAST_ENTRY_MIN_RR
     )
 
-    # v26: ratio score/max_score — filtro de calidad relativa
     score_ratio = score / max_score if max_score > 0 else 0.0
-    ratio_ok = score_ratio >= MIN_SCORE_RATIO
+    ratio_ok = score_ratio >= effective_min_ratio
 
-    # v25: EARLY nunca es señal pública válida — baja convicción
     if entry_mode == "EARLY":
         is_valid = False
     else:
         is_valid = (score >= MIN_SCORE and rr >= effective_min_rr and ratio_ok) or is_fast_valid
 
+    # v27: nota de TP dinámico para el log
+    _tp_note = (
+        f"TP×{tp_vol_scale:.2f}" if tp_vol_scale and tp_vol_scale != 1.0
+        else ("TP1×{:.2f}".format(_TP_VOL_LOW_MULT) if tp_vol_scale is None else "TP=std")
+    )
+
     log.info(
-        "[signal_engine] %s %s [%s] score=%d/%d ratio=%.2f(min=%.2f) RR=%.2f(min=%.2f) entry=%.6f sl=%.6f "
-        "tp1=%.6f tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s vwap=%.6f "
-        "funding=%.4f%% mtf_aligned=%s regime=%s | %s",
-        symbol, signal_str, setup_type, score, max_score, score_ratio, MIN_SCORE_RATIO,
+        "[signal_engine] %s %s [%s] score=%d/%d ratio=%.2f(min=%.2f) RR=%.2f(min=%.2f) "
+        "entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s "
+        "vwap=%.6f funding=%.4f%% mtf_aligned=%s regime=%s %s | %s",
+        symbol, signal_str, setup_type, score, max_score, score_ratio, effective_min_ratio,
         rr, effective_min_rr,
         entry, sl, tp1, tp2, atr_val, suggested_lev, entry_mode, is_valid,
         ind_15m.get("vwap", 0.0), funding_rate * 100,
-        mtf_aligned, regime or "none",
+        mtf_aligned, regime or "none", _tp_note,
         " · ".join(reasons),
     )
 
@@ -523,39 +602,45 @@ async def _analyze_pair_inner(
         indicators=indicators,
         is_valid=is_valid,
         reason="" if is_valid else (
-            f"[{setup_type}] score={score}/{max_score} ratio={score_ratio:.2f}(min={MIN_SCORE_RATIO:.2f}) "
+            f"[{setup_type}] score={score}/{max_score} ratio={score_ratio:.2f}(min={effective_min_ratio:.2f}) "
             f"rr={rr:.2f}(min_rr={effective_min_rr:.2f} regime={regime or 'none'})"
             + (" [EARLY bloqueado]" if entry_mode == "EARLY" else "")
             + ("" if ratio_ok else " [RATIO insuficiente]")
         ),
         extra={
-            "setup_type":       setup_type,
-            "sl_atr":           sl_atr,
-            "sl_used":          sl,
-            "is_fast":          is_fast_valid,
-            "funding_rate":     funding_rate,
-            "mtf_aligned":      mtf_aligned,
-            "bias_1h":          bias_1h,
-            "regime":           regime,
-            "effective_min_rr": effective_min_rr,
-            "is_premium":       score >= PREMIUM_SCORE,
-            "score_ratio":      round(score_ratio, 3),
+            "setup_type":         setup_type,
+            "sl_atr":             sl_atr,
+            "sl_used":            sl,
+            "is_fast":            is_fast_valid,
+            "funding_rate":       funding_rate,
+            "mtf_aligned":        mtf_aligned,
+            "bias_1h":            bias_1h,
+            "regime":             regime,
+            "effective_min_rr":   effective_min_rr,
+            "effective_min_ratio": effective_min_ratio,
+            "is_premium":         score >= PREMIUM_SCORE,
+            "score_ratio":        round(score_ratio, 3),
+            "tp_vol_scale":       tp_vol_scale if tp_vol_scale else _TP_VOL_LOW_MULT,
         },
     )
 
 
 def _detect_setup(
-    i15: dict, i1h: dict, i4h: dict, bars_15m: list
+    i15: dict, i1h: dict, i4h: dict, bars_15m: list,
+    regime: Optional[str] = None,
 ) -> Tuple[Optional[str], str, int, int, List[str]]:
+    # v27: ratio efectivo pasado a la selección de candidatos
+    effective_ratio = _min_score_ratio_for_regime(regime)
     candidates = []
     for mode_fn in (_score_tendencia, _score_breakout, _score_reversal):
         setup_type, signal_str, score, max_score, reasons = mode_fn(i15, i1h, i4h, bars_15m)
-        # v26: aplicar MIN_SCORE_RATIO también en la selección de candidatos
         score_ratio = score / max_score if max_score > 0 else 0.0
-        if signal_str != "NEUTRAL" and score >= MIN_SCORE and score_ratio >= MIN_SCORE_RATIO:
+        if signal_str != "NEUTRAL" and score >= MIN_SCORE and score_ratio >= effective_ratio:
             candidates.append((setup_type, signal_str, score, max_score, reasons))
     if not candidates:
-        return None, "NEUTRAL", 0, 10, ["Ningún setup alcanzó MIN_SCORE o MIN_SCORE_RATIO"]
+        return None, "NEUTRAL", 0, 10, [
+            f"Ningún setup alcanzó MIN_SCORE o MIN_SCORE_RATIO(regime={regime or 'none'})"
+        ]
     best = max(candidates, key=lambda x: x[2] / x[3])
     if len(candidates) > 1:
         log.debug(
@@ -568,13 +653,15 @@ def _detect_setup(
 
 def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     """
-    v25: MAX=13 (se añade +1 por estructura HH/HL o LL/LH en 15m).
-    REQUISITOS OBLIGATORIOS:
+    v27: MAX=15 (v26 era 13).
+      - +2 ADX + slope: confirma tendencia real vs rango disfrazado.
+      - +2 confluencia 4h extendida: MACD4h alineado además de ST4h.
+    REQUISITOS OBLIGATORIOS (sin cambios desde v25):
       - EMA 1h en tendencia definida
       - MACD15m a favor
       - ST1h a favor
     """
-    MAX = 13
+    MAX = 15
     reasons: List[str] = []
 
     if not i1h:
@@ -620,11 +707,19 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
     reasons.append("ST1h en favor +1")
 
     st4h_ok = False
+    macd4h_ok = False
     if i4h:
         st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
+        macd4h_ok = (direction == "LONG" and i4h.get("macd_bull")) or (direction == "SHORT" and i4h.get("macd_bear"))
         if st4h_ok:
             score += 1
             reasons.append("ST4h en favor +1")
+            # v27: confluencia 4h extendida — MACD4h alineado además de ST4h
+            if macd4h_ok:
+                score += 2
+                reasons.append("MACD4h + ST4h alineados — confluencia institucional total +2")
+            else:
+                reasons.append("ST4h OK pero MACD4h no confirma (sin bonus institucional)")
         else:
             score = max(0, score - 2)
             reasons.append("ST4h en contra — penalización -2")
@@ -633,6 +728,24 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
 
     score += 1
     reasons.append("MACD15m en favor +1")
+
+    # v27: ADX + slope EMA21_15m — filtro de tendencia real
+    closes_15m = [float(b[4]) for b in bars_15m]
+    highs_15m  = [float(b[2]) for b in bars_15m]
+    lows_15m   = [float(b[3]) for b in bars_15m]
+    adx_val = _adx_simple(highs_15m, lows_15m, closes_15m, 14)
+    ema21_series = i15.get("_ema21_series", [])
+    slope = _ema_slope(ema21_series, lookback=3) if ema21_series else 0.0
+    slope_ok = (direction == "LONG" and slope > 0) or (direction == "SHORT" and slope < 0)
+
+    if adx_val >= _ADX_MIN and slope_ok:
+        reasons.append(f"ADX={adx_val:.1f}(≥{_ADX_MIN}) + slope EMA21={slope*100:.3f}% — tendencia real confirmada")
+    elif adx_val < _ADX_MIN:
+        score = max(0, score - 2)
+        reasons.append(f"ADX={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -2")
+    elif not slope_ok:
+        score = max(0, score - 1)
+        reasons.append(f"Slope EMA21={slope*100:.3f}% en contra de {direction} — penalización -1")
 
     ema21_15m = i15.get("ema21")
     close_15m = i15.get("close", 0)
@@ -699,7 +812,6 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
     else:
         reasons.append(f"Confluencia ST parcial (15m={st15m_ok} 1h={st1h_ok} 4h={st4h_ok})")
 
-    # v21 P3 / v24: VWAP diario
     vwap_val = i15.get("vwap", 0.0)
     if vwap_val and vwap_val > 0 and close_15m:
         vwap_ok = (direction == "LONG" and close_15m > vwap_val) or \
@@ -735,12 +847,12 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
 
 def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     """
-    v25: fix del squeeze filter — umbral corregido a hist_atr * (1 - squeeze_pct/100).
-    Con BREAKOUT_SQUEEZE_PCT=40, el ATR actual debe ser < hist_atr * 0.60 para
-    confirmar compresión real. Antes era hist_atr * 1.1 (casi nunca bloqueaba).
-    MAX sigue siendo 8.
+    v27: detección de retesteo post-ruptura (+2 si el precio actual está
+    dentro del _BREAKOUT_RETEST_TOL% del nivel roto, indicando una entrada
+    de mayor calidad con menor riesgo de fakeout).
+    MAX sube de 8 a 10.
     """
-    MAX = 8
+    MAX = 10
     reasons: List[str] = []
     if len(bars_15m) < _BREAKOUT_WINDOW + 2:
         return "BREAKOUT", "NEUTRAL", 0, MAX, ["Velas insuficientes para breakout"]
@@ -754,14 +866,21 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     breakout_pad = atr_val * _BREAKOUT_ATR_CONFIRM
     broke_up   = current_close > (range_high + breakout_pad)
     broke_down = current_close < (range_low  - breakout_pad)
-    if not broke_up and not broke_down:
+
+    # v27: detección de retesteo — el precio está cerca del nivel roto (sin haberlo perforado de nuevo)
+    retest_up   = (not broke_up and not broke_down and
+                   abs(current_close - range_high) / range_high <= _BREAKOUT_RETEST_TOL and
+                   current_close >= range_high * (1 - _BREAKOUT_RETEST_TOL))
+    retest_down = (not broke_up and not broke_down and
+                   abs(current_close - range_low) / range_low <= _BREAKOUT_RETEST_TOL and
+                   current_close <= range_low * (1 + _BREAKOUT_RETEST_TOL))
+
+    if not broke_up and not broke_down and not retest_up and not retest_down:
         return "BREAKOUT", "NEUTRAL", 0, MAX, [
-            f"Sin rotura: close={current_close:.4f} rango=[{range_low:.4f}-{range_high:.4f}]"
+            f"Sin rotura ni retesteo: close={current_close:.4f} rango=[{range_low:.4f}-{range_high:.4f}]"
         ]
 
-    # v25 FIX: squeeze filter corregido — umbral real = hist_atr * (1 - squeeze_pct/100)
-    # Con squeeze_pct=40: ATR actual debe ser < hist_atr * 0.60
-    # (antes era hist_atr * 1.1 — demasiado permisivo, casi nunca bloqueaba)
+    # squeeze filter (v25 fix)
     if atr_val > 0 and len(bars_15m) >= _BREAKOUT_WINDOW * 2:
         hist_highs  = [float(b[2]) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
         hist_lows   = [float(b[3]) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
@@ -771,27 +890,43 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             squeeze_threshold = hist_atr * (1.0 - _BREAKOUT_SQUEEZE_PCT / 100.0)
             if atr_val > squeeze_threshold:
                 log.debug(
-                    "[signal_engine] BREAKOUT bloqueado: ATR actual=%.6f > umbral=%.6f (hist_atr=%.6f, squeeze=%.0f%%)",
-                    atr_val, squeeze_threshold, hist_atr, _BREAKOUT_SQUEEZE_PCT,
+                    "[signal_engine] BREAKOUT bloqueado: ATR actual=%.6f > umbral=%.6f",
+                    atr_val, squeeze_threshold,
                 )
                 return "BREAKOUT", "NEUTRAL", 0, MAX, [
-                    f"Sin compresión previa: ATR actual ({atr_val:.6f}) > umbral ({squeeze_threshold:.6f}) "
-                    f"= hist_atr*{1-_BREAKOUT_SQUEEZE_PCT/100:.2f} → posible fakeout"
+                    f"Sin compresión previa: ATR ({atr_val:.6f}) > umbral ({squeeze_threshold:.6f})"
                 ]
             reasons.append(
                 f"ATR squeeze OK: actual={atr_val:.6f} < umbral={squeeze_threshold:.6f} "
-                f"(hist={hist_atr:.6f}, squeeze={_BREAKOUT_SQUEEZE_PCT:.0f}%) +0"
+                f"(hist={hist_atr:.6f}) +0"
             )
 
-    direction = "LONG" if broke_up else "SHORT"
+    # dirección
+    if broke_up or retest_up:
+        direction = "LONG"
+    else:
+        direction = "SHORT"
+
+    is_retest = retest_up or retest_down
+
     score = 2
-    reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} confirmada +2")
+    if is_retest:
+        # Retesteo: el precio vuelve al nivel roto — entrada premium
+        score += 2
+        reasons.append(
+            f"Retesteo del nivel {'superior' if retest_up else 'inferior'} "
+            f"(close={current_close:.4f} ≈ {range_high if retest_up else range_low:.4f}) +4 total"
+        )
+    else:
+        reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} confirmada +2")
+
     if vol_ratio >= _BREAKOUT_VOL_MIN:
         score += 2; reasons.append(f"Vol={vol_ratio:.1f}x breakout +2")
     elif vol_ratio >= 1.1:
         score += 1; reasons.append(f"Vol={vol_ratio:.1f}x moderado +1")
     else:
         reasons.append(f"Vol={vol_ratio:.1f}x BAJO — posible fakeout")
+
     if i1h:
         st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
         if st1h_ok: score += 1; reasons.append("ST1h confirma +1")
@@ -814,11 +949,12 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     """
-    v25: +1 si precio dentro del 0.3% de la EMA50_1h (nivel clave confirmado).
-    MAX pasa de 11 a 12.
-    v24: ST1h es REQUISITO OBLIGATORIO. Divergencias RSI 15m suman +2.
+    v27: swing levels de estructura — si el precio está dentro del
+    _REVERSAL_SWING_TOL% de un swing_low/swing_high histórico real,
+    suma +2 (más relevante que proximidad a EMA50).
+    MAX sube de 12 a 14.
     """
-    MAX = 12
+    MAX = 14
     reasons: List[str] = []
     rsi_1h = i1h.get("rsi_val") if i1h else None
     if rsi_1h is None:
@@ -829,7 +965,7 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         return "REVERSAL", "NEUTRAL", 0, MAX, [f"RSI1h={rsi_1h:.0f} no es extremo"]
     direction = "LONG" if is_long else "SHORT"
 
-    # v24: ST1h OBLIGATORIO — sin él no hay reversal válido
+    # v24: ST1h OBLIGATORIO
     if i1h:
         st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
         if not st1h_ok:
@@ -887,16 +1023,51 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         else:
             reasons.append(f"Precio lejos EMA21_1h ({dist_pct*100:.2f}%)")
 
-    # v25: EMA50_1h como nivel clave de soporte/resistencia para reversales
+    # v25: EMA50_1h nivel clave
     ema50_1h = i1h.get("ema50") if i1h else None
     if ema50_1h and close_15m:
         dist_ema50 = abs(close_15m - ema50_1h) / ema50_1h
         if dist_ema50 <= 0.003:
-            score += 1; reasons.append(f"Precio en EMA50_1h (dist={dist_ema50*100:.2f}%) nivel clave +1")
+            score += 1; reasons.append(f"Precio en EMA50_1h (dist={dist_ema50*100:.2f}%) +1")
         else:
             reasons.append(f"Precio lejos EMA50_1h ({dist_ema50*100:.2f}%)")
 
-    # v24: divergencias RSI 15m — la confirmación más fiable de un giro
+    # v27: swing levels de estructura — confirmación de nivel histórico real
+    swing_level_hit = False
+    try:
+        from bot.structure_analyzer import analyze_structure
+        df_15m = _bars_to_df(bars_15m)
+        direction_int = 1 if is_long else -1
+        struct = analyze_structure(df_15m, direction_int)
+        if is_long:
+            swing_ref = struct.get("last_sl", 0.0)
+            if swing_ref > 0 and close_15m > 0:
+                dist_swing = abs(close_15m - swing_ref) / swing_ref
+                if dist_swing <= _REVERSAL_SWING_TOL:
+                    score += 2
+                    swing_level_hit = True
+                    reasons.append(
+                        f"Precio en swing_low histórico ({swing_ref:.4f}, dist={dist_swing*100:.2f}%) — nivel clave +2"
+                    )
+                else:
+                    reasons.append(f"Precio lejos del swing_low histórico ({swing_ref:.4f}, dist={dist_swing*100:.2f}%)")
+        else:
+            swing_ref = struct.get("last_sh", 0.0)
+            if swing_ref > 0 and close_15m > 0:
+                dist_swing = abs(close_15m - swing_ref) / swing_ref
+                if dist_swing <= _REVERSAL_SWING_TOL:
+                    score += 2
+                    swing_level_hit = True
+                    reasons.append(
+                        f"Precio en swing_high histórico ({swing_ref:.4f}, dist={dist_swing*100:.2f}%) — nivel clave +2"
+                    )
+                else:
+                    reasons.append(f"Precio lejos del swing_high histórico ({swing_ref:.4f}, dist={dist_swing*100:.2f}%)")
+    except Exception as e:
+        log.debug("[signal_engine] swing_level REVERSAL error: %s", e)
+        reasons.append("Swing levels no disponibles")
+
+    # v24: divergencias RSI 15m
     try:
         div = rsi_divergence(bars_15m)
         if div == "BULLISH" and is_long:
@@ -921,36 +1092,38 @@ def _compute_indicators(bars: list) -> dict:
     highs  = [b[2] for b in bars]
     lows   = [b[3] for b in bars]
     vols   = [b[5] for b in bars]
-    ema21 = ema(closes, 21)
-    ema50 = ema(closes, 50)
+    ema21_series = ema(closes, 21)
+    ema50_series = ema(closes, 50)
+    ema21 = ema21_series[-1] if ema21_series else None
+    ema50 = ema50_series[-1] if ema50_series else None
     rsi14 = rsi(closes, 14)
     m_line, s_line, hist = macd(closes, 12, 26, 9)
     st_dir, st_val = supertrend(highs, lows, closes, 10, 3.0)
     atr14  = calc_atr(highs, lows, closes, 14)
-    # v24: VWAP diario real (reset a 00:00 UTC)
     vwap_v = calc_vwap(bars, reset_daily=True)
     vol_window = min(_VOL_AVG_WINDOW, len(vols))
     avg_vol   = sum(vols[-vol_window:]) / vol_window if vol_window > 0 else 1.0
     vol_ratio = round(vols[-1] / avg_vol, 3) if avg_vol > 0 else 1.0
     price_dir = "rising" if len(closes) >= 2 and closes[-1] > closes[-2] else "falling"
     return {
-        "ema21":     ema21[-1] if ema21 else None,
-        "ema50":     ema50[-1] if ema50 else None,
-        "ema_bull":  bool(ema21 and ema50 and ema21[-1] > ema50[-1]),
-        "ema_bear":  bool(ema21 and ema50 and ema21[-1] < ema50[-1]),
-        "rsi_val":   rsi14,
-        "macd_hist": hist,
-        "macd_bull": hist > 0,
-        "macd_bear": hist < 0,
-        "st_dir":    st_dir,
-        "st_bull":   st_dir == 1,
-        "st_bear":   st_dir == -1,
-        "atr":       atr14,
-        "vol_ratio": vol_ratio,
-        "_avg_vol":  avg_vol,
-        "price_dir": price_dir,
-        "close":     closes[-1],
-        "vwap":      vwap_v,
+        "ema21":          ema21,
+        "ema50":          ema50,
+        "_ema21_series":  ema21_series,   # v27: necesario para slope
+        "ema_bull":       bool(ema21 and ema50 and ema21 > ema50),
+        "ema_bear":       bool(ema21 and ema50 and ema21 < ema50),
+        "rsi_val":        rsi14,
+        "macd_hist":      hist,
+        "macd_bull":      hist > 0,
+        "macd_bear":      hist < 0,
+        "st_dir":         st_dir,
+        "st_bull":        st_dir == 1,
+        "st_bear":        st_dir == -1,
+        "atr":            atr14,
+        "vol_ratio":      vol_ratio,
+        "_avg_vol":       avg_vol,
+        "price_dir":      price_dir,
+        "close":          closes[-1],
+        "vwap":           vwap_v,
     }
 
 
@@ -983,10 +1156,12 @@ def format_signal_block(signal) -> str:
     sl_note    = " [struct]" if signal.extra.get("sl_atr") and signal.extra.get("sl_used") != signal.extra.get("sl_atr") else ""
     fast_note  = " ⚡FAST" if signal.extra.get("is_fast") else ""
     mtf_note   = "" if signal.extra.get("mtf_aligned", True) else " ⚠️MTF"
-    # v25: marca premium si score >= PREMIUM_SCORE
     premium_note = " ⭐PREMIUM" if signal.extra.get("is_premium") else ""
+    # v27: nota de TP dinámico si hubo scaling
+    tp_scale = signal.extra.get("tp_vol_scale", 1.0)
+    tp_note = f" 📈TP×{tp_scale:.2f}" if tp_scale and tp_scale != 1.0 else ""
     lines = [
-        f"**{signal.symbol}** · {arrow} [{mode}]{fast_note}{premium_note}{mtf_note}",
+        f"**{signal.symbol}** · {arrow} [{mode}]{fast_note}{premium_note}{mtf_note}{tp_note}",
         f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
     ]
     if signal.entry:
