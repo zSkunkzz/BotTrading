@@ -51,6 +51,11 @@ FIX run_watchdog (2026-06-02):
   no existía (sólo existía _watchdog_tick interno).
   Fix: añadir método público async run_watchdog(traders) que ejecuta
   _watchdog_tick() en loop cada KS_WATCHDOG_INTERVAL_S segundos.
+
+FIX run() alias (2026-06-06):
+  main.py llama asyncio.create_task(kill_switch.run()) pero la clase solo
+  exponía run_watchdog(). Añadido run() como alias directo de run_watchdog()
+  para compatibilidad con la firma de main.py.
 """
 
 import asyncio
@@ -370,6 +375,9 @@ class KillSwitch:
             except Exception as e:
                 logger.warning("KillSwitch watchdog error: %s", e)
             await asyncio.sleep(interval)
+
+    # Alias para compatibilidad con main.py que llama kill_switch.run()
+    run = run_watchdog
 
     # ── Persistencia ────────────────────────────────────────────────────────────────────
 
