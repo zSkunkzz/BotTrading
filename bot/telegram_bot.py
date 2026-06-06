@@ -64,7 +64,7 @@ async def notify_startup(pairs: list, dry_run: bool, top_n: int):
     mode = "\U0001f9ea DRY RUN" if dry_run else "\U0001f4b0 REAL MONEY"
     pairs_str = _esc(", ".join(pairs[:10])) + (" ..." if len(pairs) > 10 else "")
     await _send(
-        f"\U0001f916 <b>OKXBot arrancado</b> \u2014 {mode}\n"
+        f"\U0001f916 <b>TradingBot arrancado</b> \u2014 {mode}\n"
         f"Pares activos ({top_n}): <code>{pairs_str}</code>\n"
         f"Comandos: /stop | /pause | /resume | /ksstatus | /resetks"
     )
@@ -294,7 +294,7 @@ async def _cmd_stop(chat_id: int | str, args: list[str]) -> None:
         await reply(
             "\U0001f6d1 <b>\u00bfSeguro que quieres parar el bot?</b>\n\n"
             "Esto enviar\u00e1 SIGTERM al proceso \u2014 shutdown limpio.\n"
-            "Las posiciones abiertas <b>quedan vivas</b> en OKX "
+            "Las posiciones abiertas <b>quedan vivas en el exchange</b> "
             "(SL/TP siguen activos en el exchange).\n\n"
             "Confirma con: <code>/stop confirm</code>\n"
             "Para cancelar, ignora este mensaje."

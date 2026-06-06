@@ -1,7 +1,7 @@
 import logging
 import sys
 
-def setup_logger(name="OKXBot", level=logging.INFO):
+def setup_logger(name="TradingBot", level=logging.INFO):
     logger = logging.getLogger()
     logger.setLevel(level)
     handler = logging.StreamHandler(sys.stdout)
