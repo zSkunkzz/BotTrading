@@ -27,7 +27,12 @@ global_risk: GlobalRisk = None
 _trader_instances: dict = {}
 
 MAX_ACTIVE_TRADERS     = int(os.getenv("MAX_ACTIVE_TRADERS", "10"))
-_LEVERAGE_BASE         = int(os.getenv("LEVERAGE", "5"))
+# Lee LEVERAGE primero; si no existe, prueba BINGX_DEFAULT_LEVERAGE; default=5
+_LEVERAGE_BASE         = int(
+    os.getenv("LEVERAGE")
+    or os.getenv("BINGX_DEFAULT_LEVERAGE")
+    or "5"
+)
 _max_leverage_map: dict[str, int] = {}
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
 _USDC_PER_TRADE        = float(os.getenv("USDC_PER_TRADE", "20"))
@@ -314,13 +319,9 @@ async def main():
 
     # ── Balance service ─────────────────────────────────────────────────
     try:
-        # BingXClient ya está inicializado por el primer FuturesTrader.
-        # balance_svc.init_bingx() acepta la API key/secret para consultar
-        # el balance vía REST independientemente del ciclo de trading.
         balance_svc.init_bingx(_BINGX_API_KEY, _BINGX_API_SECRET, testnet=_USE_TESTNET)
         logger.info("\u2705 Balance service inicializado (BingX, testnet=%s)", _USE_TESTNET)
     except AttributeError:
-        # balance_svc aún no tiene init_bingx — se actualizará en siguiente PR
         logger.warning("\u26a0\ufe0f  balance_svc.init_bingx() no disponible — balance service desactivado.")
     except Exception as e:
         logger.warning("\u26a0\ufe0f  Balance service no pudo inicializarse: %s", e)
