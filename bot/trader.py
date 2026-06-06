@@ -2,15 +2,12 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
-v12 — Fix _fetch_candles() BingX klines v3 (2026-06-06):
-  - El endpoint /openApi/swap/v3/quote/klines devuelve cada candle como dict
-    con claves {open, high, low, close, volume, time} — no como lista posicional.
-  - Cuando BingX devuelve error o símbolo no disponible, la respuesta tiene
-    code != 0 y data=null/[]; ahora se loguea correctamente y se devuelve [].
-  - Fix del WARNING ': 0' en OHLCVCache: era causado por que la excepción
-    capturada era el code entero 0 (respuesta vacía), ahora se lanza
-    ValueError con mensaje descriptivo en su lugar.
+v13 — Fix #4 (2026-06-06):
+  - _release_pretrade_margin: elimina kwarg redundante notional_or_margin=0.0
+    en la llamada a register_close_safe(). El método ya obtiene el margen
+    exacto desde _open_margin_by_symbol[symbol] internamente.
 
+v12 — Fix _fetch_candles() BingX klines v3 (2026-06-06).
 v11 — Migración OKX → BingX (2026-06-06).
 """
 from __future__ import annotations
@@ -160,7 +157,7 @@ class FuturesTrader:
         self._stopped_event = asyncio.Event()
         self._trading_loop  = TradingLoop(symbol)
 
-    # ── Interfaz pública ──────────────────────────────────────────────────────
+    # ── Interfaz pública ─────────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None) -> None:
         try:
@@ -178,7 +175,7 @@ class FuturesTrader:
             logger.debug("[%s] cleanup ai_trader sessions: %s", self.symbol, e)
         self._stopped_event.set()
 
-    # ── Init BingX ──────────────────────────────────────────────────────
+    # ── Init BingX ──────────────────────────────────────────────────
 
     async def _get_ccxt(self) -> None:
         if self._bingx_client is not None:
@@ -198,7 +195,7 @@ class FuturesTrader:
         """Alias de compatibilidad: devuelve el BingXClient."""
         return self._bingx_client
 
-    # ── get_price ─────────────────────────────────────────────────────────
+    # ── get_price ───────────────────────────────────────────────────────────
 
     async def get_price(self) -> float:
         if self._bingx_client is None:
@@ -264,7 +261,7 @@ class FuturesTrader:
             f"[{self.symbol}] get_price: sin precio tras {_PRICE_FETCH_RETRIES} intentos: {last_exc}"
         )
 
-    # ── _set_leverage ──────────────────────────────────────────────────────
+    # ── _set_leverage ───────────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int) -> None:
         if self.dry_run:
@@ -292,7 +289,7 @@ class FuturesTrader:
         except Exception as e:
             logger.warning("[%s] _set_leverage error: %s", self.symbol, e)
 
-    # ── OHLCV ────────────────────────────────────────────────────────────
+    # ── OHLCV ─────────────────────────────────────────────────────────────
 
     async def get_ohlcv(self, timeframe: str, n: Optional[int] = None) -> list:
         bars_needed = n or _OHLCV_BARS
@@ -303,7 +300,7 @@ class FuturesTrader:
     def get_ohlcv_fn(self) -> Callable:
         return functools.partial(self.get_ohlcv)
 
-    # ── _fetch_candles ────────────────────────────────────────────────────────
+    # ── _fetch_candles ─────────────────────────────────────────────────────────────
 
     async def _fetch_candles(self, timeframe: str, n: int) -> list:
         """
@@ -390,7 +387,7 @@ class FuturesTrader:
         result.sort(key=lambda x: x[0])
         return result
 
-    # ── _get_positions ────────────────────────────────────────────────────────
+    # ── _get_positions ─────────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list[dict]:
         if self._bingx_client is None:
@@ -401,7 +398,7 @@ class FuturesTrader:
             logger.warning("[%s] _get_positions error: %s", self.symbol, e)
             return []
 
-    # ── _get_open_orders_raw ────────────────────────────────────────────────────
+    # ── _get_open_orders_raw ──────────────────────────────────────────────────────────
 
     async def _get_open_orders_raw(self) -> list[dict]:
         if self._bingx_client is None:
@@ -417,7 +414,7 @@ class FuturesTrader:
     async def _get_open_trigger_orders_raw(self) -> list[dict]:
         return await self._get_open_orders_raw()
 
-    # ── _place_tpsl ───────────────────────────────────────────────────────────
+    # ── _place_tpsl ─────────────────────────────────────────────────────────────
 
     async def _place_tpsl(
         self,
@@ -469,7 +466,7 @@ class FuturesTrader:
                 logger.error("[%s] _place_tpsl: TP exception: %s", self.symbol, e)
                 raise
 
-    # ── open_order ───────────────────────────────────────────────────────────
+    # ── open_order ────────────────────────────────────────────────────────────
 
     async def open_order(self, signal: dict, risk) -> None:
         is_long = signal.get("side") == "long"
@@ -648,13 +645,19 @@ class FuturesTrader:
             self.sl or 0, self.tp1 or 0, self.tp2 or 0,
         )
 
-    # ── _release_pretrade_margin ───────────────────────────────────────────────
+    # ── _release_pretrade_margin ───────────────────────────────────────────────────────
 
     def _release_pretrade_margin(self) -> None:
-        """Libera el margen reservado por pretrade_risk cuando la orden no se ejecuta."""
+        """
+        Libera el margen reservado por pretrade_risk cuando la orden no se ejecuta.
+
+        register_close_safe(symbol) extrae el margen exacto desde
+        _open_margin_by_symbol[symbol] internamente; no hace falta pasar
+        notional_or_margin (kwarg redundante eliminado en v13).
+        """
         try:
             from bot.pretrade_risk import pretrade_risk
-            pretrade_risk.register_close_safe(self.symbol, notional_or_margin=0.0)
+            pretrade_risk.register_close_safe(self.symbol)
             logger.info(
                 "[%s] _release_pretrade_margin: margen liberado (orden no ejecutada).",
                 self.symbol,
@@ -665,7 +668,7 @@ class FuturesTrader:
                 self.symbol, e,
             )
 
-    # ── close_position ───────────────────────────────────────────────────────────
+    # ── close_position ───────────────────────────────────────────────────────────────
 
     async def close_position(self, reason: str = "manual") -> None:
         if self.position is None:
@@ -688,8 +691,8 @@ class FuturesTrader:
                         self._bingx_client.cancel_all_open_tpsl
                     )
                     if cancelled:
-                        logger.info("[%s] close_position: %d SL/TP cancelados.",
-                                    self.symbol, len(cancelled))
+                        logger.info("[%s] close_position: órdenes SL/TP canceladas (batch).",
+                                    self.symbol)
                 except Exception as e:
                     logger.warning("[%s] close_position: cancel_tpsl error: %s", self.symbol, e)
 
