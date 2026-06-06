@@ -85,6 +85,7 @@ class PairScanner:
         min_price_change_pct=None,
         top_n=None,
         refresh_interval_min=None,
+        on_pairs_updated=None,
     ):
         self.min_volume_usdt      = min_volume_usdt      if min_volume_usdt      is not None else _MIN_VOLUME
         self.min_price_change_pct = min_price_change_pct if min_price_change_pct is not None else _MIN_CHANGE_PCT
@@ -92,6 +93,7 @@ class PairScanner:
         self.refresh_interval     = (refresh_interval_min if refresh_interval_min is not None else _REFRESH_MIN) * 60
         self.active_pairs: list   = []
         self._last_scored: list   = []
+        self.on_pairs_updated     = on_pairs_updated
 
         extra = os.getenv("SYMBOL_BLACKLIST", "")
         self.blacklist = NON_CRYPTO_BASES | {
@@ -301,9 +303,15 @@ class PairScanner:
     def normalize(self, symbol: str) -> str:
         return symbol.replace("/", "").replace(":USDT", "").replace("USDT", "").upper()
 
-    async def run_scanner_loop(self, on_update_callback):
+    async def run_scanner_loop(self, on_update_callback=None):
         import inspect
-        cb_params = len(inspect.signature(on_update_callback).parameters)
+        # Usar el callback del __init__ si no se pasa uno explícitamente
+        callback = on_update_callback or self.on_pairs_updated
+        if callback is None:
+            logger.error("[PairScanner] run_scanner_loop: no se proporcionó callback — abortando loop")
+            return
+
+        cb_params = len(inspect.signature(callback).parameters)
 
         while True:
             try:
@@ -333,13 +341,13 @@ class PairScanner:
 
                     if added or removed:
                         if cb_params >= 3:
-                            await on_update_callback(new_pairs, added, removed)
+                            await callback(new_pairs, added, removed)
                         else:
                             logger.warning(
                                 "[PairScanner] Callback con firma antigua — "
                                 "traders salientes no esperaran al ciclo siguiente"
                             )
-                            await on_update_callback(new_pairs)
+                            await callback(new_pairs)
                     else:
                         logger.info("✅ Sin cambios en pares activos (%d pares)", len(self.active_pairs))
 
