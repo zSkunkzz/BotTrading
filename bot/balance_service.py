@@ -1,18 +1,23 @@
 """
 bot/balance_service.py — Servicio de consulta de balance con caché.
 
-v5 — OKX only:
-  Usa okx.Account REST via init_okx().
-  Campo USDT disponible en futuros OKX:
-    GET /api/v5/account/balance → details[ccy=="USDT"].availBal
-  Fallback: eq (equity) si availBal es 0, luego totalEq de la cuenta.
+v6 — BingX:
+  Usa la API REST de BingX para futuros perpetuos:
+    GET /openApi/swap/v2/user/balance
+  Campo USDT disponible: data.balance.availableMargin
+  Fallback: balance.balance (equity total)
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import time
+import urllib.parse
 from typing import Callable, Optional
+
+import requests
 
 log = logging.getLogger(__name__)
 
@@ -29,42 +34,63 @@ class BalanceService:
         self._fetch_fn:      Optional[Callable] = None  # async () -> float
         self._ready          = False
 
-    # ── OKX ──────────────────────────────────────────────────────
-    def init_okx(self, account_api) -> None:
+    # ── BingX ─────────────────────────────────────────────────────
+    def init_bingx(self, api_key: str, api_secret: str, testnet: bool = False) -> None:
         """
-        Inicializa el servicio con una instancia de okx.Account.AccountAPI.
+        Inicializa el servicio con las credenciales de BingX.
         La llamada real se hace en asyncio.to_thread para no bloquear el loop.
         """
+        base = (
+            "https://open-api-vst.bingx.com"
+            if testnet
+            else "https://open-api.bingx.com"
+        )
+
+        def _sync_fetch() -> float:
+            ts     = str(int(time.time() * 1000))
+            params = {"timestamp": ts}
+            qs     = urllib.parse.urlencode(sorted(params.items()))
+            sign   = hmac.new(
+                api_secret.encode(), qs.encode(), hashlib.sha256
+            ).hexdigest()
+            params["sign"] = sign
+
+            resp = requests.get(
+                f"{base}/openApi/swap/v2/user/balance",
+                params=params,
+                headers={"X-BX-APIKEY": api_key},
+                timeout=10,
+            ).json()
+
+            bal = (resp.get("data") or {}).get("balance") or {}
+
+            avail = float(bal.get("availableMargin") or 0)
+            if avail > 0:
+                log.debug("[BalanceSvc] availableMargin=%.2f USDT", avail)
+                return avail
+
+            equity = float(bal.get("balance") or 0)
+            if equity > 0:
+                log.debug("[BalanceSvc] availableMargin=0, usando equity=%.2f", equity)
+                return equity
+
+            log.debug("[BalanceSvc] balance response: %s", resp)
+            return 0.0
+
         async def _fetch() -> float:
-            data = await asyncio.to_thread(account_api.get_account_balance)
-            details = (
-                data.get("data", [{}])[0]
-                    .get("details", [])
-            )
-            usdt_detail = next(
-                (d for d in details if d.get("ccy") in ("USDT", "USDC")),
-                None,
-            )
-            if usdt_detail:
-                avail = float(usdt_detail.get("availBal") or 0)
-                if avail > 0:
-                    log.debug("[BalanceSvc] availBal=%.2f USDT", avail)
-                    return avail
-                total = float(usdt_detail.get("eq") or 0)
-                if total > 0:
-                    log.debug("[BalanceSvc] availBal=0, usando eq=%.2f", total)
-                    return total
-            # último recurso: totalEq de la cuenta
-            total_eq = float(
-                data.get("data", [{}])[0].get("totalEq") or 0
-            )
-            log.debug("[BalanceSvc] fallback totalEq=%.2f", total_eq)
-            return total_eq
+            return await asyncio.to_thread(_sync_fetch)
 
         self._fetch_fn = _fetch
         self._ready    = True
 
-    # ─────────────────────────────────────────────────────────────
+    # Alias de compatibilidad por si algún módulo aún llama init_okx
+    def init_okx(self, *args, **kwargs) -> None:  # type: ignore[override]
+        log.warning(
+            "[BalanceSvc] init_okx() llamado pero el bot está en modo BingX. "
+            "Usa init_bingx() en su lugar."
+        )
+
+    # ────────────────────────────────────────────────────────────
 
     def is_ready(self) -> bool:
         return self._ready
@@ -79,7 +105,7 @@ class BalanceService:
         self.invalidate(reason=f"SL/TP externo detectado para {symbol}")
         log.info(
             "[BalanceSvc] Balance invalidado por SL/TP externo en %s — "
-            "próxima consulta refrescará desde OKX.",
+            "próxima consulta refrescará desde BingX.",
             symbol,
         )
 
