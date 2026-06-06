@@ -47,32 +47,25 @@ Notas positionSide:
   /openApi/swap/v1/positionSide/dual. La variable de entorno
   BINGX_POSITION_MODE=hedge permite forzarlo sin llamada API.
 
+Fixes (2026-06-06 v9) — get_positions compatible con trading_loop:
+
+  Fix #13 — get_positions: claves 'side', 'entryPx', 'size' (🔴 CRÍTICO)
+    trading_loop.py accede a ep["side"], ep["entryPx"] y ep["size"].
+    La versión anterior devolvía 'posSide', 'avgPx' y 'pos', causando
+    KeyError: 'side' en cada iteración del loop.
+    Ahora get_positions() devuelve AMBOS juegos de claves:
+      - 'side'    (= 'long' | 'short')    ← usa trading_loop
+      - 'entryPx' (= float)               ← usa trading_loop
+      - 'size'    (= float abs)           ← usa trading_loop
+      - 'posSide', 'avgPx', 'pos', 'upl', 'lever', ... ← compatibilidad OKX
+
 Fixes (2026-06-06 v8) — set_leverage robusto:
 
   Fix #12 — set_leverage: lanza RuntimeError si BingX rechaza el cambio (🔴 CRÍTICO)
-    Anteriormente set_leverage capturaba todos los errores en except y los
-    logueaba como WARNING, de modo que si BingX rechazaba la llamada (e.g.
-    "leverage out of range", error de firma, etc.) el bot continuaba con el
-    leverage por defecto del contrato (5x) sin ningún aviso claro.
-    Ahora:
-      - Si AMBOS sides (LONG y SHORT) fallan → lanza RuntimeError.
-      - Si solo uno falla → loguea ERROR (no lanza, para no bloquear one-way mode).
-      - Loguea el leverage confirmado por BingX desde la respuesta.
 
 Fixes (2026-06-06 v7) — soporte Hedge Mode:
 
   Fix #11 — positionSide dinámico según modo de cuenta (🔴 CRÍTICO)
-    BingX devuelve "In the Hedge mode, the 'PositionSide' field can only
-    be set to LONG or SHORT." cuando la cuenta está en HEDGE MODE y se
-    envía positionSide=BOTH.
-    _BingXCore detecta el modo (hedge_mode flag) al inicializar.
-    Todos los métodos de orden usan _pos_side(is_buy) que devuelve:
-      - "BOTH"  en one-way mode
-      - "LONG"  en hedge mode si is_buy=True
-      - "SHORT" en hedge mode si is_buy=False
-    En hedge mode, reduce_only se omite (no compatible) y las órdenes
-    de cierre usan el positionSide opuesto a la posición.
-    Ref: BingX docs — positionSide: LONG | SHORT | BOTH
 
 Fixes (2026-06-06 v6) — re-auditoría doc oficial BingX (bingx-api/api-ai-skills):
 
@@ -494,11 +487,6 @@ class BingXClient:
         """
         Fix #12 (v8): ahora lanza RuntimeError si BingX rechaza el cambio
         de leverage en AMBOS sides (LONG y SHORT).
-
-        Si solo uno de los sides falla (raro en one-way mode), se loguea
-        como ERROR pero no lanza para no bloquear la operativa.
-
-        Loguea el leverage confirmado por BingX desde la respuesta.
         """
         errors: dict[str, str] = {}
         ok_sides: list[str] = []
@@ -605,10 +593,6 @@ class BingXClient:
         reduce_only: bool = False,
         ref_price: Optional[float] = None,
     ) -> dict:
-        """
-        Orden MARKET en BingX.
-        Fix #11 (v7): positionSide dinámico según modo de cuenta.
-        """
         sz_r = self.round_sz(sz)
         side = "BUY" if is_buy else "SELL"
         if self._core.hedge_mode and reduce_only:
@@ -643,10 +627,6 @@ class BingXClient:
         tp_px: Optional[float] = None,
         ref_price: Optional[float] = None,
     ) -> dict:
-        """
-        Orden MARKET con SL y TP embebidos en una sola llamada API.
-        Fix #11 (v7): positionSide dinámico según modo de cuenta.
-        """
         sz_r     = self.round_sz(sz)
         side     = "BUY" if is_buy else "SELL"
         pos_side = self._pos_side(is_buy)
@@ -692,10 +672,6 @@ class BingXClient:
         reduce_only: bool = False,
         tif: str = "GTC",
     ) -> dict:
-        """
-        Orden LIMIT en BingX.
-        Fix #11 (v7): positionSide dinámico según modo de cuenta.
-        """
         sz_r = self.round_sz(sz)
         px_r = self.round_px(price)
         side = "BUY" if is_buy else "SELL"
@@ -733,10 +709,6 @@ class BingXClient:
         limit_px:   Optional[float] = None,
         entry_px:   Optional[float] = None,
     ) -> dict:
-        """
-        Take Profit independiente.
-        Fix #11 (v7): positionSide dinámico.
-        """
         sz_r     = self.round_sz(sz)
         tpx      = self.round_px(trigger_px)
         side     = "BUY" if is_buy else "SELL"
@@ -770,10 +742,6 @@ class BingXClient:
         trigger_px: float,
         entry_px:   Optional[float] = None,
     ) -> dict:
-        """
-        Stop Loss independiente.
-        Fix #11 (v7): positionSide dinámico.
-        """
         sz_r     = self.round_sz(sz)
         tpx      = self.round_px(trigger_px)
         side     = "BUY" if is_buy else "SELL"
@@ -846,6 +814,14 @@ class BingXClient:
     # ── Posiciones ────────────────────────────────────────────────────────
 
     def get_positions(self) -> list[dict]:
+        """
+        Fix #13 (v9): devuelve claves compatibles con trading_loop.py:
+          - 'side'    → 'long' | 'short'   (trading_loop usa ep["side"])
+          - 'entryPx' → float              (trading_loop usa ep["entryPx"])
+          - 'size'    → float (abs)         (trading_loop usa ep["size"])
+        Además mantiene las claves OKX-compatibles ('posSide', 'avgPx', 'pos', ...)
+        para el resto del código que las use.
+        """
         try:
             resp = self._core._get(
                 "/openApi/swap/v2/user/positions",
@@ -857,20 +833,37 @@ class BingXClient:
                 size = float(p.get("positionAmt") or p.get("availableAmt") or 0)
                 if size == 0:
                     continue
-                side = p.get("positionSide", "BOTH")
-                # Normalizar a interfaz OKX-compatible
-                is_long = (side == "LONG") or (side == "BOTH" and size > 0)
+                bx_side  = p.get("positionSide", "BOTH")
+                # Determinar si es long o short
+                # - HEDGE MODE: positionSide=LONG → long, SHORT → short
+                # - ONE-WAY MODE: positionSide=BOTH, size>0 → long, size<0 → short
+                if bx_side == "LONG":
+                    is_long = True
+                elif bx_side == "SHORT":
+                    is_long = False
+                else:  # BOTH (one-way)
+                    is_long = size > 0
+
+                side_str   = "long" if is_long else "short"
+                entry_px   = float(p.get("avgPrice") or p.get("avgCost") or 0)
+                size_abs   = abs(size)
+
                 positions.append({
-                    "instId":       self.inst_id,
-                    "pos":          str(abs(size)),
-                    "posSide":      "long" if is_long else "short",
-                    "avgPx":        str(p.get("avgPrice") or p.get("avgCost") or 0),
-                    "upl":          str(p.get("unrealizedProfit") or 0),
-                    "lever":        str(p.get("leverage") or _DEFAULT_LEV),
-                    "liqPx":        str(p.get("liquidationPrice") or 0),
-                    "margin":       str(p.get("initialMargin") or p.get("margin") or 0),
-                    "mgnMode":      "cross" if p.get("marginType", "").lower() == "cross" else "isolated",
-                    "_raw":         p,
+                    # ── Claves que espera trading_loop.py ──
+                    "side":    side_str,
+                    "entryPx": entry_px,
+                    "size":    size_abs,
+                    # ── Claves OKX-compatibles (para position_manager etc.) ──
+                    "instId":   self.inst_id,
+                    "pos":      str(size_abs),
+                    "posSide":  side_str,
+                    "avgPx":    str(entry_px),
+                    "upl":      str(p.get("unrealizedProfit") or 0),
+                    "lever":    str(p.get("leverage") or _DEFAULT_LEV),
+                    "liqPx":    str(p.get("liquidationPrice") or 0),
+                    "margin":   str(p.get("initialMargin") or p.get("margin") or 0),
+                    "mgnMode":  "cross" if p.get("marginType", "").lower() == "cross" else "isolated",
+                    "_raw":     p,
                 })
             return positions
         except Exception as exc:
