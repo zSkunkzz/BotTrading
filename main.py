@@ -323,17 +323,17 @@ async def main():
     asyncio.create_task(kill_switch.run())
     asyncio.create_task(_idle_rotation_loop(scanner))
 
-    await setup_telegram_commands(
-        start_pair_fn=start_pair,
-        stop_pair_fn=stop_pair,
-        active_traders=active_traders,
-        trader_instances=_trader_instances,
-    )
+    # FIX: setup_telegram_commands no es async y no acepta parámetros
+    setup_telegram_commands()
 
+    dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+    top_n   = MAX_ACTIVE_TRADERS
+
+    # FIX: notify_startup acepta (pairs, dry_run, top_n) — no leverage/usdc_per_trade
     await notify_startup(
         pairs=list(active_traders.keys()),
-        leverage=_LEVERAGE_BASE,
-        usdc_per_trade=_USDC_PER_TRADE,
+        dry_run=dry_run,
+        top_n=top_n,
     )
 
     logger.info("\U0001f7e2 Bot arrancado — esperando señales del scanner...")
