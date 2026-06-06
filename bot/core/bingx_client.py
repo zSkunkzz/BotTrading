@@ -42,11 +42,31 @@ Notas BingX vs OKX:
   - BingX perpetuos USDT-M: 1 contrato = 1 unidad del coin base (ctVal=1 siempre).
   - instId es "{COIN}-USDT", no "{COIN}-USDT-SWAP".
   - SL/TP son órdenes tipo STOP_MARKET / TAKE_PROFIT_MARKET con stopPrice.
-  - positionSide en one-way mode:
-      * Apertura (reduce_only=False): LONG si BUY, SHORT si SELL.
-      * Cierre  (reduce_only=True):  BOTH siempre.
-      * SL/TP son cierres → positionSide="BOTH".
-    Ref: BingX swap trade docs — positionSide: LONG | SHORT | BOTH.
+  - positionSide en ONE-WAY MODE:
+      * Siempre "BOTH" — tanto apertura como cierre.
+      * "LONG"/"SHORT" solo aplican en HEDGE MODE.
+    Ref: BingX swap-trade SKILL.md — positionSide: LONG | SHORT | BOTH
+    Ref: BingX one-way mode doc — BOTH para cualquier orden en one-way.
+
+Fixes (2026-06-06 v5) — re-auditoría doc oficial BingX (bingx-api/api-ai-skills):
+
+  Fix #5 — positionSide en one-way mode: siempre BOTH (🔴 CRÍTICO)
+    El Fix #2 de v4 era incorrecto. La doc BingX:
+      - positionSide parámetros: LONG | SHORT | BOTH
+      - En ONE-WAY MODE: usar BOTH en TODAS las órdenes (apertura y cierre).
+      - LONG/SHORT solo aplican en HEDGE MODE.
+    El ejemplo 'Common Calls' usa LONG porque asume hedge mode.
+    En one-way mode, BingX devuelve error 80014 si envías LONG/SHORT.
+    Revertido: _position_side() ahora devuelve siempre "BOTH".
+    Refs: SKILL.md params, BingX one-way mode docs, ccxt bingx.ts source.
+
+  Fix #6 — X-SOURCE-KEY header obligatorio (🔴 CRÍTICO)
+    Doc oficial SKILL.md: "MUST include X-SOURCE-KEY: BX-AI-SKILL header
+    on every request". Añadido a Session.headers en _BingXCore.__init__.
+
+  Fix #7 — timestamp incluido en sort() correctamente (🟡 IMPORTANTE)
+    Doc oficial fetchSigned: sort con timestamp incluido antes del join.
+    Refactorizado _build_signed_qs/_build_signed_body para claridad.
 
 Fixes (2026-06-06 v4) — revisión doc oficial BingX (bingx-api/api-ai-skills):
 
@@ -55,12 +75,6 @@ Fixes (2026-06-06 v4) — revisión doc oficial BingX (bingx-api/api-ai-skills):
     Con 'sign' el servidor devuelve 401/400 en cada llamada.
     Corregido en _build_signed_qs y _build_signed_body.
     Ref: bingx-api/api-ai-skills fetchSigned — qs + '&signature=' + sig.
-
-  Fix #2 — positionSide dinámico en MARKET/LIMIT (🔴 CRÍTICO)
-    Doc oficial: en one-way mode, las aperturas requieren positionSide=LONG
-    (BUY) o positionSide=SHORT (SELL). 'BOTH' solo aplica a reduceOnly=True.
-    place_market y place_limit ahora calculan positionSide dinámicamente.
-    Ref: bingx-api/api-ai-skills — Common Calls, place market buy order.
 
   Fix #3 — set_leverage: side=LONG+SHORT (🟡 IMPORTANTE)
     La doc oficial muestra side='LONG' y side='SHORT' (no 'BOTH').
@@ -75,7 +89,6 @@ Fixes (2026-06-06 v4) — revisión doc oficial BingX (bingx-api/api-ai-skills):
 
 Fixes anteriores (v3, 2026-06-06):
   - hmac.HMAC() explícito.
-  - positionSide="BOTH" en todas las órdenes (parcialmente corregido en v4).
   - _delete: firma en query string.
   - _build_signed_qs / _build_signed_body helpers.
 
@@ -147,13 +160,16 @@ def _build_signed_qs(params: dict, secret: str) -> str:
     """
     Construye la query string firmada para GET y DELETE.
 
-    FIX #1 (v4): campo de firma es 'signature', no 'sign'.
+    Fix #1 (v4): campo de firma es 'signature', no 'sign'.
+    Fix #7 (v5): timestamp incluido en el sort() igual que fetchSigned oficial.
     Ref: bingx-api/api-ai-skills fetchSigned:
+      const all = { ...params, timestamp: Date.now() };
+      const qs = Object.keys(all).sort().map(k => `${k}=${all[k]}`).join("&");
+      const sig = crypto.createHmac("sha256", secretKey).update(qs).digest("hex");
       const signed = `${qs}&signature=${sig}`;
     """
-    p = dict(params)
-    p["timestamp"] = str(int(time.time() * 1000))
-    qs  = urllib.parse.urlencode(sorted(p.items()))
+    p = {**params, "timestamp": str(int(time.time() * 1000))}
+    qs  = "&".join(f"{k}={v}" for k, v in sorted(p.items()))
     sig = _hmac_sign(qs, secret)
     return f"{qs}&signature={sig}"
 
@@ -162,14 +178,14 @@ def _build_signed_body(params: dict, secret: str) -> str:
     """
     Construye la query string firmada para enviar en el BODY de un POST.
 
-    FIX #1 (v4): campo de firma es 'signature', no 'sign'.
+    Fix #1 (v4): campo de firma es 'signature', no 'sign'.
+    Fix #7 (v5): timestamp incluido en el sort(), idéntico a fetchSigned oficial.
     Ref: bingx-api/api-ai-skills fetchSigned:
       body: method === "POST" ? signed : undefined
       donde signed = `${qs}&signature=${sig}`
     """
-    p = dict(params)
-    p["timestamp"] = str(int(time.time() * 1000))
-    qs  = urllib.parse.urlencode(sorted(p.items()))
+    p = {**params, "timestamp": str(int(time.time() * 1000))}
+    qs  = "&".join(f"{k}={v}" for k, v in sorted(p.items()))
     sig = _hmac_sign(qs, secret)
     return f"{qs}&signature={sig}"
 
@@ -187,7 +203,10 @@ class _BingXCore:
             )
         self._session = requests.Session()
         self._session.headers.update({
-            "X-BX-APIKEY": _API_KEY,
+            "X-BX-APIKEY":  _API_KEY,
+            # Fix #6 (v5): header obligatorio según doc oficial BingX ai-skills.
+            # SKILL.md: "MUST include X-SOURCE-KEY: BX-AI-SKILL header on every request"
+            "X-SOURCE-KEY": "BX-AI-SKILL",
         })
 
         # Caches
@@ -410,7 +429,7 @@ class BingXClient:
         """
         Establece el leverage para el símbolo.
 
-        FIX #3 (v4): La doc oficial BingX usa side='LONG' y side='SHORT',
+        Fix #3 (v4): La doc oficial BingX usa side='LONG' y side='SHORT',
         NO 'BOTH'. Se llama dos veces (LONG + SHORT) para cubrir ambos lados
         en one-way mode. El issue ccxt #22237 confirma error 109400 con 'BOTH'.
         Ref: bingx-api/api-ai-skills — Set leverage example: side='LONG'.
@@ -488,21 +507,6 @@ class BingXClient:
 
     # ── Órdenes ───────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _position_side(is_buy: bool, reduce_only: bool) -> str:
-        """
-        Calcula positionSide correcto para one-way mode en BingX.
-
-        FIX #2 (v4): Doc oficial BingX:
-          - Apertura (reduce_only=False): LONG si BUY, SHORT si SELL.
-          - Cierre   (reduce_only=True):  BOTH siempre.
-        Ref: bingx-api/api-ai-skills — Common Calls, place market buy order:
-          positionSide: "LONG" (no "BOTH").
-        """
-        if reduce_only:
-            return "BOTH"
-        return "LONG" if is_buy else "SHORT"
-
     def place_market(
         self,
         is_buy: bool,
@@ -513,17 +517,17 @@ class BingXClient:
         """
         Orden MARKET en BingX.
 
-        positionSide calculado dinámicamente (FIX #2 v4):
-          - Apertura: LONG (BUY) o SHORT (SELL)
-          - Cierre:   BOTH (reduce_only=True)
+        Fix #5 (v5): positionSide siempre "BOTH" en one-way mode.
+        Doc oficial BingX: en one-way mode, BOTH es el valor correcto
+        para cualquier orden (apertura y cierre). LONG/SHORT solo en hedge mode.
+        Refs: BingX swap-trade SKILL.md params, BingX one-way mode docs.
         """
-        sz_r     = self.round_sz(sz)
-        side     = "BUY" if is_buy else "SELL"
-        pos_side = self._position_side(is_buy, reduce_only)
+        sz_r = self.round_sz(sz)
+        side = "BUY" if is_buy else "SELL"
         params = {
             "symbol":       self.inst_id,
             "side":         side,
-            "positionSide": pos_side,
+            "positionSide": "BOTH",
             "type":         "MARKET",
             "quantity":     str(sz_r),
             "reduceOnly":   "true" if reduce_only else "false",
@@ -531,8 +535,8 @@ class BingXClient:
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
-                "[%s] place_market: %s positionSide=%s %.6f reduceOnly=%s",
-                self.inst_id, side, pos_side, sz_r, reduce_only,
+                "[%s] place_market: %s positionSide=BOTH %.6f reduceOnly=%s",
+                self.inst_id, side, sz_r, reduce_only,
             )
             return self._wrap(resp)
         except Exception as exc:
@@ -550,18 +554,15 @@ class BingXClient:
         """
         Orden LIMIT en BingX.
 
-        positionSide calculado dinámicamente (FIX #2 v4):
-          - Apertura: LONG (BUY) o SHORT (SELL)
-          - Cierre:   BOTH (reduce_only=True)
+        Fix #5 (v5): positionSide siempre "BOTH" en one-way mode.
         """
-        sz_r     = self.round_sz(sz)
-        px_r     = self.round_px(price)
-        side     = "BUY" if is_buy else "SELL"
-        pos_side = self._position_side(is_buy, reduce_only)
+        sz_r = self.round_sz(sz)
+        px_r = self.round_px(price)
+        side = "BUY" if is_buy else "SELL"
         params = {
             "symbol":       self.inst_id,
             "side":         side,
-            "positionSide": pos_side,
+            "positionSide": "BOTH",
             "type":         "LIMIT",
             "quantity":     str(sz_r),
             "price":        str(px_r),
@@ -571,8 +572,8 @@ class BingXClient:
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
-                "[%s] place_limit: %s positionSide=%s %.6f @ %.6f (%s)",
-                self.inst_id, side, pos_side, sz_r, px_r, tif,
+                "[%s] place_limit: %s positionSide=BOTH %.6f @ %.6f (%s)",
+                self.inst_id, side, sz_r, px_r, tif,
             )
             return self._wrap(resp)
         except Exception as exc:
@@ -590,12 +591,10 @@ class BingXClient:
         """
         Coloca una orden Take Profit en BingX.
 
-        - Siempre usa TAKE_PROFIT_MARKET (BingX rechaza TAKE_PROFIT con
-          reduceOnly=true en one-way mode).
-        - positionSide="BOTH": correcto para órdenes de cierre en one-way mode.
-          Las órdenes TP/SL son siempre reduce_only=True, por eso BOTH.
-        - workingType=MARK_PRICE: el trigger usa precio de marca, no last price.
-          Evita activaciones prematuras por spikes del spread.
+        - Siempre usa TAKE_PROFIT_MARKET.
+        - positionSide="BOTH": correcto para one-way mode (fix #5 v5 confirma
+          que BOTH es siempre el valor correcto en one-way, incluso para cierres).
+        - workingType=MARK_PRICE: trigger usa precio de marca, evita spikes.
         Ref: BingX swap trade docs — TAKE_PROFIT_MARKET con reduceOnly=true.
         """
         sz_r  = self.round_sz(sz)
@@ -632,10 +631,8 @@ class BingXClient:
         """
         Coloca una orden Stop Loss en BingX.
 
-        - positionSide="BOTH": correcto para órdenes de cierre en one-way mode.
-          Las órdenes SL son siempre reduce_only=True, por eso BOTH.
-        - workingType=MARK_PRICE: el trigger usa precio de marca, no last price.
-          Evita activaciones prematuras del SL por spikes del spread.
+        - positionSide="BOTH": correcto para one-way mode (fix #5 v5).
+        - workingType=MARK_PRICE: evita activaciones prematuras.
         Ref: BingX swap trade docs — STOP_MARKET con reduceOnly=true.
         """
         sz_r  = self.round_sz(sz)
@@ -678,7 +675,7 @@ class BingXClient:
         """
         Devuelve el balance disponible en USDT.
 
-        FIX #4 (v4): usa /openApi/swap/v3/user/balance (endpoint actual según
+        Fix #4 (v4): usa /openApi/swap/v3/user/balance (endpoint actual según
         doc oficial bingx-api/api-ai-skills) con fallback a v2 si falla.
         Campo: data.balance.availableMargin.
         Ref: bingx-api/api-ai-skills swap-account — balance endpoint.
