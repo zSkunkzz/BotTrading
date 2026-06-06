@@ -2,6 +2,11 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v15 — Fix leverage no aplicado (2026-06-06):
+  - open_order ahora llama _set_leverage(leverage) antes de enviar la orden
+    de mercado. Sin esta llamada, BingX usaba el leverage por defecto del
+    contrato (5x) ignorando la variable LEVERAGE de Railway.
+
 v14 — open_order atómico con place_market_with_tpsl (2026-06-06):
   - open_order usa place_market_with_tpsl() para adjuntar SL+TP1 en una
     única llamada API, eliminando la race condition que existía con la
@@ -289,6 +294,8 @@ class FuturesTrader:
                 timeout=_SET_LEVERAGE_TIMEOUT_S,
             )
             self._open_leverage = leverage
+            logger.info("[%s] _set_leverage: leverage configurado a %dx en BingX.",
+                        self.symbol, leverage)
         except asyncio.TimeoutError:
             logger.warning("[%s] _set_leverage timeout (%ss)",
                            self.symbol, _SET_LEVERAGE_TIMEOUT_S)
@@ -475,6 +482,10 @@ class FuturesTrader:
         """
         Abre una posición en BingX.
 
+        v15: llama _set_leverage(leverage) antes de enviar la orden de mercado
+        para que BingX aplique el leverage correcto configurado en LEVERAGE.
+        Sin esta llamada BingX usaba el leverage por defecto del contrato (5x).
+
         v14: usa place_market_with_tpsl() — adjunta SL+TP1 a la orden MARKET
         en una única llamada API (atómica). Si falla, fallback automático a
         place_market() + _place_tpsl() para no perder la entrada.
@@ -541,6 +552,9 @@ class FuturesTrader:
             self.symbol, action, qty, usdc_per_trade, leverage,
             ref_price, self.dry_run,
         )
+
+        # ── Aplicar leverage en BingX ANTES de enviar la orden ───────────────────
+        await self._set_leverage(leverage)
 
         # Calcular SL/TP1 preliminares (se reajustan tras confirmar fill)
         sl_px_pre  = float(signal.get("sl")  or 0)
