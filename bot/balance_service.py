@@ -1,11 +1,11 @@
 """
 bot/balance_service.py — Servicio de consulta de balance con caché.
 
-v4 — OKX migration:
-  Sustituye init_hl() por init_okx() usando okx.Account REST.
-  El campo correcto para USDC disponible en futuros OKX es:
+v5 — OKX only:
+  Usa okx.Account REST via init_okx().
+  Campo USDT disponible en futuros OKX:
     GET /api/v5/account/balance → details[ccy=="USDT"].availBal
-  Fallback: totalEq si availBal no está disponible.
+  Fallback: eq (equity) si availBal es 0, luego totalEq de la cuenta.
 """
 from __future__ import annotations
 
@@ -35,11 +35,8 @@ class BalanceService:
         Inicializa el servicio con una instancia de okx.Account.AccountAPI.
         La llamada real se hace en asyncio.to_thread para no bloquear el loop.
         """
-        import asyncio as _asyncio
-
         async def _fetch() -> float:
-            import asyncio as _a
-            data = await _a.to_thread(account_api.get_account_balance)
+            data = await asyncio.to_thread(account_api.get_account_balance)
             details = (
                 data.get("data", [{}])[0]
                     .get("details", [])
@@ -67,29 +64,6 @@ class BalanceService:
         self._fetch_fn = _fetch
         self._ready    = True
 
-    # ── legado HL (mantenido por compatibilidad) ──────────────────
-    def init_hl(self, address: str, info_post_fn: Callable) -> None:
-        """Deprecated — usar init_okx()."""
-        import asyncio as _asyncio
-
-        async def _fetch() -> float:
-            data = await info_post_fn(
-                {"type": "clearinghouseState", "user": address}
-            )
-            cross  = data.get("crossMarginSummary", {})
-            margin = data.get("marginSummary", {})
-            withdrawable   = float(cross.get("withdrawable", 0) or 0)
-            margin_total   = float(margin.get("accountValue", 0) or 0)
-            cross_acct_val = float(cross.get("accountValue", 0) or 0)
-            if withdrawable > 0:
-                return withdrawable
-            if margin_total > 0:
-                return margin_total
-            return cross_acct_val
-
-        self._fetch_fn = _fetch
-        self._ready    = True
-
     # ─────────────────────────────────────────────────────────────
 
     def is_ready(self) -> bool:
@@ -105,7 +79,7 @@ class BalanceService:
         self.invalidate(reason=f"SL/TP externo detectado para {symbol}")
         log.info(
             "[BalanceSvc] Balance invalidado por SL/TP externo en %s — "
-            "próxima consulta refrescará desde exchange.",
+            "próxima consulta refrescará desde OKX.",
             symbol,
         )
 
@@ -122,11 +96,11 @@ class BalanceService:
                 return None
 
             try:
-                usdc = await self._fetch_fn()
-                self._cached_value = usdc
+                usdt = await self._fetch_fn()
+                self._cached_value = usdt
                 self._cached_at    = time.monotonic()
-                log.debug("[BalanceSvc] Balance actualizado: %.2f USDT", usdc)
-                return usdc
+                log.debug("[BalanceSvc] Balance actualizado: %.2f USDT", usdt)
+                return usdt
             except Exception as e:
                 log.warning("[BalanceSvc] Error al obtener balance: %s", e)
                 return self._cached_value

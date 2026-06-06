@@ -1,7 +1,6 @@
-"""Core trading loop, decision engine and position management."""
-from .trading_loop import TradingLoop
-from .decision_engine import DecisionEngine
-from .position_manager import PositionManager
-from .http_client import HyperliquidHTTPClient
+from bot.core.okx_client import OKXClient, _OKXCore, _norm_coin, _to_inst_id
 
-__all__ = ["TradingLoop", "DecisionEngine", "PositionManager", "HyperliquidHTTPClient"]
+# Alias de compatibilidad: cualquier import antiguo de HLClient
+# que no se haya actualizado aún apuntará a OKXClient.
+HLClient = OKXClient
+_HLCore  = _OKXCore
