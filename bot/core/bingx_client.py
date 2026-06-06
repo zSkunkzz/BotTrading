@@ -34,7 +34,7 @@ Variables de entorno requeridas:
   BINGX_API_KEY, BINGX_API_SECRET
 
 Opcionales:
-  BINGX_TESTNET=true         (usa demo-trading-openapi.bingx.com)
+  BINGX_TESTNET=true         (usa open-api-vst.bingx.com)
   BINGX_DEFAULT_LEVERAGE=10
   BINGX_MARGIN_MODE=isolated|cross
 
@@ -51,6 +51,20 @@ Fixes (2026-06-06):
     de loop orden-a-orden, evitando fallos parciales.
   - get_balance_usdc: usa availableMargin como campo primario (campo real de
     la API según docs: data.balance.availableMargin).
+
+Fixes (2026-06-06 v2) — revisión doc oficial BingX:
+  - _post: parámetros firmados van en el BODY como application/x-www-form-urlencoded,
+    no en la query string. La doc oficial exige body-signed para todos los POST.
+    Ref: BingX API docs — Authentication & Quick Start (fetchSigned con body=signed).
+  - set_leverage: en one-way mode BingX requiere side="BOTH". Llamar con
+    side="LONG" o "SHORT" genera error 80012 en one-way mode.
+    Ref: BingX swap leverage API — side param: LONG|SHORT|BOTH.
+  - place_tp / place_sl: añadido workingType=MARK_PRICE para que el trigger
+    use el precio de marca en lugar de CONTRACT_PRICE (last price). Sin este
+    campo los stops pueden activarse por spikes del last price.
+    Ref: BingX swap trade params — workingType: MARK_PRICE | CONTRACT_PRICE.
+  - _warm_cache: popula _max_leverage_cache desde /quote/contracts para evitar
+    la llamada HTTP extra por símbolo en cada get_max_leverage().
 """
 from __future__ import annotations
 
@@ -104,6 +118,19 @@ def _sign(params: dict, secret: str) -> str:
     return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
 
+def _build_signed_body(params: dict, secret: str) -> str:
+    """
+    Construye la query string firmada para enviar en el body de un POST.
+    Según la doc BingX, el body debe ser: 'param1=v1&param2=v2&...&sign=<hex>'
+    con los parámetros ordenados alfabéticamente antes de firmar.
+    """
+    p = dict(params)
+    p["timestamp"] = str(int(time.time() * 1000))
+    qs   = urllib.parse.urlencode(sorted(p.items()))
+    sig  = hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    return f"{qs}&sign={sig}"
+
+
 # ── _BingXCore (singleton) ────────────────────────────────────────────────────
 
 class _BingXCore:
@@ -118,7 +145,6 @@ class _BingXCore:
         self._session = requests.Session()
         self._session.headers.update({
             "X-BX-APIKEY": _API_KEY,
-            "Content-Type": "application/json",
         })
 
         # Caches
@@ -130,7 +156,7 @@ class _BingXCore:
         self._warm_cache()
 
     def _warm_cache(self) -> None:
-        """Carga tick sizes y step sizes de todos los contratos."""
+        """Carga tick sizes, step sizes y max leverage de todos los contratos."""
         try:
             resp = self._session.get(
                 f"{_BASE_URL}/openApi/swap/v2/quote/contracts",
@@ -163,9 +189,17 @@ class _BingXCore:
             except Exception:
                 sz_dec = 0
 
+            # FIX: popula max_leverage_cache desde warm_cache para evitar
+            # una llamada HTTP extra por símbolo en get_max_leverage().
+            try:
+                max_lev = int(c.get("maxLeverage") or _DEFAULT_LEV)
+            except Exception:
+                max_lev = _DEFAULT_LEV
+
             self._tick_size_cache[sym]   = tick_sz
             self._px_decimals_cache[sym] = px_dec
             self._sz_decimals_cache[sym] = sz_dec
+            self._max_leverage_cache[sym] = max_lev
 
         logger.info(
             "[BingXCore] Caché lista: %d contratos cargados",
@@ -183,12 +217,18 @@ class _BingXCore:
         return r.json()
 
     def _post(self, path: str, params: dict) -> dict:
-        p = dict(params)
-        p["timestamp"] = str(int(time.time() * 1000))
-        p["sign"]      = _sign(p, _API_SECRET)
+        """
+        FIX: según la doc oficial BingX, los POST deben enviarse con los
+        parámetros firmados en el BODY como application/x-www-form-urlencoded,
+        NO en la query string (params=). Antes se usaba params=p lo que ponía
+        todo en la URL y podía causar rechazos silenciosos o errores 400.
+        Ref: BingX API Quick Start — fetchSigned (body = signed query string).
+        """
+        body = _build_signed_body(params, _API_SECRET)
         r = self._session.post(
             f"{_BASE_URL}{path}",
-            params=p,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=10,
         )
         r.raise_for_status()
@@ -259,9 +299,16 @@ class BingXClient:
         return self._core._tick_size_cache.get(self.inst_id, 0.01)
 
     def get_max_leverage(self) -> int:
+        """
+        FIX: usa _max_leverage_cache populado en warm_cache desde
+        /quote/contracts (campo maxLeverage). Evita la llamada HTTP extra
+        por símbolo que antes se hacía en cada llamada a este método.
+        Solo hace HTTP fallback si el símbolo no está en caché.
+        """
         cached = self._core._max_leverage_cache.get(self.inst_id)
         if cached:
             return cached
+        # Fallback HTTP si warm_cache no tenía el símbolo
         try:
             resp = self._core._get(
                 "/openApi/swap/v2/trade/leverage",
@@ -327,18 +374,22 @@ class BingXClient:
     # ── Leverage ──────────────────────────────────────────────────────────
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> dict:
-        results = {}
-        for s in ("LONG", "SHORT"):
-            try:
-                resp = self._core._post(
-                    "/openApi/swap/v2/trade/leverage",
-                    {"symbol": self.inst_id, "side": s, "leverage": str(leverage)},
-                )
-                results[s] = resp
-            except Exception as exc:
-                logger.warning("[%s] set_leverage(%s) error: %s", self.inst_id, s, exc)
-        logger.info("[%s] Leverage: %dx", self.inst_id, leverage)
-        return results
+        """
+        FIX: en one-way mode (modo por defecto del bot) BingX requiere
+        side="BOTH". Llamar con side="LONG" o "SHORT" genera error 80012
+        en one-way mode. Solo en hedge mode se usan LONG/SHORT por separado.
+        Ref: BingX swap leverage API — side: LONG|SHORT|BOTH.
+        """
+        try:
+            resp = self._core._post(
+                "/openApi/swap/v2/trade/leverage",
+                {"symbol": self.inst_id, "side": "BOTH", "leverage": str(leverage)},
+            )
+            logger.info("[%s] Leverage: %dx (side=BOTH)", self.inst_id, leverage)
+            return resp
+        except Exception as exc:
+            logger.warning("[%s] set_leverage error: %s", self.inst_id, exc)
+            return {}
 
     # ── Helpers respuesta BingX ───────────────────────────────────────────
 
@@ -460,28 +511,31 @@ class BingXClient:
         """
         Coloca una orden Take Profit en BingX.
 
-        FIX: siempre usa TAKE_PROFIT_MARKET (tipo market al trigger).
+        FIX (v1): siempre usa TAKE_PROFIT_MARKET (tipo market al trigger).
         BingX rechaza TAKE_PROFIT (limit) con reduceOnly=true en one-way mode
         porque requeriría posSide=LONG/SHORT, que solo existe en hedge mode.
-        Referencia: BingX Perpetual Swap API — Trade Interface docs.
+
+        FIX (v2): añadido workingType=MARK_PRICE para que el trigger use el
+        precio de marca. Sin este campo BingX usa CONTRACT_PRICE (last price)
+        por defecto, lo que puede causar activaciones prematuras por spikes.
+        Ref: BingX swap trade params — workingType: MARK_PRICE | CONTRACT_PRICE.
         """
         sz_r  = self.round_sz(sz)
         tpx   = self.round_px(trigger_px)
         side  = "BUY" if is_buy else "SELL"
-        # TAKE_PROFIT_MARKET siempre: BingX one-way mode no admite
-        # TAKE_PROFIT con reduceOnly=true (requiere posSide en hedge mode).
         params: dict = {
-            "symbol":     self.inst_id,
-            "side":       side,
-            "type":       "TAKE_PROFIT_MARKET",
-            "quantity":   str(sz_r),
-            "stopPrice":  str(tpx),
-            "reduceOnly": "true",
+            "symbol":      self.inst_id,
+            "side":        side,
+            "type":        "TAKE_PROFIT_MARKET",
+            "quantity":    str(sz_r),
+            "stopPrice":   str(tpx),
+            "workingType": "MARK_PRICE",
+            "reduceOnly":  "true",
         }
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
-                "[%s] place_tp: %s %.6f @ trigger=%.6f",
+                "[%s] place_tp: %s %.6f @ trigger=%.6f (MARK_PRICE)",
                 self.inst_id, side, sz_r, tpx,
             )
             return self._wrap_algo(resp)
@@ -496,21 +550,29 @@ class BingXClient:
         trigger_px: float,
         entry_px:   Optional[float] = None,
     ) -> dict:
+        """
+        FIX: añadido workingType=MARK_PRICE para que el trigger use el precio
+        de marca. Sin este campo BingX usa CONTRACT_PRICE (last price) por
+        defecto, lo que puede causar activaciones prematuras del stop loss
+        por spikes del spread o del last price.
+        Ref: BingX swap trade params — workingType: MARK_PRICE | CONTRACT_PRICE.
+        """
         sz_r  = self.round_sz(sz)
         tpx   = self.round_px(trigger_px)
         side  = "BUY" if is_buy else "SELL"
         params = {
-            "symbol":     self.inst_id,
-            "side":       side,
-            "type":       "STOP_MARKET",
-            "quantity":   str(sz_r),
-            "stopPrice":  str(tpx),
-            "reduceOnly": "true",
+            "symbol":      self.inst_id,
+            "side":        side,
+            "type":        "STOP_MARKET",
+            "quantity":    str(sz_r),
+            "stopPrice":   str(tpx),
+            "workingType": "MARK_PRICE",
+            "reduceOnly":  "true",
         }
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
-                "[%s] place_sl: %s %.6f @ trigger=%.6f",
+                "[%s] place_sl: %s %.6f @ trigger=%.6f (MARK_PRICE)",
                 self.inst_id, side, sz_r, tpx,
             )
             return self._wrap_algo(resp)
