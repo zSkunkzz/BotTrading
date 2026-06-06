@@ -2,10 +2,16 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v14 — open_order atómico con place_market_with_tpsl (2026-06-06):
+  - open_order usa place_market_with_tpsl() para adjuntar SL+TP1 en una
+    única llamada API, eliminando la race condition que existía con la
+    secuencia place_market() + _place_tpsl() separadas (Fix #9 bingx_client v6).
+  - Si place_market_with_tpsl falla, fallback automático a place_market
+    + _place_tpsl para no perder la entrada.
+  - _place_tpsl se mantiene para TP2/TP3 y re-colocación de stops.
+
 v13 — Fix #4 (2026-06-06):
-  - _release_pretrade_margin: elimina kwarg redundante notional_or_margin=0.0
-    en la llamada a register_close_safe(). El método ya obtiene el margen
-    exacto desde _open_margin_by_symbol[symbol] internamente.
+  - _release_pretrade_margin: elimina kwarg redundante notional_or_margin=0.0.
 
 v12 — Fix _fetch_candles() BingX klines v3 (2026-06-06).
 v11 — Migración OKX → BingX (2026-06-06).
@@ -157,7 +163,7 @@ class FuturesTrader:
         self._stopped_event = asyncio.Event()
         self._trading_loop  = TradingLoop(symbol)
 
-    # ── Interfaz pública ─────────────────────────────────────────────────────
+    # ── Interfaz pública ──────────────────────────────────────────────────────────────────
 
     async def run(self, risk, *, global_risk=None) -> None:
         try:
@@ -175,7 +181,7 @@ class FuturesTrader:
             logger.debug("[%s] cleanup ai_trader sessions: %s", self.symbol, e)
         self._stopped_event.set()
 
-    # ── Init BingX ──────────────────────────────────────────────────
+    # ── Init BingX ─────────────────────────────────────────────────────────
 
     async def _get_ccxt(self) -> None:
         if self._bingx_client is not None:
@@ -195,7 +201,7 @@ class FuturesTrader:
         """Alias de compatibilidad: devuelve el BingXClient."""
         return self._bingx_client
 
-    # ── get_price ───────────────────────────────────────────────────────────
+    # ── get_price ───────────────────────────────────────────────────────────────────
 
     async def get_price(self) -> float:
         if self._bingx_client is None:
@@ -261,7 +267,7 @@ class FuturesTrader:
             f"[{self.symbol}] get_price: sin precio tras {_PRICE_FETCH_RETRIES} intentos: {last_exc}"
         )
 
-    # ── _set_leverage ───────────────────────────────────────────────────────
+    # ── _set_leverage ─────────────────────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int) -> None:
         if self.dry_run:
@@ -289,7 +295,7 @@ class FuturesTrader:
         except Exception as e:
             logger.warning("[%s] _set_leverage error: %s", self.symbol, e)
 
-    # ── OHLCV ─────────────────────────────────────────────────────────────
+    # ── OHLCV ───────────────────────────────────────────────────────────────────
 
     async def get_ohlcv(self, timeframe: str, n: Optional[int] = None) -> list:
         bars_needed = n or _OHLCV_BARS
@@ -300,7 +306,7 @@ class FuturesTrader:
     def get_ohlcv_fn(self) -> Callable:
         return functools.partial(self.get_ohlcv)
 
-    # ── _fetch_candles ─────────────────────────────────────────────────────────────
+    # ── _fetch_candles ────────────────────────────────────────────────────────────────────
 
     async def _fetch_candles(self, timeframe: str, n: int) -> list:
         """
@@ -309,13 +315,6 @@ class FuturesTrader:
         Formato de respuesta BingX klines v3:
           { "code": 0, "data": [ {"open": "...", "high": "...", "low": "...",
             "close": "...", "volume": "...", "time": 1234567890000}, ... ] }
-
-        Notas:
-          - Cuando el símbolo no existe o hay error, BingX devuelve
-            {"code": <non-zero>, "msg": "...", "data": null/[]}.
-          - Se lanza ValueError con mensaje descriptivo para que OHLCVCache
-            loguee el error correctamente (en lugar del código entero).
-          - Si data es lista posicional (formato väld alternativo) se parsea también.
         """
         interval = _TF_BINGX.get(timeframe, timeframe)
         limit    = min(n, 1000)
@@ -336,7 +335,6 @@ class FuturesTrader:
         except Exception as e:
             raise ValueError(f"_fetch_candles HTTP error {self.symbol}/{timeframe}: {e}") from e
 
-        # Validar respuesta de error de BingX
         code = resp.get("code", 0)
         if code != 0:
             msg = resp.get("msg", "unknown error")
@@ -356,7 +354,6 @@ class FuturesTrader:
         for c in raw:
             try:
                 if isinstance(c, dict):
-                    # Formato v3 (dict con claves nombradas)
                     result.append([
                         int(c.get("time", c.get("openTime", 0))),
                         float(c["open"]),
@@ -366,7 +363,6 @@ class FuturesTrader:
                         float(c.get("volume", 0)),
                     ])
                 elif isinstance(c, (list, tuple)) and len(c) >= 6:
-                    # Formato alternativo posicional [time, open, high, low, close, vol]
                     result.append([
                         int(c[0]),
                         float(c[1]),
@@ -387,7 +383,7 @@ class FuturesTrader:
         result.sort(key=lambda x: x[0])
         return result
 
-    # ── _get_positions ─────────────────────────────────────────────────────────────
+    # ── _get_positions ───────────────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list[dict]:
         if self._bingx_client is None:
@@ -398,8 +394,6 @@ class FuturesTrader:
             logger.warning("[%s] _get_positions error: %s", self.symbol, e)
             return []
 
-    # ── _get_open_orders_raw ──────────────────────────────────────────────────────────
-
     async def _get_open_orders_raw(self) -> list[dict]:
         if self._bingx_client is None:
             return []
@@ -409,12 +403,10 @@ class FuturesTrader:
             logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e)
             return []
 
-    # BingX no separa trigger orders del resto; get_open_orders() ya incluye
-    # STOP_MARKET y TAKE_PROFIT_MARKET.
     async def _get_open_trigger_orders_raw(self) -> list[dict]:
         return await self._get_open_orders_raw()
 
-    # ── _place_tpsl ─────────────────────────────────────────────────────────────
+    # ── _place_tpsl ──────────────────────────────────────────────────────────────
 
     async def _place_tpsl(
         self,
@@ -424,6 +416,17 @@ class FuturesTrader:
         is_long: bool,
         reduce_only: bool = True,
     ) -> None:
+        """
+        Coloca SL y TP como órdenes independientes (place_sl / place_tp).
+
+        Uso principal:
+          - Recolocar SL/TP tras un parcial (TP2, TP3).
+          - Fallback si place_market_with_tpsl falla.
+          - open_order ya NO lo llama en el caso normal (usa place_market_with_tpsl).
+
+        Para nuevas entradas, preferir place_market_with_tpsl() que adjunta
+        SL+TP de forma atómica a la orden MARKET (Fix #9 bingx_client v6).
+        """
         if self._bingx_client is None:
             logger.error("[%s] _place_tpsl: BingXClient no inicializado", self.symbol)
             return
@@ -466,9 +469,16 @@ class FuturesTrader:
                 logger.error("[%s] _place_tpsl: TP exception: %s", self.symbol, e)
                 raise
 
-    # ── open_order ────────────────────────────────────────────────────────────
+    # ── open_order ────────────────────────────────────────────────────────────────
 
     async def open_order(self, signal: dict, risk) -> None:
+        """
+        Abre una posición en BingX.
+
+        v14: usa place_market_with_tpsl() — adjunta SL+TP1 a la orden MARKET
+        en una única llamada API (atómica). Si falla, fallback automático a
+        place_market() + _place_tpsl() para no perder la entrada.
+        """
         is_long = signal.get("side") == "long"
         action  = signal.get("action", "BUY" if is_long else "SELL")
 
@@ -532,33 +542,72 @@ class FuturesTrader:
             ref_price, self.dry_run,
         )
 
+        # Calcular SL/TP1 preliminares (se reajustan tras confirmar fill)
+        sl_px_pre  = float(signal.get("sl")  or 0)
+        tp1_px_pre = float(signal.get("tp1") or 0)
+
         filled_price = ref_price
 
         if self.dry_run:
             logger.info("[%s] [DRY-RUN] open_order: simulando place_market %s %.6f @ %.4f",
                         self.symbol, action, qty, ref_price)
         else:
+            # ── Intento atómico: MARKET + SL + TP en una sola llamada ────────────────
+            atomic_ok = False
             try:
                 place_resp = await asyncio.to_thread(
-                    self._bingx_client.place_market,
+                    self._bingx_client.place_market_with_tpsl,
                     is_buy=is_long,
                     sz=qty,
-                    reduce_only=False,
+                    sl_px=sl_px_pre  if sl_px_pre  > 0 else None,
+                    tp_px=tp1_px_pre if tp1_px_pre > 0 else None,
                     ref_price=ref_price,
                 )
                 code = (place_resp or {}).get("code", "-1")
-                if str(code) != "0":
+                if str(code) == "0":
+                    logger.info(
+                        "[%s] open_order: place_market_with_tpsl OK (atómico, code=0)",
+                        self.symbol,
+                    )
+                    atomic_ok = True
+                else:
                     msg = (place_resp or {}).get("msg", str(place_resp))
-                    logger.error("[%s] open_order: place_market rechazado por BingX: %s",
-                                 self.symbol, msg)
+                    logger.warning(
+                        "[%s] open_order: place_market_with_tpsl rechazado (%s) "
+                        "— reintentando con place_market + _place_tpsl",
+                        self.symbol, msg,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[%s] open_order: place_market_with_tpsl excepción (%s) "
+                    "— reintentando con place_market + _place_tpsl",
+                    self.symbol, e,
+                )
+
+            # ── Fallback: place_market separado si el atómico falló ────────────────
+            if not atomic_ok:
+                try:
+                    place_resp = await asyncio.to_thread(
+                        self._bingx_client.place_market,
+                        is_buy=is_long,
+                        sz=qty,
+                        reduce_only=False,
+                        ref_price=ref_price,
+                    )
+                    code = (place_resp or {}).get("code", "-1")
+                    if str(code) != "0":
+                        msg = (place_resp or {}).get("msg", str(place_resp))
+                        logger.error("[%s] open_order: place_market rechazado por BingX: %s",
+                                     self.symbol, msg)
+                        self._release_pretrade_margin()
+                        return
+                    logger.info("[%s] open_order: place_market (fallback) OK (code=0)", self.symbol)
+                except Exception as e:
+                    logger.error("[%s] open_order: place_market excepción: %s", self.symbol, e)
                     self._release_pretrade_margin()
                     return
-                logger.info("[%s] open_order: place_market OK (code=0)", self.symbol)
-            except Exception as e:
-                logger.error("[%s] open_order: place_market excepción: %s", self.symbol, e)
-                self._release_pretrade_margin()
-                return
 
+            # ── Confirmar fill leyéndolo de posiciones activas ────────────────────
             for attempt in range(_FILL_RETRIES):
                 await asyncio.sleep(_FILL_DELAY)
                 try:
@@ -585,6 +634,7 @@ class FuturesTrader:
                 except Exception as e:
                     logger.warning("[%s] open_order: confirm fill error: %s", self.symbol, e)
 
+        # ── Reajustar SL/TP al precio real de fill ───────────────────────────────
         sl_px, tp1_px, tp2_px = _adjust_levels_to_fill(signal, filled_price, ref_price)
         tp3_px = float(signal.get("tp3") or 0)
         if tp3_px > 0 and abs(filled_price - ref_price) / max(ref_price, 1e-9) >= 0.0005:
@@ -592,15 +642,43 @@ class FuturesTrader:
             tp3_px = filled_price * (1.0 + (tp3_px - base) / base) if base > 0 else tp3_px
 
         if not self.dry_run:
-            try:
-                await self._place_tpsl(
-                    qty=qty,
-                    sl_price=sl_px  if sl_px  > 0 else None,
-                    tp_price=tp1_px if tp1_px > 0 else None,
-                    is_long=is_long,
+            # Si el atómico fue exitoso pero el fill cambió los niveles >0.05%,
+            # recolocar SL/TP con los niveles ajustados al precio real.
+            fill_drift = abs(filled_price - ref_price) / max(ref_price, 1e-9)
+            if atomic_ok and fill_drift >= 0.0005:
+                logger.info(
+                    "[%s] open_order: fill drift %.4f%% — recolocando SL/TP ajustados",
+                    self.symbol, fill_drift * 100,
                 )
-            except Exception as e:
-                logger.error("[%s] open_order: _place_tpsl error: %s", self.symbol, e)
+                try:
+                    await asyncio.to_thread(
+                        self._bingx_client.cancel_all_open_tpsl
+                    )
+                except Exception as e:
+                    logger.warning("[%s] open_order: cancel_tpsl antes de recolocar: %s",
+                                   self.symbol, e)
+                try:
+                    await self._place_tpsl(
+                        qty=qty,
+                        sl_price=sl_px  if sl_px  > 0 else None,
+                        tp_price=tp1_px if tp1_px > 0 else None,
+                        is_long=is_long,
+                    )
+                except Exception as e:
+                    logger.error("[%s] open_order: recolocación SL/TP error: %s", self.symbol, e)
+
+            elif not atomic_ok:
+                # Fallback: colocar SL/TP como órdenes independientes
+                try:
+                    await self._place_tpsl(
+                        qty=qty,
+                        sl_price=sl_px  if sl_px  > 0 else None,
+                        tp_price=tp1_px if tp1_px > 0 else None,
+                        is_long=is_long,
+                    )
+                except Exception as e:
+                    logger.error("[%s] open_order: _place_tpsl (fallback) error: %s",
+                                 self.symbol, e)
         else:
             if sl_px > 0:
                 logger.info("[%s] [DRY-RUN] SL simulado @ %.4f", self.symbol, sl_px)
@@ -645,15 +723,13 @@ class FuturesTrader:
             self.sl or 0, self.tp1 or 0, self.tp2 or 0,
         )
 
-    # ── _release_pretrade_margin ───────────────────────────────────────────────────────
+    # ── _release_pretrade_margin ─────────────────────────────────────────────────
 
     def _release_pretrade_margin(self) -> None:
         """
         Libera el margen reservado por pretrade_risk cuando la orden no se ejecuta.
-
         register_close_safe(symbol) extrae el margen exacto desde
-        _open_margin_by_symbol[symbol] internamente; no hace falta pasar
-        notional_or_margin (kwarg redundante eliminado en v13).
+        _open_margin_by_symbol[symbol] internamente.
         """
         try:
             from bot.pretrade_risk import pretrade_risk
@@ -668,7 +744,7 @@ class FuturesTrader:
                 self.symbol, e,
             )
 
-    # ── close_position ───────────────────────────────────────────────────────────────
+    # ── close_position ───────────────────────────────────────────────────────────────────
 
     async def close_position(self, reason: str = "manual") -> None:
         if self.position is None:
