@@ -42,41 +42,47 @@ Notas BingX vs OKX:
   - BingX perpetuos USDT-M: 1 contrato = 1 unidad del coin base (ctVal=1 siempre).
   - instId es "{COIN}-USDT", no "{COIN}-USDT-SWAP".
   - SL/TP son órdenes tipo STOP_MARKET / TAKE_PROFIT_MARKET con stopPrice.
-  - En one-way mode (por defecto), positionSide debe ser "BOTH" en todas las
-    órdenes (MARKET, LIMIT, STOP_MARKET, TAKE_PROFIT_MARKET).
-    Sin este campo BingX puede retornar error o comportarse de forma inesperada.
+  - positionSide en one-way mode:
+      * Apertura (reduce_only=False): LONG si BUY, SHORT si SELL.
+      * Cierre  (reduce_only=True):  BOTH siempre.
+      * SL/TP son cierres → positionSide="BOTH".
     Ref: BingX swap trade docs — positionSide: LONG | SHORT | BOTH.
 
-Fixes (2026-06-06):
-  - place_tp: fuerza siempre TAKE_PROFIT_MARKET (BingX rechaza TAKE_PROFIT
-    con reduceOnly=true en one-way mode según docs oficiales).
-  - cancel_all_open_tpsl: usa DELETE /allOpenOrders (batch atómico) en lugar
-    de loop orden-a-orden, evitando fallos parciales.
-  - get_balance_usdc: usa availableMargin como campo primario (campo real de
-    la API según docs: data.balance.availableMargin).
+Fixes (2026-06-06 v4) — revisión doc oficial BingX (bingx-api/api-ai-skills):
 
-Fixes (2026-06-06 v2) — revisión doc oficial BingX:
-  - _post: parámetros firmados van en el BODY como application/x-www-form-urlencoded,
-    no en la query string.
-  - set_leverage: en one-way mode BingX requiere side="BOTH".
-  - place_tp / place_sl: añadido workingType=MARK_PRICE.
-  - _warm_cache: popula _max_leverage_cache desde /quote/contracts.
+  Fix #1 — sign → signature (🔴 CRÍTICO, rompía TODAS las peticiones)
+    La doc oficial BingX usa '&signature=<hex>', no '&sign=<hex>'.
+    Con 'sign' el servidor devuelve 401/400 en cada llamada.
+    Corregido en _build_signed_qs y _build_signed_body.
+    Ref: bingx-api/api-ai-skills fetchSigned — qs + '&signature=' + sig.
 
-Fixes (2026-06-06 v3) — revisión doc oficial BingX (esta versión):
-  - hmac.new() → hmac.HMAC() explícito (hmac.new es alias no documentado;
-    en algunas builds de CPython puede no estar disponible).
-    Ref: Python docs — hmac.HMAC(key, msg, digestmod).
-  - place_market / place_limit / place_tp / place_sl: añadido positionSide="BOTH"
-    en todas las órdenes. Según la doc oficial BingX (parámetro positionSide):
-    "In the One-way mode, only supports BOTH". Sin este campo BingX puede
-    rechazar la orden o abrir una posición en el lado incorrecto.
-    Ref: BingX swap trade params — positionSide: LONG | SHORT | BOTH.
-  - _delete: firma correcta — los parámetros de DELETE deben ir en la query
-    string (igual que GET), NO en el body. La firma se calcula sobre la
-    query string ordenada, luego se añade &sign=<hex> a la URL.
-    Ref: BingX API authentication docs — DELETE usa query params firmados.
-  - _build_signed_qs: nuevo helper para GET y DELETE (query string firmada).
-  - _build_signed_body: renombrado más claro, solo para POST.
+  Fix #2 — positionSide dinámico en MARKET/LIMIT (🔴 CRÍTICO)
+    Doc oficial: en one-way mode, las aperturas requieren positionSide=LONG
+    (BUY) o positionSide=SHORT (SELL). 'BOTH' solo aplica a reduceOnly=True.
+    place_market y place_limit ahora calculan positionSide dinámicamente.
+    Ref: bingx-api/api-ai-skills — Common Calls, place market buy order.
+
+  Fix #3 — set_leverage: side=LONG+SHORT (🟡 IMPORTANTE)
+    La doc oficial muestra side='LONG' y side='SHORT' (no 'BOTH').
+    En one-way mode se llama dos veces para cubrir ambos lados.
+    El issue ccxt #22237 confirma error 109400 al enviar side='BOTH'.
+    Ref: bingx-api/api-ai-skills — Set leverage example.
+
+  Fix #4 — get_balance_usdc: v3 con fallback v2 (🟡 IMPORTANTE)
+    /openApi/swap/v3/user/balance es el endpoint actual según doc oficial.
+    Implementado con fallback a v2 si v3 falla.
+    Ref: bingx-api/api-ai-skills swap-account — balance endpoint table.
+
+Fixes anteriores (v3, 2026-06-06):
+  - hmac.HMAC() explícito.
+  - positionSide="BOTH" en todas las órdenes (parcialmente corregido en v4).
+  - _delete: firma en query string.
+  - _build_signed_qs / _build_signed_body helpers.
+
+Fixes anteriores (v2, 2026-06-06):
+  - place_tp: fuerza TAKE_PROFIT_MARKET.
+  - cancel_all_open_tpsl: usa DELETE /allOpenOrders (batch atómico).
+  - get_balance_usdc: usa availableMargin como campo primario.
 """
 from __future__ import annotations
 
@@ -127,9 +133,8 @@ def _to_symbol(symbol: str) -> str:
 
 def _hmac_sign(qs: str, secret: str) -> str:
     """
-    FIX v3: usa hmac.HMAC() explícito en lugar de hmac.new() que es un alias
-    no documentado y puede no estar disponible en todas las builds de CPython.
-    Ref: Python docs — hmac.HMAC(key, msg=None, digestmod='')
+    Firma HMAC-SHA256. Usa hmac.HMAC() explícito (hmac.new es alias no
+    documentado). Ref: Python docs — hmac.HMAC(key, msg, digestmod).
     """
     return _hmac.HMAC(
         secret.encode(),
@@ -141,30 +146,32 @@ def _hmac_sign(qs: str, secret: str) -> str:
 def _build_signed_qs(params: dict, secret: str) -> str:
     """
     Construye la query string firmada para GET y DELETE.
-    Añade timestamp, ordena alfabéticamente, firma y devuelve:
-      'k1=v1&k2=v2&...&timestamp=<ms>&sign=<hex>'
-    Ref: BingX auth docs — firma = HMAC-SHA256(sorted_querystring, secret).
+
+    FIX #1 (v4): campo de firma es 'signature', no 'sign'.
+    Ref: bingx-api/api-ai-skills fetchSigned:
+      const signed = `${qs}&signature=${sig}`;
     """
     p = dict(params)
     p["timestamp"] = str(int(time.time() * 1000))
     qs  = urllib.parse.urlencode(sorted(p.items()))
     sig = _hmac_sign(qs, secret)
-    return f"{qs}&sign={sig}"
+    return f"{qs}&signature={sig}"
 
 
 def _build_signed_body(params: dict, secret: str) -> str:
     """
     Construye la query string firmada para enviar en el BODY de un POST.
-    Según la doc BingX Quick Start (fetchSigned), el body debe ser:
-      'param1=v1&param2=v2&...&sign=<hex>'
-    con los parámetros ordenados alfabéticamente antes de firmar.
-    Ref: BingX API Quick Start — body = signed query string.
+
+    FIX #1 (v4): campo de firma es 'signature', no 'sign'.
+    Ref: bingx-api/api-ai-skills fetchSigned:
+      body: method === "POST" ? signed : undefined
+      donde signed = `${qs}&signature=${sig}`
     """
     p = dict(params)
     p["timestamp"] = str(int(time.time() * 1000))
     qs  = urllib.parse.urlencode(sorted(p.items()))
     sig = _hmac_sign(qs, secret)
-    return f"{qs}&sign={sig}"
+    return f"{qs}&signature={sig}"
 
 
 # ── _BingXCore (singleton) ────────────────────────────────────────────────────
@@ -243,21 +250,15 @@ class _BingXCore:
     # ── HTTP firmado ──────────────────────────────────────────────────────
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        """
-        GET firmado: parámetros en la query string.
-        Ref: BingX auth docs — GET usa query params firmados.
-        """
+        """GET firmado: parámetros en la query string."""
         signed_qs = _build_signed_qs(params or {}, _API_SECRET)
         r = self._session.get(f"{_BASE_URL}{path}?{signed_qs}", timeout=10)
         r.raise_for_status()
         return r.json()
 
     def _post(self, path: str, params: dict) -> dict:
-        """
-        POST firmado: parámetros firmados en el BODY como
-        application/x-www-form-urlencoded.
-        Ref: BingX API Quick Start — fetchSigned (body = signed query string).
-        """
+        """POST firmado: parámetros firmados en el BODY como
+        application/x-www-form-urlencoded."""
         body = _build_signed_body(params, _API_SECRET)
         r = self._session.post(
             f"{_BASE_URL}{path}",
@@ -269,13 +270,8 @@ class _BingXCore:
         return r.json()
 
     def _delete(self, path: str, params: dict) -> dict:
-        """
-        FIX v3: DELETE firmado con parámetros en la QUERY STRING (igual que GET),
-        NO en el body. La firma se calcula sobre la query string ordenada.
-        Antes se enviaban los params como dict a requests.delete(params=p)
-        pero sin el campo 'sign' en la URL, lo que causaba rechazos 401/400.
-        Ref: BingX auth docs — DELETE usa query params firmados (mismo patrón que GET).
-        """
+        """DELETE firmado con parámetros en la QUERY STRING (igual que GET).
+        Ref: BingX auth docs — DELETE usa query params firmados."""
         signed_qs = _build_signed_qs(params, _API_SECRET)
         r = self._session.delete(f"{_BASE_URL}{path}?{signed_qs}", timeout=10)
         r.raise_for_status()
@@ -413,20 +409,33 @@ class BingXClient:
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> dict:
         """
         Establece el leverage para el símbolo.
-        En one-way mode (por defecto) BingX requiere side="BOTH".
-        Llamar con side="LONG" o "SHORT" genera error 80012 en one-way mode.
-        Ref: BingX swap leverage API — side: LONG | SHORT | BOTH.
+
+        FIX #3 (v4): La doc oficial BingX usa side='LONG' y side='SHORT',
+        NO 'BOTH'. Se llama dos veces (LONG + SHORT) para cubrir ambos lados
+        en one-way mode. El issue ccxt #22237 confirma error 109400 con 'BOTH'.
+        Ref: bingx-api/api-ai-skills — Set leverage example: side='LONG'.
         """
-        try:
-            resp = self._core._post(
-                "/openApi/swap/v2/trade/leverage",
-                {"symbol": self.inst_id, "side": "BOTH", "leverage": str(leverage)},
-            )
-            logger.info("[%s] Leverage: %dx (side=BOTH)", self.inst_id, leverage)
-            return resp
-        except Exception as exc:
-            logger.warning("[%s] set_leverage error: %s", self.inst_id, exc)
-            return {}
+        results = {}
+        for side in ("LONG", "SHORT"):
+            try:
+                resp = self._core._post(
+                    "/openApi/swap/v2/trade/leverage",
+                    {"symbol": self.inst_id, "side": side, "leverage": str(leverage)},
+                )
+                results[side] = resp
+                if str(resp.get("code", "-1")) == "0":
+                    logger.info(
+                        "[%s] Leverage %dx seteado (side=%s)", self.inst_id, leverage, side
+                    )
+                else:
+                    logger.warning(
+                        "[%s] set_leverage side=%s: %s", self.inst_id, side, resp.get("msg", "")
+                    )
+            except Exception as exc:
+                logger.warning("[%s] set_leverage side=%s error: %s", self.inst_id, side, exc)
+                results[side] = {}
+        # Devolver el resultado de LONG como representativo (mismo formato que antes)
+        return results.get("LONG", {})
 
     # ── Helpers respuesta BingX ───────────────────────────────────────────
 
@@ -479,6 +488,21 @@ class BingXClient:
 
     # ── Órdenes ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _position_side(is_buy: bool, reduce_only: bool) -> str:
+        """
+        Calcula positionSide correcto para one-way mode en BingX.
+
+        FIX #2 (v4): Doc oficial BingX:
+          - Apertura (reduce_only=False): LONG si BUY, SHORT si SELL.
+          - Cierre   (reduce_only=True):  BOTH siempre.
+        Ref: bingx-api/api-ai-skills — Common Calls, place market buy order:
+          positionSide: "LONG" (no "BOTH").
+        """
+        if reduce_only:
+            return "BOTH"
+        return "LONG" if is_buy else "SHORT"
+
     def place_market(
         self,
         is_buy: bool,
@@ -489,17 +513,17 @@ class BingXClient:
         """
         Orden MARKET en BingX.
 
-        FIX v3: añadido positionSide="BOTH" (requerido en one-way mode).
-        Según la doc oficial BingX: "In the One-way mode, only supports BOTH".
-        Sin este campo BingX puede rechazar la orden (error de positionSide inválido).
-        Ref: BingX swap trade params — positionSide: LONG | SHORT | BOTH.
+        positionSide calculado dinámicamente (FIX #2 v4):
+          - Apertura: LONG (BUY) o SHORT (SELL)
+          - Cierre:   BOTH (reduce_only=True)
         """
-        sz_r = self.round_sz(sz)
-        side = "BUY" if is_buy else "SELL"
+        sz_r     = self.round_sz(sz)
+        side     = "BUY" if is_buy else "SELL"
+        pos_side = self._position_side(is_buy, reduce_only)
         params = {
             "symbol":       self.inst_id,
             "side":         side,
-            "positionSide": "BOTH",
+            "positionSide": pos_side,
             "type":         "MARKET",
             "quantity":     str(sz_r),
             "reduceOnly":   "true" if reduce_only else "false",
@@ -507,8 +531,8 @@ class BingXClient:
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
-                "[%s] place_market: %s %.6f reduceOnly=%s",
-                self.inst_id, side, sz_r, reduce_only,
+                "[%s] place_market: %s positionSide=%s %.6f reduceOnly=%s",
+                self.inst_id, side, pos_side, sz_r, reduce_only,
             )
             return self._wrap(resp)
         except Exception as exc:
@@ -526,16 +550,18 @@ class BingXClient:
         """
         Orden LIMIT en BingX.
 
-        FIX v3: añadido positionSide="BOTH" (requerido en one-way mode).
-        Ref: BingX swap trade params — positionSide: LONG | SHORT | BOTH.
+        positionSide calculado dinámicamente (FIX #2 v4):
+          - Apertura: LONG (BUY) o SHORT (SELL)
+          - Cierre:   BOTH (reduce_only=True)
         """
-        sz_r = self.round_sz(sz)
-        px_r = self.round_px(price)
-        side = "BUY" if is_buy else "SELL"
+        sz_r     = self.round_sz(sz)
+        px_r     = self.round_px(price)
+        side     = "BUY" if is_buy else "SELL"
+        pos_side = self._position_side(is_buy, reduce_only)
         params = {
             "symbol":       self.inst_id,
             "side":         side,
-            "positionSide": "BOTH",
+            "positionSide": pos_side,
             "type":         "LIMIT",
             "quantity":     str(sz_r),
             "price":        str(px_r),
@@ -545,8 +571,8 @@ class BingXClient:
         try:
             resp = self._core._post("/openApi/swap/v2/trade/order", params)
             logger.info(
-                "[%s] place_limit: %s %.6f @ %.6f (%s)",
-                self.inst_id, side, sz_r, px_r, tif,
+                "[%s] place_limit: %s positionSide=%s %.6f @ %.6f (%s)",
+                self.inst_id, side, pos_side, sz_r, px_r, tif,
             )
             return self._wrap(resp)
         except Exception as exc:
@@ -564,12 +590,13 @@ class BingXClient:
         """
         Coloca una orden Take Profit en BingX.
 
-        - Siempre usa TAKE_PROFIT_MARKET (tipo market al trigger).
-          BingX rechaza TAKE_PROFIT (limit) con reduceOnly=true en one-way mode.
+        - Siempre usa TAKE_PROFIT_MARKET (BingX rechaza TAKE_PROFIT con
+          reduceOnly=true en one-way mode).
+        - positionSide="BOTH": correcto para órdenes de cierre en one-way mode.
+          Las órdenes TP/SL son siempre reduce_only=True, por eso BOTH.
         - workingType=MARK_PRICE: el trigger usa precio de marca, no last price.
           Evita activaciones prematuras por spikes del spread.
-        - positionSide="BOTH": requerido en one-way mode.
-          Ref: BingX swap trade docs — positionSide: LONG | SHORT | BOTH.
+        Ref: BingX swap trade docs — TAKE_PROFIT_MARKET con reduceOnly=true.
         """
         sz_r  = self.round_sz(sz)
         tpx   = self.round_px(trigger_px)
@@ -605,10 +632,11 @@ class BingXClient:
         """
         Coloca una orden Stop Loss en BingX.
 
+        - positionSide="BOTH": correcto para órdenes de cierre en one-way mode.
+          Las órdenes SL son siempre reduce_only=True, por eso BOTH.
         - workingType=MARK_PRICE: el trigger usa precio de marca, no last price.
           Evita activaciones prematuras del SL por spikes del spread.
-        - positionSide="BOTH": requerido en one-way mode.
-          Ref: BingX swap trade docs — positionSide: LONG | SHORT | BOTH.
+        Ref: BingX swap trade docs — STOP_MARKET con reduceOnly=true.
         """
         sz_r  = self.round_sz(sz)
         tpx   = self.round_px(trigger_px)
@@ -649,22 +677,28 @@ class BingXClient:
     def get_balance_usdc(self) -> float:
         """
         Devuelve el balance disponible en USDT.
-        Usa availableMargin como campo primario según la respuesta real de
-        /openApi/swap/v2/user/balance:
-          { "data": { "balance": { "availableMargin": "...", "equity": "...", ... } } }
+
+        FIX #4 (v4): usa /openApi/swap/v3/user/balance (endpoint actual según
+        doc oficial bingx-api/api-ai-skills) con fallback a v2 si falla.
+        Campo: data.balance.availableMargin.
+        Ref: bingx-api/api-ai-skills swap-account — balance endpoint.
         """
-        try:
-            resp = self._core._get("/openApi/swap/v2/user/balance")
-            data = resp.get("data", {}).get("balance", {})
-            equity = float(
-                data.get("availableMargin")
-                or data.get("equity")
-                or data.get("balance")
-                or 0
-            )
-            return equity
-        except Exception as exc:
-            logger.warning("[%s] get_balance_usdc error: %s", self.inst_id, exc)
+        for version in ("v3", "v2"):
+            try:
+                resp = self._core._get(f"/openApi/swap/{version}/user/balance")
+                data = resp.get("data", {}).get("balance", {})
+                equity = float(
+                    data.get("availableMargin")
+                    or data.get("equity")
+                    or data.get("balance")
+                    or 0
+                )
+                if equity > 0 or version == "v2":
+                    return equity
+            except Exception as exc:
+                logger.warning(
+                    "[%s] get_balance_usdc (%s) error: %s", self.inst_id, version, exc
+                )
         return 0.0
 
     def get_positions(self) -> list[dict]:
