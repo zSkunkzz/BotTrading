@@ -1,6 +1,15 @@
 """
 trading_loop.py — Loop principal de trading para un símbolo.
 
+FIX v17 (2026-06-06): Issue #15 — OHLCV fail-streak → force idle rotation
+  - TradingLoop mantiene _ohlcv_fail_streak. Tras OHLCV_FAIL_STREAK_MAX
+    (env, default 10) fallos consecutivos de evaluate() SIN posición
+    abierta, activa trader._force_idle_rotate = True.
+  - main.py _idle_rotation_loop comprueba el flag y rota inmediatamente
+    sin esperar IDLE_ROTATE_CYCLES ciclos.
+  - El streak se resetea al recibir cualquier señal válida (incluyendo
+    None exitoso, es decir OHLCV ok pero sin señal) o al detectar posición.
+
 FIX v8  (2026-06-02): notificaciones Telegram + cooldown post-cierre externo
 FIX v9  (2026-06-03): on_position_closed + global_risk en cierre externo
 FIX v10 (2026-06-03): timeout en evaluate() + logs de diagnóstico
@@ -9,17 +18,7 @@ FIX v12 (2026-06-03): PnL real en notify_close para cierre externo
 FIX v13 (2026-06-05): corrección de bugs B/C/E en notificaciones Telegram
 FIX v14 (2026-06-05): corregir AttributeError trader._info_post en _init()
 FIX v15 (2026-06-06): corregir referencias a _hl_client / _master_addr / _agent_mode
-  que ya no existen en FuturesTrader OKX y silenciaban el loop entero:
-  - trader._hl_client.round_sz()            → _round_sz(trader, sz)
-  - trader._hl_client.cancel_all_open_tpsl() → trader._cancel_all_tpsl()
-  - trader._master_addr / trader._agent_mode → eliminados del log
-  Estos AttributeError eran capturados por el except genérico de run()
-  y causaban que el loop se reiniciara sin escanear nada visible.
 FIX v16 (2026-06-06): KeyError 'side' en _get_positions() — normalización defensiva
-  de claves BingX vs OKX en el resultado de _get_positions().
-  BingX puede devolver 'posSide'/'avgPx'/'positionAmt' en lugar de
-  'side'/'entryPx'/'size'. Ahora _normalize_position() unifica ambos formatos
-  antes de acceder a las claves, eliminando el KeyError definitivamente.
 """
 from __future__ import annotations
 
@@ -47,6 +46,9 @@ _GET_POS_TIMEOUT_S      = float(os.getenv("GET_POS_TIMEOUT_S",      "15"))
 _EVALUATE_TIMEOUT_S     = float(os.getenv("EVALUATE_TIMEOUT_S",     "60"))
 
 _SCAN_LOG_EVERY         = int(os.getenv("SCAN_LOG_EVERY", "1"))
+
+# Fix #15: número de fallos consecutivos de evaluate() para forzar rotación.
+_OHLCV_FAIL_STREAK_MAX  = int(os.getenv("OHLCV_FAIL_STREAK_MAX", "10"))
 
 
 def _calc_pnl_pct(entry: float, exit_p: float, is_long: bool, leverage: int) -> float:
@@ -80,15 +82,9 @@ def _normalize_position(ep: dict) -> dict:
     'side', 'entryPx' y 'size' independientemente de si viene de
     BingXClient (claves ya normalizadas por Fix #13) o de cualquier
     implementación de _get_positions() que devuelva claves crudas.
-
-    Mapeo de claves crudas BingX → claves normalizadas:
-      posSide / positionSide → side  ("long" | "short")
-      avgPx / avgPrice / avgCost / entryPrice → entryPx  (float)
-      pos / positionAmt / availableAmt / size → size  (float abs)
     """
-    out = dict(ep)  # copia para no mutar el original
+    out = dict(ep)
 
-    # ── 'side' ────────────────────────────────────────────────────────────
     if "side" not in out or out["side"] is None:
         raw_side = (
             out.get("posSide")
@@ -101,7 +97,6 @@ def _normalize_position(ep: dict) -> dict:
         elif raw_side in ("SHORT", "SELL"):
             out["side"] = "short"
         else:
-            # ONE-WAY: deducir de positionAmt (positivo=long, negativo=short)
             amt = float(
                 out.get("positionAmt")
                 or out.get("availableAmt")
@@ -114,7 +109,6 @@ def _normalize_position(ep: dict) -> dict:
                 amt, out["side"],
             )
 
-    # ── 'entryPx' ─────────────────────────────────────────────────────────
     if "entryPx" not in out or out["entryPx"] is None:
         raw_px = (
             out.get("avgPx")
@@ -128,7 +122,6 @@ def _normalize_position(ep: dict) -> dict:
         except (TypeError, ValueError):
             out["entryPx"] = 0.0
 
-    # ── 'size' ────────────────────────────────────────────────────────────
     if "size" not in out or out["size"] is None:
         raw_sz = (
             out.get("pos")
@@ -147,13 +140,15 @@ def _normalize_position(ep: dict) -> dict:
 class TradingLoop:
 
     def __init__(self, symbol: str):
-        self.symbol           = symbol
-        self._position_mgr    = None
-        self._decision_engine = None
+        self.symbol              = symbol
+        self._position_mgr       = None
+        self._decision_engine    = None
         self._last_pos_check_at: float = 0.0
         self._iteration_count: int = 0
-        self._global_risk = None
+        self._global_risk        = None
         self._open_notified: bool = False
+        # Fix #15: contador de fallos consecutivos en evaluate() sin posición abierta.
+        self._ohlcv_fail_streak: int = 0
 
     def _build_decision_engine(self, risk):
         from bot import signal_engine
@@ -298,7 +293,6 @@ class TradingLoop:
 
             if exchange_positions is not None:
                 if exchange_positions:
-                    # FIX v16: normalizar claves antes de acceder
                     ep = _normalize_position(exchange_positions[0])
                     if trader.position is None:
                         trader.position    = ep["side"]
@@ -409,6 +403,8 @@ class TradingLoop:
 
         if trader.position is not None:
             trader._last_price = price
+            # Fix #15: hay posición → resetear fail streak
+            self._ohlcv_fail_streak = 0
 
             if n % max(1, _SCAN_LOG_EVERY) == 0:
                 entry = trader.entry_price or price
@@ -450,15 +446,42 @@ class TradingLoop:
                     ),
                     timeout=_EVALUATE_TIMEOUT_S,
                 )
+                # Fix #15: evaluate() completó sin excepción → resetear streak
+                self._ohlcv_fail_streak = 0
             except asyncio.TimeoutError:
                 logger.warning(
                     "[%s] #%d evaluate() timeout (%ss) — posiblemente OHLCV fetch colgado. "
-                    "Verifica conexión a OKX API.",
+                    "Verifica conexión a BingX API.",
                     self.symbol, n, _EVALUATE_TIMEOUT_S,
                 )
+                # Fix #15: timeout cuenta como fallo OHLCV
+                self._ohlcv_fail_streak += 1
+                logger.debug(
+                    "[%s] _ohlcv_fail_streak=%d/%d",
+                    self.symbol, self._ohlcv_fail_streak, _OHLCV_FAIL_STREAK_MAX,
+                )
+                if self._ohlcv_fail_streak >= _OHLCV_FAIL_STREAK_MAX:
+                    logger.warning(
+                        "[%s] 🔄 OHLCV fail streak (%d/%d) — marcando _force_idle_rotate=True "
+                        "para que main.py rote este trader en el próximo ciclo.",
+                        self.symbol, self._ohlcv_fail_streak, _OHLCV_FAIL_STREAK_MAX,
+                    )
+                    trader._force_idle_rotate = True
                 return
             except Exception as e:
                 logger.error("[%s] #%d evaluate() error: %s", self.symbol, n, e, exc_info=True)
+                # Fix #15: error en evaluate → fallo OHLCV
+                self._ohlcv_fail_streak += 1
+                logger.debug(
+                    "[%s] _ohlcv_fail_streak=%d/%d",
+                    self.symbol, self._ohlcv_fail_streak, _OHLCV_FAIL_STREAK_MAX,
+                )
+                if self._ohlcv_fail_streak >= _OHLCV_FAIL_STREAK_MAX:
+                    logger.warning(
+                        "[%s] 🔄 OHLCV fail streak (%d/%d) — marcando _force_idle_rotate=True.",
+                        self.symbol, self._ohlcv_fail_streak, _OHLCV_FAIL_STREAK_MAX,
+                    )
+                    trader._force_idle_rotate = True
                 return
 
             if signal:
@@ -515,7 +538,6 @@ def _cancel_tpsl_safe(trader) -> None:
     """
     FIX v15: cancela todas las algo orders (TP/SL) de forma segura
     sin depender de trader._hl_client (que no existe en FuturesTrader OKX).
-    Intenta varios patrones de acceso según el tipo de trader.
     """
     if hasattr(trader, "_trade_api") and trader._trade_api is not None:
         inst_id = getattr(trader, "inst_id", None)

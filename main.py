@@ -45,6 +45,10 @@ _USE_TESTNET      = os.getenv("BINGX_TESTNET", "false").lower() in ("true", "1",
 _IDLE_ROTATE_CYCLES = int(os.getenv("IDLE_ROTATE_CYCLES", "30"))
 _idle_cycles: dict[str, int] = {}
 
+# Fix #16: tiempo máximo (segundos) que _stop_pair_with_cleanup espera a que
+# baje el flag _pending_order antes de forzar la cancelación de la tarea.
+_PENDING_ORDER_WAIT_S = float(os.getenv("PENDING_ORDER_WAIT_S", "30"))
+
 
 def make_risk():
     return RiskManager(
@@ -129,10 +133,37 @@ def _update_leverage_map(scored_data: list[dict]) -> None:
 
 
 async def _stop_pair_with_cleanup(symbol: str) -> None:
+    """
+    Fix #16: antes de cancelar la tarea, espera hasta _PENDING_ORDER_WAIT_S
+    segundos a que el flag _pending_order del trader baje a False.
+    Evita cancelar una tarea en medio de open_order() y dejar posiciones
+    huérfanas sin SL en el exchange.
+    """
     task   = active_traders.pop(symbol, None)
     trader = _trader_instances.pop(symbol, None)
     _idle_cycles.pop(symbol, None)
     register_traders(_trader_instances)
+
+    # Fix #16: esperar a que termine la orden en vuelo (si la hay)
+    if trader is not None and getattr(trader, "_pending_order", False):
+        logger.info(
+            "[%s] ⏳ _pending_order=True — esperando hasta %.0fs antes de cancelar tarea.",
+            symbol, _PENDING_ORDER_WAIT_S,
+        )
+        deadline = asyncio.get_event_loop().time() + _PENDING_ORDER_WAIT_S
+        while getattr(trader, "_pending_order", False):
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                logger.warning(
+                    "[%s] ⚠️  _pending_order no bajó en %.0fs — forzando cancelación "
+                    "(puede haber posición huérfana sin SL en el exchange).",
+                    symbol, _PENDING_ORDER_WAIT_S,
+                )
+                break
+            await asyncio.sleep(min(0.5, remaining))
+        else:
+            logger.info("[%s] _pending_order bajó — cancelando tarea de forma segura.", symbol)
+
     if task and not task.done():
         task.cancel()
     if trader is not None:
@@ -239,6 +270,16 @@ async def _idle_rotation_loop(scanner: "PairScanner") -> None:
                 if has_position:
                     _idle_cycles[sym] = 0
                     continue
+
+                # Fix #15: forzar rotación inmediata si el trader marcó _force_idle_rotate
+                if trader is not None and getattr(trader, "_force_idle_rotate", False):
+                    logger.info(
+                        "[%s] 🔄 _force_idle_rotate=True (OHLCV fail streak) — rotando inmediatamente.",
+                        sym,
+                    )
+                    to_rotate.append(sym)
+                    continue
+
                 _idle_cycles[sym] = cycles + 1
                 if _idle_cycles[sym] >= _IDLE_ROTATE_CYCLES:
                     to_rotate.append(sym)
