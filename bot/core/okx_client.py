@@ -37,6 +37,7 @@ Variables de entorno requeridas:
 
 Opcionales:
   OKX_TESTNET         — "true" → sandbox (demo.okx.com)
+  OKX_MARGIN_MODE     — "isolated" (default) o "cross"
   OKX_INFO_CONCURRENCY — máx. requests simultáneas info (default 4)
 
 Dependencias:
@@ -72,6 +73,20 @@ FIX v2 (2026-06-06):
   - BUG 7: place_limit() pasaba timeInForce= que python-okx TradeAPI
     no acepta. El parámetro correcto según SDK es simplemente no pasarlo
     (GTC es default) o usar clOrdId. Eliminado el kwarg inválido.
+
+FIX v3 (2026-06-06):
+  - BUG A: tdMode hardcodeado a 'cross' en place_market, place_limit,
+    place_tp y place_sl — ignoraba el margin_mode del FuturesTrader
+    (default 'isolated'). OKX rechazaba órdenes o las colocaba en la
+    cuenta equivocada. Ahora OKXClient acepta margin_mode en __init__
+    y create(), lo lee de OKX_MARGIN_MODE como fallback, y lo propaga
+    a tdMode en todos los métodos de orden.
+  - BUG B: _warm_cache llamaba get_instruments(instType="SWAP", uly="",
+    instFamily="") — los kwargs vacíos causaban que la API filtrara y
+    devolviera 0 instrumentos según la versión del SDK. Eliminados.
+  - BUG C: _cancel_algo_order pasaba una lista a cancel_algo_order()
+    en lugar de kwargs individuales. python-okx TradeAPI espera
+    instId= y algoId= como kwargs. Corregido.
 """
 from __future__ import annotations
 
@@ -85,10 +100,11 @@ from typing import Optional
 logger = logging.getLogger("OKXClient")
 
 # ── Env vars ──────────────────────────────────────────────────────────────────
-_OKX_API_KEY     = os.getenv("OKX_API_KEY",     "").strip()
-_OKX_API_SECRET  = os.getenv("OKX_API_SECRET",  "").strip()
-_OKX_PASSPHRASE  = os.getenv("OKX_PASSPHRASE",  "").strip()
-_USE_TESTNET     = os.getenv("OKX_TESTNET",     "").lower() in ("true", "1", "yes")
+_OKX_API_KEY      = os.getenv("OKX_API_KEY",      "").strip()
+_OKX_API_SECRET   = os.getenv("OKX_API_SECRET",   "").strip()
+_OKX_PASSPHRASE   = os.getenv("OKX_PASSPHRASE",   "").strip()
+_USE_TESTNET      = os.getenv("OKX_TESTNET",      "").lower() in ("true", "1", "yes")
+_DEFAULT_MGN_MODE = os.getenv("OKX_MARGIN_MODE",  "isolated").strip().lower()
 _INFO_CONCURRENCY = int(os.getenv("OKX_INFO_CONCURRENCY", "4"))
 
 _FLAG = "1" if _USE_TESTNET else "0"   # "1" = demo/sandbox en python-okx
@@ -175,7 +191,8 @@ class _OKXCore:
     def _warm_cache(self) -> None:
         """Pre-carga metadatos de todos los instrumentos SWAP (USDT-margined)."""
         try:
-            resp = self.public.get_instruments(instType="SWAP", uly="", instFamily="")
+            # BUG B FIX: no pasar uly='' ni instFamily='' — filtran y devuelven 0 resultados
+            resp = self.public.get_instruments(instType="SWAP")
             instruments = (resp or {}).get("data", [])
         except Exception as exc:
             logger.warning("[OKXCore] get_instruments falló: %s", exc)
@@ -263,10 +280,18 @@ class OKXClient:
       necesitas convertir de USDC a contratos antes de llamar place_market.
     """
 
-    def __init__(self, symbol: str, core: "_OKXCore | None" = None) -> None:
-        self.symbol  = symbol
-        self.coin    = _norm_coin(symbol)
-        self.inst_id = _to_inst_id(symbol)
+    def __init__(
+        self,
+        symbol: str,
+        core: "_OKXCore | None" = None,
+        margin_mode: str = _DEFAULT_MGN_MODE,
+    ) -> None:
+        self.symbol     = symbol
+        self.coin       = _norm_coin(symbol)
+        self.inst_id    = _to_inst_id(symbol)
+        # BUG A FIX: margin_mode se recibe explícitamente en lugar de
+        # hardcodear 'cross' en cada método de orden.
+        self.td_mode    = "isolated" if margin_mode == "isolated" else "cross"
 
         if core is None:
             if _OKXCore._instance is None:
@@ -283,14 +308,16 @@ class OKXClient:
         self._core    = core
 
         # Alias de compatibilidad con trader.py que accede a self._hl_client._info
-        # OKXClient expone .all_mids() directamente, pero para el acceso ._info.all_mids()
-        # creamos un namespace mínimo.
         self._info = self
 
     @classmethod
-    async def create(cls, symbol: str) -> "OKXClient":
+    async def create(
+        cls,
+        symbol: str,
+        margin_mode: str = _DEFAULT_MGN_MODE,
+    ) -> "OKXClient":
         core = await _OKXCore.get_async()
-        return cls(symbol, core=core)
+        return cls(symbol, core=core, margin_mode=margin_mode)
 
     # ── Metadatos de instrumento ──────────────────────────────────
 
@@ -316,7 +343,7 @@ class OKXClient:
         try:
             resp = self._account.get_leverage(
                 instId=self.inst_id,
-                mgnMode="cross",
+                mgnMode=self.td_mode,
             )
             data = (resp or {}).get("data", [{}])
             lev  = int(float((data[0] if data else {}).get("lever", 20)))
@@ -410,12 +437,7 @@ class OKXClient:
     ) -> dict:
         """
         FIX v2 (BUG 6): eliminado el parámetro reduceOnly de place_order().
-        La API OKX v5 NO acepta reduceOnly en /api/v5/trade/order.
-        El cierre de posición se controla con posSide (hedge mode):
-          - Abrir long:  side=buy,  posSide=long
-          - Cerrar long: side=sell, posSide=long  (reduce_only=True)
-          - Abrir short: side=sell, posSide=short
-          - Cerrar short:side=buy,  posSide=short (reduce_only=True)
+        FIX v3 (BUG A): tdMode ahora usa self.td_mode en lugar de 'cross' hardcodeado.
         """
         sz_r     = self.round_sz(sz)
         side     = "buy" if is_buy else "sell"
@@ -423,15 +445,15 @@ class OKXClient:
         try:
             resp = self._trade.place_order(
                 instId=self.inst_id,
-                tdMode="cross",
+                tdMode=self.td_mode,
                 side=side,
                 posSide=pos_side,
                 ordType="market",
                 sz=str(sz_r),
             )
             logger.info(
-                "[%s] place_market: %s %.6f contratos | posSide=%s reduce=%s",
-                self.inst_id, side.upper(), sz_r, pos_side, reduce_only,
+                "[%s] place_market: %s %.6f contratos | posSide=%s reduce=%s tdMode=%s",
+                self.inst_id, side.upper(), sz_r, pos_side, reduce_only, self.td_mode,
             )
             return resp
         except Exception as exc:
@@ -447,27 +469,19 @@ class OKXClient:
         tif: str = "Gtc",
     ) -> dict:
         """
-        FIX v2 (BUG 6 + BUG 7):
-          - Eliminado reduceOnly (no existe en OKX v5 place_order)
-          - Eliminado timeInForce (no existe en python-okx TradeAPI.place_order)
-            El SDK de python-okx usa ordType para controlar el comportamiento:
-            'limit' = GTC por defecto, 'post_only' = maker only.
-            Para IOC/FOK usar ordType='limit' con la flag correspondiente
-            pero el SDK actual no lo expone como kwarg separado.
+        FIX v2 (BUG 6 + BUG 7): eliminados reduceOnly y timeInForce.
+        FIX v3 (BUG A): tdMode ahora usa self.td_mode.
         """
         sz_r     = self.round_sz(sz)
         px_r     = self.round_px(price)
         side     = "buy" if is_buy else "sell"
         pos_side = self._infer_pos_side(is_buy, reduce_only)
-
-        # Mapear tif a ordType compatible con python-okx
-        # 'post_only' es el único ordType alternativo soportado para limit
         ord_type = "post_only" if tif.upper() in ("POST_ONLY", "POSTONLY") else "limit"
 
         try:
             resp = self._trade.place_order(
                 instId=self.inst_id,
-                tdMode="cross",
+                tdMode=self.td_mode,
                 side=side,
                 posSide=pos_side,
                 ordType=ord_type,
@@ -475,8 +489,8 @@ class OKXClient:
                 sz=str(sz_r),
             )
             logger.info(
-                "[%s] place_limit: %s %.6f @ %.6f | ordType=%s posSide=%s reduce=%s",
-                self.inst_id, side.upper(), sz_r, px_r, ord_type, pos_side, reduce_only,
+                "[%s] place_limit: %s %.6f @ %.6f | ordType=%s posSide=%s tdMode=%s",
+                self.inst_id, side.upper(), sz_r, px_r, ord_type, pos_side, self.td_mode,
             )
             return resp
         except Exception as exc:
@@ -495,21 +509,18 @@ class OKXClient:
     ) -> dict:
         """
         Take-Profit en OKX usando ordType='conditional' (algo order).
-        is_buy=True  → cierra un SHORT (tp de short)
-        is_buy=False → cierra un LONG  (tp de long)
+        FIX v3 (BUG A): tdMode ahora usa self.td_mode.
         """
-        sz_r       = self.round_sz(sz)
-        tpx        = self.round_px(trigger_px)
-        side       = "buy" if is_buy else "sell"
-        pos_side   = "short" if is_buy else "long"
-
-        # OKX: tpOrdPx="-1" = ejecutar a mercado cuando se activa el trigger
-        ord_px = "-1" if limit_px is None else str(self.round_px(limit_px))
+        sz_r     = self.round_sz(sz)
+        tpx      = self.round_px(trigger_px)
+        side     = "buy" if is_buy else "sell"
+        pos_side = "short" if is_buy else "long"
+        ord_px   = "-1" if limit_px is None else str(self.round_px(limit_px))
 
         try:
             resp = self._trade.place_algo_order(
                 instId=self.inst_id,
-                tdMode="cross",
+                tdMode=self.td_mode,
                 side=side,
                 posSide=pos_side,
                 ordType="conditional",
@@ -518,8 +529,8 @@ class OKXClient:
                 tpOrdPx=ord_px,
             )
             logger.info(
-                "[%s] place_tp: %s %.6f @ trigger=%.6f ord_px=%s",
-                self.inst_id, side.upper(), sz_r, tpx, ord_px,
+                "[%s] place_tp: %s %.6f @ trigger=%.6f ord_px=%s tdMode=%s",
+                self.inst_id, side.upper(), sz_r, tpx, ord_px, self.td_mode,
             )
             return resp
         except Exception as exc:
@@ -535,9 +546,7 @@ class OKXClient:
     ) -> dict:
         """
         Stop-Loss en OKX usando ordType='conditional' (algo order).
-        is_buy=True  → cierra un SHORT
-        is_buy=False → cierra un LONG
-        slOrdPx="-1" = ejecutar a mercado (market SL)
+        FIX v3 (BUG A): tdMode ahora usa self.td_mode.
         """
         sz_r     = self.round_sz(sz)
         tpx      = self.round_px(trigger_px)
@@ -547,7 +556,7 @@ class OKXClient:
         try:
             resp = self._trade.place_algo_order(
                 instId=self.inst_id,
-                tdMode="cross",
+                tdMode=self.td_mode,
                 side=side,
                 posSide=pos_side,
                 ordType="conditional",
@@ -556,8 +565,8 @@ class OKXClient:
                 slOrdPx="-1",
             )
             logger.info(
-                "[%s] place_sl: %s %.6f @ trigger=%.6f",
-                self.inst_id, side.upper(), sz_r, tpx,
+                "[%s] place_sl: %s %.6f @ trigger=%.6f tdMode=%s",
+                self.inst_id, side.upper(), sz_r, tpx, self.td_mode,
             )
             return resp
         except Exception as exc:
@@ -583,8 +592,8 @@ class OKXClient:
     def get_balance_usdc(self) -> float:
         """Balance total de la cuenta en USDT."""
         try:
-            resp   = self._account.get_account_balance(ccy="USDT")
-            data   = (resp or {}).get("data", [{}])
+            resp    = self._account.get_account_balance(ccy="USDT")
+            data    = (resp or {}).get("data", [{}])
             details = (data[0] if data else {}).get("details", [])
             for d in details:
                 if d.get("ccy") == "USDT":
@@ -596,9 +605,7 @@ class OKXClient:
     def get_positions(self) -> list[dict]:
         """
         Posiciones abiertas para self.inst_id.
-
-        Retorna lista con el mismo schema que HLClient.get_positions():
-          [{"side": "long"|"short", "entryPx": float, "size": float}]
+        Retorna lista con el mismo schema que HLClient.get_positions().
         """
         try:
             resp = self._account.get_positions(instId=self.inst_id)
@@ -613,15 +620,13 @@ class OKXClient:
             entry_px = float(p.get("avgPx", 0) or 0)
             if pos_sz == 0:
                 continue
-            # OKX posSide: 'long' | 'short' | 'net'
             pos_side = p.get("posSide", "")
             if pos_side not in ("long", "short"):
                 pos_side = "long" if pos_sz > 0 else "short"
             result.append({
-                "side":    pos_side,
-                "entryPx": entry_px,
-                "size":    abs(pos_sz),
-                # Extras opcionales (no rompen nada en HLClient compatibility)
+                "side":          pos_side,
+                "entryPx":       entry_px,
+                "size":          abs(pos_sz),
                 "unrealizedPnl": float(p.get("upl", 0) or 0),
                 "lever":         int(float(p.get("lever", 0) or 0)),
             })
@@ -659,10 +664,15 @@ class OKXClient:
             return {"error": str(exc)}
 
     def _cancel_algo_order(self, algo_id: str) -> dict:
-        """Cancela una algo order (TP/SL) por algoId."""
+        """
+        Cancela una algo order (TP/SL) por algoId.
+        BUG C FIX: python-okx TradeAPI.cancel_algo_order() espera instId= y
+        algoId= como kwargs, no una lista posicional.
+        """
         try:
             resp = self._trade.cancel_algo_order(
-                [{"instId": self.inst_id, "algoId": algo_id}]
+                instId=self.inst_id,
+                algoId=algo_id,
             )
             return resp or {}
         except Exception as exc:
