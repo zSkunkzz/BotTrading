@@ -2,23 +2,25 @@
 bot/ohlcv_cache.py — Caché de OHLCV con TTL por timeframe y LRU eviction.
 
 v5 — Backoff exponencial + jitter en fetch, semáforo bajado a 3:
-  Con 10 traders × 3 TF = hasta 30 requests OHLCV simultáneas a HL,
-  la API devuelve None de forma masiva (rate limit silencioso no documentado).
+  Con 10 traders × 3 TF = hasta 30 requests OHLCV simultáneas a BingX,
+  la API puede devolver None de forma masiva (rate limit silencioso).
   Cambios respecto a v4:
-  - HL_OHLCV_CONCURRENCY default: 5 → 3 para reducir presión sobre HL.
+  - BINGX_OHLCV_CONCURRENCY default: 5 → 3 para reducir presión sobre BingX.
   - fetch_fn se llama con backoff exponencial (1s, 2s, 4s) + jitter ±0.3s.
-    Si HL devuelve lista vacía o None en el primer intento, se reintenta
+    Si BingX devuelve lista vacía o None en el primer intento, se reintenta
     hasta OHLCV_FETCH_RETRIES veces antes de declarar fallo.
   - Si todos los intentos fallan y hay datos expirados en caché, se
     devuelven con WARNING (stale fallback) en lugar de lista vacía.
 
-v4 — Semáforo global _HL_OHLCV_SEMAPHORE:
-  Con 10 traders × 3 TF = hasta 30 requests OHLCV simultáneas a HL,
+v4 — Semáforo global _BINGX_OHLCV_SEMAPHORE:
+  Con 10 traders × 3 TF = hasta 30 requests OHLCV simultáneas a BingX,
   la API devuelve None de forma masiva (rate limit silencioso no documentado).
-  Se añade asyncio.Semaphore(HL_OHLCV_CONCURRENCY) que limita las requests
+  Se añade asyncio.Semaphore(BINGX_OHLCV_CONCURRENCY) que limita las requests
   reales en vuelo. Las lecturas del caché caliente NO consumen el semáforo
   (el guard ocurre antes de llamar fetch_fn).
-  Env var: HL_OHLCV_CONCURRENCY (int, default 3)
+  Env var: BINGX_OHLCV_CONCURRENCY (int, default 3)
+  Retrocompatibilidad: si HL_OHLCV_CONCURRENCY está definida se usa como
+  fallback (para no romper deploys con la env antigua).
 
 v3 — TTL diferenciado por timeframe:
   15m → 12s  (igual que antes, velas de 15m se invalidan rápido)
@@ -52,10 +54,14 @@ _TTL_4H            = float(os.getenv("OHLCV_CACHE_TTL_4H",   "180"))
 _MAX_CACHE_SYMBOLS = int(os.getenv("MAX_OHLCV_CACHE_SYMBOLS", "20"))
 
 # ── Semáforo global: limita requests OHLCV reales en vuelo ──────────────────
-# Con 10 traders × 3 TF = hasta 30 requests simultáneas → HL devuelve None.
-# Bajado de 5 a 3 para reducir la presión sobre HL y evitar None masivos.
-_HL_OHLCV_CONCURRENCY = int(os.getenv("HL_OHLCV_CONCURRENCY", "3"))
-_HL_OHLCV_SEMAPHORE: Optional[asyncio.Semaphore] = None
+# Con 10 traders × 3 TF = hasta 30 requests simultáneas → BingX puede limitar.
+# Default 3 para reducir presión. Retrocompatible con env antigua HL_OHLCV_CONCURRENCY.
+_BINGX_OHLCV_CONCURRENCY = int(
+    os.getenv("BINGX_OHLCV_CONCURRENCY")
+    or os.getenv("HL_OHLCV_CONCURRENCY")  # retrocompatibilidad
+    or "3"
+)
+_BINGX_OHLCV_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
 # ── Backoff exponencial: reintentos dentro del semáforo ─────────────────────
 # Si fetch_fn devuelve vacío o lanza excepción, se reintenta hasta este límite.
@@ -66,14 +72,14 @@ _OHLCV_FETCH_JITTER  = float(os.getenv("OHLCV_FETCH_JITTER", "0.3"))
 
 def _get_semaphore() -> asyncio.Semaphore:
     """Lazy-init del semáforo dentro del event loop activo."""
-    global _HL_OHLCV_SEMAPHORE
-    if _HL_OHLCV_SEMAPHORE is None:
-        _HL_OHLCV_SEMAPHORE = asyncio.Semaphore(_HL_OHLCV_CONCURRENCY)
+    global _BINGX_OHLCV_SEMAPHORE
+    if _BINGX_OHLCV_SEMAPHORE is None:
+        _BINGX_OHLCV_SEMAPHORE = asyncio.Semaphore(_BINGX_OHLCV_CONCURRENCY)
         log.info(
-            "[OHLCVCache] Semáforo OHLCV inicializado: max_concurrency=%d (env HL_OHLCV_CONCURRENCY)",
-            _HL_OHLCV_CONCURRENCY,
+            "[OHLCVCache] Semáforo OHLCV inicializado: max_concurrency=%d (env BINGX_OHLCV_CONCURRENCY)",
+            _BINGX_OHLCV_CONCURRENCY,
         )
-    return _HL_OHLCV_SEMAPHORE
+    return _BINGX_OHLCV_SEMAPHORE
 
 
 _TTL_BY_TF: Dict[str, float] = {
@@ -147,7 +153,7 @@ class OHLCVCache:
                         if result:  # lista no vacía → éxito
                             data = result
                             break
-                        # HL devolvió [] o None — tratar como fallo transitorio
+                        # BingX devolvió [] o None — tratar como fallo transitorio
                         log.warning(
                             "[OHLCVCache] fetch vacío %s/%s (intento %d/%d)",
                             coin, tf, attempt + 1, _OHLCV_FETCH_RETRIES,

@@ -1,22 +1,28 @@
 """
-pair_scanner.py — Escaner de pares para OKX perpetuos USDT-margined.
+pair_scanner.py — Escaner de pares para BingX perpetuos USDT-margined.
 
-v2 — OKX migration (2026-06-06)
-  Sustituye el endpoint de Hyperliquid (metaAndAssetCtxs)
-  por la API REST pública de OKX v5:
-    GET /api/v5/public/instruments?instType=SWAP
-    GET /api/v5/market/tickers?instType=SWAP
-    GET /api/v5/public/funding-rate?instId={instId}
+v3 — BingX migration (2026-06-06)
+  Sustituye todos los endpoints de OKX/Hyperliquid por la API REST
+  pública de BingX (sin firma, sin API key):
 
-  El campo "symbol" devuelto es siempre el coin corto ("BTC", "ETH").
-  Internamente los instId son "{coin}-USDT-SWAP".
+    GET /openApi/swap/v2/quote/contracts
+        → lista de contratos activos + maxLeverage
+    GET /openApi/swap/v2/quote/ticker
+        → volumen 24h, precio, openInterest (tradeAmount)
+    GET /openApi/swap/v2/quote/premiumIndex
+        → funding rate real (lastFundingRate) por símbolo
 
-  Filtros equivalentes mantenidos:
+  Formato símbolo BingX: "BTC-USDT" (no "BTC-USDT-SWAP" ni "BTC").
+
+  Filtros mantenidos:
     SCANNER_TOP_N, SCANNER_REFRESH_MIN, SCANNER_MIN_VOLUME,
     SCANNER_MIN_CHANGE, SCANNER_EXCLUDE_LOW_LEV, SYMBOL_BLACKLIST
     FUNDING_TREND_WINDOW, AI_NEWS_FILTER
 
   Score: vol 40% + cambio% 30% + funding_abs 20% + OI 10%
+
+  Funding: enriquecido con premiumIndex real (no 0 hardcodeado).
+    FUNDING_ENRICH_BATCH (default 50): máx pares a enriquecer por ciclo.
 """
 import logging
 import asyncio
@@ -36,17 +42,18 @@ NON_CRYPTO_BASES = {
     "COIN", "MSTR", "MARA", "RIOT",
 }
 
-# OKX REST pública (no requiere API key)
-_OKX_BASE = "https://www.okx.com"
+# BingX REST pública (no requiere API key ni firma)
+_BINGX_BASE = "https://open-api.bingx.com"
 
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
 _AI_NEWS_FILTER: bool  = os.getenv("AI_NEWS_FILTER", "false").lower() in ("true", "1", "yes")
 
-_TOP_N          = int(float(os.getenv("SCANNER_TOP_N",           "25")))
-_REFRESH_MIN    = int(float(os.getenv("SCANNER_REFRESH_MIN",     "15")))
-_MIN_VOLUME     = float(os.getenv("SCANNER_MIN_VOLUME",          "500000"))
-_MIN_CHANGE_PCT = float(os.getenv("SCANNER_MIN_CHANGE",          "0.3"))
-_MIN_LEV        = int(float(os.getenv("SCANNER_EXCLUDE_LOW_LEV", "3")))
+_TOP_N               = int(float(os.getenv("SCANNER_TOP_N",           "25")))
+_REFRESH_MIN         = int(float(os.getenv("SCANNER_REFRESH_MIN",     "15")))
+_MIN_VOLUME          = float(os.getenv("SCANNER_MIN_VOLUME",          "500000"))
+_MIN_CHANGE_PCT      = float(os.getenv("SCANNER_MIN_CHANGE",          "0.3"))
+_MIN_LEV             = int(float(os.getenv("SCANNER_EXCLUDE_LOW_LEV", "3")))
+_FUNDING_ENRICH_BATCH = int(os.getenv("FUNDING_ENRICH_BATCH",         "50"))
 
 _FUNDING_TREND_N: int = int(os.getenv("FUNDING_TREND_WINDOW", "3"))
 _funding_history: dict[str, list[float]] = defaultdict(list)
@@ -62,19 +69,27 @@ def _funding_trend(symbol: str, current: float) -> str:
     return "RISING" if hist[-1] > hist[0] else "FALLING"
 
 
-async def _okx_get(path: str, params: dict | None = None) -> dict | list:
-    """GET a la API pública de OKX. Devuelve el campo `data` de la respuesta."""
+async def _bingx_get(path: str, params: dict | None = None) -> dict | list:
+    """
+    GET a la API pública de BingX.
+    Los endpoints de market data no requieren firma.
+    Devuelve body["data"] o body completo según el endpoint.
+    """
     async with aiohttp.ClientSession() as s:
         async with s.get(
-            f"{_OKX_BASE}{path}",
+            f"{_BINGX_BASE}{path}",
             params=params,
             headers={"Content-Type": "application/json"},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
             body = _json.loads(await r.text())
-            if body.get("code") != "0":
-                raise RuntimeError(f"OKX API error {body.get('code')}: {body.get('msg')}")
-            return body.get("data", [])
+            # BingX: {"code": 0, "msg": "", "data": {...}}
+            code = body.get("code", -1)
+            if code != 0:
+                raise RuntimeError(
+                    f"BingX API error {code}: {body.get('msg', 'unknown')}"
+                )
+            return body.get("data", {})
 
 
 class PairScanner:
@@ -100,20 +115,23 @@ class PairScanner:
             s.strip().upper() for s in extra.split(",") if s.strip()
         }
         # Stub de compatibilidad (main.py puede acceder a self.exchange)
-        self.exchange = _OKXExchangeStub()
+        self.exchange = _BingXExchangeStub()
 
         logger.info(
             "[PairScanner] Config: top_n=%d | refresh=%dmin | "
-            "min_vol=$%s | min_change=%.1f%% | min_lev=%dx | funding_trend_n=%d",
+            "min_vol=$%s | min_change=%.1f%% | min_lev=%dx | funding_trend_n=%d | funding_batch=%d",
             self.top_n, self.refresh_interval // 60,
             f"{self.min_volume_usdt:,.0f}", self.min_price_change_pct,
-            _MIN_LEV, _FUNDING_TREND_N,
+            _MIN_LEV, _FUNDING_TREND_N, _FUNDING_ENRICH_BATCH,
         )
 
     def _is_valid(self, coin: str) -> bool:
-        if coin.upper() in self.blacklist:
+        """Valida que el coin sea cripto (no acción/materia prima) y tenga longitud razonable."""
+        # BingX símbolo: BTC-USDT → coin = BTC
+        base = coin.replace("-USDT", "").upper()
+        if base in self.blacklist:
             return False
-        if len(coin) < 2 or len(coin) > 12:
+        if len(base) < 2 or len(base) > 12:
             return False
         return True
 
@@ -139,98 +157,167 @@ class PairScanner:
         )
         return self.active_pairs
 
+    async def _fetch_funding_rates(self, symbols: list[str]) -> dict[str, float]:
+        """
+        Obtiene funding rates reales de BingX para una lista de símbolos.
+        Endpoint: GET /openApi/swap/v2/quote/premiumIndex?symbol=BTC-USDT
+        Devuelve {symbol: lastFundingRate}.
+        Limita a _FUNDING_ENRICH_BATCH pares para no sobrecargar la API.
+        """
+        result: dict[str, float] = {}
+        batch = symbols[:_FUNDING_ENRICH_BATCH]
+
+        async def _fetch_one(sym: str) -> tuple[str, float]:
+            try:
+                data = await _bingx_get(
+                    "/openApi/swap/v2/quote/premiumIndex",
+                    {"symbol": sym},
+                )
+                # BingX devuelve un objeto con campo lastFundingRate (string)
+                rate = float(data.get("lastFundingRate", 0) or 0)
+                return sym, rate
+            except Exception as e:
+                logger.debug("[PairScanner] funding %s error: %s", sym, e)
+                return sym, 0.0
+
+        results = await asyncio.gather(*[_fetch_one(s) for s in batch])
+        for sym, rate in results:
+            result[sym] = rate
+        return result
+
     async def scan(self) -> list:
         """
-        Obtiene la lista de contratos SWAP USDT-margined de OKX
+        Obtiene la lista de contratos perpetuos USDT-margined de BingX
         y selecciona los mejores pares por score.
 
         Endpoints usados:
-          1. GET /api/v5/public/instruments?instType=SWAP
-             → maxLeverage, estado del instrumento
-          2. GET /api/v5/market/tickers?instType=SWAP
-             → volumen 24h, open interest, precio last/open24h
+          1. GET /openApi/swap/v2/quote/contracts
+             → contrato activo, maxLeverage
+          2. GET /openApi/swap/v2/quote/ticker
+             → volumen 24h (volume), precio (lastPrice / openPrice),
+               open interest (tradeAmount)
+          3. GET /openApi/swap/v2/quote/premiumIndex (por símbolo)
+             → funding rate real (lastFundingRate)
         """
         try:
-            instruments_raw, tickers_raw = await asyncio.gather(
-                _okx_get("/api/v5/public/instruments", {"instType": "SWAP"}),
-                _okx_get("/api/v5/market/tickers",    {"instType": "SWAP"}),
+            contracts_raw, tickers_raw = await asyncio.gather(
+                _bingx_get("/openApi/swap/v2/quote/contracts"),
+                _bingx_get("/openApi/swap/v2/quote/ticker"),
             )
         except Exception as e:
-            logger.error("[PairScanner] Error fetcheando datos OKX: %s", e)
+            logger.error("[PairScanner] Error fetcheando datos BingX: %s", e)
             return []
 
-        # ─ Mapas de instrumentos (solo USDT-margined activos) ─
-        inst_map: dict[str, dict] = {}   # instId → {maxLev}
-        for inst in instruments_raw:
-            inst_id = inst.get("instId", "")
-            settle  = inst.get("settleCcy", "")
-            state   = inst.get("state", "")
-            if settle != "USDT" or state != "live":
+        # BingX /contracts devuelve lista directamente o dentro de "contracts"
+        if isinstance(contracts_raw, dict):
+            contracts_list = contracts_raw.get("contracts", [])
+        else:
+            contracts_list = contracts_raw or []
+
+        # BingX /ticker devuelve lista directamente o dentro de "tickers"
+        if isinstance(tickers_raw, dict):
+            tickers_list = tickers_raw.get("tickers", [])
+        else:
+            tickers_list = tickers_raw or []
+
+        # ─ Mapa de contratos: symbol → {maxLeverage} ─
+        # Campo: {"symbol": "BTC-USDT", "maxLeverage": 150, ...}
+        contracts_map: dict[str, dict] = {}
+        for c in contracts_list:
+            sym = c.get("symbol", "")
+            if not sym.endswith("-USDT"):
                 continue
             try:
-                max_lev = int(float(inst.get("lever", "0") or "0"))
+                max_lev = int(float(c.get("maxLeverage", 0) or 0))
             except (ValueError, TypeError):
                 max_lev = 0
-            inst_map[inst_id] = {"max_lev": max_lev}
+            contracts_map[sym] = {"max_lev": max_lev}
 
-        # ─ Combinar con tickers ─
-        scored = []
+        # ─ Primera pasada: filtrar por volumen / cambio ─
+        pre_scored = []
         total_seen = skipped_bl = skipped_lev = skipped_vol = skipped_chg = 0
 
-        for t in tickers_raw:
-            inst_id = t.get("instId", "")
-            if inst_id not in inst_map:
+        for t in tickers_list:
+            # BingX ticker campos:
+            #   symbol, lastPrice, openPrice, highPrice, lowPrice,
+            #   volume (en moneda base), quoteVolume (en USDT),
+            #   tradeAmount (OI en USDT), priceChangePercent
+            sym = t.get("symbol", "")
+            if not sym.endswith("-USDT"):
                 continue
 
-            # Extraer coin del instId  BTC-USDT-SWAP → BTC
-            coin = inst_id.split("-")[0]
-
-            if not self._is_valid(coin):
+            if not self._is_valid(sym):
                 skipped_bl += 1
                 continue
             total_seen += 1
 
-            inst_info = inst_map[inst_id]
-            max_lev   = inst_info["max_lev"]
+            inst_info = contracts_map.get(sym)
+            max_lev   = inst_info["max_lev"] if inst_info else 0
 
             if max_lev < _MIN_LEV:
                 skipped_lev += 1
                 continue
 
             try:
-                last_px    = float(t.get("last",    0) or 0)
-                open24h    = float(t.get("open24h", 0) or 0)
-                vol24h_ccy = float(t.get("volCcy24h", 0) or 0)   # en USDT
-                oi_ccy     = float(t.get("openInterestCcy", 0) or 0)  # OI en USDT (si disponible)
+                last_px    = float(t.get("lastPrice",  0) or 0)
+                open_px    = float(t.get("openPrice",  0) or 0)
+                # quoteVolume = volumen 24h en USDT (campo principal BingX)
+                vol24h_usdt = float(t.get("quoteVolume", 0) or 0)
+                # Fallback: volume (en base) × lastPrice
+                if vol24h_usdt == 0:
+                    vol_base    = float(t.get("volume", 0) or 0)
+                    vol24h_usdt = vol_base * last_px
+                # OI en USDT (tradeAmount)
+                oi_usdt = float(t.get("tradeAmount", 0) or 0)
             except (ValueError, TypeError):
                 continue
 
-            # volCcy24h puede no estar en tickers SWAP; fallback a vol*last
-            if vol24h_ccy == 0:
-                vol_contracts = float(t.get("vol24h", 0) or 0)
-                vol24h_ccy = vol_contracts * last_px
-
-            if vol24h_ccy < self.min_volume_usdt or last_px <= 0:
+            if vol24h_usdt < self.min_volume_usdt or last_px <= 0:
                 skipped_vol += 1
                 continue
 
-            if open24h > 0:
-                change_pct = abs((last_px - open24h) / open24h * 100)
+            if open_px > 0:
+                change_pct = abs((last_px - open_px) / open_px * 100)
                 if change_pct < self.min_price_change_pct:
                     skipped_chg += 1
                     continue
             else:
                 change_pct = None
 
-            # Funding: OKX tickers SWAP no incluye funding en el ticker;
-            # usamos 0 por defecto para no bloquear el scan con llamadas extra.
-            # Si quieres funding real, activa FUNDING_RATE_ENRICH=true (ver abajo).
-            funding = 0.0
+            pre_scored.append({
+                "symbol":       sym,
+                "vol24h_usdt":  vol24h_usdt,
+                "change_pct":   change_pct,
+                "last_price":   last_px,
+                "oi_usdt":      oi_usdt,
+                "max_leverage": max_lev,
+                "funding":      0.0,   # se enriquece abajo
+            })
+
+        logger.debug(
+            "[PairScanner] scan pre-filter: total=%d | bl=%d | lev=%d | vol=%d | chg=%d | passed=%d",
+            total_seen, skipped_bl, skipped_lev, skipped_vol, skipped_chg, len(pre_scored),
+        )
+
+        # ─ Enriquecer con funding rates reales ─
+        if pre_scored:
+            syms_to_enrich = [p["symbol"] for p in pre_scored]
+            funding_map = await self._fetch_funding_rates(syms_to_enrich)
+            for p in pre_scored:
+                p["funding"] = funding_map.get(p["symbol"], 0.0)
+
+        # ─ Calcular score y construir lista final ─
+        scored = []
+        for p in pre_scored:
+            funding      = p["funding"]
+            change_pct   = p["change_pct"]
+            vol24h_usdt  = p["vol24h_usdt"]
+            oi_usdt      = p["oi_usdt"]
 
             score_change = change_pct if change_pct is not None else 0.0
             funding_abs  = abs(funding) * 10_000
-            oi_m         = oi_ccy / 1_000_000
-            vol_m        = vol24h_ccy / 1_000_000
+            oi_m         = oi_usdt / 1_000_000
+            vol_m        = vol24h_usdt / 1_000_000
 
             score = (
                 vol_m        * 0.4 +
@@ -239,26 +326,20 @@ class PairScanner:
                 oi_m         * 0.1
             )
 
-            trend = _funding_trend(coin, funding)
+            trend = _funding_trend(p["symbol"], funding)
 
             scored.append({
-                "symbol":        coin,
-                "inst_id":       inst_id,
+                "symbol":        p["symbol"],
                 "volume_usdt":   round(vol_m, 2),
                 "change_pct":    round(change_pct, 2) if change_pct is not None else None,
-                "last_price":    last_px,
+                "last_price":    p["last_price"],
                 "funding":       round(funding * 100, 5),
                 "funding_trend": trend,
                 "oi_usdt":       round(oi_m, 2),
                 "score":         round(score, 3),
-                "max_leverage":  max_lev,
+                "max_leverage":  p["max_leverage"],
                 "ai_delta":      0.0,
             })
-
-        logger.debug(
-            "[PairScanner] scan: total=%d | bl=%d | lev=%d | vol=%d | chg=%d | passed=%d",
-            total_seen, skipped_bl, skipped_lev, skipped_vol, skipped_chg, len(scored),
-        )
 
         # ─ Filtro IA ─
         if _AI_NEWS_FILTER and scored:
@@ -287,12 +368,12 @@ class PairScanner:
         top = scored[:self.top_n]
         self._last_scored = top
 
-        logger.info("🏆 Top %d pares seleccionados (OKX):", len(top))
+        logger.info("\U0001f3c6 Top %d pares seleccionados (BingX):", len(top))
         for p in top[:10]:
             change_str = f"{p['change_pct']}%" if p["change_pct"] is not None else "N/A"
             ai_str     = f" | IA: {p['ai_delta']:+.1f}" if p.get("ai_delta") else ""
             logger.info(
-                "  %-12s Vol:$%sM Cambio:%s OI:$%sM Fund:%.3f%%(%s) Lev:%dx Score:%.2f%s",
+                "  %-14s Vol:$%sM Cambio:%s OI:$%sM Fund:%.4f%%(%s) Lev:%dx Score:%.2f%s",
                 p["symbol"], p["volume_usdt"], change_str,
                 p["oi_usdt"], p["funding"], p.get("funding_trend", "?"),
                 p.get("max_leverage", 0), p["score"], ai_str,
@@ -301,7 +382,11 @@ class PairScanner:
         return [p["symbol"] for p in top]
 
     def normalize(self, symbol: str) -> str:
-        return symbol.replace("/", "").replace(":USDT", "").replace("USDT", "").upper()
+        """Normaliza un símbolo a formato BingX (BTC-USDT)."""
+        s = symbol.replace("/", "-").replace(":USDT", "").upper()
+        if not s.endswith("-USDT"):
+            s = s.replace("USDT", "") + "-USDT"
+        return s
 
     async def run(self) -> None:
         """Alias de run_scanner_loop() — usa self.on_pairs_updated como callback."""
@@ -320,12 +405,12 @@ class PairScanner:
         while True:
             try:
                 logger.info(
-                    "🔍 Re-escaneando (top_n=%d | refresh=%dmin)...",
+                    "\U0001f50d Re-escaneando (top_n=%d | refresh=%dmin)...",
                     self.top_n, self.refresh_interval // 60,
                 )
                 new_pairs = await self.scan()
                 if not new_pairs:
-                    logger.warning("⚠️ Scanner devolvio 0 pares — manteniendo pares actuales")
+                    logger.warning("\u26a0\ufe0f Scanner devolvio 0 pares — manteniendo pares actuales")
                 else:
                     added   = set(new_pairs) - set(self.active_pairs)
                     removed = set(self.active_pairs) - set(new_pairs)
@@ -339,9 +424,9 @@ class PairScanner:
                     self.active_pairs = new_pairs
 
                     if added:
-                        logger.info("➕ Nuevos pares (%d): %s", len(added), ", ".join(sorted(added)))
+                        logger.info("\u2795 Nuevos pares (%d): %s", len(added), ", ".join(sorted(added)))
                     if removed:
-                        logger.info("➖ Pares eliminados (%d): %s", len(removed), ", ".join(sorted(removed)))
+                        logger.info("\u2796 Pares eliminados (%d): %s", len(removed), ", ".join(sorted(removed)))
 
                     if added or removed:
                         if cb_params >= 3:
@@ -353,7 +438,7 @@ class PairScanner:
                             )
                             await callback(new_pairs)
                     else:
-                        logger.info("✅ Sin cambios en pares activos (%d pares)", len(self.active_pairs))
+                        logger.info("\u2705 Sin cambios en pares activos (%d pares)", len(self.active_pairs))
 
             except asyncio.CancelledError:
                 raise
@@ -363,6 +448,6 @@ class PairScanner:
             await asyncio.sleep(self.refresh_interval)
 
 
-class _OKXExchangeStub:
-    """Stub de compatibilidad (reemplaza _HLExchangeStub)."""
+class _BingXExchangeStub:
+    """Stub de compatibilidad (main.py puede acceder a scanner.exchange)."""
     pass
