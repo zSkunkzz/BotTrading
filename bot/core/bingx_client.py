@@ -47,6 +47,24 @@ Notas positionSide:
   /openApi/swap/v1/positionSide/dual. La variable de entorno
   BINGX_POSITION_MODE=hedge permite forzarlo sin llamada API.
 
+Fixes (2026-06-07 v10) — auditoría doc oficial BingX:
+
+  Fix #14 — Migración a v3 en endpoints de orden (🔴 CRÍTICO)
+    Desde verano 2024, BingX deprecó v2 para trade/positions endpoints.
+    Todos los endpoints de orden y posición migrados a v3.
+
+  Fix #15 — stopGuaranteed obligatorio en place_tp y place_sl (🔴 CRÍTICO)
+    BingX exige stopGuaranteed='false' cuando workingType=MARK_PRICE.
+
+  Fix #16 — stopLoss/takeProfit mal serializados en place_market_with_tpsl (🔴 CRÍTICO)
+    - stopGuaranteed debe ser string 'false', no bool False.
+    - price='0' obligatorio para órdenes MARKET dentro del objeto embebido.
+    - Serializados como JSON string explícito (no dict Python).
+
+  Fix #17 — set_leverage: one-way mode solo necesita un side (🟡 IMPORTANTE)
+    En one-way mode BingX solo acepta side='LONG'. En hedge mode se llaman
+    LONG+SHORT. Evita errores/logs innecesarios en cuentas one-way.
+
 Fixes (2026-06-06 v9) — get_positions compatible con trading_loop:
 
   Fix #13 — get_positions: claves 'side', 'entryPx', 'size' (🔴 CRÍTICO)
@@ -485,13 +503,20 @@ class BingXClient:
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> dict:
         """
-        Fix #12 (v8): ahora lanza RuntimeError si BingX rechaza el cambio
-        de leverage en AMBOS sides (LONG y SHORT).
+        Fix #17 (v10): en ONE-WAY MODE solo se llama con side='LONG'
+        (BingX no acepta SHORT en one-way). En HEDGE MODE se llaman
+        ambos sides (LONG y SHORT) como antes.
+
+        Fix #12 (v8): lanza RuntimeError si BingX rechaza el cambio
+        de leverage en todos los sides aplicables.
         """
+        # Fix #17: en one-way mode solo un side; en hedge mode ambos.
+        sides = ("LONG", "SHORT") if self._core.hedge_mode else ("LONG",)
+
         errors: dict[str, str] = {}
         ok_sides: list[str] = []
 
-        for side in ("LONG", "SHORT"):
+        for side in sides:
             try:
                 resp = self._core._post(
                     "/openApi/swap/v2/trade/leverage",
@@ -532,8 +557,8 @@ class BingXClient:
 
         if not ok_sides:
             raise RuntimeError(
-                f"[{self.inst_id}] set_leverage({leverage}x) falló en ambos sides: "
-                f"LONG={errors.get('LONG', '?')} / SHORT={errors.get('SHORT', '?')}"
+                f"[{self.inst_id}] set_leverage({leverage}x) falló en todos los sides: "
+                + " / ".join(f"{s}={errors.get(s, '?')}" for s in sides)
             )
 
         return {}
@@ -609,7 +634,8 @@ class BingXClient:
         if not self._core.hedge_mode:
             params["reduceOnly"] = "true" if reduce_only else "false"
         try:
-            resp = self._core._post("/openApi/swap/v2/trade/order", params)
+            # Fix #14 (v10): endpoint v3
+            resp = self._core._post("/openApi/swap/v3/trade/order", params)
             logger.info(
                 "[%s] place_market: %s positionSide=%s %.6f reduceOnly=%s",
                 self.inst_id, side, pos_side, sz_r, reduce_only,
@@ -637,22 +663,27 @@ class BingXClient:
             "type":         "MARKET",
             "quantity":     str(sz_r),
         }
+        # Fix #16 (v10): stopLoss/takeProfit — stopGuaranteed como string,
+        # price='0' obligatorio para tipo MARKET, serializado como JSON string.
         if sl_px is not None:
-            params["stopLoss"] = {
+            params["stopLoss"] = json.dumps({
                 "type":           "STOP_MARKET",
-                "stopPrice":      self.round_px(sl_px),
+                "stopPrice":      str(self.round_px(sl_px)),
+                "price":          "0",
                 "workingType":    "MARK_PRICE",
-                "stopGuaranteed": False,
-            }
+                "stopGuaranteed": "false",
+            }, separators=(",", ":"))
         if tp_px is not None:
-            params["takeProfit"] = {
+            params["takeProfit"] = json.dumps({
                 "type":           "TAKE_PROFIT_MARKET",
-                "stopPrice":      self.round_px(tp_px),
+                "stopPrice":      str(self.round_px(tp_px)),
+                "price":          "0",
                 "workingType":    "MARK_PRICE",
-                "stopGuaranteed": False,
-            }
+                "stopGuaranteed": "false",
+            }, separators=(",", ":"))
         try:
-            resp = self._core._post("/openApi/swap/v2/trade/order", params)
+            # Fix #14 (v10): endpoint v3
+            resp = self._core._post("/openApi/swap/v3/trade/order", params)
             logger.info(
                 "[%s] place_market_with_tpsl: %s positionSide=%s %.6f sl=%s tp=%s",
                 self.inst_id, side, pos_side, sz_r,
@@ -691,7 +722,8 @@ class BingXClient:
         if not self._core.hedge_mode:
             params["reduceOnly"] = "true" if reduce_only else "false"
         try:
-            resp = self._core._post("/openApi/swap/v2/trade/order", params)
+            # Fix #14 (v10): endpoint v3
+            resp = self._core._post("/openApi/swap/v3/trade/order", params)
             logger.info(
                 "[%s] place_limit: %s positionSide=%s %.6f @ %.6f (%s)",
                 self.inst_id, side, pos_side, sz_r, px_r, tif,
@@ -714,18 +746,21 @@ class BingXClient:
         side     = "BUY" if is_buy else "SELL"
         pos_side = self._pos_side_close(is_buy) if self._core.hedge_mode else "BOTH"
         params: dict = {
-            "symbol":       self.inst_id,
-            "side":         side,
-            "positionSide": pos_side,
-            "type":         "TAKE_PROFIT_MARKET",
-            "quantity":     str(sz_r),
-            "stopPrice":    str(tpx),
-            "workingType":  "MARK_PRICE",
+            "symbol":         self.inst_id,
+            "side":           side,
+            "positionSide":   pos_side,
+            "type":           "TAKE_PROFIT_MARKET",
+            "quantity":       str(sz_r),
+            "stopPrice":      str(tpx),
+            "workingType":    "MARK_PRICE",
+            # Fix #15 (v10): stopGuaranteed obligatorio con workingType=MARK_PRICE
+            "stopGuaranteed": "false",
         }
         if not self._core.hedge_mode:
             params["reduceOnly"] = "true"
         try:
-            resp = self._core._post("/openApi/swap/v2/trade/order", params)
+            # Fix #14 (v10): endpoint v3
+            resp = self._core._post("/openApi/swap/v3/trade/order", params)
             logger.info(
                 "[%s] place_tp: %s positionSide=%s %.6f @ trigger=%.6f",
                 self.inst_id, side, pos_side, sz_r, tpx,
@@ -747,18 +782,21 @@ class BingXClient:
         side     = "BUY" if is_buy else "SELL"
         pos_side = self._pos_side_close(is_buy) if self._core.hedge_mode else "BOTH"
         params: dict = {
-            "symbol":       self.inst_id,
-            "side":         side,
-            "positionSide": pos_side,
-            "type":         "STOP_MARKET",
-            "quantity":     str(sz_r),
-            "stopPrice":    str(tpx),
-            "workingType":  "MARK_PRICE",
+            "symbol":         self.inst_id,
+            "side":           side,
+            "positionSide":   pos_side,
+            "type":           "STOP_MARKET",
+            "quantity":       str(sz_r),
+            "stopPrice":      str(tpx),
+            "workingType":    "MARK_PRICE",
+            # Fix #15 (v10): stopGuaranteed obligatorio con workingType=MARK_PRICE
+            "stopGuaranteed": "false",
         }
         if not self._core.hedge_mode:
             params["reduceOnly"] = "true"
         try:
-            resp = self._core._post("/openApi/swap/v2/trade/order", params)
+            # Fix #14 (v10): endpoint v3
+            resp = self._core._post("/openApi/swap/v3/trade/order", params)
             logger.info(
                 "[%s] place_sl: %s positionSide=%s %.6f @ trigger=%.6f",
                 self.inst_id, side, pos_side, sz_r, tpx,
@@ -821,10 +859,13 @@ class BingXClient:
           - 'size'    → float (abs)         (trading_loop usa ep["size"])
         Además mantiene las claves OKX-compatibles ('posSide', 'avgPx', 'pos', ...)
         para el resto del código que las use.
+
+        Fix #14 (v10): endpoint migrado a v3.
         """
         try:
+            # Fix #14 (v10): /openApi/swap/v3/user/positions
             resp = self._core._get(
-                "/openApi/swap/v2/user/positions",
+                "/openApi/swap/v3/user/positions",
                 {"symbol": self.inst_id},
             )
             raw = resp.get("data", []) or []
@@ -874,8 +915,9 @@ class BingXClient:
 
     def get_open_orders(self) -> list:
         try:
+            # Fix #14 (v10): endpoint v3
             resp = self._core._get(
-                "/openApi/swap/v2/trade/openOrders",
+                "/openApi/swap/v3/trade/openOrders",
                 {"symbol": self.inst_id},
             )
             return resp.get("data", {}).get("orders", []) or []
@@ -887,10 +929,13 @@ class BingXClient:
         """
         Cancela todas las órdenes abiertas del símbolo (incluyendo SL/TP)
         usando DELETE /allOpenOrders (operación atómica batch).
+
+        Fix #14 (v10): endpoint v3.
         """
         try:
+            # Fix #14 (v10): /openApi/swap/v3/trade/allOpenOrders
             resp = self._core._delete(
-                "/openApi/swap/v2/trade/allOpenOrders",
+                "/openApi/swap/v3/trade/allOpenOrders",
                 {"symbol": self.inst_id},
             )
             cancelled = resp.get("data", {}).get("orders", []) or []
@@ -905,8 +950,9 @@ class BingXClient:
 
     def cancel_order(self, order_id: str) -> dict:
         try:
+            # Fix #14 (v10): endpoint v3
             resp = self._core._delete(
-                "/openApi/swap/v2/trade/order",
+                "/openApi/swap/v3/trade/order",
                 {"symbol": self.inst_id, "orderId": str(order_id)},
             )
             logger.info("[%s] cancel_order %s: %s", self.inst_id, order_id, resp.get("code"))
