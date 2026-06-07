@@ -2,6 +2,16 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v20 — Fix 4 bugs internos (2026-06-07):
+  1. _set_leverage: get_max_leverage() no acepta argumentos — se llamaba
+     get_max_leverage(self.inst_id) → TypeError. Corregido a get_max_leverage().
+  2. _get_positions: reemplazado HMAC manual duplicado por
+     BingXClient.get_positions() (ya probado y correcto).
+  3. _get_open_orders_raw: reemplazado HMAC manual duplicado por
+     BingXClient.get_open_orders() (incluye TP/SL algo orders, fix #22).
+  4. _get_open_trigger_orders_raw: reemplazado HMAC manual duplicado por
+     BingXClient.get_open_orders() filtrando por tipo trigger/algo.
+
 v19 — Fix CRÍTICO: corregir kwargs qty= → sz= en llamadas a BingXClient (2026-06-07):
   - BingXClient.place_market firma usa `sz` (no `qty`).
   - BingXClient.place_market_with_tpsl firma usa `sz`, `sl_px`, `tp_px` (no `qty`, `sl_price`, `tp_price`).
@@ -353,6 +363,10 @@ class FuturesTrader:
         """
         Consulta las posiciones abiertas en BingX para este símbolo.
 
+        v20 fix: reemplaza la implementación manual con HMAC duplicado por
+        BingXClient.get_positions(), que ya tiene la lógica correcta y probada
+        (Fix #13, v9: claves compatibles con trading_loop.py).
+
         Retorna lista de dicts normalizados:
           {
             "symbol":      str,   # p.ej. "BTC-USDT"
@@ -376,58 +390,28 @@ class FuturesTrader:
                 return []
 
         try:
-            import requests as _req
-            import hmac, hashlib, time as _time, urllib.parse
-
-            api_key    = self._api_key
-            api_secret = self._api_secret
-            ts         = str(int(_time.time() * 1000))
-            params_raw = f"symbol={self.inst_id}&timestamp={ts}"
-            signature  = hmac.new(
-                api_secret.encode(), params_raw.encode(), hashlib.sha256
-            ).hexdigest()
-
-            resp = await asyncio.to_thread(
-                lambda: _req.get(
-                    f"{_BASE_URL}/openApi/swap/v2/user/positions",
-                    params={
-                        "symbol":    self.inst_id,
-                        "timestamp": ts,
-                        "signature": signature,
-                    },
-                    headers={"X-BX-APIKEY": api_key},
-                    timeout=10,
-                ).json()
-            )
-
-            raw_list = resp.get("data") or []
-            if isinstance(raw_list, dict):
-                raw_list = raw_list.get("positions") or []
-
+            raw_positions = await asyncio.to_thread(self._bingx_client.get_positions)
             positions: list[dict] = []
-            for p in raw_list:
-                qty = abs(float(p.get("positionAmt") or p.get("availableAmt") or 0))
+            for p in raw_positions:
+                qty = abs(float(p.get("size") or p.get("pos") or 0))
                 if qty == 0:
                     continue
-                raw_side = str(p.get("positionSide") or p.get("side") or "").upper()
-                side = "long" if raw_side in ("LONG", "BUY") else "short"
+                side = str(p.get("side") or p.get("posSide") or "").lower()
                 positions.append({
                     "symbol":      self.inst_id,
                     "side":        side,
                     "qty":         qty,
-                    "entry_price": float(p.get("avgPrice") or p.get("entryPrice") or 0),
-                    "mark_price":  float(p.get("markPrice") or 0),
-                    "pnl":         float(p.get("unrealizedProfit") or p.get("unrealisedPnl") or 0),
-                    "leverage":    int(float(p.get("leverage") or self._open_leverage)),
-                    "margin_mode": "cross" if str(p.get("marginType") or "").upper() == "CROSSED" else "isolated",
+                    "entry_price": float(p.get("entryPx") or p.get("avgPx") or 0),
+                    "mark_price":  float(p.get("markPx") or 0),
+                    "pnl":         float(p.get("upl") or 0),
+                    "leverage":    int(float(p.get("lever") or self._open_leverage)),
+                    "margin_mode": str(p.get("mgnMode") or "isolated").lower(),
                 })
-
             logger.debug(
                 "[%s] _get_positions: %d posición(es) abiertas.",
                 self.symbol, len(positions),
             )
             return positions
-
         except Exception as e:
             logger.warning("[%s] _get_positions error (%s) — retornando [].", self.symbol, e)
             return []
@@ -439,6 +423,10 @@ class FuturesTrader:
         Fix #14: antes de llamar al exchange, consulta el leverage máximo
         real del par y capea el valor. Evita el error "Invalid leverage value"
         cuando LEVERAGE > max permitido por BingX para ese símbolo.
+
+        v20 fix: get_max_leverage() no acepta argumentos (solo self).
+        Era: self._bingx_client.get_max_leverage(self.inst_id) → TypeError.
+        Fix: self._bingx_client.get_max_leverage()
         """
         if self.dry_run:
             logger.info("[%s] [DRY-RUN] _set_leverage(%dx)", self.symbol, leverage)
@@ -452,8 +440,9 @@ class FuturesTrader:
         effective_leverage = leverage
         try:
             if hasattr(self._bingx_client, "get_max_leverage"):
+                # v20 fix: get_max_leverage() no acepta argumentos
                 max_lev = await asyncio.to_thread(
-                    self._bingx_client.get_max_leverage, self.inst_id
+                    self._bingx_client.get_max_leverage
                 )
                 if max_lev and isinstance(max_lev, int) and max_lev > 0:
                     if leverage > max_lev:
@@ -858,35 +847,14 @@ class FuturesTrader:
         """
         Retorna las órdenes pendientes activas para este símbolo desde BingX.
         Usado por PositionManager._ensure_tpsl().
+
+        v20 fix: reemplaza HMAC manual duplicado por BingXClient.get_open_orders()
+        que ya incluye tanto órdenes normales como TP/SL standalone (fix #22).
         """
         if self._bingx_client is None:
             return []
         try:
-            import requests as _req
-            import hmac, hashlib, time as _time
-
-            api_key    = self._api_key
-            api_secret = self._api_secret
-            ts         = str(int(_time.time() * 1000))
-            params_raw = f"symbol={self.inst_id}&timestamp={ts}"
-            signature  = hmac.new(
-                api_secret.encode(), params_raw.encode(), hashlib.sha256
-            ).hexdigest()
-
-            resp = await asyncio.to_thread(
-                lambda: _req.get(
-                    f"{_BASE_URL}/openApi/swap/v2/trade/openOrders",
-                    params={
-                        "symbol":    self.inst_id,
-                        "timestamp": ts,
-                        "signature": signature,
-                    },
-                    headers={"X-BX-APIKEY": api_key},
-                    timeout=10,
-                ).json()
-            )
-            data = resp.get("data") or {}
-            orders = data.get("orders") or data if isinstance(data, list) else []
+            orders = await asyncio.to_thread(self._bingx_client.get_open_orders)
             return list(orders)
         except Exception as e:
             logger.warning("[%s] _get_open_orders_raw error: %s", self.symbol, e)
@@ -896,40 +864,21 @@ class FuturesTrader:
         """
         Retorna las trigger orders (SL/TP algo-orders) pendientes para este símbolo.
         Usado por PositionManager._ensure_tpsl().
+
+        v20 fix: reemplaza HMAC manual duplicado por BingXClient.get_open_orders()
+        filtrando únicamente las órdenes de tipo trigger (STOP_MARKET, TAKE_PROFIT_MARKET).
         """
         if self._bingx_client is None:
             return []
         try:
-            import requests as _req
-            import hmac, hashlib, time as _time
-
-            api_key    = self._api_key
-            api_secret = self._api_secret
-            ts         = str(int(_time.time() * 1000))
-            params_raw = f"symbol={self.inst_id}&timestamp={ts}"
-            signature  = hmac.new(
-                api_secret.encode(), params_raw.encode(), hashlib.sha256
-            ).hexdigest()
-
-            resp = await asyncio.to_thread(
-                lambda: _req.get(
-                    f"{_BASE_URL}/openApi/swap/v2/trade/openStopOrders",
-                    params={
-                        "symbol":    self.inst_id,
-                        "timestamp": ts,
-                        "signature": signature,
-                    },
-                    headers={"X-BX-APIKEY": api_key},
-                    timeout=10,
-                ).json()
-            )
-            data = resp.get("data") or {}
-            orders = data.get("stopOrders") or data if isinstance(data, list) else []
-            # Normalizar a formato compatible con _get_tpsl_type() de position_manager
+            all_orders = await asyncio.to_thread(self._bingx_client.get_open_orders)
             normalized = []
-            for o in orders:
-                o_norm = dict(o)
+            for o in all_orders:
                 otype = str(o.get("type") or o.get("orderType") or "").upper()
+                # Solo incluir órdenes trigger (SL/TP standalone)
+                if not any(t in otype for t in ("STOP", "TAKE_PROFIT")):
+                    continue
+                o_norm = dict(o)
                 if "STOP" in otype or "SL" in otype:
                     o_norm["algoType"] = "sl"
                 elif "TAKE_PROFIT" in otype or "TP" in otype:
