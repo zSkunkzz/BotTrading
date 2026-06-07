@@ -9,7 +9,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr, vwap as calc_vwap, rsi_divergence
+from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr, rsi_divergence
 
 log = logging.getLogger(__name__)
 
@@ -1042,23 +1042,25 @@ def _compute_indicators(bars: list) -> dict:
     else:
         macd_bull = macd_bear = False
 
-    # SuperTrend - usa 'factor' en lugar de 'multiplier'
+    # SuperTrend
     st_bull, st_bear = False, False
     if len(closes) >= 20:
         try:
             st_raw = supertrend(highs, lows, closes, period=10, factor=3.0)
         except TypeError:
-            # fallback a argumentos posicionales
             st_raw = supertrend(highs, lows, closes, 10, 3.0)
         if st_raw:
             last_st = _safe_last(st_raw)
             st_bull = last_st == 1
             st_bear = last_st == -1
 
-    # VWAP
+    # VWAP manual (sin usar calc_vwap externa)
     vwap_val = 0.0
-    if len(closed_bars) > 0:
-        vwap_val = calc_vwap(highs, lows, closes, volumes)
+    if len(closed_bars) > 0 and len(closes) == len(volumes) and sum(volumes) > 0:
+        # Usamos el precio de cierre como típico (más estable que high+low+close/3)
+        cumulative_pv = sum(close * vol for close, vol in zip(closes, volumes))
+        cumulative_vol = sum(volumes)
+        vwap_val = cumulative_pv / cumulative_vol if cumulative_vol > 0 else 0.0
 
     # Volumen ratio
     vol_avg = sum(volumes[-_VOL_AVG_WINDOW:]) / _VOL_AVG_WINDOW if len(volumes) >= _VOL_AVG_WINDOW else volumes[-1]
