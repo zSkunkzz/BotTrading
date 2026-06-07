@@ -128,11 +128,19 @@ _MTF_BLOCK_SCORE_OVERRIDE = int(os.getenv("MTF_BLOCK_SCORE_OVERRIDE", "10"))
 # ── v23: semáforo interno ────────────────────────────────────────────────────
 _ANALYZE_PAIR_CONCURRENCY = int(os.getenv("ANALYZE_PAIR_CONCURRENCY", "6"))
 _analyze_pair_sem: Optional[asyncio.Semaphore] = None
+_analyze_pair_sem_loop: Optional[asyncio.AbstractEventLoop] = None
+
 
 def _get_analyze_sem() -> asyncio.Semaphore:
-    global _analyze_pair_sem
-    if _analyze_pair_sem is None:
+    # fix: recrear el semáforo si el event loop cambió (reinicios, tests)
+    global _analyze_pair_sem, _analyze_pair_sem_loop
+    try:
+        current_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        current_loop = None
+    if _analyze_pair_sem is None or _analyze_pair_sem_loop is not current_loop:
         _analyze_pair_sem = asyncio.Semaphore(_ANALYZE_PAIR_CONCURRENCY)
+        _analyze_pair_sem_loop = current_loop
         log.info("[signal_engine] Semáforo analyze_pair inicializado: max=%d", _ANALYZE_PAIR_CONCURRENCY)
     return _analyze_pair_sem
 
@@ -443,9 +451,10 @@ async def _analyze_pair_inner(
     if vol_ratio_15m < _VOL_MIN_GLOBAL:
         return _hold_result(symbol, f"Vol={vol_ratio_15m:.2f}x — mercado dormido (min {_VOL_MIN_GLOBAL}x)")
 
-    if len(bars_15m) >= _VOL_AVG_WINDOW + 1:
-        vol_last    = float(_b_vol(bars_15m[-1]))
-        vol_avg_ref = sum(float(_b_vol(b)) for b in bars_15m[-_VOL_AVG_WINDOW - 1:-1]) / _VOL_AVG_WINDOW
+    # fix: usar bars_15m[-2] (última vela CERRADA) en lugar de [-1] (vela en curso, incompleta)
+    if len(bars_15m) >= _VOL_AVG_WINDOW + 2:
+        vol_last    = float(_b_vol(bars_15m[-2]))
+        vol_avg_ref = sum(float(_b_vol(b)) for b in bars_15m[-_VOL_AVG_WINDOW - 2:-2]) / _VOL_AVG_WINDOW
         vol_signal  = round(vol_last / vol_avg_ref, 3) if vol_avg_ref > 0 else 1.0
         if vol_signal < _VOL_SIGNAL_MIN:
             return _hold_result(symbol, f"Vol señal {vol_signal:.2f}x < {_VOL_SIGNAL_MIN}x (vela sin convicción)")
@@ -770,17 +779,28 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
     lows_15m   = [float(_b_low(b))   for b in bars_15m]
     adx_val = _adx_simple(highs_15m, lows_15m, closes_15m, 14)
     ema21_series = i15.get("_ema21_series", [])
-    slope = _ema_slope(ema21_series, lookback=3) if ema21_series else 0.0
-    slope_ok = (direction == "LONG" and slope > 0) or (direction == "SHORT" and slope < 0)
 
-    if adx_val >= _ADX_MIN and slope_ok:
-        reasons.append(f"ADX={adx_val:.1f}(≥{_ADX_MIN}) + slope EMA21={slope*100:.3f}% — tendencia real confirmada")
-    elif adx_val < _ADX_MIN:
-        score = max(0, score - 2)
-        reasons.append(f"ADX={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -2")
-    elif not slope_ok:
-        score = max(0, score - 1)
-        reasons.append(f"Slope EMA21={slope*100:.3f}% en contra de {direction} — penalización -1")
+    # fix: si ema21_series está vacía, omitir slope sin penalizar
+    if ema21_series:
+        slope = _ema_slope(ema21_series, lookback=3)
+        slope_ok = (direction == "LONG" and slope > 0) or (direction == "SHORT" and slope < 0)
+
+        if adx_val >= _ADX_MIN and slope_ok:
+            reasons.append(f"ADX={adx_val:.1f}(≥{_ADX_MIN}) + slope EMA21={slope*100:.3f}% — tendencia real confirmada")
+        elif adx_val < _ADX_MIN:
+            score = max(0, score - 2)
+            reasons.append(f"ADX={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -2")
+        else:
+            score = max(0, score - 1)
+            reasons.append(f"Slope EMA21={slope*100:.3f}% en contra de {direction} — penalización -1")
+    else:
+        # sin datos de serie EMA21: evaluar solo ADX, omitir slope
+        reasons.append("EMA21 series no disponible — slope omitido")
+        if adx_val < _ADX_MIN:
+            score = max(0, score - 2)
+            reasons.append(f"ADX={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -2")
+        else:
+            reasons.append(f"ADX={adx_val:.1f}(≥{_ADX_MIN}) — tendencia confirmada por ADX (slope no disponible)")
 
     ema21_15m = i15.get("ema21")
     close_15m = i15.get("close", 0)
@@ -946,11 +966,12 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
     score = 2
     if is_retest:
-        # Retesteo: el precio vuelve al nivel roto — entrada premium
+        # fix: mensaje aclarado — el bonus del retest es +2, el score acumulado es 4
         score += 2
         reasons.append(
             f"Retesteo del nivel {'superior' if retest_up else 'inferior'} "
-            f"(close={current_close:.4f} ≈ {range_high if retest_up else range_low:.4f}) +4 total"
+            f"(close={current_close:.4f} ≈ {range_high if retest_up else range_low:.4f}) "
+            f"+2 bonus (score base=2, score total=4)"
         )
     else:
         reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} confirmada +2")
@@ -1188,87 +1209,64 @@ def format_signal_block(signal) -> str:
     lev  = f"{signal.suggested_lev}x" if signal.suggested_lev else "—"
     rr   = f"{signal.rr:.2f}" if signal.rr else "—"
     mode = signal.extra.get("setup_type", signal.entry_mode)
-    sl_note    = " [struct]" if signal.extra.get("sl_atr") and signal.extra.get("sl_used") != signal.extra.get("sl_atr") else ""
-    fast_note  = " ⚡FAST" if signal.extra.get("is_fast") else ""
-    mtf_note   = "" if signal.extra.get("mtf_aligned", True) else " ⚠️MTF"
-    premium_note = " ⭐PREMIUM" if signal.extra.get("is_premium") else ""
-    # v27: nota de TP dinámico si hubo scaling
-    tp_scale = signal.extra.get("tp_vol_scale", 1.0)
-    tp_note = f" 📈TP×{tp_scale:.2f}" if tp_scale and tp_scale != 1.0 else ""
+    premium = " ⭐" if signal.extra.get("is_premium") else ""
+    ratio = signal.extra.get("score_ratio", 0.0)
     lines = [
-        f"**{signal.symbol}** · {arrow} [{mode}]{fast_note}{premium_note}{mtf_note}{tp_note}",
-        f"Score: `{signal.score}/{signal.max_score}` · Mode: `{signal.entry_mode}` · Lev: `{lev}` · R/R: `{rr}`",
+        f"{arrow}{premium} [{mode}] score={signal.score}/{signal.max_score} ({ratio:.0%})",
+        f"Entry: {signal.entry:.6f}  SL: {signal.sl:.6f}",
+        f"TP1: {signal.tp1:.6f}  TP2: {signal.tp2:.6f}",
+        f"RR: {rr}  Lev: {lev}  ATR: {signal.atr:.6f}",
     ]
-    if signal.entry:
-        lines.append(f"Entry: `{signal.entry}` | SL: `{signal.sl}`{sl_note} | TP1: `{signal.tp1}` | TP2: `{signal.tp2}`")
-    if signal.reason:
-        lines.append(f"_{signal.reason}_")
     return "\n".join(lines)
 
 
-_FLIP_COOLDOWN_S = float(os.getenv("SIGNAL_FLIP_COOLDOWN_S", "120"))
-
+# ── Utilidades de estado ──────────────────────────────────────────────────────
 
 class SignalFlipGuard:
-    def __init__(self, cooldown_s: float = _FLIP_COOLDOWN_S):
+    """Previene flips rápidos de señal (LONG→SHORT o viceversa) en ventana corta."""
+
+    def __init__(self, cooldown_s: float = 300.0):
         self._cooldown = cooldown_s
         self._last: Dict[str, Tuple[str, float]] = {}
 
-    def allow(self, symbol: str, signal) -> bool:
-        if self._cooldown <= 0 or signal is None:
-            return True
-        side = getattr(signal, "side", None) or getattr(signal, "signal", None)
-        if not side:
-            if isinstance(signal, str) and signal.upper() in ("LONG", "SHORT", "BUY", "SELL"):
-                side = signal
-            else:
-                return True
-        side_norm = "long" if str(side).upper() in ("LONG", "BUY") else "short"
-        last = self._last.get(symbol)
-        if last is not None:
-            last_side, last_ts = last
-            elapsed = time.monotonic() - last_ts
-            if last_side != side_norm and elapsed < self._cooldown:
-                log.warning("[SignalFlipGuard] %s: señal %s BLOQUEADA (flip en %.1fs)", symbol, side_norm, elapsed)
+    def allow(self, symbol: str, new_signal: str) -> bool:
+        now = time.monotonic()
+        if symbol in self._last:
+            prev_sig, ts = self._last[symbol]
+            if prev_sig != new_signal and (now - ts) < self._cooldown:
                 return False
-        self._last[symbol] = (side_norm, time.monotonic())
+        self._last[symbol] = (new_signal, now)
         return True
 
     def reset(self, symbol: str) -> None:
         self._last.pop(symbol, None)
 
-    def update(self, symbol: str, side: str) -> None:
-        side_norm = "long" if str(side).upper() in ("LONG", "BUY") else "short"
-        self._last[symbol] = (side_norm, time.monotonic())
 
-
-signal_flip_guard = SignalFlipGuard()
-
-_MANUAL_CLOSE_COOLDOWN_S = int(os.getenv("MANUAL_CLOSE_COOLDOWN_S", "600"))
+signal_flip_guard = SignalFlipGuard(
+    cooldown_s=float(os.getenv("SIGNAL_FLIP_COOLDOWN_S", "300"))
+)
 
 
 class ManualCloseCooldown:
-    def __init__(self, cooldown_s: int = _MANUAL_CLOSE_COOLDOWN_S):
-        self._cooldown = cooldown_s
-        self._closed: Dict[str, float] = {}
+    """Bloquea re-entrada en el mismo símbolo tras cierre manual."""
 
-    def register(self, symbol: str) -> None:
-        self._closed[symbol] = time.monotonic()
-        log.info("[ManualCloseCooldown] %s: cooldown manual activado (%ds)", symbol, self._cooldown)
+    def __init__(self, cooldown_s: float = 600.0):
+        self._cooldown = cooldown_s
+        self._closed_at: Dict[str, float] = {}
+
+    def register_close(self, symbol: str) -> None:
+        self._closed_at[symbol] = time.monotonic()
 
     def is_blocked(self, symbol: str) -> bool:
-        ts = self._closed.get(symbol)
+        ts = self._closed_at.get(symbol)
         if ts is None:
             return False
-        elapsed = time.monotonic() - ts
-        if elapsed < self._cooldown:
-            log.debug("[ManualCloseCooldown] %s: bloqueado — %ds restantes", symbol, int(self._cooldown - elapsed))
-            return True
-        del self._closed[symbol]
-        return False
+        return (time.monotonic() - ts) < self._cooldown
 
-    def clear(self, symbol: str) -> None:
-        self._closed.pop(symbol, None)
+    def reset(self, symbol: str) -> None:
+        self._closed_at.pop(symbol, None)
 
 
-manual_close_cooldown = ManualCloseCooldown()
+manual_close_cooldown = ManualCloseCooldown(
+    cooldown_s=float(os.getenv("MANUAL_CLOSE_COOLDOWN_S", "600"))
+)
