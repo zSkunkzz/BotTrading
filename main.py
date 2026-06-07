@@ -37,7 +37,7 @@ _max_leverage_map: dict[str, int] = {}
 _TRADER_STOP_TIMEOUT_S = float(os.getenv("TRADER_STOP_TIMEOUT_S", "15"))
 _USDC_PER_TRADE        = float(os.getenv("USDC_PER_TRADE", "20"))
 
-# ── Credenciales BingX ──────────────────────────────────────────────────────
+# ── Credenciales BingX ───────────────────────────────────────────────
 _BINGX_API_KEY    = os.getenv("BINGX_API_KEY",    "")
 _BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
 _USE_TESTNET      = os.getenv("BINGX_TESTNET", "false").lower() in ("true", "1", "yes")
@@ -48,6 +48,18 @@ _idle_cycles: dict[str, int] = {}
 # Fix #16: tiempo máximo (segundos) que _stop_pair_with_cleanup espera a que
 # baje el flag _pending_order antes de forzar la cancelación de la tarea.
 _PENDING_ORDER_WAIT_S = float(os.getenv("PENDING_ORDER_WAIT_S", "30"))
+
+
+# ── Notifier ligero que delega en telegram_bot._send ───────────────────────
+class _TelegramNotifier:
+    """
+    Adapter que expone la interfaz `notifier.send(text)` esperada por
+    BacktestScheduler y run_backtest_now(), delegando en las funciones
+    existentes de telegram_bot.py (HTML parse_mode).
+    """
+    async def send(self, text: str) -> None:
+        from bot import telegram_bot
+        await telegram_bot._send(text)
 
 
 def make_risk():
@@ -155,7 +167,7 @@ async def _stop_pair_with_cleanup(symbol: str) -> None:
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
                 logger.warning(
-                    "[%s] ⚠️  _pending_order no bajó en %.0fs — forzando cancelación "
+                    "[%s] \u26a0\ufe0f  _pending_order no bajó en %.0fs — forzando cancelación "
                     "(puede haber posición huérfana sin SL en el exchange).",
                     symbol, _PENDING_ORDER_WAIT_S,
                 )
@@ -274,7 +286,7 @@ async def _idle_rotation_loop(scanner: "PairScanner") -> None:
                 # Fix #15: forzar rotación inmediata si el trader marcó _force_idle_rotate
                 if trader is not None and getattr(trader, "_force_idle_rotate", False):
                     logger.info(
-                        "[%s] 🔄 _force_idle_rotate=True (OHLCV fail streak) — rotando inmediatamente.",
+                        "[%s] \U0001f504 _force_idle_rotate=True (OHLCV fail streak) — rotando inmediatamente.",
                         sym,
                     )
                     to_rotate.append(sym)
@@ -358,7 +370,7 @@ async def main():
     if not _BINGX_API_KEY:
         logger.warning("\u26a0\ufe0f  BINGX_API_KEY no configurado — operando en DRY-RUN.")
 
-    # ── Balance service ─────────────────────────────────────────────────
+    # ── Balance service ──────────────────────────────────────────────
     try:
         balance_svc.init_bingx(_BINGX_API_KEY, _BINGX_API_SECRET, testnet=_USE_TESTNET)
         logger.info("\u2705 Balance service inicializado (BingX, testnet=%s)", _USE_TESTNET)
@@ -386,7 +398,18 @@ async def main():
     asyncio.create_task(kill_switch.run())
     asyncio.create_task(_idle_rotation_loop(scanner))
 
+    # ── Telegram: comandos + backtest scheduler ───────────────────────────
     setup_telegram_commands()
+
+    # Crear notifier ligero y registrarlo para el comando /backtest
+    _notifier = _TelegramNotifier()
+    from bot import telegram_bot as _tgbot
+    from bot.backtest_scheduler import get_scheduler
+    _tgbot.set_notifier(_notifier)
+    get_scheduler(_notifier).start()
+    logger.info("\u23f0 Backtest scheduler activo (cada %s días a las %s:00 UTC)",
+                os.getenv("BACKTEST_SCHED_DAYS", "7"),
+                os.getenv("BACKTEST_SCHED_HOUR", "3"))
 
     dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
     top_n   = MAX_ACTIVE_TRADERS
