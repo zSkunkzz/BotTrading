@@ -80,12 +80,18 @@ Fix Bug3 (2026-06-07) — BUG RAÍZ del TypeError:
   Fix: siempre pasar exch explícitamente. Si no hay exchange disponible,
   pasar exch=None para que analyze_pair use la rama ohlcv_fn interna.
 
-feat: SentimentGate (2026-06-08):
+feat: SentimentGate v2 (2026-06-08) — SIN BLOQUEO, solo sizing:
   Gate 2.5 — entre pretrade_risk y la señal técnica.
-  Combina Fear&Greed Index (api.alternative.me, gratuito) + Groq macro
-  sentiment en un score 0-100. Si el score < SENTIMENT_OPEN_MIN (35)
-  se bloquea la entrada. Si score < SENTIMENT_SIZE_BOOST (65) se reduce
-  el margin al 50%. Configurable por env; desactivable con SENTIMENT_GATE=false.
+  El SentimentGate NUNCA bloquea una entrada, ni LONG ni SHORT.
+  Fear & Greed en Extreme Fear sigue siendo una oportunidad válida:
+    - Longs: posibles rebotes desde capitulación.
+    - Shorts: continuación de tendencia bajista.
+  El score 0-100 solo ajusta el size_multiplier:
+    score >= SENTIMENT_SIZE_BOOST (65) → size 100%
+    score >= SENTIMENT_SIZE_MID   (50) → size 75%
+    score >= SENTIMENT_OPEN_MIN   (35) → size 50%
+    score <  SENTIMENT_OPEN_MIN        → size 35% (mínimo, nunca 0)
+  allowed siempre True — el técnico manda, el sentimiento solo pondera.
 """
 from __future__ import annotations
 
@@ -128,7 +134,7 @@ class DecisionEngine:
         Gates:
           1. Cooldown activo
           2. PretradeRisk (rate-limiting + open_margin)
-          2.5 SentimentGate: Fear&Greed + Groq macro → bloquear o reducir size
+          2.5 SentimentGate: Fear&Greed + Groq macro → SOLO ajusta size, NUNCA bloquea
           3. Señal técnica (analyze_pair)
         """
         # Gate 1: cooldown activo
@@ -166,21 +172,24 @@ class DecisionEngine:
             return None
 
         # Gate 2.5: SentimentGate (Fear&Greed + Groq macro)
+        # IMPORTANTE: el gate NUNCA bloquea — allowed es siempre True.
+        # Solo reduce el effective_margin según el size_multiplier.
+        # F&G en Extreme Fear es oportunidad válida para LONG (rebote) y SHORT (continuación).
         try:
             from bot.sentiment_gate import sentiment_gate_check
-            sg_allowed, sg_reason, sg_full_size = await sentiment_gate_check()
-            if not sg_allowed:
-                log.warning(
-                    "[%s] evaluate: BLOQUEADO por SentimentGate — %s",
-                    symbol, sg_reason,
-                )
-                return None
+            _sg_allowed, sg_reason, sg_full_size = await sentiment_gate_check()
+            # _sg_allowed ignorado — siempre continuamos independientemente del sentimiento
             if not sg_full_size:
                 prev = effective_margin
                 effective_margin = effective_margin * 0.5
                 log.info(
                     "[%s] evaluate: SentimentGate size reducido 50%% — %s (%.2f → %.2f USDC)",
                     symbol, sg_reason, prev, effective_margin,
+                )
+            else:
+                log.debug(
+                    "[%s] evaluate: SentimentGate full size — %s",
+                    symbol, sg_reason,
                 )
         except Exception as _sge:
             # Fail-open: si el gate falla, no bloqueamos la operación
