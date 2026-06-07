@@ -33,7 +33,18 @@ FEAT BE (Break-Even) — Cuando el precio se aleja de la entrada un porcentaje
     BE_TRIGGER_PCT  (default 0.4) — % del recorrido entry→TP1 necesario para activar
     BE_OFFSET_PCT   (default 0.0) — offset sobre entry (0 = BE exacto, >0 = pequeño beneficio)
   El BE solo se activa una vez por posición (_tp1_be_done). Una vez activado,
-  cancela el SL antiguo del exchange y coloca uno nuevo en entry+offset.
+  cancela TODAS las órdenes SL/TP activas del exchange antes de recolocar
+  el nuevo SL en BE + el TP1 original, evitando duplicados en BingX.
+
+v20 — Fix BingX migration — _update_sl_to_be cancela todas las órdenes
+  SL/TP pendientes antes de recolocar (evita duplicados en BingX).
+  Usa cancel_all_orders() del BingXClient si está disponible; si no,
+  cancela order by order con cancel_order().
+
+v19 — _reset_trader_position_state: reemplaza asyncio.ensure_future() por
+  asyncio.get_event_loop().create_task() con fallback a ensure_future() para
+  mayor robustez en contextos donde el loop puede no estar activo en el hilo
+  actual. Añade guard para evitar RuntimeError si no hay loop disponible.
 
 v18 — reentry_guard hook:
   _emergency_close ahora llama reentry_guard.register_sl(symbol) cuando
@@ -44,15 +55,6 @@ Fix qty=0 loop — _ensure_tpsl ahora verifica si la posición sigue abierta
   en el exchange antes de intentar colocar SL/TP de emergencia. Si _open_qty
   es 0 o la posición ya no existe, limpia el estado del trader en lugar de
   entrar en un loop infinito de errores.
-
-Fix BingX migration — _update_sl_to_be ahora usa BingXClient en lugar de
-  OKXClient (el exchange migró a BingX). Usa trader._place_tpsl() directamente
-  para mantener consistencia con el resto del sistema.
-
-Fix v19 — _reset_trader_position_state: reemplaza asyncio.ensure_future() por
-  asyncio.get_event_loop().create_task() con fallback a ensure_future() para
-  mayor robustez en contextos donde el loop puede no estar activo en el hilo
-  actual. Añade guard para evitar RuntimeError si no hay loop disponible.
 """
 from __future__ import annotations
 
@@ -239,12 +241,18 @@ class PositionManager:
 
     async def _update_sl_to_be(self, be_price: float, is_long: bool, symbol: str) -> None:
         """
-        Cancela el SL antiguo y coloca uno nuevo en be_price.
-        En dry_run solo logea.
+        v20: Cancela TODAS las órdenes SL/TP pendientes del exchange antes de
+        recolocar el nuevo SL en BE + el TP1 original.
 
-        FIX BingX migration: usa trader._place_tpsl() directamente en lugar
-        de OKXClient (el exchange migró a BingX). Esto mantiene consistencia
-        con el resto del sistema y evita ImportError silencioso.
+        Esto evita el problema de órdenes duplicadas en BingX que causaba
+        comportamiento errático del SL/TP.
+
+        Flujo:
+          1. Cancelar todas las órdenes algo/trigger pendientes del símbolo.
+          2. Colocar SL nuevo en be_price.
+          3. Recolocar el TP1 original (único TP activo).
+
+        En dry_run solo logea.
         """
         trader = self._trader
 
@@ -268,10 +276,15 @@ class PositionManager:
             trader.sl = None
             return
 
-        entry_price = getattr(trader, "entry_price", be_price)
         tp1 = getattr(trader, "tp1", None)
 
-        # 1. Colocar SL nuevo en BE (cancela el anterior internamente via _place_tpsl)
+        # ── 1. Cancelar todas las órdenes SL/TP pendientes ───────────────
+        # Esto es CRÍTICO para evitar duplicados en BingX. Si el exchange tiene
+        # ya un SL y/o TP activo, colocar uno nuevo sin cancelar el anterior
+        # genera dos órdenes en el mismo lado → comportamiento impredecible.
+        await self._cancel_all_tpsl_orders(symbol)
+
+        # ── 2. Colocar SL nuevo en BE ─────────────────────────────────────
         try:
             await place_tpsl_fn(
                 qty=open_qty,
@@ -287,7 +300,7 @@ class PositionManager:
             trader.sl = None
             return
 
-        # 2. Recolocar TP1 si existe
+        # ── 3. Recolocar TP1 original (único TP activo) ───────────────────
         if tp1 and tp1 > 0:
             try:
                 await place_tpsl_fn(
@@ -313,6 +326,78 @@ class PositionManager:
             )
         except Exception:
             pass
+
+    async def _cancel_all_tpsl_orders(self, symbol: str) -> None:
+        """
+        Cancela todas las órdenes SL/TP (trigger/algo) pendientes del símbolo
+        en el exchange antes de recolocar nuevas órdenes de protección.
+
+        Estrategia:
+          1. Intentar cancel_all_orders() del BingXClient si está disponible
+             (cancela de golpe todas las órdenes del símbolo).
+          2. Si no existe, obtener la lista de trigger orders y cancelarlas
+             una a una con cancel_order().
+          3. Si ninguna opción funciona, logear warning y continuar
+             (el paso posterior recolocará de todas formas).
+        """
+        trader = self._trader
+        bingx  = getattr(trader, "_bingx_client", None)
+
+        if bingx is None:
+            log.debug("[%s] _cancel_all_tpsl_orders: sin cliente BingX — skip.", symbol)
+            return
+
+        # Opción A: cancel_all_orders() — cancela todo en una sola llamada
+        if hasattr(bingx, "cancel_all_orders") and callable(bingx.cancel_all_orders):
+            try:
+                result = await asyncio.to_thread(bingx.cancel_all_orders)
+                code = (result or {}).get("code", -1)
+                if code in (0, "0", None):
+                    log.info("[%s] BE: todas las órdenes SL/TP canceladas (cancel_all_orders).", symbol)
+                else:
+                    log.warning(
+                        "[%s] BE: cancel_all_orders devolvió código %s: %s",
+                        symbol, code, (result or {}).get("msg", ""),
+                    )
+                return
+            except Exception as e:
+                log.warning("[%s] BE: cancel_all_orders falló (%s) — intentando cancelación individual.", symbol, e)
+
+        # Opción B: cancelar orden a orden
+        get_trigger_fn = getattr(trader, "_get_open_trigger_orders_raw", None)
+        cancel_fn_name = None
+        for fn_name in ("cancel_order", "cancel_algo_order", "cancel_trigger_order"):
+            if hasattr(bingx, fn_name) and callable(getattr(bingx, fn_name)):
+                cancel_fn_name = fn_name
+                break
+
+        if not callable(get_trigger_fn) or cancel_fn_name is None:
+            log.warning(
+                "[%s] BE: no se puede cancelar órdenes individuales "
+                "(get_trigger_fn=%s cancel_fn=%s) — continuando sin cancelar.",
+                symbol, callable(get_trigger_fn), cancel_fn_name,
+            )
+            return
+
+        try:
+            orders = await get_trigger_fn() or []
+        except Exception as e:
+            log.warning("[%s] BE: no se pudo listar trigger orders: %s — skip cancelación.", symbol, e)
+            return
+
+        cancel_fn = getattr(bingx, cancel_fn_name)
+        cancelled = 0
+        for order in orders:
+            order_id = order.get("orderId") or order.get("algoId") or order.get("id")
+            if not order_id:
+                continue
+            try:
+                await asyncio.to_thread(cancel_fn, order_id)
+                cancelled += 1
+            except Exception as e:
+                log.debug("[%s] BE: error cancelando orden %s: %s", symbol, order_id, e)
+
+        log.info("[%s] BE: %d orden(es) SL/TP cancelada(s) antes de recolocar.", symbol, cancelled)
 
     # ── Check SL por software ───────────────────────────────────────────────────
 
