@@ -49,6 +49,27 @@ Notas positionSide:
   /openApi/swap/v1/positionSide/dual. La variable de entorno
   BINGX_POSITION_MODE=hedge permite forzarlo sin llamada API.
 
+Fixes (2026-06-08 v13) — cancel_order y detección de tipo SL/TP:
+
+  Bug A — cancel_order: siempre usaba el endpoint v3 (/openApi/swap/v3/trade/order),
+    que solo cancela órdenes normales LIMIT/MARKET. Las órdenes SL/TP standalone
+    (STOP_MARKET, TAKE_PROFIT_MARKET) viven en el endpoint v2 algo. Resultado:
+    _cancel_sl_orders() llamaba cancel_order(id) → v3 devolvía error silencioso →
+    el SL antiguo NUNCA se cancelaba → al colocar el nuevo SL de BE quedaban
+    DOS SL activos en el exchange.
+    Fix: cancel_order prueba primero v3; si recibe code != 0, reintenta con v2
+    /openApi/swap/v2/trade/order (endpoint de algo orders).
+
+  Bug B — get_open_orders(): devuelve órdenes BingX con type='STOP_MARKET' o
+    type='TAKE_PROFIT_MARKET' (string plano), pero _get_tpsl_type() en
+    position_manager.py solo leía el campo algoType (que BingX no siempre
+    incluye). Resultado: has_sl y has_tp siempre False → _ensure_tpsl()
+    creía que faltaban SL/TP y los recolocaba en bucle cada 60s (spam de órdenes).
+    Fix: get_open_orders() enriquece cada orden con algoType='sl'|'tp'
+    basándose en el campo 'type' de BingX antes de devolverlas.
+    Esto permite que _get_tpsl_type() en position_manager las detecte
+    correctamente.
+
 Fixes (2026-06-07 v12) — fix 429 Too Many Requests:
 
   Fix #24 — _request: retry con backoff exponencial + jitter para HTTP 429 (🔴 CRÍTICO)
@@ -180,6 +201,28 @@ def _build_signed_body(params: dict, secret: str) -> str:
     # Fix #18: usar 'secret' parámetro, no la variable global _API_SECRET
     sig = _hmac_sign(qs, secret)
     return f"{qs}&signature={sig}"
+
+
+# ── Helper: enriquecer orden BingX con algoType ───────────────────────────────
+
+def _enrich_order_type(order: dict) -> dict:
+    """
+    v13 (Bug B): BingX devuelve órdenes SL/TP con type='STOP_MARKET' o
+    type='TAKE_PROFIT_MARKET' como string plano, pero sin algoType.
+    position_manager._get_tpsl_type() solo lee algoType, por lo que
+    has_sl/has_tp siempre era False → spam de recolocación de órdenes.
+    Esta función enriquece el dict con algoType='sl'|'tp' si no existe ya,
+    basándose en el campo 'type' de BingX.
+    """
+    if order.get("algoType"):
+        return order  # ya tiene tipo — no tocar
+
+    order_type = str(order.get("type") or order.get("orderType") or "").upper()
+    if "STOP_MARKET" in order_type or order_type == "STOP":
+        order["algoType"] = "sl"
+    elif "TAKE_PROFIT" in order_type:
+        order["algoType"] = "tp"
+    return order
 
 
 # ── _BingXCore (singleton) ────────────────────────────────────────────────────
@@ -985,6 +1028,11 @@ class BingXClient:
     def get_open_orders(self) -> list:
         """
         Fix #22 (v11): incluye órdenes TP/SL standalone.
+        v13 (Bug B): enriquece cada orden con algoType='sl'|'tp' basándose en
+        el campo 'type' de BingX (STOP_MARKET → sl, TAKE_PROFIT_MARKET → tp).
+        Esto permite que _get_tpsl_type() en position_manager las detecte
+        correctamente, evitando el spam de recolocación de órdenes.
+
         /openApi/swap/v3/trade/openOrders → órdenes normales (LIMIT, MARKET pendientes).
         /openApi/swap/v2/trade/openOrders → órdenes algo (STOP_MARKET, TAKE_PROFIT_MARKET).
         Se consultan ambos y se mergea el resultado.
@@ -1017,7 +1065,9 @@ class BingXClient:
         except Exception as exc:
             logger.warning("[%s] get_open_orders (v2 algo) error: %s", self.inst_id, exc)
 
-        return orders
+        # v13 (Bug B): enriquecer con algoType para que position_manager
+        # pueda identificar SL/TP sin depender del campo algoType de BingX
+        return [_enrich_order_type(o) for o in orders]
 
     def cancel_all_open_tpsl(self) -> list[dict]:
         """
@@ -1065,13 +1115,46 @@ class BingXClient:
         return cancelled
 
     def cancel_order(self, order_id: str) -> dict:
+        """
+        v13 (Bug A): las órdenes SL/TP standalone (STOP_MARKET, TAKE_PROFIT_MARKET)
+        viven en el endpoint v2 algo, no en v3. El cancel_order anterior solo
+        usaba v3 → error silencioso → SL antiguo nunca se cancelaba → doble SL
+        al activar el Break-Even.
+        Fix: prueba primero v3 (órdenes normales); si devuelve code != 0,
+        reintenta con v2 /openApi/swap/v2/trade/order (algo orders).
+        """
+        # Intento 1: endpoint v3 (órdenes normales LIMIT/MARKET)
         try:
             resp = self._core._delete(
                 "/openApi/swap/v3/trade/order",
                 {"symbol": self.inst_id, "orderId": str(order_id)},
             )
-            logger.info("[%s] cancel_order %s: %s", self.inst_id, order_id, resp.get("code"))
-            return resp
+            code = str(resp.get("code", "-1"))
+            if code == "0":
+                logger.info("[%s] cancel_order %s: OK (v3)", self.inst_id, order_id)
+                return resp
+            logger.debug(
+                "[%s] cancel_order %s: v3 code=%s — reintentando con v2 (algo)",
+                self.inst_id, order_id, code,
+            )
         except Exception as exc:
-            logger.error("[%s] cancel_order %s error: %s", self.inst_id, order_id, exc)
+            logger.debug("[%s] cancel_order %s: v3 excepción (%s) — reintentando v2", self.inst_id, order_id, exc)
+
+        # Intento 2: endpoint v2 (órdenes algo: STOP_MARKET, TAKE_PROFIT_MARKET)
+        try:
+            resp2 = self._core._delete(
+                "/openApi/swap/v2/trade/order",
+                {"symbol": self.inst_id, "orderId": str(order_id)},
+            )
+            code2 = str(resp2.get("code", "-1"))
+            if code2 == "0":
+                logger.info("[%s] cancel_order %s: OK (v2 algo)", self.inst_id, order_id)
+            else:
+                logger.warning(
+                    "[%s] cancel_order %s: v2 también falló (code=%s): %s",
+                    self.inst_id, order_id, code2, resp2.get("msg", ""),
+                )
+            return resp2
+        except Exception as exc:
+            logger.error("[%s] cancel_order %s v2 error: %s", self.inst_id, order_id, exc)
             return {"code": "-1", "msg": str(exc)}
