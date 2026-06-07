@@ -1,6 +1,11 @@
 """
 trading_loop.py — Loop principal de trading para un símbolo.
 
+FIX v20 (2026-06-07): limpiar tp2/tp3 — solo 1 TP activo
+  - _init(): ya no restaura tp2/tp3 desde disco.
+  - _iteration(): notify_open ya no envía tp2/tp3.
+  - Cierre externo: ya resetea tp2/tp3 a None (sin cambios).
+
 FIX v19 (2026-06-07): PnL real en cierre externo + asyncio.ensure_future fix
   - Cuando se detecta cierre externo, se intenta obtener el precio real
     de fill via trader.get_last_fill_price(symbol) antes de usar el
@@ -249,9 +254,11 @@ class TradingLoop:
             trader.entry_price    = saved["entry"]
             trader.sl             = saved.get("sl")
             trader.tp1            = saved.get("tp1")
-            trader.tp2            = saved.get("tp2")
-            trader.tp3            = saved.get("tp3")
-            trader.tp2_hit        = saved.get("tp2_hit", False)
+            # FIX v20: tp2/tp3 ya no se usan — solo hay 1 TP activo.
+            # No se restauran desde disco para evitar estado contaminado.
+            trader.tp2            = None
+            trader.tp3            = None
+            trader.tp2_hit        = False
             trader._open_notional = saved.get("usdc_amount", saved.get("usdt_amount", 0.0))
             trader._open_leverage = saved.get("leverage", trader.leverage)
             trader._protection_ok = True
@@ -587,12 +594,12 @@ class TradingLoop:
                 pos_before = trader.position
                 await trader.open_order(signal, risk)
 
+                # FIX v20: notify_open solo envía tp1 (un único TP activo).
+                # tp2/tp3 se eliminaron del flujo de órdenes.
                 if trader.position is not None and pos_before is None and not self._open_notified:
                     _entry = trader.entry_price or float(signal.get("entry") or price)
                     _sl    = trader.sl    or float(signal.get("sl")  or 0) or None
                     _tp1   = trader.tp1   or float(signal.get("tp1") or 0) or None
-                    _tp2   = trader.tp2   or float(signal.get("tp2") or 0) or None
-                    _tp3   = trader.tp3   or float(signal.get("tp3") or 0) or None
                     _size  = trader._open_notional or getattr(risk, "usdc_per_trade", None)
 
                     self._open_notified = True
@@ -606,8 +613,6 @@ class TradingLoop:
                             size_usdc  = _size,
                             sl         = _sl,
                             tp1        = _tp1,
-                            tp2        = _tp2,
-                            tp3        = _tp3,
                             dry_run    = trader.dry_run,
                             entry_mode = signal.get("entry_mode"),
                         )

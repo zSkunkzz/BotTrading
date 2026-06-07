@@ -36,6 +36,10 @@ FEAT BE (Break-Even) — Cuando el precio se aleja de la entrada un porcentaje
   cancela TODAS las órdenes SL/TP activas del exchange antes de recolocar
   el nuevo SL en BE + el TP1 original, evitando duplicados en BingX.
 
+v21 — Fix tp2/tp3 limpieza en _reset_trader_position_state:
+  Cuando se detecta cierre externo con qty=0, ahora también se limpian
+  trader.tp2 y trader.tp3 para evitar estado contaminado.
+
 v20 — Fix BingX migration — _update_sl_to_be cancela todas las órdenes
   SL/TP pendientes antes de recolocar (evita duplicados en BingX).
   Usa cancel_all_orders() del BingXClient si está disponible; si no,
@@ -673,18 +677,26 @@ def _reset_trader_position_state(trader, symbol: str) -> None:
     fue cerrada externamente (qty=0 pero el bot sigue creyendo que está abierta).
     Esto evita el loop infinito de ensure_tpsl / place_emergency_sl_tp.
 
+    FIX v21: también limpia tp2/tp3 para evitar estado contaminado cuando
+    el bot se reinicia con posición guardada que tenía múltiples TPs.
+
     FIX v19: usa asyncio.get_event_loop().create_task() en lugar de
     asyncio.ensure_future() para mayor robustez. Añade guard contra
     RuntimeError si no hay event loop disponible en el hilo actual.
     """
     log.warning(
         "[%s] Reseteando estado de posición (cerrada externamente): "
-        "position=None, sl=None, tp1=None, _open_qty=0, _protection_ok=False",
+        "position=None, sl=None, tp1=None, tp2=None, tp3=None, _open_qty=0, _protection_ok=False",
         symbol,
     )
     trader.position = None
     trader.sl = None
     trader.tp1 = None
+    # FIX v21: limpiar tp2/tp3 — ya no se usan, solo 1 TP activo
+    if hasattr(trader, "tp2"):
+        trader.tp2 = None
+    if hasattr(trader, "tp3"):
+        trader.tp3 = None
     if hasattr(trader, "tp"):
         trader.tp = None
     trader._open_qty = 0.0
