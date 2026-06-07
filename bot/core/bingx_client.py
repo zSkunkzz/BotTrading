@@ -23,6 +23,7 @@ Expone exactamente la misma interfaz pública:
     get_balance_usdc() -> float
     get_user_state() -> dict
     set_leverage(coin, leverage, is_cross)
+    set_margin_mode(symbol, margin_type) -> dict
     get_sz_decimals() -> int
     get_px_decimals() -> int
     get_tick_size() -> float
@@ -47,6 +48,41 @@ Notas positionSide:
   /openApi/swap/v1/positionSide/dual. La variable de entorno
   BINGX_POSITION_MODE=hedge permite forzarlo sin llamada API.
 
+Fixes (2026-06-07 v11) — auditoría profunda doc oficial BingX:
+
+  Fix #18 — _build_signed_body usaba _API_SECRET global en lugar del parámetro secret (🔴 CRÍTICO)
+    La función recibía 'secret' como parámetro pero firmaba con la variable global
+    _API_SECRET. Aunque en producción es la misma, rompe tests unitarios y
+    cualquier uso multi-cuenta. Corregido para usar el parámetro 'secret'.
+
+  Fix #19 — _warm_cache: pricePrecision es número de decimales, no tick size (🟡 IMPORTANTE)
+    BingX devuelve pricePrecision como entero (ej: 2 = 2 decimales = tick 0.01).
+    La lógica anterior usaba nombres confusos y una rama else inalcanzable.
+    Simplificado: px_dec = int(pricePrecision), tick_sz = 10**(-px_dec).
+
+  Fix #20 — get_balance_usdc: priorizar availableMargin sobre balance total (🔴 CRÍTICO)
+    Para un bot de trading, el saldo relevante es el margen disponible
+    (availableMargin), no el balance total que incluye margen en uso.
+    El orden de búsqueda ahora es: availableMargin → balance (fallback).
+    Estructura real v3: data.balance.availableMargin y data.balance.balance.
+
+  Fix #21 — cancel_all_open_tpsl: también cancela órdenes TP/SL standalone (🔴 CRÍTICO)
+    DELETE /openApi/swap/v3/trade/allOpenOrders cancela órdenes normales.
+    Las órdenes TP/SL colocadas con place_tp/place_sl (TAKE_PROFIT_MARKET /
+    STOP_MARKET) son "algo orders" y requieren DELETE /openApi/swap/v2/trade/allOpenOrders
+    con type=STOP adicionalmente. Ahora se ejecutan ambas llamadas y se
+    devuelve la lista combinada de cancelaciones.
+
+  Fix #22 — get_open_orders: incluye órdenes TP/SL standalone (🔴 CRÍTICO)
+    /openApi/swap/v3/trade/openOrders solo devuelve órdenes normales.
+    Las TP/SL standalone requieren /openApi/swap/v2/trade/openOrders.
+    Ahora se consultan ambos endpoints y se mergea el resultado.
+
+  Fix #23 — Nuevo método set_margin_mode() (🟡 IMPORTANTE)
+    Añadido set_margin_mode(symbol, margin_type) para poder configurar
+    el modo de margen (isolated/cross) via API antes de operar.
+    BingX endpoint: POST /openApi/swap/v2/trade/marginType
+
 Fixes (2026-06-07 v10) — auditoría doc oficial BingX:
 
   Fix #14 — Migración a v3 en endpoints de orden (🔴 CRÍTICO)
@@ -65,48 +101,7 @@ Fixes (2026-06-07 v10) — auditoría doc oficial BingX:
     En one-way mode BingX solo acepta side='LONG'. En hedge mode se llaman
     LONG+SHORT. Evita errores/logs innecesarios en cuentas one-way.
 
-Fixes (2026-06-06 v9) — get_positions compatible con trading_loop:
-
-  Fix #13 — get_positions: claves 'side', 'entryPx', 'size' (🔴 CRÍTICO)
-    trading_loop.py accede a ep["side"], ep["entryPx"] y ep["size"].
-    La versión anterior devolvía 'posSide', 'avgPx' y 'pos', causando
-    KeyError: 'side' en cada iteración del loop.
-    Ahora get_positions() devuelve AMBOS juegos de claves:
-      - 'side'    (= 'long' | 'short')    ← usa trading_loop
-      - 'entryPx' (= float)               ← usa trading_loop
-      - 'size'    (= float abs)           ← usa trading_loop
-      - 'posSide', 'avgPx', 'pos', 'upl', 'lever', ... ← compatibilidad OKX
-
-Fixes (2026-06-06 v8) — set_leverage robusto:
-
-  Fix #12 — set_leverage: lanza RuntimeError si BingX rechaza el cambio (🔴 CRÍTICO)
-
-Fixes (2026-06-06 v7) — soporte Hedge Mode:
-
-  Fix #11 — positionSide dinámico según modo de cuenta (🔴 CRÍTICO)
-
-Fixes (2026-06-06 v6) — re-auditoría doc oficial BingX (bingx-api/api-ai-skills):
-
-  Fix #8 — domain fallback .pro obligatorio (🔴 CRÍTICO)
-  Fix #9 — stopLoss/takeProfit embebidos en MARKET (🔴 CRÍTICO)
-  Fix #10 — get_user_state usa v3 (🟡 IMPORTANTE)
-
-Fixes (2026-06-06 v5) — re-auditoría doc oficial BingX (bingx-api/api-ai-skills):
-
-  Fix #5 — positionSide en one-way mode: siempre BOTH (🔴 CRÍTICO)
-  Fix #6 — X-SOURCE-KEY header obligatorio (🔴 CRÍTICO)
-  Fix #7 — timestamp incluido en sort() correctamente (🟡 IMPORTANTE)
-
-Fixes (2026-06-06 v4):
-  Fix #1 — sign → signature (🔴 CRÍTICO)
-  Fix #3 — set_leverage: side=LONG+SHORT (🟡 IMPORTANTE)
-  Fix #4 — get_balance_usdc: v3 con fallback v2 (🟡 IMPORTANTE)
-
-Fixes anteriores (v2/v3):
-  - hmac.HMAC() explícito.
-  - _delete: firma en query string.
-  - place_tp: fuerza TAKE_PROFIT_MARKET.
-  - cancel_all_open_tpsl: DELETE /allOpenOrders (batch atómico).
+Fixes anteriores (v9 y previos): ver historial git.
 """
 from __future__ import annotations
 
@@ -188,6 +183,10 @@ def _build_signed_qs(params: dict, secret: str) -> str:
 
 
 def _build_signed_body(params: dict, secret: str) -> str:
+    """
+    Fix #18 (v11): usa el parámetro 'secret' (antes firmaba con _API_SECRET
+    global ignorando el parámetro, lo que rompía tests y uso multi-cuenta).
+    """
     serialized: dict = {}
     for k, v in params.items():
         if isinstance(v, (dict, list)):
@@ -197,7 +196,8 @@ def _build_signed_body(params: dict, secret: str) -> str:
 
     p = {**serialized, "timestamp": str(int(time.time() * 1000))}
     qs  = "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}" for k, v in sorted(p.items()))
-    sig = _hmac_sign(qs, _API_SECRET)
+    # Fix #18: usar 'secret' parámetro, no la variable global _API_SECRET
+    sig = _hmac_sign(qs, secret)
     return f"{qs}&signature={sig}"
 
 
@@ -254,7 +254,14 @@ class _BingXCore:
             return False
 
     def _warm_cache(self) -> None:
-        """Carga tick sizes, step sizes y max leverage de todos los contratos."""
+        """
+        Carga tick sizes, step sizes y max leverage de todos los contratos.
+
+        Fix #19 (v11): pricePrecision en BingX es un entero que representa
+        el número de decimales (ej: 2 → tick_sz=0.01, px_dec=2).
+        La lógica anterior era innecesariamente compleja y tenía una rama
+        else inalcanzable. Simplificado a: px_dec = int(pricePrecision).
+        """
         try:
             resp = self._request("GET", "/openApi/swap/v2/quote/contracts", {})
             data = resp.get("data", [])
@@ -266,20 +273,17 @@ class _BingXCore:
             sym = c.get("symbol", "")
             if not sym.endswith("-USDT"):
                 continue
+
+            # Fix #19: pricePrecision es número de decimales (entero)
             try:
-                tick_sz = float(c.get("pricePrecision") or 0.01)
-                if tick_sz >= 1:
-                    px_dec  = int(tick_sz)
-                    tick_sz = 10 ** (-px_dec)
-                else:
-                    px_dec = max(0, round(-math.log10(tick_sz))) if tick_sz > 0 else 2
+                px_dec  = int(c.get("pricePrecision") or 2)
+                tick_sz = 10 ** (-px_dec) if px_dec >= 0 else 1.0
             except Exception:
-                tick_sz = 0.01
                 px_dec  = 2
+                tick_sz = 0.01
 
             try:
-                qty_prec = int(c.get("quantityPrecision") or 0)
-                sz_dec   = qty_prec
+                sz_dec = int(c.get("quantityPrecision") or 0)
             except Exception:
                 sz_dec = 0
 
@@ -499,7 +503,7 @@ class BingXClient:
             logger.warning("[%s] all_mids error: %s", self.inst_id, exc)
             return {}
 
-    # ── Leverage ──────────────────────────────────────────────────────────
+    # ── Leverage & Margin ─────────────────────────────────────────────────
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> dict:
         """
@@ -510,7 +514,6 @@ class BingXClient:
         Fix #12 (v8): lanza RuntimeError si BingX rechaza el cambio
         de leverage en todos los sides aplicables.
         """
-        # Fix #17: en one-way mode solo un side; en hedge mode ambos.
         sides = ("LONG", "SHORT") if self._core.hedge_mode else ("LONG",)
 
         errors: dict[str, str] = {}
@@ -562,6 +565,37 @@ class BingXClient:
             )
 
         return {}
+
+    def set_margin_mode(self, symbol: str, margin_type: str = "ISOLATED") -> dict:
+        """
+        Fix #23 (v11): configura el modo de margen del contrato via API.
+        BingX endpoint: POST /openApi/swap/v2/trade/marginType
+        margin_type: "ISOLATED" | "CROSSED"
+        Lanza RuntimeError si BingX rechaza el cambio.
+        """
+        mt = margin_type.upper()
+        # BingX acepta "ISOLATED" o "CROSSED" (no "CROSS")
+        if mt == "CROSS":
+            mt = "CROSSED"
+        try:
+            resp = self._core._post(
+                "/openApi/swap/v2/trade/marginType",
+                {"symbol": self.inst_id, "marginType": mt},
+            )
+            code = str(resp.get("code", "-1"))
+            if code == "0":
+                logger.info("[%s] set_margin_mode: OK → %s", self.inst_id, mt)
+                return resp
+            msg = resp.get("msg", f"code={code}")
+            logger.error("[%s] set_margin_mode RECHAZADO: %s", self.inst_id, msg)
+            raise RuntimeError(
+                f"[{self.inst_id}] set_margin_mode({mt}) rechazado por BingX: {msg}"
+            )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.error("[%s] set_margin_mode excepción: %s", self.inst_id, exc)
+            raise
 
     # ── Helpers respuesta BingX ───────────────────────────────────────────
 
@@ -634,7 +668,6 @@ class BingXClient:
         if not self._core.hedge_mode:
             params["reduceOnly"] = "true" if reduce_only else "false"
         try:
-            # Fix #14 (v10): endpoint v3
             resp = self._core._post("/openApi/swap/v3/trade/order", params)
             logger.info(
                 "[%s] place_market: %s positionSide=%s %.6f reduceOnly=%s",
@@ -663,8 +696,8 @@ class BingXClient:
             "type":         "MARKET",
             "quantity":     str(sz_r),
         }
-        # Fix #16 (v10): stopLoss/takeProfit — stopGuaranteed como string,
-        # price='0' obligatorio para tipo MARKET, serializado como JSON string.
+        # Fix #16 (v10): stopGuaranteed como string, price='0' obligatorio,
+        # serializado como JSON string explícito.
         if sl_px is not None:
             params["stopLoss"] = json.dumps({
                 "type":           "STOP_MARKET",
@@ -682,7 +715,6 @@ class BingXClient:
                 "stopGuaranteed": "false",
             }, separators=(",", ":"))
         try:
-            # Fix #14 (v10): endpoint v3
             resp = self._core._post("/openApi/swap/v3/trade/order", params)
             logger.info(
                 "[%s] place_market_with_tpsl: %s positionSide=%s %.6f sl=%s tp=%s",
@@ -722,7 +754,6 @@ class BingXClient:
         if not self._core.hedge_mode:
             params["reduceOnly"] = "true" if reduce_only else "false"
         try:
-            # Fix #14 (v10): endpoint v3
             resp = self._core._post("/openApi/swap/v3/trade/order", params)
             logger.info(
                 "[%s] place_limit: %s positionSide=%s %.6f @ %.6f (%s)",
@@ -753,13 +784,11 @@ class BingXClient:
             "quantity":       str(sz_r),
             "stopPrice":      str(tpx),
             "workingType":    "MARK_PRICE",
-            # Fix #15 (v10): stopGuaranteed obligatorio con workingType=MARK_PRICE
             "stopGuaranteed": "false",
         }
         if not self._core.hedge_mode:
             params["reduceOnly"] = "true"
         try:
-            # Fix #14 (v10): endpoint v3
             resp = self._core._post("/openApi/swap/v3/trade/order", params)
             logger.info(
                 "[%s] place_tp: %s positionSide=%s %.6f @ trigger=%.6f",
@@ -789,13 +818,11 @@ class BingXClient:
             "quantity":       str(sz_r),
             "stopPrice":      str(tpx),
             "workingType":    "MARK_PRICE",
-            # Fix #15 (v10): stopGuaranteed obligatorio con workingType=MARK_PRICE
             "stopGuaranteed": "false",
         }
         if not self._core.hedge_mode:
             params["reduceOnly"] = "true"
         try:
-            # Fix #14 (v10): endpoint v3
             resp = self._core._post("/openApi/swap/v3/trade/order", params)
             logger.info(
                 "[%s] place_sl: %s positionSide=%s %.6f @ trigger=%.6f",
@@ -820,8 +847,12 @@ class BingXClient:
 
     def get_balance_usdc(self) -> float:
         """
-        Fix #4 (v4): usa v3 con fallback a v2.
-        Ref: BingX swap-account — /openApi/swap/v3/user/balance
+        Fix #20 (v11): prioriza availableMargin (margen libre) sobre balance
+        total. Para un bot de trading el saldo útil es el disponible, no el
+        total que incluye margen en uso.
+
+        Estructura real BingX v3: data.balance.availableMargin / data.balance.balance
+        Fallback v2: data[0].availableMargin / data[0].balance
         """
         endpoints = [
             "/openApi/swap/v3/user/balance",
@@ -831,17 +862,27 @@ class BingXClient:
             try:
                 resp = self._core._get(ep)
                 data = resp.get("data", {})
-                # v3: data.balance.balance | v2: data[0].balance
+                bal = None
                 if isinstance(data, dict):
-                    bal = (
-                        data.get("balance", {}).get("balance")
-                        or data.get("availableMargin")
-                        or data.get("balance")
-                    )
+                    # v3: data.balance.{availableMargin,balance}
+                    inner = data.get("balance", {})
+                    if isinstance(inner, dict):
+                        bal = (
+                            inner.get("availableMargin")
+                            or inner.get("balance")
+                        )
+                    # fallback: campos directos en data
+                    if bal is None:
+                        bal = (
+                            data.get("availableMargin")
+                            or data.get("balance")
+                        )
                 elif isinstance(data, list) and data:
-                    bal = data[0].get("balance") or data[0].get("availableMargin")
-                else:
-                    bal = None
+                    # v2: data[0].{availableMargin,balance}
+                    bal = (
+                        data[0].get("availableMargin")
+                        or data[0].get("balance")
+                    )
                 if bal is not None:
                     return float(bal)
             except Exception as exc:
@@ -854,16 +895,13 @@ class BingXClient:
     def get_positions(self) -> list[dict]:
         """
         Fix #13 (v9): devuelve claves compatibles con trading_loop.py:
-          - 'side'    → 'long' | 'short'   (trading_loop usa ep["side"])
-          - 'entryPx' → float              (trading_loop usa ep["entryPx"])
-          - 'size'    → float (abs)         (trading_loop usa ep["size"])
-        Además mantiene las claves OKX-compatibles ('posSide', 'avgPx', 'pos', ...)
-        para el resto del código que las use.
-
+          - 'side'    → 'long' | 'short'
+          - 'entryPx' → float
+          - 'size'    → float (abs)
+        Además mantiene claves OKX-compatibles para el resto del código.
         Fix #14 (v10): endpoint migrado a v3.
         """
         try:
-            # Fix #14 (v10): /openApi/swap/v3/user/positions
             resp = self._core._get(
                 "/openApi/swap/v3/user/positions",
                 {"symbol": self.inst_id},
@@ -874,10 +912,7 @@ class BingXClient:
                 size = float(p.get("positionAmt") or p.get("availableAmt") or 0)
                 if size == 0:
                     continue
-                bx_side  = p.get("positionSide", "BOTH")
-                # Determinar si es long o short
-                # - HEDGE MODE: positionSide=LONG → long, SHORT → short
-                # - ONE-WAY MODE: positionSide=BOTH, size>0 → long, size<0 → short
+                bx_side = p.get("positionSide", "BOTH")
                 if bx_side == "LONG":
                     is_long = True
                 elif bx_side == "SHORT":
@@ -885,16 +920,16 @@ class BingXClient:
                 else:  # BOTH (one-way)
                     is_long = size > 0
 
-                side_str   = "long" if is_long else "short"
-                entry_px   = float(p.get("avgPrice") or p.get("avgCost") or 0)
-                size_abs   = abs(size)
+                side_str = "long" if is_long else "short"
+                entry_px = float(p.get("avgPrice") or p.get("avgCost") or 0)
+                size_abs = abs(size)
 
                 positions.append({
-                    # ── Claves que espera trading_loop.py ──
+                    # Claves que espera trading_loop.py
                     "side":    side_str,
                     "entryPx": entry_px,
                     "size":    size_abs,
-                    # ── Claves OKX-compatibles (para position_manager etc.) ──
+                    # Claves OKX-compatibles
                     "instId":   self.inst_id,
                     "pos":      str(size_abs),
                     "posSide":  side_str,
@@ -914,43 +949,89 @@ class BingXClient:
     # ── Órdenes abiertas ──────────────────────────────────────────────────
 
     def get_open_orders(self) -> list:
+        """
+        Fix #22 (v11): incluye órdenes TP/SL standalone.
+        /openApi/swap/v3/trade/openOrders → órdenes normales (LIMIT, MARKET pendientes).
+        /openApi/swap/v2/trade/openOrders → órdenes algo (STOP_MARKET, TAKE_PROFIT_MARKET).
+        Se consultan ambos y se mergea el resultado.
+        """
+        orders: list = []
+
+        # Órdenes normales (v3)
         try:
-            # Fix #14 (v10): endpoint v3
             resp = self._core._get(
                 "/openApi/swap/v3/trade/openOrders",
                 {"symbol": self.inst_id},
             )
-            return resp.get("data", {}).get("orders", []) or []
+            normal = resp.get("data", {}).get("orders", []) or []
+            orders.extend(normal)
         except Exception as exc:
-            logger.warning("[%s] get_open_orders error: %s", self.inst_id, exc)
-            return []
+            logger.warning("[%s] get_open_orders (v3 normal) error: %s", self.inst_id, exc)
+
+        # Órdenes TP/SL standalone (v2 algo orders)
+        try:
+            resp2 = self._core._get(
+                "/openApi/swap/v2/trade/openOrders",
+                {"symbol": self.inst_id},
+            )
+            algo = resp2.get("data", {}).get("orders", []) or []
+            # Evitar duplicados por orderId
+            existing_ids = {str(o.get("orderId", "")) for o in orders}
+            for o in algo:
+                if str(o.get("orderId", "")) not in existing_ids:
+                    orders.append(o)
+        except Exception as exc:
+            logger.warning("[%s] get_open_orders (v2 algo) error: %s", self.inst_id, exc)
+
+        return orders
 
     def cancel_all_open_tpsl(self) -> list[dict]:
         """
-        Cancela todas las órdenes abiertas del símbolo (incluyendo SL/TP)
-        usando DELETE /allOpenOrders (operación atómica batch).
-
-        Fix #14 (v10): endpoint v3.
+        Fix #21 (v11): cancela TODAS las órdenes abiertas incluyendo TP/SL standalone.
+        - DELETE /openApi/swap/v3/trade/allOpenOrders → órdenes normales.
+        - DELETE /openApi/swap/v2/trade/allOpenOrders → órdenes algo (TP/SL standalone).
+        Se ejecutan ambas y se devuelve la lista combinada de cancelaciones.
         """
+        cancelled: list[dict] = []
+
+        # Cancelar órdenes normales (v3)
         try:
-            # Fix #14 (v10): /openApi/swap/v3/trade/allOpenOrders
             resp = self._core._delete(
                 "/openApi/swap/v3/trade/allOpenOrders",
                 {"symbol": self.inst_id},
             )
-            cancelled = resp.get("data", {}).get("orders", []) or []
+            batch = resp.get("data", {}).get("orders", []) or []
+            cancelled.extend(batch)
             logger.info(
-                "[%s] cancel_all_open_tpsl: %d órdenes canceladas",
-                self.inst_id, len(cancelled),
+                "[%s] cancel_all_open_tpsl (v3 normal): %d canceladas",
+                self.inst_id, len(batch),
             )
-            return cancelled
         except Exception as exc:
-            logger.error("[%s] cancel_all_open_tpsl error: %s", self.inst_id, exc)
-            return []
+            logger.error("[%s] cancel_all_open_tpsl (v3 normal) error: %s", self.inst_id, exc)
+
+        # Cancelar órdenes TP/SL standalone (v2 algo)
+        try:
+            resp2 = self._core._delete(
+                "/openApi/swap/v2/trade/allOpenOrders",
+                {"symbol": self.inst_id},
+            )
+            batch2 = resp2.get("data", {}).get("orders", []) or []
+            cancelled.extend(batch2)
+            logger.info(
+                "[%s] cancel_all_open_tpsl (v2 algo TP/SL): %d canceladas",
+                self.inst_id, len(batch2),
+            )
+        except Exception as exc:
+            logger.error("[%s] cancel_all_open_tpsl (v2 algo) error: %s", self.inst_id, exc)
+
+        logger.info(
+            "[%s] cancel_all_open_tpsl: total %d órdenes canceladas",
+            self.inst_id, len(cancelled),
+        )
+        return cancelled
 
     def cancel_order(self, order_id: str) -> dict:
         try:
-            # Fix #14 (v10): endpoint v3
             resp = self._core._delete(
                 "/openApi/swap/v3/trade/order",
                 {"symbol": self.inst_id, "orderId": str(order_id)},
