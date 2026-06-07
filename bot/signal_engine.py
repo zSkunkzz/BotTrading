@@ -1,88 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-signal_engine.py — Motor de señales técnicas puras.
-
-EXPORTA:
-  SignalResult, analyze_pair, format_signal_block,
-  MIN_SCORE, MIN_RR, SignalFlipGuard, signal_flip_guard,
-  ManualCloseCooldown, manual_close_cooldown
-
-ARQUITECTURA:
-  signal_engine → lógica técnica pura (OHLCV + indicadores, SIN imports de strategy)
-  strategy      → orquesta: llama analyze_pair + enriched_filter + IA
-  trader        → ejecuta órdenes usando strategy.decide()
-
-SISTEMA DE SCORING:
-  El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
-
-CAMBIOS v28 (calidad de señales — 6 mejoras):
-  1. _detect_setup normalización: se elige el mejor candidato por score/max_score
-     (ratio real), pero además BREAKOUT debe superar MIN_SCORE_RATIO × MAX_BREAKOUT
-     en términos absolutos, eliminando ventaja espuria del MAX=10 más bajo.
-  2. REVERSAL RSI umbrales más estrictos: 25/75 (era 28/72). Reduce entradas
-     en sobreventa/sobrecompra moderada que puede prolongarse horas.
-  3. REVERSAL divergencia RSI OBLIGATORIA: si no hay divergencia RSI confirmada,
-     la señal es NEUTRAL (antes era solo +2 de bonus opcional).
-  4. TENDENCIA ADX en 1h además de 15m: si el ADX_1h < ADX_MIN se penaliza -1
-     adicional. El ADX de 14 períodos en 1h = 14h de mercado, mucho más
-     representativo que 3.5h en 15m.
-  5. VWAP penalización activa: si el precio está al lado equivocado del VWAP
-     se aplica -1 (antes era solo "sin confirmación" sin penalizar).
-  6. BREAKOUT vol mínimo obligatorio: si vol_ratio < BREAKOUT_VOL_MIN_HARD
-     (default 1.2x) se bloquea el setup antes de calcular score, evitando
-     falsos breakouts en mercados sin liquidez.
-
-CAMBIOS v27 (señales premium máxima calidad):
-  1. TP DINÁMICO por vol_ratio: cuando vol_ratio > 2.0 los TPs se escalan x1.2
-     (mercado expansivo); cuando vol_ratio < 0.9 el TP1 se reduce x0.85
-     (objetivo conservador en mercados lentos).
-  2. MIN_SCORE_RATIO DINÁMICO por regime: en regímenes BEAR o VOLATILE el
-     umbral sube automáticamente a MIN_SCORE_RATIO_BEAR (default 0.72) para
-     que solo entren las señales más sólidas en mercados adversos.
-  3. BREAKOUT — detección de retesteo: si el precio actual está dentro del
-     0.5% del nivel roto (range_high/range_low) se interpreta como retest y
-     suma +2 adicionales (entrada de mayor calidad y menor riesgo de fakeout).
-  4. REVERSAL — swing levels de estructura: cruza el precio con los
-     swing_low/swing_high reales de structure_analyzer. Si el precio está
-     dentro del 0.5% de un swing histórico suma +2 (más relevante que EMA50).
-  5. TENDENCIA — ADX + slope EMA21_15m: filtra tendencias planas. Requiere
-     que el slope de EMA21_15m sea positivo (LONG) o negativo (SHORT) y que
-     ADX simple (DX proxy) supere un umbral configurable (ADX_MIN, default 20).
-     Un ADX bajo indica rango disfrazado de tendencia → penalización -2.
-  6. TENDENCIA — confluencia 4h extendida: si 4h tiene MACD alcista/bajista
-     además de ST4h en favor, suma +2 adicionales (señal institucional total).
-     MAX de TENDENCIA sube de 13 a 15.
-
-CAMBIOS v26 (MIN_SCORE_RATIO):
-  1. MIN_SCORE_RATIO: nuevo filtro que exige que score/max_score >= umbral.
-  2. Variable de entorno: MIN_SCORE_RATIO (float, default "0.62").
-
-CAMBIOS v25 (señales premium):
-  1. MIN_SCORE: 7→8.
-  2. PREMIUM_SCORE=10: señales con score>=10 se marcan con ⭐.
-  3. BREAKOUT — fix squeeze filter: umbral corregido a hist_atr*0.60.
-  4. TENDENCIA — estructura HH/HL o LL/LH: +1 de calidad.
-  5. REVERSAL — EMA50_1h como nivel clave: +1 si dentro del 0.3%.
-  6. Filtro vela doji: bloquea señales cuyo cuerpo sea <20% del rango.
-  7. MIN_RR_REVERSAL=2.0.
-
-CAMBIOS v24 (fix/signal-quality):
-  1. VWAP diario real.
-  2. REVERSAL — ST1h obligatorio.
-  3. BREAKOUT — filtro de compresión previa.
-  4. Divergencias RSI en REVERSAL: +2.
-  5. TENDENCIA — volumen decreciente en pullback: +1.
-
-CAMBIOS v23 (fix/ohlcv-resilience):
-  1. Modo degradado operativo para 1h.
-  2. Semáforo interno ANALYZE_PAIR_CONCURRENCY.
-  3. _analyze_pair_inner().
-
-CAMBIOS v22: MTF bias filter + R/R dinámico por régimen.
-CAMBIOS v21: OHLCV robustos + VWAP.
-CAMBIOS v20: early entry + SL ATR dinámico.
-CAMBIOS v19: trend following puro.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -98,20 +13,15 @@ from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr, vwap as 
 
 log = logging.getLogger(__name__)
 
-# ── Umbrales globales ────────────────────────────────────────────────────────
 MIN_SCORE: int     = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
 MIN_RR: float      = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
 PREMIUM_SCORE: int = int(os.getenv("PREMIUM_SIGNAL_SCORE", "10"))
 
-# max_score usado en resultados NEUTRAL (sin setup detectado)
 MAX_SCORE_NEUTRAL: int = 10
 
-# v26: ratio mínimo base
 MIN_SCORE_RATIO: float = float(os.getenv("MIN_SCORE_RATIO", "0.62"))
-# v27: ratio elevado para regímenes adversos (BEAR / VOLATILE)
 MIN_SCORE_RATIO_BEAR: float = float(os.getenv("MIN_SCORE_RATIO_BEAR", "0.72"))
 
-# ── v22: R/R dinámico por régimen ────────────────────────────────────────────
 _MIN_RR_TRENDING  = float(os.getenv("MIN_RR_TRENDING",  "1.6"))
 _MIN_RR_RANGING   = float(os.getenv("MIN_RR_RANGING",   "2.0"))
 _MIN_RR_VOLATILE  = float(os.getenv("MIN_RR_VOLATILE",  "2.2"))
@@ -129,9 +39,7 @@ def _min_rr_for_regime(regime: Optional[str]) -> float:
         return _MIN_RR_VOLATILE
     return MIN_RR
 
-# v27: ratio efectivo según régimen
 def _min_score_ratio_for_regime(regime: Optional[str]) -> float:
-    """Eleva MIN_SCORE_RATIO en mercados adversos (BEAR o VOLATILE)."""
     if not regime:
         return MIN_SCORE_RATIO
     r = regime.upper()
@@ -139,16 +47,11 @@ def _min_score_ratio_for_regime(regime: Optional[str]) -> float:
         return MIN_SCORE_RATIO_BEAR
     return MIN_SCORE_RATIO
 
-# ── v22: MTF bias filter — bloqueo total por defecto ─────────────────────────
-# Default 999 = ninguna señal desalineada con el bias 1h puede pasar nunca.
-# Para permitir overrides puntuales usa la variable de entorno MTF_BLOCK_SCORE_OVERRIDE.
 _MTF_BLOCK_SCORE_OVERRIDE = int(os.getenv("MTF_BLOCK_SCORE_OVERRIDE", "999"))
 
-# ── v23: semáforo interno ────────────────────────────────────────────────────
 _ANALYZE_PAIR_CONCURRENCY = int(os.getenv("ANALYZE_PAIR_CONCURRENCY", "6"))
 _analyze_pair_sem: Optional[asyncio.Semaphore] = None
 _analyze_pair_sem_loop: Optional[asyncio.AbstractEventLoop] = None
-
 
 def _get_analyze_sem() -> asyncio.Semaphore:
     global _analyze_pair_sem, _analyze_pair_sem_loop
@@ -202,7 +105,6 @@ _TP_VOL_HIGH_MULT      = float(os.getenv("TP_VOL_HIGH_MULT",      "1.2"))
 _TP_VOL_LOW_THRESHOLD  = float(os.getenv("TP_VOL_LOW_THRESHOLD",  "0.9"))
 _TP_VOL_LOW_MULT       = float(os.getenv("TP_VOL_LOW_MULT",       "0.85"))
 
-
 def _to_ccxt_symbol(symbol: str) -> str:
     if "/USDC:USDC" in symbol:
         return symbol
@@ -214,7 +116,6 @@ def _to_ccxt_symbol(symbol: str) -> str:
         .upper().strip()
     )
     return f"{coin}/USDC:USDC"
-
 
 def _bar_val(b, idx: int, key: str):
     if isinstance(b, dict):
@@ -246,7 +147,6 @@ def _clean_bars(bars: list) -> list:
             cleaned.append(nb)
     return cleaned
 
-
 @dataclass
 class SignalResult:
     symbol:        str
@@ -267,12 +167,10 @@ class SignalResult:
     signal_block:  str  = ""
     extra:         Dict = field(default_factory=dict)
 
-
 def _bars_to_df(bars: list) -> pd.DataFrame:
     df = pd.DataFrame(bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
     return df
-
 
 def _structure_sl(
     bars_1h: list,
@@ -315,7 +213,6 @@ def _structure_sl(
         log.debug("[signal_engine] _structure_sl error (fallback ATR): %s", e)
     return sl_atr
 
-
 def _mtf_bias(ind_1h: dict) -> Optional[str]:
     if not ind_1h:
         return None
@@ -324,7 +221,6 @@ def _mtf_bias(ind_1h: dict) -> Optional[str]:
     if ind_1h.get("ema_bear"):
         return "SHORT"
     return None
-
 
 def _adx_simple(highs: list, lows: list, closes: list, period: int = 14) -> float:
     if len(closes) < period + 2:
@@ -359,7 +255,6 @@ def _adx_simple(highs: list, lows: list, closes: list, period: int = 14) -> floa
     except Exception:
         return 0.0
 
-
 def _ema_slope(ema_series: list, lookback: int = 3) -> float:
     if not ema_series or len(ema_series) < lookback + 1:
         return 0.0
@@ -367,7 +262,6 @@ def _ema_slope(ema_series: list, lookback: int = 3) -> float:
     delta = tail[-1] - tail[0]
     base = tail[0]
     return delta / base if base != 0 else 0.0
-
 
 async def analyze_pair(
     exch,
@@ -380,7 +274,6 @@ async def analyze_pair(
         return await _analyze_pair_inner(exch, symbol, ohlcv_fn, funding_rate, regime)
     async with _get_analyze_sem():
         return await _analyze_pair_inner(exch, symbol, None, funding_rate, regime)
-
 
 async def _analyze_pair_inner(
     exch,
@@ -654,7 +547,6 @@ async def _analyze_pair_inner(
         },
     )
 
-
 def _detect_setup(
     i15: dict, i1h: dict, i4h: dict, bars_15m: list,
     bars_1h: list = None,
@@ -684,7 +576,6 @@ def _detect_setup(
             ", ".join(f"{c[0]}({c[2]}/{c[3]}={c[2]/c[3]:.2f})" for c in candidates if c is not best),
         )
     return best
-
 
 def _score_tendencia(
     i15: dict, i1h: dict, i4h: dict, bars_15m: list,
@@ -900,7 +791,6 @@ def _score_tendencia(
 
     return "TENDENCIA", direction, score, MAX, reasons
 
-
 def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     MAX = 10
     reasons: List[str] = []
@@ -997,7 +887,6 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         if macd_ok: score += 1; reasons.append("MACD1h en favor +1")
         else: reasons.append("MACD1h en contra")
     return "BREAKOUT", direction, score, MAX, reasons
-
 
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     MAX = 14
@@ -1110,14 +999,7 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
     return "REVERSAL", direction, score, MAX, reasons
 
-
-# =============================================================================
-# COMPUTE INDICATORS — CORREGIDO (soporta retornos escalares o listas)
-# =============================================================================
 def _compute_indicators(bars: list) -> dict:
-    """Calcula indicadores técnicos usando SOLO velas cerradas (bars[:-1]).
-    ATR se calcula con todas las velas (incl. la actual) para mejor precisión de SL/TP.
-    """
     if not bars or len(bars) < 30:
         return {}
     bars = _clean_bars(bars)
@@ -1160,10 +1042,14 @@ def _compute_indicators(bars: list) -> dict:
     else:
         macd_bull = macd_bear = False
 
-    # SuperTrend
+    # SuperTrend - usa 'factor' en lugar de 'multiplier'
     st_bull, st_bear = False, False
     if len(closes) >= 20:
-        st_raw = supertrend(highs, lows, closes, period=10, multiplier=3.0)
+        try:
+            st_raw = supertrend(highs, lows, closes, period=10, factor=3.0)
+        except TypeError:
+            # fallback a argumentos posicionales
+            st_raw = supertrend(highs, lows, closes, 10, 3.0)
         if st_raw:
             last_st = _safe_last(st_raw)
             st_bull = last_st == 1
@@ -1214,7 +1100,6 @@ def _compute_indicators(bars: list) -> dict:
         "rsi_bear_div": bear_div,
     }
 
-
 def _hold_result(symbol: str, reason: str, max_score: int = MAX_SCORE_NEUTRAL) -> SignalResult:
     return SignalResult(
         symbol=symbol,
@@ -1234,7 +1119,6 @@ def _hold_result(symbol: str, reason: str, max_score: int = MAX_SCORE_NEUTRAL) -
         reason=reason,
     )
 
-
 def format_signal_block(res: SignalResult) -> str:
     if not res.is_valid:
         return f"🚫 {res.symbol} | NEUTRAL | {res.reason}"
@@ -1246,7 +1130,6 @@ def format_signal_block(res: SignalResult) -> str:
         f"tp2 {res.tp2:.6f} | lev {res.suggested_lev}x | {res.extra.get('setup_type', '')}"
     )
     return block
-
 
 class SignalFlipGuard:
     def __init__(self, cooldown_seconds: int = 300):
@@ -1265,10 +1148,8 @@ class SignalFlipGuard:
                 return False
         return True
 
-
 def manual_close_cooldown(guard: SignalFlipGuard, symbol: str, new_signal: str, last_signal: Optional[str] = None) -> bool:
     return guard.can_enter(symbol, new_signal, last_signal)
-
 
 async def _fetch_bars(exch, symbol: str, tf: str, limit: int) -> list:
     try:
