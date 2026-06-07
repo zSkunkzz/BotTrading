@@ -25,6 +25,11 @@ v7 — COOLDOWN PERSISTENTE (BUG cooldown-rotation)
   y causando que el bot re-abriera la posición inmediatamente después de un cierre manual.
   Fix: _cooldowns dict[symbol -> expiry_timestamp_utc] persistido en el mismo JSON.
   Nuevas helpers: save_cooldown / load_cooldown / clear_cooldown (sync + async).
+
+v8 — save_position acepta kwargs individuales
+  Fix: save_position(symbol, side=..., entry=..., sl=..., tp1=..., be_done=...)
+  Backward-compatible: si se pasa data como dict posicional sigue funcionando.
+  Nuevos campos: be_done (bool) para persistir estado de break-even.
 """
 from __future__ import annotations
 
@@ -161,7 +166,7 @@ class BotState:
         except Exception as exc:
             log.error("State save failed: %s", exc)
 
-    # ── async API ─────────────────────────────────────────────────────────
+    # ── async API ─────────────────────────────────────────────────────
 
     async def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         async with self._lock:
@@ -214,7 +219,7 @@ class BotState:
         async with self._lock:
             return {"session_pnl": self._session_pnl, "trades": self._trades}
 
-    # ── cooldown async API ────────────────────────────────────────────────
+    # ── cooldown async API ─────────────────────────────────────────────
 
     async def set_cooldown(self, symbol: str, duration_s: float) -> None:
         """Activa cooldown para `symbol` durante `duration_s` segundos."""
@@ -240,7 +245,7 @@ class BotState:
             self._cooldowns.pop(symbol, None)
             self._save_sync()
 
-    # ── sync helpers (backward-compat layer) ──────────────────────────────
+    # ── sync helpers (backward-compat layer) ────────────────────────────────────────
 
     def _save_position_sync(self, symbol: str, data: Dict[str, Any]) -> None:
         pos = dict(data)
@@ -268,7 +273,7 @@ class BotState:
                 self._positions[symbol]["tp2_hit"] = True
                 self._save_sync()
 
-    # ── cooldown sync helpers ─────────────────────────────────────────────
+    # ── cooldown sync helpers ───────────────────────────────────────────────
 
     def _set_cooldown_sync(self, symbol: str, duration_s: float) -> None:
         expiry = time.time() + duration_s
@@ -292,14 +297,56 @@ class BotState:
             self._save_sync()
 
 
-# ── module-level singleton ────────────────────────────────────────────────
+# ── module-level singleton ──────────────────────────────────────────────────────
 bot_state = BotState()
 
 
-# ── BACKWARD-COMPATIBLE FREE FUNCTIONS ───────────────────────────────────
+# ── BACKWARD-COMPATIBLE FREE FUNCTIONS ───────────────────────────────────────────
 
-def save_position(symbol: str, data: Dict[str, Any]) -> None:
-    bot_state._save_position_sync(symbol, data)
+def save_position(
+    symbol: str,
+    data: Optional[Dict[str, Any]] = None,
+    *,
+    side: Optional[str] = None,
+    entry: Optional[float] = None,
+    sl: Optional[float] = None,
+    tp1: Optional[float] = None,
+    tp2: Optional[float] = None,
+    tp3: Optional[float] = None,
+    qty: Optional[float] = None,
+    usdc_amount: Optional[float] = None,
+    leverage: Optional[int] = None,
+    be_done: bool = False,
+    **extra: Any,
+) -> None:
+    """
+    Guarda la posición abierta para `symbol`.
+
+    Acepta dos formas:
+      1. Forma antigua (backward-compat): save_position(symbol, {"side": ..., ...})
+      2. Forma nueva con kwargs:           save_position(symbol, side=..., entry=..., be_done=False)
+
+    Los kwargs individuales tienen precedencia sobre el dict posicional.
+    El campo `be_done` (bool) indica si el break-even ya fue activado.
+    """
+    if data is None:
+        data = {}
+    pos = dict(data)   # copia para no mutar el original
+
+    # Aplicar kwargs individuales (sobrescriben el dict si se pasan ambos)
+    if side        is not None: pos["side"]        = side
+    if entry       is not None: pos["entry"]       = entry
+    if sl          is not None: pos["sl"]          = sl
+    if tp1         is not None: pos["tp1"]         = tp1
+    if tp2         is not None: pos["tp2"]         = tp2
+    if tp3         is not None: pos["tp3"]         = tp3
+    if qty         is not None: pos["qty"]         = qty
+    if usdc_amount is not None: pos["usdc_amount"] = usdc_amount
+    if leverage    is not None: pos["leverage"]    = leverage
+    pos["be_done"] = be_done
+    pos.update(extra)
+
+    bot_state._save_position_sync(symbol, pos)
 
 
 def load_position(symbol: str) -> Optional[Dict[str, Any]]:
@@ -314,7 +361,7 @@ def mark_tp2_hit(symbol: str) -> None:
     bot_state._mark_tp2_hit_sync(symbol)
 
 
-# ── cooldown free functions ───────────────────────────────────────────────
+# ── cooldown free functions ────────────────────────────────────────────────────
 
 def save_cooldown(symbol: str, duration_s: float) -> None:
     """Persiste un cooldown post-cierre externo para `symbol`."""
