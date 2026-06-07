@@ -2,6 +2,12 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v22 — Fix Bug Crítico 1: _do_open_order() ahora llama pretrade_risk.confirm_order() (2026-06-07):
+  - Tras confirmar fill y persistir estado, se registra el margen en PreTradeRisk
+    usando signal._confirm_margin (o usdc_per_trade como fallback).
+  - Sin este registro, _open_margin se queda en 0.0 → Gate 2 (límite 500 USDC) nunca
+    se alcanza y register_close_safe() libera margen que nunca fue registrado.
+
 v21 — Fix Bug Menor 4: guardia dura SL/TP + cierre de emergencia si SL falla (2026-06-07):
   - _confirm_margin(): aborta la apertura si falta SL o TP antes de tocar el exchange.
     Espeja la guardia dura de ExecutionEngine.execute() (trade_side=="open").
@@ -547,6 +553,7 @@ class FuturesTrader:
             "tp1":    float,
             "tp2":    float | None,
             "tp3":    float | None,
+            "_confirm_margin": float | None,  # margen a registrar en pretrade_risk
           }
 
         risk debe tener .usdc_per_trade (float).
@@ -662,6 +669,21 @@ class FuturesTrader:
                 "[%s] [DRY-RUN] Posición simulada: %s @ %.4f (qty=%.6f)",
                 self.symbol, side_str.upper(), ref_price, qty,
             )
+            # v22 FIX BUG CRÍTICO 1: registrar margen en pretrade_risk también en dry-run
+            # para que Gate 2 funcione correctamente en simulación.
+            _confirm_margin_amt = float(signal.get("_confirm_margin") or usdc_per_trade)
+            try:
+                from bot.pretrade_risk import pretrade_risk as _pt
+                _pt.confirm_order(self.symbol, _confirm_margin_amt)
+                logger.debug(
+                    "[%s] [DRY-RUN] pretrade_risk.confirm_order(%.2f USDC)",
+                    self.symbol, _confirm_margin_amt,
+                )
+            except Exception as _pt_err:
+                logger.warning(
+                    "[%s] pretrade_risk.confirm_order falló (dry-run): %s",
+                    self.symbol, _pt_err,
+                )
             return
 
         # ── 7. LIVE: set leverage + colocar orden ─────────────────────────
@@ -833,6 +855,25 @@ class FuturesTrader:
             self.symbol, side_str.upper(), filled_price,
             sl_price or 0, tp1_price or 0, qty,
         )
+
+        # ── 9b. v22 FIX BUG CRÍTICO 1: registrar margen en pretrade_risk ─────────────
+        # decision_engine.evaluate() pone _confirm_margin en el signal dict.
+        # Sin esta llamada, pretrade_risk._open_margin se queda en 0.0 y:
+        #   - Gate 2 (límite 500 USDC) nunca se alcanza → el bot puede abrir sin límite.
+        #   - register_close_safe() libera margen que nunca fue registrado → estado corrupto.
+        _confirm_margin_amt = float(signal.get("_confirm_margin") or usdc_per_trade)
+        try:
+            from bot.pretrade_risk import pretrade_risk as _pt
+            _pt.confirm_order(self.symbol, _confirm_margin_amt)
+            logger.info(
+                "[%s] pretrade_risk.confirm_order(%.2f USDC) — _open_margin actualizado.",
+                self.symbol, _confirm_margin_amt,
+            )
+        except Exception as _pt_err:
+            logger.warning(
+                "[%s] pretrade_risk.confirm_order falló: %s — Gate 2 puede no funcionar correctamente.",
+                self.symbol, _pt_err,
+            )
 
         # ── 10. Colocar TP2/TP3 adicionales ───────────────────────────────
         if tp2_price:
