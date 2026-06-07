@@ -86,6 +86,9 @@ MIN_SCORE: int     = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
 MIN_RR: float      = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
 PREMIUM_SCORE: int = int(os.getenv("PREMIUM_SIGNAL_SCORE", "10"))
 
+# max_score usado en resultados NEUTRAL (sin setup detectado)
+MAX_SCORE_NEUTRAL: int = 10
+
 # v26: ratio mínimo base
 MIN_SCORE_RATIO: float = float(os.getenv("MIN_SCORE_RATIO", "0.62"))
 # v27: ratio elevado para regímenes adversos (BEAR / VOLATILE)
@@ -453,7 +456,7 @@ async def _analyze_pair_inner(
     )
 
     if signal_str == "NEUTRAL" or setup_type is None:
-        return _hold_result(symbol, f"NEUTRAL ({', '.join(reasons[-3:])})")
+        return _hold_result(symbol, f"NEUTRAL ({', '.join(reasons[-3:])})", max_score=max_score)
 
     # ── v22: MTF bias filter ──────────────────────────────────────────────────
     bias_1h = _mtf_bias(ind_1h)
@@ -670,7 +673,7 @@ def _detect_setup(
         if signal_str != "NEUTRAL" and score >= MIN_SCORE and score_ratio >= effective_ratio:
             candidates.append((setup_type, signal_str, score, max_score, reasons))
     if not candidates:
-        return None, "NEUTRAL", 0, 10, [
+        return None, "NEUTRAL", 0, MAX_SCORE_NEUTRAL, [
             f"Ningún setup alcanzó MIN_SCORE o MIN_SCORE_RATIO(regime={regime or 'none'})"
         ]
     best = max(candidates, key=lambda x: x[2] / x[3])
@@ -1169,10 +1172,10 @@ async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
         return []
 
 
-def _hold_result(symbol: str, reason: str) -> SignalResult:
+def _hold_result(symbol: str, reason: str, max_score: int = MAX_SCORE_NEUTRAL) -> SignalResult:
     return SignalResult(
         symbol=symbol, signal="NEUTRAL", entry_mode="HOLD",
-        score=0, max_score=10, entry=0.0, sl=0.0, tp1=0.0, tp2=0.0,
+        score=0, max_score=max_score, entry=0.0, sl=0.0, tp1=0.0, tp2=0.0,
         atr=0.0, rr=0.0, suggested_lev=1, indicators={},
         is_valid=False, reason=reason,
     )
