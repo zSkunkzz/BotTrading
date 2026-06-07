@@ -364,10 +364,12 @@ async def _cmd_resume(chat_id: int | str) -> None:
 async def _cmd_backtest(chat_id: int | str, args: list[str]) -> None:
     """
     /backtest                      — backtest simple con config por defecto
-    /backtest opt                  — activa el optimizador walk-forward
-    /backtest 180                  — backtest simple con 180 días de histórico
-    /backtest opt 180              — optimizador con 180 días
+    /backtest 180                  — backtest con 180 días de histórico
     /backtest BTC/USDT:USDT 90     — símbolo concreto con 90 días
+    /backtest opt / optimize       — ignorado (optimizador no implementado aún)
+
+    Nota: run_backtest_now() no acepta 'optimize'. Si en el futuro se
+    implementa el optimizador walk-forward, añadir el parámetro allí primero.
     """
     bot = _get_bot()
     if not bot:
@@ -379,15 +381,17 @@ async def _cmd_backtest(chat_id: int | str, args: list[str]) -> None:
         except TelegramError as e:
             logger.warning("[Telegram cmd_backtest] %s", e)
 
-    # Parseo de argumentos
-    optimize  = False
     hist_days = None
     symbols   = None
 
     remaining = list(args)
+    # Ignorar token 'opt'/'optimize' — no implementado aún en run_backtest_now
     if remaining and remaining[0].lower() in ("opt", "optimize", "optimizar"):
-        optimize = True
         remaining.pop(0)
+        await reply(
+            "\u26a0\ufe0f El modo optimizador no está implementado todavía.\n"
+            "Ejecutando backtest simple..."
+        )
 
     for token in remaining:
         if "/" in token or ":" in token:
@@ -398,7 +402,6 @@ async def _cmd_backtest(chat_id: int | str, args: list[str]) -> None:
             except ValueError:
                 pass
 
-    # Inyectar notifier si está disponible
     notifier = _notifier
     if notifier is None:
         await reply(
@@ -409,20 +412,19 @@ async def _cmd_backtest(chat_id: int | str, args: list[str]) -> None:
 
     await reply(
         f"\u23f3 <b>Backtest lanzado</b>\n"
-        f"Modo: <b>{'Optimizador Walk-Forward' if optimize else 'Backtest Simple'}</b>\n"
+        f"Modo: <b>Backtest Simple</b>\n"
         + (f"S\u00edmbolos: <code>{', '.join(symbols)}</code>\n" if symbols else "")
         + (f"Hist\u00f3rico: <code>{hist_days}d</code>\n" if hist_days else "")
         + "El resultado llegar\u00e1 en unos minutos..."
     )
 
-    # Lanzar en background para no bloquear el polling
     asyncio.create_task(
-        _run_backtest_background(notifier, symbols, hist_days, optimize),
+        _run_backtest_background(notifier, symbols, hist_days),
         name="backtest_cmd",
     )
 
 
-async def _run_backtest_background(notifier, symbols, hist_days, optimize) -> None:
+async def _run_backtest_background(notifier, symbols, hist_days) -> None:
     """Wrapper que captura excepciones del backtest para que no maten el task."""
     try:
         from bot.backtest_scheduler import run_backtest_now
@@ -430,13 +432,11 @@ async def _run_backtest_background(notifier, symbols, hist_days, optimize) -> No
             notifier=notifier,
             symbols=symbols,
             hist_days=hist_days,
-            optimize=optimize,
         )
     except Exception as e:
         logger.error("[backtest_cmd] Error inesperado: %s", e)
         try:
-            from bot.notifier import Notifier
-            await notifier.send(f"\u274c <b>Backtest fallido</b>\n<code>{e}</code>")
+            await notifier.send(f"\u274c <b>Backtest fallido</b>\n<code>{_esc(str(e))}</code>")
         except Exception:
             pass
 
