@@ -23,8 +23,16 @@ try:
 except ImportError:
     ta_lib = None
 
-from bot.signal_engine import _analyze_tf, _compute_score, MIN_SCORE, MIN_RR
-from bot.signal_engine import ATR_MULT_SL, TP1_MULT, TP2_MULT, TP3_MULT
+# _compute_indicators analiza una lista de barras OHLCV y devuelve un dict
+# con los mismos indicadores que usa el bot en producción.
+# Nota: _analyze_tf fue renombrado a _compute_indicators en signal_engine v23.
+from bot.signal_engine import _compute_indicators, MIN_SCORE, MIN_RR
+
+# ── Constantes de SL/TP (alineadas con signal_engine defaults) ────────────────
+ATR_MULT_SL: float = float(os.getenv("SL_ATR_MULT",  "1.5"))
+TP1_MULT:    float = float(os.getenv("TP1_ATR_MULT", "2.25"))
+TP2_MULT:    float = float(os.getenv("TP2_ATR_MULT", "4.5"))
+TP3_MULT:    float = float(os.getenv("TP3_ATR_MULT", "6.0"))   # extensión extra para backtest
 
 log = logging.getLogger("Backtester")
 logging.basicConfig(level=logging.INFO,
@@ -132,10 +140,9 @@ class BacktestResult:
 async def _fetch_full_history(
     symbol: str, tf: str, days: int, api_key="", api_secret="", passphrase=""
 ) -> pd.DataFrame:
-    exchange = ccxt.bitget({
+    exchange = ccxt.bingx({
         "apiKey":   api_key,
         "secret":   api_secret,
-        "password": passphrase,
         "options":  {"defaultType": "swap"},
     })
     try:
@@ -162,6 +169,30 @@ async def _fetch_full_history(
         return df
     finally:
         await exchange.close()
+
+
+# ─────────────────────────────────────────────────────────────
+# CONVERSIÓN DataFrame → formato de barras que acepta signal_engine
+# ─────────────────────────────────────────────────────────────
+
+def _df_window_to_bars(window: pd.DataFrame) -> list:
+    """
+    Convierte una ventana de pd.DataFrame (index=ts, cols=open/high/low/close/volume)
+    al formato de listas [ts_ms, open, high, low, close, volume] que espera
+    _compute_indicators de signal_engine.
+    """
+    bars = []
+    for ts, row in window.iterrows():
+        ts_ms = int(ts.timestamp() * 1000) if hasattr(ts, 'timestamp') else 0
+        bars.append([
+            ts_ms,
+            float(row["open"]),
+            float(row["high"]),
+            float(row["low"]),
+            float(row["close"]),
+            float(row["volume"]),
+        ])
+    return bars
 
 
 # ─────────────────────────────────────────────────────────────
@@ -216,7 +247,6 @@ def _run_backtest(
                 if tp2_hit:
                     t.tp2_hit = True
                     t.sl      = t.entry_price   # mover SL a BE
-                    # El PnL parcial se realizará en la salida final
 
             # TP3
             if t.tp3:
@@ -226,7 +256,6 @@ def _run_backtest(
                     pnl_full = (exit_p - t.entry_price) / t.entry_price * 100 * leverage
                     if not is_long:
                         pnl_full = -pnl_full
-                    # Si TP2 fue hit, parte del PnL ya se realizó a TP2
                     if t.tp2_hit and t.tp2:
                         pnl_tp2 = abs(t.tp2 - t.entry_price) / t.entry_price * 100 * leverage
                         pnl = pnl_tp2 * tp2_partial_ratio + pnl_full * (1 - tp2_partial_ratio)
@@ -261,18 +290,23 @@ def _run_backtest(
         if len(window) < 55:
             continue
 
-        # Para el backtest usamos solo el timeframe del df cargado
-        # (equivalente a 15m). Señal simplificada 1-TF.
-        s = _analyze_tf(window)
+        # Convertir ventana DataFrame → lista de barras para _compute_indicators
+        bars = _df_window_to_bars(window)
+        s = _compute_indicators(bars)
         if not s:
             continue
 
         score_l = sum(max(0,  s.get(k, 0)) for k in
-                      ("ema_trend", "macd", "rsi", "supertrend", "stoch", "volume", "bb"))
-        score_s = sum(max(0, -s.get(k, 0)) for k in
-                      ("ema_trend", "macd", "rsi", "supertrend", "stoch", "volume", "bb"))
-        score = max(score_l, score_s)
-        direction = "LONG" if score_l >= score_s else "SHORT"
+                      ("ema_bull", "macd_bull", "rsi_val", "st_bull", "vol_ratio"))
+        score_s = sum(max(0, s.get(k, 0)) for k in
+                      ("ema_bear", "macd_bear", "st_bear"))
+        # Puntuaciones simples booleanas → int para comparar
+        score_l_int = int(bool(s.get("ema_bull"))) + int(bool(s.get("macd_bull"))) + \
+                      int(bool(s.get("st_bull"))) + (1 if (s.get("rsi_val") or 50) < 55 else 0)
+        score_s_int = int(bool(s.get("ema_bear"))) + int(bool(s.get("macd_bear"))) + \
+                      int(bool(s.get("st_bear"))) + (1 if (s.get("rsi_val") or 50) > 45 else 0)
+        score = max(score_l_int, score_s_int)
+        direction = "LONG" if score_l_int >= score_s_int else "SHORT"
 
         if score < MIN_SCORE:
             continue
@@ -362,8 +396,8 @@ def save_csv(result: BacktestResult, path: str = ""):
 # ─────────────────────────────────────────────────────────────
 
 async def _main():
-    parser = argparse.ArgumentParser(description="Backtester BitgetProBot")
-    parser.add_argument("--symbol",   default="BTC/USDT:USDT")
+    parser = argparse.ArgumentParser(description="Backtester BingX TradingBot")
+    parser.add_argument("--symbol",   default="BTC-USDT")
     parser.add_argument("--tf",       default="15m")
     parser.add_argument("--days",     type=int, default=90)
     parser.add_argument("--leverage", type=int, default=5)
@@ -377,9 +411,8 @@ async def _main():
         symbol     = args.symbol,
         tf         = args.tf,
         days       = args.days,
-        api_key    = os.getenv("BITGET_API_KEY",    ""),
-        api_secret = os.getenv("BITGET_API_SECRET", ""),
-        passphrase = os.getenv("BITGET_PASSPHRASE", ""),
+        api_key    = os.getenv("BINGX_API_KEY",    ""),
+        api_secret = os.getenv("BINGX_API_SECRET", ""),
     )
 
     if df.empty:
