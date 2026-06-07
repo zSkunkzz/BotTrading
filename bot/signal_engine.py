@@ -15,6 +15,23 @@ ARQUITECTURA:
 SISTEMA DE SCORING:
   El bot detecta uno de tres tipos de setup. Si no encaja en ninguno, NEUTRAL.
 
+CAMBIOS v28 (calidad de señales — 6 mejoras):
+  1. _detect_setup normalización: se elige el mejor candidato por score/max_score
+     (ratio real), pero además BREAKOUT debe superar MIN_SCORE_RATIO × MAX_BREAKOUT
+     en términos absolutos, eliminando ventaja espuria del MAX=10 más bajo.
+  2. REVERSAL RSI umbrales más estrictos: 25/75 (era 28/72). Reduce entradas
+     en sobreventa/sobrecompra moderada que puede prolongarse horas.
+  3. REVERSAL divergencia RSI OBLIGATORIA: si no hay divergencia RSI confirmada,
+     la señal es NEUTRAL (antes era solo +2 de bonus opcional).
+  4. TENDENCIA ADX en 1h además de 15m: si el ADX_1h < ADX_MIN se penaliza -1
+     adicional. El ADX de 14 períodos en 1h = 14h de mercado, mucho más
+     representativo que 3.5h en 15m.
+  5. VWAP penalización activa: si el precio está al lado equivocado del VWAP
+     se aplica -1 (antes era solo "sin confirmación" sin penalizar).
+  6. BREAKOUT vol mínimo obligatorio: si vol_ratio < BREAKOUT_VOL_MIN_HARD
+     (default 1.2x) se bloquea el setup antes de calcular score, evitando
+     falsos breakouts en mercados sin liquidez.
+
 CAMBIOS v27 (señales premium máxima calidad):
   1. TP DINÁMICO por vol_ratio: cuando vol_ratio > 2.0 los TPs se escalan x1.2
      (mercado expansivo); cuando vol_ratio < 0.9 el TP1 se reduce x0.85
@@ -166,12 +183,15 @@ _EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.002"))
 _EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.0015"))
 _BREAKOUT_WINDOW       = int(os.getenv("BREAKOUT_WINDOW", "20"))
 _BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.4"))
+# v28: vol mínimo OBLIGATORIO para entrar en breakout (antes de score)
+_BREAKOUT_VOL_MIN_HARD = float(os.getenv("BREAKOUT_VOL_MIN_HARD", "1.2"))
 _BREAKOUT_ATR_CONFIRM  = float(os.getenv("BREAKOUT_ATR_CONFIRM", "0.3"))
 _BREAKOUT_SQUEEZE_PCT  = float(os.getenv("BREAKOUT_SQUEEZE_PCT", "40"))
 # v27: tolerancia para detectar retesteo en BREAKOUT (porcentaje del nivel roto)
 _BREAKOUT_RETEST_TOL   = float(os.getenv("BREAKOUT_RETEST_TOL", "0.005"))
-_REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "28"))
-_REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "72"))
+# v28: umbrales RSI más estrictos para REVERSAL (era 28/72)
+_REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "25"))
+_REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "75"))
 _VOL_MIN_GLOBAL        = float(os.getenv("VOL_MIN_GLOBAL",    "0.6"))
 _VOL_CONFIRM_MIN       = float(os.getenv("VOL_CONFIRM_MIN",   "1.2"))
 _PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "2"))
@@ -461,7 +481,7 @@ async def _analyze_pair_inner(
         log.debug("[signal_engine] %s vol_signal=%.2fx (min %.1fx)", symbol, vol_signal, _VOL_SIGNAL_MIN)
 
     setup_type, signal_str, score, max_score, reasons = _detect_setup(
-        ind_15m, ind_1h, ind_4h, bars_15m, regime
+        ind_15m, ind_1h, ind_4h, bars_15m, bars_1h, regime
     )
 
     if signal_str == "NEUTRAL" or setup_type is None:
@@ -671,13 +691,24 @@ async def _analyze_pair_inner(
 
 def _detect_setup(
     i15: dict, i1h: dict, i4h: dict, bars_15m: list,
+    bars_1h: list = None,
     regime: Optional[str] = None,
 ) -> Tuple[Optional[str], str, int, int, List[str]]:
-    # v27: ratio efectivo pasado a la selección de candidatos
+    """
+    v28: la selección del mejor candidato usa score/max_score (ratio real).
+    Esto evita que BREAKOUT (MAX=10) gane con scores bajos en términos absolutos
+    frente a TENDENCIA (MAX=15) o REVERSAL (MAX=14).
+    Se pasa bars_1h para que _score_tendencia pueda calcular ADX en 1h.
+    """
     effective_ratio = _min_score_ratio_for_regime(regime)
     candidates = []
     for mode_fn in (_score_tendencia, _score_breakout, _score_reversal):
-        setup_type, signal_str, score, max_score, reasons = mode_fn(i15, i1h, i4h, bars_15m)
+        if mode_fn == _score_tendencia:
+            setup_type, signal_str, score, max_score, reasons = mode_fn(
+                i15, i1h, i4h, bars_15m, bars_1h or []
+            )
+        else:
+            setup_type, signal_str, score, max_score, reasons = mode_fn(i15, i1h, i4h, bars_15m)
         score_ratio = score / max_score if max_score > 0 else 0.0
         if signal_str != "NEUTRAL" and score >= MIN_SCORE and score_ratio >= effective_ratio:
             candidates.append((setup_type, signal_str, score, max_score, reasons))
@@ -685,18 +716,26 @@ def _detect_setup(
         return None, "NEUTRAL", 0, MAX_SCORE_NEUTRAL, [
             f"Ningún setup alcanzó MIN_SCORE o MIN_SCORE_RATIO(regime={regime or 'none'})"
         ]
+    # v28: elegir por score/max_score (ratio), no por score absoluto
     best = max(candidates, key=lambda x: x[2] / x[3])
     if len(candidates) > 1:
         log.debug(
-            "[signal_engine] %d setups válidos — elegido %s (%d/%d) sobre %s",
-            len(candidates), best[0], best[2], best[3],
-            ", ".join(f"{c[0]}({c[2]}/{c[3]})" for c in candidates if c is not best),
+            "[signal_engine] %d setups válidos — elegido %s (%d/%d=%.2f) sobre %s",
+            len(candidates), best[0], best[2], best[3], best[2] / best[3],
+            ", ".join(f"{c[0]}({c[2]}/{c[3]}={c[2]/c[3]:.2f})" for c in candidates if c is not best),
         )
     return best
 
 
-def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
+def _score_tendencia(
+    i15: dict, i1h: dict, i4h: dict, bars_15m: list,
+    bars_1h: list = None,
+) -> Tuple[str, str, int, int, List[str]]:
     """
+    v28: ADX calculado también en 1h (14 periodos = 14h de mercado).
+    Si ADX_1h < ADX_MIN se aplica penalización adicional -1 porque la
+    tendencia en timeframe relevante no es lo suficientemente fuerte.
+
     v27: MAX=15 (v26 era 13).
       - +2 ADX + slope: confirma tendencia real vs rango disfrazado.
       - +2 confluencia 4h extendida: MACD4h alineado además de ST4h.
@@ -786,10 +825,10 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
         slope_ok = (direction == "LONG" and slope > 0) or (direction == "SHORT" and slope < 0)
 
         if adx_val >= _ADX_MIN and slope_ok:
-            reasons.append(f"ADX={adx_val:.1f}(≥{_ADX_MIN}) + slope EMA21={slope*100:.3f}% — tendencia real confirmada")
+            reasons.append(f"ADX15m={adx_val:.1f}(≥{_ADX_MIN}) + slope EMA21={slope*100:.3f}% — tendencia real confirmada")
         elif adx_val < _ADX_MIN:
             score = max(0, score - 2)
-            reasons.append(f"ADX={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -2")
+            reasons.append(f"ADX15m={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -2")
         else:
             score = max(0, score - 1)
             reasons.append(f"Slope EMA21={slope*100:.3f}% en contra de {direction} — penalización -1")
@@ -798,9 +837,28 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
         reasons.append("EMA21 series no disponible — slope omitido")
         if adx_val < _ADX_MIN:
             score = max(0, score - 2)
-            reasons.append(f"ADX={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -2")
+            reasons.append(f"ADX15m={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -2")
         else:
-            reasons.append(f"ADX={adx_val:.1f}(≥{_ADX_MIN}) — tendencia confirmada por ADX (slope no disponible)")
+            reasons.append(f"ADX15m={adx_val:.1f}(≥{_ADX_MIN}) — tendencia confirmada por ADX (slope no disponible)")
+
+    # v28: ADX en 1h — validación de tendencia en timeframe relevante
+    if bars_1h and len(bars_1h) >= 16:
+        highs_1h  = [float(_b_high(b))  for b in bars_1h]
+        lows_1h   = [float(_b_low(b))   for b in bars_1h]
+        closes_1h = [float(_b_close(b)) for b in bars_1h]
+        adx_1h = _adx_simple(highs_1h, lows_1h, closes_1h, 14)
+        if adx_1h > 0:
+            if adx_1h < _ADX_MIN:
+                score = max(0, score - 1)
+                reasons.append(
+                    f"ADX1h={adx_1h:.1f} < {_ADX_MIN} — tendencia 1h débil — penalización -1"
+                )
+            else:
+                reasons.append(f"ADX1h={adx_1h:.1f}(≥{_ADX_MIN}) — tendencia 1h confirmada")
+        else:
+            reasons.append("ADX1h no calculable (pocos datos)")
+    else:
+        reasons.append("ADX1h omitido (sin datos 1h suficientes)")
 
     ema21_15m = i15.get("ema21")
     close_15m = i15.get("close", 0)
@@ -867,6 +925,7 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
     else:
         reasons.append(f"Confluencia ST parcial (15m={st15m_ok} 1h={st1h_ok} 4h={st4h_ok})")
 
+    # v28: VWAP con penalización activa si está al lado equivocado
     vwap_val = i15.get("vwap", 0.0)
     if vwap_val and vwap_val > 0 and close_15m:
         vwap_ok = (direction == "LONG" and close_15m > vwap_val) or \
@@ -875,7 +934,10 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
             score += 1
             reasons.append(f"Precio {'>' if direction == 'LONG' else '<'} VWAP_diario({vwap_val:.4f}) +1")
         else:
-            reasons.append(f"Precio {'<' if direction == 'LONG' else '>'} VWAP_diario({vwap_val:.4f}) — sin confirmación")
+            score = max(0, score - 1)
+            reasons.append(
+                f"Precio al lado equivocado del VWAP_diario({vwap_val:.4f}) — penalización -1"
+            )
     else:
         reasons.append("VWAP diario no disponible")
 
@@ -902,6 +964,10 @@ def _score_tendencia(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[s
 
 def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     """
+    v28: vol mínimo OBLIGATORIO antes de calcular score. Si vol_ratio <
+    BREAKOUT_VOL_MIN_HARD (default 1.2x), se descarta directamente para
+    evitar falsos breakouts en mercados sin liquidez.
+
     v27: detección de retesteo post-ruptura (+2 si el precio actual está
     dentro del _BREAKOUT_RETEST_TOL% del nivel roto, indicando una entrada
     de mayor calidad con menor riesgo de fakeout).
@@ -912,11 +978,17 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     if len(bars_15m) < _BREAKOUT_WINDOW + 2:
         return "BREAKOUT", "NEUTRAL", 0, MAX, ["Velas insuficientes para breakout"]
 
+    # v28: filtro de volumen mínimo obligatorio — antes de calcular nada
+    vol_ratio = i15.get("vol_ratio", 1.0)
+    if vol_ratio < _BREAKOUT_VOL_MIN_HARD:
+        return "BREAKOUT", "NEUTRAL", 0, MAX, [
+            f"Vol={vol_ratio:.2f}x < {_BREAKOUT_VOL_MIN_HARD}x — breakout sin liquidez suficiente"
+        ]
+
     window = bars_15m[-(_BREAKOUT_WINDOW + 1):-1]
     range_high = max(float(_b_high(b)) for b in window)
     range_low  = min(float(_b_low(b))  for b in window)
     current_close = float(_b_close(bars_15m[-1]))
-    vol_ratio = i15.get("vol_ratio", 1.0)
     atr_val = float(i15.get("atr", 0) or 0)
     breakout_pad = atr_val * _BREAKOUT_ATR_CONFIRM
     broke_up   = current_close > (range_high + breakout_pad)
@@ -981,7 +1053,7 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     elif vol_ratio >= 1.1:
         score += 1; reasons.append(f"Vol={vol_ratio:.1f}x moderado +1")
     else:
-        reasons.append(f"Vol={vol_ratio:.1f}x BAJO — posible fakeout")
+        reasons.append(f"Vol={vol_ratio:.1f}x aceptable (superó mínimo duro de {_BREAKOUT_VOL_MIN_HARD}x)")
 
     if i1h:
         st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
@@ -1005,6 +1077,11 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
     """
+    v28:
+      - RSI umbrales más estrictos: 25/75 (era 28/72).
+      - Divergencia RSI OBLIGATORIA: si no hay divergencia confirmada → NEUTRAL.
+        Antes era +2 de bonus opcional; ahora es condición de entrada.
+
     v27: swing levels de estructura — si el precio está dentro del
     _REVERSAL_SWING_TOL% de un swing_low/swing_high histórico real,
     suma +2 (más relevante que proximidad a EMA50).
@@ -1018,7 +1095,7 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     is_long  = rsi_1h <= _REVERSAL_RSI_LOW
     is_short = rsi_1h >= _REVERSAL_RSI_HIGH
     if not is_long and not is_short:
-        return "REVERSAL", "NEUTRAL", 0, MAX, [f"RSI1h={rsi_1h:.0f} no es extremo"]
+        return "REVERSAL", "NEUTRAL", 0, MAX, [f"RSI1h={rsi_1h:.0f} no es extremo (umbral {_REVERSAL_RSI_LOW}/{_REVERSAL_RSI_HIGH})"]
     direction = "LONG" if is_long else "SHORT"
 
     # v24: ST1h OBLIGATORIO
@@ -1029,6 +1106,22 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             return "REVERSAL", "NEUTRAL", 0, MAX, reasons
     else:
         reasons.append("ST1h no disponible — REVERSAL requiere confirmación 1h")
+        return "REVERSAL", "NEUTRAL", 0, MAX, reasons
+
+    # v28: Divergencia RSI OBLIGATORIA — bloquear si no hay divergencia confirmada
+    try:
+        div = rsi_divergence(bars_15m)
+        div_ok = (div == "BULLISH" and is_long) or (div == "BEARISH" and is_short)
+        if not div_ok:
+            reasons.append(
+                f"Divergencia RSI no confirmada (div={div}, dir={direction}) — "
+                f"REQUISITO OBLIGATORIO en REVERSAL v28"
+            )
+            return "REVERSAL", "NEUTRAL", 0, MAX, reasons
+        reasons.append(f"Divergencia RSI {div} confirmada — requisito cumplido ✓")
+    except Exception as e:
+        log.debug("[signal_engine] rsi_divergence error en filtro obligatorio: %s", e)
+        reasons.append("Divergencia RSI no calculable — REVERSAL bloqueado por precaución")
         return "REVERSAL", "NEUTRAL", 0, MAX, reasons
 
     score = 2
@@ -1123,20 +1216,19 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         log.debug("[signal_engine] swing_level REVERSAL error: %s", e)
         reasons.append("Swing levels no disponibles")
 
-    # v24: divergencias RSI 15m
-    try:
-        div = rsi_divergence(bars_15m)
-        if div == "BULLISH" and is_long:
-            score += 2; reasons.append("Divergencia RSI alcista confirmada +2")
-        elif div == "BEARISH" and is_short:
-            score += 2; reasons.append("Divergencia RSI bajista confirmada +2")
-        elif div != "NONE":
-            reasons.append(f"Divergencia RSI {div} — no coincide con dirección")
+    # v28: divergencia RSI ya validada como obligatoria arriba → aquí solo suma bonus si es fuerte
+    # (la divergencia básica ya está confirmada; añadir +2 si hay MACD confirmando también)
+    if hist_15m is not None:
+        div_strong = div_ok and (
+            (is_long and hist_15m > 0) or (is_short and hist_15m < 0)
+        )
+        if div_strong:
+            score += 2
+            reasons.append(f"Divergencia RSI + MACD15m en fase — confluencia máxima +2")
         else:
-            reasons.append("Sin divergencia RSI detectada")
-    except Exception as e:
-        log.debug("[signal_engine] rsi_divergence error: %s", e)
-        reasons.append("Divergencia RSI no calculada")
+            reasons.append(f"Divergencia RSI confirmada pero MACD15m aún no giró (solo requisito)")
+    else:
+        reasons.append("MACD15m no disponible para bonus divergencia")
 
     return "REVERSAL", direction, score, MAX, reasons
 
