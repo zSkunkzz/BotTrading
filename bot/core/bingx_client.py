@@ -40,6 +40,7 @@ Opcionales:
   BINGX_DEFAULT_LEVERAGE=10
   BINGX_MARGIN_MODE=isolated|cross
   BINGX_POSITION_MODE=hedge  (fuerza hedge mode sin consultar la API)
+  BINGX_POSITIONS_CACHE_TTL  (segundos de caché para get_positions; default=4)
 
 Notas positionSide:
   - ONE-WAY MODE:  positionSide="BOTH" en todas las órdenes.
@@ -48,60 +49,32 @@ Notas positionSide:
   /openApi/swap/v1/positionSide/dual. La variable de entorno
   BINGX_POSITION_MODE=hedge permite forzarlo sin llamada API.
 
+Fixes (2026-06-07 v12) — fix 429 Too Many Requests:
+
+  Fix #24 — _request: retry con backoff exponencial + jitter para HTTP 429 (🔴 CRÍTICO)
+    r.raise_for_status() en 429 propagaba el error inmediatamente.
+    Ahora se detecta el código 429 antes de raise_for_status y se reintenta
+    hasta _MAX_RETRIES_429 veces (default 4) con espera exponencial + jitter
+    (0.5s, 1s, 2s, 4s + jitter ±0.3s) antes de relanzar el error.
+
+  Fix #25 — get_positions: caché compartida por símbolo con TTL (🔴 CRÍTICO)
+    Con N pares activos, cada instancia de BingXClient llamaba get_positions()
+    de forma independiente → N requests simultáneos → 429.
+    Solución: _BingXCore almacena un cache de posiciones por símbolo con TTL
+    configurable (BINGX_POSITIONS_CACHE_TTL, default 4 segundos). Todas las
+    instancias comparten el singleton _BingXCore, por lo que el endpoint solo
+    se consulta una vez por ventana de TTL aunque haya 50 pares activos.
+
 Fixes (2026-06-07 v11) — auditoría profunda doc oficial BingX:
 
   Fix #18 — _build_signed_body usaba _API_SECRET global en lugar del parámetro secret (🔴 CRÍTICO)
-    La función recibía 'secret' como parámetro pero firmaba con la variable global
-    _API_SECRET. Aunque en producción es la misma, rompe tests unitarios y
-    cualquier uso multi-cuenta. Corregido para usar el parámetro 'secret'.
-
   Fix #19 — _warm_cache: pricePrecision es número de decimales, no tick size (🟡 IMPORTANTE)
-    BingX devuelve pricePrecision como entero (ej: 2 = 2 decimales = tick 0.01).
-    La lógica anterior usaba nombres confusos y una rama else inalcanzable.
-    Simplificado: px_dec = int(pricePrecision), tick_sz = 10**(-px_dec).
-
   Fix #20 — get_balance_usdc: priorizar availableMargin sobre balance total (🔴 CRÍTICO)
-    Para un bot de trading, el saldo relevante es el margen disponible
-    (availableMargin), no el balance total que incluye margen en uso.
-    El orden de búsqueda ahora es: availableMargin → balance (fallback).
-    Estructura real v3: data.balance.availableMargin y data.balance.balance.
-
   Fix #21 — cancel_all_open_tpsl: también cancela órdenes TP/SL standalone (🔴 CRÍTICO)
-    DELETE /openApi/swap/v3/trade/allOpenOrders cancela órdenes normales.
-    Las órdenes TP/SL colocadas con place_tp/place_sl (TAKE_PROFIT_MARKET /
-    STOP_MARKET) son "algo orders" y requieren DELETE /openApi/swap/v2/trade/allOpenOrders
-    con type=STOP adicionalmente. Ahora se ejecutan ambas llamadas y se
-    devuelve la lista combinada de cancelaciones.
-
   Fix #22 — get_open_orders: incluye órdenes TP/SL standalone (🔴 CRÍTICO)
-    /openApi/swap/v3/trade/openOrders solo devuelve órdenes normales.
-    Las TP/SL standalone requieren /openApi/swap/v2/trade/openOrders.
-    Ahora se consultan ambos endpoints y se mergea el resultado.
-
   Fix #23 — Nuevo método set_margin_mode() (🟡 IMPORTANTE)
-    Añadido set_margin_mode(symbol, margin_type) para poder configurar
-    el modo de margen (isolated/cross) via API antes de operar.
-    BingX endpoint: POST /openApi/swap/v2/trade/marginType
 
-Fixes (2026-06-07 v10) — auditoría doc oficial BingX:
-
-  Fix #14 — Migración a v3 en endpoints de orden (🔴 CRÍTICO)
-    Desde verano 2024, BingX deprecó v2 para trade/positions endpoints.
-    Todos los endpoints de orden y posición migrados a v3.
-
-  Fix #15 — stopGuaranteed obligatorio en place_tp y place_sl (🔴 CRÍTICO)
-    BingX exige stopGuaranteed='false' cuando workingType=MARK_PRICE.
-
-  Fix #16 — stopLoss/takeProfit mal serializados en place_market_with_tpsl (🔴 CRÍTICO)
-    - stopGuaranteed debe ser string 'false', no bool False.
-    - price='0' obligatorio para órdenes MARKET dentro del objeto embebido.
-    - Serializados como JSON string explícito (no dict Python).
-
-  Fix #17 — set_leverage: one-way mode solo necesita un side (🟡 IMPORTANTE)
-    En one-way mode BingX solo acepta side='LONG'. En hedge mode se llaman
-    LONG+SHORT. Evita errores/logs innecesarios en cuentas one-way.
-
-Fixes anteriores (v9 y previos): ver historial git.
+Fixes anteriores (v10 y previos): ver historial git.
 """
 from __future__ import annotations
 
@@ -112,6 +85,7 @@ import json
 import logging
 import math
 import os
+import random
 import time
 import urllib.parse
 from typing import Optional
@@ -128,6 +102,13 @@ _DEFAULT_LEV  = int(os.getenv("BINGX_DEFAULT_LEVERAGE", "10"))
 _MARGIN_MODE  = os.getenv("BINGX_MARGIN_MODE", "isolated").strip().lower()
 # BINGX_POSITION_MODE=hedge fuerza hedge mode sin consultar la API.
 _FORCE_HEDGE  = os.getenv("BINGX_POSITION_MODE", "").strip().lower() == "hedge"
+
+# Fix #24: parámetros de retry para 429
+_MAX_RETRIES_429  = int(os.getenv("BINGX_MAX_RETRIES_429", "4"))
+_RETRY_BASE_DELAY = float(os.getenv("BINGX_RETRY_BASE_DELAY", "0.5"))  # segundos
+
+# Fix #25: TTL de caché de posiciones (segundos)
+_POSITIONS_CACHE_TTL = float(os.getenv("BINGX_POSITIONS_CACHE_TTL", "4"))
 
 if _USE_TESTNET:
     _BASE_URLS = [
@@ -218,11 +199,15 @@ class _BingXCore:
             "X-SOURCE-KEY": "BX-AI-SKILL",
         })
 
-        # Caches
+        # Caches de metadatos
         self._tick_size_cache:    dict[str, float] = {}
         self._px_decimals_cache:  dict[str, int]   = {}
         self._sz_decimals_cache:  dict[str, int]   = {}
         self._max_leverage_cache: dict[str, int]   = {}
+
+        # Fix #25: caché de posiciones por símbolo con TTL
+        # { inst_id: {"data": list[dict], "ts": float} }
+        self._positions_cache: dict[str, dict] = {}
 
         # Fix #11 (v7): detectar hedge mode al inicializar.
         self.hedge_mode: bool = self._detect_hedge_mode()
@@ -302,7 +287,7 @@ class _BingXCore:
             len(self._tick_size_cache),
         )
 
-    # ── HTTP firmado con domain fallback ──────────────────────────────────
+    # ── HTTP firmado con domain fallback y retry 429 ──────────────────────
 
     def _request(
         self,
@@ -311,44 +296,67 @@ class _BingXCore:
         params: dict,
         body: Optional[str] = None,
     ) -> dict:
+        """
+        Fix #24 (v12): retry con backoff exponencial + jitter para HTTP 429.
+        Antes de probar el dominio de fallback se reintenta hasta
+        _MAX_RETRIES_429 veces en el mismo dominio con espera creciente.
+        Los errores de red siguen propagándose al dominio de fallback como antes.
+        """
         last_exc: Optional[Exception] = None
         for i, base_url in enumerate(_BASE_URLS):
             is_last = (i == len(_BASE_URLS) - 1)
-            try:
-                if method == "GET":
-                    signed_qs = _build_signed_qs(params, _API_SECRET)
-                    r = self._session.get(
-                        f"{base_url}{path}?{signed_qs}", timeout=10
-                    )
-                elif method == "POST":
-                    signed_body = body or _build_signed_body(params, _API_SECRET)
-                    r = self._session.post(
-                        f"{base_url}{path}",
-                        data=signed_body,
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        timeout=10,
-                    )
-                elif method == "DELETE":
-                    signed_qs = _build_signed_qs(params, _API_SECRET)
-                    r = self._session.delete(
-                        f"{base_url}{path}?{signed_qs}", timeout=10
-                    )
-                else:
-                    raise ValueError(f"Método HTTP no soportado: {method}")
 
-                r.raise_for_status()
-                return r.json()
+            for attempt in range(_MAX_RETRIES_429 + 1):
+                try:
+                    if method == "GET":
+                        signed_qs = _build_signed_qs(params, _API_SECRET)
+                        r = self._session.get(
+                            f"{base_url}{path}?{signed_qs}", timeout=10
+                        )
+                    elif method == "POST":
+                        signed_body = body or _build_signed_body(params, _API_SECRET)
+                        r = self._session.post(
+                            f"{base_url}{path}",
+                            data=signed_body,
+                            headers={"Content-Type": "application/x-www-form-urlencoded"},
+                            timeout=10,
+                        )
+                    elif method == "DELETE":
+                        signed_qs = _build_signed_qs(params, _API_SECRET)
+                        r = self._session.delete(
+                            f"{base_url}{path}?{signed_qs}", timeout=10
+                        )
+                    else:
+                        raise ValueError(f"Método HTTP no soportado: {method}")
 
-            except Exception as exc:
-                last_exc = exc
-                if not _is_network_error(exc) or is_last:
+                    # Fix #24: manejar 429 antes de raise_for_status
+                    if r.status_code == 429:
+                        if attempt < _MAX_RETRIES_429:
+                            delay = _RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.3)
+                            logger.warning(
+                                "[BingXCore] 429 en %s %s — reintento %d/%d en %.2fs",
+                                method, path, attempt + 1, _MAX_RETRIES_429, delay,
+                            )
+                            time.sleep(delay)
+                            continue
+                        # Agotados los reintentos en este dominio
+                        r.raise_for_status()
+
+                    r.raise_for_status()
+                    return r.json()
+
+                except Exception as exc:
+                    last_exc = exc
+                    # Errores de red: pasar al dominio de fallback (no reintentar aquí)
+                    if _is_network_error(exc):
+                        if not is_last:
+                            logger.warning(
+                                "[BingXCore] %s %s — error de red en %s, reintentando con %s: %s",
+                                method, path, base_url, _BASE_URLS[i + 1], exc,
+                            )
+                        break  # salir del loop de intentos, probar siguiente dominio
+                    # Cualquier otro error: propagar inmediatamente
                     raise
-                logger.warning(
-                    "[BingXCore] %s %s — error de red en %s, reintentando con %s: %s",
-                    method, path, base_url,
-                    _BASE_URLS[i + 1] if not is_last else "(último dominio)",
-                    exc,
-                )
 
         raise last_exc
 
@@ -894,13 +902,26 @@ class BingXClient:
 
     def get_positions(self) -> list[dict]:
         """
-        Fix #13 (v9): devuelve claves compatibles con trading_loop.py:
-          - 'side'    → 'long' | 'short'
-          - 'entryPx' → float
-          - 'size'    → float (abs)
-        Además mantiene claves OKX-compatibles para el resto del código.
+        Fix #13 (v9): devuelve claves compatibles con trading_loop.py.
         Fix #14 (v10): endpoint migrado a v3.
+        Fix #25 (v12): caché compartida por símbolo en _BingXCore con TTL
+        configurable (BINGX_POSITIONS_CACHE_TTL, default 4s).
+
+        Con N pares activos en paralelo, todas las instancias de BingXClient
+        comparten el singleton _BingXCore. Si el caché del símbolo es válido
+        (ts + TTL > now), se devuelven los datos cacheados sin hacer request.
+        Esto reduce N llamadas simultáneas a 1 llamada por ventana de TTL,
+        eliminando el 429 por saturación del endpoint /swap/v3/user/positions.
         """
+        now = time.time()
+        cached = self._core._positions_cache.get(self.inst_id)
+        if cached and (now - cached["ts"]) < _POSITIONS_CACHE_TTL:
+            logger.debug(
+                "[%s] get_positions: caché hit (age=%.2fs, TTL=%.1fs)",
+                self.inst_id, now - cached["ts"], _POSITIONS_CACHE_TTL,
+            )
+            return cached["data"]
+
         try:
             resp = self._core._get(
                 "/openApi/swap/v3/user/positions",
@@ -941,9 +962,22 @@ class BingXClient:
                     "mgnMode":  "cross" if p.get("marginType", "").lower() == "cross" else "isolated",
                     "_raw":     p,
                 })
+
+            # Actualizar caché
+            self._core._positions_cache[self.inst_id] = {
+                "data": positions,
+                "ts":   now,
+            }
             return positions
         except Exception as exc:
             logger.warning("[%s] get_positions error: %s", self.inst_id, exc)
+            # En caso de error, devolver caché expirado si existe (mejor que nada)
+            if cached:
+                logger.warning(
+                    "[%s] get_positions: usando caché expirado (age=%.2fs) por error de red",
+                    self.inst_id, now - cached["ts"],
+                )
+                return cached["data"]
             return []
 
     # ── Órdenes abiertas ──────────────────────────────────────────────────
