@@ -1108,3 +1108,277 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     # v24: ST1h OBLIGATORIO
     if i1h:
         st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
+        if not st1h_ok:
+            reasons.append(f"ST1h en contra de {direction} — requisito obligatorio")
+            return "REVERSAL", "NEUTRAL", 0, MAX, reasons
+    else:
+        reasons.append("ST1h no disponible — requisito obligatorio")
+        return "REVERSAL", "NEUTRAL", 0, MAX, reasons
+
+    # v28: divergencia RSI OBLIGATORIA
+    if direction == "LONG":
+        has_div = i15.get("rsi_bull_div", False)
+    else:
+        has_div = i15.get("rsi_bear_div", False)
+
+    if not has_div:
+        reasons.append(f"Divergencia RSI no confirmada para {direction} — requisito obligatorio")
+        return "REVERSAL", "NEUTRAL", 0, MAX, reasons
+
+    score = 2  # base por RSI extremo + ST1h ok
+    reasons.append(f"RSI1h={rsi_1h:.0f} extremo + ST1h alineado (score base=2)")
+
+    # v27: swing levels de estructura
+    try:
+        from bot.structure_analyzer import analyze_structure, STRUCTURE_SWING_N
+        if len(bars_15m) >= 30:
+            df = _bars_to_df(bars_15m)
+            # direccion contraria a la reversal: buscamos swing extremo
+            swing_dir = -1 if direction == "LONG" else 1
+            struct = analyze_structure(df, swing_dir)
+            current_price = float(_b_close(bars_15m[-1]))
+            if direction == "LONG":
+                swing_level = struct.get("last_sl", 0.0)  # soporte
+            else:
+                swing_level = struct.get("last_sh", 0.0)  # resistencia
+            if swing_level > 0:
+                dist_pct = abs(current_price - swing_level) / swing_level
+                if dist_pct <= _REVERSAL_SWING_TOL:
+                    score += 2
+                    reasons.append(f"Swing level {swing_level:.4f} cerca (dist={dist_pct*100:.2f}%) +2")
+                else:
+                    reasons.append(f"Swing level lejano (dist={dist_pct*100:.2f}%)")
+            else:
+                reasons.append("Sin swing level reciente")
+    except Exception as e:
+        log.debug("[signal_engine] _score_reversal swing level error: %s", e)
+        reasons.append("Swing levels no disponible")
+
+    # v25: EMA50_1h como nivel clave
+    ema50_1h = i1h.get("ema50")
+    if ema50_1h:
+        current_price = float(_b_close(bars_15m[-1]))
+        dist_pct = abs(current_price - ema50_1h) / ema50_1h
+        if dist_pct <= 0.003:
+            score += 1
+            reasons.append(f"Precio cerca de EMA50_1h ({ema50_1h:.4f}) +1")
+        else:
+            reasons.append(f"Precio lejos de EMA50_1h (dist={dist_pct*100:.2f}%)")
+    else:
+        reasons.append("EMA50_1h no disponible")
+
+    # v24: confluencia MACD 1h
+    if i1h:
+        macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or (direction == "SHORT" and i1h.get("macd_bear"))
+        if macd_ok:
+            score += 1
+            reasons.append("MACD1h en favor +1")
+        else:
+            reasons.append("MACD1h en contra")
+    # v24: divergencia RSI ya es obligatoria, pero si está, ya sumamos 2? No, ahora es condición, no bonus.
+    # Pero mantenemos la lógica de bonus adicional si la divergencia es muy fuerte? No es necesario, ya es obligatoria.
+    # v28: se eliminó el bonus opcional, así que no se suma nada extra aquí.
+
+    # Volumen en reversal
+    vol_ratio = i15.get("vol_ratio", 1.0)
+    if vol_ratio >= _VOL_CONFIRM_MIN:
+        score += 1
+        reasons.append(f"Vol={vol_ratio:.1f}x confirma +1")
+    else:
+        reasons.append(f"Vol={vol_ratio:.1f}x bajo")
+
+    # RSI 15m no extremo
+    rsi_15m = i15.get("rsi_val")
+    if rsi_15m is not None:
+        if (direction == "LONG" and rsi_15m < 40) or (direction == "SHORT" and rsi_15m > 60):
+            score += 1
+            reasons.append(f"RSI15m={rsi_15m:.0f} alineado +1")
+        else:
+            reasons.append(f"RSI15m={rsi_15m:.0f} no extremo")
+
+    # VWAP (solo como confluencia, no penaliza)
+    vwap_val = i15.get("vwap", 0.0)
+    if vwap_val and vwap_val > 0:
+        current_price = float(_b_close(bars_15m[-1]))
+        if (direction == "LONG" and current_price < vwap_val) or (direction == "SHORT" and current_price > vwap_val):
+            score += 1
+            reasons.append(f"Precio del lado correcto de VWAP ({vwap_val:.4f}) +1")
+        else:
+            reasons.append("Precio del lado equivocado de VWAP — sin penalización")
+
+    # 4h confluencia (opcional)
+    if i4h:
+        st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
+        if st4h_ok:
+            score += 1
+            reasons.append("ST4h en favor +1")
+        else:
+            reasons.append("ST4h en contra (sin penalización)")
+
+    return "REVERSAL", direction, score, MAX, reasons
+
+
+# =============================================================================
+# COMPUTE INDICATORS — CORREGIDO (Opción A: solo velas cerradas para indicadores,
+# ATR con todas las velas)
+# =============================================================================
+def _compute_indicators(bars: list) -> dict:
+    """Calcula indicadores técnicos usando SOLO velas cerradas (bars[:-1]).
+    ATR se calcula con todas las velas (incl. la actual) para mejor precisión de SL/TP.
+    """
+    if not bars or len(bars) < 30:
+        return {}
+    bars = _clean_bars(bars)
+    if len(bars) < 30:
+        return {}
+
+    # Opción A: todas las medias, osciladores y volumen se calculan sobre velas cerradas
+    closed_bars = bars[:-1]          # excluye la última vela (incompleta)
+    closes = [float(_b_close(b)) for b in closed_bars]
+    highs  = [float(_b_high(b))  for b in closed_bars]
+    lows   = [float(_b_low(b))   for b in closed_bars]
+    volumes= [float(_b_vol(b))   for b in closed_bars]
+
+    if len(closes) < 14:
+        return {}
+
+    # --- EMA ---
+    ema21 = ema(closes, 21)[-1] if len(closes) >= 21 else 0.0
+    ema50 = ema(closes, 50)[-1] if len(closes) >= 50 else 0.0
+    ema21_series = ema(closes, 21) if len(closes) >= 21 else []
+    # tendencia EMA
+    ema_bull = ema21 > ema50 if ema21 and ema50 else False
+    ema_bear = ema21 < ema50 if ema21 and ema50 else False
+
+    # --- RSI (sobre velas cerradas) ---
+    rsi_val = rsi(closes, 14)[-1] if len(closes) >= 14 else None
+
+    # --- MACD (sobre velas cerradas) ---
+    macd_line, signal_line, _ = macd(closes)
+    macd_bull = macd_line[-1] > signal_line[-1] if len(macd_line) and len(signal_line) else False
+    macd_bear = macd_line[-1] < signal_line[-1] if len(macd_line) and len(signal_line) else False
+
+    # --- SuperTrend (15m) sobre velas cerradas ---
+    st_bull, st_bear = False, False
+    if len(closes) >= 20:
+        st = supertrend(highs, lows, closes, period=10, multiplier=3.0)
+        if st:
+            st_bull = st[-1] == 1   # 1 = uptrend
+            st_bear = st[-1] == -1  # -1 = downtrend
+
+    # --- VWAP diario (usa velas cerradas, pero el timeframe se controla fuera) ---
+    vwap_val = 0.0
+    if len(closed_bars) > 0:
+        # vwap con todas las velas cerradas disponibles (asume que bars son del mismo día)
+        vwap_val = calc_vwap(highs, lows, closes, volumes)
+
+    # --- Volumen ratio (sobre velas cerradas) ---
+    vol_avg = sum(volumes[-_VOL_AVG_WINDOW:]) / _VOL_AVG_WINDOW if len(volumes) >= _VOL_AVG_WINDOW else volumes[-1]
+    vol_ratio = volumes[-1] / vol_avg if vol_avg > 0 else 1.0
+    # vol_avg_raw para uso en pullback
+    avg_vol_raw = vol_avg
+
+    # --- ATR (USA TODAS LAS VELAS, incl. la actual, para SL/TP más precisos) ---
+    atr_val = calc_atr(
+        [float(_b_high(b)) for b in bars],
+        [float(_b_low(b))  for b in bars],
+        [float(_b_close(b)) for b in bars],
+        14,
+    )
+
+    # --- Divergencias RSI (sobre velas cerradas) ---
+    bull_div, bear_div = rsi_divergence(closes, rsi(closes, 14), 14)
+
+    return {
+        "close": closes[-1],
+        "ema21": ema21,
+        "ema50": ema50,
+        "ema_bull": ema_bull,
+        "ema_bear": ema_bear,
+        "_ema21_series": ema21_series,
+        "rsi_val": rsi_val,
+        "macd_bull": macd_bull,
+        "macd_bear": macd_bear,
+        "st_bull": st_bull,
+        "st_bear": st_bear,
+        "vwap": vwap_val,
+        "vol_ratio": vol_ratio,
+        "_avg_vol": avg_vol_raw,
+        "atr": atr_val,
+        "rsi_bull_div": bull_div,
+        "rsi_bear_div": bear_div,
+    }
+
+
+def _hold_result(symbol: str, reason: str, max_score: int = MAX_SCORE_NEUTRAL) -> SignalResult:
+    """Retorna una señal NEUTRAL inválida con el motivo."""
+    return SignalResult(
+        symbol=symbol,
+        signal="NEUTRAL",
+        entry_mode="NONE",
+        score=0,
+        max_score=max_score,
+        entry=0.0,
+        sl=0.0,
+        tp1=0.0,
+        tp2=0.0,
+        atr=0.0,
+        rr=0.0,
+        suggested_lev=0,
+        indicators={},
+        is_valid=False,
+        reason=reason,
+    )
+
+
+def format_signal_block(res: SignalResult) -> str:
+    """Genera un bloque legible para logging/notificaciones."""
+    if not res.is_valid:
+        return f"🚫 {res.symbol} | NEUTRAL | {res.reason}"
+    premium = " ⭐" if res.extra.get("is_premium") else ""
+    block = (
+        f"{res.symbol} | {res.signal}{premium} [{res.entry_mode}] | "
+        f"score {res.score}/{res.max_score} (ratio {res.extra.get('score_ratio', 0):.2f}) | "
+        f"RR {res.rr:.2f} | entry {res.entry:.6f} | sl {res.sl:.6f} | tp1 {res.tp1:.6f} | "
+        f"tp2 {res.tp2:.6f} | lev {res.suggested_lev}x | {res.extra.get('setup_type', '')}"
+    )
+    return block
+
+
+# ── Exportación para guards de cooldown (compatibilidad con strategy) ────────
+class SignalFlipGuard:
+    """Evita que una señal contraria entre inmediatamente después de un cierre manual."""
+    def __init__(self, cooldown_seconds: int = 300):
+        self.cooldown = cooldown_seconds
+        self.last_close_time: Dict[str, float] = {}
+
+    def record_close(self, symbol: str):
+        self.last_close_time[symbol] = time.time()
+
+    def can_enter(self, symbol: str, new_signal: str, last_signal: Optional[str] = None) -> bool:
+        if symbol not in self.last_close_time:
+            return True
+        if time.time() - self.last_close_time[symbol] < self.cooldown:
+            if last_signal and last_signal != new_signal:
+                log.debug("[SignalFlipGuard] %s cooldown activo: %s -> %s", symbol, last_signal, new_signal)
+                return False
+        return True
+
+
+def manual_close_cooldown(guard: SignalFlipGuard, symbol: str, new_signal: str, last_signal: Optional[str] = None) -> bool:
+    """Función helper para usar en strategy."""
+    return guard.can_enter(symbol, new_signal, last_signal)
+
+
+# ── Fetch de barras con el exchange real (si no se pasa ohlcv_fn) ────────────
+async def _fetch_bars(exch, symbol: str, tf: str, limit: int) -> list:
+    """Obtiene velas del exchange en formato estándar."""
+    try:
+        # Convertir símbolo a formato CCXT si es necesario
+        ccxt_symbol = _to_ccxt_symbol(symbol) if hasattr(exch, 'market') else symbol
+        ohlcv = await exch.fetch_ohlcv(ccxt_symbol, timeframe=tf, limit=limit)
+        # Normalizar a lista de listas
+        return [[ts, o, h, l, c, v] for ts, o, h, l, c, v in ohlcv]
+    except Exception as e:
+        log.error("[signal_engine] Error fetching %s %s: %s", symbol, tf, e)
+        raise
