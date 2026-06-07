@@ -78,8 +78,6 @@ async def notify_open(
     notional=None,
     sl=None,
     tp1=None,
-    tp2=None,
-    tp3=None,
     dry_run=False,
     signal_block=None,
     ai_used=False,
@@ -101,9 +99,8 @@ async def notify_open(
     ]
     if sl:
         lines.append(f"SL: <code>{_esc(sl)}</code>")
-    tps = [tp for tp in (tp1, tp2, tp3) if tp is not None]
-    if tps:
-        lines.append("TP: " + " / ".join(f"<code>{_esc(t)}</code>" for t in tps))
+    if tp1 is not None:
+        lines.append(f"TP: <code>{_esc(tp1)}</code>")
     if entry_mode:
         lines.append(f"Modo: <code>{_esc(entry_mode)}</code>")
     if ai_used and ai_confidence:
@@ -131,12 +128,21 @@ async def notify_close_failed(symbol, reason, error):
     )
 
 
-async def notify_tp_partial(symbol, side, price, tp_level: int = 2, ratio: float = 0.5, dry_run: bool = False):
+async def notify_tp_hit(symbol, side, price, dry_run: bool = False):
+    """Notifica que el TP único ha sido alcanzado y la posición cerrada."""
     mode = " [DRY]" if dry_run else ""
     await _send(
-        f"\u2702\ufe0f <b>TP{tp_level} PARCIAL</b>{mode} <code>{_esc(symbol)}</code>\n"
-        f"Cerrado <code>{ratio*100:.0f}%</code> de la posici\u00f3n {_esc(side.upper())} @ <code>{_esc(price)}</code>\n"
-        f"SL movido a <b>break-even</b>"
+        f"\U0001f3af <b>TP ALCANZADO</b>{mode} <code>{_esc(symbol)}</code>\n"
+        f"Posici\u00f3n {_esc(side.upper())} cerrada @ <code>{_esc(price)}</code>"
+    )
+
+
+async def notify_be_moved(symbol, side, be_price, dry_run: bool = False):
+    """Notifica que el SL ha sido movido a break-even."""
+    mode = " [DRY]" if dry_run else ""
+    await _send(
+        f"\U0001f512 <b>SL \u2192 Break-Even</b>{mode} <code>{_esc(symbol)}</code>\n"
+        f"{_esc(side.upper())} | BE @ <code>{_esc(be_price)}</code>"
     )
 
 
@@ -163,7 +169,7 @@ async def notify_scanner_update(added: set, removed: set, total: int):
 async def notify_kill_switch(level: int, trigger: str):
     level_labels = {
         1: "\u26a0\ufe0f L1 \u2014 Nuevas entradas pausadas",
-        2: "\U0001f6d1 L2 \u2014 S\u00edmbolo/estrategia halted",
+        2: "\U0001f6d1 L2 \u2014 S\u00edmbol/estrategia halted",
         3: "\U0001f6a8 L3 \u2014 \u00d3rdenes bloqueadas",
         4: "\U0001f480 L4 \u2014 HARD KILL",
     }
@@ -367,9 +373,6 @@ async def _cmd_backtest(chat_id: int | str, args: list[str]) -> None:
     /backtest 180                  — backtest con 180 días de histórico
     /backtest BTC/USDT:USDT 90     — símbolo concreto con 90 días
     /backtest opt / optimize       — ignorado (optimizador no implementado aún)
-
-    Nota: run_backtest_now() no acepta 'optimize'. Si en el futuro se
-    implementa el optimizador walk-forward, añadir el parámetro allí primero.
     """
     bot = _get_bot()
     if not bot:
@@ -385,7 +388,6 @@ async def _cmd_backtest(chat_id: int | str, args: list[str]) -> None:
     symbols   = None
 
     remaining = list(args)
-    # Ignorar token 'opt'/'optimize' — no implementado aún en run_backtest_now
     if remaining and remaining[0].lower() in ("opt", "optimize", "optimizar"):
         remaining.pop(0)
         await reply(
