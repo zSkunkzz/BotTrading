@@ -12,12 +12,28 @@ Combina dos fuentes en un score 0-100:
      Si F&G es extremo (< 25 o > 75), decide solo sin gastar tokens.
      Cache global de 2h: se llama como máximo 12 veces al día.
 
-Lógica de llamada a Groq:
-  - F&G <= FNG_GROQ_LO (default 25)  → Extreme Fear  → decide solo (score bajo)
-  - F&G >= FNG_GROQ_HI (default 75)  → Extreme Greed → decide solo (score alto)
+Lógica DIRECCIONAL (side="LONG" | "SHORT" | None):
+  ┌─────────────────┬──────────────────────┬──────────────────────┐
+  │   F&G           │       LONG           │       SHORT          │
+  ├─────────────────┼──────────────────────┼──────────────────────┤
+  │ ≤ FNG_GROQ_LO   │ 🚫 BLOQUEADO         │ ✅ FAVORECIDO (100%) │
+  │   (Extreme Fear)│ mercado en pánico    │ señal bajista válida │
+  ├─────────────────┼──────────────────────┼──────────────────────┤
+  │ ambiguo (25-75) │ score combinado      │ score combinado      │
+  │                 │ F&G + Groq           │ F&G + Groq           │
+  ├─────────────────┼──────────────────────┼──────────────────────┤
+  │ ≥ FNG_GROQ_HI   │ ✅ FAVORECIDO (100%) │ 🚫 BLOQUEADO         │
+  │   (Extreme Greed│ señal alcista válida │ mercado eufórico     │
+  └─────────────────┴──────────────────────┴──────────────────────┘
+
+Cuando side=None (llamada sin dirección) se mantiene la lógica simétrica original.
+
+Llamadas a Groq:
+  - F&G <= FNG_GROQ_LO (default 25)  → Extreme Fear  → decide solo (sin tokens)
+  - F&G >= FNG_GROQ_HI (default 75)  → Extreme Greed → decide solo (sin tokens)
   - 25 < F&G < 75 (zona ambigua)      → llama Groq para desempatar
 
-Score final y acción:
+Score final y acción (zona ambigua):
   score >= SENTIMENT_OPEN_MIN (default 35)   → ✅ permitir entrada
   score <  SENTIMENT_OPEN_MIN               → 🚫 bloquear entrada
   score >= SENTIMENT_SIZE_BOOST (default 65) → 💪 size completo
@@ -25,14 +41,14 @@ Score final y acción:
 
 Cache:
   - Fear&Greed: TTL 30 min (1 llamada HTTP ligera cada 30 min máximo)
-  - Groq macro: TTL 2h    (solo cuando F&G es ambiguo → máx 12/día)
+  - Groq macro: TTL 2h    (solo cuando F&G es ambiguo → máx ~12/día)
 
 Variables de entorno Railway:
   SENTIMENT_GATE=true/false       (default: true)
-  SENTIMENT_OPEN_MIN=35           score mínimo para abrir
-  SENTIMENT_SIZE_BOOST=65         score para size completo
-  FNG_GROQ_LO=25                  por debajo: F&G decide solo (extremo bajista)
-  FNG_GROQ_HI=75                  por encima: F&G decide solo (extremo alcista)
+  SENTIMENT_OPEN_MIN=35           score mínimo para abrir (zona ambigua)
+  SENTIMENT_SIZE_BOOST=65         score para size completo (zona ambigua)
+  FNG_GROQ_LO=25                  por debajo: Extreme Fear → bloquea LONG, favorece SHORT
+  FNG_GROQ_HI=75                  por encima: Extreme Greed → favorece LONG, bloquea SHORT
   GROQ_MACRO_CACHE_TTL_H=2        TTL cache Groq en horas
 """
 from __future__ import annotations
@@ -43,6 +59,7 @@ import logging
 import os
 import re
 import time
+from typing import Optional
 
 import aiohttp
 
@@ -52,8 +69,8 @@ log = logging.getLogger("SentimentGate")
 SENTIMENT_GATE       = os.getenv("SENTIMENT_GATE",    "true").lower() != "false"
 SENTIMENT_OPEN_MIN   = float(os.getenv("SENTIMENT_OPEN_MIN",   "35"))
 SENTIMENT_SIZE_BOOST = float(os.getenv("SENTIMENT_SIZE_BOOST", "65"))
-_FNG_GROQ_LO         = float(os.getenv("FNG_GROQ_LO", "25"))  # por debajo: no llama Groq
-_FNG_GROQ_HI         = float(os.getenv("FNG_GROQ_HI", "75"))  # por encima: no llama Groq
+_FNG_GROQ_LO         = float(os.getenv("FNG_GROQ_LO", "25"))  # por debajo: Extreme Fear
+_FNG_GROQ_HI         = float(os.getenv("FNG_GROQ_HI", "75"))  # por encima: Extreme Greed
 _FNG_CACHE_TTL_S     = 1800.0  # 30 min
 _GROQ_CACHE_TTL_S    = float(os.getenv("GROQ_MACRO_CACHE_TTL_H", "2")) * 3600
 _GROQ_API_URL        = "https://api.groq.com/openai/v1/chat/completions"
@@ -190,9 +207,17 @@ async def _groq_macro(session: aiohttp.ClientSession) -> float:
 
 # ── Score combinado ───────────────────────────────────────────────────────────
 
-async def sentiment_gate_check() -> tuple[bool, str, bool]:
+async def sentiment_gate_check(
+    side: Optional[str] = None,
+) -> tuple[bool, str, bool]:
     """
     Punto de entrada para decision_engine.
+
+    Args:
+        side: "LONG", "SHORT", "long", "short" o None (sin dirección).
+              Cuando se proporciona, el gate es DIRECCIONAL:
+                - Extreme Fear (F&G ≤ 25): bloquea LONG, deja pasar SHORT
+                - Extreme Greed (F&G ≥ 75): bloquea SHORT, deja pasar LONG
 
     Returns: (allowed, reason, full_size)
       allowed   → True si el sentimiento permite abrir
@@ -200,38 +225,64 @@ async def sentiment_gate_check() -> tuple[bool, str, bool]:
       full_size → True = size completo | False = reducir al 50%
 
     Llamadas a Groq:
-      - F&G <= FNG_GROQ_LO (25): NUNCA llama Groq (Extreme Fear, decide solo)
-      - F&G >= FNG_GROQ_HI (75): NUNCA llama Groq (Extreme Greed, decide solo)
+      - F&G <= FNG_GROQ_LO (25): NUNCA llama Groq (decide por dirección)
+      - F&G >= FNG_GROQ_HI (75): NUNCA llama Groq (decide por dirección)
       - 25 < F&G < 75: llama Groq 1 vez, cache 2h (máx ~12 llamadas/día)
     """
     if not SENTIMENT_GATE:
         return True, "sentiment_gate=OFF", True
 
+    # Normalizar side a mayúsculas para comparación uniforme
+    side_upper = side.upper() if side else None
+
     try:
         async with aiohttp.ClientSession() as session:
             fng = await _fetch_fear_greed(session)
 
-            # Zona extrema: F&G decide solo, 0 tokens Groq
+            # ── Zona extrema: lógica direccional sin Groq ──────────────────
             if fng <= _FNG_GROQ_LO:
-                # Extreme Fear → score basado solo en F&G
-                score = fng  # ej: 15 → score=15 → casi siempre < OPEN_MIN → bloquea
-                groq_delta = None
-                log.info("[sentiment] F&G=%.0f ≤ %.0f (Extreme Fear) → sin Groq, score=%.0f",
-                         fng, _FNG_GROQ_LO, score)
+                # Extreme Fear
+                if side_upper == "LONG":
+                    reason = f"F&G={fng:.0f} (Extreme Fear) | score={fng:.0f}/100"
+                    log.info("[sentiment] F&G=%.0f ≤ %.0f (Extreme Fear) → 🚫 BLOCK LONG", fng, _FNG_GROQ_LO)
+                    return False, reason, False
+                elif side_upper == "SHORT":
+                    reason = f"F&G={fng:.0f} (Extreme Fear) | score=100/100 → SHORT favorecido"
+                    log.info("[sentiment] F&G=%.0f ≤ %.0f (Extreme Fear) → ✅ ALLOW SHORT (bearish confirmed)", fng, _FNG_GROQ_LO)
+                    return True, reason, True
+                else:
+                    # Sin dirección: lógica original (bloquear si score bajo)
+                    score = fng
+                    groq_delta = None
+                    log.info("[sentiment] F&G=%.0f ≤ %.0f (Extreme Fear) → sin Groq, score=%.0f",
+                             fng, _FNG_GROQ_LO, score)
+
             elif fng >= _FNG_GROQ_HI:
-                # Extreme Greed → score basado solo en F&G
-                score = fng  # ej: 85 → score=85 → full size
-                groq_delta = None
-                log.info("[sentiment] F&G=%.0f ≥ %.0f (Extreme Greed) → sin Groq, score=%.0f",
-                         fng, _FNG_GROQ_HI, score)
+                # Extreme Greed
+                if side_upper == "SHORT":
+                    reason = f"F&G={fng:.0f} (Extreme Greed) | score={fng:.0f}/100"
+                    log.info("[sentiment] F&G=%.0f ≥ %.0f (Extreme Greed) → 🚫 BLOCK SHORT", fng, _FNG_GROQ_HI)
+                    return False, reason, False
+                elif side_upper == "LONG":
+                    reason = f"F&G={fng:.0f} (Extreme Greed) | score=100/100 → LONG favorecido"
+                    log.info("[sentiment] F&G=%.0f ≥ %.0f (Extreme Greed) → ✅ ALLOW LONG (bullish confirmed)", fng, _FNG_GROQ_HI)
+                    return True, reason, True
+                else:
+                    # Sin dirección: lógica original
+                    score = fng
+                    groq_delta = None
+                    log.info("[sentiment] F&G=%.0f ≥ %.0f (Extreme Greed) → sin Groq, score=%.0f",
+                             fng, _FNG_GROQ_HI, score)
+
             else:
-                # Zona ambigua: llamar Groq para desempatar (con cache 2h)
+                # ── Zona ambigua: llamar Groq para desempatar (cache 2h) ───
                 groq_delta = await _groq_macro(session)
                 groq_norm  = (groq_delta + 2.0) / 4.0 * 100.0  # [-2,+2] → [0,100]
                 score = 0.60 * fng + 0.40 * groq_norm
                 log.info("[sentiment] F&G=%.0f (ambiguo) + Groq=%+.1f → score=%.0f",
                          fng, groq_delta, score)
 
+        # ── Evaluación score (solo se llega aquí en zona ambigua o side=None en extremos) ──
         score     = max(0.0, min(100.0, score))
         allowed   = score >= SENTIMENT_OPEN_MIN
         full_size = score >= SENTIMENT_SIZE_BOOST
