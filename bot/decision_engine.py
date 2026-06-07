@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-decision_engine.py — Motor de decisión de trading.
+bot/decision_engine.py — Motor de decisión de trading.
 
 Fix ohlcv_fn (2026-06-02):
   evaluate() ahora acepta ohlcv como Callable (ohlcv_fn) además de list.
@@ -42,12 +42,20 @@ Fix Bug R (2026-06-03) — BUG RAÍZ:
   o pasar usdc_per_trade del risk_manager como aproximación.
   También: tp3 ahora se incluye en el signal dict que se devuelve.
 
-v18 — reentry_guard integration:
-  evaluate() aplica reentry_guard.size_factor(symbol, score) al margin
-  efectivo justo antes de confirmar la orden. Si el par tiene un SL reciente
-  registrado y el score no supera REENTRY_MIN_SCORE, el capital arriesgado
-  se multiplica por REENTRY_SIZE_PCT (default 0.50 → 50% del size normal).
-  El ajuste se logea con nivel INFO para trazabilidad.
+v18 — reentry_guard integration (MOVIDO a trader.open_order):
+  El ajuste de size por reentry_guard se aplica en trader.open_order()
+  después de confirmar que se va a abrir la orden. Eliminado de evaluate()
+  para evitar que confirm_order() se llame antes de que la orden se ejecute.
+
+Fix Bug2 (2026-06-07) — BUG RAÍZ confirm_order prematuro:
+  evaluate() llamaba pretrade_risk.confirm_order() ANTES de que open_order()
+  se ejecutara. Si open_order() fallaba (posición ya abierta, error de red,
+  qty=0, etc.), el margin quedaba reservado PARA SIEMPRE — nunca liberado.
+  Tras 500 USDC acumulados Gate 2 bloqueaba permanentemente todos los trades.
+  Fix: confirm_order() ELIMINADO de evaluate(). Ahora se llama en
+  trader.open_order() tras confirmar que la orden se colocó.
+  evaluate() devuelve el signal dict con confirm_margin para que open_order()
+  lo use en confirm_order().
 
 Fix analyze_pair error logging (2026-06-07):
   El warning "analyze_pair error: 4" no mostraba el traceback real.
@@ -56,12 +64,12 @@ Fix analyze_pair error logging (2026-06-07):
   insuficientes (warm-up transitorio), se loguea a DEBUG en lugar de WARNING
   para evitar ruido en los primeros ciclos del bot.
 
-Fix Bug1+Bug2 (2026-06-07):
+Fix Bug1+Bug3 (2026-06-07):
   Bug1: _register_close_safe ahora lee el margin real de
     pretrade._open_margin_by_symbol.get(symbol) antes de llamar
     register_close_safe, evitando que _open_margin se acumule
     indefinidamente y bloquee Gate 2 para siempre.
-  Bug2: analyze_pair recibía exch=None. Ahora se pasa self._signal
+  Bug3: analyze_pair recibía exch=None. Ahora se pasa self._signal
     (que puede ser el exchange/cliente) si está disponible, o se omite
     el parámetro para que analyze_pair use su propio cliente interno.
 
@@ -116,6 +124,11 @@ class DecisionEngine:
         ohlcv puede ser:
           - un Callable async (ohlcv_fn) → se pasa directamente a analyze_pair
           - una list (legado) → se envuelve con _make_ohlcv_fn
+
+        IMPORTANTE: esta función NO llama confirm_order(). La reserva de margen
+        en pretrade_risk se hace en trader.open_order() DESPUÉS de confirmar
+        que la orden se colocó realmente. Así se evita el bug de acumulación
+        de _open_margin cuando la orden falla (Bug2).
         """
         # Gate 1: cooldown activo
         if self._cooldown.is_in_cooldown(symbol):
@@ -123,15 +136,14 @@ class DecisionEngine:
             log.debug("[%s] evaluate: cooldown activo (%.0fs restantes)", symbol, remaining)
             return None
 
-        # Gate 2: pretrade risk
+        # Gate 2: pretrade risk — solo rate-limiting y límite de open_margin
         # FIX Bug Q: si margin es 0 o el fallback 1.0, intentar obtenerlo del risk_manager
         effective_margin = margin
         if effective_margin <= 1.0:
             try:
                 usdc = float(getattr(self._risk, "usdc_per_trade", 0) or 0)
-                lev  = float(getattr(self._risk, "leverage", 1) or 1)
                 if usdc > 0:
-                    effective_margin = usdc  # margen = capital por trade (no notional)
+                    effective_margin = usdc
             except Exception:
                 pass
 
@@ -202,9 +214,8 @@ class DecisionEngine:
             log.debug("[%s] evaluate: señal NEUTRAL/HOLD — sin entrada", symbol)
             return None
 
-        # v18: aplicar reentry_guard ANTES de confirmar la orden
-        # Si el par tuvo un SL reciente y el score no es suficientemente alto,
-        # se reduce el margin efectivo al REENTRY_SIZE_PCT configurado.
+        # Calcular confirm_margin (puede ser reducido por reentry_guard)
+        # pero NO llamamos confirm_order() aquí — se llama en open_order().
         confirm_margin = effective_margin
         try:
             from bot.reentry_guard import reentry_guard
@@ -218,29 +229,25 @@ class DecisionEngine:
         except Exception as _rge:
             log.debug("[%s] evaluate: reentry_guard.size_factor error (ignorado): %s", symbol, _rge)
 
-        # Registrar el margin usado para poder liberarlo exactamente al cerrar
-        try:
-            self._pretrade.confirm_order(symbol=symbol, notional_or_margin=confirm_margin)
-        except Exception as e:
-            log.warning("[%s] evaluate: pretrade confirm_order error: %s", symbol, e)
-
         signal = {
-            "action":        "BUY" if result.signal == "LONG" else "SELL",
-            "side":          "long" if result.signal == "LONG" else "short",
-            "entry_mode":    result.entry_mode,
-            "entry":         result.entry,
-            "sl":            result.sl,
-            "tp1":           result.tp1,
-            "tp2":           result.tp2,
-            "tp3":           getattr(result, "tp3", None),
-            "atr":           result.atr,
-            "rr":            result.rr,
-            "score":         result.score,
-            "max_score":     result.max_score,
-            "leverage":      result.suggested_lev,
-            "indicators":    result.indicators,
-            "reason":        result.reason,
+            "action":         "BUY" if result.signal == "LONG" else "SELL",
+            "side":           "long" if result.signal == "LONG" else "short",
+            "entry_mode":     result.entry_mode,
+            "entry":          result.entry,
+            "sl":             result.sl,
+            "tp1":            result.tp1,
+            "tp2":            result.tp2,
+            "tp3":            getattr(result, "tp3", None),
+            "atr":            result.atr,
+            "rr":             result.rr,
+            "score":          result.score,
+            "max_score":      result.max_score,
+            "leverage":       result.suggested_lev,
+            "indicators":     result.indicators,
+            "reason":         result.reason,
             "reentry_factor": confirm_margin / effective_margin if effective_margin > 0 else 1.0,
+            # Incluido para que open_order() pueda llamar confirm_order() con el margin correcto
+            "_confirm_margin": confirm_margin,
         }
 
         log.info(
