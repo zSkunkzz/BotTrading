@@ -79,6 +79,13 @@ Fix Bug3 (2026-06-07) — BUG RAÍZ del TypeError:
     TypeError: analyze_pair() missing 1 required positional argument: 'exch'
   Fix: siempre pasar exch explícitamente. Si no hay exchange disponible,
   pasar exch=None para que analyze_pair use la rama ohlcv_fn interna.
+
+feat: SentimentGate (2026-06-08):
+  Gate 2.5 — entre pretrade_risk y la señal técnica.
+  Combina Fear&Greed Index (api.alternative.me, gratuito) + Groq macro
+  sentiment en un score 0-100. Si el score < SENTIMENT_OPEN_MIN (35)
+  se bloquea la entrada. Si score < SENTIMENT_SIZE_BOOST (65) se reduce
+  el margin al 50%. Configurable por env; desactivable con SENTIMENT_GATE=false.
 """
 from __future__ import annotations
 
@@ -93,7 +100,6 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Número de errores consecutivos de analyze_pair antes de elevar a WARNING.
-# Permite que los primeros ciclos de warm-up sean silenciosos (DEBUG).
 _ANALYZE_PAIR_WARMUP_THRESHOLD = 3
 
 
@@ -104,11 +110,9 @@ class DecisionEngine:
         self._pretrade     = pretrade_risk
         self._signal       = signal_engine
         self._cooldown     = cooldown
-        # Contador de errores consecutivos de analyze_pair por símbolo.
-        # Se resetea cuando el par evalúa correctamente (result no None).
         self._analyze_error_count: dict[str, int] = {}
 
-    # ── Evaluación de señal ───────────────────────────────────────────────────
+    # ── Evaluación de señal ─────────────────────────────────────────────────
 
     async def evaluate(
         self,
@@ -121,14 +125,11 @@ class DecisionEngine:
         """
         Evalúa si hay condiciones para abrir una posición.
 
-        ohlcv puede ser:
-          - un Callable async (ohlcv_fn) → se pasa directamente a analyze_pair
-          - una list (legado) → se envuelve con _make_ohlcv_fn
-
-        IMPORTANTE: esta función NO llama confirm_order(). La reserva de margen
-        en pretrade_risk se hace en trader.open_order() DESPUÉS de confirmar
-        que la orden se colocó realmente. Así se evita el bug de acumulación
-        de _open_margin cuando la orden falla (Bug2).
+        Gates:
+          1. Cooldown activo
+          2. PretradeRisk (rate-limiting + open_margin)
+          2.5 SentimentGate: Fear&Greed + Groq macro → bloquear o reducir size
+          3. Señal técnica (analyze_pair)
         """
         # Gate 1: cooldown activo
         if self._cooldown.is_in_cooldown(symbol):
@@ -136,8 +137,7 @@ class DecisionEngine:
             log.debug("[%s] evaluate: cooldown activo (%.0fs restantes)", symbol, remaining)
             return None
 
-        # Gate 2: pretrade risk — solo rate-limiting y límite de open_margin
-        # FIX Bug Q: si margin es 0 o el fallback 1.0, intentar obtenerlo del risk_manager
+        # Gate 2: pretrade risk
         effective_margin = margin
         if effective_margin <= 1.0:
             try:
@@ -147,7 +147,6 @@ class DecisionEngine:
             except Exception:
                 pass
 
-        # Si seguimos sin margin válido, usar 10.0 como fallback conservador
         if effective_margin <= 0:
             effective_margin = 10.0
 
@@ -166,9 +165,28 @@ class DecisionEngine:
             log.warning("[%s] evaluate: BLOQUEADO por pretrade_risk — %s", symbol, reason)
             return None
 
+        # Gate 2.5: SentimentGate (Fear&Greed + Groq macro)
+        try:
+            from bot.sentiment_gate import sentiment_gate_check
+            sg_allowed, sg_reason, sg_full_size = await sentiment_gate_check()
+            if not sg_allowed:
+                log.warning(
+                    "[%s] evaluate: BLOQUEADO por SentimentGate — %s",
+                    symbol, sg_reason,
+                )
+                return None
+            if not sg_full_size:
+                prev = effective_margin
+                effective_margin = effective_margin * 0.5
+                log.info(
+                    "[%s] evaluate: SentimentGate size reducido 50%% — %s (%.2f → %.2f USDC)",
+                    symbol, sg_reason, prev, effective_margin,
+                )
+        except Exception as _sge:
+            # Fail-open: si el gate falla, no bloqueamos la operación
+            log.warning("[%s] evaluate: SentimentGate error (fail-open): %s", symbol, _sge)
+
         # Gate 3: señal técnica
-        # FIX ohlcv_fn: si ohlcv es callable, usarlo directamente.
-        # Si es list (legado), envolver con _make_ohlcv_fn.
         if callable(ohlcv):
             ohlcv_fn = ohlcv
         else:
@@ -176,10 +194,6 @@ class DecisionEngine:
 
         try:
             from bot.signal_engine import analyze_pair
-            # FIX Bug3: analyze_pair() define `exch` como primer argumento POSICIONAL.
-            # Llamarla sin él lanza TypeError. Siempre pasar exch explícitamente:
-            # - Si self._signal expone un exchange/cliente real, usarlo.
-            # - Si no, pasar exch=None para que analyze_pair use la rama ohlcv_fn.
             exch = getattr(self._signal, "exchange", None) or getattr(self._signal, "client", None)
             result = await analyze_pair(exch=exch, symbol=symbol, ohlcv_fn=ohlcv_fn)
         except Exception as e:
@@ -187,20 +201,18 @@ class DecisionEngine:
             self._analyze_error_count[symbol] = err_count
 
             if err_count <= _ANALYZE_PAIR_WARMUP_THRESHOLD:
-                # Primeros N errores: DEBUG silencioso (warm-up transitorio esperado)
                 log.debug(
                     "[%s] evaluate: analyze_pair error (warm-up #%d/%d): %s",
                     symbol, err_count, _ANALYZE_PAIR_WARMUP_THRESHOLD, e,
                 )
             else:
-                # A partir del umbral: WARNING con traceback completo para diagnóstico real
                 log.warning(
                     "[%s] evaluate: analyze_pair error persistente (#%d): %s\n%s",
                     symbol, err_count, e, traceback.format_exc(),
                 )
             return None
 
-        # Reset contador de errores al evaluar correctamente
+        # Reset contador de errores
         if symbol in self._analyze_error_count:
             prev = self._analyze_error_count.pop(symbol)
             if prev > 0:
@@ -215,7 +227,6 @@ class DecisionEngine:
             return None
 
         # Calcular confirm_margin (puede ser reducido por reentry_guard)
-        # pero NO llamamos confirm_order() aquí — se llama en open_order().
         confirm_margin = effective_margin
         try:
             from bot.reentry_guard import reentry_guard
@@ -230,23 +241,22 @@ class DecisionEngine:
             log.debug("[%s] evaluate: reentry_guard.size_factor error (ignorado): %s", symbol, _rge)
 
         signal = {
-            "action":         "BUY" if result.signal == "LONG" else "SELL",
-            "side":           "long" if result.signal == "LONG" else "short",
-            "entry_mode":     result.entry_mode,
-            "entry":          result.entry,
-            "sl":             result.sl,
-            "tp1":            result.tp1,
-            "tp2":            result.tp2,
-            "tp3":            getattr(result, "tp3", None),
-            "atr":            result.atr,
-            "rr":             result.rr,
-            "score":          result.score,
-            "max_score":      result.max_score,
-            "leverage":       result.suggested_lev,
-            "indicators":     result.indicators,
-            "reason":         result.reason,
-            "reentry_factor": confirm_margin / effective_margin if effective_margin > 0 else 1.0,
-            # Incluido para que open_order() pueda llamar confirm_order() con el margin correcto
+            "action":          "BUY" if result.signal == "LONG" else "SELL",
+            "side":            "long" if result.signal == "LONG" else "short",
+            "entry_mode":      result.entry_mode,
+            "entry":           result.entry,
+            "sl":              result.sl,
+            "tp1":             result.tp1,
+            "tp2":             result.tp2,
+            "tp3":             getattr(result, "tp3", None),
+            "atr":             result.atr,
+            "rr":              result.rr,
+            "score":           result.score,
+            "max_score":       result.max_score,
+            "leverage":        result.suggested_lev,
+            "indicators":      result.indicators,
+            "reason":          result.reason,
+            "reentry_factor":  confirm_margin / effective_margin if effective_margin > 0 else 1.0,
             "_confirm_margin": confirm_margin,
         }
 
@@ -261,7 +271,7 @@ class DecisionEngine:
         )
         return signal
 
-    # ── Notificación de cierre ────────────────────────────────────────────────
+    # ── Notificación de cierre ─────────────────────────────────────────────
 
     async def on_position_closed(
         self,
@@ -287,7 +297,6 @@ class DecisionEngine:
             pass
 
     async def _register_close_safe(self, symbol: str, pnl: float) -> None:
-        # FIX Bug R: cerrar GlobalRisk
         try:
             await self._risk.register_close(pnl_pct=pnl, symbol=symbol)
         except Exception as e:
@@ -297,8 +306,6 @@ class DecisionEngine:
                 exc_info=True,
             )
 
-        # FIX Bug1: leer el margin REAL reservado ANTES de llamar register_close_safe
-        # para que _open_margin baje correctamente y Gate 2 no quede bloqueado.
         try:
             reserved_margin = self._pretrade._open_margin_by_symbol.get(symbol, 0.0)
             self._pretrade.register_close_safe(symbol=symbol, notional_or_margin=reserved_margin)
@@ -315,7 +322,7 @@ class DecisionEngine:
             )
 
 
-# ── Helper: adaptar lista ohlcv plana a ohlcv_fn callable ────────────────────
+# ── Helper: adaptar lista ohlcv plana a ohlcv_fn callable ──────────────────
 
 def _make_ohlcv_fn(ohlcv_data: list):
     """
