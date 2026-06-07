@@ -64,6 +64,13 @@ Fix Bug1+Bug2 (2026-06-07):
   Bug2: analyze_pair recibía exch=None. Ahora se pasa self._signal
     (que puede ser el exchange/cliente) si está disponible, o se omite
     el parámetro para que analyze_pair use su propio cliente interno.
+
+Fix Bug3 (2026-06-07) — BUG RAÍZ del TypeError:
+  analyze_pair() define `exch` como primer argumento POSICIONAL obligatorio.
+  Llamarla sin él (analyze_pair(symbol=..., ohlcv_fn=...)) lanza:
+    TypeError: analyze_pair() missing 1 required positional argument: 'exch'
+  Fix: siempre pasar exch explícitamente. Si no hay exchange disponible,
+  pasar exch=None para que analyze_pair use la rama ohlcv_fn interna.
 """
 from __future__ import annotations
 
@@ -157,13 +164,12 @@ class DecisionEngine:
 
         try:
             from bot.signal_engine import analyze_pair
-            # FIX Bug2: no pasar exch=None — usar el exchange del signal_engine
-            # si está disponible, o dejar que analyze_pair use su cliente interno.
+            # FIX Bug3: analyze_pair() define `exch` como primer argumento POSICIONAL.
+            # Llamarla sin él lanza TypeError. Siempre pasar exch explícitamente:
+            # - Si self._signal expone un exchange/cliente real, usarlo.
+            # - Si no, pasar exch=None para que analyze_pair use la rama ohlcv_fn.
             exch = getattr(self._signal, "exchange", None) or getattr(self._signal, "client", None)
-            if exch is not None:
-                result = await analyze_pair(exch=exch, symbol=symbol, ohlcv_fn=ohlcv_fn)
-            else:
-                result = await analyze_pair(symbol=symbol, ohlcv_fn=ohlcv_fn)
+            result = await analyze_pair(exch=exch, symbol=symbol, ohlcv_fn=ohlcv_fn)
         except Exception as e:
             err_count = self._analyze_error_count.get(symbol, 0) + 1
             self._analyze_error_count[symbol] = err_count
