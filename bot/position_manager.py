@@ -36,6 +36,16 @@ FEAT BE (Break-Even) — Cuando el precio se aleja de la entrada un porcentaje
   cancela TODAS las órdenes SL/TP activas del exchange antes de recolocar
   el nuevo SL en BE + el TP1 original, evitando duplicados en BingX.
 
+v25 — Fix SL/TP único y BE robusto:
+  1. _ensure_tpsl y _place_emergency_sl_tp usan solo trader.tp1.
+     Elimina fallback a trader.tp que reinyectaba TP2/TP3 desde estado antiguo.
+  2. _check_break_even maneja sl=None (restart): si precio ya volvió a entry
+     o peor, marca _tp1_be_done=True sin disparar el BE (evita doble BE).
+  3. Persiste be_done=True en bot_state cuando se activa el BE.
+  4. Sincroniza trader.sl = be_price tras colocar SL en BE con éxito.
+  5. _ensure_tpsl detecta SL en entry_price (±0.1%) como SL válido,
+     evitando spam de "emergencia" cuando el SL ya está en BE.
+
 v21 — Fix tp2/tp3 limpieza en _reset_trader_position_state:
   Cuando se detecta cierre externo con qty=0, ahora también se limpian
   trader.tp2 y trader.tp3 para evitar estado contaminado.
@@ -185,6 +195,10 @@ class PositionManager:
         Mueve el SL a break-even (entry + offset) cuando el precio alcanza
         BE_TRIGGER_PCT del recorrido entry → TP1.
         Solo se activa UNA VEZ por posición (_tp1_be_done).
+
+        v25: maneja sl=None tras restart correctamente.
+        Si el precio ya retrocedió a entry o peor, marca _tp1_be_done=True
+        sin disparar el BE (evita doble activación al reiniciar el bot).
         """
         trader = self._trader
 
@@ -223,9 +237,20 @@ class PositionManager:
 
         if sl is not None:
             if is_long and sl >= be_price:
+                # SL ya está en BE o más allá — no hacer nada
                 trader._tp1_be_done = True
                 return
             if not is_long and sl <= be_price:
+                trader._tp1_be_done = True
+                return
+        else:
+            # sl=None: puede que venga de un restart. Verificamos si ya lo
+            # habíamos activado comparando la distancia al entry.
+            # Si el precio ya volvió a entry (o peor), no tiene sentido activar BE.
+            if is_long and price <= entry:
+                trader._tp1_be_done = True
+                return
+            if not is_long and price >= entry:
                 trader._tp1_be_done = True
                 return
 
@@ -240,6 +265,34 @@ class PositionManager:
         # Marcar como hecho ANTES de la llamada async (evita doble ejecución)
         trader._tp1_be_done = True
         trader.sl = be_price
+
+        # v25: Persistir be_done=True en state para sobrevivir reinicios del bot
+        try:
+            from bot.state import save_position as _save_pos
+            _sl_to_save  = be_price
+            _entry_save  = getattr(trader, "entry_price", None)
+            _tp1_save    = getattr(trader, "tp1", None)
+            _tp2_save    = getattr(trader, "tp2", None)
+            _tp3_save    = getattr(trader, "tp3", None)
+            _qty_save    = getattr(trader, "_open_qty", 0.0)
+            _usdc_save   = getattr(trader, "_open_notional", 0.0)
+            _lev_save    = getattr(trader, "_open_leverage", 1)
+            _side_save   = getattr(trader, "position", None)
+            _save_pos(
+                symbol,
+                side=_side_save,
+                entry=_entry_save,
+                sl=_sl_to_save,
+                tp1=_tp1_save,
+                tp2=_tp2_save,
+                tp3=_tp3_save,
+                qty=_qty_save,
+                usdc_amount=_usdc_save,
+                leverage=_lev_save,
+                be_done=True,
+            )
+        except Exception as _be_state_err:
+            log.debug("[%s] BE: no se pudo persistir be_done en state: %s", symbol, _be_state_err)
 
         await self._update_sl_to_be(be_price, is_long, symbol)
 
@@ -280,6 +333,7 @@ class PositionManager:
             trader.sl = None
             return
 
+        # v25: solo TP1 — nunca tp2/tp3
         tp1 = getattr(trader, "tp1", None)
 
         # ── 1. Cancelar todas las órdenes SL/TP pendientes ───────────────
@@ -298,6 +352,7 @@ class PositionManager:
                 reduce_only=True,
             )
             log.info("[%s] BE: SL colocado en entrada (%.4f).", symbol, be_price)
+            trader.sl = be_price  # v25: sincronizar estado en memoria
         except Exception as e:
             log.error("[%s] BE: error colocando SL en BE: %s", symbol, e)
             trader._tp1_be_done = False
@@ -451,6 +506,9 @@ class PositionManager:
         Fix qty=0 loop: si _open_qty es 0 o la posición ya no existe en el
         exchange, limpiamos el estado del trader en lugar de intentar colocar
         órdenes de emergencia infinitamente.
+
+        v25: solo usa trader.tp1 como referencia de TP (elimina fallback a trader.tp).
+        Detecta SL en entry_price (±0.1%) como SL válido cuando el BE ya está activo.
         """
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
@@ -498,9 +556,12 @@ class PositionManager:
         has_tp = any(_get_tpsl_type(o) == "tp" for o in coin_orders)
 
         # 5. Bug B: fallback por precio si el campo algoType no viene
+        # v25: solo usa trader.tp1 (elimina fallback a trader.tp que reinyectaba TP2/TP3)
+        # v25: detecta SL en entry_price (±0.1%) como SL válido cuando BE está activo
         if not has_sl or not has_tp:
-            sl_price = getattr(trader, "sl", None)
-            tp_price = getattr(trader, "tp1", None) or getattr(trader, "tp", None)
+            sl_price    = getattr(trader, "sl", None)
+            tp_price    = getattr(trader, "tp1", None)   # v25: solo tp1, sin fallback a tp
+            entry_price = getattr(trader, "entry_price", None)
             for o in coin_orders:
                 if not _is_reduce_only(o):
                     continue
@@ -514,8 +575,12 @@ class PositionManager:
                     )
                 except (TypeError, ValueError):
                     opx = 0.0
-                if not has_sl and sl_price and opx:
-                    if abs(opx - sl_price) / sl_price < 0.002:
+                if not has_sl and opx:
+                    # Detectar SL por precio exacto O SL en BE (≈ entry_price)
+                    if sl_price and abs(opx - sl_price) / sl_price < 0.002:
+                        has_sl = True
+                    elif entry_price and abs(opx - entry_price) / entry_price < 0.001:
+                        # v25: SL de break-even colocado en entry_price — es válido
                         has_sl = True
                 if not has_tp and tp_price and opx:
                     if abs(opx - tp_price) / tp_price < 0.002:
@@ -558,7 +623,8 @@ class PositionManager:
         symbol = getattr(trader, "symbol", "?")
 
         sl_price = getattr(trader, "sl", None)
-        tp_price = getattr(trader, "tp1", None) or getattr(trader, "tp", None)
+        # v25: solo tp1, sin fallback a trader.tp
+        tp_price = getattr(trader, "tp1", None)
         open_qty = _round_qty_safe(trader, getattr(trader, "_open_qty", 0.0) or 0.0)
 
         if open_qty <= 0:
