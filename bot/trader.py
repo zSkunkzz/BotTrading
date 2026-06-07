@@ -2,6 +2,17 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v24 — Rebase automático de niveles al precio de mercado (2026-06-07):
+  - _check_price_staleness() ELIMINADO. Ya no cancela órdenes por drift.
+  - _rebase_signal_to_market(): nueva función que sustituye signal["entry"]
+    por ref_price y reescala SL y TP1 proporcionalmente, preservando los
+    ratios %  entry→SL y entry→TP1 originales de la señal.
+    Si el precio se ha movido >30% se aborta (precio irracional/error de datos).
+  - Paso 4 en _do_open_order(): ya no llama _check_price_staleness; llama
+    _rebase_signal_to_market() y actualiza signal in-place.
+  - Resultado: el bot entra SIEMPRE al precio real de mercado con los mismos
+    ratios de riesgo/recompensa, independientemente del lag del signal.
+
 v23 — Solo un TP; SL a Break-Even al 40% entry→TP1 (2026-06-07):
   - _do_open_order(): eliminado el bloque «Paso 10 – TP2/TP3».
     Ahora solo se coloca un único TP (tp1). tp2 y tp3 se ignoran
@@ -60,9 +71,12 @@ _TF_BINGX = {
     "1w":  "1w",  "1M":  "1M",
 }
 
-_FILL_RETRIES        = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "3"))
-_FILL_DELAY          = float(os.getenv("POST_FILL_CONFIRM_DELAY", "2.0"))
-_MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "3.0")) / 100.0
+_FILL_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "3"))
+_FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "2.0"))
+
+# v24: límite absoluto de drift antes de considerar los datos de la señal corruptos.
+# Por encima de este umbral se aborta la orden (no es lag — son datos malos).
+_MAX_REBASE_DRIFT_PCT = float(os.getenv("MAX_REBASE_DRIFT_PCT", "30.0")) / 100.0
 
 _BASE_URL = (
     "https://open-api-vst.bingx.com"
@@ -80,32 +94,75 @@ def _to_inst_id(symbol: str) -> str:
     return f"{base}-USDT"
 
 
-def _check_price_staleness(
+def _rebase_signal_to_market(
     signal: dict,
     ref_price: float,
-    is_long: bool,
+    symbol: str = "",
 ) -> Optional[str]:
+    """
+    v24: Reescala entry/sl/tp1 del signal al precio real de mercado (ref_price),
+    preservando los mismos ratios porcentuales entry→SL y entry→TP1.
+
+    Modifica signal in-place. Devuelve None si todo va bien, o un mensaje
+    de error string si el drift es tan grande que parece datos corruptos
+    (>MAX_REBASE_DRIFT_PCT, por defecto 30%).
+
+    Casos manejados:
+      - Señal reciente sin drift: sin cambios (entry ≈ ref_price).
+      - Señal con lag (precio subió/bajó): entry → ref_price, SL/TP reescalados.
+      - entry == 0 o ausente: se usa ref_price directamente, SL/TP sin cambio.
+    """
     entry_signal = float(signal.get("entry") or 0)
+
     if entry_signal <= 0:
+        # Sin entry de referencia: usar precio de mercado, SL/TP sin tocar.
+        signal["entry"] = ref_price
+        logger.debug("[%s] rebase: sin entry en signal → usando ref_price=%.4f", symbol, ref_price)
         return None
-    drift     = (ref_price - entry_signal) / entry_signal
+
+    drift = (ref_price - entry_signal) / entry_signal
     abs_drift = abs(drift)
-    threshold = _MAX_ENTRY_DRIFT_PCT
-    if abs_drift > threshold * 2:
+
+    # Drift mayor al umbral de datos corruptos → abortar
+    if abs_drift > _MAX_REBASE_DRIFT_PCT:
         return (
-            f"\u26a0\ufe0f Precio actual ({ref_price:.4f}) se alejó {drift*100:+.2f}% del entry "
-            f"({entry_signal:.4f}) — supera \u00b1{threshold*200:.1f}% — entrada cancelada"
+            f"🛑 Drift del precio ({drift*100:+.2f}%) supera el límite de "
+            f"±{_MAX_REBASE_DRIFT_PCT*100:.0f}% — posibles datos corruptos — entrada cancelada"
         )
-    if abs_drift <= threshold:
+
+    # Sin drift significativo: nada que hacer
+    if abs_drift < 0.0005:
         return None
-    if is_long:
-        if drift > 0:
-            return f"\u23eb [LONG] precio {ref_price:.4f} subió {drift*100:+.2f}% — demasiado caro, cancelado"
-        return f"\u23ea [LONG] precio {ref_price:.4f} cayó {drift*100:+.2f}% — setup roto, cancelado"
-    else:
-        if drift < 0:
-            return f"\u23ea [SHORT] precio {ref_price:.4f} bajó {drift*100:+.2f}% — cancelado"
-        return f"\u23eb [SHORT] precio {ref_price:.4f} subió {drift*100:+.2f}% — setup roto, cancelado"
+
+    # Reescalar SL y TP1 preservando los ratios porcentuales originales
+    sl_orig  = float(signal.get("sl")  or 0)
+    tp1_orig = float(signal.get("tp1") or 0)
+
+    def _rescale(level: float) -> float:
+        if level <= 0:
+            return level
+        ratio = (level - entry_signal) / entry_signal
+        return ref_price * (1.0 + ratio)
+
+    sl_new  = _rescale(sl_orig)
+    tp1_new = _rescale(tp1_orig)
+
+    logger.info(
+        "[%s] 🔄 Rebase de señal: entry %.4f → %.4f (%+.2f%%) | "
+        "SL %.4f→%.4f | TP1 %.4f→%.4f",
+        symbol,
+        entry_signal, ref_price, drift * 100,
+        sl_orig, sl_new,
+        tp1_orig, tp1_new,
+    )
+
+    signal["entry"] = ref_price
+    if sl_new > 0:
+        signal["sl"]  = sl_new
+    if tp1_new > 0:
+        signal["tp1"] = tp1_new
+
+    return None
 
 
 def _adjust_levels_to_fill(
@@ -559,11 +616,18 @@ class FuturesTrader:
             logger.error("[%s] open_order: no se pudo obtener precio: %s — abortando.", self.symbol, e)
             return
 
-        # ── 4. Validar staleness ──────────────────────────────────────────
-        stale_msg = _check_price_staleness(signal, ref_price, is_long)
-        if stale_msg:
-            logger.warning("[%s] open_order cancelado: %s", self.symbol, stale_msg)
+        # ── 4. Rebase automático de niveles al precio de mercado (v24) ───
+        # En lugar de cancelar la orden por drift, reescalamos entry/sl/tp1
+        # al precio real actual preservando los ratios porcentuales originales.
+        # Solo se aborta si el drift supera MAX_REBASE_DRIFT_PCT (datos corruptos).
+        rebase_err = _rebase_signal_to_market(signal, ref_price, symbol=self.symbol)
+        if rebase_err:
+            logger.warning("[%s] open_order cancelado: %s", self.symbol, rebase_err)
             return
+
+        # Leer niveles ya rebased del signal (pueden haber cambiado)
+        sl_price  = float(signal.get("sl")  or 0) or None
+        tp1_price = float(signal.get("tp1") or 0) or None
 
         # ── 5. Calcular qty ───────────────────────────────────────────────
         notional = usdc_per_trade * leverage
