@@ -55,6 +55,15 @@ Fix analyze_pair error logging (2026-06-07):
   Además se añade warm-up guard: si analyze_pair retorna None por datos
   insuficientes (warm-up transitorio), se loguea a DEBUG en lugar de WARNING
   para evitar ruido en los primeros ciclos del bot.
+
+Fix Bug1+Bug2 (2026-06-07):
+  Bug1: _register_close_safe ahora lee el margin real de
+    pretrade._open_margin_by_symbol.get(symbol) antes de llamar
+    register_close_safe, evitando que _open_margin se acumule
+    indefinidamente y bloquee Gate 2 para siempre.
+  Bug2: analyze_pair recibía exch=None. Ahora se pasa self._signal
+    (que puede ser el exchange/cliente) si está disponible, o se omite
+    el parámetro para que analyze_pair use su propio cliente interno.
 """
 from __future__ import annotations
 
@@ -148,7 +157,13 @@ class DecisionEngine:
 
         try:
             from bot.signal_engine import analyze_pair
-            result = await analyze_pair(exch=None, symbol=symbol, ohlcv_fn=ohlcv_fn)
+            # FIX Bug2: no pasar exch=None — usar el exchange del signal_engine
+            # si está disponible, o dejar que analyze_pair use su cliente interno.
+            exch = getattr(self._signal, "exchange", None) or getattr(self._signal, "client", None)
+            if exch is not None:
+                result = await analyze_pair(exch=exch, symbol=symbol, ohlcv_fn=ohlcv_fn)
+            else:
+                result = await analyze_pair(symbol=symbol, ohlcv_fn=ohlcv_fn)
         except Exception as e:
             err_count = self._analyze_error_count.get(symbol, 0) + 1
             self._analyze_error_count[symbol] = err_count
@@ -269,11 +284,16 @@ class DecisionEngine:
                 exc_info=True,
             )
 
-        # FIX Bug R (BUG RAÍZ): liberar el margin REAL reservado para este symbol.
+        # FIX Bug1: leer el margin REAL reservado ANTES de llamar register_close_safe
+        # para que _open_margin baje correctamente y Gate 2 no quede bloqueado.
         try:
-            self._pretrade.register_close_safe(symbol=symbol, notional_or_margin=0.0)
+            reserved_margin = self._pretrade._open_margin_by_symbol.get(symbol, 0.0)
+            self._pretrade.register_close_safe(symbol=symbol, notional_or_margin=reserved_margin)
             log.info(
-                "[%s] pretrade_risk margin liberado correctamente.", symbol
+                "[%s] pretrade_risk margin liberado: %.2f USDC (total open=%.2f)",
+                symbol,
+                reserved_margin,
+                self._pretrade._open_margin,
             )
         except Exception as e:
             log.error(
