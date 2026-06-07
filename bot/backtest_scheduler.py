@@ -12,7 +12,8 @@ Variables de entorno:
   BACKTEST_SCHED_ENABLED   → true/false (default: true)
   BACKTEST_SCHED_DAYS      → cada cuántos días ejecutar (default: 7)
   BACKTEST_SCHED_HOUR      → hora UTC de ejecución (default: 3)
-  BACKTEST_SCHED_SYMBOLS   → lista separada por comas (default: BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT)
+  BACKTEST_SCHED_SYMBOLS   → lista separada por comas — OPCIONAL: si no se
+                             define, se usan los pares activos del bot.
   BACKTEST_SCHED_HIST_DAYS → días de histórico a usar (default: 90)
   BACKTEST_SCHED_OPTIMIZE  → true/false — activar optimizador walk-forward (default: false)
   BACKTEST_SCHED_FOLDS     → número de folds para el optimizador (default: 3)
@@ -24,22 +25,71 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────
 SCHED_ENABLED   = os.getenv("BACKTEST_SCHED_ENABLED",  "true").lower() == "true"
 SCHED_DAYS      = int(os.getenv("BACKTEST_SCHED_DAYS",     "7"))
 SCHED_HOUR      = int(os.getenv("BACKTEST_SCHED_HOUR",     "3"))   # UTC
-SCHED_SYMBOLS   = os.getenv("BACKTEST_SCHED_SYMBOLS",
-                             "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT").split(",")
 SCHED_HIST_DAYS = int(os.getenv("BACKTEST_SCHED_HIST_DAYS", "90"))
 SCHED_OPTIMIZE  = os.getenv("BACKTEST_SCHED_OPTIMIZE",  "false").lower() == "true"
 SCHED_FOLDS     = int(os.getenv("BACKTEST_SCHED_FOLDS",    "3"))
 
+# Lista estática OPCIONAL — solo se usa si BACKTEST_SCHED_SYMBOLS está definida
+# en el .env Y no hay pares activos disponibles (fallback).
+_SCHED_SYMBOLS_ENV: Optional[list[str]] = (
+    [s.strip() for s in os.getenv("BACKTEST_SCHED_SYMBOLS", "").split(",") if s.strip()]
+    or None
+)
 
-# ── Telegram helper (usa el Notifier existente si está disponible) ────────────
+# Función inyectable desde main.py para obtener los pares activos en tiempo real.
+# Se asigna con set_active_symbols_fn() al arrancar el bot.
+_get_active_symbols: Optional[Callable[[], list[str]]] = None
+
+
+def set_active_symbols_fn(fn: Callable[[], list[str]]) -> None:
+    """
+    Registra la función que devuelve los símbolos activos del bot.
+    Llamar desde main.py tras inicializar active_traders:
+
+        from bot.backtest_scheduler import set_active_symbols_fn
+        set_active_symbols_fn(lambda: list(active_traders.keys()))
+    """
+    global _get_active_symbols
+    _get_active_symbols = fn
+    log.info("[backtest_sched] Función de símbolos activos registrada.")
+
+
+def _resolve_symbols(override: Optional[list[str]] = None) -> list[str]:
+    """
+    Resuelve qué símbolos usar en este orden de prioridad:
+      1. override explícito (pasado al llamar run_backtest_now)
+      2. active_traders en tiempo real (vía _get_active_symbols)
+      3. BACKTEST_SCHED_SYMBOLS del .env (lista estática de fallback)
+      4. Lista mínima de fallback si todo lo demás falla
+    """
+    if override:
+        return override
+
+    if _get_active_symbols is not None:
+        live = _get_active_symbols()
+        if live:
+            log.info("[backtest_sched] Símbolos tomados de active_traders: %s", live)
+            return live
+        log.warning("[backtest_sched] active_traders vacío — intentando fallback...")
+
+    if _SCHED_SYMBOLS_ENV:
+        log.info("[backtest_sched] Usando BACKTEST_SCHED_SYMBOLS del .env: %s", _SCHED_SYMBOLS_ENV)
+        return _SCHED_SYMBOLS_ENV
+
+    fallback = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
+    log.warning("[backtest_sched] Sin símbolos configurados — usando fallback: %s", fallback)
+    return fallback
+
+
+# ── Telegram helper ──────────────────────────────────────────────────
 async def _send(notifier, text: str) -> None:
     """Envía mensaje partiendo el texto si supera el límite de Telegram (4096 chars)."""
     MAX = 4000
@@ -48,7 +98,7 @@ async def _send(notifier, text: str) -> None:
         await asyncio.sleep(0.3)
 
 
-# ── Formateadores ────────────────────────────────────────────────────────────
+# ── Formateadores ─────────────────────────────────────────────────────────
 def _fmt_result(symbol: str, r) -> str:
     """Formatea un BacktestResult en una línea compacta para Telegram."""
     wr  = f"{r.win_rate * 100:.1f}%"  if r.trades else "—"
@@ -67,7 +117,7 @@ def _fmt_optimizer_top(top_params: list) -> str:
     """Formatea el top-3 del optimizador walk-forward."""
     if not top_params:
         return ""
-    lines = ["\n📊 *Top 3 parámetros (Walk-Forward)*"]
+    lines = ["\n\U0001f4ca *Top 3 parámetros (Walk-Forward)*"]
     for i, p in enumerate(top_params[:3], 1):
         lines.append(
             f"  #{i} Score≥{p['min_score']} · RR≥{p['min_rr']} · "
@@ -77,7 +127,7 @@ def _fmt_optimizer_top(top_params: list) -> str:
     best = top_params[0]
     lines += [
         "",
-        "📌 *Configuración recomendada:*",
+        "\U0001f4cc *Configuración recomendada:*",
         f"  `MIN_SIGNAL_SCORE={best['min_score']}`",
         f"  `MIN_RR_REQUIRED={best['min_rr']}`",
         f"  `MIN_SCORE_RATIO={best['min_ratio']}`",
@@ -94,14 +144,14 @@ def _build_report(
     elapsed: float,
 ) -> str:
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    icon = "🔬" if optimized else "📈"
+    icon = "\U0001f52c" if optimized else "\U0001f4c8"
     mode = "Optimizador Walk-Forward" if optimized else "Backtest Simple"
 
     header = (
         f"{icon} *{mode} — {now_str}*\n"
-        f"Símbolos: {', '.join(symbols)}\n"
+        f"Símbolos ({len(symbols)}): {', '.join(symbols)}\n"
         f"Histórico: {hist_days}d · Tiempo: {elapsed:.0f}s\n"
-        f"{'─' * 30}"
+        f"{─ * 30}"
     )
 
     body_lines = []
@@ -109,7 +159,7 @@ def _build_report(
         if r is not None and not isinstance(r, Exception):
             body_lines.append(_fmt_result(sym, r))
         else:
-            body_lines.append(f"*{sym}* — ❌ Error al ejecutar")
+            body_lines.append(f"*{sym}* — \u274c Error al ejecutar")
 
     body = "\n\n".join(body_lines)
 
@@ -120,7 +170,7 @@ def _build_report(
     return f"{header}\n\n{body}{optimizer_section}{footer}"
 
 
-# ── Runner principal ─────────────────────────────────────────────────────────
+# ── Runner principal ─────────────────────────────────────────────────────────────
 async def run_backtest_now(
     notifier,
     symbols: Optional[list] = None,
@@ -131,15 +181,21 @@ async def run_backtest_now(
     """
     Ejecuta el backtester para cada símbolo y envía el informe a Telegram.
     Puede llamarse desde el scheduler o desde el comando /backtest de Telegram.
+
+    Los símbolos se resuelven en este orden:
+      1. Parámetro `symbols` explícito
+      2. Pares activos de active_traders (vía set_active_symbols_fn)
+      3. BACKTEST_SCHED_SYMBOLS del .env
+      4. Fallback mínimo BTC/ETH/SOL
     """
-    symbols   = symbols   or SCHED_SYMBOLS
+    resolved_symbols = _resolve_symbols(symbols)
     hist_days = hist_days or SCHED_HIST_DAYS
     optimize  = optimize  if optimize is not None else SCHED_OPTIMIZE
     folds     = folds     or SCHED_FOLDS
 
     await _send(notifier,
-        f"⏳ *Backtest iniciado*\n"
-        f"Símbolos: {', '.join(symbols)}\n"
+        f"\u23f3 *Backtest iniciado*\n"
+        f"Símbolos ({len(resolved_symbols)}): {', '.join(resolved_symbols)}\n"
         f"Modo: {'Optimizador Walk-Forward' if optimize else 'Backtest Simple'}\n"
         f"Histórico: {hist_days}d — esto puede tardar unos minutos..."
     )
@@ -153,7 +209,7 @@ async def run_backtest_now(
 
         bt = Backtester()
 
-        for sym in symbols:
+        for sym in resolved_symbols:
             try:
                 log.info("[backtest_sched] Ejecutando %s...", sym)
                 r = await bt.run(
@@ -164,32 +220,30 @@ async def run_backtest_now(
                 )
                 results.append(r)
                 if optimize and hasattr(r, 'top_params'):
-                    # Fusionamos los top_params de todos los símbolos
                     top_params = (top_params or []) + (r.top_params or [])
             except Exception as e:
                 log.error("[backtest_sched] Error en %s: %s", sym, e)
                 results.append(None)
 
-        # Ordenar top_params por Sharpe
         if top_params:
             top_params = sorted(top_params, key=lambda x: x.get('sharpe', 0), reverse=True)
 
     except ImportError:
         log.error("[backtest_sched] No se pudo importar Backtester — ¿rama correcta?")
-        await _send(notifier, "❌ *Backtest fallido* — módulo `backtester` no disponible.")
+        await _send(notifier, "\u274c *Backtest fallido* — módulo `backtester` no disponible.")
         return
     except Exception as e:
         log.error("[backtest_sched] Error inesperado: %s", e)
-        await _send(notifier, f"❌ *Backtest fallido*\n`{e}`")
+        await _send(notifier, f"\u274c *Backtest fallido*\n`{e}`")
         return
 
     elapsed = time.monotonic() - t0
-    report  = _build_report(symbols, results, hist_days, optimize, top_params, elapsed)
+    report  = _build_report(resolved_symbols, results, hist_days, optimize, top_params, elapsed)
     await _send(notifier, report)
     log.info("[backtest_sched] Informe enviado a Telegram (%.0fs)", elapsed)
 
 
-# ── Scheduler loop ────────────────────────────────────────────────────────────
+# ── Scheduler loop ──────────────────────────────────────────────────────────────
 class BacktestScheduler:
     """
     Corre como tarea asyncio en background.
@@ -198,7 +252,7 @@ class BacktestScheduler:
 
     def __init__(self, notifier) -> None:
         self._notifier  = notifier
-        self._last_run: float = 0.0   # timestamp POSIX de la última ejecución
+        self._last_run: float = 0.0
         self._task: Optional[asyncio.Task] = None
 
     def start(self) -> None:
@@ -221,17 +275,15 @@ class BacktestScheduler:
                 await asyncio.sleep(3600)  # comprobar cada hora
                 now = datetime.now(timezone.utc)
 
-                # ¿Es la hora correcta?
                 if now.hour != SCHED_HOUR:
                     continue
 
-                # ¿Han pasado suficientes días desde la última ejecución?
                 elapsed_days = (time.time() - self._last_run) / 86400
                 if elapsed_days < SCHED_DAYS:
                     continue
 
                 self._last_run = time.time()
-                log.info("[backtest_sched] 🚀 Lanzando backtest programado...")
+                log.info("[backtest_sched] \U0001f680 Lanzando backtest programado...")
                 await run_backtest_now(self._notifier)
 
             except asyncio.CancelledError:
