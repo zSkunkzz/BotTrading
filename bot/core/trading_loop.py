@@ -1,6 +1,12 @@
 """
 trading_loop.py — Loop principal de trading para un símbolo.
 
+FIX v19 (2026-06-07): PnL real en cierre externo + asyncio.ensure_future fix
+  - Cuando se detecta cierre externo, se intenta obtener el precio real
+    de fill via trader.get_last_fill_price(symbol) antes de usar el
+    precio de mercado actual. Fallback al precio de mercado si el método
+    no existe o falla. Esto da un PnL más preciso en notify_close.
+
 FIX v18 (2026-06-06): reentry_guard hook en cierre externo
   - Cuando se detecta que la posición fue cerrada externamente (exchange
     posición = 0 pero trader.position != None), se comprueba si el precio
@@ -159,6 +165,33 @@ def _is_sl_close(exit_price: float, sl_price, tolerance: float = _SL_CLOSE_TOLER
     if not sl_price or sl_price <= 0 or exit_price <= 0:
         return False
     return abs(exit_price - sl_price) / sl_price <= tolerance
+
+
+async def _get_exit_price(trader, symbol: str, fallback: float) -> float:
+    """
+    FIX v19: intenta obtener el precio real de fill del cierre via
+    trader.get_last_fill_price(symbol). Si el método no existe o falla,
+    devuelve el precio de mercado actual como fallback.
+    """
+    get_fill_fn = getattr(trader, "get_last_fill_price", None)
+    if callable(get_fill_fn):
+        try:
+            fill_price = await asyncio.wait_for(
+                get_fill_fn(symbol),
+                timeout=_GET_PRICE_TIMEOUT_S,
+            )
+            if fill_price and fill_price > 0:
+                logger.debug(
+                    "[%s] exit_price real (fill): %.6f (mercado: %.6f)",
+                    symbol, fill_price, fallback,
+                )
+                return round(float(fill_price), 6)
+        except Exception as e:
+            logger.debug(
+                "[%s] get_last_fill_price() error — usando precio de mercado: %s",
+                symbol, e,
+            )
+    return round(fallback, 6)
 
 
 class TradingLoop:
@@ -337,7 +370,9 @@ class TradingLoop:
                         entry_price  = trader.entry_price or price
                         leverage     = int(trader._open_leverage or trader.leverage or 1)
                         is_long      = closed_side == "long"
-                        exit_price   = round(price, 6)
+
+                        # FIX v19: intentar precio real de fill, fallback a precio de mercado
+                        exit_price = await _get_exit_price(trader, self.symbol, price)
 
                         pnl_pct = _calc_pnl_pct(entry_price, exit_price, is_long, leverage)
 

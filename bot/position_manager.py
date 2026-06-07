@@ -48,6 +48,11 @@ Fix qty=0 loop — _ensure_tpsl ahora verifica si la posición sigue abierta
 Fix BingX migration — _update_sl_to_be ahora usa BingXClient en lugar de
   OKXClient (el exchange migró a BingX). Usa trader._place_tpsl() directamente
   para mantener consistencia con el resto del sistema.
+
+Fix v19 — _reset_trader_position_state: reemplaza asyncio.ensure_future() por
+  asyncio.get_event_loop().create_task() con fallback a ensure_future() para
+  mayor robustez en contextos donde el loop puede no estar activo en el hilo
+  actual. Añade guard para evitar RuntimeError si no hay loop disponible.
 """
 from __future__ import annotations
 
@@ -582,6 +587,10 @@ def _reset_trader_position_state(trader, symbol: str) -> None:
     Limpia el estado de posición del trader cuando se detecta que la posición
     fue cerrada externamente (qty=0 pero el bot sigue creyendo que está abierta).
     Esto evita el loop infinito de ensure_tpsl / place_emergency_sl_tp.
+
+    FIX v19: usa asyncio.get_event_loop().create_task() en lugar de
+    asyncio.ensure_future() para mayor robustez. Añade guard contra
+    RuntimeError si no hay event loop disponible en el hilo actual.
     """
     log.warning(
         "[%s] Reseteando estado de posición (cerrada externamente): "
@@ -602,15 +611,21 @@ def _reset_trader_position_state(trader, symbol: str) -> None:
     if hasattr(trader, "_entry_price"):
         trader._entry_price = None
 
-    # Notificar por Telegram
+    # Notificar por Telegram de forma no bloqueante
     try:
-        import asyncio as _asyncio
         from bot.telegram_bot import send_message
-        _asyncio.ensure_future(
-            send_message(
-                f"⚠️ *Posición cerrada externamente detectada* `{symbol}`\n"
-                f"Estado limpiado. El bot ya no gestionará esta posición."
-            )
+        msg = (
+            f"⚠️ *Posición cerrada externamente detectada* `{symbol}`\n"
+            f"Estado limpiado. El bot ya no gestionará esta posición."
         )
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(send_message(msg))
+            else:
+                loop.run_until_complete(send_message(msg))
+        except RuntimeError:
+            # No hay event loop en este hilo — último recurso
+            asyncio.ensure_future(send_message(msg))
     except Exception:
         pass
