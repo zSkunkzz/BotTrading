@@ -10,13 +10,9 @@ logger = logging.getLogger("TelegramBot")
 
 _bot: Bot | None = None
 
-# Long-poll timeout enviado a Telegram (segundos que el servidor espera antes de
-# responder con lista vacía si no hay updates). El read_timeout del cliente HTTP
-# DEBE ser mayor para que httpx no corte la conexión antes de que Telegram responda.
 _POLL_TIMEOUT    = int(os.getenv("TG_POLL_TIMEOUT",    "30"))
-_HTTP_READ_TIMEOUT = int(os.getenv("TG_HTTP_READ_TIMEOUT", "45"))  # > _POLL_TIMEOUT
+_HTTP_READ_TIMEOUT = int(os.getenv("TG_HTTP_READ_TIMEOUT", "45"))
 
-# Flag pendiente de confirmación para /stop
 _STOP_PENDING: bool = False
 
 
@@ -66,7 +62,7 @@ async def notify_startup(pairs: list, dry_run: bool, top_n: int):
     await _send(
         f"\U0001f916 <b>TradingBot arrancado</b> \u2014 {mode}\n"
         f"Pares activos ({top_n}): <code>{pairs_str}</code>\n"
-        f"Comandos: /stop | /pause | /resume | /ksstatus | /resetks"
+        f"Comandos: /stop | /pause | /resume | /ksstatus | /resetks | /backtest"
     )
 
 
@@ -182,6 +178,14 @@ async def notify_kill_switch(level: int, trigger: str):
 
 _ALLOWED_CHAT: str = ""
 
+# Referencia al notifier para el comando /backtest (se inyecta desde main.py)
+_notifier = None
+
+def set_notifier(notifier) -> None:
+    """Inyecta el Notifier para que /backtest pueda enviar el informe."""
+    global _notifier
+    _notifier = notifier
+
 
 async def _handle_update(update: Update) -> None:
     msg = update.message
@@ -203,10 +207,12 @@ async def _handle_update(update: Update) -> None:
         await _cmd_pause(msg.chat_id)
     elif text.startswith("/resume"):
         await _cmd_resume(msg.chat_id)
+    elif text.startswith("/backtest"):
+        parts = text.split()
+        await _cmd_backtest(msg.chat_id, parts[1:])
 
 
 async def _cmd_ksstatus(chat_id: int | str) -> None:
-    """Muestra el estado actual del Kill Switch sin hacer nada."""
     from bot.kill_switch import kill_switch
     bot = _get_bot()
     if not bot:
@@ -236,10 +242,6 @@ async def _cmd_ksstatus(chat_id: int | str) -> None:
 
 
 async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
-    """
-    /resetks          — re-arma el Kill Switch completamente
-    /resetks daily    — resetea solo contadores diarios
-    """
     from bot.kill_switch import kill_switch
     bot = _get_bot()
     if not bot:
@@ -274,10 +276,6 @@ async def _cmd_resetks(chat_id: int | str, args: list[str]) -> None:
 
 
 async def _cmd_stop(chat_id: int | str, args: list[str]) -> None:
-    """
-    /stop          — Pide confirmación antes de parar el proceso.
-    /stop confirm  — Envía SIGTERM al proceso (graceful shutdown).
-    """
     global _STOP_PENDING
     bot = _get_bot()
     if not bot:
@@ -318,10 +316,6 @@ async def _cmd_stop(chat_id: int | str, args: list[str]) -> None:
 
 
 async def _cmd_pause(chat_id: int | str) -> None:
-    """
-    /pause — Activa KS L4 via hard_kill(): el bot deja de abrir y gestionar
-    órdenes pero el proceso sigue corriendo. Para reanudar: /resume
-    """
     from bot.kill_switch import kill_switch
     bot = _get_bot()
     if not bot:
@@ -344,10 +338,6 @@ async def _cmd_pause(chat_id: int | str) -> None:
 
 
 async def _cmd_resume(chat_id: int | str) -> None:
-    """
-    /resume — Re-arma el Kill Switch (alias de /resetks).
-    El bot vuelve a operar normalmente.
-    """
     from bot.kill_switch import kill_switch
     bot = _get_bot()
     if not bot:
@@ -371,6 +361,86 @@ async def _cmd_resume(chat_id: int | str) -> None:
     )
 
 
+async def _cmd_backtest(chat_id: int | str, args: list[str]) -> None:
+    """
+    /backtest                      — backtest simple con config por defecto
+    /backtest opt                  — activa el optimizador walk-forward
+    /backtest 180                  — backtest simple con 180 días de histórico
+    /backtest opt 180              — optimizador con 180 días
+    /backtest BTC/USDT:USDT 90     — símbolo concreto con 90 días
+    """
+    bot = _get_bot()
+    if not bot:
+        return
+
+    async def reply(text: str):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        except TelegramError as e:
+            logger.warning("[Telegram cmd_backtest] %s", e)
+
+    # Parseo de argumentos
+    optimize  = False
+    hist_days = None
+    symbols   = None
+
+    remaining = list(args)
+    if remaining and remaining[0].lower() in ("opt", "optimize", "optimizar"):
+        optimize = True
+        remaining.pop(0)
+
+    for token in remaining:
+        if "/" in token or ":" in token:
+            symbols = [token]
+        else:
+            try:
+                hist_days = int(token)
+            except ValueError:
+                pass
+
+    # Inyectar notifier si está disponible
+    notifier = _notifier
+    if notifier is None:
+        await reply(
+            "\u26a0\ufe0f El notifier no está inicializado. "
+            "Aseg\u00farate de que el bot est\u00e9 correctamente configurado."
+        )
+        return
+
+    await reply(
+        f"\u23f3 <b>Backtest lanzado</b>\n"
+        f"Modo: <b>{'Optimizador Walk-Forward' if optimize else 'Backtest Simple'}</b>\n"
+        + (f"S\u00edmbolos: <code>{', '.join(symbols)}</code>\n" if symbols else "")
+        + (f"Hist\u00f3rico: <code>{hist_days}d</code>\n" if hist_days else "")
+        + "El resultado llegar\u00e1 en unos minutos..."
+    )
+
+    # Lanzar en background para no bloquear el polling
+    asyncio.create_task(
+        _run_backtest_background(notifier, symbols, hist_days, optimize),
+        name="backtest_cmd",
+    )
+
+
+async def _run_backtest_background(notifier, symbols, hist_days, optimize) -> None:
+    """Wrapper que captura excepciones del backtest para que no maten el task."""
+    try:
+        from bot.backtest_scheduler import run_backtest_now
+        await run_backtest_now(
+            notifier=notifier,
+            symbols=symbols,
+            hist_days=hist_days,
+            optimize=optimize,
+        )
+    except Exception as e:
+        logger.error("[backtest_cmd] Error inesperado: %s", e)
+        try:
+            from bot.notifier import Notifier
+            await notifier.send(f"\u274c <b>Backtest fallido</b>\n<code>{e}</code>")
+        except Exception:
+            pass
+
+
 async def _polling_loop() -> None:
     bot = _get_bot()
     if not bot:
@@ -378,7 +448,7 @@ async def _polling_loop() -> None:
         return
     offset: int | None = None
     logger.info(
-        "[Telegram polling] Iniciado \u2014 escuchando /stop /pause /resume /resetks /ksstatus "
+        "[Telegram polling] Iniciado \u2014 escuchando /stop /pause /resume /resetks /ksstatus /backtest "
         "(poll_timeout=%ds read_timeout=%ds)",
         _POLL_TIMEOUT, _HTTP_READ_TIMEOUT,
     )
