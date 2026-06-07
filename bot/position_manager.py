@@ -44,6 +44,10 @@ Fix qty=0 loop — _ensure_tpsl ahora verifica si la posición sigue abierta
   en el exchange antes de intentar colocar SL/TP de emergencia. Si _open_qty
   es 0 o la posición ya no existe, limpia el estado del trader en lugar de
   entrar en un loop infinito de errores.
+
+Fix BingX migration — _update_sl_to_be ahora usa BingXClient en lugar de
+  OKXClient (el exchange migró a BingX). Usa trader._place_tpsl() directamente
+  para mantener consistencia con el resto del sistema.
 """
 from __future__ import annotations
 
@@ -233,8 +237,9 @@ class PositionManager:
         Cancela el SL antiguo y coloca uno nuevo en be_price.
         En dry_run solo logea.
 
-        BUG 1+2 FIX: usa OKXClient (via bot.core.okx_client) en lugar de
-        trader._hl_client que no existe en FuturesTrader OKX.
+        FIX BingX migration: usa trader._place_tpsl() directamente en lugar
+        de OKXClient (el exchange migró a BingX). Esto mantiene consistencia
+        con el resto del sistema y evita ImportError silencioso.
         """
         trader = self._trader
 
@@ -247,12 +252,13 @@ class PositionManager:
             log.warning("[%s] BE: qty=0 — no se puede colocar SL de BE.", symbol)
             return
 
-        # Obtener OKXClient (igual que ExecutionEngine)
-        try:
-            from bot.core.okx_client import OKXClient
-            client = await OKXClient.create(symbol)
-        except Exception as e:
-            log.error("[%s] BE: no se pudo obtener OKXClient: %s", symbol, e)
+        # Verificar que trader tiene _place_tpsl
+        place_tpsl_fn = getattr(trader, "_place_tpsl", None)
+        if not callable(place_tpsl_fn):
+            log.error(
+                "[%s] BE: trader no tiene _place_tpsl — no se puede colocar SL de BE.",
+                symbol,
+            )
             trader._tp1_be_done = False
             trader.sl = None
             return
@@ -260,50 +266,33 @@ class PositionManager:
         entry_price = getattr(trader, "entry_price", be_price)
         tp1 = getattr(trader, "tp1", None)
 
-        # 1. Cancelar SL/TP anteriores
+        # 1. Colocar SL nuevo en BE (cancela el anterior internamente via _place_tpsl)
         try:
-            cancelled = await asyncio.to_thread(client.cancel_all_open_tpsl)
-            log.info("[%s] BE: %d algo order(s) canceladas.", symbol, len(cancelled) if cancelled else 0)
-        except Exception as e:
-            log.warning("[%s] BE: no se pudo cancelar algo orders: %s", symbol, e)
-
-        # 2. Colocar SL nuevo en BE
-        try:
-            result = await asyncio.to_thread(
-                client.place_sl,
-                is_buy=not is_long,   # cierre = lado opuesto a la posición
-                sz=open_qty,
-                trigger_px=be_price,
-                entry_px=entry_price,
+            await place_tpsl_fn(
+                qty=open_qty,
+                sl_price=be_price,
+                tp_price=None,
+                is_long=is_long,
+                reduce_only=True,
             )
-            if result and result.get("code") == "0":
-                log.info("[%s] BE: SL colocado en entrada (%.4f).", symbol, be_price)
-            else:
-                err = (result or {}).get("msg", "error desconocido")
-                raise RuntimeError(err)
+            log.info("[%s] BE: SL colocado en entrada (%.4f).", symbol, be_price)
         except Exception as e:
             log.error("[%s] BE: error colocando SL en BE: %s", symbol, e)
             trader._tp1_be_done = False
             trader.sl = None
             return
 
-        # 3. Recolocar TP1 (cancel_all_open_tpsl lo borró también)
+        # 2. Recolocar TP1 si existe
         if tp1 and tp1 > 0:
-            tp_limit = tp1  # TP como limit (misma lógica que ExecutionEngine)
             try:
-                result = await asyncio.to_thread(
-                    client.place_tp,
-                    is_buy=not is_long,
-                    sz=open_qty,
-                    trigger_px=tp1,
-                    limit_px=tp_limit,
-                    entry_px=entry_price,
+                await place_tpsl_fn(
+                    qty=open_qty,
+                    sl_price=None,
+                    tp_price=tp1,
+                    is_long=is_long,
+                    reduce_only=True,
                 )
-                if result and result.get("code") == "0":
-                    log.info("[%s] BE: TP1 recolocado en %.4f.", symbol, tp1)
-                else:
-                    err = (result or {}).get("msg", "error desconocido")
-                    log.warning("[%s] BE: TP1 rechazado: %s", symbol, err)
+                log.info("[%s] BE: TP1 recolocado en %.4f.", symbol, tp1)
             except Exception as e:
                 log.warning("[%s] BE: error recolocando TP1: %s", symbol, e)
 
