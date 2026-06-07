@@ -33,8 +33,17 @@ FEAT BE (Break-Even) — Cuando el precio se aleja de la entrada un porcentaje
     BE_TRIGGER_PCT  (default 0.4) — % del recorrido entry→TP1 necesario para activar
     BE_OFFSET_PCT   (default 0.0) — offset sobre entry (0 = BE exacto, >0 = pequeño beneficio)
   El BE solo se activa una vez por posición (_tp1_be_done). Una vez activado,
-  cancela TODAS las órdenes SL/TP activas del exchange antes de recolocar
-  el nuevo SL en BE + el TP1 original, evitando duplicados en BingX.
+  cancela SOLO las órdenes de tipo SL antes de recolocar el nuevo SL en BE.
+  El TP1 original NO se toca — sigue activo en el exchange sin recolocarse,
+  evitando duplicados.
+
+v26 — Fix BE sin duplicar TP:
+  1. _update_sl_to_be ya NO cancela el TP activo ni lo recoloca.
+     Solo cancela órdenes SL y coloca el nuevo SL en BE.
+     Esto evita el bug de TP duplicado cuando cancel_all_orders tiene latencia.
+  2. _cancel_sl_orders(): nuevo helper que cancela SOLO las órdenes de tipo SL
+     (en lugar de cancel_all_orders que también mataba el TP único).
+  3. _cancel_all_tpsl_orders() se mantiene para otros usos (limpieza total).
 
 v25 — Fix SL/TP único y BE robusto:
   1. _ensure_tpsl y _place_emergency_sl_tp usan solo trader.tp1.
@@ -220,13 +229,15 @@ class PositionManager:
 
     async def _update_sl_to_be(self, be_price: float, is_long: bool, symbol: str) -> None:
         """
-        Cancela todas las órdenes SL/TP pendientes y recoloca SL en BE + TP1.
+        v26: Cancela SOLO las órdenes SL pendientes y recoloca el SL en BE.
+        El TP1 activo en el exchange NO se toca — sigue vigente sin recolocarse,
+        evitando el bug de TP duplicado.
         En dry_run solo logea.
         """
         trader = self._trader
 
         if getattr(trader, "dry_run", True):
-            log.info("[%s] DRY_RUN: BE SL=%.4f omitido.", symbol, be_price)
+            log.info("[%s] DRY_RUN: BE SL=%.4f (TP1 sin tocar).", symbol, be_price)
             return
 
         open_qty = _round_qty_safe(trader, getattr(trader, "_open_qty", 0.0) or 0.0)
@@ -241,35 +252,22 @@ class PositionManager:
             trader.sl = None
             return
 
-        tp1 = getattr(trader, "tp1", None)   # v25: solo tp1
+        # 1. Cancelar SOLO las órdenes SL pendientes (el TP queda intacto)
+        await self._cancel_sl_orders(symbol)
 
-        # 1. Cancelar todas las órdenes SL/TP pendientes (evita duplicados)
-        await self._cancel_all_tpsl_orders(symbol)
-
-        # 2. Colocar SL en BE
+        # 2. Colocar nuevo SL en BE (solo SL, tp_price=None)
         try:
             await place_tpsl_fn(
                 qty=open_qty, sl_price=be_price, tp_price=None,
                 is_long=is_long, reduce_only=True,
             )
-            log.info("[%s] BE: SL colocado en entrada (%.4f).", symbol, be_price)
-            trader.sl = be_price   # v25: sincronizar estado en memoria
+            log.info("[%s] BE: SL movido a entrada (%.4f). TP1 sin cambios.", symbol, be_price)
+            trader.sl = be_price   # sincronizar estado en memoria
         except Exception as e:
             log.error("[%s] BE: error colocando SL en BE: %s", symbol, e)
             trader._tp1_be_done = False
             trader.sl = None
             return
-
-        # 3. Recolocar TP1 (único TP activo — v23/v25)
-        if tp1 and tp1 > 0:
-            try:
-                await place_tpsl_fn(
-                    qty=open_qty, sl_price=None, tp_price=tp1,
-                    is_long=is_long, reduce_only=True,
-                )
-                log.info("[%s] BE: TP1 recolocado en %.4f.", symbol, tp1)
-            except Exception as e:
-                log.warning("[%s] BE: error recolocando TP1: %s", symbol, e)
 
         trader._protection_ok = True
 
@@ -283,7 +281,58 @@ class PositionManager:
         except Exception:
             pass
 
+    async def _cancel_sl_orders(self, symbol: str) -> None:
+        """
+        v26: Cancela SOLO las órdenes de tipo SL pendientes para este símbolo.
+        No toca los TP activos. Esto evita el bug de TP duplicado al activar BE.
+        """
+        trader = self._trader
+        bingx  = getattr(trader, "_bingx_client", None)
+
+        if bingx is None:
+            log.debug("[%s] _cancel_sl_orders: sin cliente BingX — skip.", symbol)
+            return
+
+        get_trigger_fn = getattr(trader, "_get_open_trigger_orders_raw", None)
+        cancel_fn_name = None
+        for fn_name in ("cancel_order", "cancel_algo_order", "cancel_trigger_order"):
+            if hasattr(bingx, fn_name) and callable(getattr(bingx, fn_name)):
+                cancel_fn_name = fn_name
+                break
+
+        if not callable(get_trigger_fn) or cancel_fn_name is None:
+            log.warning("[%s] _cancel_sl_orders: no se puede cancelar SL individual — skip.", symbol)
+            return
+
+        try:
+            orders = await get_trigger_fn() or []
+        except Exception as e:
+            log.warning("[%s] _cancel_sl_orders: no se pudo listar trigger orders: %s", symbol, e)
+            return
+
+        cancel_fn = getattr(bingx, cancel_fn_name)
+        cancelled = 0
+        for order in orders:
+            # Solo cancelar órdenes identificadas como SL
+            if _get_tpsl_type(order) != "sl":
+                continue
+            order_id = order.get("orderId") or order.get("algoId") or order.get("id")
+            if not order_id:
+                continue
+            try:
+                await asyncio.to_thread(cancel_fn, order_id)
+                cancelled += 1
+                log.debug("[%s] SL cancelado: id=%s", symbol, order_id)
+            except Exception as e:
+                log.debug("[%s] _cancel_sl_orders: error cancelando %s: %s", symbol, order_id, e)
+        log.info("[%s] BE: %d orden(es) SL cancelada(s) (TP intacto).", symbol, cancelled)
+
     async def _cancel_all_tpsl_orders(self, symbol: str) -> None:
+        """
+        Cancela TODAS las órdenes SL+TP pendientes.
+        Mantenido para uso en limpieza total (close_position, emergencias).
+        NO se usa en el flujo de BE (usa _cancel_sl_orders en su lugar).
+        """
         trader = self._trader
         bingx  = getattr(trader, "_bingx_client", None)
 
@@ -296,13 +345,13 @@ class PositionManager:
                 result = await asyncio.to_thread(bingx.cancel_all_orders)
                 code = (result or {}).get("code", -1)
                 if code in (0, "0", None):
-                    log.info("[%s] BE: todas las órdenes canceladas (cancel_all_orders).", symbol)
+                    log.info("[%s] Todas las órdenes canceladas (cancel_all_orders).", symbol)
                 else:
-                    log.warning("[%s] BE: cancel_all_orders código %s: %s",
+                    log.warning("[%s] cancel_all_orders código %s: %s",
                                 symbol, code, (result or {}).get("msg", ""))
                 return
             except Exception as e:
-                log.warning("[%s] BE: cancel_all_orders falló (%s) — intentando individual.", symbol, e)
+                log.warning("[%s] cancel_all_orders falló (%s) — intentando individual.", symbol, e)
 
         get_trigger_fn = getattr(trader, "_get_open_trigger_orders_raw", None)
         cancel_fn_name = None
@@ -312,13 +361,13 @@ class PositionManager:
                 break
 
         if not callable(get_trigger_fn) or cancel_fn_name is None:
-            log.warning("[%s] BE: no se puede cancelar órdenes individuales — skip.", symbol)
+            log.warning("[%s] _cancel_all_tpsl_orders: no se puede cancelar órdenes individuales — skip.", symbol)
             return
 
         try:
             orders = await get_trigger_fn() or []
         except Exception as e:
-            log.warning("[%s] BE: no se pudo listar trigger orders: %s", symbol, e)
+            log.warning("[%s] _cancel_all_tpsl_orders: no se pudo listar trigger orders: %s", symbol, e)
             return
 
         cancel_fn = getattr(bingx, cancel_fn_name)
@@ -331,8 +380,8 @@ class PositionManager:
                 await asyncio.to_thread(cancel_fn, order_id)
                 cancelled += 1
             except Exception as e:
-                log.debug("[%s] BE: error cancelando orden %s: %s", symbol, order_id, e)
-        log.info("[%s] BE: %d orden(es) cancelada(s).", symbol, cancelled)
+                log.debug("[%s] error cancelando orden %s: %s", symbol, order_id, e)
+        log.info("[%s] %d orden(es) cancelada(s).", symbol, cancelled)
 
     # ── Check SL por software ───────────────────────────────────────────────────
 
