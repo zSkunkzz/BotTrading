@@ -2,6 +2,12 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v25 — Persistencia BE y restauración tras restart (2026-06-07):
+  - load_position importado para restaurar _tp1_be_done en __init__.
+  - save_position guarda be_done=False al abrir posición.
+  - Al arrancar el bot, si be_done=True en state, _tp1_be_done=True
+    evita que el BE se dispare dos veces tras un restart.
+
 v24 — Rebase automático de niveles al precio de mercado (2026-06-07):
   - _check_price_staleness() ELIMINADO. Ya no cancela órdenes por drift.
   - _rebase_signal_to_market(): nueva función que sustituye signal["entry"]
@@ -53,7 +59,7 @@ from typing import Callable, Optional
 
 from bot.core.trading_loop import TradingLoop
 from bot.ohlcv_cache import ohlcv_cache
-from bot.state import save_position
+from bot.state import save_position, load_position
 
 logger = logging.getLogger("FuturesTrader")
 
@@ -242,6 +248,18 @@ class FuturesTrader:
 
         self._stopped_event = asyncio.Event()
         self._trading_loop  = TradingLoop(symbol)
+
+        # v25: restaurar _tp1_be_done desde state persistido (evita doble BE tras restart)
+        try:
+            _saved = load_position(self.symbol)
+            if _saved and _saved.get("be_done", False):
+                self._tp1_be_done = True
+                logger.info(
+                    "[%s] BE ya activado en sesión anterior — restaurado desde state.",
+                    self.symbol,
+                )
+        except Exception:
+            pass
 
     # ── Interfaz pública ──────────────────────────────────────────────────────────────────
 
@@ -683,6 +701,7 @@ class FuturesTrader:
                 qty=qty,
                 usdc_amount=usdc_per_trade,
                 leverage=leverage,
+                be_done=False,
             )
             logger.info(
                 "[%s] [DRY-RUN] Posición simulada: %s @ %.4f (qty=%.6f) | "
@@ -847,6 +866,7 @@ class FuturesTrader:
             qty=qty,
             usdc_amount=usdc_per_trade,
             leverage=leverage,
+            be_done=False,
         )
 
         logger.info(
