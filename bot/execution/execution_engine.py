@@ -7,7 +7,8 @@ Flujo de apertura:
   3. Intentar limit agresiva si spread <= umbral y depth suficiente
   4. Si llena: colocar SL + TP via place_sl() / place_tp() del BingXClient
   5. Si no llena en timeout: cancelar → fallback market + SL/TP
-  6. Registrar telemetría
+  6. Si el SL no se coloca tras todos los reintentos → cerrar la posición (NUEVO)
+  7. Registrar telemetría
 
 Respuestas normalizadas (BingXClient convierte al formato OKX internamente):
   place_order  → {"code":"0", "data":[{"ordId":"...","sCode":"0"}]}
@@ -51,7 +52,7 @@ def _e(key: str, default: float) -> float:
     return float(os.getenv(key, str(default)))
 
 
-# ── Helpers de respuesta (formato normalizado OKX-compatible) ────────────────
+# ── Helpers de respuesta (formato normalizado OKX-compatible) ──────────────────────────────
 
 def _okx_ok(resp: dict) -> bool:
     if not resp or resp.get("code") != "0":
@@ -92,7 +93,7 @@ def _okx_algo_id(resp: dict) -> Optional[str]:
     return None
 
 
-# ── TradeRecord ─────────────────────────────────────────────────────────────
+# ── TradeRecord ────────────────────────────────────────────────────────────────────
 
 @dataclass
 class TradeRecord:
@@ -113,7 +114,7 @@ class TradeRecord:
 _MAX_RECORDS_PER_SYMBOL = int(os.getenv("EE_MAX_RECORDS_PER_SYMBOL", "500"))
 
 
-# ── ExecutionEngine ─────────────────────────────────────────────────────────
+# ── ExecutionEngine ───────────────────────────────────────────────────────────────────
 
 class ExecutionEngine:
     """
@@ -122,6 +123,7 @@ class ExecutionEngine:
       - Coloca TP y SL como TAKE_PROFIT_MARKET / STOP_MARKET via place_sl() / place_tp()
       - TP/SL sobreviven reinicios del bot (persisten en el exchange)
       - NUNCA abre una posición sin SL y TP válidos
+      - FIX: si el SL no se coloca tras todos los reintentos → cierra la posición
     """
 
     def __init__(self) -> None:
@@ -142,7 +144,7 @@ class ExecutionEngine:
             self._clients[symbol] = await BingXClient.create(symbol)
         return self._clients[symbol]
 
-    # ── UTILIDADES ──────────────────────────────────────────────────────
+    # ── UTILIDADES ─────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _round_qty(qty: float, sz_decimals: int) -> float:
@@ -189,7 +191,7 @@ class ExecutionEngine:
             raise last_exc
         return {"status": "error", "response": "unknown"}
 
-    # ── EXECUTE PRINCIPAL ───────────────────────────────────────────────
+    # ── EXECUTE PRINCIPAL ────────────────────────────────────────────────────────
 
     async def execute(
         self,
@@ -212,7 +214,7 @@ class ExecutionEngine:
 
         is_buy = side in ("buy", "long")
 
-        # ── GUARDIA DURA: NUNCA abrir sin SL y TP ─────────────────────
+        # ── GUARDIA DURA: NUNCA abrir sin SL y TP ───────────────────────────────
         if trade_side == "open" and not reduce_only:
             missing = []
             if not sl or sl <= 0:
@@ -292,15 +294,63 @@ class ExecutionEngine:
             rec.fill_price      = arrival_price
             rec.cancel_reason   = reason
 
-        # ── Colocar SL + TP tras entrada confirmada ──────────────────
+        # ── Colocar SL + TP tras entrada confirmada ──────────────────────────────
         if entry_ok and not reduce_only and trade_side == "open":
+            # FIX: reset _protection_ok al abrir para que _ensure_tpsl
+            # no omita la verificación de la nueva posición
+            trader._protection_ok = False
+
             effective_entry_px = entry_px if (entry_px and entry_px > 0) else arrival_price
-            await self._place_tpsl(client, is_buy, qty, sl, tp, sym, effective_entry_px)
+            sl_placed = await self._place_tpsl(
+                client, is_buy, qty, sl, tp, sym, effective_entry_px
+            )
+
+            # FIX CRITICO: si el SL no se pudo colocar, cerrar la posición
+            # inmediatamente para no quedar expuestos sin protección
+            if not sl_placed:
+                logger.error(
+                    "[%s] 🚨 SL NO colocado — cerrando posición para evitar exposición sin stop loss",
+                    sym,
+                )
+                try:
+                    close_fn = getattr(trader, "close_position", None) or getattr(trader, "_close_position", None)
+                    if callable(close_fn):
+                        await close_fn(reason="NO_SL")
+                    else:
+                        # Fallback directo al exchange
+                        await self._place_market_with_retry(
+                            client, not is_buy, qty, True, arrival_price, sym
+                        )
+                    logger.warning("[%s] Posición cerrada preventivamente por falta de SL.", sym)
+                    result = {"status": "error", "response": "position closed: SL placement failed"}
+                except Exception as close_exc:
+                    logger.critical(
+                        "[%s] ❌❌ FALLO CRITICO: no se pudo colocar SL NI cerrar la posición: %s",
+                        sym, close_exc,
+                    )
+                    result = {"status": "error", "response": f"CRITICAL: no SL and close failed: {close_exc}"}
+
+                # Notificar por Telegram
+                try:
+                    from bot.telegram_bot import send_message
+                    await send_message(
+                        f"🚨 *ALERTA CRÍTICA* `{sym}`\n"
+                        f"SL no pudo colocarse en BingX tras {self.tpsl_retry_attempts} intentos.\n"
+                        f"Posición cerrada preventivamente."
+                    )
+                except Exception:
+                    pass
+
+                self._finalize_rec(rec, result, side, arrival_price)
+                return result
+
+            # SL colocado correctamente
+            trader._protection_ok = True
 
         self._finalize_rec(rec, result, side, arrival_price)
         return result
 
-    # ── SL + TP ─────────────────────────────────────────────────────────────
+    # ── SL + TP ───────────────────────────────────────────────────────────────────────
 
     async def _place_tpsl(
         self,
@@ -311,10 +361,17 @@ class ExecutionEngine:
         tp: Optional[float],
         sym: str,
         entry_px: Optional[float] = None,
-    ) -> None:
-        # ── SL ────────────────────────────────────────────────────────
+    ) -> bool:
+        """
+        Coloca SL y TP en BingX.
+        Devuelve True si el SL fue colocado con éxito (requisito crítico),
+        False si falló tras todos los reintentos.
+        """
+        sl_placed = False
+        tp_placed = False
+
+        # ── SL ─────────────────────────────────────────────────────────────────────
         if sl is not None and sl > 0:
-            sl_placed = False
             for attempt in range(self.tpsl_retry_attempts):
                 if attempt > 0:
                     delay = self.tpsl_retry_base_delay * (2 ** (attempt - 1))
@@ -339,26 +396,28 @@ class ExecutionEngine:
                     err = _okx_error_msg(result)
                     if any(s in err.lower() for s in _RATE_LIMIT_SUBSTRS):
                         logger.warning("[%s] SL rate-limited: %s", sym, err)
-                        continue
-                    logger.error("[%s] ❌ SL rechazado por BingX: %s", sym, err)
+                        continue  # reintentar
+                    # Error definitivo (precio inválido, qty, etc.) — no reintentar
+                    logger.error("[%s] ❌ SL rechazado por BingX (definitivo): %s", sym, err)
                     break
                 except Exception as e:
                     if any(s in str(e).lower() for s in _RATE_LIMIT_SUBSTRS):
                         logger.warning("[%s] SL rate-limit exception: %s", sym, e)
-                        continue
-                    logger.error("[%s] ❌ SL exception: %s", sym, e)
+                        continue  # reintentar
+                    logger.error("[%s] ❌ SL exception (definitiva): %s", sym, e)
                     break
 
             if not sl_placed:
                 logger.error(
-                    "[%s] ❌ SL NO colocado tras %d intentos — POSICIÓN SIN STOP LOSS",
+                    "[%s] 🚨 SL NO colocado tras %d intentos — SE CERRARÁ LA POSICIÓN",
                     sym, self.tpsl_retry_attempts,
                 )
+                # Devolvemos False para que execute() gestione el cierre
+                return False
 
-        # ── TP ────────────────────────────────────────────────────────
+        # ── TP (no crítico: se loguea si falla pero no cierra la posición) ─────────
         if tp is not None and tp > 0:
-            tp_placed = False
-            tp_limit  = tp if self.tp_as_limit else None
+            tp_limit = tp if self.tp_as_limit else None
 
             for attempt in range(self.tpsl_retry_attempts):
                 if attempt > 0:
@@ -386,22 +445,24 @@ class ExecutionEngine:
                     if any(s in err.lower() for s in _RATE_LIMIT_SUBSTRS):
                         logger.warning("[%s] TP rate-limited: %s", sym, err)
                         continue
-                    logger.error("[%s] ❌ TP rechazado por BingX: %s", sym, err)
+                    logger.error("[%s] ❌ TP rechazado por BingX (definitivo): %s", sym, err)
                     break
                 except Exception as e:
                     if any(s in str(e).lower() for s in _RATE_LIMIT_SUBSTRS):
                         logger.warning("[%s] TP rate-limit exception: %s", sym, e)
                         continue
-                    logger.error("[%s] ❌ TP exception: %s", sym, e)
+                    logger.error("[%s] ❌ TP exception (definitiva): %s", sym, e)
                     break
 
             if not tp_placed:
                 logger.error(
-                    "[%s] ❌ TP NO colocado tras %d intentos",
+                    "[%s] ⚠️ TP NO colocado tras %d intentos — SL activo, posición protegida.",
                     sym, self.tpsl_retry_attempts,
                 )
 
-    # ── LIMIT INTERNO ──────────────────────────────────────────────────────
+        return sl_placed
+
+    # ── LIMIT INTERNO ────────────────────────────────────────────────────────────────────
 
     async def _try_limit(
         self,
@@ -458,7 +519,7 @@ class ExecutionEngine:
 
         return {"status": "ok" if filled else "error", "response": raw}, filled
 
-    # ── TELEMETRÍA ─────────────────────────────────────────────────────────
+    # ── TELEMETRÍA ────────────────────────────────────────────────────────────────────
 
     def _finalize_rec(self, rec: TradeRecord, result: dict, side: str, arrival_price: float) -> None:
         rec.fill_latency_ms = (time.monotonic() - rec._t0) * 1000
