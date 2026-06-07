@@ -2,21 +2,17 @@
 """
 backtest_scheduler.py — Scheduler automático del backtester completo
 
-Ejecuta el backtester con optimizador walk-forward cada N días y envía
-un informe detallado a Telegram.
-
-También expone `run_backtest_now()` para que el bot de Telegram lo
-lance manualmente via /backtest.
+Ejecuta el backtester cada N días y envía un informe a Telegram.
+También expone `run_backtest_now()` para el comando /backtest.
 
 Variables de entorno:
   BACKTEST_SCHED_ENABLED   → true/false (default: true)
   BACKTEST_SCHED_DAYS      → cada cuántos días ejecutar (default: 7)
   BACKTEST_SCHED_HOUR      → hora UTC de ejecución (default: 3)
-  BACKTEST_SCHED_SYMBOLS   → lista separada por comas — OPCIONAL: si no se
-                             define, se usan los pares activos del bot.
-  BACKTEST_SCHED_HIST_DAYS → días de histórico a usar (default: 90)
-  BACKTEST_SCHED_OPTIMIZE  → true/false — activar optimizador walk-forward (default: false)
-  BACKTEST_SCHED_FOLDS     → número de folds para el optimizador (default: 3)
+  BACKTEST_SCHED_SYMBOLS   → lista separada por comas (opcional, fallback)
+  BACKTEST_SCHED_TF        → timeframe a usar (default: 15m)
+  BACKTEST_SCHED_HIST_DAYS → días de histórico (default: 90)
+  BACKTEST_SCHED_LEVERAGE  → leverage para el backtest (default: 5)
 """
 from __future__ import annotations
 
@@ -29,34 +25,24 @@ from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────
 SCHED_ENABLED   = os.getenv("BACKTEST_SCHED_ENABLED",  "true").lower() == "true"
 SCHED_DAYS      = int(os.getenv("BACKTEST_SCHED_DAYS",     "7"))
-SCHED_HOUR      = int(os.getenv("BACKTEST_SCHED_HOUR",     "3"))   # UTC
+SCHED_HOUR      = int(os.getenv("BACKTEST_SCHED_HOUR",     "3"))
+SCHED_TF        = os.getenv("BACKTEST_SCHED_TF",          "15m")
 SCHED_HIST_DAYS = int(os.getenv("BACKTEST_SCHED_HIST_DAYS", "90"))
-SCHED_OPTIMIZE  = os.getenv("BACKTEST_SCHED_OPTIMIZE",  "false").lower() == "true"
-SCHED_FOLDS     = int(os.getenv("BACKTEST_SCHED_FOLDS",    "3"))
+SCHED_LEVERAGE  = int(os.getenv("BACKTEST_SCHED_LEVERAGE",  "5"))
 
-# Lista estática OPCIONAL — solo se usa si BACKTEST_SCHED_SYMBOLS está definida
-# en el .env Y no hay pares activos disponibles (fallback).
 _SCHED_SYMBOLS_ENV: Optional[list[str]] = (
     [s.strip() for s in os.getenv("BACKTEST_SCHED_SYMBOLS", "").split(",") if s.strip()]
     or None
 )
 
-# Función inyectable desde main.py para obtener los pares activos en tiempo real.
-# Se asigna con set_active_symbols_fn() al arrancar el bot.
 _get_active_symbols: Optional[Callable[[], list[str]]] = None
 
 
 def set_active_symbols_fn(fn: Callable[[], list[str]]) -> None:
-    """
-    Registra la función que devuelve los símbolos activos del bot.
-    Llamar desde main.py tras inicializar active_traders:
-
-        from bot.backtest_scheduler import set_active_symbols_fn
-        set_active_symbols_fn(lambda: list(active_traders.keys()))
-    """
+    """Registrar la función que devuelve los pares activos del bot en tiempo real."""
     global _get_active_symbols
     _get_active_symbols = fn
     log.info("[backtest_sched] Función de símbolos activos registrada.")
@@ -64,192 +50,153 @@ def set_active_symbols_fn(fn: Callable[[], list[str]]) -> None:
 
 def _resolve_symbols(override: Optional[list[str]] = None) -> list[str]:
     """
-    Resuelve qué símbolos usar en este orden de prioridad:
-      1. override explícito (pasado al llamar run_backtest_now)
-      2. active_traders en tiempo real (vía _get_active_symbols)
-      3. BACKTEST_SCHED_SYMBOLS del .env (lista estática de fallback)
-      4. Lista mínima de fallback si todo lo demás falla
+    Orden de prioridad:
+      1. override explícito (/backtest BTC/USDT:USDT)
+      2. active_traders en tiempo real
+      3. BACKTEST_SCHED_SYMBOLS del .env
+      4. Fallback mínimo
     """
     if override:
         return override
-
     if _get_active_symbols is not None:
         live = _get_active_symbols()
         if live:
-            log.info("[backtest_sched] Símbolos tomados de active_traders: %s", live)
+            log.info("[backtest_sched] Símbolos de active_traders: %s", live)
             return live
-        log.warning("[backtest_sched] active_traders vacío — intentando fallback...")
-
+        log.warning("[backtest_sched] active_traders vacío — usando fallback")
     if _SCHED_SYMBOLS_ENV:
-        log.info("[backtest_sched] Usando BACKTEST_SCHED_SYMBOLS del .env: %s", _SCHED_SYMBOLS_ENV)
         return _SCHED_SYMBOLS_ENV
-
     fallback = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
-    log.warning("[backtest_sched] Sin símbolos configurados — usando fallback: %s", fallback)
+    log.warning("[backtest_sched] Usando fallback mínimo: %s", fallback)
     return fallback
 
 
 # ── Telegram helper ──────────────────────────────────────────────────
 async def _send(notifier, text: str) -> None:
-    """Envía mensaje partiendo el texto si supera el límite de Telegram (4096 chars)."""
     MAX = 4000
     for i in range(0, len(text), MAX):
         await notifier.send(text[i:i + MAX])
         await asyncio.sleep(0.3)
 
 
-# ── Formateadores ─────────────────────────────────────────────────────────
-def _fmt_result(symbol: str, r) -> str:
-    """Formatea un BacktestResult en una línea compacta para Telegram."""
-    wr  = f"{r.win_rate * 100:.1f}%"  if r.trades else "—"
-    pnl = f"{r.gross_pnl:+.2f}%"    if r.trades else "—"
-    pf  = f"{r.profit_factor:.2f}"   if r.trades else "—"
-    dd  = f"{r.max_dd:.2f}%"         if r.trades else "—"
-    shr = f"{r.sharpe:.2f}"          if hasattr(r, 'sharpe') and r.trades else "—"
+# ── Formateador ──────────────────────────────────────────────────────────
+def _fmt_result(r) -> str:
+    """
+    Adapta BacktestResult real de bot/backtester.py.
+    Propiedades disponibles: .symbol .timeframe .n_days .n_trades
+    .win_rate (%) .total_pnl .avg_pnl .max_dd .profit_factor .expectancy
+    """
+    if r.n_trades == 0:
+        return f"*{r.symbol}*\n  Sin trades en el período"
+
+    wr  = f"{r.win_rate:.1f}%"
+    pnl = f"{r.total_pnl:+.2f}%"
+    pf  = f"{r.profit_factor:.2f}" if r.profit_factor != float('inf') else "∞"
+    dd  = f"{r.max_dd:.2f}%"
+    exp = f"{r.expectancy:+.2f}%"
+
     return (
-        f"*{symbol}*\n"
-        f"  Trades: {r.trades} · WR: {wr} · PnL: {pnl}\n"
-        f"  PF: {pf} · MaxDD: {dd} · Sharpe: {shr}"
+        f"*{r.symbol}* ({r.timeframe})\n"
+        f"  Trades: {r.n_trades} · WR: {wr} · PnL: {pnl}\n"
+        f"  PF: {pf} · MaxDD: {dd} · Exp: {exp}/trade"
     )
 
 
-def _fmt_optimizer_top(top_params: list) -> str:
-    """Formatea el top-3 del optimizador walk-forward."""
-    if not top_params:
-        return ""
-    lines = ["\n\U0001f4ca *Top 3 parámetros (Walk-Forward)*"]
-    for i, p in enumerate(top_params[:3], 1):
-        lines.append(
-            f"  #{i} Score≥{p['min_score']} · RR≥{p['min_rr']} · "
-            f"Ratio≥{p['min_ratio']:.2f} → Sharpe {p['sharpe']:.2f} · "
-            f"WR {p['wr']*100:.0f}%"
-        )
-    best = top_params[0]
-    lines += [
-        "",
-        "\U0001f4cc *Configuración recomendada:*",
-        f"  `MIN_SIGNAL_SCORE={best['min_score']}`",
-        f"  `MIN_RR_REQUIRED={best['min_rr']}`",
-        f"  `MIN_SCORE_RATIO={best['min_ratio']}`",
-    ]
-    return "\n".join(lines)
-
-
-def _build_report(
-    symbols: list,
-    results: list,
-    hist_days: int,
-    optimized: bool,
-    top_params: Optional[list],
-    elapsed: float,
-) -> str:
+def _build_report(symbols, results, hist_days, tf, elapsed) -> str:
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    icon = "\U0001f52c" if optimized else "\U0001f4c8"
-    mode = "Optimizador Walk-Forward" if optimized else "Backtest Simple"
+    ok  = sum(1 for r in results if r is not None and not isinstance(r, Exception))
+    err = len(results) - ok
 
     header = (
-        f"{icon} *{mode} — {now_str}*\n"
-        f"Símbolos ({len(symbols)}): {', '.join(symbols)}\n"
-        f"Histórico: {hist_days}d · Tiempo: {elapsed:.0f}s\n"
-        f"{─ * 30}"
+        f"\U0001f4c8 *Backtest — {now_str}*\n"
+        f"Símbolos: {ok} OK"
+        + (f" / {err} error" if err else "") +
+        f" · TF: {tf} · Hist: {hist_days}d · {elapsed:.0f}s\n"
+        f"{'\u2500' * 32}"
     )
 
     body_lines = []
     for sym, r in zip(symbols, results):
         if r is not None and not isinstance(r, Exception):
-            body_lines.append(_fmt_result(sym, r))
+            body_lines.append(_fmt_result(r))
+        elif isinstance(r, Exception):
+            body_lines.append(f"*{sym}* — \u274c `{r}`")
         else:
-            body_lines.append(f"*{sym}* — \u274c Error al ejecutar")
-
-    body = "\n\n".join(body_lines)
-
-    optimizer_section = _fmt_optimizer_top(top_params) if optimized and top_params else ""
+            body_lines.append(f"*{sym}* — \u274c Error desconocido")
 
     footer = "\n\n_Generado automáticamente por BotTrading_"
+    return f"{header}\n\n" + "\n\n".join(body_lines) + footer
 
-    return f"{header}\n\n{body}{optimizer_section}{footer}"
 
-
-# ── Runner principal ─────────────────────────────────────────────────────────────
+# ── Runner principal ───────────────────────────────────────────────────────────
 async def run_backtest_now(
     notifier,
-    symbols: Optional[list] = None,
-    hist_days: Optional[int] = None,
-    optimize: Optional[bool] = None,
-    folds: Optional[int] = None,
+    symbols:   Optional[list] = None,
+    hist_days: Optional[int]  = None,
+    tf:        Optional[str]  = None,
+    leverage:  Optional[int]  = None,
 ) -> None:
     """
-    Ejecuta el backtester para cada símbolo y envía el informe a Telegram.
-    Puede llamarse desde el scheduler o desde el comando /backtest de Telegram.
-
-    Los símbolos se resuelven en este orden:
-      1. Parámetro `symbols` explícito
-      2. Pares activos de active_traders (vía set_active_symbols_fn)
-      3. BACKTEST_SCHED_SYMBOLS del .env
-      4. Fallback mínimo BTC/ETH/SOL
+    Descarga OHLCV y ejecuta el backtest vectorizado para cada símbolo.
+    Llama directamente a _fetch_full_history() + _run_backtest() de bot/backtester.py.
     """
-    resolved_symbols = _resolve_symbols(symbols)
+    resolved = _resolve_symbols(symbols)
     hist_days = hist_days or SCHED_HIST_DAYS
-    optimize  = optimize  if optimize is not None else SCHED_OPTIMIZE
-    folds     = folds     or SCHED_FOLDS
+    tf        = tf        or SCHED_TF
+    leverage  = leverage  or SCHED_LEVERAGE
 
     await _send(notifier,
         f"\u23f3 *Backtest iniciado*\n"
-        f"Símbolos ({len(resolved_symbols)}): {', '.join(resolved_symbols)}\n"
-        f"Modo: {'Optimizador Walk-Forward' if optimize else 'Backtest Simple'}\n"
-        f"Histórico: {hist_days}d — esto puede tardar unos minutos..."
+        f"Símbolos ({len(resolved)}): {', '.join(resolved)}\n"
+        f"TF: {tf} · Histórico: {hist_days}d · Leverage: {leverage}x\n"
+        f"Esto puede tardar unos minutos..."
     )
 
-    t0 = time.monotonic()
-    results    = []
-    top_params = None
-
+    # Importación diferida — las funciones reales del backtester
     try:
-        from bot.backtester import Backtester  # importación diferida
-
-        bt = Backtester()
-
-        for sym in resolved_symbols:
-            try:
-                log.info("[backtest_sched] Ejecutando %s...", sym)
-                r = await bt.run(
-                    symbol=sym,
-                    days=hist_days,
-                    optimize=optimize,
-                    folds=folds,
-                )
-                results.append(r)
-                if optimize and hasattr(r, 'top_params'):
-                    top_params = (top_params or []) + (r.top_params or [])
-            except Exception as e:
-                log.error("[backtest_sched] Error en %s: %s", sym, e)
-                results.append(None)
-
-        if top_params:
-            top_params = sorted(top_params, key=lambda x: x.get('sharpe', 0), reverse=True)
-
-    except ImportError:
-        log.error("[backtest_sched] No se pudo importar Backtester — ¿rama correcta?")
-        await _send(notifier, "\u274c *Backtest fallido* — módulo `backtester` no disponible.")
+        from bot.backtester import _fetch_full_history, _run_backtest
+    except ImportError as e:
+        log.error("[backtest_sched] No se pudo importar backtester: %s", e)
+        await _send(notifier, f"\u274c *Backtest fallido* — error de importación:\n`{e}`")
         return
-    except Exception as e:
-        log.error("[backtest_sched] Error inesperado: %s", e)
-        await _send(notifier, f"\u274c *Backtest fallido*\n`{e}`")
-        return
+
+    api_key    = os.getenv("BITGET_API_KEY",    "")
+    api_secret = os.getenv("BITGET_API_SECRET", "")
+    passphrase = os.getenv("BITGET_PASSPHRASE", "")
+
+    t0      = time.monotonic()
+    results = []
+
+    for sym in resolved:
+        try:
+            log.info("[backtest_sched] Descargando histórico %s %s %dd...", sym, tf, hist_days)
+            df = await _fetch_full_history(
+                symbol=sym, tf=tf, days=hist_days,
+                api_key=api_key, api_secret=api_secret, passphrase=passphrase,
+            )
+            if df.empty:
+                raise ValueError("DataFrame vacío — sin datos del exchange")
+
+            log.info("[backtest_sched] Ejecutando backtest %s (%d velas)...", sym, len(df))
+            r = await asyncio.to_thread(
+                _run_backtest, df, sym, tf, hist_days, leverage
+            )
+            results.append(r)
+            log.info("[backtest_sched] %s — %d trades, WR %.1f%%, PnL %+.2f%%",
+                     sym, r.n_trades, r.win_rate, r.total_pnl)
+
+        except Exception as e:
+            log.error("[backtest_sched] Error en %s: %s", sym, e)
+            results.append(e)
 
     elapsed = time.monotonic() - t0
-    report  = _build_report(resolved_symbols, results, hist_days, optimize, top_params, elapsed)
+    report  = _build_report(resolved, results, hist_days, tf, elapsed)
     await _send(notifier, report)
-    log.info("[backtest_sched] Informe enviado a Telegram (%.0fs)", elapsed)
+    log.info("[backtest_sched] Informe enviado (%.0fs)", elapsed)
 
 
-# ── Scheduler loop ──────────────────────────────────────────────────────────────
+# ── Scheduler loop ────────────────────────────────────────────────────────────
 class BacktestScheduler:
-    """
-    Corre como tarea asyncio en background.
-    Se despierta cada hora, comprueba si toca ejecutar y lanza run_backtest_now().
-    """
-
     def __init__(self, notifier) -> None:
         self._notifier  = notifier
         self._last_run: float = 0.0
@@ -272,20 +219,16 @@ class BacktestScheduler:
     async def _loop(self) -> None:
         while True:
             try:
-                await asyncio.sleep(3600)  # comprobar cada hora
+                await asyncio.sleep(3600)
                 now = datetime.now(timezone.utc)
-
                 if now.hour != SCHED_HOUR:
                     continue
-
                 elapsed_days = (time.time() - self._last_run) / 86400
                 if elapsed_days < SCHED_DAYS:
                     continue
-
                 self._last_run = time.time()
                 log.info("[backtest_sched] \U0001f680 Lanzando backtest programado...")
                 await run_backtest_now(self._notifier)
-
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -293,7 +236,6 @@ class BacktestScheduler:
                 await asyncio.sleep(60)
 
 
-# Singleton
 _scheduler: Optional[BacktestScheduler] = None
 
 
