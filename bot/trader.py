@@ -2,6 +2,19 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v21 — Fix Bug Menor 4: guardia dura SL/TP + cierre de emergencia si SL falla (2026-06-07):
+  - _confirm_margin(): aborta la apertura si falta SL o TP antes de tocar el exchange.
+    Espeja la guardia dura de ExecutionEngine.execute() (trade_side=="open").
+  - _place_tpsl() ahora devuelve bool: True si el SL fue colocado, False si falló.
+    Era void → el camino fallback (place_market + _place_tpsl) nunca podía detectar
+    que el SL no se colocó.
+  - _do_open_order() fallback: si _place_tpsl() devuelve False, cierra la posición
+    recién abierta con close_position(reason="NO_SL") y aborta sin guardar estado.
+    Espeja ExecutionEngine._place_tpsl() → execute() cierre de emergencia.
+  - TODO (deuda técnica): migrar open_order() para delegar a
+    execution_engine.execute() como único punto de entrada, eliminando la
+    dualidad place_market_with_tpsl / place_market + _place_tpsl.
+
 v20 — Fix 4 bugs internos (2026-06-07):
   1. _set_leverage: get_max_leverage() no acepta argumentos — se llamaba
      get_max_leverage(self.inst_id) → TypeError. Corregido a get_max_leverage().
@@ -486,6 +499,37 @@ class FuturesTrader:
                 self.symbol, e,
             )
 
+    # ── _confirm_margin ────────────────────────────────────────────────────────────────
+    # v21 FIX (Bug Menor 4): guardia dura pre-apertura. Espeja ExecutionEngine.execute()
+    # trade_side=="open". Llamar ANTES de cualquier llamada al exchange.
+
+    def _confirm_margin(
+        self,
+        sl_price: Optional[float],
+        tp1_price: Optional[float],
+    ) -> Optional[str]:
+        """
+        Verifica que los niveles mínimos de protección estén presentes antes de abrir.
+        Devuelve un mensaje de error si falta alguno, None si todo está OK.
+
+        Por qué aquí y no solo en ExecutionEngine:
+          - trader.py usa place_market_with_tpsl / place_market + _place_tpsl
+            directamente, sin pasar por ExecutionEngine.execute().
+          - TODO: cuando se migre a execution_engine.execute() como único punto
+            de entrada, esta guardia se puede eliminar (ExecutionEngine ya la tiene).
+        """
+        missing = []
+        if not sl_price or sl_price <= 0:
+            missing.append("SL")
+        if not tp1_price or tp1_price <= 0:
+            missing.append("TP1")
+        if missing:
+            return (
+                f"Apertura bloqueada — faltan: {', '.join(missing)}. "
+                f"No se abre ninguna posición sin SL y TP."
+            )
+        return None
+
     # ── open_order ────────────────────────────────────────────────────────────────────
     # v18 FIX CRÍTICO: trading_loop.py línea 553 llama trader.open_order(signal, risk).
     # Este método no existía → AttributeError bloqueaba toda ejecución de órdenes.
@@ -536,20 +580,29 @@ class FuturesTrader:
         usdc_per_trade = float(getattr(risk, "usdc_per_trade", 20.0))
         leverage       = int(getattr(risk, "leverage", self.leverage) or self.leverage)
 
-        # ── 2. Obtener precio de referencia ───────────────────────────────
+        # ── 2. GUARDIA DURA: SL y TP1 obligatorios antes de tocar el exchange ──
+        # v21: espeja ExecutionEngine.execute() trade_side=="open".
+        # TODO: eliminar cuando se migre a execution_engine.execute().
+        if not self.dry_run:
+            guard_err = self._confirm_margin(sl_price, tp1_price)
+            if guard_err:
+                logger.error("[%s] 🚫 %s", self.symbol, guard_err)
+                return
+
+        # ── 3. Obtener precio de referencia ───────────────────────────────
         try:
             ref_price = await self.get_price()
         except Exception as e:
             logger.error("[%s] open_order: no se pudo obtener precio: %s — abortando.", self.symbol, e)
             return
 
-        # ── 3. Validar staleness ──────────────────────────────────────────
+        # ── 4. Validar staleness ──────────────────────────────────────────
         stale_msg = _check_price_staleness(signal, ref_price, is_long)
         if stale_msg:
             logger.warning("[%s] open_order cancelado: %s", self.symbol, stale_msg)
             return
 
-        # ── 4. Calcular qty ───────────────────────────────────────────────
+        # ── 5. Calcular qty ───────────────────────────────────────────────
         notional = usdc_per_trade * leverage
         raw_qty  = notional / ref_price
         # Redondear a 4 decimales como mínimo seguro; BingXClient refina si expone sz_decimals
@@ -580,7 +633,7 @@ class FuturesTrader:
             sl_price or 0, tp1_price or 0,
         )
 
-        # ── 5. DRY-RUN: simular apertura ──────────────────────────────────
+        # ── 6. DRY-RUN: simular apertura ──────────────────────────────────
         if self.dry_run:
             self.position       = side_str
             self.entry_price    = ref_price
@@ -611,7 +664,7 @@ class FuturesTrader:
             )
             return
 
-        # ── 6. LIVE: set leverage + colocar orden ─────────────────────────
+        # ── 7. LIVE: set leverage + colocar orden ─────────────────────────
         if self._bingx_client is None:
             await self._get_ccxt()
 
@@ -697,17 +750,50 @@ class FuturesTrader:
                 await asyncio.sleep(_FILL_DELAY)
 
             # Colocar SL+TP1 separados
+            # v21 FIX (Bug Menor 4): _place_tpsl ahora devuelve bool.
+            # Si SL falla → cerrar posición para no quedar expuestos sin stop.
             if sl_price or tp1_price:
-                await self._place_tpsl(
+                sl_placed = await self._place_tpsl(
                     qty=qty,
                     sl_price=sl_price,
                     tp_price=tp1_price,
                     is_long=is_long,
                     reduce_only=True,
                 )
-                self._protection_ok = True
+                if sl_placed:
+                    self._protection_ok = True
+                else:
+                    # SL no colocado → cierre de emergencia (espeja ExecutionEngine)
+                    logger.error(
+                        "[%s] 🚨 SL NO colocado en fallback — cerrando posición "
+                        "para evitar exposición sin stop loss.",
+                        self.symbol,
+                    )
+                    try:
+                        await self.close_position(reason="NO_SL")
+                        logger.warning(
+                            "[%s] Posición cerrada preventivamente por falta de SL.",
+                            self.symbol,
+                        )
+                    except Exception as close_exc:
+                        logger.critical(
+                            "[%s] ❌❌ FALLO CRÍTICO: no se pudo colocar SL NI cerrar la posición: %s",
+                            self.symbol, close_exc,
+                        )
+                    # Notificar por Telegram
+                    try:
+                        from bot.telegram_bot import send_message
+                        await send_message(
+                            f"🚨 *ALERTA CRÍTICA* `{self.symbol}`\n"
+                            f"SL no pudo colocarse tras el fallback place_market.\n"
+                            f"Posición cerrada preventivamente."
+                        )
+                    except Exception:
+                        pass
+                    # No guardar estado ni continuar: posición cerrada
+                    return
 
-        # ── 7. Ajustar niveles al fill real ───────────────────────────────
+        # ── 8. Ajustar niveles al fill real ───────────────────────────────
         sl_adj, tp1_adj, tp2_adj = _adjust_levels_to_fill(signal, filled_price, ref_price)
         if sl_adj:
             sl_price  = sl_adj
@@ -716,7 +802,7 @@ class FuturesTrader:
         if tp2_adj and tp2_price:
             tp2_price = tp2_adj
 
-        # ── 8. Actualizar estado ──────────────────────────────────────────
+        # ── 9. Actualizar estado ──────────────────────────────────────────
         self.position       = side_str
         self.entry_price    = filled_price
         self.sl             = sl_price
@@ -748,7 +834,7 @@ class FuturesTrader:
             sl_price or 0, tp1_price or 0, qty,
         )
 
-        # ── 9. Colocar TP2/TP3 adicionales ───────────────────────────────
+        # ── 10. Colocar TP2/TP3 adicionales ───────────────────────────────
         if tp2_price:
             try:
                 await self._place_tpsl(
@@ -784,23 +870,33 @@ class FuturesTrader:
         tp_price: Optional[float],
         is_long: bool,
         reduce_only: bool = True,
-    ) -> None:
+    ) -> bool:
         """
         Coloca SL y/o TP como órdenes separadas usando BingXClient.
         Usado para TP2/TP3, re-colocación de stops y fallback de open_order.
+
+        v21 FIX (Bug Menor 4): ahora devuelve bool.
+          - True  → SL colocado con éxito (o no había SL que colocar).
+          - False → se intentó colocar SL y falló.
+        El llamador (_do_open_order fallback) usa este valor para decidir
+        si cerrar la posición de emergencia.
         """
         if self.dry_run:
             logger.info(
                 "[%s] [DRY-RUN] _place_tpsl: SL=%.4f TP=%.4f qty=%.6f",
                 self.symbol, sl_price or 0, tp_price or 0, qty,
             )
-            return
+            return True  # dry-run siempre "OK"
 
         if self._bingx_client is None:
             logger.warning("[%s] _place_tpsl: BingXClient no inicializado — skip.", self.symbol)
-            return
+            # Si hay SL pendiente, considerar fallo para que el llamador actúe
+            return sl_price is None or sl_price <= 0
+
+        sl_placed = True  # optimista: si no hay SL que colocar, no es un fallo
 
         if sl_price and sl_price > 0:
+            sl_placed = False  # ahora sí hay SL que colocar → asumir fallo hasta confirmar
             try:
                 result = await asyncio.to_thread(
                     self._bingx_client.place_sl,
@@ -812,6 +908,7 @@ class FuturesTrader:
                 code = (result or {}).get("code", -1)
                 if code in (0, "0", None):
                     logger.info("[%s] SL colocado: %.4f", self.symbol, sl_price)
+                    sl_placed = True
                 else:
                     logger.warning(
                         "[%s] SL rechazado (code=%s): %s",
@@ -840,6 +937,8 @@ class FuturesTrader:
                     )
             except Exception as e:
                 logger.warning("[%s] _place_tpsl TP error: %s", self.symbol, e)
+
+        return sl_placed
 
     # ── _get_open_orders_raw ──────────────────────────────────────────────────────────
 
