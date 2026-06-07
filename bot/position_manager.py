@@ -41,34 +41,16 @@ v25 — Fix SL/TP único y BE robusto:
      Elimina fallback a trader.tp que reinyectaba TP2/TP3 desde estado antiguo.
   2. _check_break_even maneja sl=None (restart): si precio ya volvió a entry
      o peor, marca _tp1_be_done=True sin disparar el BE (evita doble BE).
-  3. Persiste be_done=True en bot_state cuando se activa el BE.
+  3. Persiste sl y be_done=True en bot_state.update_position al activar el BE.
   4. Sincroniza trader.sl = be_price tras colocar SL en BE con éxito.
   5. _ensure_tpsl detecta SL en entry_price (±0.1%) como SL válido,
      evitando spam de "emergencia" cuando el SL ya está en BE.
 
-v21 — Fix tp2/tp3 limpieza en _reset_trader_position_state:
-  Cuando se detecta cierre externo con qty=0, ahora también se limpian
-  trader.tp2 y trader.tp3 para evitar estado contaminado.
-
-v20 — Fix BingX migration — _update_sl_to_be cancela todas las órdenes
-  SL/TP pendientes antes de recolocar (evita duplicados en BingX).
-  Usa cancel_all_orders() del BingXClient si está disponible; si no,
-  cancela order by order con cancel_order().
-
-v19 — _reset_trader_position_state: reemplaza asyncio.ensure_future() por
-  asyncio.get_event_loop().create_task() con fallback a ensure_future() para
-  mayor robustez en contextos donde el loop puede no estar activo en el hilo
-  actual. Añade guard para evitar RuntimeError si no hay loop disponible.
-
-v18 — reentry_guard hook:
-  _emergency_close ahora llama reentry_guard.register_sl(symbol) cuando
-  reason contiene 'SL'. Esto activa la reducción de size en el siguiente
-  re-entry sobre el mismo par durante la ventana REENTRY_WINDOW_S.
-
-Fix qty=0 loop — _ensure_tpsl ahora verifica si la posición sigue abierta
-  en el exchange antes de intentar colocar SL/TP de emergencia. Si _open_qty
-  es 0 o la posición ya no existe, limpia el estado del trader en lugar de
-  entrar en un loop infinito de errores.
+v21 — Fix tp2/tp3 limpieza en _reset_trader_position_state.
+v20 — Fix BingX migration — _update_sl_to_be cancela todas las órdenes.
+v19 — _reset_trader_position_state robusto con asyncio.
+v18 — reentry_guard hook en _emergency_close.
+Fix qty=0 loop — _ensure_tpsl verifica posición abierta antes de emergencia.
 """
 from __future__ import annotations
 
@@ -80,35 +62,18 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Margen de precio para el check de SL por software (evita doble cierre)
-_SL_SW_MARGIN = float(os.getenv("SL_SW_MARGIN_PCT", "0.0005"))
-
-# Intervalo entre verificaciones del SL/TP en el exchange (segundos)
-_TPSL_VERIFY_INTERVAL_S = float(os.getenv("TPSL_VERIFY_INTERVAL_S", "60"))
-
-# Máximo de reintentos al colocar SL/TP de emergencia
-_EMERGENCY_TPSL_RETRIES = int(os.getenv("EMERGENCY_TPSL_RETRIES", "3"))
-
-# RR mínimo para TP dinámico cuando trader.tp es None
-_TP_FALLBACK_RR = float(os.getenv("TP_FALLBACK_RR", "1.5"))
-
-# Break-Even: porcentaje del recorrido entry→TP1 para activar (0.4 = 40%)
-_BE_TRIGGER_PCT = float(os.getenv("BE_TRIGGER_PCT", "0.4"))
-# Break-Even: offset sobre entry en % (0.0 = BE exacto, 0.001 = +0.1% sobre entry)
-_BE_OFFSET_PCT  = float(os.getenv("BE_OFFSET_PCT", "0.0"))
+_SL_SW_MARGIN           = float(os.getenv("SL_SW_MARGIN_PCT",           "0.0005"))
+_TPSL_VERIFY_INTERVAL_S = float(os.getenv("TPSL_VERIFY_INTERVAL_S",     "60"))
+_EMERGENCY_TPSL_RETRIES = int(os.getenv("EMERGENCY_TPSL_RETRIES",       "3"))
+_TP_FALLBACK_RR         = float(os.getenv("TP_FALLBACK_RR",             "1.5"))
+_BE_TRIGGER_PCT         = float(os.getenv("BE_TRIGGER_PCT",             "0.4"))
+_BE_OFFSET_PCT          = float(os.getenv("BE_OFFSET_PCT",              "0.0"))
 
 
 def _get_tpsl_type(order: dict) -> Optional[str]:
-    """
-    Extrae 'sl', 'tp' o None del campo orderType.trigger.tpsl.
-    Compatible con openOrders y frontendOpenOrders de Hyperliquid,
-    y con algo-orders de OKX (campo algoType: 'sl' o 'tp').
-    """
-    # OKX algo-orders usan 'algoType' con valores 'sl' o 'tp'
     algo_type = order.get("algoType", "").lower()
     if algo_type in ("sl", "tp"):
         return algo_type
-    # HL compat
     ot = order.get("orderType", {})
     if isinstance(ot, dict):
         trigger = ot.get("trigger", {})
@@ -125,14 +90,12 @@ def _get_tpsl_type(order: dict) -> Optional[str]:
 def _is_reduce_only(order: dict) -> bool:
     if order.get("reduceOnly"):
         return True
-    # OKX algo-orders son siempre reduce-only por definición
     if order.get("algoId"):
         return True
     return _get_tpsl_type(order) in ("sl", "tp")
 
 
 def _round_qty_safe(trader, qty: float) -> float:
-    """Bug C: redondea qty con el método del trader si está disponible."""
     if hasattr(trader, "_round_qty") and callable(trader._round_qty):
         try:
             return trader._round_qty(qty)
@@ -142,7 +105,6 @@ def _round_qty_safe(trader, qty: float) -> float:
 
 
 def _resolve_is_long(position) -> bool:
-    """Bug I: soporta position como dict {'side': '...'} o str 'long'/'short'."""
     if isinstance(position, dict):
         return position.get("side", "").upper() == "LONG"
     if isinstance(position, str):
@@ -151,7 +113,6 @@ def _resolve_is_long(position) -> bool:
 
 
 def _calc_fallback_tp(entry: float, sl: float, is_long: bool, rr: float) -> Optional[float]:
-    """Bug J: TP dinámico cuando trader.tp es None."""
     if not entry or not sl or entry <= 0 or sl <= 0:
         return None
     risk = abs(entry - sl)
@@ -164,8 +125,8 @@ def _calc_fallback_tp(entry: float, sl: float, is_long: bool, rr: float) -> Opti
 class PositionManager:
     """
     Gestiona el ciclo de vida de una posición abierta:
-      - Check de SL por software (con margen anti-doble-cierre)
-      - Break-Even automático cuando el precio avanza lo suficiente hacia el TP
+      - Check de SL por software
+      - Break-Even automático al 40% del recorrido entry→TP1
       - Verificación periódica de SL/TP en el exchange
       - Colocación de emergencia si faltan SL/TP
     """
@@ -175,15 +136,10 @@ class PositionManager:
         self._last_tpsl_check: float = 0.0
 
     async def manage(self) -> None:
-        """Llamar cada tick mientras hay posición abierta."""
         now = time.monotonic()
-
         if await self._check_sl_software():
             return
-
-        # BE: mover SL a entrada cuando el precio avanza hacia el TP
         await self._check_break_even()
-
         if now - self._last_tpsl_check >= _TPSL_VERIFY_INTERVAL_S:
             self._last_tpsl_check = now
             await self._ensure_tpsl()
@@ -192,25 +148,24 @@ class PositionManager:
 
     async def _check_break_even(self) -> None:
         """
-        Mueve el SL a break-even (entry + offset) cuando el precio alcanza
-        BE_TRIGGER_PCT del recorrido entry → TP1.
-        Solo se activa UNA VEZ por posición (_tp1_be_done).
+        Mueve el SL a break-even cuando el precio alcanza BE_TRIGGER_PCT
+        del recorrido entry → TP1. Solo se activa UNA VEZ por posición.
 
-        v25: maneja sl=None tras restart correctamente.
-        Si el precio ya retrocedió a entry o peor, marca _tp1_be_done=True
-        sin disparar el BE (evita doble activación al reiniciar el bot).
+        v25: maneja sl=None tras restart. Si el precio ya retrocedió
+        a entry o peor, marca _tp1_be_done=True sin disparar el BE.
+        Persiste be_done en bot_state para sobrevivir reinicios.
         """
         trader = self._trader
 
         if getattr(trader, "_tp1_be_done", False):
             return
 
-        position   = getattr(trader, "position", None)
-        entry      = getattr(trader, "entry_price", None)
-        tp1        = getattr(trader, "tp1", None)
-        sl         = getattr(trader, "sl", None)
-        price      = getattr(trader, "_last_price", None)
-        symbol     = getattr(trader, "symbol", "?")
+        position = getattr(trader, "position",    None)
+        entry    = getattr(trader, "entry_price", None)
+        tp1      = getattr(trader, "tp1",         None)
+        sl       = getattr(trader, "sl",          None)
+        price    = getattr(trader, "_last_price", None)
+        symbol   = getattr(trader, "symbol",      "?")
 
         if not position or not entry or not tp1 or not price:
             return
@@ -221,11 +176,7 @@ class PositionManager:
             return
 
         trigger_dist = recorrido * _BE_TRIGGER_PCT
-
-        if is_long:
-            triggered = price >= entry + trigger_dist
-        else:
-            triggered = price <= entry - trigger_dist
+        triggered    = (price >= entry + trigger_dist) if is_long else (price <= entry - trigger_dist)
 
         if not triggered:
             return
@@ -236,85 +187,46 @@ class PositionManager:
         )
 
         if sl is not None:
-            if is_long and sl >= be_price:
-                # SL ya está en BE o más allá — no hacer nada
-                trader._tp1_be_done = True
-                return
-            if not is_long and sl <= be_price:
+            # SL ya está en BE o más allá — no hacer nada
+            if (is_long and sl >= be_price) or (not is_long and sl <= be_price):
                 trader._tp1_be_done = True
                 return
         else:
-            # sl=None: puede que venga de un restart. Verificamos si ya lo
-            # habíamos activado comparando la distancia al entry.
-            # Si el precio ya volvió a entry (o peor), no tiene sentido activar BE.
-            if is_long and price <= entry:
-                trader._tp1_be_done = True
-                return
-            if not is_long and price >= entry:
+            # sl=None tras restart: si precio ya volvió a entry (o peor),
+            # no tiene sentido activar BE — marcar como hecho y salir
+            if (is_long and price <= entry) or (not is_long and price >= entry):
                 trader._tp1_be_done = True
                 return
 
         log.info(
-            "[%s] 🟡 BREAK-EVEN activado: precio=%.4f trigger=%.4f (%.0f%% de %.4f recorrido) "
+            "[%s] 🟡 BREAK-EVEN activado: precio=%.4f trigger=%.4f (%.0f%% de %.4f) "
             "| SL anterior=%.4f → BE=%.4f",
             symbol, price, entry + (trigger_dist if is_long else -trigger_dist),
-            _BE_TRIGGER_PCT * 100, recorrido,
-            sl or 0, be_price,
+            _BE_TRIGGER_PCT * 100, recorrido, sl or 0, be_price,
         )
 
-        # Marcar como hecho ANTES de la llamada async (evita doble ejecución)
+        # Marcar ANTES de la llamada async (evita doble ejecución)
         trader._tp1_be_done = True
         trader.sl = be_price
 
-        # v25: Persistir be_done=True en state para sobrevivir reinicios del bot
+        # v25: persistir sl y be_done=True en state (sobrevive reinicios)
         try:
-            from bot.state import save_position as _save_pos
-            _sl_to_save  = be_price
-            _entry_save  = getattr(trader, "entry_price", None)
-            _tp1_save    = getattr(trader, "tp1", None)
-            _tp2_save    = getattr(trader, "tp2", None)
-            _tp3_save    = getattr(trader, "tp3", None)
-            _qty_save    = getattr(trader, "_open_qty", 0.0)
-            _usdc_save   = getattr(trader, "_open_notional", 0.0)
-            _lev_save    = getattr(trader, "_open_leverage", 1)
-            _side_save   = getattr(trader, "position", None)
-            _save_pos(
-                symbol,
-                side=_side_save,
-                entry=_entry_save,
-                sl=_sl_to_save,
-                tp1=_tp1_save,
-                tp2=_tp2_save,
-                tp3=_tp3_save,
-                qty=_qty_save,
-                usdc_amount=_usdc_save,
-                leverage=_lev_save,
-                be_done=True,
-            )
-        except Exception as _be_state_err:
-            log.debug("[%s] BE: no se pudo persistir be_done en state: %s", symbol, _be_state_err)
+            from bot.state import bot_state as _bs
+            await _bs.update_position(symbol, sl=be_price, be_done=True)
+        except Exception as _e:
+            log.debug("[%s] BE: no se pudo persistir be_done en state: %s", symbol, _e)
 
         await self._update_sl_to_be(be_price, is_long, symbol)
 
     async def _update_sl_to_be(self, be_price: float, is_long: bool, symbol: str) -> None:
         """
-        v20: Cancela TODAS las órdenes SL/TP pendientes del exchange antes de
-        recolocar el nuevo SL en BE + el TP1 original.
-
-        Esto evita el problema de órdenes duplicadas en BingX que causaba
-        comportamiento errático del SL/TP.
-
-        Flujo:
-          1. Cancelar todas las órdenes algo/trigger pendientes del símbolo.
-          2. Colocar SL nuevo en be_price.
-          3. Recolocar el TP1 original (único TP activo).
-
+        Cancela todas las órdenes SL/TP pendientes y recoloca SL en BE + TP1.
         En dry_run solo logea.
         """
         trader = self._trader
 
         if getattr(trader, "dry_run", True):
-            log.info("[%s] DRY_RUN: BE SL=%.4f omitido (sin orden real).", symbol, be_price)
+            log.info("[%s] DRY_RUN: BE SL=%.4f omitido.", symbol, be_price)
             return
 
         open_qty = _round_qty_safe(trader, getattr(trader, "_open_qty", 0.0) or 0.0)
@@ -322,52 +234,38 @@ class PositionManager:
             log.warning("[%s] BE: qty=0 — no se puede colocar SL de BE.", symbol)
             return
 
-        # Verificar que trader tiene _place_tpsl
         place_tpsl_fn = getattr(trader, "_place_tpsl", None)
         if not callable(place_tpsl_fn):
-            log.error(
-                "[%s] BE: trader no tiene _place_tpsl — no se puede colocar SL de BE.",
-                symbol,
-            )
+            log.error("[%s] BE: trader no tiene _place_tpsl.", symbol)
             trader._tp1_be_done = False
             trader.sl = None
             return
 
-        # v25: solo TP1 — nunca tp2/tp3
-        tp1 = getattr(trader, "tp1", None)
+        tp1 = getattr(trader, "tp1", None)   # v25: solo tp1
 
-        # ── 1. Cancelar todas las órdenes SL/TP pendientes ───────────────
-        # Esto es CRÍTICO para evitar duplicados en BingX. Si el exchange tiene
-        # ya un SL y/o TP activo, colocar uno nuevo sin cancelar el anterior
-        # genera dos órdenes en el mismo lado → comportamiento impredecible.
+        # 1. Cancelar todas las órdenes SL/TP pendientes (evita duplicados)
         await self._cancel_all_tpsl_orders(symbol)
 
-        # ── 2. Colocar SL nuevo en BE ─────────────────────────────────────
+        # 2. Colocar SL en BE
         try:
             await place_tpsl_fn(
-                qty=open_qty,
-                sl_price=be_price,
-                tp_price=None,
-                is_long=is_long,
-                reduce_only=True,
+                qty=open_qty, sl_price=be_price, tp_price=None,
+                is_long=is_long, reduce_only=True,
             )
             log.info("[%s] BE: SL colocado en entrada (%.4f).", symbol, be_price)
-            trader.sl = be_price  # v25: sincronizar estado en memoria
+            trader.sl = be_price   # v25: sincronizar estado en memoria
         except Exception as e:
             log.error("[%s] BE: error colocando SL en BE: %s", symbol, e)
             trader._tp1_be_done = False
             trader.sl = None
             return
 
-        # ── 3. Recolocar TP1 original (único TP activo) ───────────────────
+        # 3. Recolocar TP1 (único TP activo — v23/v25)
         if tp1 and tp1 > 0:
             try:
                 await place_tpsl_fn(
-                    qty=open_qty,
-                    sl_price=None,
-                    tp_price=tp1,
-                    is_long=is_long,
-                    reduce_only=True,
+                    qty=open_qty, sl_price=None, tp_price=tp1,
+                    is_long=is_long, reduce_only=True,
                 )
                 log.info("[%s] BE: TP1 recolocado en %.4f.", symbol, tp1)
             except Exception as e:
@@ -375,30 +273,17 @@ class PositionManager:
 
         trader._protection_ok = True
 
-        # Notificar por Telegram
         try:
             from bot.telegram_bot import send_message
-            side_emoji = "🟢" if is_long else "🔴"
+            emoji = "🟢" if is_long else "🔴"
             await send_message(
-                f"{side_emoji} *BE activado* `{symbol}`\n"
+                f"{emoji} *BE activado* `{symbol}`\n"
                 f"SL movido a entrada: `{be_price:.6f}` — posición sin riesgo 🛡️"
             )
         except Exception:
             pass
 
     async def _cancel_all_tpsl_orders(self, symbol: str) -> None:
-        """
-        Cancela todas las órdenes SL/TP (trigger/algo) pendientes del símbolo
-        en el exchange antes de recolocar nuevas órdenes de protección.
-
-        Estrategia:
-          1. Intentar cancel_all_orders() del BingXClient si está disponible
-             (cancela de golpe todas las órdenes del símbolo).
-          2. Si no existe, obtener la lista de trigger orders y cancelarlas
-             una a una con cancel_order().
-          3. Si ninguna opción funciona, logear warning y continuar
-             (el paso posterior recolocará de todas formas).
-        """
         trader = self._trader
         bingx  = getattr(trader, "_bingx_client", None)
 
@@ -406,23 +291,19 @@ class PositionManager:
             log.debug("[%s] _cancel_all_tpsl_orders: sin cliente BingX — skip.", symbol)
             return
 
-        # Opción A: cancel_all_orders() — cancela todo en una sola llamada
         if hasattr(bingx, "cancel_all_orders") and callable(bingx.cancel_all_orders):
             try:
                 result = await asyncio.to_thread(bingx.cancel_all_orders)
                 code = (result or {}).get("code", -1)
                 if code in (0, "0", None):
-                    log.info("[%s] BE: todas las órdenes SL/TP canceladas (cancel_all_orders).", symbol)
+                    log.info("[%s] BE: todas las órdenes canceladas (cancel_all_orders).", symbol)
                 else:
-                    log.warning(
-                        "[%s] BE: cancel_all_orders devolvió código %s: %s",
-                        symbol, code, (result or {}).get("msg", ""),
-                    )
+                    log.warning("[%s] BE: cancel_all_orders código %s: %s",
+                                symbol, code, (result or {}).get("msg", ""))
                 return
             except Exception as e:
-                log.warning("[%s] BE: cancel_all_orders falló (%s) — intentando cancelación individual.", symbol, e)
+                log.warning("[%s] BE: cancel_all_orders falló (%s) — intentando individual.", symbol, e)
 
-        # Opción B: cancelar orden a orden
         get_trigger_fn = getattr(trader, "_get_open_trigger_orders_raw", None)
         cancel_fn_name = None
         for fn_name in ("cancel_order", "cancel_algo_order", "cancel_trigger_order"):
@@ -431,17 +312,13 @@ class PositionManager:
                 break
 
         if not callable(get_trigger_fn) or cancel_fn_name is None:
-            log.warning(
-                "[%s] BE: no se puede cancelar órdenes individuales "
-                "(get_trigger_fn=%s cancel_fn=%s) — continuando sin cancelar.",
-                symbol, callable(get_trigger_fn), cancel_fn_name,
-            )
+            log.warning("[%s] BE: no se puede cancelar órdenes individuales — skip.", symbol)
             return
 
         try:
             orders = await get_trigger_fn() or []
         except Exception as e:
-            log.warning("[%s] BE: no se pudo listar trigger orders: %s — skip cancelación.", symbol, e)
+            log.warning("[%s] BE: no se pudo listar trigger orders: %s", symbol, e)
             return
 
         cancel_fn = getattr(bingx, cancel_fn_name)
@@ -455,42 +332,30 @@ class PositionManager:
                 cancelled += 1
             except Exception as e:
                 log.debug("[%s] BE: error cancelando orden %s: %s", symbol, order_id, e)
-
-        log.info("[%s] BE: %d orden(es) SL/TP cancelada(s) antes de recolocar.", symbol, cancelled)
+        log.info("[%s] BE: %d orden(es) cancelada(s).", symbol, cancelled)
 
     # ── Check SL por software ───────────────────────────────────────────────────
 
     async def _check_sl_software(self) -> bool:
         trader = self._trader
-        sl = getattr(trader, "sl", None)
+        sl     = getattr(trader, "sl",       None)
         position = getattr(trader, "position", None)
         if not sl or not position:
             return False
-
         price = getattr(trader, "_last_price", None)
         if not price:
             return False
-
-        is_long = _resolve_is_long(position)
+        is_long   = _resolve_is_long(position)
         threshold = sl * (1.0 - _SL_SW_MARGIN) if is_long else sl * (1.0 + _SL_SW_MARGIN)
         triggered = (price <= threshold) if is_long else (price >= threshold)
-
         if not triggered:
             return False
-
         symbol = getattr(trader, "symbol", "?")
-        log.warning(
-            "[%s] SL SW disparado: precio=%.4f umbral=%.4f sl=%.4f margen=%.4f%%",
-            symbol, price, threshold, sl, _SL_SW_MARGIN * 100,
-        )
-
+        log.warning("[%s] SL SW disparado: precio=%.4f umbral=%.4f sl=%.4f margen=%.4f%%",
+                    symbol, price, threshold, sl, _SL_SW_MARGIN * 100)
         if getattr(trader, "_protection_ok", False):
-            log.info(
-                "[%s] SL SW: precio cruzó umbral pero _protection_ok=True → esperando fill del exchange",
-                symbol,
-            )
+            log.info("[%s] SL SW: _protection_ok=True → esperando fill del exchange", symbol)
             return False
-
         await self._emergency_close(reason="SL_SW")
         return True
 
@@ -498,51 +363,35 @@ class PositionManager:
 
     async def _ensure_tpsl(self) -> None:
         """
-        BUG 3 FIX: En OKX los SL/TP son algo-orders que viven en
-        GET /api/v5/trade/orders-algo-pending, no en orders-pending.
-        Se detectan via trader._get_open_trigger_orders_raw() que ahora
-        está implementado en FuturesTrader consultando ese endpoint.
-
-        Fix qty=0 loop: si _open_qty es 0 o la posición ya no existe en el
-        exchange, limpiamos el estado del trader en lugar de intentar colocar
-        órdenes de emergencia infinitamente.
-
-        v25: solo usa trader.tp1 como referencia de TP (elimina fallback a trader.tp).
-        Detecta SL en entry_price (±0.1%) como SL válido cuando el BE ya está activo.
+        Verifica que haya SL y TP activos en el exchange.
+        v25: solo usa trader.tp1 (sin fallback a trader.tp).
+        v25: detecta SL en entry_price (±0.1%) como válido (BE activo).
         """
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
 
-        # ── Guardia: si qty=0, la posición fue cerrada externamente ──────────
         open_qty = _round_qty_safe(trader, getattr(trader, "_open_qty", 0.0) or 0.0)
         if open_qty <= 0:
-            log.info(
-                "[%s] _ensure_tpsl: _open_qty=0 — posición cerrada externamente. "
-                "Limpiando estado del trader.",
-                symbol,
-            )
+            log.info("[%s] _ensure_tpsl: qty=0 — posición cerrada externamente.", symbol)
             _reset_trader_position_state(trader, symbol)
             return
 
-        # 1. Órdenes normales (limit/market pending)
         try:
             raw_orders = await trader._get_open_orders_raw() or []
         except Exception as e:
             log.warning("[%s] _ensure_tpsl: orders-pending error: %s", symbol, e)
             raw_orders = []
 
-        # 2. Algo orders (TP/SL) — en OKX viven en orders-algo-pending
         trigger_orders: list[dict] = []
         get_trigger_fn = getattr(trader, "_get_open_trigger_orders_raw", None)
         if callable(get_trigger_fn):
             try:
                 trigger_orders = await get_trigger_fn() or []
             except Exception as e:
-                log.warning("[%s] _ensure_tpsl: orders-algo-pending error: %s", symbol, e)
+                log.warning("[%s] _ensure_tpsl: trigger orders error: %s", symbol, e)
 
-        # 3. Combinar y filtrar por instId
         all_orders = raw_orders + trigger_orders
-        inst_id = getattr(trader, "inst_id", symbol).upper()
+        inst_id    = getattr(trader, "inst_id", symbol).upper()
         coin_orders = [
             o for o in all_orders
             if (
@@ -551,56 +400,41 @@ class PositionManager:
             )
         ]
 
-        # 4. Detectar SL/TP por tipo de orden
         has_sl = any(_get_tpsl_type(o) == "sl" for o in coin_orders)
         has_tp = any(_get_tpsl_type(o) == "tp" for o in coin_orders)
 
-        # 5. Bug B: fallback por precio si el campo algoType no viene
-        # v25: solo usa trader.tp1 (elimina fallback a trader.tp que reinyectaba TP2/TP3)
-        # v25: detecta SL en entry_price (±0.1%) como SL válido cuando BE está activo
+        # Fallback por precio cuando algoType no viene parseado
+        # v25: solo tp1, sin fallback a trader.tp; detecta BE en entry_price
         if not has_sl or not has_tp:
-            sl_price    = getattr(trader, "sl", None)
-            tp_price    = getattr(trader, "tp1", None)   # v25: solo tp1, sin fallback a tp
+            sl_price    = getattr(trader, "sl",          None)
+            tp_price    = getattr(trader, "tp1",         None)  # solo tp1
             entry_price = getattr(trader, "entry_price", None)
             for o in coin_orders:
                 if not _is_reduce_only(o):
                     continue
                 try:
-                    # OKX algo-orders usan triggerPx; limit orders usan px
-                    opx = float(
-                        o.get("triggerPx")
-                        or o.get("limitPx")
-                        or o.get("px")
-                        or 0
-                    )
+                    opx = float(o.get("triggerPx") or o.get("limitPx") or o.get("px") or 0)
                 except (TypeError, ValueError):
                     opx = 0.0
                 if not has_sl and opx:
-                    # Detectar SL por precio exacto O SL en BE (≈ entry_price)
                     if sl_price and abs(opx - sl_price) / sl_price < 0.002:
                         has_sl = True
                     elif entry_price and abs(opx - entry_price) / entry_price < 0.001:
-                        # v25: SL de break-even colocado en entry_price — es válido
+                        # SL de break-even en entry_price — válido
                         has_sl = True
                 if not has_tp and tp_price and opx:
                     if abs(opx - tp_price) / tp_price < 0.002:
                         has_tp = True
 
-        log.debug(
-            "[%s] _ensure_tpsl: total=%d (pending=%d algo=%d) has_sl=%s has_tp=%s",
-            symbol, len(all_orders), len(raw_orders), len(trigger_orders), has_sl, has_tp,
-        )
+        log.debug("[%s] _ensure_tpsl: total=%d has_sl=%s has_tp=%s",
+                  symbol, len(all_orders), has_sl, has_tp)
 
         if has_sl and has_tp:
             trader._protection_ok = True
             return
 
         if getattr(trader, "_protection_ok", False):
-            log.info(
-                "[%s] _ensure_tpsl: no se detectan SL/TP pero _protection_ok=True "
-                "(probablemente ejecutados). Saltando emergencia.",
-                symbol,
-            )
+            log.info("[%s] _ensure_tpsl: no detectados pero _protection_ok=True — skip.", symbol)
             return
 
         trader._protection_ok = False
@@ -609,115 +443,73 @@ class PositionManager:
             missing.append("SL")
         if not has_tp:
             missing.append("TP")
-
-        log.warning(
-            "[%s] _ensure_tpsl: FALTAN órdenes: %s → colocando emergencia",
-            symbol, ", ".join(missing),
-        )
+        log.warning("[%s] _ensure_tpsl: FALTAN %s → colocando emergencia",
+                    symbol, ", ".join(missing))
         await self._place_emergency_sl_tp(place_sl=not has_sl, place_tp=not has_tp)
 
-    # ── Colocación de emergencia SL/TP ───────────────────────────────────────────────
+    # ── Emergencia SL/TP ─────────────────────────────────────────────────────────────────
 
     async def _place_emergency_sl_tp(self, place_sl: bool = True, place_tp: bool = True) -> None:
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
 
-        sl_price = getattr(trader, "sl", None)
-        # v25: solo tp1, sin fallback a trader.tp
-        tp_price = getattr(trader, "tp1", None)
+        sl_price = getattr(trader, "sl",   None)
+        tp_price = getattr(trader, "tp1",  None)   # v25: solo tp1
         open_qty = _round_qty_safe(trader, getattr(trader, "_open_qty", 0.0) or 0.0)
 
         if open_qty <= 0:
-            log.error("[%s] _place_emergency_sl_tp: qty=0 — no se puede colocar orden", symbol)
+            log.error("[%s] _place_emergency_sl_tp: qty=0", symbol)
             return
 
         position = getattr(trader, "position", None)
-        is_long = _resolve_is_long(position)
+        is_long  = _resolve_is_long(position)
 
-        # Bug J: TP dinámico cuando falta
         if place_tp and tp_price is None:
             entry_price = getattr(trader, "entry_price", None) or getattr(trader, "_entry_price", None)
             tp_price = _calc_fallback_tp(entry_price, sl_price, is_long, _TP_FALLBACK_RR)
             if tp_price is not None:
                 trader.tp1 = tp_price
-                log.info(
-                    "[%s] TP calculado dinámicamente (entry=%.4f sl=%.4f rr=%.1f) → tp=%.4f",
-                    symbol, entry_price, sl_price, _TP_FALLBACK_RR, tp_price,
-                )
+                log.info("[%s] TP dinámico: %.4f", symbol, tp_price)
             else:
-                log.warning(
-                    "[%s] No se puede calcular TP dinámico: entry=%s sl=%s — saltando TP",
-                    symbol, entry_price, sl_price,
-                )
+                log.warning("[%s] No se puede calcular TP dinámico — saltando TP", symbol)
                 place_tp = False
 
         for attempt in range(1, _EMERGENCY_TPSL_RETRIES + 1):
             try:
                 if place_sl and sl_price:
                     await trader._place_tpsl(
-                        qty=open_qty,
-                        sl_price=sl_price,
-                        tp_price=None,
-                        is_long=is_long,
-                        reduce_only=True,
+                        qty=open_qty, sl_price=sl_price, tp_price=None,
+                        is_long=is_long, reduce_only=True,
                     )
-                    log.info("[%s] SL emergencia colocado: %.4f (qty=%.4f)", symbol, sl_price, open_qty)
-
+                    log.info("[%s] SL emergencia: %.4f", symbol, sl_price)
                 if place_tp and tp_price:
                     await trader._place_tpsl(
-                        qty=open_qty,
-                        sl_price=None,
-                        tp_price=tp_price,
-                        is_long=is_long,
-                        reduce_only=True,
+                        qty=open_qty, sl_price=None, tp_price=tp_price,
+                        is_long=is_long, reduce_only=True,
                     )
-                    log.info("[%s] TP emergencia colocado: %.4f (qty=%.4f)", symbol, tp_price, open_qty)
-
+                    log.info("[%s] TP emergencia: %.4f", symbol, tp_price)
                 trader._protection_ok = True
                 break
-
             except Exception as e:
-                log.warning(
-                    "[%s] _place_emergency_sl_tp intento %d/%d falló: %s",
-                    symbol, attempt, _EMERGENCY_TPSL_RETRIES, e,
-                )
+                log.warning("[%s] _place_emergency_sl_tp intento %d/%d: %s",
+                            symbol, attempt, _EMERGENCY_TPSL_RETRIES, e)
                 if attempt < _EMERGENCY_TPSL_RETRIES:
                     await asyncio.sleep(2 ** attempt)
 
-    # ── Cierre de emergencia ───────────────────────────────────────────────────────────────
+    # ── Cierre de emergencia ────────────────────────────────────────────────────────────────
 
     async def _emergency_close(self, reason: str = "EMERGENCY") -> None:
-        """
-        BUG SL-SW FIX: FuturesTrader OKX expone close_position() (sin guión bajo).
-        El código anterior buscaba _close_position() → callable() devolvía False
-        → el SL por software se disparaba en los logs pero nunca cerraba la posición.
-
-        Se intenta close_position primero (FuturesTrader OKX), luego _close_position
-        como fallback (compatibilidad con traders legacy).
-
-        v18: llama reentry_guard.register_sl(symbol) cuando reason contiene 'SL'
-        para activar la reducción de size en el siguiente re-entry.
-        """
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
 
-        # v18: registrar la liquidación por SL antes de cerrar
         if "SL" in reason.upper():
             try:
                 from bot.reentry_guard import reentry_guard
                 reentry_guard.register_sl(symbol)
-                log.info(
-                    "[%s] reentry_guard.register_sl llamado (reason=%s) — "
-                    "size reducido en próximo re-entry",
-                    symbol, reason,
-                )
             except Exception as _e:
-                log.debug("[%s] reentry_guard.register_sl error (ignorado): %s", symbol, _e)
+                log.debug("[%s] reentry_guard.register_sl error: %s", symbol, _e)
 
-        # Intentar primero el método público de FuturesTrader OKX
         close_fn = getattr(trader, "close_position", None)
-
-        # Fallback: nombre alternativo usado en traders legacy
         if not callable(close_fn):
             close_fn = getattr(trader, "_close_position", None)
 
@@ -728,58 +520,36 @@ class PositionManager:
             except Exception as e:
                 log.error("[%s] _emergency_close falló: %s", symbol, e)
         else:
-            log.error(
-                "[%s] _emergency_close: el trader no tiene close_position ni _close_position "
-                "— posición SIN CERRAR",
-                symbol,
-            )
+            log.error("[%s] _emergency_close: sin close_position — posición SIN CERRAR", symbol)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────────────────
 
 def _reset_trader_position_state(trader, symbol: str) -> None:
     """
-    Limpia el estado de posición del trader cuando se detecta que la posición
-    fue cerrada externamente (qty=0 pero el bot sigue creyendo que está abierta).
-    Esto evita el loop infinito de ensure_tpsl / place_emergency_sl_tp.
-
-    FIX v21: también limpia tp2/tp3 para evitar estado contaminado cuando
-    el bot se reinicia con posición guardada que tenía múltiples TPs.
-
-    FIX v19: usa asyncio.get_event_loop().create_task() en lugar de
-    asyncio.ensure_future() para mayor robustez. Añade guard contra
-    RuntimeError si no hay event loop disponible en el hilo actual.
+    Limpia el estado de posición del trader cuando se detecta cierre externo.
     """
     log.warning(
-        "[%s] Reseteando estado de posición (cerrada externamente): "
-        "position=None, sl=None, tp1=None, tp2=None, tp3=None, _open_qty=0, _protection_ok=False",
+        "[%s] Reset estado posición: position=None sl=None tp1=None qty=0",
         symbol,
     )
-    trader.position = None
-    trader.sl = None
-    trader.tp1 = None
-    # FIX v21: limpiar tp2/tp3 — ya no se usan, solo 1 TP activo
-    if hasattr(trader, "tp2"):
-        trader.tp2 = None
-    if hasattr(trader, "tp3"):
-        trader.tp3 = None
-    if hasattr(trader, "tp"):
-        trader.tp = None
-    trader._open_qty = 0.0
+    trader.position      = None
+    trader.sl            = None
+    trader.tp1           = None
+    if hasattr(trader, "tp2"):          trader.tp2 = None
+    if hasattr(trader, "tp3"):          trader.tp3 = None
+    if hasattr(trader, "tp"):           trader.tp  = None
+    trader._open_qty     = 0.0
     trader._protection_ok = False
-    if hasattr(trader, "_tp1_be_done"):
-        trader._tp1_be_done = False
-    if hasattr(trader, "entry_price"):
-        trader.entry_price = None
-    if hasattr(trader, "_entry_price"):
-        trader._entry_price = None
+    if hasattr(trader, "_tp1_be_done"): trader._tp1_be_done = False
+    if hasattr(trader, "entry_price"):  trader.entry_price  = None
+    if hasattr(trader, "_entry_price"): trader._entry_price = None
 
-    # Notificar por Telegram de forma no bloqueante
     try:
         from bot.telegram_bot import send_message
         msg = (
-            f"⚠️ *Posición cerrada externamente detectada* `{symbol}`\n"
-            f"Estado limpiado. El bot ya no gestionará esta posición."
+            f"⚠️ *Posición cerrada externamente* `{symbol}`\n"
+            f"Estado limpiado."
         )
         try:
             loop = asyncio.get_event_loop()
@@ -788,7 +558,6 @@ def _reset_trader_position_state(trader, symbol: str) -> None:
             else:
                 loop.run_until_complete(send_message(msg))
         except RuntimeError:
-            # No hay event loop en este hilo — último recurso
             asyncio.ensure_future(send_message(msg))
     except Exception:
         pass
