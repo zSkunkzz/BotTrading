@@ -767,6 +767,11 @@ def _score_tendencia(
         return "TENDENCIA", "NEUTRAL", 0, MAX, ["Sin tendencia definida en 1h"]
 
     direction = "LONG" if trend_1h_up else "SHORT"
+    log.debug(
+        "[signal_engine] _score_tendencia direction=%s trend_1h_up=%s trend_1h_down=%s "
+        "ema21_1h=%.4f ema50_1h=%.4f",
+        direction, trend_1h_up, trend_1h_down, ema21_1h, ema50_1h,
+    )
 
     macd_ok = (direction == "LONG" and i15.get("macd_bull")) or (direction == "SHORT" and i15.get("macd_bear"))
     if not macd_ok:
