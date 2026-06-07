@@ -39,6 +39,11 @@ v18 — reentry_guard hook:
   _emergency_close ahora llama reentry_guard.register_sl(symbol) cuando
   reason contiene 'SL'. Esto activa la reducción de size en el siguiente
   re-entry sobre el mismo par durante la ventana REENTRY_WINDOW_S.
+
+Fix qty=0 loop — _ensure_tpsl ahora verifica si la posición sigue abierta
+  en el exchange antes de intentar colocar SL/TP de emergencia. Si _open_qty
+  es 0 o la posición ya no existe, limpia el estado del trader en lugar de
+  entrar en un loop infinito de errores.
 """
 from __future__ import annotations
 
@@ -359,9 +364,24 @@ class PositionManager:
         GET /api/v5/trade/orders-algo-pending, no en orders-pending.
         Se detectan via trader._get_open_trigger_orders_raw() que ahora
         está implementado en FuturesTrader consultando ese endpoint.
+
+        Fix qty=0 loop: si _open_qty es 0 o la posición ya no existe en el
+        exchange, limpiamos el estado del trader en lugar de intentar colocar
+        órdenes de emergencia infinitamente.
         """
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
+
+        # ── Guardia: si qty=0, la posición fue cerrada externamente ──────────
+        open_qty = _round_qty_safe(trader, getattr(trader, "_open_qty", 0.0) or 0.0)
+        if open_qty <= 0:
+            log.info(
+                "[%s] _ensure_tpsl: _open_qty=0 — posición cerrada externamente. "
+                "Limpiando estado del trader.",
+                symbol,
+            )
+            _reset_trader_position_state(trader, symbol)
+            return
 
         # 1. Órdenes normales (limit/market pending)
         try:
@@ -564,3 +584,44 @@ class PositionManager:
                 "— posición SIN CERRAR",
                 symbol,
             )
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────────────────
+
+def _reset_trader_position_state(trader, symbol: str) -> None:
+    """
+    Limpia el estado de posición del trader cuando se detecta que la posición
+    fue cerrada externamente (qty=0 pero el bot sigue creyendo que está abierta).
+    Esto evita el loop infinito de ensure_tpsl / place_emergency_sl_tp.
+    """
+    log.warning(
+        "[%s] Reseteando estado de posición (cerrada externamente): "
+        "position=None, sl=None, tp1=None, _open_qty=0, _protection_ok=False",
+        symbol,
+    )
+    trader.position = None
+    trader.sl = None
+    trader.tp1 = None
+    if hasattr(trader, "tp"):
+        trader.tp = None
+    trader._open_qty = 0.0
+    trader._protection_ok = False
+    if hasattr(trader, "_tp1_be_done"):
+        trader._tp1_be_done = False
+    if hasattr(trader, "entry_price"):
+        trader.entry_price = None
+    if hasattr(trader, "_entry_price"):
+        trader._entry_price = None
+
+    # Notificar por Telegram
+    try:
+        import asyncio as _asyncio
+        from bot.telegram_bot import send_message
+        _asyncio.ensure_future(
+            send_message(
+                f"⚠️ *Posición cerrada externamente detectada* `{symbol}`\n"
+                f"Estado limpiado. El bot ya no gestionará esta posición."
+            )
+        )
+    except Exception:
+        pass
