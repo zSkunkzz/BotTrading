@@ -216,13 +216,15 @@ async def sentiment_gate_check(
 
             if fng <= _FNG_GROQ_LO:
                 score = fng
-                log.info(
+                # Extreme Fear: solo DEBUG para no saturar logs
+                log.debug(
                     "[sentiment] F&G=%.0f ≤ %.0f (Extreme Fear) → sin Groq, score=%.0f",
                     fng, _FNG_GROQ_LO, score,
                 )
             elif fng >= _FNG_GROQ_HI:
                 score = fng
-                log.info(
+                # Extreme Greed: solo DEBUG para no saturar logs
+                log.debug(
                     "[sentiment] F&G=%.0f ≥ %.0f (Extreme Greed) → sin Groq, score=%.0f",
                     fng, _FNG_GROQ_HI, score,
                 )
@@ -246,7 +248,12 @@ async def sentiment_gate_check(
         groq_str = f" | Groq={groq_delta:+.1f}" if groq_delta is not None else ""
         reason   = f"F&G={fng:.0f} ({fng_label}){groq_str} | score={score:.0f}/100 | ℹ️ solo informativo"
 
-        log.info("[sentiment] %s", reason)
+        # Solo loguear a INFO en zona ambigua (donde hay decisión real).
+        # En extremos (Fear/Greed) ya se logueó a DEBUG arriba.
+        if _FNG_GROQ_LO < fng < _FNG_GROQ_HI:
+            log.info("[sentiment] %s", reason)
+        else:
+            log.debug("[sentiment] %s", reason)
 
         # Siempre True — el sentimiento es solo informativo
         return True, reason, True
