@@ -487,10 +487,7 @@ async def _analyze_pair_inner(
     score_ratio = score / max_score if max_score > 0 else 0.0
     ratio_ok = score_ratio >= effective_min_ratio
 
-    if entry_mode == "EARLY":
-        is_valid = False
-    else:
-        is_valid = (score >= MIN_SCORE and rr >= effective_min_rr and ratio_ok) or is_fast_valid
+    is_valid = (score >= MIN_SCORE and rr >= effective_min_rr and ratio_ok) or is_fast_valid
 
     _tp_note = (
         f"TP×{tp_vol_scale:.2f}" if tp_vol_scale and tp_vol_scale != 1.0
@@ -527,7 +524,6 @@ async def _analyze_pair_inner(
         reason="" if is_valid else (
             f"[{setup_type}] score={score}/{max_score} ratio={score_ratio:.2f}(min={effective_min_ratio:.2f}) "
             f"rr={rr:.2f}(min_rr={effective_min_rr:.2f} regime={regime or 'none'})"
-            + (" [EARLY bloqueado]" if entry_mode == "EARLY" else "")
             + ("" if ratio_ok else " [RATIO insuficiente]")
         ),
         extra={
