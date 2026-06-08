@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
 """
-session_filter.py — Filtro de sesión de trading.
+bot/session_filter.py — Filtro de sesión de trading.
 
-Bloquea entradas de tipo TENDENCIA y BREAKOUT fuera del horario de mayor
-liquidez (London open + NY overlap). Los setups REVERSAL se permiten las
-24h porque buscan agotamiento de tendencia, que ocurre en cualquier sesión.
+Bloquea la apertura de nuevas posiciones fuera del horario de trading activo
+según el tipo de setup:
 
-Horario activo por defecto: 07:00–18:00 UTC
-  - London open:  07:00–09:00 UTC
-  - NY open:      13:00–15:00 UTC
-  - Overlap:      13:00–17:00 UTC
+  - TENDENCIA / BREAKOUT: solo entre SESSION_START_UTC y SESSION_END_UTC (UTC).
+    Fuera de ese horario la liquidez es baja y los fakeouts son frecuentes.
+  - REVERSAL: permitido 24h si SESSION_ALLOW_REVERSAL=true (default).
+  - Si SESSION_FILTER_ENABLED=false, check_session() siempre retorna None (sin bloqueo).
 
-Fuera de este horario (Asia/noche europea), los fakeouts en breakout y
-tendencia son significativamente más frecuentes por baja liquidez.
-
-Config Railway:
-  SESSION_FILTER_ENABLED   → default true  (false = desactiva el filtro)
-  SESSION_START_UTC        → default 7     (hora UTC de inicio)
-  SESSION_END_UTC          → default 18    (hora UTC de fin)
-  SESSION_ALLOW_REVERSAL   → default true  (REVERSAL siempre permitido)
+Variables de entorno:
+  SESSION_FILTER_ENABLED  (default: true)
+  SESSION_START_UTC       (default: 7)   — hora de inicio en UTC (int)
+  SESSION_END_UTC         (default: 18)  — hora de fin en UTC (int)
+  SESSION_ALLOW_REVERSAL  (default: true)
 """
-from __future__ import annotations
 
 import logging
 import os
@@ -29,51 +24,47 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-SESSION_FILTER_ENABLED = os.getenv("SESSION_FILTER_ENABLED", "true").lower() != "false"
-SESSION_START_UTC      = int(os.getenv("SESSION_START_UTC",   "7"))
-SESSION_END_UTC        = int(os.getenv("SESSION_END_UTC",     "18"))
-SESSION_ALLOW_REVERSAL = os.getenv("SESSION_ALLOW_REVERSAL",  "true").lower() != "false"
+_ENABLED         = os.getenv("SESSION_FILTER_ENABLED", "true").lower() not in ("false", "0", "no")
+_START_UTC       = int(os.getenv("SESSION_START_UTC",  "7"))
+_END_UTC         = int(os.getenv("SESSION_END_UTC",    "18"))
+_ALLOW_REVERSAL  = os.getenv("SESSION_ALLOW_REVERSAL", "true").lower() not in ("false", "0", "no")
 
 
-def is_trading_session(setup_type: Optional[str] = None) -> tuple[bool, str]:
+def check_session(setup_type: Optional[str]) -> Optional[str]:
     """
-    Determina si la hora actual es adecuada para operar el setup dado.
+    Devuelve:
+      None   → sesión OK, la entrada está permitida.
+      str    → motivo de bloqueo (se usa como reason en _result("HOLD", ...)).
 
-    Args:
-        setup_type: 'TENDENCIA' | 'BREAKOUT' | 'REVERSAL' | None
-
-    Returns:
-        (True, "")           si se permite la entrada
-        (False, reason_str)  si se bloquea
+    Lógica:
+      - Filtro desactivado → None.
+      - setup_type == 'REVERSAL' y SESSION_ALLOW_REVERSAL=true → None.
+      - Dentro del horario [START_UTC, END_UTC) → None.
+      - Fuera del horario → string de bloqueo.
     """
-    if not SESSION_FILTER_ENABLED:
-        return True, ""
+    if not _ENABLED:
+        return None
 
-    # REVERSAL permitido 24h (busca agotamiento, no liquidez)
-    if SESSION_ALLOW_REVERSAL and setup_type == "REVERSAL":
-        return True, ""
+    st = (setup_type or "").upper()
 
-    now_utc  = datetime.now(timezone.utc)
-    hour_utc = now_utc.hour + now_utc.minute / 60.0
+    if st == "REVERSAL" and _ALLOW_REVERSAL:
+        log.debug("[session_filter] REVERSAL — permitido 24h")
+        return None
 
-    in_session = SESSION_START_UTC <= hour_utc < SESSION_END_UTC
+    now_utc = datetime.now(tz=timezone.utc)
+    hour    = now_utc.hour
 
-    if in_session:
-        return True, ""
+    if _START_UTC <= hour < _END_UTC:
+        log.debug(
+            "[session_filter] %s — hora UTC=%d dentro de [%d, %d) — OK",
+            st or "(sin tipo)", hour, _START_UTC, _END_UTC,
+        )
+        return None
 
     reason = (
-        f"⏰ Fuera de sesión ({now_utc.strftime('%H:%M')} UTC, "
-        f"activa {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC) "
-        f"— {setup_type or 'setup'} bloqueado (baja liquidez)"
+        f"⏰ session_filter: {st or 'setup'} bloqueado fuera de sesión activa "
+        f"(UTC {hour:02d}:xx está fuera de [{_START_UTC:02d}:00–{_END_UTC:02d}:00]). "
+        f"Espera la apertura europea/americana para TENDENCIA/BREAKOUT."
     )
     log.info("[session_filter] %s", reason)
-    return False, reason
-
-
-def check_session(setup_type: Optional[str] = None) -> Optional[str]:
-    """
-    Convenience wrapper: devuelve el motivo de bloqueo o None si OK.
-    Úsalo en signal_engine o strategy para obtener el motivo directamente.
-    """
-    allowed, reason = is_trading_session(setup_type)
-    return None if allowed else reason
+    return reason
