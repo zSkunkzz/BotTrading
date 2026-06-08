@@ -27,6 +27,90 @@ _MIN_RR_RANGING   = float(os.getenv("MIN_RR_RANGING",   "2.0"))
 _MIN_RR_VOLATILE  = float(os.getenv("MIN_RR_VOLATILE",  "2.2"))
 _MIN_RR_REVERSAL  = float(os.getenv("MIN_RR_REVERSAL",  "2.0"))
 
+# ---------------------------------------------------------------------------
+# Pesos diferenciales por indicador — Mejora #6
+# Cada peso se lee desde Railway env vars; si no están definidas el default
+# es exactamente el valor entero original → backward compatible al 100%.
+#
+# Uso:  score += _w("W_TREND_EMA_ALIGN_FULL", 2.0)
+#       score -= _w("W_TREND_VWAP_PENALTY", 1.0)
+#
+# Los scores siguen siendo numéricos (float internamente), la comparación
+# con MIN_SCORE (int) sigue funcionando porque float >= int es válido en Python.
+# ---------------------------------------------------------------------------
+
+def _w(name: str, default: float) -> float:
+    """Lee un peso desde env var. Si no está definida devuelve el default."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        log.warning("[signal_engine] Peso %s='%s' inválido — usando default=%.2f", name, raw, default)
+        return default
+
+
+# TENDENCIA
+_WT = {
+    "EMA_ALIGN_FULL":    _w("W_TREND_EMA_ALIGN_FULL",    2.0),
+    "EMA_ALIGN_PARTIAL": _w("W_TREND_EMA_ALIGN_PARTIAL", 1.0),
+    "ST_1H":             _w("W_TREND_ST_1H",             1.0),
+    "ST_4H":             _w("W_TREND_ST_4H",             1.0),
+    "ST_4H_PENALTY":     _w("W_TREND_ST_4H_PENALTY",     2.0),
+    "MACD_4H_CONF":      _w("W_TREND_MACD_4H_CONFLUENCE",2.0),
+    "MACD_15M":          _w("W_TREND_MACD_15M",          1.0),
+    "ADX_PENALTY":       _w("W_TREND_ADX_PENALTY",       2.0),
+    "ADX_SLOPE_PENALTY": _w("W_TREND_ADX_SLOPE_PENALTY", 1.0),
+    "ADX1H_PENALTY":     _w("W_TREND_ADX1H_PENALTY",     1.0),
+    "PULLBACK":          _w("W_TREND_PULLBACK",          1.0),
+    "PULLBACK_VOL":      _w("W_TREND_PULLBACK_VOL",      1.0),
+    "RSI":               _w("W_TREND_RSI",               1.0),
+    "VOLUME":            _w("W_TREND_VOLUME",            1.0),
+    "VOLUME_PENALTY":    _w("W_TREND_VOLUME_PENALTY",    1.0),
+    "ST_CONFLUENCE":     _w("W_TREND_ST_CONFLUENCE",     2.0),
+    "VWAP":              _w("W_TREND_VWAP",              1.0),
+    "VWAP_PENALTY":      _w("W_TREND_VWAP_PENALTY",      1.0),
+    "STRUCTURE":         _w("W_TREND_STRUCTURE",         1.0),
+}
+
+# BREAKOUT
+_WB = {
+    "BASE":     _w("W_BO_BASE",     2.0),
+    "RETEST":   _w("W_BO_RETEST",   2.0),
+    "VOL_HIGH": _w("W_BO_VOL_HIGH", 2.0),
+    "VOL_MID":  _w("W_BO_VOL_MID",  1.0),
+    "ST_1H":    _w("W_BO_ST_1H",    1.0),
+    "ST_4H":    _w("W_BO_ST_4H",    1.0),
+    "RSI":      _w("W_BO_RSI",      1.0),
+    "MACD_1H":  _w("W_BO_MACD_1H",  1.0),
+}
+
+# REVERSAL
+_WR = {
+    "BASE":    _w("W_REV_BASE",    2.0),
+    "SWING":   _w("W_REV_SWING",   2.0),
+    "EMA50":   _w("W_REV_EMA50",   1.0),
+    "MACD":    _w("W_REV_MACD",    1.0),
+    "VOL":     _w("W_REV_VOL",     1.0),
+    "RSI":     _w("W_REV_RSI",     1.0),
+    "VWAP":    _w("W_REV_VWAP",    1.0),
+    "ST_4H":   _w("W_REV_ST_4H",   1.0),
+}
+
+log.info(
+    "[signal_engine] Pesos TENDENCIA: %s",
+    " | ".join(f"{k}={v:.2f}" for k, v in _WT.items()),
+)
+log.info(
+    "[signal_engine] Pesos BREAKOUT: %s",
+    " | ".join(f"{k}={v:.2f}" for k, v in _WB.items()),
+)
+log.info(
+    "[signal_engine] Pesos REVERSAL: %s",
+    " | ".join(f"{k}={v:.2f}" for k, v in _WR.items()),
+)
+
 # FIX #1: _min_rr_for_regime ahora cubre el caso REVERSAL explicitamente
 def _min_rr_for_regime(regime: Optional[str]) -> float:
     if not regime:
@@ -498,7 +582,7 @@ async def _analyze_pair_inner(
     )
 
     log.info(
-        "[signal_engine] %s %s [%s] score=%d/%d ratio=%.2f(min=%.2f) RR=%.2f(min=%.2f) "
+        "[signal_engine] %s %s [%s] score=%.2f/%d ratio=%.2f(min=%.2f) RR=%.2f(min=%.2f) "
         "entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f atr=%.6f lev=%dx mode=%s valid=%s "
         "vwap=%.6f funding=%.4f%% mtf_aligned=%s regime=%s %s | %s",
         symbol, signal_str, setup_type, score, max_score, score_ratio, effective_min_ratio,
@@ -513,7 +597,7 @@ async def _analyze_pair_inner(
         symbol=symbol,
         signal=signal_str,
         entry_mode=entry_mode,
-        score=score,
+        score=int(round(score)),
         max_score=max_score,
         entry=entry,
         sl=sl,
@@ -525,7 +609,7 @@ async def _analyze_pair_inner(
         indicators=indicators,
         is_valid=is_valid,
         reason="" if is_valid else (
-            f"[{setup_type}] score={score}/{max_score} ratio={score_ratio:.2f}(min={effective_min_ratio:.2f}) "
+            f"[{setup_type}] score={score:.2f}/{max_score} ratio={score_ratio:.2f}(min={effective_min_ratio:.2f}) "
             f"rr={rr:.2f}(min_rr={effective_min_rr:.2f} regime={regime or 'none'})"
             + ("" if ratio_ok else " [RATIO insuficiente]")
         ),
@@ -570,16 +654,16 @@ def _detect_setup(
     best = max(candidates, key=lambda x: x[2] / x[3])
     if len(candidates) > 1:
         log.debug(
-            "[signal_engine] %d setups válidos — elegido %s (%d/%d=%.2f) sobre %s",
+            "[signal_engine] %d setups válidos — elegido %s (%.2f/%d=%.2f) sobre %s",
             len(candidates), best[0], best[2], best[3], best[2] / best[3],
-            ", ".join(f"{c[0]}({c[2]}/{c[3]}={c[2]/c[3]:.2f})" for c in candidates if c is not best),
+            ", ".join(f"{c[0]}({c[2]:.2f}/{c[3]}={c[2]/c[3]:.2f})" for c in candidates if c is not best),
         )
     return best
 
 def _score_tendencia(
     i15: dict, i1h: dict, i4h: dict, bars_15m: list,
     bars_1h: list = None,
-) -> Tuple[str, str, int, int, List[str]]:
+) -> Tuple[str, str, float, int, List[str]]:
     MAX = 15
     reasons: List[str] = []
 
@@ -617,18 +701,21 @@ def _score_tendencia(
         reasons.append(f"ST1h en contra de {direction} — requisito obligatorio")
         return "TENDENCIA", "NEUTRAL", 0, MAX, reasons
 
-    score = 0
+    score = 0.0
 
     ema_15m_ok = (direction == "LONG" and i15.get("ema_bull")) or (direction == "SHORT" and i15.get("ema_bear"))
     if ema_15m_ok:
-        score += 2
-        reasons.append(f"EMA15m+1h alineados {direction} (spread={ema_spread_1h*100:.2f}%) +2")
+        w = _WT["EMA_ALIGN_FULL"]
+        score += w
+        reasons.append(f"EMA15m+1h alineados {direction} (spread={ema_spread_1h*100:.2f}%) +{w:.2f}")
     else:
-        score += 1
-        reasons.append(f"EMA1h en {direction} pero 15m aun no (spread={ema_spread_1h*100:.2f}%) +1")
+        w = _WT["EMA_ALIGN_PARTIAL"]
+        score += w
+        reasons.append(f"EMA1h en {direction} pero 15m aun no (spread={ema_spread_1h*100:.2f}%) +{w:.2f}")
 
-    score += 1
-    reasons.append("ST1h en favor +1")
+    w = _WT["ST_1H"]
+    score += w
+    reasons.append(f"ST1h en favor +{w:.2f}")
 
     st4h_ok = False
     macd4h_ok = False
@@ -636,21 +723,25 @@ def _score_tendencia(
         st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
         macd4h_ok = (direction == "LONG" and i4h.get("macd_bull")) or (direction == "SHORT" and i4h.get("macd_bear"))
         if st4h_ok:
-            score += 1
-            reasons.append("ST4h en favor +1")
+            w_st4 = _WT["ST_4H"]
+            score += w_st4
+            reasons.append(f"ST4h en favor +{w_st4:.2f}")
             if macd4h_ok:
-                score += 2
-                reasons.append("MACD4h + ST4h alineados — confluencia institucional total +2")
+                w_conf = _WT["MACD_4H_CONF"]
+                score += w_conf
+                reasons.append(f"MACD4h + ST4h alineados — confluencia institucional total +{w_conf:.2f}")
             else:
                 reasons.append("ST4h OK pero MACD4h no confirma (sin bonus institucional)")
         else:
-            score = max(0, score - 2)
-            reasons.append("ST4h en contra — penalización -2")
+            w_pen = _WT["ST_4H_PENALTY"]
+            score = max(0.0, score - w_pen)
+            reasons.append(f"ST4h en contra — penalización -{w_pen:.2f}")
     else:
         reasons.append("ST4h sin datos")
 
-    score += 1
-    reasons.append("MACD15m en favor +1")
+    w = _WT["MACD_15M"]
+    score += w
+    reasons.append(f"MACD15m en favor +{w:.2f}")
 
     closes_15m = [float(_b_close(b)) for b in bars_15m]
     highs_15m  = [float(_b_high(b))  for b in bars_15m]
@@ -665,16 +756,19 @@ def _score_tendencia(
         if adx_val >= _ADX_MIN and slope_ok:
             reasons.append(f"ADX15m={adx_val:.1f}(≥{_ADX_MIN}) + slope EMA21={slope*100:.3f}% — tendencia real confirmada")
         elif adx_val < _ADX_MIN:
-            score = max(0, score - 2)
-            reasons.append(f"ADX15m={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -2")
+            w_pen = _WT["ADX_PENALTY"]
+            score = max(0.0, score - w_pen)
+            reasons.append(f"ADX15m={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -{w_pen:.2f}")
         else:
-            score = max(0, score - 1)
-            reasons.append(f"Slope EMA21={slope*100:.3f}% en contra de {direction} — penalización -1")
+            w_pen = _WT["ADX_SLOPE_PENALTY"]
+            score = max(0.0, score - w_pen)
+            reasons.append(f"Slope EMA21={slope*100:.3f}% en contra de {direction} — penalización -{w_pen:.2f}")
     else:
         reasons.append("EMA21 series no disponible — slope omitido")
         if adx_val < _ADX_MIN:
-            score = max(0, score - 2)
-            reasons.append(f"ADX15m={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -2")
+            w_pen = _WT["ADX_PENALTY"]
+            score = max(0.0, score - w_pen)
+            reasons.append(f"ADX15m={adx_val:.1f} < {_ADX_MIN} — rango disfrazado de tendencia — penalización -{w_pen:.2f}")
         else:
             reasons.append(f"ADX15m={adx_val:.1f}(≥{_ADX_MIN}) — tendencia confirmada por ADX (slope no disponible)")
 
@@ -685,8 +779,9 @@ def _score_tendencia(
         adx_1h = _adx_simple(highs_1h, lows_1h, closes_1h, 14)
         if adx_1h > 0:
             if adx_1h < _ADX_MIN:
-                score = max(0, score - 1)
-                reasons.append(f"ADX1h={adx_1h:.1f} < {_ADX_MIN} — tendencia 1h débil — penalización -1")
+                w_pen = _WT["ADX1H_PENALTY"]
+                score = max(0.0, score - w_pen)
+                reasons.append(f"ADX1h={adx_1h:.1f} < {_ADX_MIN} — tendencia 1h débil — penalización -{w_pen:.2f}")
             else:
                 reasons.append(f"ADX1h={adx_1h:.1f}(≥{_ADX_MIN}) — tendencia 1h confirmada")
         else:
@@ -719,11 +814,13 @@ def _score_tendencia(
                         pullback_vol_low = True
                     break
         if pullback_detected:
-            score += 1
-            reasons.append("Pullback a EMA21_15m +1")
+            w = _WT["PULLBACK"]
+            score += w
+            reasons.append(f"Pullback a EMA21_15m +{w:.2f}")
             if pullback_vol_low:
-                score += 1
-                reasons.append("Pullback con volumen bajo (corrección sana) +1")
+                wv = _WT["PULLBACK_VOL"]
+                score += wv
+                reasons.append(f"Pullback con volumen bajo (corrección sana) +{wv:.2f}")
         else:
             reasons.append("Sin pullback a EMA21_15m")
 
@@ -731,31 +828,35 @@ def _score_tendencia(
     if rsi_15m is not None:
         rsi_ok = 35 <= rsi_15m <= 65
         if rsi_ok:
-            score += 1
-            reasons.append(f"RSI15m={rsi_15m:.0f} zona rebote +1")
+            w = _WT["RSI"]
+            score += w
+            reasons.append(f"RSI15m={rsi_15m:.0f} zona rebote +{w:.2f}")
         elif (direction == "LONG" and rsi_15m > 72) or (direction == "SHORT" and rsi_15m < 28):
             reasons.append(f"RSI15m={rsi_15m:.0f} SOBREEXTENDIDO — filtro duro")
-            score = 0
+            score = 0.0
         else:
             reasons.append(f"RSI15m={rsi_15m:.0f} zona neutra")
 
     vol_ratio = i15.get("vol_ratio", 1.0)
     if vol_ratio >= _VOL_CONFIRM_MIN:
-        score += 1
-        reasons.append(f"Vol15m={vol_ratio:.1f}x confirma +1")
+        w = _WT["VOLUME"]
+        score += w
+        reasons.append(f"Vol15m={vol_ratio:.1f}x confirma +{w:.2f}")
     elif vol_ratio >= 1.0:
         reasons.append(f"Vol15m={vol_ratio:.1f}x aceptable")
     elif vol_ratio < 0.8:
-        score = max(0, score - 1)
-        reasons.append(f"Vol15m={vol_ratio:.1f}x muy débil — penalización -1")
+        w_pen = _WT["VOLUME_PENALTY"]
+        score = max(0.0, score - w_pen)
+        reasons.append(f"Vol15m={vol_ratio:.1f}x muy débil — penalización -{w_pen:.2f}")
     else:
         reasons.append(f"Vol15m={vol_ratio:.1f}x débil")
 
     st15m_ok = (direction == "LONG" and i15.get("st_bull")) or (direction == "SHORT" and i15.get("st_bear"))
     confluencia = st15m_ok and st1h_ok and (not i4h or st4h_ok)
     if confluencia:
-        score += 2
-        reasons.append("Confluencia total ST 15m+1h+4h +2")
+        w = _WT["ST_CONFLUENCE"]
+        score += w
+        reasons.append(f"Confluencia total ST 15m+1h+4h +{w:.2f}")
     else:
         reasons.append(f"Confluencia ST parcial (15m={st15m_ok} 1h={st1h_ok} 4h={st4h_ok})")
 
@@ -763,11 +864,13 @@ def _score_tendencia(
     if vwap_val and vwap_val > 0 and close_15m:
         vwap_ok = (direction == "LONG" and close_15m > vwap_val) or (direction == "SHORT" and close_15m < vwap_val)
         if vwap_ok:
-            score += 1
-            reasons.append(f"Precio {'>' if direction == 'LONG' else '<'} VWAP_diario({vwap_val:.4f}) +1")
+            w = _WT["VWAP"]
+            score += w
+            reasons.append(f"Precio {'>' if direction == 'LONG' else '<'} VWAP_diario({vwap_val:.4f}) +{w:.2f}")
         else:
-            score = max(0, score - 1)
-            reasons.append(f"Precio al lado equivocado del VWAP_diario({vwap_val:.4f}) — penalización -1")
+            w_pen = _WT["VWAP_PENALTY"]
+            score = max(0.0, score - w_pen)
+            reasons.append(f"Precio al lado equivocado del VWAP_diario({vwap_val:.4f}) — penalización -{w_pen:.2f}")
     else:
         reasons.append("VWAP diario no disponible")
 
@@ -776,21 +879,23 @@ def _score_tendencia(
         if direction == "LONG":
             hh_hl = closes_recent[-1] > closes_recent[-2] > closes_recent[-3]
             if hh_hl:
-                score += 1
-                reasons.append("Estructura HH/HL confirmada en 15m +1")
+                w = _WT["STRUCTURE"]
+                score += w
+                reasons.append(f"Estructura HH/HL confirmada en 15m +{w:.2f}")
             else:
                 reasons.append("Sin estructura HH/HL en 15m")
         else:
             ll_lh = closes_recent[-1] < closes_recent[-2] < closes_recent[-3]
             if ll_lh:
-                score += 1
-                reasons.append("Estructura LL/LH confirmada en 15m +1")
+                w = _WT["STRUCTURE"]
+                score += w
+                reasons.append(f"Estructura LL/LH confirmada en 15m +{w:.2f}")
             else:
                 reasons.append("Sin estructura LL/LH en 15m")
 
     return "TENDENCIA", direction, score, MAX, reasons
 
-def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
+def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, float, int, List[str]]:
     MAX = 10
     reasons: List[str] = []
     if len(bars_15m) < _BREAKOUT_WINDOW + 2:
@@ -850,59 +955,65 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
     is_retest = retest_up or retest_down
 
-    score = 2
+    score = float(_WB["BASE"])
     if is_retest:
-        score += 2
+        w = _WB["RETEST"]
+        score += w
         reasons.append(
             f"Retesteo del nivel {'superior' if retest_up else 'inferior'} "
             f"(close={current_close:.4f} ≈ {range_high if retest_up else range_low:.4f}) "
-            f"+2 bonus (score base=2, score total=4)"
+            f"+{w:.2f} bonus (score base={_WB['BASE']:.2f}, score total={score:.2f})"
         )
     else:
-        reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} confirmada +2")
+        reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} confirmada +{_WB['BASE']:.2f}")
 
-    # FIX #4: sentencias separadas (PEP 8 — no múltiples statements en una línea)
     if vol_ratio >= _BREAKOUT_VOL_MIN:
-        score += 2
-        reasons.append(f"Vol={vol_ratio:.1f}x breakout +2")
+        w = _WB["VOL_HIGH"]
+        score += w
+        reasons.append(f"Vol={vol_ratio:.1f}x breakout +{w:.2f}")
     elif vol_ratio >= 1.1:
-        score += 1
-        reasons.append(f"Vol={vol_ratio:.1f}x moderado +1")
+        w = _WB["VOL_MID"]
+        score += w
+        reasons.append(f"Vol={vol_ratio:.1f}x moderado +{w:.2f}")
     else:
         reasons.append(f"Vol={vol_ratio:.1f}x aceptable (superó mínimo duro de {_BREAKOUT_VOL_MIN_HARD}x)")
 
     if i1h:
         st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
         if st1h_ok:
-            score += 1
-            reasons.append("ST1h confirma +1")
+            w = _WB["ST_1H"]
+            score += w
+            reasons.append(f"ST1h confirma +{w:.2f}")
         else:
             reasons.append("ST1h no confirma")
     if i4h:
         st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
         if st4h_ok:
-            score += 1
-            reasons.append("ST4h confirma +1")
+            w = _WB["ST_4H"]
+            score += w
+            reasons.append(f"ST4h confirma +{w:.2f}")
         else:
             reasons.append("ST4h no confirma")
     rsi_15m = i15.get("rsi_val")
     if rsi_15m is not None:
         rsi_ok = (direction == "LONG" and 45 <= rsi_15m <= 70) or (direction == "SHORT" and 30 <= rsi_15m <= 55)
         if rsi_ok:
-            score += 1
-            reasons.append(f"RSI15m={rsi_15m:.0f} razonable +1")
+            w = _WB["RSI"]
+            score += w
+            reasons.append(f"RSI15m={rsi_15m:.0f} razonable +{w:.2f}")
         else:
             reasons.append(f"RSI15m={rsi_15m:.0f} sobreextendido")
     if i1h:
         macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or (direction == "SHORT" and i1h.get("macd_bear"))
         if macd_ok:
-            score += 1
-            reasons.append("MACD1h en favor +1")
+            w = _WB["MACD_1H"]
+            score += w
+            reasons.append(f"MACD1h en favor +{w:.2f}")
         else:
             reasons.append("MACD1h en contra")
     return "BREAKOUT", direction, score, MAX, reasons
 
-def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
+def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, float, int, List[str]]:
     MAX = 14
     reasons: List[str] = []
     rsi_1h = i1h.get("rsi_val") if i1h else None
@@ -932,8 +1043,8 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         reasons.append(f"Divergencia RSI no confirmada para {direction} — requisito obligatorio")
         return "REVERSAL", "NEUTRAL", 0, MAX, reasons
 
-    score = 2
-    reasons.append(f"RSI1h={rsi_1h:.0f} extremo + ST1h alineado (score base=2)")
+    score = float(_WR["BASE"])
+    reasons.append(f"RSI1h={rsi_1h:.0f} extremo + ST1h alineado (score base={_WR['BASE']:.2f})")
 
     try:
         from bot.structure_analyzer import analyze_structure, STRUCTURE_SWING_N
@@ -949,8 +1060,9 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             if swing_level > 0:
                 dist_pct = abs(current_price - swing_level) / swing_level
                 if dist_pct <= _REVERSAL_SWING_TOL:
-                    score += 2
-                    reasons.append(f"Swing level {swing_level:.4f} cerca (dist={dist_pct*100:.2f}%) +2")
+                    w = _WR["SWING"]
+                    score += w
+                    reasons.append(f"Swing level {swing_level:.4f} cerca (dist={dist_pct*100:.2f}%) +{w:.2f}")
                 else:
                     reasons.append(f"Swing level lejano (dist={dist_pct*100:.2f}%)")
             else:
@@ -964,8 +1076,9 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         current_price = float(_b_close(bars_15m[-1]))
         dist_pct = abs(current_price - ema50_1h) / ema50_1h
         if dist_pct <= 0.003:
-            score += 1
-            reasons.append(f"Precio cerca de EMA50_1h ({ema50_1h:.4f}) +1")
+            w = _WR["EMA50"]
+            score += w
+            reasons.append(f"Precio cerca de EMA50_1h ({ema50_1h:.4f}) +{w:.2f}")
         else:
             reasons.append(f"Precio lejos de EMA50_1h (dist={dist_pct*100:.2f}%)")
     else:
@@ -974,23 +1087,26 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     if i1h:
         macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or (direction == "SHORT" and i1h.get("macd_bear"))
         if macd_ok:
-            score += 1
-            reasons.append("MACD1h en favor +1")
+            w = _WR["MACD"]
+            score += w
+            reasons.append(f"MACD1h en favor +{w:.2f}")
         else:
             reasons.append("MACD1h en contra")
 
     vol_ratio = i15.get("vol_ratio", 1.0)
     if vol_ratio >= _VOL_CONFIRM_MIN:
-        score += 1
-        reasons.append(f"Vol={vol_ratio:.1f}x confirma +1")
+        w = _WR["VOL"]
+        score += w
+        reasons.append(f"Vol={vol_ratio:.1f}x confirma +{w:.2f}")
     else:
         reasons.append(f"Vol={vol_ratio:.1f}x bajo")
 
     rsi_15m = i15.get("rsi_val")
     if rsi_15m is not None:
         if (direction == "LONG" and rsi_15m < 40) or (direction == "SHORT" and rsi_15m > 60):
-            score += 1
-            reasons.append(f"RSI15m={rsi_15m:.0f} alineado +1")
+            w = _WR["RSI"]
+            score += w
+            reasons.append(f"RSI15m={rsi_15m:.0f} alineado +{w:.2f}")
         else:
             reasons.append(f"RSI15m={rsi_15m:.0f} no extremo")
 
@@ -998,16 +1114,18 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     if vwap_val and vwap_val > 0:
         current_price = float(_b_close(bars_15m[-1]))
         if (direction == "LONG" and current_price < vwap_val) or (direction == "SHORT" and current_price > vwap_val):
-            score += 1
-            reasons.append(f"Precio del lado correcto de VWAP ({vwap_val:.4f}) +1")
+            w = _WR["VWAP"]
+            score += w
+            reasons.append(f"Precio del lado correcto de VWAP ({vwap_val:.4f}) +{w:.2f}")
         else:
             reasons.append("Precio del lado equivocado de VWAP — sin penalización")
 
     if i4h:
         st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
         if st4h_ok:
-            score += 1
-            reasons.append("ST4h en favor +1")
+            w = _WR["ST_4H"]
+            score += w
+            reasons.append(f"ST4h en favor +{w:.2f}")
         else:
             reasons.append("ST4h en contra (sin penalización)")
 
