@@ -60,30 +60,56 @@ def atr(highs, lows, closes, period=14):
     return round(atr_val, 6)
 
 def supertrend(highs, lows, closes, period=10, factor=3.0):
+    """
+    Supertrend con persistencia de bandas correcta.
+    - upper/lower se 'pegan' al valor anterior si el precio no cruza
+    - direction se mantiene cuando el precio está entre bandas
+    - Evita el sesgo alcista permanente del algoritmo anterior
+    """
     atr_vals = []
     for i in range(1, len(closes)):
         tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
         atr_vals.append(tr)
     if len(atr_vals) < period:
         return 1, closes[-1]
-    smoothed = [sum(atr_vals[:period])/period]
+
+    smoothed = [sum(atr_vals[:period]) / period]
     for v in atr_vals[period:]:
-        smoothed.append((smoothed[-1]*(period-1)+v)/period)
+        smoothed.append((smoothed[-1] * (period - 1) + v) / period)
+
     direction = 1
+    prev_upper = float('inf')
+    prev_lower = 0.0
     st = closes[-1]
+
     for i in range(len(smoothed)):
         idx = i + period
         if idx >= len(closes):
             break
         mid = (highs[idx] + lows[idx]) / 2
-        upper = mid + factor * smoothed[i]
-        lower = mid - factor * smoothed[i]
+        basic_upper = mid + factor * smoothed[i]
+        basic_lower = mid - factor * smoothed[i]
+
+        # Persistencia: la banda solo se mueve a favor de la tendencia
+        upper = basic_upper if basic_upper < prev_upper or closes[idx - 1] > prev_upper else prev_upper
+        lower = basic_lower if basic_lower > prev_lower or closes[idx - 1] < prev_lower else prev_lower
+
         if closes[idx] > upper:
             direction = 1
             st = lower
         elif closes[idx] < lower:
             direction = -1
             st = upper
+        else:
+            # Precio entre bandas: mantener dirección y banda activa
+            if direction == 1:
+                st = lower
+            else:
+                st = upper
+
+        prev_upper = upper
+        prev_lower = lower
+
     return direction, round(st, 6)
 
 
