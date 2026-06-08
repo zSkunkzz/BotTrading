@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot/decision_engine.py — Cálculo de tamaño de posición y sizing.
+bot/decision_engine.py — Cálculo de tamaño de posición, sizing y orquestación de señales.
 
 v10 — Kelly sizing:
   - compute_kelly_fraction(win_rate, avg_win, avg_loss) calcula la fracción
@@ -10,9 +10,15 @@ v10 — Kelly sizing:
   - Config: KELLY_ENABLED (default false), KELLY_MIN_FRACTION (default 0.05),
             KELLY_MAX_FRACTION (default 0.25).
 
-fix: clase DecisionEngine añadida para que bot/core/decision_engine.py
-     pueda hacer `from bot.decision_engine import DecisionEngine` sin
-     ImportError. Envuelve compute_kelly_fraction y calc_position_size.
+Clase DecisionEngine:
+  Fachada que orquesta señales (signal_engine.evaluate), pretrade_risk
+  y sizing. Inyectada por TradingLoop._build_decision_engine() con:
+    DecisionEngine(
+        risk_manager  = risk,       # RiskManager
+        pretrade_risk = ...,        # PretradeRisk singleton
+        signal_engine = ...,        # módulo signal_engine
+        cooldown      = ...,        # SignalCooldown
+    )
 """
 
 import logging
@@ -25,12 +31,12 @@ log = logging.getLogger(__name__)
 _CAPITAL               = float(os.getenv("CAPITAL",                "100.0"))
 _MAX_RISK_PCT          = float(os.getenv("MAX_RISK_PCT",           "0.01"))
 _MAX_LEVERAGE          = int(os.getenv("MAX_LEVERAGE",             "10"))
-_EF_PENALTY_REDUCTION  = float(os.getenv("EF_PENALTY_REDUCTION",   "0.10"))  # 10% reducción por penalización
+_EF_PENALTY_REDUCTION  = float(os.getenv("EF_PENALTY_REDUCTION",   "0.10"))
 
-# ─ Kelly ───────────────────────────────────────────────────────────────────────────
+# ─ Kelly ────────────────────────────────────────────────────────────────────────
 _KELLY_ENABLED      = os.getenv("KELLY_ENABLED",     "false").lower() not in ("false", "0", "no")
-_KELLY_MIN_FRACTION = float(os.getenv("KELLY_MIN_FRACTION", "0.05"))   # 5% mínimo de Kelly
-_KELLY_MAX_FRACTION = float(os.getenv("KELLY_MAX_FRACTION", "0.25"))   # 25% máximo de Kelly
+_KELLY_MIN_FRACTION = float(os.getenv("KELLY_MIN_FRACTION", "0.05"))
+_KELLY_MAX_FRACTION = float(os.getenv("KELLY_MAX_FRACTION", "0.25"))
 
 
 def compute_kelly_fraction(
@@ -40,12 +46,7 @@ def compute_kelly_fraction(
 ) -> float:
     """
     Fracción de Kelly = (p * b - q) / b
-      donde p = win_rate,  q = 1 - p,
-            b = avg_win / avg_loss  (odds)
-
-    La fracción se limita al intervalo [KELLY_MIN_FRACTION, KELLY_MAX_FRACTION].
-    Si los inputs son inválidos o la fracción es negativa (EV negativo)
-    se devuelve KELLY_MIN_FRACTION para forzar tamaño mínimo seguro.
+    Limitada a [KELLY_MIN_FRACTION, KELLY_MAX_FRACTION].
     """
     if avg_loss <= 0 or win_rate <= 0 or win_rate >= 1:
         log.debug("[kelly] inputs inválidos: win_rate=%.3f avg_win=%.4f avg_loss=%.4f",
@@ -61,8 +62,7 @@ def compute_kelly_fraction(
         return _KELLY_MIN_FRACTION
 
     clipped = max(_KELLY_MIN_FRACTION, min(_KELLY_MAX_FRACTION, kelly))
-    log.debug("[kelly] raw=%.4f → clipped=%.4f (min=%.3f max=%.3f)",
-              kelly, clipped, _KELLY_MIN_FRACTION, _KELLY_MAX_FRACTION)
+    log.debug("[kelly] raw=%.4f → clipped=%.4f", kelly, clipped)
     return clipped
 
 
@@ -74,22 +74,7 @@ def calc_position_size(
     ef_penalty:  int             = 0,
     kelly_stats: Optional[dict]  = None,
 ) -> float:
-    """
-    Calcula el tamaño de posición (en contratos/monedas).
-
-    Flujo:
-      1. Riesgo base = capital * MAX_RISK_PCT
-      2. Si kelly_stats provisto y KELLY_ENABLED=true:
-           kelly_fraction = compute_kelly_fraction(...)
-           riesgo_efectivo = riesgo_base * kelly_fraction
-         else:
-           riesgo_efectivo = riesgo_base
-      3. Penalización EF: riesgo *= (1 - ef_penalty * EF_PENALTY_REDUCTION)
-      4. qty = riesgo_efectivo / (risk_per_unit * leverage)
-
-    kelly_stats: dict con claves 'win_rate', 'avg_win', 'avg_loss' (floats).
-    ef_penalty:  0–3 penalizaciones de enriched_filter.
-    """
+    """Calcula el tamaño de posición (en contratos/monedas)."""
     _cap = capital if capital is not None else _CAPITAL
     if entry <= 0 or sl <= 0 or entry == sl:
         log.warning("[decision_engine] entry/sl inválidos: entry=%.6f sl=%.6f", entry, sl)
@@ -98,7 +83,6 @@ def calc_position_size(
     risk_per_unit = abs(entry - sl)
     base_risk     = _cap * _MAX_RISK_PCT
 
-    # Kelly
     kelly_fraction = 1.0
     if _KELLY_ENABLED and kelly_stats:
         kelly_fraction = compute_kelly_fraction(
@@ -116,7 +100,6 @@ def calc_position_size(
 
     effective_risk = base_risk * kelly_fraction
 
-    # Penalización por enriquecido (0–3 niveles)
     if ef_penalty > 0:
         factor = max(0.0, 1.0 - ef_penalty * _EF_PENALTY_REDUCTION)
         effective_risk *= factor
@@ -137,17 +120,108 @@ def calc_position_size(
 
 class DecisionEngine:
     """
-    Fachada orientada a objetos sobre las funciones de sizing de este módulo.
+    Orquestador de señales para TradingLoop.
 
-    Permite que bot/core/decision_engine.py haga:
-        from bot.decision_engine import DecisionEngine  # re-export
-    sin ImportError.
+    Inyectado desde TradingLoop._build_decision_engine() con:
+        DecisionEngine(
+            risk_manager  = risk,
+            pretrade_risk = pretrade_risk_singleton,
+            signal_engine = signal_engine_module,
+            cooldown      = signal_cooldown,
+        )
 
-    Uso:
-        de = DecisionEngine()
-        qty = de.calc_position_size(entry=..., sl=..., leverage=...)
-        frac = de.compute_kelly_fraction(win_rate=..., avg_win=..., avg_loss=...)
+    Métodos públicos:
+        await evaluate(symbol, price, ohlcv_fn)  → dict | None
+        await on_position_closed(symbol, pnl, reason, entry_mode)
+        calc_position_size(...)                  → float  (delegado)
+        compute_kelly_fraction(...)              → float  (delegado)
     """
+
+    def __init__(
+        self,
+        risk_manager=None,
+        pretrade_risk=None,
+        signal_engine=None,
+        cooldown=None,
+    ):
+        self._risk_manager  = risk_manager
+        self._pretrade_risk = pretrade_risk
+        self._signal_engine = signal_engine
+        self._cooldown      = cooldown
+
+    # ── Interface principal ───────────────────────────────────────────────────
+
+    async def evaluate(self, symbol: str, price: float, ohlcv_fn) -> Optional[dict]:
+        """
+        Evalúa la señal para el símbolo delegando en signal_engine.
+        Retorna dict de señal o None si no hay entrada.
+        Soporta signal_engine con evaluate(), evaluate_signal() o get_signal(),
+        tanto síncronos como async.
+        """
+        if self._signal_engine is None:
+            log.warning("[DecisionEngine] signal_engine no inyectado para %s", symbol)
+            return None
+
+        try:
+            se = self._signal_engine
+            if hasattr(se, "evaluate"):
+                result = se.evaluate(symbol, price, ohlcv_fn)
+            elif hasattr(se, "evaluate_signal"):
+                result = se.evaluate_signal(symbol, price, ohlcv_fn)
+            elif hasattr(se, "get_signal"):
+                result = se.get_signal(symbol, price, ohlcv_fn)
+            else:
+                log.error(
+                    "[DecisionEngine] signal_engine no tiene evaluate/evaluate_signal/get_signal"
+                )
+                return None
+
+            import inspect
+            if inspect.isawaitable(result):
+                result = await result
+
+            return result if isinstance(result, dict) else None
+
+        except Exception as exc:
+            log.error("[DecisionEngine] evaluate(%s) error: %s", symbol, exc, exc_info=True)
+            return None
+
+    async def on_position_closed(
+        self,
+        symbol:     str,
+        pnl:        float,
+        reason:     str = "",
+        entry_mode: str = "",
+    ) -> None:
+        """
+        Notifica el cierre de posición a pretrade_risk (libera slot)
+        y al cooldown si corresponde.
+        """
+        if self._pretrade_risk is not None:
+            try:
+                fn = getattr(self._pretrade_risk, "on_position_closed", None)
+                if callable(fn):
+                    import inspect
+                    res = fn(symbol=symbol, pnl=pnl, reason=reason, entry_mode=entry_mode)
+                    if inspect.isawaitable(res):
+                        await res
+            except Exception as exc:
+                log.warning(
+                    "[DecisionEngine] pretrade_risk.on_position_closed error: %s", exc
+                )
+
+        if self._cooldown is not None:
+            try:
+                fn = getattr(self._cooldown, "register_close", None)
+                if callable(fn):
+                    import inspect
+                    res = fn(symbol)
+                    if inspect.isawaitable(res):
+                        await res
+            except Exception as exc:
+                log.debug("[DecisionEngine] cooldown.register_close error: %s", exc)
+
+    # ── Delegados de sizing ───────────────────────────────────────────────────
 
     def calc_position_size(
         self,
@@ -159,12 +233,8 @@ class DecisionEngine:
         kelly_stats: Optional[dict]  = None,
     ) -> float:
         return calc_position_size(
-            entry=entry,
-            sl=sl,
-            leverage=leverage,
-            capital=capital,
-            ef_penalty=ef_penalty,
-            kelly_stats=kelly_stats,
+            entry=entry, sl=sl, leverage=leverage,
+            capital=capital, ef_penalty=ef_penalty, kelly_stats=kelly_stats,
         )
 
     def compute_kelly_fraction(
@@ -174,7 +244,5 @@ class DecisionEngine:
         avg_loss: float,
     ) -> float:
         return compute_kelly_fraction(
-            win_rate=win_rate,
-            avg_win=avg_win,
-            avg_loss=avg_loss,
+            win_rate=win_rate, avg_win=avg_win, avg_loss=avg_loss,
         )
