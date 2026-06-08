@@ -1143,298 +1143,205 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             "close=%.6f range=[%.6f-%.6f] pad=%.6f | "
             "Vol=%.2fx(min=%.1fx) | ST1h=%s | ST4h=%s | RSI=%.1f | MACD1h=%s | umbral=%d",
             MAX,
-            "✅" if broke_up    else "❌",
-            "✅" if broke_down  else "❌",
-            "✅" if retest_up   else "❌",
-            "✅" if retest_down else "❌",
+            broke_up, broke_down, retest_up, retest_down,
             current_close, range_low, range_high, breakout_pad,
-            vol_ratio, _BREAKOUT_VOL_MIN,
-            "✅" if st1h_ok   else "❌",
-            "✅" if st4h_ok   else "❌",
+            vol_ratio, _BREAKOUT_VOL_MIN_HARD,
+            "✅" if st1h_ok else "❌",
+            "✅" if st4h_ok else "❌",
             rsi_val,
             "✅" if macd_1h_ok else "❌",
             MIN_SCORE,
         )
         return "BREAKOUT", "NEUTRAL", 0, MAX, [
-            f"Sin rotura ni retesteo: close={current_close:.4f} rango=[{range_low:.4f}-{range_high:.4f}]"
+            f"Precio en rango (no breakout ni retest): close={current_close:.6f} "
+            f"range=[{range_low:.6f}-{range_high:.6f}] pad={breakout_pad:.6f}"
         ]
 
-    if atr_val > 0 and len(bars_15m) >= _BREAKOUT_WINDOW * 2:
-        hist_highs  = [float(_b_high(b))  for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
-        hist_lows   = [float(_b_low(b))   for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
-        hist_closes = [float(_b_close(b)) for b in bars_15m[-(_BREAKOUT_WINDOW * 2):-_BREAKOUT_WINDOW]]
-        hist_atr = calc_atr(hist_highs, hist_lows, hist_closes, min(14, len(hist_closes) - 1))
-        if hist_atr > 0:
-            squeeze_threshold = hist_atr * (1.0 - _BREAKOUT_SQUEEZE_PCT / 100.0)
-            if atr_val > squeeze_threshold:
-                log.debug(
-                    "[signal_engine] BREAKOUT bloqueado: ATR actual=%.6f > umbral=%.6f",
-                    atr_val, squeeze_threshold,
-                )
-                return "BREAKOUT", "NEUTRAL", 0, MAX, [
-                    f"Sin compresión previa: ATR ({atr_val:.6f}) > umbral ({squeeze_threshold:.6f})"
-                ]
-            reasons.append(
-                f"ATR squeeze OK: actual={atr_val:.6f} < umbral={squeeze_threshold:.6f} "
-                f"(hist={hist_atr:.6f}) +0"
-            )
+    direction = "LONG" if (broke_up or retest_up) else "SHORT"
+    score = 0.0
 
-    if broke_up or retest_up:
-        direction = "LONG"
-    else:
-        direction = "SHORT"
-
-    is_retest = retest_up or retest_down
-
-    score = float(_WB["BASE"])
-    if is_retest:
+    if broke_up or broke_down:
+        w = _WB["BASE"]
+        score += w
+        reasons.append(f"Breakout confirmado {'↑' if broke_up else '↓'} +{w:.2f}")
+    if retest_up or retest_down:
         w = _WB["RETEST"]
         score += w
-        reasons.append(
-            f"Retesteo del nivel {'superior' if retest_up else 'inferior'} "
-            f"(close={current_close:.4f} ≈ {range_high if retest_up else range_low:.4f}) "
-            f"+{w:.2f} bonus (score base={_WB['BASE']:.2f}, score parcial={score:.2f})"
-        )
-    else:
-        reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} confirmada +{_WB['BASE']:.2f}")
+        reasons.append(f"Retest del nivel {'resistencia' if retest_up else 'soporte'} +{w:.2f}")
 
     if vol_ratio >= _BREAKOUT_VOL_MIN:
         w = _WB["VOL_HIGH"]
         score += w
-        reasons.append(f"Vol={vol_ratio:.1f}x breakout +{w:.2f}")
-    elif vol_ratio >= 1.1:
+        reasons.append(f"Vol={vol_ratio:.1f}x breakout de alta convicción +{w:.2f}")
+    elif vol_ratio >= _BREAKOUT_VOL_MIN_HARD:
         w = _WB["VOL_MID"]
         score += w
-        reasons.append(f"Vol={vol_ratio:.1f}x moderado +{w:.2f}")
-    else:
-        reasons.append(f"Vol={vol_ratio:.1f}x aceptable (superó mínimo duro de {_BREAKOUT_VOL_MIN_HARD}x)")
-
-    st1h_ok = False
-    st4h_ok = False
-    macd_1h_ok = False
+        reasons.append(f"Vol={vol_ratio:.1f}x breakout aceptable +{w:.2f}")
 
     if i1h:
         st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
         if st1h_ok:
             w = _WB["ST_1H"]
             score += w
-            reasons.append(f"ST1h confirma +{w:.2f}")
-        else:
-            reasons.append("ST1h no confirma")
+            reasons.append(f"ST1h confirmando dirección {direction} +{w:.2f}")
+
     if i4h:
         st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
         if st4h_ok:
             w = _WB["ST_4H"]
             score += w
-            reasons.append(f"ST4h confirma +{w:.2f}")
-        else:
-            reasons.append("ST4h no confirma")
+            reasons.append(f"ST4h confirmando dirección {direction} +{w:.2f}")
+
     rsi_15m = i15.get("rsi_val")
-    rsi_ok = False
     if rsi_15m is not None:
-        rsi_ok = (direction == "LONG" and 45 <= rsi_15m <= 70) or (direction == "SHORT" and 30 <= rsi_15m <= 55)
+        rsi_ok = (direction == "LONG" and 40 <= rsi_15m <= 70) or (direction == "SHORT" and 30 <= rsi_15m <= 60)
         if rsi_ok:
             w = _WB["RSI"]
             score += w
-            reasons.append(f"RSI15m={rsi_15m:.0f} razonable +{w:.2f}")
-        else:
-            reasons.append(f"RSI15m={rsi_15m:.0f} sobreextendido")
+            reasons.append(f"RSI15m={rsi_15m:.0f} zona válida breakout +{w:.2f}")
+
     if i1h:
         macd_1h_ok = (direction == "LONG" and i1h.get("macd_bull")) or (direction == "SHORT" and i1h.get("macd_bear"))
         if macd_1h_ok:
             w = _WB["MACD_1H"]
             score += w
-            reasons.append(f"MACD1h en favor +{w:.2f}")
-        else:
-            reasons.append("MACD1h en contra")
+            reasons.append(f"MACD1h confirma {direction} +{w:.2f}")
+
+    # Squeeze check
+    range_size = range_high - range_low
+    avg_atr_approx = atr_val * _BREAKOUT_WINDOW
+    is_squeeze = (range_size / avg_atr_approx * 100) < _BREAKOUT_SQUEEZE_PCT if avg_atr_approx > 0 else False
+    if is_squeeze:
+        reasons.append(f"Squeeze detectado ({range_size/avg_atr_approx*100:.0f}% < {_BREAKOUT_SQUEEZE_PCT}% ATR range)")
 
     log.info(
         "[signal_engine] EVAL BREAKOUT(%s) → score=%.2f/%d | "
-        "BrokeUp=%s | BrokeDown=%s | Retest=%s | "
-        "Vol=%.2fx(min=%.1fx) | ST1h=%s | ST4h=%s | RSI=%.1f(%s) | MACD1h=%s | "
-        "umbral=%d | ratio=%.2f(min=%.2f)",
+        "BrokeUp=%s | BrokeDown=%s | RetestUp=%s | RetestDown=%s | "
+        "close=%.6f range=[%.6f-%.6f] pad=%.6f | "
+        "Vol=%.2fx | Squeeze=%s | umbral=%d | ratio=%.2f(min=%.2f)",
         direction, score, MAX,
-        "✅" if broke_up   else "❌",
-        "✅" if broke_down else "❌",
-        "✅" if is_retest  else "❌",
-        vol_ratio, _BREAKOUT_VOL_MIN,
-        "✅" if st1h_ok    else "❌",
-        "✅" if st4h_ok    else "❌",
-        rsi_15m or 0.0,
-        "✅" if rsi_ok     else "❌",
-        "✅" if macd_1h_ok else "❌",
-        MIN_SCORE,
-        score / MAX if MAX > 0 else 0.0,
-        _min_score_ratio_for_regime(None),
+        broke_up, broke_down, retest_up, retest_down,
+        current_close, range_low, range_high, breakout_pad,
+        vol_ratio, is_squeeze,
+        MIN_SCORE, score / MAX if MAX > 0 else 0.0, _min_score_ratio_for_regime(None),
     )
 
     return "BREAKOUT", direction, score, MAX, reasons
+
 
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, float, int, List[str]]:
     MAX = 10
     reasons: List[str] = []
 
-    close_15m = i15.get("close", 0)
-    rsi_15m   = i15.get("rsi_val")
-
+    rsi_15m = i15.get("rsi_val")
     if rsi_15m is None:
         return "REVERSAL", "NEUTRAL", 0, MAX, ["RSI no disponible"]
 
-    oversold  = rsi_15m <= _REVERSAL_RSI_LOW
-    overbought = rsi_15m >= _REVERSAL_RSI_HIGH
+    is_oversold  = rsi_15m <= _REVERSAL_RSI_LOW
+    is_overbought = rsi_15m >= _REVERSAL_RSI_HIGH
 
-    if not oversold and not overbought:
+    if not is_oversold and not is_overbought:
+        log.info(
+            "[signal_engine] EVAL REVERSAL → score=0/%d | RSI=%.1f "
+            "(oversold<=%s overbought>=%s) | umbral=%d",
+            MAX, rsi_15m, _REVERSAL_RSI_LOW, _REVERSAL_RSI_HIGH, MIN_SCORE,
+        )
         return "REVERSAL", "NEUTRAL", 0, MAX, [
-            f"RSI15m={rsi_15m:.1f} fuera de zona extrema ({_REVERSAL_RSI_LOW}/{_REVERSAL_RSI_HIGH})"
+            f"RSI15m={rsi_15m:.0f} fuera de zona reversión (umbral: <{_REVERSAL_RSI_LOW} o >{_REVERSAL_RSI_HIGH})"
         ]
 
-    direction = "LONG" if oversold else "SHORT"
+    direction = "LONG" if is_oversold else "SHORT"
+    score = 0.0
 
-    score = float(_WR["BASE"])
-    reasons.append(f"RSI15m={rsi_15m:.1f} zona {'oversold' if oversold else 'overbought'} +{_WR['BASE']:.2f}")
+    w = _WR["BASE"]
+    score += w
+    reasons.append(f"RSI15m={rsi_15m:.0f} en zona reversión {'sobrevendida' if is_oversold else 'sobrecomprada'} +{w:.2f}")
 
+    # Swing high/low check
     if len(bars_15m) >= 10:
         recent = bars_15m[-10:]
-        swing_low  = min(float(_b_low(b))  for b in recent)
-        swing_high = max(float(_b_high(b)) for b in recent)
         if direction == "LONG":
-            swing_ok = abs(close_15m - swing_low) / swing_low <= _REVERSAL_SWING_TOL if swing_low > 0 else False
+            swing_low = min(float(_b_low(b)) for b in recent)
+            current_low = float(_b_low(bars_15m[-1]))
+            if current_low <= swing_low * (1 + _REVERSAL_SWING_TOL):
+                w = _WR["SWING"]
+                score += w
+                reasons.append(f"Swing low confirmado ({current_low:.6f} ≈ {swing_low:.6f}) +{w:.2f}")
         else:
-            swing_ok = abs(close_15m - swing_high) / swing_high <= _REVERSAL_SWING_TOL if swing_high > 0 else False
-        if swing_ok:
-            w = _WR["SWING"]
-            score += w
-            reasons.append(f"Precio cerca del swing {'low' if direction == 'LONG' else 'high'} +{w:.2f}")
-        else:
-            reasons.append(f"Sin swing {'low' if direction == 'LONG' else 'high'} cercano")
+            swing_high = max(float(_b_high(b)) for b in recent)
+            current_high = float(_b_high(bars_15m[-1]))
+            if current_high >= swing_high * (1 - _REVERSAL_SWING_TOL):
+                w = _WR["SWING"]
+                score += w
+                reasons.append(f"Swing high confirmado ({current_high:.6f} ≈ {swing_high:.6f}) +{w:.2f}")
 
+    # EMA50 soporte/resistencia
     ema50_15m = i15.get("ema50")
+    close_15m  = i15.get("close", 0)
     if ema50_15m and close_15m:
-        ema50_ok = (direction == "LONG" and close_15m < ema50_15m) or (direction == "SHORT" and close_15m > ema50_15m)
+        ema50_ok = (direction == "LONG" and close_15m >= ema50_15m * 0.995) or \
+                   (direction == "SHORT" and close_15m <= ema50_15m * 1.005)
         if ema50_ok:
             w = _WR["EMA50"]
             score += w
-            reasons.append(f"Precio al lado correcto de EMA50_15m +{w:.2f}")
-        else:
-            reasons.append("Precio al lado incorrecto de EMA50_15m")
+            reasons.append(f"EMA50_15m soporte/resistencia activo ({ema50_15m:.6f}) +{w:.2f}")
 
-    macd_ok_rev = (direction == "LONG" and i15.get("macd_bull")) or (direction == "SHORT" and i15.get("macd_bear"))
-    if macd_ok_rev:
+    # MACD divergencia
+    macd_div = (direction == "LONG" and i15.get("rsi_div_bull")) or \
+               (direction == "SHORT" and i15.get("rsi_div_bear"))
+    if macd_div:
         w = _WR["MACD"]
         score += w
-        reasons.append(f"MACD15m confirma reversión +{w:.2f}")
-    else:
-        reasons.append("MACD15m no confirma reversión aún")
+        reasons.append(f"Divergencia RSI {direction} confirmada +{w:.2f}")
 
+    # Volumen
     vol_ratio = i15.get("vol_ratio", 1.0)
     if vol_ratio >= _VOL_CONFIRM_MIN:
         w = _WR["VOL"]
         score += w
-        reasons.append(f"Vol15m={vol_ratio:.1f}x confirma reversión +{w:.2f}")
-    else:
-        reasons.append(f"Vol15m={vol_ratio:.1f}x débil para reversión")
+        reasons.append(f"Vol={vol_ratio:.1f}x confirmando reversión +{w:.2f}")
 
-    div_ok = i15.get("rsi_div_bull") if direction == "LONG" else i15.get("rsi_div_bear")
-    if div_ok:
+    # RSI bonus (zona extrema)
+    extreme_rsi = (direction == "LONG" and rsi_15m <= 20) or (direction == "SHORT" and rsi_15m >= 80)
+    if extreme_rsi:
         w = _WR["RSI"]
         score += w
-        reasons.append(f"Divergencia RSI {'alcista' if direction == 'LONG' else 'bajista'} confirmada +{w:.2f}")
-    else:
-        reasons.append(f"Sin divergencia RSI {'alcista' if direction == 'LONG' else 'bajista'}")
+        reasons.append(f"RSI extremo {rsi_15m:.0f} — alta probabilidad reversión +{w:.2f}")
 
+    # VWAP
     vwap_val = i15.get("vwap", 0.0)
     if vwap_val and vwap_val > 0 and close_15m:
-        vwap_ok = (direction == "LONG" and close_15m < vwap_val) or (direction == "SHORT" and close_15m > vwap_val)
-        if vwap_ok:
+        vwap_rev_ok = (direction == "LONG" and close_15m < vwap_val) or \
+                      (direction == "SHORT" and close_15m > vwap_val)
+        if vwap_rev_ok:
             w = _WR["VWAP"]
             score += w
-            reasons.append(f"Precio bajo VWAP para reversión {direction} +{w:.2f}")
-        else:
-            reasons.append(f"Precio sobre VWAP — menos favorable para reversión {direction}")
+            reasons.append(f"Precio lejos del VWAP — tensión para reversión +{w:.2f}")
 
+    # ST4h contra-tendencia (válido en reversión)
     if i4h:
-        st4h_rev_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
-        if st4h_rev_ok:
+        st4h_against = (direction == "LONG" and i4h.get("st_bear")) or \
+                       (direction == "SHORT" and i4h.get("st_bull"))
+        if st4h_against:
             w = _WR["ST_4H"]
             score += w
-            reasons.append(f"ST4h confirma reversión {direction} +{w:.2f}")
-        else:
-            reasons.append(f"ST4h no confirma reversión {direction}")
+            reasons.append(f"ST4h en contra — posible agotamiento de tendencia +{w:.2f}")
 
     log.info(
-        "[signal_engine] EVAL REVERSAL(%s) → score=%.2f/%d | RSI=%.1f | "
-        "umbral=%d | ratio=%.2f(min=%.2f)",
-        direction, score, MAX, rsi_15m or 0.0,
-        MIN_SCORE,
-        score / MAX if MAX > 0 else 0.0,
-        _min_score_ratio_for_regime(None),
+        "[signal_engine] EVAL REVERSAL(%s) → score=%.2f/%d | "
+        "RSI=%.1f | Vol=%.2fx | VWAP=%s | Divergencia=%s | ST4h_contra=%s | umbral=%d | ratio=%.2f(min=%.2f)",
+        direction, score, MAX,
+        rsi_15m, vol_ratio,
+        "✅" if (vwap_val and close_15m and ((direction == "LONG" and close_15m < vwap_val) or (direction == "SHORT" and close_15m > vwap_val))) else "❌",
+        "✅" if macd_div else "❌",
+        "✅" if (i4h and ((direction == "LONG" and i4h.get("st_bear")) or (direction == "SHORT" and i4h.get("st_bull")))) else "❌",
+        MIN_SCORE, score / MAX if MAX > 0 else 0.0, _min_score_ratio_for_regime(None),
     )
 
     return "REVERSAL", direction, score, MAX, reasons
 
 
-# ---------------------------------------------------------------------------
-# WRAPPER evaluate() — requerido por DecisionEngine
-# ---------------------------------------------------------------------------
-# DecisionEngine busca signal_engine.evaluate(symbol, price, ohlcv_fn).
-# Este wrapper adapta esa firma a analyze_pair() y devuelve un dict
-# compatible, o None si la señal no es válida.
-# ---------------------------------------------------------------------------
-
-async def evaluate(symbol: str, price: float, ohlcv_fn) -> Optional[dict]:
-    """
-    Punto de entrada para DecisionEngine.evaluate().
-    Llama a analyze_pair con ohlcv_fn y convierte SignalResult → dict.
-    Devuelve None si is_valid=False o signal=NEUTRAL.
-    """
-    try:
-        result: SignalResult = await analyze_pair(
-            exch=None,
-            symbol=symbol,
-            ohlcv_fn=ohlcv_fn,
-        )
-    except Exception as exc:
-        log.error("[signal_engine] evaluate(%s) error: %s", symbol, exc, exc_info=True)
-        return None
-
-    if result is None:
-        return None
-    if result.signal == "NEUTRAL" or not result.is_valid:
-        log.debug(
-            "[signal_engine] evaluate(%s) → sin señal válida (signal=%s is_valid=%s reason=%s)",
-            symbol, result.signal, result.is_valid, result.reason,
-        )
-        return None
-
-    return {
-        "symbol":        result.symbol,
-        "signal":        result.signal,
-        "entry_mode":    result.entry_mode,
-        "score":         result.score,
-        "max_score":     result.max_score,
-        "entry":         result.entry,
-        "sl":            result.sl,
-        "tp1":           result.tp1,
-        "tp2":           result.tp2,
-        "atr":           result.atr,
-        "rr":            result.rr,
-        "suggested_lev": result.suggested_lev,
-        "indicators":    result.indicators,
-        "reason":        result.reason,
-        "signal_block":  result.signal_block,
-        **result.extra,
-    }
-
-
-# ---------------------------------------------------------------------------
-# _hold_result / _fetch_bars — helpers internos
-# ---------------------------------------------------------------------------
-
-def _hold_result(
-    symbol: str,
-    reason: str = "",
-    max_score: int = MAX_SCORE_NEUTRAL,
-) -> SignalResult:
+def _hold_result(symbol: str, reason: str, max_score: int = MAX_SCORE_NEUTRAL) -> SignalResult:
     return SignalResult(
         symbol=symbol,
         signal="NEUTRAL",
@@ -1454,17 +1361,10 @@ def _hold_result(
     )
 
 
-async def _fetch_bars(
-    exch,
-    symbol: str,
-    timeframe: str,
-    limit: int,
-) -> list:
-    """Fetch OHLCV bars usando el exchange ccxt pasado como parámetro."""
+async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
     try:
-        ccxt_symbol = _to_ccxt_symbol(symbol)
-        bars = await exch.fetch_ohlcv(ccxt_symbol, timeframe=timeframe, limit=limit)
+        bars = await exch.fetch_ohlcv(symbol, timeframe, limit=limit)
         return bars or []
     except Exception as e:
-        log.warning("[signal_engine] _fetch_bars(%s, %s) error: %s", symbol, timeframe, e)
+        log.warning("[signal_engine] _fetch_bars %s %s error: %s", symbol, timeframe, e)
         return []
