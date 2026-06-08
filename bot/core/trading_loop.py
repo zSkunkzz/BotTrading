@@ -1,6 +1,19 @@
 """
 trading_loop.py — Loop principal de trading para un símbolo.
 
+FIX v21 (2026-06-08): global_risk.can_open() + register_open() integrados
+  - _iteration(): antes de llamar trader.open_order(), se consulta
+    global_risk.can_open(). Si retorna False, se registra en log y se
+    descarta la señal para este ciclo (sin cooldown — se reintentará en
+    el siguiente scan cuando haya slot disponible).
+  - Tras open_order(), si se confirma que trader.position pasó de None a
+    algo, se llama global_risk.register_open() para incrementar el contador
+    de posiciones abiertas. Sin esto, max_concurrent_trades nunca se aplicaba.
+  - _build_decision_engine(): corregido para pasar siempre `risk`
+    (RiskManager) al DecisionEngine en lugar de `global_risk or risk`.
+    GlobalRisk no implementa la interfaz de RiskManager y su uso aquí
+    causaba AttributeError silenciosos en evaluate().
+
 FIX v20 (2026-06-07): limpiar tp2/tp3 — solo 1 TP activo
   - _init(): ya no restaura tp2/tp3 desde disco.
   - _iteration(): notify_open ya no envía tp2/tp3.
@@ -213,6 +226,9 @@ class TradingLoop:
         self._ohlcv_fail_streak: int = 0
 
     def _build_decision_engine(self, risk):
+        # v21 fix: siempre pasar `risk` (RiskManager) — nunca GlobalRisk.
+        # GlobalRisk no implementa la interfaz de RiskManager y su uso aquí
+        # causaba AttributeError silenciosos dentro de DecisionEngine.evaluate().
         from bot import signal_engine
         from bot.signal_cooldown import signal_cooldown
         from bot.pretrade_risk import pretrade_risk as _pretrade_singleton
@@ -226,7 +242,8 @@ class TradingLoop:
 
     async def run(self, trader, risk, *, global_risk=None) -> None:
         if self._decision_engine is None:
-            self._decision_engine = self._build_decision_engine(global_risk or risk)
+            # v21 fix: pasar siempre `risk`, no `global_risk or risk`
+            self._decision_engine = self._build_decision_engine(risk)
 
         if global_risk is not None:
             self._global_risk = global_risk
@@ -591,8 +608,45 @@ class TradingLoop:
                     float(signal.get("sl") or 0),
                     float(signal.get("tp1") or 0),
                 )
+
+                # ── v21: Guardia GlobalRisk — comprobar slot disponible ────────
+                _gr = self._global_risk or global_risk
+                if _gr is not None:
+                    try:
+                        can_open, reason = await _gr.can_open()
+                    except Exception as _gre:
+                        logger.warning(
+                            "[%s] global_risk.can_open() error — permitiendo apertura: %s",
+                            self.symbol, _gre,
+                        )
+                        can_open, reason = True, "error en can_open (fallback permisivo)"
+                    if not can_open:
+                        logger.info(
+                            "[%s] ⛔ GlobalRisk bloqueó apertura: %s — "
+                            "señal descartada (se reintentará en próximo scan).",
+                            self.symbol, reason,
+                        )
+                        return
+                # ─────────────────────────────────────────────────────────────
+
                 pos_before = trader.position
                 await trader.open_order(signal, risk)
+
+                # ── v21: Registrar apertura en GlobalRisk ─────────────────────
+                if trader.position is not None and pos_before is None:
+                    if _gr is not None:
+                        try:
+                            await _gr.register_open()
+                            logger.info(
+                                "[%s] global_risk.register_open() — slot ocupado.",
+                                self.symbol,
+                            )
+                        except Exception as _gre:
+                            logger.warning(
+                                "[%s] global_risk.register_open() error: %s",
+                                self.symbol, _gre,
+                            )
+                # ─────────────────────────────────────────────────────────────
 
                 # FIX v20: notify_open solo envía tp1 (un único TP activo).
                 # tp2/tp3 se eliminaron del flujo de órdenes.
