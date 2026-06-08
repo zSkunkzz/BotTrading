@@ -55,6 +55,14 @@ v25 — Fix SL/TP único y BE robusto:
   5. _ensure_tpsl detecta SL en entry_price (±0.1%) como SL válido,
      evitando spam de "emergencia" cuando el SL ya está en BE.
 
+v27 — trailing SL ATR integrado:
+  Tras _check_break_even(), si trader.trailing_sl_activated=True, se ejecuta
+  compute_trailing_sl() de trailing_sl.py. El nuevo SL y el nuevo pico
+  se persisten en trader.sl y trader._trailing_peak. Si el precio toca el
+  trailing SL → cierre de emergencia 'TRAILING_SL'.
+  Config: TRAILING_SL_MODE (default 'atr'), TRAILING_SL_ATR_MULT (1.5x),
+          TRAILING_SL_PCT (0.015).
+
 v21 — Fix tp2/tp3 limpieza en _reset_trader_position_state.
 v20 — Fix BingX migration — _update_sl_to_be cancela todas las órdenes.
 v19 — _reset_trader_position_state robusto con asyncio.
@@ -136,6 +144,7 @@ class PositionManager:
     Gestiona el ciclo de vida de una posición abierta:
       - Check de SL por software
       - Break-Even automático al 40% del recorrido entry→TP1
+      - Trailing SL ATR (post-TP1, cuando trailing_sl_activated=True)
       - Verificación periódica de SL/TP en el exchange
       - Colocación de emergencia si faltan SL/TP
     """
@@ -149,9 +158,82 @@ class PositionManager:
         if await self._check_sl_software():
             return
         await self._check_break_even()
+        await self._check_trailing_sl()   # v27: trailing SL post-TP1
         if now - self._last_tpsl_check >= _TPSL_VERIFY_INTERVAL_S:
             self._last_tpsl_check = now
             await self._ensure_tpsl()
+
+    # ── Trailing SL (v27) ───────────────────────────────────────────────────────────
+
+    async def _check_trailing_sl(self) -> None:
+        """
+        Si trader.trailing_sl_activated=True, actualiza el trailing SL usando
+        compute_trailing_sl() de trailing_sl.py.
+
+        - El ATR se lee de trader.indicators['15m']['atr_val'] (o 0.0).
+        - El pico favorable se persiste en trader._trailing_peak.
+        - Si el precio toca el trailing SL → cierre de emergencia 'TRAILING_SL'.
+        """
+        trader = self._trader
+
+        if not getattr(trader, "trailing_sl_activated", False):
+            return
+
+        position = getattr(trader, "position",     None)
+        price    = getattr(trader, "_last_price",  None)
+        current_sl = getattr(trader, "sl",         None)
+        symbol   = getattr(trader, "symbol",       "?")
+
+        if not position or not price or current_sl is None:
+            return
+
+        is_long    = _resolve_is_long(position)
+        peak_price = getattr(trader, "_trailing_peak", None)
+        if peak_price is None:
+            # Inicializar pico con el precio actual
+            peak_price = price
+            trader._trailing_peak = peak_price
+
+        # Leer ATR del timeframe de seguimiento (15m)
+        atr_val = 0.0
+        try:
+            indicators = getattr(trader, "indicators", {}) or {}
+            atr_val = float(indicators.get("15m", {}).get("atr_val") or 0.0)
+        except Exception:
+            pass
+
+        try:
+            from bot.trailing_sl import compute_trailing_sl, is_trailing_sl_hit
+        except ImportError as e:
+            log.error("[%s] trailing_sl import error: %s", symbol, e)
+            return
+
+        new_sl, new_peak = compute_trailing_sl(
+            is_long=is_long,
+            current_price=price,
+            peak_price=peak_price,
+            current_sl=current_sl,
+            atr_val=atr_val,
+        )
+
+        # Persistir pico actualizado
+        trader._trailing_peak = new_peak
+
+        # Actualizar SL solo si mejoró (trailing nunca retrocede)
+        if new_sl != current_sl:
+            log.info(
+                "[%s] 🟡 trailing SL: %.6f → %.6f (pico=%.6f atr=%.6f)",
+                symbol, current_sl, new_sl, new_peak, atr_val,
+            )
+            trader.sl = new_sl
+
+        # Verificar si el precio ha tocado el trailing SL
+        if is_trailing_sl_hit(is_long=is_long, current_price=price, trailing_sl=new_sl):
+            log.warning(
+                "[%s] 🔴 TRAILING SL HIT: precio=%.6f sl=%.6f",
+                symbol, price, new_sl,
+            )
+            await self._emergency_close(reason="TRAILING_SL")
 
     # ── Break-Even ─────────────────────────────────────────────────────────────────
 
@@ -383,7 +465,7 @@ class PositionManager:
                 log.debug("[%s] error cancelando orden %s: %s", symbol, order_id, e)
         log.info("[%s] %d orden(es) cancelada(s).", symbol, cancelled)
 
-    # ── Check SL por software ───────────────────────────────────────────────────
+    # ── Check SL por software ──────────────────────────────────────────────────────
 
     async def _check_sl_software(self) -> bool:
         trader = self._trader
@@ -408,7 +490,7 @@ class PositionManager:
         await self._emergency_close(reason="SL_SW")
         return True
 
-    # ── Verificación SL/TP en exchange ──────────────────────────────────────────────
+    # ── Verificación SL/TP en exchange ────────────────────────────────────────────────
 
     async def _ensure_tpsl(self) -> None:
         """
@@ -545,7 +627,7 @@ class PositionManager:
                 if attempt < _EMERGENCY_TPSL_RETRIES:
                     await asyncio.sleep(2 ** attempt)
 
-    # ── Cierre de emergencia ────────────────────────────────────────────────────────────────
+    # ── Cierre de emergencia ─────────────────────────────────────────────────────────────
 
     async def _emergency_close(self, reason: str = "EMERGENCY") -> None:
         trader = self._trader
@@ -585,14 +667,16 @@ def _reset_trader_position_state(trader, symbol: str) -> None:
     trader.position      = None
     trader.sl            = None
     trader.tp1           = None
-    if hasattr(trader, "tp2"):          trader.tp2 = None
-    if hasattr(trader, "tp3"):          trader.tp3 = None
-    if hasattr(trader, "tp"):           trader.tp  = None
+    if hasattr(trader, "tp2"):               trader.tp2 = None
+    if hasattr(trader, "tp3"):               trader.tp3 = None
+    if hasattr(trader, "tp"):                trader.tp  = None
     trader._open_qty     = 0.0
     trader._protection_ok = False
-    if hasattr(trader, "_tp1_be_done"): trader._tp1_be_done = False
-    if hasattr(trader, "entry_price"):  trader.entry_price  = None
-    if hasattr(trader, "_entry_price"): trader._entry_price = None
+    if hasattr(trader, "_tp1_be_done"):      trader._tp1_be_done = False
+    if hasattr(trader, "entry_price"):       trader.entry_price  = None
+    if hasattr(trader, "_entry_price"):      trader._entry_price = None
+    if hasattr(trader, "trailing_sl_activated"): trader.trailing_sl_activated = False
+    if hasattr(trader, "_trailing_peak"):   trader._trailing_peak = None
 
     try:
         from bot.telegram_bot import send_message
