@@ -2,6 +2,18 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v28 — Fix: self.atr no se seteaba al abrir posición (2026-06-08):
+  - _do_open_order() Paso 6 (DRY-RUN) y Paso 9 (LIVE):
+    ahora incluyen self.atr, self.trailing_sl_activated=False,
+    self._trailing_peak=None al actualizar estado post-apertura.
+  - __init__: declarados self.atr=0.0, self.trailing_sl_activated=False,
+    self._trailing_peak=None.
+  - Restauración desde state en __init__: si trailing_activated=True
+    y 'atr' guardado > 0, los restaura para que el trailing SL
+    sobreviva reinicios correctamente.
+  Sin este fix, position_manager._read_atr() siempre devolvía 0.0
+  y el trailing SL usaba modo 'pct' aunque TRAILING_SL_MODE=atr.
+
 v27 — Conectar kelly_multiplier al sizing (2026-06-08):
   - _do_open_order() paso 5b: tras calcular qty bruta, aplica kelly_multiplier()
     usando entry_mode, rr y score_ratio del signal.
@@ -9,46 +21,10 @@ v27 — Conectar kelly_multiplier al sizing (2026-06-08):
   - qty_kelly usa los mismos decimales del exchange que qty.
   - Guardia defensiva: si qty_kelly <= 0, se usa qty original.
 
-v26 — Fix get_ohlcv_fn: delegar en ohlcv_cache (2026-06-08):
-  - _ohlcv_fn ya NO traga ConnectionResetError/ConnectionAbortedError con return [].
-  - El fetch raw se extrae a _raw_fetch_ohlcv() que propaga excepciones.
-  - _ohlcv_fn delega en ohlcv_cache.get() que tiene backoff exponencial
-    (1s/2s/4s + jitter), OHLCV_FETCH_RETRIES reintentos y stale fallback.
-  - Resultado: ConnectionResetError(104) ya no produce lista vacía instantánea;
-    el bot usa datos en caché mientras BingX se recupera → señales continúan.
-
-v25 — Persistencia BE y restauración tras restart (2026-06-07):
-  - load_position importado para restaurar _tp1_be_done en __init__.
-  - save_position guarda be_done=False al abrir posición.
-  - Al arrancar el bot, si be_done=True en state, _tp1_be_done=True
-    evita que el BE se dispare dos veces tras un restart.
-
-v24 — Rebase automático de niveles al precio de mercado (2026-06-07):
-  - _check_price_staleness() ELIMINADO. Ya no cancela órdenes por drift.
-  - _rebase_signal_to_market(): nueva función que sustituye signal["entry"]
-    por ref_price y reescala SL y TP1 proporcionalmente, preservando los
-    ratios %  entry→SL y entry→TP1 originales de la señal.
-    Si el precio se ha movido >30% se aborta (precio irracional/error de datos).
-  - Paso 4 en _do_open_order(): ya no llama _check_price_staleness; llama
-    _rebase_signal_to_market() y actualiza signal in-place.
-  - Resultado: el bot entra SIEMPRE al precio real de mercado con los mismos
-    ratios de riesgo/recompensa, independientemente del lag del signal.
-
-v23 — Solo un TP; SL a Break-Even al 40% entry→TP1 (2026-06-07):
-  - _do_open_order(): eliminado el bloque «Paso 10 – TP2/TP3».
-    Ahora solo se coloca un único TP (tp1). tp2 y tp3 se ignoran
-    completamente: ni se extraen del signal para el exchange, ni se
-    persisten como órdenes en BingX.
-  - _adjust_levels_to_fill(): ya no reescala tp2 (eliminada la variable
-    tp2_adj y el return de tres valores → ahora devuelve (sl_adj, tp1_adj)).
-  - DRY-RUN: self.tp2 y self.tp3 siguen existiendo en el estado interno
-    (save_position los acepta), pero NO se colocan como órdenes en el
-    exchange (ni en dry-run ni en live). Esto evita confusión con el
-    exchange en modo live.
-  - La lógica de Break-Even ya estaba correcta en position_manager.py:
-    _BE_TRIGGER_PCT = 0.40 → mueve el SL a entry cuando el precio
-    alcanza el 40% del recorrido entry→tp1. No se modifica.
-
+v26 — Fix get_ohlcv_fn: delegar en ohlcv_cache (2026-06-08).
+v25 — Persistencia BE y restauración tras restart (2026-06-07).
+v24 — Rebase automático de niveles al precio de mercado (2026-06-07).
+v23 — Solo un TP; SL a Break-Even al 40% entry→TP1 (2026-06-07).
 v22 — Fix Bug Crítico 1: _do_open_order() ahora llama pretrade_risk.confirm_order() (2026-06-07).
 v21 — Fix Bug Menor 4: guardia dura SL/TP + cierre de emergencia si SL falla (2026-06-07).
 v20 — Fix 4 bugs internos (2026-06-07).
@@ -127,16 +103,10 @@ def _rebase_signal_to_market(
     Modifica signal in-place. Devuelve None si todo va bien, o un mensaje
     de error string si el drift es tan grande que parece datos corruptos
     (>MAX_REBASE_DRIFT_PCT, por defecto 30%).
-
-    Casos manejados:
-      - Señal reciente sin drift: sin cambios (entry ≈ ref_price).
-      - Señal con lag (precio subió/bajó): entry → ref_price, SL/TP reescalados.
-      - entry == 0 o ausente: se usa ref_price directamente, SL/TP sin cambio.
     """
     entry_signal = float(signal.get("entry") or 0)
 
     if entry_signal <= 0:
-        # Sin entry de referencia: usar precio de mercado, SL/TP sin tocar.
         signal["entry"] = ref_price
         logger.debug("[%s] rebase: sin entry en signal → usando ref_price=%.4f", symbol, ref_price)
         return None
@@ -144,18 +114,15 @@ def _rebase_signal_to_market(
     drift = (ref_price - entry_signal) / entry_signal
     abs_drift = abs(drift)
 
-    # Drift mayor al umbral de datos corruptos → abortar
     if abs_drift > _MAX_REBASE_DRIFT_PCT:
         return (
             f"🛑 Drift del precio ({drift*100:+.2f}%) supera el límite de "
             f"±{_MAX_REBASE_DRIFT_PCT*100:.0f}% — posibles datos corruptos — entrada cancelada"
         )
 
-    # Sin drift significativo: nada que hacer
     if abs_drift < 0.0005:
         return None
 
-    # Reescalar SL y TP1 preservando los ratios porcentuales originales
     sl_orig  = float(signal.get("sl")  or 0)
     tp1_orig = float(signal.get("tp1") or 0)
 
@@ -249,8 +216,12 @@ class FuturesTrader:
         self._last_price:    float           = 0.0
         self._instrument_unavailable: bool   = False
 
+        # v28: atributos para trailing SL ATR
+        self.atr:                    float           = 0.0    # ATR del timeframe de entrada (de signal.atr)
+        self.trailing_sl_activated:  bool            = False  # True tras activar BE
+        self._trailing_peak:         Optional[float] = None   # máximo/mínimo favorable desde BE
+
         # Fix #16: flag que indica que hay una orden en vuelo (open_order en ejecución).
-        # _stop_pair_with_cleanup() en main.py espera a que baje antes de cancelar la tarea.
         self._pending_order: bool = False
 
         # Fix #15: expuesto para que _idle_rotation_loop pueda rotarlo inmediatamente.
@@ -265,14 +236,26 @@ class FuturesTrader:
         self._trading_loop  = TradingLoop(symbol)
 
         # v25: restaurar _tp1_be_done desde state persistido (evita doble BE tras restart)
+        # v28: restaurar también trailing_sl_activated y atr para que el trailing
+        #      sobreviva reinicios del bot sin perder el contexto ATR.
         try:
             _saved = load_position(self.symbol)
-            if _saved and _saved.get("be_done", False):
-                self._tp1_be_done = True
-                logger.info(
-                    "[%s] BE ya activado en sesión anterior — restaurado desde state.",
-                    self.symbol,
-                )
+            if _saved:
+                if _saved.get("be_done", False):
+                    self._tp1_be_done = True
+                    logger.info(
+                        "[%s] BE ya activado en sesión anterior — restaurado desde state.",
+                        self.symbol,
+                    )
+                if _saved.get("trailing_activated", False):
+                    self.trailing_sl_activated = True
+                    _saved_atr = float(_saved.get("atr") or 0.0)
+                    if _saved_atr > 0:
+                        self.atr = _saved_atr
+                    logger.info(
+                        "[%s] trailing_sl_activated=True restaurado desde state (ATR=%.6f).",
+                        self.symbol, self.atr,
+                    )
         except Exception:
             pass
 
@@ -385,24 +368,11 @@ class FuturesTrader:
     def get_ohlcv_fn(self) -> Callable:
         """
         v26 FIX: Retorna un callable async que delega en ohlcv_cache.get().
-
-        ohlcv_cache tiene:
-          - Backoff exponencial (1s, 2s, 4s + jitter) en caso de error
-          - OHLCV_FETCH_RETRIES reintentos configurables
-          - Stale fallback: si BingX falla, devuelve datos anteriores en caché
-            en lugar de lista vacía
-
-        El fetch raw (_raw_fetch) ahora PROPAGA excepciones (no las traga)
-        para que ohlcv_cache pueda reintentar correctamente.
         """
         symbol = self.symbol
         inst_id = self.inst_id
 
         async def _raw_fetch(timeframe: str) -> list[dict]:
-            """
-            Fetch directo a BingX. Propaga excepciones — NO captura errores.
-            ohlcv_cache.get() es el responsable de reintentar con backoff.
-            """
             if self._bingx_client is None:
                 await self._get_ccxt()
 
@@ -437,11 +407,6 @@ class FuturesTrader:
             return candles
 
         async def _ohlcv_fn(timeframe: str = "15m", limit: int = _OHLCV_BARS) -> list[dict]:
-            """
-            Wrapper con caché: delega en ohlcv_cache que maneja backoff + stale fallback.
-            Si BingX devuelve ConnectionResetError, ohlcv_cache reintentará hasta
-            OHLCV_FETCH_RETRIES veces y devolverá datos anteriores si los tiene.
-            """
             return await ohlcv_cache.get(
                 coin=symbol,
                 tf=timeframe,
@@ -453,28 +418,6 @@ class FuturesTrader:
     # ── _get_positions ──────────────────────────────────────────────────────────────────
 
     async def _get_positions(self) -> list[dict]:
-        """
-        Consulta las posiciones abiertas en BingX para este símbolo.
-
-        v20 fix: reemplaza la implementación manual con HMAC duplicado por
-        BingXClient.get_positions(), que ya tiene la lógica correcta y probada
-        (Fix #13, v9: claves compatibles con trading_loop.py).
-
-        Retorna lista de dicts normalizados:
-          {
-            "symbol":      str,   # p.ej. "BTC-USDT"
-            "side":        str,   # "long" | "short"
-            "qty":         float, # tamaño en contratos (positivo)
-            "entry_price": float,
-            "mark_price":  float,
-            "pnl":         float, # PnL no realizado en USDT
-            "leverage":    int,
-            "margin_mode": str,   # "isolated" | "cross"
-          }
-
-        Filtra posiciones con qty == 0 (cerradas).
-        Retorna [] si el cliente no está listo o hay error de red.
-        """
         if self._bingx_client is None:
             try:
                 await self._get_ccxt()
@@ -512,15 +455,6 @@ class FuturesTrader:
     # ── _set_leverage ─────────────────────────────────────────────────────────────────
 
     async def _set_leverage(self, leverage: int) -> None:
-        """
-        Fix #14: antes de llamar al exchange, consulta el leverage máximo
-        real del par y capea el valor. Evita el error "Invalid leverage value"
-        cuando LEVERAGE > max permitido por BingX para ese símbolo.
-
-        v20 fix: get_max_leverage() no acepta argumentos (solo self).
-        Era: self._bingx_client.get_max_leverage(self.inst_id) → TypeError.
-        Fix: self._bingx_client.get_max_leverage()
-        """
         if self.dry_run:
             logger.info("[%s] [DRY-RUN] _set_leverage(%dx)", self.symbol, leverage)
             self._open_leverage = leverage
@@ -529,11 +463,9 @@ class FuturesTrader:
             logger.warning("[%s] _set_leverage: BingXClient no inicializado — skip.", self.symbol)
             return
 
-        # ── Fix #14: capping interno ─────────────────────────────────────
         effective_leverage = leverage
         try:
             if hasattr(self._bingx_client, "get_max_leverage"):
-                # v20 fix: get_max_leverage() no acepta argumentos
                 max_lev = await asyncio.to_thread(
                     self._bingx_client.get_max_leverage
                 )
@@ -550,7 +482,6 @@ class FuturesTrader:
                 "usando leverage configurado %dx sin verificar.",
                 self.symbol, e, leverage,
             )
-        # ─────────────────────────────────────────────────────────────────
 
         is_cross = self.margin_mode == "cross"
         try:
@@ -579,19 +510,11 @@ class FuturesTrader:
                 self.symbol, e,
             )
 
-    # ── _confirm_margin ────────────────────────────────────────────────────────────────
-    # v21 FIX (Bug Menor 4): guardia dura pre-apertura. Espeja ExecutionEngine.execute()
-    # trade_side=="open". Llamar ANTES de cualquier llamada al exchange.
-
     def _confirm_margin(
         self,
         sl_price: Optional[float],
         tp1_price: Optional[float],
     ) -> Optional[str]:
-        """
-        Verifica que los niveles mínimos de protección estén presentes antes de abrir.
-        Devuelve un mensaje de error si falta alguno, None si todo está OK.
-        """
         missing = []
         if not sl_price or sl_price <= 0:
             missing.append("SL")
@@ -607,23 +530,6 @@ class FuturesTrader:
     # ── open_order ────────────────────────────────────────────────────────────────────
 
     async def open_order(self, signal: dict, risk) -> None:
-        """
-        Abre una posición de mercado en BingX a partir de un signal dict.
-
-        signal esperado:
-          {
-            "side":      "long" | "short",
-            "action":    "BUY"  | "SELL",
-            "entry":     float,   # precio de referencia de la señal
-            "sl":        float,
-            "tp1":       float,   # único TP que se coloca en el exchange (v23)
-            "entry_mode": str,   # 'STRONG'|'FAST'|'NORMAL'|'EARLY'
-            "rr":        float,  # risk/reward del trade
-            "score":     float,  # score bruto de la señal
-            "max_score": float,  # score máximo posible (para score_ratio)
-            "_confirm_margin": float | None,
-          }
-        """
         if self.position is not None:
             logger.info(
                 "[%s] open_order: ya hay posición abierta (%s) — ignorando señal.",
@@ -647,10 +553,11 @@ class FuturesTrader:
 
         sl_price  = float(signal.get("sl")  or 0) or None
         tp1_price = float(signal.get("tp1") or 0) or None
-        # v23: tp2/tp3 se leen del signal solo para persistir en estado interno
-        # (historial/referencia), pero NO se colocan como órdenes en el exchange.
         tp2_ref   = float(signal.get("tp2") or 0) or None
         tp3_ref   = float(signal.get("tp3") or 0) or None
+
+        # v28: ATR de la señal — fuente primaria para trailing SL
+        signal_atr = float(signal.get("atr") or 0.0)
 
         usdc_per_trade = float(getattr(risk, "usdc_per_trade", 20.0))
         leverage       = int(getattr(risk, "leverage", self.leverage) or self.leverage)
@@ -670,15 +577,11 @@ class FuturesTrader:
             return
 
         # ── 4. Rebase automático de niveles al precio de mercado (v24) ───
-        # En lugar de cancelar la orden por drift, reescalamos entry/sl/tp1
-        # al precio real actual preservando los ratios porcentuales originales.
-        # Solo se aborta si el drift supera MAX_REBASE_DRIFT_PCT (datos corruptos).
         rebase_err = _rebase_signal_to_market(signal, ref_price, symbol=self.symbol)
         if rebase_err:
             logger.warning("[%s] open_order cancelado: %s", self.symbol, rebase_err)
             return
 
-        # Leer niveles ya rebased del signal (pueden haber cambiado)
         sl_price  = float(signal.get("sl")  or 0) or None
         tp1_price = float(signal.get("tp1") or 0) or None
 
@@ -686,7 +589,7 @@ class FuturesTrader:
         notional = usdc_per_trade * leverage
         raw_qty  = notional / ref_price
         qty = round(raw_qty, 4)
-        dec = 4  # decimales por defecto
+        dec = 4
         if hasattr(self._bingx_client, "get_sz_decimals"):
             try:
                 dec = self._bingx_client.get_sz_decimals()
@@ -706,9 +609,6 @@ class FuturesTrader:
             return
 
         # ── 5b. Ajuste Kelly fraccionado (v27) ───────────────────────────
-        # kelly_multiplier() lee estadísticas históricas de shadow_mode y
-        # pondera el size por la calidad de la señal (score_ratio).
-        # Si shadow_mode no tiene suficientes trades, devuelve 1.0 (neutro).
         try:
             from bot.kelly_sizer import kelly_multiplier
             _entry_mode  = str(signal.get("entry_mode") or "NORMAL")
@@ -740,7 +640,6 @@ class FuturesTrader:
                 "[%s] kelly_multiplier error (%s) — usando qty sin ajuste Kelly.",
                 self.symbol, _ke,
             )
-        # ─────────────────────────────────────────────────────────────────
 
         logger.info(
             "[%s] 🚀 open_order: %s | price=%.4f | qty=%.6f | "
@@ -756,13 +655,17 @@ class FuturesTrader:
             self.entry_price    = ref_price
             self.sl             = sl_price
             self.tp1            = tp1_price
-            self.tp2            = tp2_ref   # solo referencia interna
-            self.tp3            = tp3_ref   # solo referencia interna
+            self.tp2            = tp2_ref
+            self.tp3            = tp3_ref
             self._open_qty      = qty
             self._open_notional = usdc_per_trade
             self._open_leverage = leverage
             self._protection_ok = True
             self._tp1_be_done   = False
+            # v28: inicializar estado trailing SL al abrir posición
+            self.atr                   = signal_atr
+            self.trailing_sl_activated = False
+            self._trailing_peak        = None
             save_position(
                 self.symbol,
                 side=side_str,
@@ -778,9 +681,9 @@ class FuturesTrader:
             )
             logger.info(
                 "[%s] [DRY-RUN] Posición simulada: %s @ %.4f (qty=%.6f) | "
-                "SL=%.4f | TP1=%.4f (único TP activo)",
+                "SL=%.4f | TP1=%.4f (único TP activo) | ATR=%.6f",
                 self.symbol, side_str.upper(), ref_price, qty,
-                sl_price or 0, tp1_price or 0,
+                sl_price or 0, tp1_price or 0, signal_atr,
             )
             _confirm_margin_amt = float(signal.get("_confirm_margin") or usdc_per_trade)
             try:
@@ -805,7 +708,6 @@ class FuturesTrader:
 
         filled_price: Optional[float] = None
 
-        # Intento atómico: place_market_with_tpsl (SL + TP1 en una sola llamada)
         if (
             hasattr(self._bingx_client, "place_market_with_tpsl")
             and sl_price
@@ -814,10 +716,10 @@ class FuturesTrader:
             try:
                 result = await asyncio.to_thread(
                     self._bingx_client.place_market_with_tpsl,
-                    is_long,      # is_buy
-                    qty,          # sz
-                    sl_price,     # sl_px
-                    tp1_price,    # tp_px — único TP (v23)
+                    is_long,
+                    qty,
+                    sl_price,
+                    tp1_price,
                 )
                 if result and result.get("code") in (0, "0", None):
                     logger.info("[%s] place_market_with_tpsl OK: %s", self.symbol, result)
@@ -837,7 +739,6 @@ class FuturesTrader:
                 )
                 filled_price = None
 
-        # Fallback: place_market separado + _place_tpsl (SL + TP1 únicamente)
         if filled_price is None:
             try:
                 result = await asyncio.to_thread(
@@ -860,7 +761,6 @@ class FuturesTrader:
                 logger.error("[%s] open_order: place_market error: %s — abortando.", self.symbol, e)
                 return
 
-            # Confirmar fill con retries
             for attempt in range(_FILL_RETRIES):
                 try:
                     confirmed = await self.get_price()
@@ -871,7 +771,6 @@ class FuturesTrader:
                     pass
                 await asyncio.sleep(_FILL_DELAY)
 
-            # Colocar SL + TP1 (único TP — v23)
             if sl_price or tp1_price:
                 sl_placed = await self._place_tpsl(
                     qty=qty,
@@ -908,7 +807,6 @@ class FuturesTrader:
                     return
 
         # ── 8. Ajustar niveles al fill real ───────────────────────────────
-        # v23: _adjust_levels_to_fill ya no devuelve tp2_adj
         sl_adj, tp1_adj = _adjust_levels_to_fill(signal, filled_price, ref_price)
         if sl_adj:
             sl_price  = sl_adj
@@ -920,13 +818,17 @@ class FuturesTrader:
         self.entry_price    = filled_price
         self.sl             = sl_price
         self.tp1            = tp1_price
-        self.tp2            = tp2_ref    # referencia interna — no activo en exchange
-        self.tp3            = tp3_ref    # referencia interna — no activo en exchange
+        self.tp2            = tp2_ref
+        self.tp3            = tp3_ref
         self._open_qty      = qty
         self._open_notional = usdc_per_trade
         self._open_leverage = leverage
         self._tp1_be_done   = False
         self._last_price    = filled_price
+        # v28: inicializar estado trailing SL al abrir posición (LIVE)
+        self.atr                   = signal_atr
+        self.trailing_sl_activated = False
+        self._trailing_peak        = None
 
         save_position(
             self.symbol,
@@ -943,9 +845,10 @@ class FuturesTrader:
         )
 
         logger.info(
-            "[%s] ✅ Posición abierta: %s @ %.4f | SL=%.4f | TP1=%.4f (único TP) | qty=%.6f",
+            "[%s] ✅ Posición abierta: %s @ %.4f | SL=%.4f | TP1=%.4f (único TP) "
+            "| qty=%.6f | ATR=%.6f",
             self.symbol, side_str.upper(), filled_price,
-            sl_price or 0, tp1_price or 0, qty,
+            sl_price or 0, tp1_price or 0, qty, signal_atr,
         )
 
         # ── 9b. v22: registrar margen en pretrade_risk ────────────────────
@@ -964,8 +867,6 @@ class FuturesTrader:
             )
 
         # ── 10. v23: NO se colocan TP2/TP3 — único TP es tp1 ─────────────
-        # Bloque eliminado intencionalmente. Solo existe un TP activo en el
-        # exchange (tp1), colocado en el paso 7 junto al SL.
 
     # ── _place_tpsl ───────────────────────────────────────────────────────────────────
 
@@ -977,15 +878,6 @@ class FuturesTrader:
         is_long: bool,
         reduce_only: bool = True,
     ) -> bool:
-        """
-        Coloca SL y/o TP como órdenes separadas usando BingXClient.
-        Usado para re-colocación de stops (Break-Even) y fallback de open_order.
-
-        v23: ya no se usa para TP2/TP3 (eliminados).
-        v21: devuelve bool.
-          - True  → SL colocado con éxito (o no había SL que colocar).
-          - False → se intentó colocar SL y falló.
-        """
         if self.dry_run:
             logger.info(
                 "[%s] [DRY-RUN] _place_tpsl: SL=%.4f TP=%.4f qty=%.6f",
@@ -1047,12 +939,6 @@ class FuturesTrader:
     # ── _get_open_orders_raw ──────────────────────────────────────────────────────────
 
     async def _get_open_orders_raw(self) -> list[dict]:
-        """
-        Retorna las órdenes pendientes activas para este símbolo desde BingX.
-        Usado por PositionManager._ensure_tpsl().
-
-        v20 fix: reemplaza HMAC manual duplicado por BingXClient.get_open_orders().
-        """
         if self._bingx_client is None:
             return []
         try:
@@ -1063,9 +949,6 @@ class FuturesTrader:
             return []
 
     async def _get_open_trigger_orders_raw(self) -> list[dict]:
-        """
-        Retorna las trigger orders (SL/TP algo-orders) pendientes para este símbolo.
-        """
         if self._bingx_client is None:
             return []
         try:
@@ -1087,10 +970,6 @@ class FuturesTrader:
             return []
 
     async def close_position(self, reason: str = "MANUAL") -> None:
-        """
-        Cierra la posición abierta con una orden de mercado en BingX.
-        Llamado por PositionManager._emergency_close() y externamente.
-        """
         if self.position is None:
             logger.info("[%s] close_position: no hay posición abierta.", self.symbol)
             return
@@ -1113,9 +992,9 @@ class FuturesTrader:
                 try:
                     result = await asyncio.to_thread(
                         self._bingx_client.place_market,
-                        not is_long,   # is_buy — cierre = lado opuesto
-                        qty,           # sz
-                        True,          # reduce_only
+                        not is_long,
+                        qty,
+                        True,
                     )
                     code = (result or {}).get("code", -1)
                     if code in (0, "0", None):
@@ -1129,14 +1008,17 @@ class FuturesTrader:
                     logger.error("[%s] close_position error: %s", self.symbol, e)
 
         from bot.state import clear_position as _clear
-        self.position       = None
-        self.entry_price    = None
-        self.sl             = None
-        self.tp1            = None
-        self.tp2            = None
-        self.tp3            = None
-        self._open_qty      = 0.0
-        self._open_notional = 0.0
-        self._protection_ok = False
-        self._tp1_be_done   = False
+        self.position              = None
+        self.entry_price           = None
+        self.sl                    = None
+        self.tp1                   = None
+        self.tp2                   = None
+        self.tp3                   = None
+        self._open_qty             = 0.0
+        self._open_notional        = 0.0
+        self._protection_ok        = False
+        self._tp1_be_done          = False
+        self.atr                   = 0.0
+        self.trailing_sl_activated = False
+        self._trailing_peak        = None
         _clear(self.symbol)
