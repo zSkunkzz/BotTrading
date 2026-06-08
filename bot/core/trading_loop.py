@@ -1,6 +1,14 @@
 """
 trading_loop.py — Loop principal de trading para un símbolo.
 
+FIX v23 (2026-06-08): open_positions formato correcto para correlation_guard
+  - _iteration(): _open_positions ahora se construye como
+      {symbol: {"direction": side.upper()}}
+    en lugar de {symbol: side_str}.
+  - correlation_guard.check_correlation() espera el formato con "direction"
+    (documentado en correlation_guard.py). El formato anterior hacía que
+    same_dir siempre fuera 0 — la guardia nunca bloqueaba.
+
 FIX v22 (2026-06-08): check_correlation() conectado al flujo de señal
   - _iteration(): antes de global_risk.can_open(), se llama
     check_correlation() con la dirección propuesta y un dict
@@ -218,6 +226,22 @@ async def _get_exit_price(trader, symbol: str, fallback: float) -> float:
                 symbol, e,
             )
     return round(fallback, 6)
+
+
+def _build_open_positions_dict(trader) -> dict:
+    """
+    v23: construye el dict open_positions con el formato que espera
+    correlation_guard.check_correlation():
+      {symbol: {"direction": "LONG" | "SHORT"}}
+
+    Antes (v22) se pasaba {symbol: side_str} donde side_str era "long"/"short",
+    lo que hacía que same_dir siempre fuera 0 (p.get("direction") nunca
+    coincidía con un string plano).
+    """
+    if trader.position is None:
+        return {}
+    direction = trader.position.upper()  # "LONG" o "SHORT"
+    return {trader.symbol: {"direction": direction}}
 
 
 class TradingLoop:
@@ -617,14 +641,12 @@ class TradingLoop:
                     float(signal.get("tp1") or 0),
                 )
 
-                # ── v22: Guardia de correlación — evitar pares correlacionados ─
+                # ── v22/v23: Guardia de correlación ──────────────────────────
+                # v23 FIX: formato correcto {symbol: {"direction": "LONG"}}
+                # v22 tenía {symbol: side_str} → same_dir siempre 0 → guardia inactiva.
                 try:
                     from bot.correlation_guard import check_correlation
-                    _open_positions = (
-                        {trader.symbol: trader.position}
-                        if trader.position is not None
-                        else {}
-                    )
+                    _open_positions = _build_open_positions_dict(trader)
                     _corr_ok, _corr_reason = check_correlation(
                         proposed_direction=signal.get("side") or signal.get("action", ""),
                         open_positions=_open_positions,
