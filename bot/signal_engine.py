@@ -659,21 +659,37 @@ def _score_tendencia(
     MAX = 15
     reasons: List[str] = []
 
+    # --- EARLY-EXIT DIAGNOSTICS ---
     if not i1h:
+        log.info("[signal_engine] TENDENCIA early-exit: sin datos 1h")
         return "TENDENCIA", "NEUTRAL", 0, MAX, ["Sin datos 1h"]
 
     ema21_1h = i1h.get("ema21")
     ema50_1h = i1h.get("ema50")
     if not ema21_1h or not ema50_1h or ema50_1h == 0:
+        log.info(
+            "[signal_engine] TENDENCIA early-exit: EMA 1h no calculada (ema21=%s ema50=%s)",
+            ema21_1h, ema50_1h,
+        )
         return "TENDENCIA", "NEUTRAL", 0, MAX, ["EMA 1h no calculada"]
 
     ema_spread_1h = abs(ema21_1h - ema50_1h) / ema50_1h
     if ema_spread_1h < _EMA_SPREAD_RANGE_MAX:
+        log.info(
+            "[signal_engine] TENDENCIA early-exit: mercado en rango "
+            "(spread EMA 1h=%.4f%% < umbral=%.4f%%)",
+            ema_spread_1h * 100, _EMA_SPREAD_RANGE_MAX * 100,
+        )
         return "TENDENCIA", "NEUTRAL", 0, MAX, [f"Mercado en rango (spread EMA 1h={ema_spread_1h*100:.2f}%)"]
 
     trend_1h_up   = i1h.get("ema_bull", False)
     trend_1h_down = i1h.get("ema_bear", False)
     if not trend_1h_up and not trend_1h_down:
+        log.info(
+            "[signal_engine] TENDENCIA early-exit: sin tendencia definida en 1h "
+            "(ema21=%.6f ema50=%.6f spread=%.4f%%)",
+            ema21_1h, ema50_1h, ema_spread_1h * 100,
+        )
         return "TENDENCIA", "NEUTRAL", 0, MAX, ["Sin tendencia definida en 1h"]
 
     direction = "LONG" if trend_1h_up else "SHORT"
@@ -685,11 +701,21 @@ def _score_tendencia(
 
     macd_ok = (direction == "LONG" and i15.get("macd_bull")) or (direction == "SHORT" and i15.get("macd_bear"))
     if not macd_ok:
+        log.info(
+            "[signal_engine] TENDENCIA early-exit: MACD15m en contra de %s "
+            "(macd_bull=%s macd_bear=%s)",
+            direction, i15.get("macd_bull"), i15.get("macd_bear"),
+        )
         reasons.append(f"MACD15m en contra de {direction} — requisito obligatorio")
         return "TENDENCIA", "NEUTRAL", 0, MAX, reasons
 
     st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
     if not st1h_ok:
+        log.info(
+            "[signal_engine] TENDENCIA early-exit: ST1h en contra de %s "
+            "(st_bull=%s st_bear=%s)",
+            direction, i1h.get("st_bull"), i1h.get("st_bear"),
+        )
         reasons.append(f"ST1h en contra de {direction} — requisito obligatorio")
         return "TENDENCIA", "NEUTRAL", 0, MAX, reasons
 
