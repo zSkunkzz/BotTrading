@@ -1,6 +1,13 @@
 """
 trading_loop.py — Loop principal de trading para un símbolo.
 
+FIX v24 (2026-06-08): correlation_guard registry conectado
+  - _iteration(): tras confirmar apertura, llama register_position(symbol, direction).
+  - _iteration(): al detectar cierre externo, llama unregister_position(symbol).
+  - check_correlation(): añadido argumento symbol=self.symbol para chequeo de grupo.
+  Sin estos hooks _POSITION_REGISTRY quedaba vacío y la guardia
+  seguía viendo solo el trader actual (mismo bug raíz que v22).
+
 FIX v23 (2026-06-08): open_positions formato correcto para correlation_guard
   - _iteration(): _open_positions ahora se construye como
       {symbol: {"direction": side.upper()}}
@@ -45,7 +52,7 @@ FIX v18 (2026-06-06): reentry_guard hook en cierre externo
   - Cuando se detecta que la posición fue cerrada externamente (exchange
     posición = 0 pero trader.position != None), se comprueba si el precio
     de salida está dentro del 2% del SL registrado para ese par.
-  - Si la distancia al SL es ≤ 2%, se interpreta como liquidación por SL
+  - Si la distancia al SL es ≤2%, se interpreta como liquidación por SL
     y se llama reentry_guard.register_sl(symbol) para activar la reducción
     de size en el siguiente re-entry.
   - Si el SL no estaba seteado o el precio está más lejos, se asume cierre
@@ -236,7 +243,7 @@ def _build_open_positions_dict(trader) -> dict:
 
     Antes (v22) se pasaba {symbol: side_str} donde side_str era "long"/"short",
     lo que hacía que same_dir siempre fuera 0 (p.get("direction") nunca
-    coincidía con un string plano).
+    coincída con un string plano).
     """
     if trader.position is None:
         return {}
@@ -335,6 +342,18 @@ class TradingLoop:
                     )
 
             self._open_notified = True
+
+            # v24: restaurar posición en el registry global al reiniciar
+            try:
+                from bot.correlation_guard import register_position
+                register_position(self.symbol, saved["side"])
+                logger.debug(
+                    "[%s] correlation_guard: posición restaurada en registry (%s).",
+                    self.symbol, saved["side"],
+                )
+            except Exception as _re:
+                logger.debug("[%s] correlation_guard register (init): %s", self.symbol, _re)
+
             logger.info(
                 "[%s] Posición restaurada: %s @ %s",
                 self.symbol, trader.position, trader.entry_price,
@@ -533,6 +552,20 @@ class TradingLoop:
                                     self.symbol, e,
                                 )
 
+                        # v24: limpiar del registry global al cerrar
+                        try:
+                            from bot.correlation_guard import unregister_position
+                            unregister_position(self.symbol)
+                            logger.debug(
+                                "[%s] correlation_guard: posición eliminada del registry.",
+                                self.symbol,
+                            )
+                        except Exception as _ue:
+                            logger.debug(
+                                "[%s] correlation_guard unregister (cierre externo): %s",
+                                self.symbol, _ue,
+                            )
+
                         save_cooldown(self.symbol, _EXTERNAL_CLOSE_COOLDOWN_S)
 
                         trader.position    = None
@@ -641,19 +674,21 @@ class TradingLoop:
                     float(signal.get("tp1") or 0),
                 )
 
-                # ── v22/v23: Guardia de correlación ──────────────────────────
-                # v23 FIX: formato correcto {symbol: {"direction": "LONG"}}
-                # v22 tenía {symbol: side_str} → same_dir siempre 0 → guardia inactiva.
+                # ── v22/v23/v24: Guardia de correlación ───────────────────────────
+                # v24: añadido symbol=self.symbol para chequeo de grupo de correlación.
+                # v23: formato {symbol: {"direction": "LONG"}} para que same_dir funcione.
+                # v22: primera conexión. Sin registry → siempre 0 peers (bug raíz).
                 try:
                     from bot.correlation_guard import check_correlation
                     _open_positions = _build_open_positions_dict(trader)
                     _corr_ok, _corr_reason = check_correlation(
-                        proposed_direction=signal.get("side") or signal.get("action", ""),
-                        open_positions=_open_positions,
+                        proposed_direction = signal.get("side") or signal.get("action", ""),
+                        open_positions     = _open_positions,
+                        symbol             = self.symbol,
                     )
                     if not _corr_ok:
                         logger.info(
-                            "[%s] 🔗 Correlación bloqueó apertura: %s — "
+                            "[%s] 🔗 Correlación bloqueada: %s — "
                             "señal descartada (se reintentará en próximo scan).",
                             self.symbol, _corr_reason,
                         )
@@ -668,9 +703,9 @@ class TradingLoop:
                         "[%s] check_correlation() error — permitiendo apertura: %s",
                         self.symbol, _ce,
                     )
-                # ─────────────────────────────────────────────────────────────
+                # ──────────────────────────────────────────────────────────────────────
 
-                # ── v21: Guardia GlobalRisk — comprobar slot disponible ────────
+                # ── v21: Guardia GlobalRisk — comprobar slot disponible ───────────────
                 _gr = self._global_risk or global_risk
                 if _gr is not None:
                     try:
@@ -683,17 +718,17 @@ class TradingLoop:
                         can_open, reason = True, "error en can_open (fallback permisivo)"
                     if not can_open:
                         logger.info(
-                            "[%s] ⛔ GlobalRisk bloqueó apertura: %s — "
+                            "[%s] ⛔ GlobalRisk bloqueada apertura: %s — "
                             "señal descartada (se reintentará en próximo scan).",
                             self.symbol, reason,
                         )
                         return
-                # ─────────────────────────────────────────────────────────────
+                # ───────────────────────────────────────────────────────────────────
 
                 pos_before = trader.position
                 await trader.open_order(signal, risk)
 
-                # ── v21: Registrar apertura en GlobalRisk ─────────────────────
+                # ── v21 + v24: Registrar apertura en GlobalRisk y registry global ──
                 if trader.position is not None and pos_before is None:
                     if _gr is not None:
                         try:
@@ -707,7 +742,20 @@ class TradingLoop:
                                 "[%s] global_risk.register_open() error: %s",
                                 self.symbol, _gre,
                             )
-                # ─────────────────────────────────────────────────────────────
+                    # v24: registrar en correlation_guard registry
+                    try:
+                        from bot.correlation_guard import register_position
+                        register_position(self.symbol, trader.position)
+                        logger.debug(
+                            "[%s] correlation_guard: posición registrada (%s).",
+                            self.symbol, trader.position,
+                        )
+                    except Exception as _re:
+                        logger.debug(
+                            "[%s] correlation_guard register (apertura): %s",
+                            self.symbol, _re,
+                        )
+                # ───────────────────────────────────────────────────────────────────
 
                 # FIX v20: notify_open solo envía tp1 (un único TP activo).
                 # tp2/tp3 se eliminaron del flujo de órdenes.
