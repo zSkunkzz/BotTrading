@@ -10,6 +10,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import pandas as pd
 
 from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr, rsi_divergence
+from bot.session_vwap import compute_session_vwap
 
 log = logging.getLogger(__name__)
 
@@ -325,7 +326,12 @@ async def _analyze_pair_inner(
     elif len(bars_1h) < 20:
         log.warning("[signal_engine] %s 1h incompleto (%d velas) → MTF degradado", symbol, len(bars_1h))
 
-    ind_15m = _compute_indicators(bars_15m)
+    # Derivar el inicio de sesión desde las propias velas (sin dependencia de time.time())
+    # Usamos el timestamp de la última vela del buffer de 15m como referencia
+    _last_bar_ts = int(_b_ts(bars_15m[-1]))
+    _session_open_ts = _session_open_ms_from_bars(_last_bar_ts)
+
+    ind_15m = _compute_indicators(bars_15m, session_open_ts=_session_open_ts)
     ind_1h  = _compute_indicators(bars_1h) if len(bars_1h) >= 30 else {}
     ind_4h  = _compute_indicators(bars_4h) if len(bars_4h) >= 20 else {}
 
@@ -542,6 +548,11 @@ async def _analyze_pair_inner(
             "tp_vol_scale":       tp_vol_scale if tp_vol_scale else _TP_VOL_LOW_MULT,
         },
     )
+
+def _session_open_ms_from_bars(last_bar_ts_ms: int) -> int:
+    """Wrapper para obtener el inicio de sesión desde el timestamp de la última vela."""
+    from bot.session_vwap import _session_open_ms
+    return _session_open_ms(last_bar_ts_ms)
 
 def _detect_setup(
     i15: dict, i1h: dict, i4h: dict, bars_15m: list,
@@ -761,12 +772,12 @@ def _score_tendencia(
         vwap_ok = (direction == "LONG" and close_15m > vwap_val) or (direction == "SHORT" and close_15m < vwap_val)
         if vwap_ok:
             score += 1
-            reasons.append(f"Precio {'>' if direction == 'LONG' else '<'} VWAP_diario({vwap_val:.4f}) +1")
+            reasons.append(f"Precio {'>' if direction == 'LONG' else '<'} VWAP_sesión({vwap_val:.4f}) +1")
         else:
             score = max(0, score - 1)
-            reasons.append(f"Precio al lado equivocado del VWAP_diario({vwap_val:.4f}) — penalización -1")
+            reasons.append(f"Precio al lado equivocado del VWAP_sesión({vwap_val:.4f}) — penalización -1")
     else:
-        reasons.append("VWAP diario no disponible")
+        reasons.append("VWAP sesión no disponible")
 
     if len(bars_15m) >= 4:
         closes_recent = [float(_b_close(b)) for b in bars_15m[-4:]]
@@ -981,9 +992,9 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         current_price = float(_b_close(bars_15m[-1]))
         if (direction == "LONG" and current_price < vwap_val) or (direction == "SHORT" and current_price > vwap_val):
             score += 1
-            reasons.append(f"Precio del lado correcto de VWAP ({vwap_val:.4f}) +1")
+            reasons.append(f"Precio del lado correcto de VWAP_sesión ({vwap_val:.4f}) +1")
         else:
-            reasons.append("Precio del lado equivocado de VWAP — sin penalización")
+            reasons.append("Precio del lado equivocado de VWAP_sesión — sin penalización")
 
     if i4h:
         st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
@@ -995,7 +1006,14 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
     return "REVERSAL", direction, score, MAX, reasons
 
-def _compute_indicators(bars: list) -> dict:
+def _compute_indicators(bars: list, session_open_ts: Optional[int] = None) -> dict:
+    """Calcula todos los indicadores técnicos.
+
+    Args:
+        bars: lista de velas OHLCV.
+        session_open_ts: timestamp ms del inicio de sesión para anclar el VWAP.
+                         Si None, se usa el acumulado clásico (compatibilidad 1h/4h).
+    """
     if not bars or len(bars) < 30:
         return {}
     bars = _clean_bars(bars)
@@ -1050,12 +1068,20 @@ def _compute_indicators(bars: list) -> dict:
             st_bull = last_st == 1
             st_bear = last_st == -1
 
-    # VWAP manual
-    vwap_val = 0.0
-    if len(closed_bars) > 0 and len(closes) == len(volumes) and sum(volumes) > 0:
-        cumulative_pv = sum(close * vol for close, vol in zip(closes, volumes))
-        cumulative_vol = sum(volumes)
-        vwap_val = cumulative_pv / cumulative_vol if cumulative_vol > 0 else 0.0
+    # VWAP anclado a sesión (15m) o acumulado clásico (1h/4h sin session_open_ts)
+    if session_open_ts is not None:
+        vwap_val = compute_session_vwap(bars, session_open_ts_ms=session_open_ts)
+    else:
+        # Fallback acumulado para timeframes superiores (1h, 4h)
+        if len(closed_bars) > 0 and len(closes) == len(volumes) and sum(volumes) > 0:
+            cumulative_pv = sum(
+                (float(_b_high(b)) + float(_b_low(b)) + float(_b_close(b))) / 3.0 * float(_b_vol(b))
+                for b in closed_bars
+            )
+            cumulative_vol = sum(volumes)
+            vwap_val = cumulative_pv / cumulative_vol if cumulative_vol > 0 else 0.0
+        else:
+            vwap_val = 0.0
 
     # Volumen ratio
     vol_avg = sum(volumes[-_VOL_AVG_WINDOW:]) / _VOL_AVG_WINDOW if len(volumes) >= _VOL_AVG_WINDOW else volumes[-1]
