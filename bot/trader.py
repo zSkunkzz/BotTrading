@@ -2,6 +2,14 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v26 — Fix get_ohlcv_fn: delegar en ohlcv_cache (2026-06-08):
+  - _ohlcv_fn ya NO traga ConnectionResetError/ConnectionAbortedError con return [].
+  - El fetch raw se extrae a _raw_fetch_ohlcv() que propaga excepciones.
+  - _ohlcv_fn delega en ohlcv_cache.get() que tiene backoff exponencial
+    (1s/2s/4s + jitter), OHLCV_FETCH_RETRIES reintentos y stale fallback.
+  - Resultado: ConnectionResetError(104) ya no produce lista vacía instantánea;
+    el bot usa datos en caché mientras BingX se recupera → señales continúan.
+
 v25 — Persistencia BE y restauración tras restart (2026-06-07):
   - load_position importado para restaurar _tp1_be_done en __init__.
   - save_position guarda be_done=False al abrir posición.
@@ -369,53 +377,69 @@ class FuturesTrader:
 
     def get_ohlcv_fn(self) -> Callable:
         """
-        Retorna un callable async que TradingLoop puede invocar para obtener
-        datos OHLCV del exchange.
+        v26 FIX: Retorna un callable async que delega en ohlcv_cache.get().
 
-        Uso en TradingLoop:
-            ohlcv_fn = trader.get_ohlcv_fn()
-            candles  = await ohlcv_fn(timeframe="15m", limit=100)
+        ohlcv_cache tiene:
+          - Backoff exponencial (1s, 2s, 4s + jitter) en caso de error
+          - OHLCV_FETCH_RETRIES reintentos configurables
+          - Stale fallback: si BingX falla, devuelve datos expirados en caché
+            en lugar de lista vacía
 
-        Retorna lista de dicts con claves: timestamp, open, high, low, close, volume.
-        Si BingXClient no está inicializado, inicializa antes de la primera llamada.
+        El fetch raw (_raw_fetch) ahora PROPAGA excepciones (no las traga)
+        para que ohlcv_cache pueda reintentar correctamente.
         """
-        async def _ohlcv_fn(timeframe: str = "15m", limit: int = _OHLCV_BARS) -> list[dict]:
+        symbol = self.symbol
+        inst_id = self.inst_id
+
+        async def _raw_fetch(timeframe: str) -> list[dict]:
+            """
+            Fetch directo a BingX. Propaga excepciones — NO captura errores.
+            ohlcv_cache.get() es el responsable de reintentar con backoff.
+            """
             if self._bingx_client is None:
                 await self._get_ccxt()
 
             interval = _TF_BINGX.get(timeframe, timeframe)
-            try:
-                import requests as _req
-                resp = await asyncio.to_thread(
-                    lambda: _req.get(
-                        f"{_BASE_URL}/openApi/swap/v3/quote/klines",
-                        params={
-                            "symbol": self.inst_id,
-                            "interval": interval,
-                            "limit": limit,
-                        },
-                        timeout=10,
-                    ).json()
-                )
-                raw = resp.get("data") or []
-                candles: list[dict] = []
-                for bar in raw:
-                    candles.append({
-                        "timestamp": int(bar.get("time") or bar.get("t") or 0),
-                        "open":      float(bar.get("open")  or bar.get("o") or 0),
-                        "high":      float(bar.get("high")  or bar.get("h") or 0),
-                        "low":       float(bar.get("low")   or bar.get("l") or 0),
-                        "close":     float(bar.get("close") or bar.get("c") or 0),
-                        "volume":    float(bar.get("volume") or bar.get("v") or 0),
-                    })
-                logger.debug(
-                    "[%s] get_ohlcv_fn: %d barras (%s) recibidas.",
-                    self.symbol, len(candles), timeframe,
-                )
-                return candles
-            except Exception as e:
-                logger.warning("[%s] get_ohlcv_fn error (%s) — retornando lista vacía.", self.symbol, e)
-                return []
+            import requests as _req
+            resp = await asyncio.to_thread(
+                lambda: _req.get(
+                    f"{_BASE_URL}/openApi/swap/v3/quote/klines",
+                    params={
+                        "symbol": inst_id,
+                        "interval": interval,
+                        "limit": _OHLCV_BARS,
+                    },
+                    timeout=10,
+                ).json()
+            )
+            raw = resp.get("data") or []
+            candles: list[dict] = []
+            for bar in raw:
+                candles.append({
+                    "timestamp": int(bar.get("time") or bar.get("t") or 0),
+                    "open":      float(bar.get("open")  or bar.get("o") or 0),
+                    "high":      float(bar.get("high")  or bar.get("h") or 0),
+                    "low":       float(bar.get("low")   or bar.get("l") or 0),
+                    "close":     float(bar.get("close") or bar.get("c") or 0),
+                    "volume":    float(bar.get("volume") or bar.get("v") or 0),
+                })
+            logger.debug(
+                "[%s] _raw_fetch: %d barras (%s) recibidas.",
+                symbol, len(candles), timeframe,
+            )
+            return candles
+
+        async def _ohlcv_fn(timeframe: str = "15m", limit: int = _OHLCV_BARS) -> list[dict]:
+            """
+            Wrapper con caché: delega en ohlcv_cache que maneja backoff + stale fallback.
+            Si BingX devuelve ConnectionResetError, ohlcv_cache reintentará hasta
+            OHLCV_FETCH_RETRIES veces y devolverá datos anteriores si los tiene.
+            """
+            return await ohlcv_cache.get(
+                coin=symbol,
+                tf=timeframe,
+                fetch_fn=_raw_fetch,
+            )
 
         return _ohlcv_fn
 
