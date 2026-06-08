@@ -2,18 +2,12 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
-v30 — Fix CRÍTICO: guardia SL/TP obligatoria también en dry-run (2026-06-09):
-  - _do_open_order() paso 2: la guardia _confirm_margin() ya NO está
-    condicionada a `not self.dry_run`. Ahora bloquea en cualquier modo
-    si sl_price o tp1_price son None/0 ANTES del rebase.
-  - Paso 2b (nuevo): segunda comprobación POST-rebase para cubrir el caso
-    en que el rebase limpiara algún nivel. Si tras el rebase sl o tp1
-    siguen siendo None, se aborta igual en ambos modos.
-  - Paso 7 (fallback place_market): eliminado el bloque `if sl_price or
-    tp1_price` que permitía abrir sin protección. Ahora si la guardia
-    previa ya pasó, se garantiza que sl_price y tp1_price existen; si
-    _place_tpsl falla de todas formas se cierra la posición igual que antes.
+v31 — Fix CRÍTICO: side leído desde 'signal' (campo de SignalResult):
+  - _do_open_order() paso 1: raw_side ahora lee también signal.get('signal')
+    como tercer fallback. SignalResult.signal = 'LONG'/'SHORT' → side siempre
+    correcto, nunca hardcodeado a SHORT.
 
+v30 — Fix CRÍTICO: guardia SL/TP obligatoria también en dry-run (2026-06-09).
 v29 — Fix kelly_multiplier: propagar min_ratio desde signal (2026-06-08).
 v28 — Fix: self.atr no se seteaba al abrir posición (2026-06-08).
 v27 — Conectar kelly_multiplier al sizing (2026-06-08).
@@ -543,9 +537,23 @@ class FuturesTrader:
         """Lógica interna de open_order (separada para el bracket _pending_order)."""
 
         # ── 1. Extraer parámetros del signal ─────────────────────────────
-        raw_side = str(signal.get("side") or signal.get("action") or "").lower()
+        # v31 FIX: SignalResult serializa la dirección en el campo 'signal'
+        # (valor 'LONG'/'SHORT'), no en 'side' ni 'action'.
+        # Orden de prioridad: side → action → signal
+        raw_side = str(
+            signal.get("side")
+            or signal.get("action")
+            or signal.get("signal")
+            or ""
+        ).lower()
         is_long  = raw_side in ("long", "buy")
         side_str = "long" if is_long else "short"
+
+        logger.info(
+            "[%s] _do_open_order: raw_side=%r → side_str=%s (campos: side=%r action=%r signal=%r)",
+            self.symbol, raw_side, side_str,
+            signal.get("side"), signal.get("action"), signal.get("signal"),
+        )
 
         sl_price  = float(signal.get("sl")  or 0) or None
         tp1_price = float(signal.get("tp1") or 0) or None

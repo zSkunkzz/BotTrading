@@ -2,6 +2,11 @@
 """
 bot/decision_engine.py — Cálculo de tamaño de posición, sizing y orquestación de señales.
 
+v11 — Fix CRÍTICO: SignalResult (dataclass) ya no se descarta silenciosamente.
+  - evaluate() convierte dataclass → dict via dataclasses.asdict() antes de
+    rechazar el resultado. También normaliza el campo 'side' desde 'signal'
+    si falta, para que trader.py reciba siempre side=long/short.
+
 v10 — Kelly sizing:
   - compute_kelly_fraction(win_rate, avg_win, avg_loss) calcula la fracción
     óptima de Kelly y la limita en [KELLY_MIN_FRACTION, KELLY_MAX_FRACTION].
@@ -21,6 +26,7 @@ Clase DecisionEngine:
     )
 """
 
+import dataclasses
 import inspect
 import logging
 import os
@@ -119,6 +125,51 @@ def calc_position_size(
     return qty
 
 
+def _signal_result_to_dict(result) -> Optional[dict]:
+    """
+    v11 FIX: convierte un SignalResult (dataclass) a dict.
+    Si ya es dict, lo devuelve tal cual.
+    Si es None, devuelve None.
+    Si es dataclass, usa dataclasses.asdict().
+    Normaliza el campo 'side' desde 'signal' (LONG/SHORT → long/short)
+    para que trader.py siempre reciba side= correcto.
+    """
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        d = result
+    elif dataclasses.is_dataclass(result) and not isinstance(result, type):
+        try:
+            d = dataclasses.asdict(result)
+        except Exception as e:
+            log.warning("[DecisionEngine] asdict() falló (%s) — intentando __dict__", e)
+            try:
+                d = dict(vars(result))
+            except Exception:
+                return None
+    else:
+        # Último intento: __dict__
+        try:
+            d = dict(vars(result))
+        except Exception:
+            return None
+
+    # Normalizar 'side' desde 'signal' si falta
+    # SignalResult tiene .signal = "LONG" | "SHORT"
+    if not d.get("side") and d.get("signal"):
+        raw = str(d["signal"]).lower()
+        if "long" in raw or raw == "buy":
+            d["side"] = "long"
+        elif "short" in raw or raw == "sell":
+            d["side"] = "short"
+        log.debug(
+            "[DecisionEngine] normalizado side=%s desde signal=%s",
+            d.get("side"), d.get("signal"),
+        )
+
+    return d
+
+
 class DecisionEngine:
     """
     Orquestador de señales para TradingLoop.
@@ -159,9 +210,8 @@ class DecisionEngine:
         Soporta signal_engine con evaluate(), evaluate_signal() o get_signal(),
         tanto síncronos como async.
 
-        FIX: se resuelve correctamente la coroutine con await antes de comprobar
-        el tipo de retorno, evitando que una coroutine no esperada sea descartada
-        silenciosamente como "no es dict".
+        v11 FIX: si el resultado es un dataclass (SignalResult), se convierte
+        a dict via _signal_result_to_dict() en lugar de descartarlo silenciosamente.
         """
         if self._signal_engine is None:
             log.warning("[DecisionEngine] signal_engine no inyectado para %s", symbol)
@@ -199,12 +249,28 @@ class DecisionEngine:
                 log.debug("[DecisionEngine] %s → None (sin señal)", symbol)
                 return None
 
+            # v11 FIX: convertir dataclass → dict antes de rechazar por tipo
             if not isinstance(result, dict):
-                log.warning(
-                    "[DecisionEngine] %s → tipo inesperado %s (esperado dict): %r",
-                    symbol, type(result).__name__, result,
+                converted = _signal_result_to_dict(result)
+                if converted is None:
+                    log.warning(
+                        "[DecisionEngine] %s → tipo inesperado %s y no convertible: %r",
+                        symbol, type(result).__name__, result,
+                    )
+                    return None
+                log.debug(
+                    "[DecisionEngine] %s → convertido %s → dict OK",
+                    symbol, type(result).__name__,
                 )
-                return None
+                result = converted
+
+            # Normalizar side también si el result ya era dict pero le falta side
+            if isinstance(result, dict) and not result.get("side") and result.get("signal"):
+                raw = str(result["signal"]).lower()
+                if "long" in raw or raw == "buy":
+                    result["side"] = "long"
+                elif "short" in raw or raw == "sell":
+                    result["side"] = "short"
 
             log.debug("[DecisionEngine] %s → señal OK: %s", symbol, result)
             return result
