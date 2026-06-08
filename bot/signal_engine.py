@@ -1368,3 +1368,5 @@ async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
     except Exception as e:
         log.warning("[signal_engine] _fetch_bars %s %s error: %s", symbol, timeframe, e)
         return []
+# Alias para compatibilidad con DecisionEngine
+evaluate = analyze_pair
