@@ -29,14 +29,6 @@ _MIN_RR_REVERSAL  = float(os.getenv("MIN_RR_REVERSAL",  "2.0"))
 
 # ---------------------------------------------------------------------------
 # Pesos diferenciales por indicador — Mejora #6
-# Cada peso se lee desde Railway env vars; si no están definidas el default
-# es exactamente el valor entero original → backward compatible al 100%.
-#
-# Uso:  score += _w("W_TREND_EMA_ALIGN_FULL", 2.0)
-#       score -= _w("W_TREND_VWAP_PENALTY", 1.0)
-#
-# Los scores siguen siendo numéricos (float internamente), la comparación
-# con MIN_SCORE (int) sigue funcionando porque float >= int es válido en Python.
 # ---------------------------------------------------------------------------
 
 def _w(name: str, default: float) -> float:
@@ -893,6 +885,37 @@ def _score_tendencia(
             else:
                 reasons.append("Sin estructura LL/LH en 15m")
 
+    # --- LOG DE DIAGNÓSTICO TENDENCIA ---
+    st15m_diag = i15.get("st_bull") if direction == "LONG" else i15.get("st_bear")
+    adx_diag   = _adx_simple(
+        [float(_b_high(b)) for b in bars_15m],
+        [float(_b_low(b))  for b in bars_15m],
+        [float(_b_close(b)) for b in bars_15m],
+        14,
+    )
+    log.info(
+        "[%s] EVAL TENDENCIA(%s) → score=%.2f/%d | "
+        "EMA15m=%s | ST1h=%s | ST4h=%s | MACD15m=%s | MACD4h=%s | "
+        "RSI=%.1f | Vol=%.2fx | ADX=%.1f | VWAP=%s | Pullback=%s | "
+        "umbral=%d | ratio=%.2f(min=%.2f)",
+        _score_tendencia.__module__ if hasattr(_score_tendencia, "__module__") else "signal_engine",
+        direction,
+        score, MAX,
+        "✅" if ema_15m_ok  else "❌",
+        "✅" if st1h_ok     else "❌",
+        "✅" if st4h_ok     else "❌",
+        "✅" if macd_ok     else "❌",
+        "✅" if macd4h_ok   else "❌",
+        i15.get("rsi_val") or 0.0,
+        i15.get("vol_ratio", 1.0),
+        adx_diag,
+        "✅" if (vwap_val and close_15m and ((direction == "LONG" and close_15m > vwap_val) or (direction == "SHORT" and close_15m < vwap_val))) else "❌",
+        "✅" if pullback_detected else "❌",
+        MIN_SCORE,
+        score / MAX if MAX > 0 else 0.0,
+        _min_score_ratio_for_regime(None),
+    )
+
     return "TENDENCIA", direction, score, MAX, reasons
 
 def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, float, int, List[str]]:
@@ -924,6 +947,29 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
                    current_close <= range_low * (1 + _BREAKOUT_RETEST_TOL))
 
     if not broke_up and not broke_down and not retest_up and not retest_down:
+        # --- LOG DE DIAGNÓSTICO BREAKOUT (sin rotura) ---
+        rsi_val = i15.get("rsi_val") or 0.0
+        st1h_ok = (i1h.get("st_bull") or i1h.get("st_bear")) if i1h else False
+        st4h_ok = (i4h.get("st_bull") or i4h.get("st_bear")) if i4h else False
+        macd_1h_ok = (i1h.get("macd_bull") or i1h.get("macd_bear")) if i1h else False
+        log.info(
+            "[signal_engine] EVAL BREAKOUT → score=0/%d | "
+            "BrokeUp=%s | BrokeDown=%s | RetestUp=%s | RetestDown=%s | "
+            "close=%.6f range=[%.6f-%.6f] pad=%.6f | "
+            "Vol=%.2fx(min=%.1fx) | ST1h=%s | ST4h=%s | RSI=%.1f | MACD1h=%s | umbral=%d",
+            MAX,
+            "✅" if broke_up    else "❌",
+            "✅" if broke_down  else "❌",
+            "✅" if retest_up   else "❌",
+            "✅" if retest_down else "❌",
+            current_close, range_low, range_high, breakout_pad,
+            vol_ratio, _BREAKOUT_VOL_MIN,
+            "✅" if st1h_ok   else "❌",
+            "✅" if st4h_ok   else "❌",
+            rsi_val,
+            "✅" if macd_1h_ok else "❌",
+            MIN_SCORE,
+        )
         return "BREAKOUT", "NEUTRAL", 0, MAX, [
             f"Sin rotura ni retesteo: close={current_close:.4f} rango=[{range_low:.4f}-{range_high:.4f}]"
         ]
@@ -978,6 +1024,10 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     else:
         reasons.append(f"Vol={vol_ratio:.1f}x aceptable (superó mínimo duro de {_BREAKOUT_VOL_MIN_HARD}x)")
 
+    st1h_ok = False
+    st4h_ok = False
+    macd_1h_ok = False
+
     if i1h:
         st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
         if st1h_ok:
@@ -995,6 +1045,7 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         else:
             reasons.append("ST4h no confirma")
     rsi_15m = i15.get("rsi_val")
+    rsi_ok = False
     if rsi_15m is not None:
         rsi_ok = (direction == "LONG" and 45 <= rsi_15m <= 70) or (direction == "SHORT" and 30 <= rsi_15m <= 55)
         if rsi_ok:
@@ -1004,13 +1055,35 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         else:
             reasons.append(f"RSI15m={rsi_15m:.0f} sobreextendido")
     if i1h:
-        macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or (direction == "SHORT" and i1h.get("macd_bear"))
-        if macd_ok:
+        macd_1h_ok = (direction == "LONG" and i1h.get("macd_bull")) or (direction == "SHORT" and i1h.get("macd_bear"))
+        if macd_1h_ok:
             w = _WB["MACD_1H"]
             score += w
             reasons.append(f"MACD1h en favor +{w:.2f}")
         else:
             reasons.append("MACD1h en contra")
+
+    # --- LOG DE DIAGNÓSTICO BREAKOUT (con rotura/retest) ---
+    log.info(
+        "[signal_engine] EVAL BREAKOUT(%s) → score=%.2f/%d | "
+        "BrokeUp=%s | BrokeDown=%s | Retest=%s | "
+        "Vol=%.2fx(min=%.1fx) | ST1h=%s | ST4h=%s | RSI=%.1f(%s) | MACD1h=%s | "
+        "umbral=%d | ratio=%.2f(min=%.2f)",
+        direction, score, MAX,
+        "✅" if broke_up   else "❌",
+        "✅" if broke_down else "❌",
+        "✅" if is_retest  else "❌",
+        vol_ratio, _BREAKOUT_VOL_MIN,
+        "✅" if st1h_ok    else "❌",
+        "✅" if st4h_ok    else "❌",
+        rsi_15m or 0.0,
+        "✅" if rsi_ok     else "❌",
+        "✅" if macd_1h_ok else "❌",
+        MIN_SCORE,
+        score / MAX if MAX > 0 else 0.0,
+        _min_score_ratio_for_regime(None),
+    )
+
     return "BREAKOUT", direction, score, MAX, reasons
 
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, float, int, List[str]]:
@@ -1022,6 +1095,16 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     is_long  = rsi_1h <= _REVERSAL_RSI_LOW
     is_short = rsi_1h >= _REVERSAL_RSI_HIGH
     if not is_long and not is_short:
+        # --- LOG DE DIAGNÓSTICO REVERSAL (RSI no extremo) ---
+        log.info(
+            "[signal_engine] EVAL REVERSAL → score=0/%d | "
+            "RSI1h=%.1f (umbral: LOW≤%.0f HIGH≥%.0f) | ST1h=%s | Div=%s | umbral=%d",
+            MAX,
+            rsi_1h, _REVERSAL_RSI_LOW, _REVERSAL_RSI_HIGH,
+            "✅" if (i1h and (i1h.get("st_bull") or i1h.get("st_bear"))) else "❌",
+            "❌",
+            MIN_SCORE,
+        )
         return "REVERSAL", "NEUTRAL", 0, MAX, [f"RSI1h={rsi_1h:.0f} no es extremo (umbral {_REVERSAL_RSI_LOW}/{_REVERSAL_RSI_HIGH})"]
     direction = "LONG" if is_long else "SHORT"
 
@@ -1029,6 +1112,11 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
         if not st1h_ok:
             reasons.append(f"ST1h en contra de {direction} — requisito obligatorio")
+            log.info(
+                "[signal_engine] EVAL REVERSAL(%s) → score=0/%d | "
+                "RSI1h=%.1f ✅ | ST1h=❌ | umbral=%d",
+                direction, MAX, rsi_1h, MIN_SCORE,
+            )
             return "REVERSAL", "NEUTRAL", 0, MAX, reasons
     else:
         reasons.append("ST1h no disponible — requisito obligatorio")
@@ -1041,6 +1129,11 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
     if not has_div:
         reasons.append(f"Divergencia RSI no confirmada para {direction} — requisito obligatorio")
+        log.info(
+            "[signal_engine] EVAL REVERSAL(%s) → score=0/%d | "
+            "RSI1h=%.1f ✅ | ST1h=✅ | Div=❌ | umbral=%d",
+            direction, MAX, rsi_1h, MIN_SCORE,
+        )
         return "REVERSAL", "NEUTRAL", 0, MAX, reasons
 
     score = float(_WR["BASE"])
@@ -1072,10 +1165,12 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         reasons.append("Swing levels no disponible")
 
     ema50_1h = i1h.get("ema50")
+    ema50_ok = False
     if ema50_1h:
         current_price = float(_b_close(bars_15m[-1]))
         dist_pct = abs(current_price - ema50_1h) / ema50_1h
         if dist_pct <= 0.003:
+            ema50_ok = True
             w = _WR["EMA50"]
             score += w
             reasons.append(f"Precio cerca de EMA50_1h ({ema50_1h:.4f}) +{w:.2f}")
@@ -1084,6 +1179,7 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     else:
         reasons.append("EMA50_1h no disponible")
 
+    macd_ok = False
     if i1h:
         macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or (direction == "SHORT" and i1h.get("macd_bear"))
         if macd_ok:
@@ -1094,7 +1190,8 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             reasons.append("MACD1h en contra")
 
     vol_ratio = i15.get("vol_ratio", 1.0)
-    if vol_ratio >= _VOL_CONFIRM_MIN:
+    vol_ok = vol_ratio >= _VOL_CONFIRM_MIN
+    if vol_ok:
         w = _WR["VOL"]
         score += w
         reasons.append(f"Vol={vol_ratio:.1f}x confirma +{w:.2f}")
@@ -1102,8 +1199,10 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         reasons.append(f"Vol={vol_ratio:.1f}x bajo")
 
     rsi_15m = i15.get("rsi_val")
+    rsi_15m_ok = False
     if rsi_15m is not None:
-        if (direction == "LONG" and rsi_15m < 40) or (direction == "SHORT" and rsi_15m > 60):
+        rsi_15m_ok = (direction == "LONG" and rsi_15m < 40) or (direction == "SHORT" and rsi_15m > 60)
+        if rsi_15m_ok:
             w = _WR["RSI"]
             score += w
             reasons.append(f"RSI15m={rsi_15m:.0f} alineado +{w:.2f}")
@@ -1111,15 +1210,18 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             reasons.append(f"RSI15m={rsi_15m:.0f} no extremo")
 
     vwap_val = i15.get("vwap", 0.0)
+    vwap_ok = False
     if vwap_val and vwap_val > 0:
         current_price = float(_b_close(bars_15m[-1]))
-        if (direction == "LONG" and current_price < vwap_val) or (direction == "SHORT" and current_price > vwap_val):
+        vwap_ok = (direction == "LONG" and current_price < vwap_val) or (direction == "SHORT" and current_price > vwap_val)
+        if vwap_ok:
             w = _WR["VWAP"]
             score += w
             reasons.append(f"Precio del lado correcto de VWAP ({vwap_val:.4f}) +{w:.2f}")
         else:
             reasons.append("Precio del lado equivocado de VWAP — sin penalización")
 
+    st4h_ok = False
     if i4h:
         st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
         if st4h_ok:
@@ -1128,6 +1230,27 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             reasons.append(f"ST4h en favor +{w:.2f}")
         else:
             reasons.append("ST4h en contra (sin penalización)")
+
+    # --- LOG DE DIAGNÓSTICO REVERSAL ---
+    log.info(
+        "[signal_engine] EVAL REVERSAL(%s) → score=%.2f/%d | "
+        "RSI1h=%.1f ✅ | ST1h=✅ | Div=✅ | EMA50=%s | MACD1h=%s | "
+        "Vol=%.2fx(%s) | RSI15m=%.1f(%s) | VWAP=%s | ST4h=%s | "
+        "umbral=%d | ratio=%.2f(min=%.2f)",
+        direction, score, MAX,
+        rsi_1h,
+        "✅" if ema50_ok    else "❌",
+        "✅" if macd_ok     else "❌",
+        vol_ratio,
+        "✅" if vol_ok      else "❌",
+        rsi_15m or 0.0,
+        "✅" if rsi_15m_ok  else "❌",
+        "✅" if vwap_ok     else "❌",
+        "✅" if st4h_ok     else "❌",
+        MIN_SCORE,
+        score / MAX if MAX > 0 else 0.0,
+        _min_score_ratio_for_regime(None),
+    )
 
     return "REVERSAL", direction, score, MAX, reasons
 
@@ -1314,18 +1437,6 @@ async def _fetch_bars(exch, symbol: str, tf: str, limit: int) -> list:
 
 # ---------------------------------------------------------------------------
 # evaluate() — wrapper para DecisionEngine
-#
-# DecisionEngine.evaluate() busca signal_engine.evaluate(symbol, price, ohlcv_fn).
-# Este wrapper traduce esa interfaz → analyze_pair().
-#
-# Opción B (cero riesgo): exch=None es seguro porque cuando ohlcv_fn is not None,
-# _analyze_pair_inner usa directamente ohlcv_fn("15m/1h/4h") y nunca llama
-# a _fetch_bars(exch, ...). El parámetro `price` no se usa en analyze_pair
-# (el entry se calcula desde el close de la última vela); se acepta aquí
-# solo para compatibilidad con la firma de DecisionEngine.
-#
-# El dict retornado incluye `min_score_ratio` para que trader.py v29 lo use
-# como min_ratio en kelly_multiplier() sin necesidad de hardcodear el valor.
 # ---------------------------------------------------------------------------
 
 async def evaluate(
