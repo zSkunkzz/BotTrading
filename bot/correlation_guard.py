@@ -19,6 +19,20 @@ Variables de entorno:
   CORR_MAX_SAME_DIR   (default: 3)  — máx. posiciones en la misma dirección
   CORR_MAX_OPEN       (default: 5)  — máx. posiciones abiertas totales
 
+Fix v2 — Global Position Registry:
+  Problema raíz: trading_loop pasaba _build_open_positions_dict(trader) que
+  contenía solo el trader ACTUAL. Los demás pares abiertos eran invisibles.
+  Con 3 LONGs en BTC/ETH/SOL cada trader ve 0 peers — guardia nunca bloqueaba.
+
+  Solución: _POSITION_REGISTRY es un dict global {symbol: {"direction": "LONG"}}
+  que todos los traders mantienen. check_correlation() fusiona el registro
+  con open_positions para tener el portfolio completo.
+
+  API nueva:
+    register_position(symbol, direction)  — llamar tras abrir posición
+    unregister_position(symbol)           — llamar al cerrar
+    get_portfolio_snapshot()              — dict completo para logs/Telegram
+
 Uso desde strategy.decide():
   ok, reason = check_correlation(
       symbol="BTCUSDT",
@@ -33,14 +47,70 @@ from typing import Dict, Tuple
 
 log = logging.getLogger(__name__)
 
-# ── configuración ─────────────────────────────────────────────────────────────
+# ── configuración ───────────────────────────────────────────────────────────────────
 
 _ENABLED        = os.getenv("CORR_ENABLED",       "true").lower() not in ("false", "0", "no")
 _MAX_GROUP      = int(os.getenv("CORR_MAX_GROUP",      "2"))
 _MAX_SAME_DIR   = int(os.getenv("CORR_MAX_SAME_DIR",   "3"))
 _MAX_OPEN       = int(os.getenv("CORR_MAX_OPEN",       "5"))
 
-# ── grupos de correlación estáticos ──────────────────────────────────────────
+# ── registro global de posiciones (Fix v2) ───────────────────────────────────
+# {symbol_upper: {"direction": "LONG" | "SHORT"}}
+# Thread-safety: asyncio es single-threaded en el bot; no se necesita lock.
+_POSITION_REGISTRY: Dict[str, dict] = {}
+
+
+def register_position(symbol: str, direction: str) -> None:
+    """
+    Registra una posición abierta en el portfolio global.
+    Llamar desde trading_loop._iteration() justo después de confirmar
+    que trader.position pasó de None a no-None.
+
+    Args:
+        symbol    — ej. "BTC", "ETH"
+        direction — "LONG" o "SHORT"
+    """
+    key = symbol.upper()
+    _POSITION_REGISTRY[key] = {"direction": direction.upper()}
+    log.debug("[correlation_guard] REGISTRY +%s %s | total=%d",
+              key, direction.upper(), len(_POSITION_REGISTRY))
+
+
+def unregister_position(symbol: str) -> None:
+    """
+    Elimina una posición del portfolio global.
+    Llamar desde trading_loop._iteration() cuando se detecta cierre
+    (externo o por PositionManager).
+    """
+    key = symbol.upper()
+    if key in _POSITION_REGISTRY:
+        del _POSITION_REGISTRY[key]
+        log.debug("[correlation_guard] REGISTRY -%s | total=%d",
+                  key, len(_POSITION_REGISTRY))
+
+
+def get_portfolio_snapshot() -> dict:
+    """
+    Devuelve una copia del portfolio completo para logs o notificaciones
+    Telegram.
+
+    Retorna:
+        {
+          "BTC": {"direction": "LONG"},
+          "ETH": {"direction": "SHORT"},
+          "total": 2,
+          "long": ["BTC"],
+          "short": ["ETH"],
+        }
+    """
+    snapshot = dict(_POSITION_REGISTRY)
+    snapshot["total"] = len(_POSITION_REGISTRY)
+    snapshot["long"]  = [s for s, v in _POSITION_REGISTRY.items() if v.get("direction") == "LONG"]
+    snapshot["short"] = [s for s, v in _POSITION_REGISTRY.items() if v.get("direction") == "SHORT"]
+    return snapshot
+
+
+# ── grupos de correlación estáticos ────────────────────────────────────────────
 # Los símbolos pueden ir con o sin USDT/USDC en el nombre;
 # la normalización se hace en _group_of().
 #
@@ -102,12 +172,12 @@ def _group_of(symbol: str) -> str | None:
     return _SYMBOL_TO_GROUP.get(_base(symbol))
 
 
-# ── función pública ───────────────────────────────────────────────────────────
+# ── función pública ───────────────────────────────────────────────────────────────────
 
 def check_correlation(
-    symbol: str,
     proposed_direction: str,
     open_positions: dict,
+    symbol: str = "",
 ) -> Tuple[bool, str]:
     """
     Retorna:
@@ -115,18 +185,37 @@ def check_correlation(
       (False, motivo)   → entrada bloqueada.
 
     Argumentos:
-      symbol              : símbolo que se quiere abrir (ej.: "BTCUSDT").
       proposed_direction  : "LONG" o "SHORT".
       open_positions      : dict { symbol: {"direction": "LONG" | "SHORT"} }
+                            pasado por trading_loop (puede ser solo el trader actual).
+      symbol              : símbolo que se quiere abrir (ej.: "BTC"). Opcional
+                            pero necesario para el chequeo de grupo.
+
+    Fix v2: fusiona open_positions con _POSITION_REGISTRY (portfolio global)
+    para que la guardia vea TODOS los pares, no solo el trader actual.
     """
     if not _ENABLED:
         return True, ""
 
     direction = proposed_direction.upper()
-    positions = list(open_positions.items()) if open_positions else []
+
+    # ── Fix v2: fusionar registry global con open_positions local ───────────
+    # open_positions puede estar desactualizado (solo el trader actual);
+    # _POSITION_REGISTRY tiene el estado real de todos los traders.
+    merged: Dict[str, dict] = {}
+    merged.update(_POSITION_REGISTRY)        # estado global completo
+    for sym, val in (open_positions or {}).items():  # sobreescribe con info local
+        merged[sym.upper()] = val
+
+    # Excluir el propio símbolo (si ya tiene posición, open_order() lo filtra antes)
+    if symbol:
+        merged.pop(symbol.upper(), None)
+        merged.pop(_base(symbol), None)
+
+    positions = list(merged.items())
     total     = len(positions)
 
-    # ── Nivel 2a: límite total de posiciones ──────────────────────────────────
+    # ── Nivel 2a: límite total de posiciones ────────────────────────────────────
     if total >= _MAX_OPEN:
         msg = (
             f"🔒 límite de posiciones abiertas alcanzado ({total}/{_MAX_OPEN}). "
@@ -135,7 +224,7 @@ def check_correlation(
         log.info("[correlation_guard] %s", msg)
         return False, msg
 
-    # ── Nivel 2b: límite por dirección ────────────────────────────────────────
+    # ── Nivel 2b: límite por dirección ───────────────────────────────────────
     same_dir = sum(
         1 for _, p in positions
         if (p.get("direction") or "").upper() == direction
@@ -148,8 +237,8 @@ def check_correlation(
         log.info("[correlation_guard] %s", msg)
         return False, msg
 
-    # ── Nivel 1: límite por grupo de correlación (nuevo) ─────────────────────
-    new_group = _group_of(symbol)
+    # ── Nivel 1: límite por grupo de correlación ─────────────────────────────
+    new_group = _group_of(symbol) if symbol else None
     if new_group is not None:
         group_peers = [
             sym for sym, p in positions
@@ -161,13 +250,14 @@ def check_correlation(
                 f"🔒 correlación alta: el grupo {new_group!r} ya tiene "
                 f"{len(group_peers)}/{_MAX_GROUP} posiciones {direction} "
                 f"({', '.join(group_peers)}). "
-                f"Añadir {_base(symbol)} incrementaría el riesgo correlacionado."
+                f"Añadir {_base(symbol) if symbol else '?'} incrementaría el riesgo correlacionado."
             )
             log.info("[correlation_guard] %s", msg)
             return False, msg
 
     log.debug(
-        "[correlation_guard] %s %s OK — total=%d same_dir=%d group=%s",
-        symbol, direction, total, same_dir, new_group or "ninguno",
+        "[correlation_guard] %s %s OK — total=%d same_dir=%d group=%s (registry=%d)",
+        symbol or "?", direction, total, same_dir,
+        new_group or "ninguno", len(_POSITION_REGISTRY),
     )
     return True, ""
