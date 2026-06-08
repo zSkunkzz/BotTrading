@@ -27,6 +27,7 @@ _MIN_RR_RANGING   = float(os.getenv("MIN_RR_RANGING",   "2.0"))
 _MIN_RR_VOLATILE  = float(os.getenv("MIN_RR_VOLATILE",  "2.2"))
 _MIN_RR_REVERSAL  = float(os.getenv("MIN_RR_REVERSAL",  "2.0"))
 
+# FIX #1: _min_rr_for_regime ahora cubre el caso REVERSAL explicitamente
 def _min_rr_for_regime(regime: Optional[str]) -> float:
     if not regime:
         return MIN_RR
@@ -37,6 +38,8 @@ def _min_rr_for_regime(regime: Optional[str]) -> float:
         return _MIN_RR_RANGING
     if "VOL" in r:
         return _MIN_RR_VOLATILE
+    if "REVERSAL" in r:
+        return _MIN_RR_REVERSAL
     return MIN_RR
 
 def _min_score_ratio_for_regime(regime: Optional[str]) -> float:
@@ -858,30 +861,45 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     else:
         reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} confirmada +2")
 
+    # FIX #4: sentencias separadas (PEP 8 — no múltiples statements en una línea)
     if vol_ratio >= _BREAKOUT_VOL_MIN:
-        score += 2; reasons.append(f"Vol={vol_ratio:.1f}x breakout +2")
+        score += 2
+        reasons.append(f"Vol={vol_ratio:.1f}x breakout +2")
     elif vol_ratio >= 1.1:
-        score += 1; reasons.append(f"Vol={vol_ratio:.1f}x moderado +1")
+        score += 1
+        reasons.append(f"Vol={vol_ratio:.1f}x moderado +1")
     else:
         reasons.append(f"Vol={vol_ratio:.1f}x aceptable (superó mínimo duro de {_BREAKOUT_VOL_MIN_HARD}x)")
 
     if i1h:
         st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
-        if st1h_ok: score += 1; reasons.append("ST1h confirma +1")
-        else: reasons.append("ST1h no confirma")
+        if st1h_ok:
+            score += 1
+            reasons.append("ST1h confirma +1")
+        else:
+            reasons.append("ST1h no confirma")
     if i4h:
         st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
-        if st4h_ok: score += 1; reasons.append("ST4h confirma +1")
-        else: reasons.append("ST4h no confirma")
+        if st4h_ok:
+            score += 1
+            reasons.append("ST4h confirma +1")
+        else:
+            reasons.append("ST4h no confirma")
     rsi_15m = i15.get("rsi_val")
     if rsi_15m is not None:
         rsi_ok = (direction == "LONG" and 45 <= rsi_15m <= 70) or (direction == "SHORT" and 30 <= rsi_15m <= 55)
-        if rsi_ok: score += 1; reasons.append(f"RSI15m={rsi_15m:.0f} razonable +1")
-        else: reasons.append(f"RSI15m={rsi_15m:.0f} sobreextendido")
+        if rsi_ok:
+            score += 1
+            reasons.append(f"RSI15m={rsi_15m:.0f} razonable +1")
+        else:
+            reasons.append(f"RSI15m={rsi_15m:.0f} sobreextendido")
     if i1h:
         macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or (direction == "SHORT" and i1h.get("macd_bear"))
-        if macd_ok: score += 1; reasons.append("MACD1h en favor +1")
-        else: reasons.append("MACD1h en contra")
+        if macd_ok:
+            score += 1
+            reasons.append("MACD1h en favor +1")
+        else:
+            reasons.append("MACD1h en contra")
     return "BREAKOUT", direction, score, MAX, reasons
 
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, int, int, List[str]]:
@@ -1050,12 +1068,29 @@ def _compute_indicators(bars: list) -> dict:
             st_bull = last_st == 1
             st_bear = last_st == -1
 
-    # VWAP manual
+    # FIX #3: VWAP diario reseteado por día UTC — solo velas del día actual
     vwap_val = 0.0
-    if len(closed_bars) > 0 and len(closes) == len(volumes) and sum(volumes) > 0:
-        cumulative_pv = sum(close * vol for close, vol in zip(closes, volumes))
-        cumulative_vol = sum(volumes)
-        vwap_val = cumulative_pv / cumulative_vol if cumulative_vol > 0 else 0.0
+    if len(closed_bars) > 0 and len(closes) == len(volumes):
+        import datetime
+        now_utc = datetime.datetime.utcnow()
+        day_start_ms = int(datetime.datetime(now_utc.year, now_utc.month, now_utc.day,
+                                             tzinfo=datetime.timezone.utc).timestamp() * 1000)
+        today_closes = []
+        today_volumes = []
+        for b, c, v in zip(closed_bars, closes, volumes):
+            ts = int(_b_ts(b))
+            if ts >= day_start_ms:
+                today_closes.append(c)
+                today_volumes.append(v)
+        if today_closes and sum(today_volumes) > 0:
+            cumulative_pv = sum(c * v for c, v in zip(today_closes, today_volumes))
+            cumulative_vol = sum(today_volumes)
+            vwap_val = cumulative_pv / cumulative_vol
+        elif sum(volumes) > 0:
+            # fallback: VWAP acumulado si no hay velas del día (e.g. timeframe > 1d)
+            cumulative_pv = sum(c * v for c, v in zip(closes, volumes))
+            cumulative_vol = sum(volumes)
+            vwap_val = cumulative_pv / cumulative_vol if cumulative_vol > 0 else 0.0
 
     # Volumen ratio
     vol_avg = sum(volumes[-_VOL_AVG_WINDOW:]) / _VOL_AVG_WINDOW if len(volumes) >= _VOL_AVG_WINDOW else volumes[-1]
@@ -1148,9 +1183,10 @@ class SignalFlipGuard:
 def manual_close_cooldown(guard: SignalFlipGuard, symbol: str, new_signal: str, last_signal: Optional[str] = None) -> bool:
     return guard.can_enter(symbol, new_signal, last_signal)
 
+# FIX #2: usar hasattr(exch, 'markets') en lugar de 'market' (CCXT usa .markets, no .market)
 async def _fetch_bars(exch, symbol: str, tf: str, limit: int) -> list:
     try:
-        ccxt_symbol = _to_ccxt_symbol(symbol) if hasattr(exch, 'market') else symbol
+        ccxt_symbol = _to_ccxt_symbol(symbol) if hasattr(exch, 'markets') else symbol
         ohlcv = await exch.fetch_ohlcv(ccxt_symbol, timeframe=tf, limit=limit)
         return [[ts, o, h, l, c, v] for ts, o, h, l, c, v in ohlcv]
     except Exception as e:
