@@ -2,6 +2,13 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v27 — Conectar kelly_multiplier al sizing (2026-06-08):
+  - _do_open_order() paso 5b: tras calcular qty bruta, aplica kelly_multiplier()
+    usando entry_mode, rr y score_ratio del signal.
+  - score_ratio = signal.score / signal.max_score (fallback 1.0 si ausente).
+  - qty_kelly usa los mismos decimales del exchange que qty.
+  - Guardia defensiva: si qty_kelly <= 0, se usa qty original.
+
 v26 — Fix get_ohlcv_fn: delegar en ohlcv_cache (2026-06-08):
   - _ohlcv_fn ya NO traga ConnectionResetError/ConnectionAbortedError con return [].
   - El fetch raw se extrae a _raw_fetch_ohlcv() que propaga excepciones.
@@ -382,7 +389,7 @@ class FuturesTrader:
         ohlcv_cache tiene:
           - Backoff exponencial (1s, 2s, 4s + jitter) en caso de error
           - OHLCV_FETCH_RETRIES reintentos configurables
-          - Stale fallback: si BingX falla, devuelve datos expirados en caché
+          - Stale fallback: si BingX falla, devuelve datos anteriores en caché
             en lugar de lista vacía
 
         El fetch raw (_raw_fetch) ahora PROPAGA excepciones (no las traga)
@@ -605,11 +612,15 @@ class FuturesTrader:
 
         signal esperado:
           {
-            "side":   "long" | "short",
-            "action": "BUY"  | "SELL",
-            "entry":  float,   # precio de referencia de la señal
-            "sl":     float,
-            "tp1":    float,   # único TP que se coloca en el exchange (v23)
+            "side":      "long" | "short",
+            "action":    "BUY"  | "SELL",
+            "entry":     float,   # precio de referencia de la señal
+            "sl":        float,
+            "tp1":       float,   # único TP que se coloca en el exchange (v23)
+            "entry_mode": str,   # 'STRONG'|'FAST'|'NORMAL'|'EARLY'
+            "rr":        float,  # risk/reward del trade
+            "score":     float,  # score bruto de la señal
+            "max_score": float,  # score máximo posible (para score_ratio)
             "_confirm_margin": float | None,
           }
         """
@@ -675,6 +686,7 @@ class FuturesTrader:
         notional = usdc_per_trade * leverage
         raw_qty  = notional / ref_price
         qty = round(raw_qty, 4)
+        dec = 4  # decimales por defecto
         if hasattr(self._bingx_client, "get_sz_decimals"):
             try:
                 dec = self._bingx_client.get_sz_decimals()
@@ -692,6 +704,43 @@ class FuturesTrader:
                 self.symbol, usdc_per_trade, leverage, ref_price,
             )
             return
+
+        # ── 5b. Ajuste Kelly fraccionado (v27) ───────────────────────────
+        # kelly_multiplier() lee estadísticas históricas de shadow_mode y
+        # pondera el size por la calidad de la señal (score_ratio).
+        # Si shadow_mode no tiene suficientes trades, devuelve 1.0 (neutro).
+        try:
+            from bot.kelly_sizer import kelly_multiplier
+            _entry_mode  = str(signal.get("entry_mode") or "NORMAL")
+            _rr          = float(signal.get("rr") or 0)
+            _score       = float(signal.get("score") or 0)
+            _max_score   = float(signal.get("max_score") or 0)
+            _score_ratio = (_score / _max_score) if _max_score > 0 else 1.0
+            _kelly_mult  = kelly_multiplier(
+                entry_mode  = _entry_mode,
+                rr          = _rr,
+                score_ratio = _score_ratio,
+            )
+            qty_kelly = round(qty * _kelly_mult, dec) if dec > 0 else float(math.floor(qty * _kelly_mult))
+            if qty_kelly > 0:
+                logger.info(
+                    "[%s] 📐 Kelly sizing: mult=%.3f | qty %.6f → %.6f "
+                    "(mode=%s rr=%.2f score_ratio=%.2f)",
+                    self.symbol, _kelly_mult, qty, qty_kelly,
+                    _entry_mode, _rr, _score_ratio,
+                )
+                qty = qty_kelly
+            else:
+                logger.warning(
+                    "[%s] Kelly devolvió qty_kelly=%.6f <= 0 — usando qty original %.6f.",
+                    self.symbol, qty_kelly, qty,
+                )
+        except Exception as _ke:
+            logger.warning(
+                "[%s] kelly_multiplier error (%s) — usando qty sin ajuste Kelly.",
+                self.symbol, _ke,
+            )
+        # ─────────────────────────────────────────────────────────────────
 
         logger.info(
             "[%s] 🚀 open_order: %s | price=%.4f | qty=%.6f | "
