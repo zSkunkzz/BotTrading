@@ -2,6 +2,11 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v32 — Fix CRÍTICO: guardia dura de side en _do_open_order.
+  - Si raw_side no es long/buy/short/sell, se aborta con ERROR.
+  - Elimina el fallback silencioso a 'short' para valores no reconocidos
+    (ej. 'neutral') que causaba aperturas de SHORT involuntarias.
+
 v31 — Fix CRÍTICO: side leído desde 'signal' (campo de SignalResult):
   - _do_open_order() paso 1: raw_side ahora lee también signal.get('signal')
     como tercer fallback. SignalResult.signal = 'LONG'/'SHORT' → side siempre
@@ -62,7 +67,6 @@ _FILL_RETRIES = int(os.getenv("POST_FILL_CONFIRM_RETRIES", "3"))
 _FILL_DELAY   = float(os.getenv("POST_FILL_CONFIRM_DELAY", "2.0"))
 
 # v24: límite absoluto de drift antes de considerar los datos de la señal corruptos.
-# Por encima de este umbral se aborta la orden (no es lag — son datos malos).
 _MAX_REBASE_DRIFT_PCT = float(os.getenv("MAX_REBASE_DRIFT_PCT", "30.0")) / 100.0
 
 _BASE_URL = (
@@ -70,6 +74,11 @@ _BASE_URL = (
     if _USE_TESTNET
     else "https://open-api.bingx.com"
 )
+
+# v32: valores de side válidos — cualquier otro valor aborta la orden
+_VALID_LONG_SIDES  = frozenset({"long", "buy"})
+_VALID_SHORT_SIDES = frozenset({"short", "sell"})
+_VALID_SIDES       = _VALID_LONG_SIDES | _VALID_SHORT_SIDES
 
 
 def _to_inst_id(symbol: str) -> str:
@@ -207,9 +216,9 @@ class FuturesTrader:
         self._instrument_unavailable: bool   = False
 
         # v28: atributos para trailing SL ATR
-        self.atr:                    float           = 0.0    # ATR del timeframe de entrada (de signal.atr)
-        self.trailing_sl_activated:  bool            = False  # True tras activar BE
-        self._trailing_peak:         Optional[float] = None   # máximo/mínimo favorable desde BE
+        self.atr:                    float           = 0.0
+        self.trailing_sl_activated:  bool            = False
+        self._trailing_peak:         Optional[float] = None
 
         # Fix #16: flag que indica que hay una orden en vuelo (open_order en ejecución).
         self._pending_order: bool = False
@@ -225,9 +234,7 @@ class FuturesTrader:
         self._stopped_event = asyncio.Event()
         self._trading_loop  = TradingLoop(symbol)
 
-        # v25: restaurar _tp1_be_done desde state persistido (evita doble BE tras restart)
-        # v28: restaurar también trailing_sl_activated y atr para que el trailing
-        #      sobreviva reinicios del bot sin perder el contexto ATR.
+        # v25: restaurar _tp1_be_done desde state persistido
         try:
             _saved = load_position(self.symbol)
             if _saved:
@@ -536,23 +543,40 @@ class FuturesTrader:
     async def _do_open_order(self, signal: dict, risk) -> None:
         """Lógica interna de open_order (separada para el bracket _pending_order)."""
 
-        # ── 1. Extraer parámetros del signal ─────────────────────────────
-        # v31 FIX: SignalResult serializa la dirección en el campo 'signal'
-        # (valor 'LONG'/'SHORT'), no en 'side' ni 'action'.
+        # ── 1. Extraer y validar side ─────────────────────────────────────
+        # v32 FIX: guardia dura — abortar si side no es long/buy/short/sell.
+        # Elimina el fallback silencioso a 'short' que causaba aperturas
+        # involuntarias cuando signal='NEUTRAL' pasaba por error hasta aquí.
+        #
         # Orden de prioridad: side → action → signal
         raw_side = str(
             signal.get("side")
             or signal.get("action")
             or signal.get("signal")
             or ""
-        ).lower()
-        is_long  = raw_side in ("long", "buy")
+        ).strip().lower()
+
+        logger.info(
+            "[%s] _do_open_order: raw_side=%r (campos: side=%r action=%r signal=%r)",
+            self.symbol, raw_side,
+            signal.get("side"), signal.get("action"), signal.get("signal"),
+        )
+
+        # v32: guardia dura — valores no reconocidos abortan la orden
+        if raw_side not in _VALID_SIDES:
+            logger.error(
+                "[%s] 🚫 _do_open_order: side=%r no reconocido "
+                "(válidos: long/buy/short/sell) — abortando orden.",
+                self.symbol, raw_side,
+            )
+            return
+
+        is_long  = raw_side in _VALID_LONG_SIDES
         side_str = "long" if is_long else "short"
 
         logger.info(
-            "[%s] _do_open_order: raw_side=%r → side_str=%s (campos: side=%r action=%r signal=%r)",
-            self.symbol, raw_side, side_str,
-            signal.get("side"), signal.get("action"), signal.get("signal"),
+            "[%s] _do_open_order: side_str=%s",
+            self.symbol, side_str,
         )
 
         sl_price  = float(signal.get("sl")  or 0) or None
@@ -567,7 +591,6 @@ class FuturesTrader:
         leverage       = int(getattr(risk, "leverage", self.leverage) or self.leverage)
 
         # ── 2. GUARDIA DURA PRE-REBASE: SL y TP1 obligatorios en CUALQUIER modo ──
-        # v30 FIX: eliminado `if not self.dry_run` — la guardia aplica siempre.
         guard_err = self._confirm_margin(sl_price, tp1_price)
         if guard_err:
             logger.error("[%s] 🚫 %s", self.symbol, guard_err)
@@ -589,8 +612,7 @@ class FuturesTrader:
         sl_price  = float(signal.get("sl")  or 0) or None
         tp1_price = float(signal.get("tp1") or 0) or None
 
-        # ── 2b. GUARDIA DURA POST-REBASE: segunda comprobación tras reescalar ──
-        # v30 FIX: el rebase podría haber dejado sl/tp1 en 0 si entry era 0.
+        # ── 2b. GUARDIA DURA POST-REBASE ──────────────────────────────────
         guard_err_post = self._confirm_margin(sl_price, tp1_price)
         if guard_err_post:
             logger.error(
@@ -630,7 +652,6 @@ class FuturesTrader:
             _score       = float(signal.get("score") or 0)
             _max_score   = float(signal.get("max_score") or 0)
             _score_ratio = (_score / _max_score) if _max_score > 0 else 0.0
-            # v29 fix Bug 1: propagar min_ratio real del signal en lugar de hardcodear 0.62
             _min_ratio   = float(signal.get("min_score_ratio") or 0.62)
             _kelly_mult  = kelly_multiplier(
                 entry_mode  = _entry_mode,
@@ -679,7 +700,6 @@ class FuturesTrader:
             self._open_leverage = leverage
             self._protection_ok = True
             self._tp1_be_done   = False
-            # v28: inicializar estado trailing SL al abrir posición
             self.atr                   = signal_atr
             self.trailing_sl_activated = False
             self._trailing_peak        = None
@@ -757,9 +777,6 @@ class FuturesTrader:
                 filled_price = None
 
         if filled_price is None:
-            # v30 FIX: el fallback place_market SIEMPRE intenta colocar SL/TP
-            # porque la guardia del paso 2 ya garantiza que sl_price y tp1_price
-            # existen. El bloque `if sl_price or tp1_price` fue eliminado.
             try:
                 result = await asyncio.to_thread(
                     self._bingx_client.place_market,
@@ -844,7 +861,6 @@ class FuturesTrader:
         self._open_leverage = leverage
         self._tp1_be_done   = False
         self._last_price    = filled_price
-        # v28: inicializar estado trailing SL al abrir posición (LIVE)
         self.atr                   = signal_atr
         self.trailing_sl_activated = False
         self._trailing_peak        = None

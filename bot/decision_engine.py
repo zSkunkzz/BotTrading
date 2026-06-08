@@ -2,6 +2,12 @@
 """
 bot/decision_engine.py — Cálculo de tamaño de posición, sizing y orquestación de señales.
 
+v12 — Fix CRÍTICO: NEUTRAL ya no llega al trader.
+  - evaluate() descarta explícitamente señales con signal/side == NEUTRAL/HOLD
+    antes de devolver el dict, evitando que trader.py abra un SHORT silencioso.
+  - analyze_pair añadido como cuarto método soportado en signal_engine
+    (fix para error 'no tiene evaluate/evaluate_signal/get_signal').
+
 v11 — Fix CRÍTICO: SignalResult (dataclass) ya no se descarta silenciosamente.
   - evaluate() convierte dataclass → dict via dataclasses.asdict() antes de
     rechazar el resultado. También normaliza el campo 'side' desde 'signal'
@@ -16,7 +22,7 @@ v10 — Kelly sizing:
             KELLY_MAX_FRACTION (default 0.25).
 
 Clase DecisionEngine:
-  Fachada que orquesta señales (signal_engine.evaluate), pretrade_risk
+  Fachada que orquesta señales (signal_engine.analyze_pair), pretrade_risk
   y sizing. Inyectada por TradingLoop._build_decision_engine() con:
     DecisionEngine(
         risk_manager  = risk,       # RiskManager
@@ -44,6 +50,9 @@ _EF_PENALTY_REDUCTION  = float(os.getenv("EF_PENALTY_REDUCTION",   "0.10"))
 _KELLY_ENABLED      = os.getenv("KELLY_ENABLED",     "false").lower() not in ("false", "0", "no")
 _KELLY_MIN_FRACTION = float(os.getenv("KELLY_MIN_FRACTION", "0.05"))
 _KELLY_MAX_FRACTION = float(os.getenv("KELLY_MAX_FRACTION", "0.25"))
+
+# Valores de señal que significan "sin entrada" — nunca deben llegar al trader
+_NEUTRAL_SIGNALS = frozenset({"neutral", "hold", "none", "", "0"})
 
 
 def compute_kelly_fraction(
@@ -207,11 +216,15 @@ class DecisionEngine:
         """
         Evalúa la señal para el símbolo delegando en signal_engine.
         Retorna dict de señal o None si no hay entrada.
-        Soporta signal_engine con evaluate(), evaluate_signal() o get_signal(),
-        tanto síncronos como async.
 
+        Métodos soportados en signal_engine (por orden de prioridad):
+          evaluate(), evaluate_signal(), get_signal(), analyze_pair()
+        Tanto síncronos como async.
+
+        v12 FIX: descarta explícitamente señales NEUTRAL/HOLD antes de
+          devolver al trader, evitando la apertura de SHORT silenciosos.
         v11 FIX: si el resultado es un dataclass (SignalResult), se convierte
-        a dict via _signal_result_to_dict() en lugar de descartarlo silenciosamente.
+          a dict via _signal_result_to_dict() en lugar de descartarlo.
         """
         if self._signal_engine is None:
             log.warning("[DecisionEngine] signal_engine no inyectado para %s", symbol)
@@ -220,7 +233,7 @@ class DecisionEngine:
         try:
             se = self._signal_engine
 
-            # Determinar qué método usar
+            # Determinar qué método usar (v12: añade analyze_pair)
             if hasattr(se, "evaluate"):
                 fn = se.evaluate
                 fn_name = "evaluate"
@@ -230,9 +243,13 @@ class DecisionEngine:
             elif hasattr(se, "get_signal"):
                 fn = se.get_signal
                 fn_name = "get_signal"
+            elif hasattr(se, "analyze_pair"):
+                fn = se.analyze_pair
+                fn_name = "analyze_pair"
             else:
                 log.error(
-                    "[DecisionEngine] signal_engine no tiene evaluate/evaluate_signal/get_signal"
+                    "[DecisionEngine] signal_engine no tiene "
+                    "evaluate/evaluate_signal/get_signal/analyze_pair"
                 )
                 return None
 
@@ -264,8 +281,19 @@ class DecisionEngine:
                 )
                 result = converted
 
+            # v12 FIX: descartar señales NEUTRAL/HOLD — nunca deben llegar al trader
+            sig_val = str(
+                result.get("signal") or result.get("side") or ""
+            ).strip().lower()
+            if sig_val in _NEUTRAL_SIGNALS:
+                log.debug(
+                    "[DecisionEngine] %s → signal=%r (NEUTRAL/HOLD) — descartado, sin entrada",
+                    symbol, result.get("signal") or result.get("side"),
+                )
+                return None
+
             # Normalizar side también si el result ya era dict pero le falta side
-            if isinstance(result, dict) and not result.get("side") and result.get("signal"):
+            if not result.get("side") and result.get("signal"):
                 raw = str(result["signal"]).lower()
                 if "long" in raw or raw == "buy":
                     result["side"] = "long"
