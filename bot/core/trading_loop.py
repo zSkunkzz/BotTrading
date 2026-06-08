@@ -1,6 +1,14 @@
 """
 trading_loop.py — Loop principal de trading para un símbolo.
 
+FIX v22 (2026-06-08): check_correlation() conectado al flujo de señal
+  - _iteration(): antes de global_risk.can_open(), se llama
+    check_correlation() con la dirección propuesta y un dict
+    {symbol: side} con la posición actual del trader.
+  - Si not ok → señal descartada con log INFO, sin cooldown
+    (se reintentará en el siguiente scan).
+  - Fallo de importación o excepción → fallback permisivo con log WARNING.
+
 FIX v21 (2026-06-08): global_risk.can_open() + register_open() integrados
   - _iteration(): antes de llamar trader.open_order(), se consulta
     global_risk.can_open(). Si retorna False, se registra en log y se
@@ -608,6 +616,37 @@ class TradingLoop:
                     float(signal.get("sl") or 0),
                     float(signal.get("tp1") or 0),
                 )
+
+                # ── v22: Guardia de correlación — evitar pares correlacionados ─
+                try:
+                    from bot.correlation_guard import check_correlation
+                    _open_positions = (
+                        {trader.symbol: trader.position}
+                        if trader.position is not None
+                        else {}
+                    )
+                    _corr_ok, _corr_reason = check_correlation(
+                        proposed_direction=signal.get("side") or signal.get("action", ""),
+                        open_positions=_open_positions,
+                    )
+                    if not _corr_ok:
+                        logger.info(
+                            "[%s] 🔗 Correlación bloqueó apertura: %s — "
+                            "señal descartada (se reintentará en próximo scan).",
+                            self.symbol, _corr_reason,
+                        )
+                        return
+                except ImportError:
+                    logger.warning(
+                        "[%s] correlation_guard no disponible — omitiendo guardia de correlación.",
+                        self.symbol,
+                    )
+                except Exception as _ce:
+                    logger.warning(
+                        "[%s] check_correlation() error — permitiendo apertura: %s",
+                        self.symbol, _ce,
+                    )
+                # ─────────────────────────────────────────────────────────────
 
                 # ── v21: Guardia GlobalRisk — comprobar slot disponible ────────
                 _gr = self._global_risk or global_risk
