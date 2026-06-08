@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bot/sentiment_gate.py — Filtro multi-factor de sentimiento macro.
+bot/sentiment_gate.py — Indicador de sentimiento macro (solo informativo).
 
 Combina dos fuentes en un score 0-100:
 
@@ -12,17 +12,14 @@ Combina dos fuentes en un score 0-100:
      Si F&G es extremo (< 25 o > 75), decide solo sin gastar tokens.
      Cache global de 2h: se llama como máximo 12 veces al día.
 
-Lógica de sizing (NUNCA bloquea — solo escala el size):
-  El sentimiento ya NO bloquea ninguna entrada, ni LONG ni SHORT.
-  En su lugar, el score 0-100 se traduce en un size_multiplier:
+Comportamiento (PURAMENTE INFORMATIVO):
+  El sentimiento NO bloquea ninguna entrada, ni LONG ni SHORT.
+  El sentimiento NO modifica el margin ni el size.
+  El score 0-100 se loguea para trazabilidad pero no afecta a ninguna decisión.
 
-    score >= SENTIMENT_SIZE_BOOST (default 65) → size_multiplier = 1.00 (full)
-    score >= SENTIMENT_SIZE_MID   (default 50) → size_multiplier = 0.75
-    score >= SENTIMENT_OPEN_MIN   (default 35) → size_multiplier = 0.50
-    score <  SENTIMENT_OPEN_MIN               → size_multiplier = 0.35 (mínimo)
-
-  allowed siempre es True — el gate nunca veta una señal técnica.
-  full_size=True solo cuando size_multiplier == 1.0.
+  allowed  → SIEMPRE True
+  full_size → SIEMPRE True
+  reason   → string con F&G + Groq + score para logs/Telegram
 
 Llamadas a Groq:
   - F&G <= FNG_GROQ_LO (25): NUNCA llama Groq
@@ -31,8 +28,6 @@ Llamadas a Groq:
 
 Variables de entorno Railway:
   SENTIMENT_GATE=true/false       (default: true)
-  SENTIMENT_OPEN_MIN=35           umbral mínimo → size_multiplier 0.35
-  SENTIMENT_SIZE_BOOST=65         umbral full size → size_multiplier 1.0
   FNG_GROQ_LO=25                  por debajo: Extreme Fear → score = F&G
   FNG_GROQ_HI=75                  por encima: Extreme Greed → score = F&G
   GROQ_MACRO_CACHE_TTL_H=2        TTL cache Groq en horas
@@ -52,18 +47,15 @@ import aiohttp
 log = logging.getLogger("SentimentGate")
 
 # ── Configuración ──────────────────────────────────────────────────────
-SENTIMENT_GATE       = os.getenv("SENTIMENT_GATE",    "true").lower() != "false"
-SENTIMENT_OPEN_MIN   = float(os.getenv("SENTIMENT_OPEN_MIN",   "35"))
-SENTIMENT_SIZE_BOOST = float(os.getenv("SENTIMENT_SIZE_BOOST", "65"))
-_SENTIMENT_SIZE_MID  = float(os.getenv("SENTIMENT_SIZE_MID",   "50"))
-_FNG_GROQ_LO         = float(os.getenv("FNG_GROQ_LO", "25"))  # por debajo: Extreme Fear
-_FNG_GROQ_HI         = float(os.getenv("FNG_GROQ_HI", "75"))  # por encima: Extreme Greed
-_FNG_CACHE_TTL_S     = 1800.0  # 30 min
-_GROQ_CACHE_TTL_S    = float(os.getenv("GROQ_MACRO_CACHE_TTL_H", "2")) * 3600
-_GROQ_API_URL        = "https://api.groq.com/openai/v1/chat/completions"
-_GROQ_MODEL          = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-_FNG_API_URL         = "https://api.alternative.me/fng/?limit=1&format=json"
-_RSS_FEEDS           = [
+SENTIMENT_GATE    = os.getenv("SENTIMENT_GATE", "true").lower() != "false"
+_FNG_GROQ_LO      = float(os.getenv("FNG_GROQ_LO", "25"))
+_FNG_GROQ_HI      = float(os.getenv("FNG_GROQ_HI", "75"))
+_FNG_CACHE_TTL_S  = 1800.0  # 30 min
+_GROQ_CACHE_TTL_S = float(os.getenv("GROQ_MACRO_CACHE_TTL_H", "2")) * 3600
+_GROQ_API_URL     = "https://api.groq.com/openai/v1/chat/completions"
+_GROQ_MODEL       = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+_FNG_API_URL      = "https://api.alternative.me/fng/?limit=1&format=json"
+_RSS_FEEDS        = [
     "https://cointelegraph.com/rss",
     "https://coindesk.com/arc/outboundfeeds/rss/",
 ]
@@ -131,7 +123,6 @@ async def _groq_macro(session: aiohttp.ClientSession) -> float:
     """Llama Groq UNA vez y cachea 2h. Protegido por lock para evitar doble llamada."""
     global _groq_cache
 
-    # Check cache antes del lock (fast path)
     if _groq_cache is not None:
         delta, ts = _groq_cache
         if time.monotonic() - ts < _GROQ_CACHE_TTL_S:
@@ -143,7 +134,6 @@ async def _groq_macro(session: aiohttp.ClientSession) -> float:
         return 0.0
 
     async with _groq_lock:
-        # Double-check tras lock
         if _groq_cache is not None:
             delta, ts = _groq_cache
             if time.monotonic() - ts < _GROQ_CACHE_TTL_S:
@@ -192,18 +182,6 @@ async def _groq_macro(session: aiohttp.ClientSession) -> float:
             return 0.0
 
 
-def _score_to_size_multiplier(score: float) -> float:
-    """Convierte score 0-100 en size_multiplier. Nunca devuelve 0."""
-    if score >= SENTIMENT_SIZE_BOOST:
-        return 1.00
-    elif score >= _SENTIMENT_SIZE_MID:
-        return 0.75
-    elif score >= SENTIMENT_OPEN_MIN:
-        return 0.50
-    else:
-        return 0.35
-
-
 # ── Score combinado ───────────────────────────────────────────────────────────
 
 async def sentiment_gate_check(
@@ -212,23 +190,15 @@ async def sentiment_gate_check(
     """
     Punto de entrada para decision_engine.
 
-    IMPORTANTE: El gate NUNCA bloquea una entrada.
-    Solo calcula el size_multiplier basado en el score de sentimiento.
+    PURAMENTE INFORMATIVO — nunca bloquea, nunca modifica el margin.
 
     Args:
-        side: "LONG", "SHORT", "long", "short" o None.
-              Ya no afecta al resultado (lógica direccional eliminada).
-              Se mantiene el parámetro por compatibilidad con decision_engine.
+        side: ignorado. Se mantiene por compatibilidad con decision_engine.
 
     Returns: (allowed, reason, full_size)
-      allowed    → SIEMPRE True (el gate nunca veta)
-      reason     → string para log/Telegram con score y size_multiplier
-      full_size  → True = size completo (1.0x) | False = size reducido
-
-    El size_multiplier real se expone en el campo 'reason' para trazabilidad.
-    El decision_engine puede leer full_size para ajustar el sizing:
-      full_size=True  → usar USDC_PER_TRADE al 100%
-      full_size=False → reducir según el multiplier embebido en reason
+      allowed   → SIEMPRE True
+      full_size → SIEMPRE True
+      reason    → string informativo con F&G + Groq + score para logs/Telegram
 
     Llamadas a Groq:
       - F&G <= FNG_GROQ_LO (25): NUNCA llama Groq
@@ -244,7 +214,6 @@ async def sentiment_gate_check(
         async with aiohttp.ClientSession() as session:
             fng = await _fetch_fear_greed(session)
 
-            # ── Zona extrema: score = F&G directamente, sin Groq ──────────
             if fng <= _FNG_GROQ_LO:
                 score = fng
                 log.info(
@@ -258,7 +227,6 @@ async def sentiment_gate_check(
                     fng, _FNG_GROQ_HI, score,
                 )
             else:
-                # ── Zona ambigua: llamar Groq para desempatar (cache 2h) ──
                 groq_delta = await _groq_macro(session)
                 groq_norm  = (groq_delta + 2.0) / 4.0 * 100.0  # [-2,+2] → [0,100]
                 score = 0.60 * fng + 0.40 * groq_norm
@@ -268,8 +236,6 @@ async def sentiment_gate_check(
                 )
 
         score = max(0.0, min(100.0, score))
-        size_mult = _score_to_size_multiplier(score)
-        full_size = size_mult >= 1.0
 
         if fng <= 20:       fng_label = "Extreme Fear"
         elif fng <= 40:     fng_label = "Fear"
@@ -277,19 +243,13 @@ async def sentiment_gate_check(
         elif fng <= 80:     fng_label = "Greed"
         else:               fng_label = "Extreme Greed"
 
-        groq_str  = f" | Groq={groq_delta:+.1f}" if groq_delta is not None else ""
-        reason    = (
-            f"F&G={fng:.0f} ({fng_label}){groq_str} | score={score:.0f}/100"
-            f" | size={size_mult:.0%}"
-        )
+        groq_str = f" | Groq={groq_delta:+.1f}" if groq_delta is not None else ""
+        reason   = f"F&G={fng:.0f} ({fng_label}){groq_str} | score={score:.0f}/100 | ℹ️ solo informativo"
 
-        log.info(
-            "[sentiment] %s → ✅ OPEN size=%s",
-            reason,
-            f"{size_mult:.0%}",
-        )
-        # allowed siempre True — el técnico manda, el sentimiento solo pondera el size
-        return True, reason, full_size
+        log.info("[sentiment] %s", reason)
+
+        # Siempre True — el sentimiento es solo informativo
+        return True, reason, True
 
     except Exception as e:
         log.warning("[sentiment] sentiment_gate_check error (fail-open): %s", e)
