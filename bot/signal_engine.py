@@ -912,6 +912,7 @@ def _score_tendencia(
                 reasons.append("Sin estructura LL/LH en 15m")
 
     # --- LOG DE DIAGNÓSTICO TENDENCIA ---
+    # Bug 1 fix: usar literal "signal_engine" en lugar de _score_tendencia.__module__
     st15m_diag = i15.get("st_bull") if direction == "LONG" else i15.get("st_bear")
     adx_diag   = _adx_simple(
         [float(_b_high(b)) for b in bars_15m],
@@ -920,11 +921,10 @@ def _score_tendencia(
         14,
     )
     log.info(
-        "[%s] EVAL TENDENCIA(%s) → score=%.2f/%d | "
+        "[signal_engine] EVAL TENDENCIA(%s) → score=%.2f/%d | "
         "EMA15m=%s | ST1h=%s | ST4h=%s | MACD15m=%s | MACD4h=%s | "
         "RSI=%.1f | Vol=%.2fx | ADX=%.1f | VWAP=%s | Pullback=%s | "
         "umbral=%d | ratio=%.2f(min=%.2f)",
-        _score_tendencia.__module__ if hasattr(_score_tendencia, "__module__") else "signal_engine",
         direction,
         score, MAX,
         "✅" if ema_15m_ok  else "❌",
@@ -1031,10 +1031,11 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     if is_retest:
         w = _WB["RETEST"]
         score += w
+        # Bug 5 fix: "score parcial" en lugar de "score total" — los indicadores ST/RSI/MACD aún no se han sumado
         reasons.append(
             f"Retesteo del nivel {'superior' if retest_up else 'inferior'} "
             f"(close={current_close:.4f} ≈ {range_high if retest_up else range_low:.4f}) "
-            f"+{w:.2f} bonus (score base={_WB['BASE']:.2f}, score total={score:.2f})"
+            f"+{w:.2f} bonus (score base={_WB['BASE']:.2f}, score parcial={score:.2f})"
         )
     else:
         reasons.append(f"Ruptura {'alcista' if broke_up else 'bajista'} confirmada +{_WB['BASE']:.2f}")
@@ -1113,7 +1114,11 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     return "BREAKOUT", direction, score, MAX, reasons
 
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, float, int, List[str]]:
-    MAX = 14
+    # Bug 3 fix: MAX corregido de 14 → 10
+    # Suma máxima teórica real: BASE(2)+SWING(2)+EMA50(1)+MACD(1)+VOL(1)+RSI(1)+VWAP(1)+ST_4H(1) = 10
+    # Con MAX=14 un setup perfecto obtenía ratio 10/14=0.71 en lugar de 1.0,
+    # haciendo que el umbral MIN_SCORE_RATIO se aplicase sobre un denominador inflado.
+    MAX = 10
     reasons: List[str] = []
     rsi_1h = i1h.get("rsi_val") if i1h else None
     if rsi_1h is None:
