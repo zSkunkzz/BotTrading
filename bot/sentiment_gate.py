@@ -31,6 +31,17 @@ Variables de entorno Railway:
   FNG_GROQ_LO=25                  por debajo: Extreme Fear → score = F&G
   FNG_GROQ_HI=75                  por encima: Extreme Greed → score = F&G
   GROQ_MACRO_CACHE_TTL_H=2        TTL cache Groq en horas
+
+Fix #2 (2026-06-08) — Race condition en _groq_macro:
+  El check del caché previo a adquirir _groq_lock se hacía sin protección.
+  En asyncio, un yield entre la lectura de _groq_cache y su reasignación
+  podía provocar que dos coroutines distintos pasaran el check exterior y
+  ambos intentaran llamar a la API Groq. Aunque el double-check dentro del
+  lock evitaba la doble escritura, el primer check exterior ya era una
+  lectura no protegida de una variable global mutable.
+  Fix: eliminado el check previo al lock. Toda la lógica de caché y la
+  llamada a Groq ocurren dentro de async with _groq_lock, que es la única
+  región crítica correcta en asyncio.
 """
 from __future__ import annotations
 
@@ -120,23 +131,25 @@ async def _fetch_macro_headlines(session: aiohttp.ClientSession) -> list[str]:
 
 
 async def _groq_macro(session: aiohttp.ClientSession) -> float:
-    """Llama Groq UNA vez y cachea 2h. Protegido por lock para evitar doble llamada."""
-    global _groq_cache
+    """Llama Groq UNA vez y cachea 2h. Protegido por lock para evitar doble llamada.
 
-    if _groq_cache is not None:
-        delta, ts = _groq_cache
-        if time.monotonic() - ts < _GROQ_CACHE_TTL_S:
-            log.debug("[sentiment] Groq macro cache hit: %+.1f", delta)
-            return delta
+    Fix #2: todo el acceso a _groq_cache ocurre dentro del lock.
+    El check previo al lock fue eliminado porque en asyncio la lectura de
+    _groq_cache fuera del lock no es atómica con la asignación que ocurre
+    dentro, y podía causar una doble llamada a la API en casos de contención.
+    """
+    global _groq_cache
 
     groq_key = os.getenv("GROQ_API_KEY", "")
     if not groq_key:
         return 0.0
 
     async with _groq_lock:
+        # Check caché dentro del lock — única región crítica correcta.
         if _groq_cache is not None:
             delta, ts = _groq_cache
             if time.monotonic() - ts < _GROQ_CACHE_TTL_S:
+                log.debug("[sentiment] Groq macro cache hit: %+.1f", delta)
                 return delta
 
         headlines = await _fetch_macro_headlines(session)

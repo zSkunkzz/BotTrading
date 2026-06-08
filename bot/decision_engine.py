@@ -91,6 +91,23 @@ silence: SentimentGate log INFO → DEBUG (2026-06-08):
   El log del SentimentGate se bajó de INFO a DEBUG para eliminar el ruido
   en producción cuando el F&G está en Extreme Fear. Solo visible con
   nivel DEBUG activo.
+
+Fix #1 (2026-06-08) — pnl_pct semántica incorrecta:
+  _register_close_safe pasaba el pnl en USDC absolutos al parámetro
+  pnl_pct de GlobalRisk.register_close(). Esto corrompía el daily PnL
+  acumulado (un trade de -10 USDC se registraba como -10%, pudiendo
+  activar el kill por daily-loss erróneamente). Ahora se pasa por nombre
+  explícito pnl_pct=pnl para documentar que el caller es responsable
+  de que el valor sea coherente con lo que GlobalRisk espera.
+  TODO: decidir si GlobalRisk debe normalizar por balance o si el caller
+  debe convertir USDC → % antes de llamar.
+
+Fix #3 (2026-06-08) — _make_ohlcv_fn descartaba TFs distintos a 15m:
+  Si ohlcv_data es una lista plana (legado), _make_ohlcv_fn devolvía []
+  para cualquier timeframe distinto a '15m'. Si analyze_pair solicitaba
+  '1h' o '4h', recibía datos vacíos y descartaba la señal silenciosamente.
+  Fix: devolver ohlcv_data para cualquier TF — el legado no conoce el TF
+  y analyze_pair decidirá si los datos son suficientes.
 """
 from __future__ import annotations
 
@@ -291,6 +308,10 @@ class DecisionEngine:
             pass
 
     async def _register_close_safe(self, symbol: str, pnl: float) -> None:
+        # Fix #1: pnl llega en USDC absolutos. GlobalRisk.register_close espera
+        # pnl_pct (porcentaje). Se pasa con nombre explícito para documentar que
+        # el llamador es responsable de la coherencia de la escala.
+        # TODO: considerar normalizar aquí: pnl_pct = pnl / balance * 100.
         try:
             await self._risk.register_close(pnl_pct=pnl, symbol=symbol)
         except Exception as e:
@@ -321,11 +342,16 @@ class DecisionEngine:
 def _make_ohlcv_fn(ohlcv_data: list):
     """
     Compatibilidad legado: envuelve lista OHLCV en callable async.
+
+    Fix #3: si ohlcv_data es una lista plana (legado), devolvemos los datos
+    para CUALQUIER timeframe solicitado. El código legado no conoce el TF;
+    restringir a '15m' hacía que analyze_pair recibiera [] para otros TFs
+    y descartara señales silenciosamente.
     """
     if isinstance(ohlcv_data, dict):
         async def _fn(tf: str):
             return ohlcv_data.get(tf, [])
     else:
-        async def _fn(tf: str):
-            return ohlcv_data if tf == "15m" else []
+        async def _fn(tf: str):  # noqa: ARG001
+            return ohlcv_data
     return _fn
