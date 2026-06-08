@@ -1,4 +1,9 @@
 import math
+import time as _time
+
+# Aperturas de sesión en horas UTC: Asia, London, New York, Post-NY/Asia-pre
+_SESSION_OPENS_UTC = [0, 8, 13, 21]
+
 
 def ema(closes, period):
     if len(closes) < period:
@@ -82,33 +87,79 @@ def supertrend(highs, lows, closes, period=10, factor=3.0):
     return direction, round(st, 6)
 
 
-def vwap(bars: list, reset_daily: bool = True) -> float:
-    """VWAP con reset diario a las 00:00 UTC (por defecto).
+def _session_start_ms(now_s: float) -> int:
+    """
+    Devuelve el timestamp en milisegundos del inicio de la sesión activa
+    (Asia / London / New York) para el instante now_s (epoch segundos UTC).
 
-    Cuando reset_daily=True (default), solo acumula las barras del
-    dia UTC actual (timestamp >= inicio_dia_utc). Esto produce un
-    VWAP diario real, mucho mas significativo como nivel de precio
-    que el VWAP acumulado de todas las barras del array.
+    Sesiones (UTC):
+      Asia    00:00 – 08:00
+      London  08:00 – 13:00
+      New York 13:00 – 21:00
+      Post-NY 21:00 – 00:00  (ancla a 21:00)
+    """
+    day_start_s   = now_s - (now_s % 86400)          # 00:00 UTC de hoy en segundos
+    hour_utc      = int((now_s % 86400) // 3600)      # hora UTC actual (0–23)
+    session_open_h = max(h for h in _SESSION_OPENS_UTC if h <= hour_utc)
+    return int((day_start_s + session_open_h * 3600) * 1000)
+
+
+def vwap(bars: list, reset_daily: bool = True) -> float:
+    """
+    VWAP anclado a la sesión activa (Asia / London / New York).
+
+    Cuando reset_daily=True (default), acumula SOLO las barras desde
+    el inicio de la sesión de mercado activa en ese momento:
+      - Asia:     00:00 – 08:00 UTC
+      - London:   08:00 – 13:00 UTC
+      - New York: 13:00 – 21:00 UTC
+      - Post-NY:  21:00 – 00:00 UTC
+
+    Esto produce un VWAP siempre fresco y representativo del contexto
+    de liquidez actual, en lugar de acumular hasta 21 horas de datos
+    como hacía el reset diario fijo a 00:00 UTC.
+
+    Fallback: si la sesión actual tiene < 4 barras (sesión muy reciente),
+    retrocede a la sesión anterior completa en lugar de retroceder 24h.
 
     Cuando reset_daily=False, acumula todas las barras provistas
-    (comportamiento anterior, util para tests o timeframes > 1h).
+    (comportamiento anterior, útil para tests o timeframes > 1h).
 
     Usa el Typical Price (H+L+C)/3 ponderado por volumen.
-    Seguro ante barras con v=0 o v=None (las omite sin lanzar excepcion).
-    Retorna 0.0 si no hay volumen acumulado valido.
+    Seguro ante barras con v=0 o v=None (las omite sin excepción).
+    Retorna 0.0 si no hay volumen acumulado válido.
     """
-    import time as _time
-    if reset_daily:
-        # Inicio del dia UTC en milisegundos
-        now_s = _time.time()
-        day_start_ms = int((now_s - (now_s % 86400)) * 1000)
-        bars_to_use = [b for b in bars if b is not None and len(b) > 0 and b[0] is not None and int(b[0]) >= day_start_ms]
-        # Si el dia acaba de empezar y hay menos de 4 barras, fallback a ultimas 24h
-        if len(bars_to_use) < 4:
-            day_start_ms -= 86400 * 1000
-            bars_to_use = [b for b in bars if b is not None and len(b) > 0 and b[0] is not None and int(b[0]) >= day_start_ms]
-    else:
+    if not reset_daily:
         bars_to_use = bars
+    else:
+        now_s         = _time.time()
+        session_ms    = _session_start_ms(now_s)
+
+        bars_to_use = [
+            b for b in bars
+            if b is not None and len(b) > 0
+            and b[0] is not None and int(b[0]) >= session_ms
+        ]
+
+        # Fallback: sesión con < 4 barras → usar sesión anterior
+        if len(bars_to_use) < 4:
+            # Retroceder hasta la apertura de la sesión anterior
+            hour_utc       = int((now_s % 86400) // 3600)
+            opens_sorted   = sorted(_SESSION_OPENS_UTC)
+            # Índice de la sesión actual
+            cur_idx        = max(i for i, h in enumerate(opens_sorted) if h <= hour_utc)
+            prev_idx       = (cur_idx - 1) % len(opens_sorted)
+            prev_open_h    = opens_sorted[prev_idx]
+            day_start_s    = now_s - (now_s % 86400)
+            # Si la sesión anterior pertenece al día anterior (ej: Post-NY 21h y son las 00:xx)
+            if prev_open_h > hour_utc:
+                day_start_s -= 86400
+            prev_session_ms = int((day_start_s + prev_open_h * 3600) * 1000)
+            bars_to_use = [
+                b for b in bars
+                if b is not None and len(b) > 0
+                and b[0] is not None and int(b[0]) >= prev_session_ms
+            ]
 
     cum_vol = 0.0
     cum_tpv = 0.0
