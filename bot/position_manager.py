@@ -63,6 +63,19 @@ v27 — trailing SL ATR integrado:
   Config: TRAILING_SL_MODE (default 'atr'), TRAILING_SL_ATR_MULT (1.5x),
           TRAILING_SL_PCT (0.015).
 
+v28 — Fix 2 bugs trailing SL:
+  Bug 1 — ATR siempre era 0.0:
+    _check_trailing_sl() leía indicators['15m']['atr_val'] pero ese dict
+    nunca se escribe en el trader. El ATR vive en trader.atr (seteado
+    al abrir la posición desde signal.atr). Se lee ahora trader.atr
+    directamente, con fallback a indicators.get('15m',{}).get('atr') (clave
+    real usada por _compute_indicators en signal_engine).
+  Bug 2 — trailing_sl_activated nunca se ponía a True:
+    Ningún sitio del flujo activaba el flag tras el hit de BE. Se activa
+    ahora al final de _check_break_even(), justo después de persistir
+    be_done en state. También se persiste el ATR de entrada (trader.atr)
+    para que _check_trailing_sl lo tenga disponible tras un reinicio.
+
 v21 — Fix tp2/tp3 limpieza en _reset_trader_position_state.
 v20 — Fix BingX migration — _update_sl_to_be cancela todas las órdenes.
 v19 — _reset_trader_position_state robusto con asyncio.
@@ -139,12 +152,43 @@ def _calc_fallback_tp(entry: float, sl: float, is_long: bool, rr: float) -> Opti
     return tp if tp > 0 else None
 
 
+def _read_atr(trader) -> float:
+    """
+    v28 fix Bug 1: lee el ATR del trader de forma robusta.
+
+    Orden de prioridad:
+      1. trader.atr           — seteado al abrir la posición desde signal.atr
+                                (fuente más fiable y directa)
+      2. indicators['15m']['atr'] — clave real en el dict de _compute_indicators
+                                    (fallback si trader.atr no existe)
+      3. 0.0                  — fallback final → trailing_sl usará modo 'pct'
+
+    NOTA: la clave correcta en el dict de indicadores es 'atr', NO 'atr_val'.
+    'atr_val' nunca existió en _compute_indicators de signal_engine.py.
+    """
+    # Fuente primaria: trader.atr (float simple, seteado en _do_open_order)
+    atr = getattr(trader, "atr", None)
+    if atr and float(atr) > 0:
+        return float(atr)
+
+    # Fallback: dict de indicadores (clave 'atr', no 'atr_val')
+    try:
+        indicators = getattr(trader, "indicators", {}) or {}
+        atr_ind = float(indicators.get("15m", {}).get("atr") or 0.0)
+        if atr_ind > 0:
+            return atr_ind
+    except Exception:
+        pass
+
+    return 0.0
+
+
 class PositionManager:
     """
     Gestiona el ciclo de vida de una posición abierta:
       - Check de SL por software
       - Break-Even automático al 40% del recorrido entry→TP1
-      - Trailing SL ATR (post-TP1, cuando trailing_sl_activated=True)
+      - Trailing SL ATR (post-BE, cuando trailing_sl_activated=True)
       - Verificación periódica de SL/TP en el exchange
       - Colocación de emergencia si faltan SL/TP
     """
@@ -158,19 +202,28 @@ class PositionManager:
         if await self._check_sl_software():
             return
         await self._check_break_even()
-        await self._check_trailing_sl()   # v27: trailing SL post-TP1
+        await self._check_trailing_sl()   # v27: trailing SL post-BE
         if now - self._last_tpsl_check >= _TPSL_VERIFY_INTERVAL_S:
             self._last_tpsl_check = now
             await self._ensure_tpsl()
 
-    # ── Trailing SL (v27) ───────────────────────────────────────────────────────────
+    # ── Trailing SL (v27 + v28 fix) ────────────────────────────────────────────────
 
     async def _check_trailing_sl(self) -> None:
         """
         Si trader.trailing_sl_activated=True, actualiza el trailing SL usando
         compute_trailing_sl() de trailing_sl.py.
 
-        - El ATR se lee de trader.indicators['15m']['atr_val'] (o 0.0).
+        v28 fix Bug 1:
+          - El ATR se obtiene via _read_atr(trader), que lee trader.atr
+            (fuente primaria) o indicators['15m']['atr'] (fallback).
+            Ya NO usa la clave inexistente 'atr_val'.
+
+        v28 fix Bug 2 (activación):
+          - trailing_sl_activated=True se activa en _check_break_even()
+            justo tras persistir be_done en state.
+          - Esta función solo se ocupa de ejecutar el trailing una vez activo.
+
         - El pico favorable se persiste en trader._trailing_peak.
         - Si el precio toca el trailing SL → cierre de emergencia 'TRAILING_SL'.
         """
@@ -179,10 +232,10 @@ class PositionManager:
         if not getattr(trader, "trailing_sl_activated", False):
             return
 
-        position = getattr(trader, "position",     None)
-        price    = getattr(trader, "_last_price",  None)
-        current_sl = getattr(trader, "sl",         None)
-        symbol   = getattr(trader, "symbol",       "?")
+        position   = getattr(trader, "position",    None)
+        price      = getattr(trader, "_last_price", None)
+        current_sl = getattr(trader, "sl",          None)
+        symbol     = getattr(trader, "symbol",      "?")
 
         if not position or not price or current_sl is None:
             return
@@ -190,17 +243,16 @@ class PositionManager:
         is_long    = _resolve_is_long(position)
         peak_price = getattr(trader, "_trailing_peak", None)
         if peak_price is None:
-            # Inicializar pico con el precio actual
             peak_price = price
             trader._trailing_peak = peak_price
 
-        # Leer ATR del timeframe de seguimiento (15m)
-        atr_val = 0.0
-        try:
-            indicators = getattr(trader, "indicators", {}) or {}
-            atr_val = float(indicators.get("15m", {}).get("atr_val") or 0.0)
-        except Exception:
-            pass
+        # v28 fix Bug 1: usar _read_atr() en lugar de indicators['15m']['atr_val']
+        atr_val = _read_atr(trader)
+        if atr_val == 0.0:
+            log.debug(
+                "[%s] _check_trailing_sl: ATR=0 — usando modo pct como fallback",
+                symbol,
+            )
 
         try:
             from bot.trailing_sl import compute_trailing_sl, is_trailing_sl_hit
@@ -245,6 +297,12 @@ class PositionManager:
         v25: maneja sl=None tras restart. Si el precio ya retrocedió
         a entry o peor, marca _tp1_be_done=True sin disparar el BE.
         Persiste be_done en bot_state para sobrevivir reinicios.
+
+        v28 fix Bug 2:
+        Tras activar el BE con éxito, pone trader.trailing_sl_activated=True
+        para que _check_trailing_sl() comience a ejecutarse en el siguiente
+        ciclo. También persiste trader.atr en state para que el trailing
+        tenga el ATR correcto tras un posible reinicio.
         """
         trader = self._trader
 
@@ -281,6 +339,10 @@ class PositionManager:
             # SL ya está en BE o más allá — no hacer nada
             if (is_long and sl >= be_price) or (not is_long and sl <= be_price):
                 trader._tp1_be_done = True
+                # v28: si el SL ya está en BE pero trailing no está activo, activarlo
+                if not getattr(trader, "trailing_sl_activated", False):
+                    trader.trailing_sl_activated = True
+                    log.info("[%s] trailing_sl_activated=True (BE ya estaba activo)", symbol)
                 return
         else:
             # sl=None tras restart: si precio ya volvió a entry (o peor),
@@ -300,10 +362,24 @@ class PositionManager:
         trader._tp1_be_done = True
         trader.sl = be_price
 
-        # v25: persistir sl y be_done=True en state (sobrevive reinicios)
+        # v28 fix Bug 2: activar trailing SL ahora que el BE está confirmado
+        trader.trailing_sl_activated = True
+        trader._trailing_peak = price   # inicializar pico con el precio actual
+        log.info(
+            "[%s] 🟢 trailing_sl_activated=True (ATR=%.6f) — trailing comenzará en próximo ciclo",
+            symbol, _read_atr(trader),
+        )
+
+        # v25+v28: persistir sl, be_done=True y atr en state (sobrevive reinicios)
         try:
             from bot.state import bot_state as _bs
-            await _bs.update_position(symbol, sl=be_price, be_done=True)
+            await _bs.update_position(
+                symbol,
+                sl=be_price,
+                be_done=True,
+                trailing_activated=True,
+                atr=_read_atr(trader),
+            )
         except Exception as _e:
             log.debug("[%s] BE: no se pudo persistir be_done en state: %s", symbol, _e)
 
@@ -358,7 +434,8 @@ class PositionManager:
             emoji = "🟢" if is_long else "🔴"
             await send_message(
                 f"{emoji} *BE activado* `{symbol}`\n"
-                f"SL movido a entrada: `{be_price:.6f}` — posición sin riesgo 🛡️"
+                f"SL movido a entrada: `{be_price:.6f}` — posición sin riesgo 🛡️\n"
+                f"Trailing SL ATR activado 🎯"
             )
         except Exception:
             pass
@@ -496,7 +573,7 @@ class PositionManager:
         """
         Verifica que haya SL y TP activos en el exchange.
         v25: solo usa trader.tp1 (sin fallback a trader.tp).
-        v25: detecta SL en entry_price (±0.1%) como válido (BE activo).
+        v25: detecta SL en entry_price (±0.1%) como SL válido (BE activo).
         """
         trader = self._trader
         symbol = getattr(trader, "symbol", "?")
@@ -677,6 +754,7 @@ def _reset_trader_position_state(trader, symbol: str) -> None:
     if hasattr(trader, "_entry_price"):      trader._entry_price = None
     if hasattr(trader, "trailing_sl_activated"): trader.trailing_sl_activated = False
     if hasattr(trader, "_trailing_peak"):   trader._trailing_peak = None
+    if hasattr(trader, "atr"):              trader.atr = 0.0
 
     try:
         from bot.telegram_bot import send_message
