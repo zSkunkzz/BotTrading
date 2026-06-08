@@ -86,6 +86,11 @@ feat: SentimentGate PURAMENTE INFORMATIVO (2026-06-08):
   El SentimentGate NUNCA modifica effective_margin ni el size.
   Solo loguea el score F&G + Groq para trazabilidad en logs/Telegram.
   El técnico manda siempre — el sentimiento es contexto, no decisión.
+
+silence: SentimentGate log INFO → DEBUG (2026-06-08):
+  El log del SentimentGate se bajó de INFO a DEBUG para eliminar el ruido
+  en producción cuando el F&G está en Extreme Fear. Solo visible con
+  nivel DEBUG activo.
 """
 from __future__ import annotations
 
@@ -167,13 +172,13 @@ class DecisionEngine:
 
         # Gate 2.5: SentimentGate (Fear&Greed + Groq macro) — SOLO INFORMATIVO
         # No bloquea, no modifica effective_margin, no toca el size.
-        # El score se loguea únicamente para trazabilidad en logs/Telegram.
+        # Logueado en DEBUG para evitar ruido en producción con F&G en Extreme Fear.
         try:
             from bot.sentiment_gate import sentiment_gate_check
             _sg_allowed, sg_reason, _sg_full_size = await sentiment_gate_check()
-            log.info("[%s] evaluate: SentimentGate ℹ️ %s", symbol, sg_reason)
+            log.debug("[%s] evaluate: SentimentGate ℹ️ %s", symbol, sg_reason)
         except Exception as _sge:
-            log.warning("[%s] evaluate: SentimentGate error (ignorado): %s", symbol, _sge)
+            log.debug("[%s] evaluate: SentimentGate error (ignorado): %s", symbol, _sge)
 
         # Gate 3: señal técnica
         if callable(ohlcv):
