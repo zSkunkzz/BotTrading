@@ -21,6 +21,10 @@ Comportamiento (PURAMENTE INFORMATIVO):
   full_size → SIEMPRE True
   reason   → string con F&G + Groq + score para logs/Telegram
 
+Niveles de log:
+  DEBUG → F&G fetch, extremos (Extreme Fear/Greed), reason en extremos
+  INFO  → solo zona ambigua (25 < F&G < 75) donde se llama a Groq
+
 Llamadas a Groq:
   - F&G <= FNG_GROQ_LO (25): NUNCA llama Groq
   - F&G >= FNG_GROQ_HI (75): NUNCA llama Groq
@@ -33,20 +37,15 @@ Variables de entorno Railway:
   GROQ_MACRO_CACHE_TTL_H=2        TTL cache Groq en horas
 
 Fix #2 (2026-06-08) — Race condition en _groq_macro:
-  El check del caché previo a adquirir _groq_lock se hacía sin protección.
-  En asyncio, un yield entre la lectura de _groq_cache y su reasignación
-  podía provocar que dos coroutines distintos pasaran el check exterior y
-  ambos intentaran llamar a la API Groq. Aunque el double-check dentro del
-  lock evitaba la doble escritura, el primer check exterior ya era una
-  lectura no protegida de una variable global mutable.
   Fix: eliminado el check previo al lock. Toda la lógica de caché y la
-  llamada a Groq ocurren dentro de async with _groq_lock, que es la única
-  región crítica correcta en asyncio.
+  llamada a Groq ocurren dentro de async with _groq_lock.
 
 Fix #3 (2026-06-08) — SentimentGate nunca bloquea:
-  La versión en producción tenía lógica residual que podía bloquear entradas
-  en Extreme Fear/Greed. Se confirma explícitamente que allowed y full_size
-  son SIEMPRE True. Los logs de extremos se elevan a INFO para trazabilidad.
+  allowed y full_size son SIEMPRE True.
+
+Fix #4 (2026-06-08) — Logs de extremos bajados a DEBUG:
+  Los logs de F&G fetch y extremos (Extreme Fear/Greed) se mueven a DEBUG
+  para evitar spam. Solo INFO en zona ambigua (Groq activo).
 """
 from __future__ import annotations
 
@@ -102,7 +101,7 @@ async def _fetch_fear_greed(session: aiohttp.ClientSession) -> float:
         val   = float(data["data"][0]["value"])
         label = data["data"][0].get("value_classification", "")
         _fng_cache = (val, time.monotonic())
-        log.info("[sentiment] Fear&Greed = %.0f (%s) | ℹ️ solo informativo", val, label)
+        log.debug("[sentiment] Fear&Greed = %.0f (%s)", val, label)
         return val
     except Exception as e:
         log.warning("[sentiment] Fear&Greed error: %s — usando 50", e)
@@ -136,13 +135,7 @@ async def _fetch_macro_headlines(session: aiohttp.ClientSession) -> list[str]:
 
 
 async def _groq_macro(session: aiohttp.ClientSession) -> float:
-    """Llama Groq UNA vez y cachea 2h. Protegido por lock para evitar doble llamada.
-
-    Fix #2: todo el acceso a _groq_cache ocurre dentro del lock.
-    El check previo al lock fue eliminado porque en asyncio la lectura de
-    _groq_cache fuera del lock no es atómica con la asignación que ocurre
-    dentro, y podía causar una doble llamada a la API en casos de contención.
-    """
+    """Llama Groq UNA vez y cachea 2h. Protegido por lock para evitar doble llamada."""
     global _groq_cache
 
     groq_key = os.getenv("GROQ_API_KEY", "")
@@ -150,7 +143,6 @@ async def _groq_macro(session: aiohttp.ClientSession) -> float:
         return 0.0
 
     async with _groq_lock:
-        # Check caché dentro del lock — única región crítica correcta.
         if _groq_cache is not None:
             delta, ts = _groq_cache
             if time.monotonic() - ts < _GROQ_CACHE_TTL_S:
@@ -210,18 +202,10 @@ async def sentiment_gate_check(
 
     PURAMENTE INFORMATIVO — nunca bloquea, nunca modifica el margin.
 
-    Args:
-        side: ignorado. Se mantiene por compatibilidad con decision_engine.
-
     Returns: (allowed, reason, full_size)
       allowed   → SIEMPRE True
       full_size → SIEMPRE True
-      reason    → string informativo con F&G + Groq + score para logs/Telegram
-
-    Llamadas a Groq:
-      - F&G <= FNG_GROQ_LO (25): NUNCA llama Groq
-      - F&G >= FNG_GROQ_HI (75): NUNCA llama Groq
-      - 25 < F&G < 75: llama Groq 1 vez, cache 2h (máx ~12 llamadas/día)
+      reason    → string informativo para logs/Telegram
     """
     if not SENTIMENT_GATE:
         return True, "sentiment_gate=OFF", True
@@ -234,14 +218,14 @@ async def sentiment_gate_check(
 
             if fng <= _FNG_GROQ_LO:
                 score = fng
-                log.info(
-                    "[sentiment] F&G=%.0f ≤ %.0f (Extreme Fear) → sin Groq, score=%.0f | ℹ️ solo informativo",
+                log.debug(
+                    "[sentiment] F&G=%.0f ≤ %.0f (Extreme Fear) → sin Groq, score=%.0f",
                     fng, _FNG_GROQ_LO, score,
                 )
             elif fng >= _FNG_GROQ_HI:
                 score = fng
-                log.info(
-                    "[sentiment] F&G=%.0f ≥ %.0f (Extreme Greed) → sin Groq, score=%.0f | ℹ️ solo informativo",
+                log.debug(
+                    "[sentiment] F&G=%.0f ≥ %.0f (Extreme Greed) → sin Groq, score=%.0f",
                     fng, _FNG_GROQ_HI, score,
                 )
             else:
@@ -264,7 +248,11 @@ async def sentiment_gate_check(
         groq_str = f" | Groq={groq_delta:+.1f}" if groq_delta is not None else ""
         reason   = f"F&G={fng:.0f} ({fng_label}){groq_str} | score={score:.0f}/100 | ℹ️ solo informativo"
 
-        log.info("[sentiment] %s", reason)
+        # Solo INFO en zona ambigua (Groq activo); DEBUG en extremos
+        if _FNG_GROQ_LO < fng < _FNG_GROQ_HI:
+            log.info("[sentiment] %s", reason)
+        else:
+            log.debug("[sentiment] %s", reason)
 
         # SIEMPRE True — el sentimiento es puramente informativo, nunca bloquea
         return True, reason, True
