@@ -12,6 +12,11 @@ El trailing SL:
     (normalmente tras el hit de TP1).
   - El pico favorable (peak_price) se actualiza cada ciclo.
 
+Fix v29:
+  Bug 4 — current_sl=None tras restart parcial causaba TypeError en
+    max(None, computed_sl) / min(None, computed_sl). Guardia añadida:
+    si current_sl es None o <= 0, se usa computed_sl directamente.
+
 Variables de entorno:
   TRAILING_SL_MODE      (default: 'atr')   — 'atr' o 'pct'
   TRAILING_SL_ATR_MULT  (default: 1.5)    — multiplicador de ATR
@@ -20,7 +25,7 @@ Variables de entorno:
 
 import logging
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +38,7 @@ def compute_trailing_sl(
     is_long:       bool,
     current_price: float,
     peak_price:    float,
-    current_sl:    float,
+    current_sl:    Optional[float],   # Bug 4 fix: acepta None explícitamente
     atr_val:       float = 0.0,
 ) -> Tuple[float, float]:
     """
@@ -43,8 +48,13 @@ def compute_trailing_sl(
       (new_sl, new_peak)
 
     El SL nuevo NUNCA retrocede respecto al actual:
-      - LONG:  new_sl  = max(current_sl, computed_sl)
-      - SHORT: new_sl  = min(current_sl, computed_sl)
+      - LONG:  new_sl = max(current_sl, computed_sl)
+      - SHORT: new_sl = min(current_sl, computed_sl)
+
+    Bug 4 fix:
+      Si current_sl es None o <= 0 (posición restaurada desde state sin SL
+      guardado), se usa computed_sl directamente sin intentar max/min contra
+      None, lo que causaba TypeError en versiones anteriores.
     """
     # Actualizar pico favorable
     if is_long:
@@ -61,16 +71,26 @@ def compute_trailing_sl(
 
     if is_long:
         computed_sl = new_peak - distance
-        new_sl      = max(current_sl, computed_sl)  # nunca retrocede
     else:
         computed_sl = new_peak + distance
-        new_sl      = min(current_sl, computed_sl)  # nunca retrocede
+
+    # Bug 4 fix: guardia explícita contra current_sl=None o <= 0
+    if current_sl is None or current_sl <= 0:
+        new_sl = computed_sl
+        log.debug(
+            "[trailing_sl] current_sl ausente — usando computed_sl=%.6f directamente",
+            computed_sl,
+        )
+    elif is_long:
+        new_sl = max(current_sl, computed_sl)  # nunca retrocede
+    else:
+        new_sl = min(current_sl, computed_sl)  # nunca retrocede
 
     log.debug(
         "[trailing_sl] is_long=%s current=%.6f peak=%.6f→%.6f dist=%.6f "
-        "sl=%.6f→%.6f (mode=%s)",
+        "sl=%s→%.6f (mode=%s)",
         is_long, current_price, peak_price, new_peak, distance,
-        current_sl, new_sl, _MODE,
+        f"{current_sl:.6f}" if current_sl else "None", new_sl, _MODE,
     )
 
     return new_sl, new_peak

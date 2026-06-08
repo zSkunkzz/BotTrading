@@ -17,14 +17,24 @@ Ajuste por score_ratio:
 
   El multiplicador final es: kelly_mult × score_factor, acotado a [KELLY_MIN_MULT, KELLY_MAX_MULT].
 
+Fixes v29:
+  Bug 1 — min_ratio era hardcodeado a 0.62 en la signatura de kelly_multiplier().
+    Ahora se pasa como parámetro explícito desde trader.py (propagado desde
+    signal.get('min_score_ratio', 0.62)). Default 0.62 para compatibilidad.
+  Bug 2 — KELLY_FRACTION > 1 podía producir base_mult explosivo antes del
+    clamp. Añadida guardia: KELLY_FRACTION se clampea a [0.01, 1.0] en runtime.
+  Bug 3 — score_ratio=0.0 (señal sin score) recibía penalización score_factor=0.7
+    porque 0.0 < min_ratio=0.62 → t clampeado a 0 → factor=KELLY_SCORE_MIN_MULT.
+    Corrección: si score_ratio <= 0 se devuelve 1.0 (factor neutro).
+
 Config Railway:
   KELLY_ENABLED           → default true
-  KELLY_FRACTION          → default 0.25  (quarter-Kelly)
+  KELLY_FRACTION          → default 0.25  (quarter-Kelly, clampado a [0.01, 1.0])
   KELLY_MIN_MULT          → default 0.5
   KELLY_MAX_MULT          → default 2.0
   KELLY_MIN_TRADES        → default 30
   KELLY_SCORE_WEIGHT      → default true  (activar ponderación por score_ratio)
-  KELLY_SCORE_MIN_MULT    → default 0.7   (factor para score_ratio mínimo)
+  KELLY_SCORE_MIN_MULT    → default 0.7   (factor para score_ratio en el umbral mínimo)
   KELLY_SCORE_MAX_MULT    → default 1.3   (factor para score_ratio = 1.0)
 """
 from __future__ import annotations
@@ -45,18 +55,35 @@ def _parse_int_env(name: str, default: int) -> int:
 
 
 KELLY_ENABLED        = os.getenv("KELLY_ENABLED",      "true").lower() not in ("false", "0", "no")
-KELLY_FRACTION       = float(os.getenv("KELLY_FRACTION",      "0.25"))
 KELLY_MIN_MULT       = float(os.getenv("KELLY_MIN_MULT",      "0.5"))
 KELLY_MAX_MULT       = float(os.getenv("KELLY_MAX_MULT",      "2.0"))
 KELLY_MIN_TRADES     = _parse_int_env("KELLY_MIN_TRADES", 30)
 KELLY_SCORE_WEIGHT   = os.getenv("KELLY_SCORE_WEIGHT", "true").lower() not in ("false", "0", "no")
-KELLY_SCORE_MIN_MULT = float(os.getenv("KELLY_SCORE_MIN_MULT", "0.7"))  # factor en score_ratio mínimo
-KELLY_SCORE_MAX_MULT = float(os.getenv("KELLY_SCORE_MAX_MULT", "1.3"))  # factor en score_ratio = 1.0
+KELLY_SCORE_MIN_MULT = float(os.getenv("KELLY_SCORE_MIN_MULT", "0.7"))
+KELLY_SCORE_MAX_MULT = float(os.getenv("KELLY_SCORE_MAX_MULT", "1.3"))
+
+# Bug 2 fix: clampear KELLY_FRACTION a [0.01, 1.0] para evitar sizing explosivo
+_RAW_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
+if _RAW_FRACTION > 1.0 or _RAW_FRACTION < 0.01:
+    log.warning(
+        "[kelly] KELLY_FRACTION=%.3f fuera de rango [0.01, 1.0] — clampando a %.3f",
+        _RAW_FRACTION,
+        max(0.01, min(1.0, _RAW_FRACTION)),
+    )
+KELLY_FRACTION = max(0.01, min(1.0, _RAW_FRACTION))
 
 
 def _score_factor(score_ratio: float, min_ratio: float) -> float:
-    """Interpola linealmente entre KELLY_SCORE_MIN_MULT y KELLY_SCORE_MAX_MULT."""
+    """
+    Interpola linealmente entre KELLY_SCORE_MIN_MULT y KELLY_SCORE_MAX_MULT.
+
+    Bug 3 fix: score_ratio <= 0 significa que la señal no tiene score —
+    devolvemos 1.0 (factor neutro) en lugar de penalizar con KELLY_SCORE_MIN_MULT.
+    """
     if not KELLY_SCORE_WEIGHT or min_ratio >= 1.0:
+        return 1.0
+    # Bug 3 fix: score_ratio ausente (0.0 o negativo) → factor neutro
+    if score_ratio <= 0:
         return 1.0
     t = (score_ratio - min_ratio) / (1.0 - min_ratio)
     t = max(0.0, min(1.0, t))
@@ -67,7 +94,7 @@ def kelly_multiplier(
     entry_mode: str,
     rr: float,
     score_ratio: float = 0.0,
-    min_ratio: float = 0.62,
+    min_ratio: float = 0.62,   # Bug 1 fix: parámetro explícito, propagado desde signal
 ) -> float:
     """
     Calcula el multiplicador de sizing Kelly ponderado por score_ratio.
@@ -75,8 +102,9 @@ def kelly_multiplier(
     Args:
         entry_mode:  'STRONG', 'FAST', 'NORMAL', 'EARLY'
         rr:          Risk/Reward del trade.
-        score_ratio: score / max_score (0–1). Default 0 → factor neutro.
-        min_ratio:   Umbral mínimo de ratio de la señal (MIN_SCORE_RATIO).
+        score_ratio: score / max_score (0–1). 0 → factor neutro (sin penalización).
+        min_ratio:   Umbral mínimo del score de la señal (MIN_SCORE_RATIO).
+                     Propagado desde signal.get('min_score_ratio', 0.62).
 
     Returns:
         float: multiplicador final acotado en [KELLY_MIN_MULT, KELLY_MAX_MULT].
@@ -105,7 +133,7 @@ def kelly_multiplier(
             q = 1.0 - p
             b = rr
             f_full = (p * b - q) / b
-            f = f_full * KELLY_FRACTION
+            f = f_full * KELLY_FRACTION  # KELLY_FRACTION ya clampado a [0.01, 1.0]
             base_mult = 1.0 + f
             log.info(
                 "[kelly] %s: p=%.2f b=%.2f f_full=%.3f f=%.3f → base_mult=%.2f",
@@ -115,12 +143,13 @@ def kelly_multiplier(
         log.warning("[kelly] Error calculando mult: %s", e)
         base_mult = 1.0
 
+    # Bug 1 fix: min_ratio propagado desde el caller (signal.min_score_ratio)
     sf = _score_factor(score_ratio, min_ratio)
     mult = base_mult * sf
     mult = max(KELLY_MIN_MULT, min(KELLY_MAX_MULT, mult))
 
     log.info(
-        "[kelly] %s: base_mult=%.3f × score_factor=%.3f (ratio=%.2f) → mult_final=%.3f",
-        entry_mode, base_mult, sf, score_ratio, mult,
+        "[kelly] %s: base_mult=%.3f × score_factor=%.3f (ratio=%.2f min_ratio=%.2f) → mult_final=%.3f",
+        entry_mode, base_mult, sf, score_ratio, min_ratio, mult,
     )
     return round(mult, 3)

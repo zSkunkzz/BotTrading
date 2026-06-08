@@ -2,6 +2,12 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v29 — Fix kelly_multiplier: propagar min_ratio desde signal (2026-06-08):
+  - _do_open_order() paso 5b: lee signal.get('min_score_ratio', 0.62)
+    y lo pasa como parámetro min_ratio a kelly_multiplier().
+    Antes, min_ratio quedaba hardcodeado a 0.62 en kelly_sizer.py
+    ignorando el valor real que usa signal_engine para filtrar señales.
+
 v28 — Fix: self.atr no se seteaba al abrir posición (2026-06-08):
   - _do_open_order() Paso 6 (DRY-RUN) y Paso 9 (LIVE):
     ahora incluyen self.atr, self.trailing_sl_activated=False,
@@ -608,26 +614,29 @@ class FuturesTrader:
             )
             return
 
-        # ── 5b. Ajuste Kelly fraccionado (v27) ───────────────────────────
+        # ── 5b. Ajuste Kelly fraccionado (v27 + v29 fix) ─────────────────
         try:
             from bot.kelly_sizer import kelly_multiplier
             _entry_mode  = str(signal.get("entry_mode") or "NORMAL")
             _rr          = float(signal.get("rr") or 0)
             _score       = float(signal.get("score") or 0)
             _max_score   = float(signal.get("max_score") or 0)
-            _score_ratio = (_score / _max_score) if _max_score > 0 else 1.0
+            _score_ratio = (_score / _max_score) if _max_score > 0 else 0.0
+            # v29 fix Bug 1: propagar min_ratio real del signal en lugar de hardcodear 0.62
+            _min_ratio   = float(signal.get("min_score_ratio") or 0.62)
             _kelly_mult  = kelly_multiplier(
                 entry_mode  = _entry_mode,
                 rr          = _rr,
                 score_ratio = _score_ratio,
+                min_ratio   = _min_ratio,
             )
             qty_kelly = round(qty * _kelly_mult, dec) if dec > 0 else float(math.floor(qty * _kelly_mult))
             if qty_kelly > 0:
                 logger.info(
                     "[%s] 📐 Kelly sizing: mult=%.3f | qty %.6f → %.6f "
-                    "(mode=%s rr=%.2f score_ratio=%.2f)",
+                    "(mode=%s rr=%.2f score_ratio=%.2f min_ratio=%.2f)",
                     self.symbol, _kelly_mult, qty, qty_kelly,
-                    _entry_mode, _rr, _score_ratio,
+                    _entry_mode, _rr, _score_ratio, _min_ratio,
                 )
                 qty = qty_kelly
             else:
