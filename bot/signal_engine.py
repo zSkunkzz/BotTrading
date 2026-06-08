@@ -13,9 +13,12 @@ from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr, rsi_dive
 
 log = logging.getLogger(__name__)
 
-# FIX: leer MIN_SCORE como alias de MIN_SIGNAL_SCORE para compatibilidad con Railway.
-# Railway puede tener configurada la variable como MIN_SCORE (sin el prefijo MIN_SIGNAL_).
-# Orden de prioridad: MIN_SIGNAL_SCORE > MIN_SCORE > default (7).
+# ---------------------------------------------------------------------------
+# CONFIGURACIÓN PRINCIPAL — todos los valores son sobreescribibles por Railway
+# ---------------------------------------------------------------------------
+# MIN_SCORE / MIN_SIGNAL_SCORE — umbral mínimo de puntuación para emitir señal
+# Railway puede tener cualquiera de las dos; se respeta la prioridad:
+#   MIN_SIGNAL_SCORE > MIN_SCORE > default (7)
 _env_min_score = os.getenv("MIN_SIGNAL_SCORE") or os.getenv("MIN_SCORE")
 MIN_SCORE: int     = int(_env_min_score) if _env_min_score else 7
 MIN_RR: float      = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
@@ -23,8 +26,8 @@ PREMIUM_SCORE: int = int(os.getenv("PREMIUM_SIGNAL_SCORE", "10"))
 
 MAX_SCORE_NEUTRAL: int = 10
 
-# FIX: default bajado de 0.62 → 0.50 para permitir más señales válidas.
-MIN_SCORE_RATIO: float = float(os.getenv("MIN_SCORE_RATIO", "0.50"))
+# Ratio mínimo score/max_score — bajado de 0.62 → 0.50 para más señales válidas
+MIN_SCORE_RATIO: float      = float(os.getenv("MIN_SCORE_RATIO",      "0.50"))
 MIN_SCORE_RATIO_BEAR: float = float(os.getenv("MIN_SCORE_RATIO_BEAR", "0.72"))
 
 _MIN_RR_TRENDING  = float(os.getenv("MIN_RR_TRENDING",  "1.6"))
@@ -33,7 +36,7 @@ _MIN_RR_VOLATILE  = float(os.getenv("MIN_RR_VOLATILE",  "2.2"))
 _MIN_RR_REVERSAL  = float(os.getenv("MIN_RR_REVERSAL",  "2.0"))
 
 # ---------------------------------------------------------------------------
-# Pesos diferenciales por indicador — Mejora #6
+# Pesos diferenciales por indicador
 # ---------------------------------------------------------------------------
 
 def _w(name: str, default: float) -> float:
@@ -112,7 +115,7 @@ log.info(
     " | ".join(f"{k}={v:.2f}" for k, v in _WR.items()),
 )
 
-# FIX #1: _min_rr_for_regime ahora cubre el caso REVERSAL explicitamente
+# FIX #1: _min_rr_for_regime cubre el caso REVERSAL explicitamente
 def _min_rr_for_regime(regime: Optional[str]) -> float:
     if not regime:
         return MIN_RR
@@ -167,21 +170,36 @@ _SL_CANDLE_BUFFER  = float(os.getenv("SL_CANDLE_BUFFER", "0.2"))
 _SL_STRUCTURE_ENABLED = os.getenv("SL_STRUCTURE_ENABLED", "true").lower() != "false"
 _SL_STRUCTURE_MAX_DIST_PCT = float(os.getenv("SL_STRUCTURE_MAX_DIST_PCT", "4.0").replace("%", "").strip()) / 100.0
 _VOL_AVG_WINDOW    = int(os.getenv("VOL_AVG_WINDOW", "20"))
-_VOL_SIGNAL_MIN    = float(os.getenv("VOL_SIGNAL_MIN", "1.0"))
+
+# --- FILTROS DE VOLUMEN (todos configurables) ---
+# VOL_SIGNAL_MIN: volumen de la vela de señal vs media — bajado 1.0 → 0.7
+_VOL_SIGNAL_MIN    = float(os.getenv("VOL_SIGNAL_MIN",  "0.7"))
+# VOL_MIN_GLOBAL: volumen global del mercado — bajado 0.6 → 0.5
+_VOL_MIN_GLOBAL    = float(os.getenv("VOL_MIN_GLOBAL",  "0.5"))
+# VOL_CONFIRM_MIN: volumen mínimo para bonus de confirmación — bajado 1.2 → 1.0
+_VOL_CONFIRM_MIN   = float(os.getenv("VOL_CONFIRM_MIN", "1.0"))
+
 _FUNDING_LONG_MAX  = float(os.getenv("FUNDING_LONG_MAX",  "0.0005"))
 _FUNDING_SHORT_MIN = float(os.getenv("FUNDING_SHORT_MIN", "-0.0005"))
-_EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.002"))
-_EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.0015"))
+
+# --- FILTROS EMA SPREAD (configurables) ---
+# EMA_SPREAD_TREND_MIN: spread mínimo para considerar mercado en tendencia — bajado 0.002 → 0.001
+_EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.001"))
+# EMA_SPREAD_RANGE_MAX: spread máximo antes de bloquear por "mercado en rango" — subido 0.0015 → 0.003
+_EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.003"))
+
+# --- FILTROS BREAKOUT ---
 _BREAKOUT_WINDOW       = int(os.getenv("BREAKOUT_WINDOW", "20"))
-_BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",  "1.4"))
+_BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",      "1.4"))
 _BREAKOUT_VOL_MIN_HARD = float(os.getenv("BREAKOUT_VOL_MIN_HARD", "1.2"))
-_BREAKOUT_ATR_CONFIRM  = float(os.getenv("BREAKOUT_ATR_CONFIRM", "0.3"))
-_BREAKOUT_SQUEEZE_PCT  = float(os.getenv("BREAKOUT_SQUEEZE_PCT", "40"))
-_BREAKOUT_RETEST_TOL   = float(os.getenv("BREAKOUT_RETEST_TOL", "0.005"))
+_BREAKOUT_ATR_CONFIRM  = float(os.getenv("BREAKOUT_ATR_CONFIRM",  "0.3"))
+_BREAKOUT_SQUEEZE_PCT  = float(os.getenv("BREAKOUT_SQUEEZE_PCT",  "40"))
+_BREAKOUT_RETEST_TOL   = float(os.getenv("BREAKOUT_RETEST_TOL",   "0.005"))
+
+# --- FILTROS REVERSAL ---
 _REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "25"))
 _REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "75"))
-_VOL_MIN_GLOBAL        = float(os.getenv("VOL_MIN_GLOBAL",    "0.6"))
-_VOL_CONFIRM_MIN       = float(os.getenv("VOL_CONFIRM_MIN",   "1.2"))
+
 _PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "2"))
 _PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.005"))
 _EARLY_LEV_FACTOR      = float(os.getenv("EARLY_LEV_FACTOR", "0.2"))
@@ -192,6 +210,20 @@ _TP_VOL_HIGH_THRESHOLD = float(os.getenv("TP_VOL_HIGH_THRESHOLD", "2.0"))
 _TP_VOL_HIGH_MULT      = float(os.getenv("TP_VOL_HIGH_MULT",      "1.2"))
 _TP_VOL_LOW_THRESHOLD  = float(os.getenv("TP_VOL_LOW_THRESHOLD",  "0.9"))
 _TP_VOL_LOW_MULT       = float(os.getenv("TP_VOL_LOW_MULT",       "0.85"))
+
+# --- REQUISITOS OBLIGATORIOS TENDENCIA (configurables) ---
+# Poner "false" en Railway para desactivar el early-exit correspondiente
+_TENDENCIA_REQUIRE_MACD15M = os.getenv("TENDENCIA_REQUIRE_MACD15M", "true").lower() != "false"
+_TENDENCIA_REQUIRE_ST1H    = os.getenv("TENDENCIA_REQUIRE_ST1H",    "true").lower() != "false"
+
+log.info(
+    "[signal_engine] Filtros: EMA_SPREAD_RANGE_MAX=%.4f EMA_SPREAD_TREND_MIN=%.4f "
+    "VOL_SIGNAL_MIN=%.2f VOL_MIN_GLOBAL=%.2f VOL_CONFIRM_MIN=%.2f "
+    "REQUIRE_MACD15M=%s REQUIRE_ST1H=%s",
+    _EMA_SPREAD_RANGE_MAX, _EMA_SPREAD_TREND_MIN,
+    _VOL_SIGNAL_MIN, _VOL_MIN_GLOBAL, _VOL_CONFIRM_MIN,
+    _TENDENCIA_REQUIRE_MACD15M, _TENDENCIA_REQUIRE_ST1H,
+)
 
 def _to_ccxt_symbol(symbol: str) -> str:
     if "/USDC:USDC" in symbol:
@@ -615,19 +647,19 @@ async def _analyze_pair_inner(
             + ("" if ratio_ok else " [RATIO insuficiente]")
         ),
         extra={
-            "setup_type":         setup_type,
-            "sl_atr":             sl_atr,
-            "sl_used":            sl,
-            "is_fast":            is_fast_valid,
-            "funding_rate":       funding_rate,
-            "mtf_aligned":        mtf_aligned,
-            "bias_1h":            bias_1h,
-            "regime":             regime,
-            "effective_min_rr":   effective_min_rr,
+            "setup_type":          setup_type,
+            "sl_atr":              sl_atr,
+            "sl_used":             sl,
+            "is_fast":             is_fast_valid,
+            "funding_rate":        funding_rate,
+            "mtf_aligned":         mtf_aligned,
+            "bias_1h":             bias_1h,
+            "regime":              regime,
+            "effective_min_rr":    effective_min_rr,
             "effective_min_ratio": effective_min_ratio,
-            "is_premium":         score >= PREMIUM_SCORE,
-            "score_ratio":        round(score_ratio, 3),
-            "tp_vol_scale":       tp_vol_scale if tp_vol_scale else _TP_VOL_LOW_MULT,
+            "is_premium":          score >= PREMIUM_SCORE,
+            "score_ratio":         round(score_ratio, 3),
+            "tp_vol_scale":        tp_vol_scale if tp_vol_scale else _TP_VOL_LOW_MULT,
         },
     )
 
@@ -708,25 +740,41 @@ def _score_tendencia(
         direction, trend_1h_up, trend_1h_down, ema21_1h, ema50_1h,
     )
 
+    # MACD 15m — obligatorio si TENDENCIA_REQUIRE_MACD15M=true (default)
     macd_ok = (direction == "LONG" and i15.get("macd_bull")) or (direction == "SHORT" and i15.get("macd_bear"))
     if not macd_ok:
-        log.info(
-            "[signal_engine] TENDENCIA early-exit: MACD15m en contra de %s "
-            "(macd_bull=%s macd_bear=%s)",
-            direction, i15.get("macd_bull"), i15.get("macd_bear"),
-        )
-        reasons.append(f"MACD15m en contra de {direction} — requisito obligatorio")
-        return "TENDENCIA", "NEUTRAL", 0, MAX, reasons
+        if _TENDENCIA_REQUIRE_MACD15M:
+            log.info(
+                "[signal_engine] TENDENCIA early-exit: MACD15m en contra de %s "
+                "(macd_bull=%s macd_bear=%s)",
+                direction, i15.get("macd_bull"), i15.get("macd_bear"),
+            )
+            reasons.append(f"MACD15m en contra de {direction} — requisito obligatorio")
+            return "TENDENCIA", "NEUTRAL", 0, MAX, reasons
+        else:
+            log.info(
+                "[signal_engine] TENDENCIA: MACD15m en contra de %s — penalizado (REQUIRE=false)",
+                direction,
+            )
+            reasons.append(f"MACD15m en contra de {direction} (no bloqueante, TENDENCIA_REQUIRE_MACD15M=false)")
 
+    # ST 1h — obligatorio si TENDENCIA_REQUIRE_ST1H=true (default)
     st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
     if not st1h_ok:
-        log.info(
-            "[signal_engine] TENDENCIA early-exit: ST1h en contra de %s "
-            "(st_bull=%s st_bear=%s)",
-            direction, i1h.get("st_bull"), i1h.get("st_bear"),
-        )
-        reasons.append(f"ST1h en contra de {direction} — requisito obligatorio")
-        return "TENDENCIA", "NEUTRAL", 0, MAX, reasons
+        if _TENDENCIA_REQUIRE_ST1H:
+            log.info(
+                "[signal_engine] TENDENCIA early-exit: ST1h en contra de %s "
+                "(st_bull=%s st_bear=%s)",
+                direction, i1h.get("st_bull"), i1h.get("st_bear"),
+            )
+            reasons.append(f"ST1h en contra de {direction} — requisito obligatorio")
+            return "TENDENCIA", "NEUTRAL", 0, MAX, reasons
+        else:
+            log.info(
+                "[signal_engine] TENDENCIA: ST1h en contra de %s — penalizado (REQUIRE=false)",
+                direction,
+            )
+            reasons.append(f"ST1h en contra de {direction} (no bloqueante, TENDENCIA_REQUIRE_ST1H=false)")
 
     score = 0.0
 
@@ -740,9 +788,10 @@ def _score_tendencia(
         score += w
         reasons.append(f"EMA1h en {direction} pero 15m aun no (spread={ema_spread_1h*100:.2f}%) +{w:.2f}")
 
-    w = _WT["ST_1H"]
-    score += w
-    reasons.append(f"ST1h en favor +{w:.2f}")
+    if st1h_ok:
+        w = _WT["ST_1H"]
+        score += w
+        reasons.append(f"ST1h en favor +{w:.2f}")
 
     st4h_ok = False
     macd4h_ok = False
@@ -766,9 +815,10 @@ def _score_tendencia(
     else:
         reasons.append("ST4h sin datos")
 
-    w = _WT["MACD_15M"]
-    score += w
-    reasons.append(f"MACD15m en favor +{w:.2f}")
+    if macd_ok:
+        w = _WT["MACD_15M"]
+        score += w
+        reasons.append(f"MACD15m en favor +{w:.2f}")
 
     closes_15m = [float(_b_close(b)) for b in bars_15m]
     highs_15m  = [float(_b_high(b))  for b in bars_15m]
@@ -1121,393 +1171,101 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, float, int, List[str]]:
     MAX = 10
     reasons: List[str] = []
-    rsi_1h = i1h.get("rsi_val") if i1h else None
-    if rsi_1h is None:
-        return "REVERSAL", "NEUTRAL", 0, MAX, ["Sin datos 1h"]
-    is_long  = rsi_1h <= _REVERSAL_RSI_LOW
-    is_short = rsi_1h >= _REVERSAL_RSI_HIGH
-    if not is_long and not is_short:
-        log.info(
-            "[signal_engine] EVAL REVERSAL → score=0/%d | "
-            "RSI1h=%.1f (umbral: LOW≤%.0f HIGH≥%.0f) | ST1h=%s | Div=%s | umbral=%d",
-            MAX,
-            rsi_1h, _REVERSAL_RSI_LOW, _REVERSAL_RSI_HIGH,
-            "✅" if (i1h and (i1h.get("st_bull") or i1h.get("st_bear"))) else "❌",
-            "❌",
-            MIN_SCORE,
-        )
-        return "REVERSAL", "NEUTRAL", 0, MAX, [f"RSI1h={rsi_1h:.0f} no es extremo (umbral {_REVERSAL_RSI_LOW}/{_REVERSAL_RSI_HIGH})"]
-    direction = "LONG" if is_long else "SHORT"
 
-    if i1h:
-        st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
-        if not st1h_ok:
-            reasons.append(f"ST1h en contra de {direction} — requisito obligatorio")
-            log.info(
-                "[signal_engine] EVAL REVERSAL(%s) → score=0/%d | "
-                "RSI1h=%.1f ✅ | ST1h=❌ | umbral=%d",
-                direction, MAX, rsi_1h, MIN_SCORE,
-            )
-            return "REVERSAL", "NEUTRAL", 0, MAX, reasons
-    else:
-        reasons.append("ST1h no disponible — requisito obligatorio")
-        return "REVERSAL", "NEUTRAL", 0, MAX, reasons
+    close_15m = i15.get("close", 0)
+    rsi_15m   = i15.get("rsi_val")
 
-    if direction == "LONG":
-        has_div = i15.get("rsi_bull_div", False)
-    else:
-        has_div = i15.get("rsi_bear_div", False)
+    if rsi_15m is None:
+        return "REVERSAL", "NEUTRAL", 0, MAX, ["RSI no disponible"]
 
-    if not has_div:
-        reasons.append(f"Divergencia RSI no confirmada para {direction} — requisito obligatorio")
-        log.info(
-            "[signal_engine] EVAL REVERSAL(%s) → score=0/%d | "
-            "RSI1h=%.1f ✅ | ST1h=✅ | Div=❌ | umbral=%d",
-            direction, MAX, rsi_1h, MIN_SCORE,
-        )
-        return "REVERSAL", "NEUTRAL", 0, MAX, reasons
+    oversold  = rsi_15m <= _REVERSAL_RSI_LOW
+    overbought = rsi_15m >= _REVERSAL_RSI_HIGH
+
+    if not oversold and not overbought:
+        return "REVERSAL", "NEUTRAL", 0, MAX, [
+            f"RSI15m={rsi_15m:.1f} fuera de zona extrema ({_REVERSAL_RSI_LOW}/{_REVERSAL_RSI_HIGH})"
+        ]
+
+    direction = "LONG" if oversold else "SHORT"
 
     score = float(_WR["BASE"])
-    reasons.append(f"RSI1h={rsi_1h:.0f} extremo + ST1h alineado (score base={_WR['BASE']:.2f})")
+    reasons.append(f"RSI15m={rsi_15m:.1f} zona {'oversold' if oversold else 'overbought'} +{_WR['BASE']:.2f}")
 
-    try:
-        from bot.structure_analyzer import analyze_structure, STRUCTURE_SWING_N
-        if len(bars_15m) >= 30:
-            df = _bars_to_df(bars_15m)
-            swing_dir = -1 if direction == "LONG" else 1
-            struct = analyze_structure(df, swing_dir)
-            current_price = float(_b_close(bars_15m[-1]))
-            if direction == "LONG":
-                swing_level = struct.get("last_sl", 0.0)
-            else:
-                swing_level = struct.get("last_sh", 0.0)
-            if swing_level > 0:
-                dist_pct = abs(current_price - swing_level) / swing_level
-                if dist_pct <= _REVERSAL_SWING_TOL:
-                    w = _WR["SWING"]
-                    score += w
-                    reasons.append(f"Swing level {swing_level:.4f} cerca (dist={dist_pct*100:.2f}%) +{w:.2f}")
-                else:
-                    reasons.append(f"Swing level lejano (dist={dist_pct*100:.2f}%)")
-            else:
-                reasons.append("Sin swing level reciente")
-    except Exception as e:
-        log.debug("[signal_engine] _score_reversal swing level error: %s", e)
-        reasons.append("Swing levels no disponible")
+    if len(bars_15m) >= 10:
+        recent = bars_15m[-10:]
+        swing_low  = min(float(_b_low(b))  for b in recent)
+        swing_high = max(float(_b_high(b)) for b in recent)
+        if direction == "LONG":
+            swing_ok = abs(close_15m - swing_low) / swing_low <= _REVERSAL_SWING_TOL if swing_low > 0 else False
+        else:
+            swing_ok = abs(close_15m - swing_high) / swing_high <= _REVERSAL_SWING_TOL if swing_high > 0 else False
+        if swing_ok:
+            w = _WR["SWING"]
+            score += w
+            reasons.append(f"Precio cerca del swing {'low' if direction == 'LONG' else 'high'} +{w:.2f}")
+        else:
+            reasons.append(f"Sin swing {'low' if direction == 'LONG' else 'high'} cercano")
 
-    ema50_1h = i1h.get("ema50")
-    ema50_ok = False
-    if ema50_1h:
-        current_price = float(_b_close(bars_15m[-1]))
-        dist_pct = abs(current_price - ema50_1h) / ema50_1h
-        if dist_pct <= 0.003:
-            ema50_ok = True
+    ema50_15m = i15.get("ema50")
+    if ema50_15m and close_15m:
+        ema50_ok = (direction == "LONG" and close_15m < ema50_15m) or (direction == "SHORT" and close_15m > ema50_15m)
+        if ema50_ok:
             w = _WR["EMA50"]
             score += w
-            reasons.append(f"Precio cerca de EMA50_1h ({ema50_1h:.4f}) +{w:.2f}")
+            reasons.append(f"Precio al lado correcto de EMA50_15m +{w:.2f}")
         else:
-            reasons.append(f"Precio lejos de EMA50_1h (dist={dist_pct*100:.2f}%)")
-    else:
-        reasons.append("EMA50_1h no disponible")
+            reasons.append("Precio al lado incorrecto de EMA50_15m")
 
-    macd_ok = False
-    if i1h:
-        macd_ok = (direction == "LONG" and i1h.get("macd_bull")) or (direction == "SHORT" and i1h.get("macd_bear"))
-        if macd_ok:
-            w = _WR["MACD"]
-            score += w
-            reasons.append(f"MACD1h en favor +{w:.2f}")
-        else:
-            reasons.append("MACD1h en contra")
+    macd_ok_rev = (direction == "LONG" and i15.get("macd_bull")) or (direction == "SHORT" and i15.get("macd_bear"))
+    if macd_ok_rev:
+        w = _WR["MACD"]
+        score += w
+        reasons.append(f"MACD15m confirma reversión +{w:.2f}")
+    else:
+        reasons.append("MACD15m no confirma reversión aún")
 
     vol_ratio = i15.get("vol_ratio", 1.0)
-    vol_ok = vol_ratio >= _VOL_CONFIRM_MIN
-    if vol_ok:
+    if vol_ratio >= _VOL_CONFIRM_MIN:
         w = _WR["VOL"]
         score += w
-        reasons.append(f"Vol={vol_ratio:.1f}x confirma +{w:.2f}")
+        reasons.append(f"Vol15m={vol_ratio:.1f}x confirma reversión +{w:.2f}")
     else:
-        reasons.append(f"Vol={vol_ratio:.1f}x bajo")
+        reasons.append(f"Vol15m={vol_ratio:.1f}x débil para reversión")
 
-    rsi_15m = i15.get("rsi_val")
-    rsi_15m_ok = False
-    if rsi_15m is not None:
-        rsi_15m_ok = (direction == "LONG" and rsi_15m < 40) or (direction == "SHORT" and rsi_15m > 60)
-        if rsi_15m_ok:
-            w = _WR["RSI"]
-            score += w
-            reasons.append(f"RSI15m={rsi_15m:.0f} alineado +{w:.2f}")
-        else:
-            reasons.append(f"RSI15m={rsi_15m:.0f} no extremo")
+    div_ok = i15.get("rsi_div_bull") if direction == "LONG" else i15.get("rsi_div_bear")
+    if div_ok:
+        w = _WR["RSI"]
+        score += w
+        reasons.append(f"Divergencia RSI {'alcista' if direction == 'LONG' else 'bajista'} confirmada +{w:.2f}")
+    else:
+        reasons.append(f"Sin divergencia RSI {'alcista' if direction == 'LONG' else 'bajista'}")
 
     vwap_val = i15.get("vwap", 0.0)
-    vwap_ok = False
-    if vwap_val and vwap_val > 0:
-        current_price = float(_b_close(bars_15m[-1]))
-        vwap_ok = (direction == "LONG" and current_price < vwap_val) or (direction == "SHORT" and current_price > vwap_val)
+    if vwap_val and vwap_val > 0 and close_15m:
+        vwap_ok = (direction == "LONG" and close_15m < vwap_val) or (direction == "SHORT" and close_15m > vwap_val)
         if vwap_ok:
             w = _WR["VWAP"]
             score += w
-            reasons.append(f"Precio del lado correcto de VWAP ({vwap_val:.4f}) +{w:.2f}")
+            reasons.append(f"Precio bajo VWAP para reversión {direction} +{w:.2f}")
         else:
-            reasons.append("Precio del lado equivocado de VWAP — sin penalización")
+            reasons.append(f"Precio sobre VWAP — menos favorable para reversión {direction}")
 
-    st4h_ok = False
     if i4h:
-        st4h_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
-        if st4h_ok:
+        st4h_rev_ok = (direction == "LONG" and i4h.get("st_bull")) or (direction == "SHORT" and i4h.get("st_bear"))
+        if st4h_rev_ok:
             w = _WR["ST_4H"]
             score += w
-            reasons.append(f"ST4h en favor +{w:.2f}")
+            reasons.append(f"ST4h confirma reversión {direction} +{w:.2f}")
         else:
-            reasons.append("ST4h en contra (sin penalización)")
+            reasons.append(f"ST4h no confirma reversión {direction}")
 
     log.info(
-        "[signal_engine] EVAL REVERSAL(%s) → score=%.2f/%d | "
-        "RSI1h=%.1f ✅ | ST1h=✅ | Div=✅ | EMA50=%s | MACD1h=%s | "
-        "Vol=%.2fx(%s) | RSI15m=%.1f(%s) | VWAP=%s | ST4h=%s | "
+        "[signal_engine] EVAL REVERSAL(%s) → score=%.2f/%d | RSI=%.1f | "
         "umbral=%d | ratio=%.2f(min=%.2f)",
-        direction, score, MAX,
-        rsi_1h,
-        "✅" if ema50_ok    else "❌",
-        "✅" if macd_ok     else "❌",
-        vol_ratio,
-        "✅" if vol_ok      else "❌",
-        rsi_15m or 0.0,
-        "✅" if rsi_15m_ok  else "❌",
-        "✅" if vwap_ok     else "❌",
-        "✅" if st4h_ok     else "❌",
+        direction, score, MAX, rsi_15m or 0.0,
         MIN_SCORE,
         score / MAX if MAX > 0 else 0.0,
         _min_score_ratio_for_regime(None),
     )
 
     return "REVERSAL", direction, score, MAX, reasons
-
-def _compute_indicators(bars: list) -> dict:
-    if not bars or len(bars) < 30:
-        return {}
-    bars = _clean_bars(bars)
-    if len(bars) < 30:
-        return {}
-
-    closed_bars = bars[:-1]
-    closes = [float(_b_close(b)) for b in closed_bars]
-    highs  = [float(_b_high(b))  for b in closed_bars]
-    lows   = [float(_b_low(b))   for b in closed_bars]
-    volumes= [float(_b_vol(b))   for b in closed_bars]
-
-    if len(closes) < 14:
-        return {}
-
-    def _safe_last(value):
-        return value[-1] if isinstance(value, (list, tuple)) else value
-
-    # EMA
-    ema21_raw = ema(closes, 21) if len(closes) >= 21 else None
-    ema50_raw = ema(closes, 50) if len(closes) >= 50 else None
-    ema21 = _safe_last(ema21_raw) if ema21_raw is not None else 0.0
-    ema50 = _safe_last(ema50_raw) if ema50_raw is not None else 0.0
-    ema21_series = ema21_raw if isinstance(ema21_raw, (list, tuple)) else []
-    ema_bull = ema21 > ema50 if ema21 and ema50 else False
-    ema_bear = ema21 < ema50 if ema21 and ema50 else False
-
-    # RSI
-    rsi_raw = rsi(closes, 14) if len(closes) >= 14 else None
-    rsi_val = _safe_last(rsi_raw) if rsi_raw is not None else None
-
-    # MACD
-    macd_raw = macd(closes)
-    if isinstance(macd_raw, tuple) and len(macd_raw) >= 2:
-        macd_line_raw, signal_line_raw, _ = macd_raw
-        macd_line = _safe_last(macd_line_raw) if macd_line_raw else 0.0
-        signal_line = _safe_last(signal_line_raw) if signal_line_raw else 0.0
-        macd_bull = macd_line > signal_line
-        macd_bear = macd_line < signal_line
-    else:
-        macd_bull = macd_bear = False
-
-    # SuperTrend
-    st_bull, st_bear = False, False
-    if len(closes) >= 20:
-        try:
-            st_raw = supertrend(highs, lows, closes, period=10, factor=3.0)
-        except TypeError:
-            st_raw = supertrend(highs, lows, closes, 10, 3.0)
-        if st_raw:
-            last_st = _safe_last(st_raw)
-            st_bull = last_st == 1
-            st_bear = last_st == -1
-
-    # FIX #3: VWAP diario reseteado por día UTC — solo velas del día actual
-    vwap_val = 0.0
-    if len(closed_bars) > 0 and len(closes) == len(volumes):
-        import datetime
-        now_utc = datetime.datetime.utcnow()
-        day_start_ms = int(datetime.datetime(now_utc.year, now_utc.month, now_utc.day,
-                                             tzinfo=datetime.timezone.utc).timestamp() * 1000)
-        today_closes = []
-        today_volumes = []
-        for b, c, v in zip(closed_bars, closes, volumes):
-            ts = int(_b_ts(b))
-            if ts >= day_start_ms:
-                today_closes.append(c)
-                today_volumes.append(v)
-        if today_closes and sum(today_volumes) > 0:
-            cumulative_pv = sum(c * v for c, v in zip(today_closes, today_volumes))
-            cumulative_vol = sum(today_volumes)
-            vwap_val = cumulative_pv / cumulative_vol
-        elif sum(volumes) > 0:
-            cumulative_pv = sum(c * v for c, v in zip(closes, volumes))
-            cumulative_vol = sum(volumes)
-            vwap_val = cumulative_pv / cumulative_vol if cumulative_vol > 0 else 0.0
-
-    # Volumen ratio
-    vol_avg = sum(volumes[-_VOL_AVG_WINDOW:]) / _VOL_AVG_WINDOW if len(volumes) >= _VOL_AVG_WINDOW else volumes[-1]
-    vol_ratio = volumes[-1] / vol_avg if vol_avg > 0 else 1.0
-    avg_vol_raw = vol_avg
-
-    # ATR
-    atr_val = calc_atr(
-        [float(_b_high(b)) for b in bars],
-        [float(_b_low(b))  for b in bars],
-        [float(_b_close(b)) for b in bars],
-        14,
-    )
-
-    # Divergencias RSI
-    rsi_series = rsi(closes, 14)
-    if isinstance(rsi_series, (list, tuple)):
-        bull_div, bear_div = rsi_divergence(closes, rsi_series, 14)
-    else:
-        bull_div = bear_div = False
-
-    return {
-        "close": closes[-1],
-        "ema21": ema21,
-        "ema50": ema50,
-        "ema_bull": ema_bull,
-        "ema_bear": ema_bear,
-        "_ema21_series": ema21_series,
-        "rsi_val": rsi_val,
-        "macd_bull": macd_bull,
-        "macd_bear": macd_bear,
-        "st_bull": st_bull,
-        "st_bear": st_bear,
-        "vwap": vwap_val,
-        "vol_ratio": vol_ratio,
-        "_avg_vol": avg_vol_raw,
-        "atr": atr_val,
-        "rsi_bull_div": bull_div,
-        "rsi_bear_div": bear_div,
-    }
-
-def _hold_result(symbol: str, reason: str, max_score: int = MAX_SCORE_NEUTRAL) -> SignalResult:
-    return SignalResult(
-        symbol=symbol,
-        signal="NEUTRAL",
-        entry_mode="NONE",
-        score=0,
-        max_score=max_score,
-        entry=0.0,
-        sl=0.0,
-        tp1=0.0,
-        tp2=0.0,
-        atr=0.0,
-        rr=0.0,
-        suggested_lev=0,
-        indicators={},
-        is_valid=False,
-        reason=reason,
-    )
-
-def format_signal_block(res: SignalResult) -> str:
-    if not res.is_valid:
-        return f"🚫 {res.symbol} | NEUTRAL | {res.reason}"
-    premium = " ⭐" if res.extra.get("is_premium") else ""
-    block = (
-        f"{res.symbol} | {res.signal}{premium} [{res.entry_mode}] | "
-        f"score {res.score}/{res.max_score} (ratio {res.extra.get('score_ratio', 0):.2f}) | "
-        f"RR {res.rr:.2f} | entry {res.entry:.6f} | sl {res.sl:.6f} | tp1 {res.tp1:.6f} | "
-        f"tp2 {res.tp2:.6f} | lev {res.suggested_lev}x | {res.extra.get('setup_type', '')}"
-    )
-    return block
-
-class SignalFlipGuard:
-    def __init__(self, cooldown_seconds: int = 300):
-        self.cooldown = cooldown_seconds
-        self.last_close_time: Dict[str, float] = {}
-
-    def record_close(self, symbol: str):
-        self.last_close_time[symbol] = time.time()
-
-    def can_enter(self, symbol: str, new_signal: str, last_signal: Optional[str] = None) -> bool:
-        if symbol not in self.last_close_time:
-            return True
-        if time.time() - self.last_close_time[symbol] < self.cooldown:
-            if last_signal and last_signal != new_signal:
-                log.debug("[SignalFlipGuard] %s cooldown activo: %s -> %s", symbol, last_signal, new_signal)
-                return False
-        return True
-
-def manual_close_cooldown(guard: SignalFlipGuard, symbol: str, new_signal: str, last_signal: Optional[str] = None) -> bool:
-    return guard.can_enter(symbol, new_signal, last_signal)
-
-# FIX #2: usar hasattr(exch, 'markets') en lugar de 'market' (CCXT usa .markets, no .market)
-async def _fetch_bars(exch, symbol: str, tf: str, limit: int) -> list:
-    try:
-        ccxt_symbol = _to_ccxt_symbol(symbol) if hasattr(exch, 'markets') else symbol
-        ohlcv = await exch.fetch_ohlcv(ccxt_symbol, timeframe=tf, limit=limit)
-        return [[ts, o, h, l, c, v] for ts, o, h, l, c, v in ohlcv]
-    except Exception as e:
-        log.error("[signal_engine] Error fetching %s %s: %s", symbol, tf, e)
-        raise
-
-
-# ---------------------------------------------------------------------------
-# evaluate() — wrapper para DecisionEngine
-# ---------------------------------------------------------------------------
-
-async def evaluate(
-    symbol: str,
-    price: float,  # noqa: ARG001 — no usado, mantenido para compatibilidad con DecisionEngine
-    ohlcv_fn: Optional[Callable] = None,
-    exch=None,
-    funding_rate: float = 0.0,
-    regime: Optional[str] = None,
-) -> Optional[dict]:
-    """
-    Wrapper para DecisionEngine.evaluate().
-    Traduce la interfaz (symbol, price, ohlcv_fn) → analyze_pair().
-    Retorna None si la señal no es válida (NEUTRAL / score insuficiente).
-    """
-    result = await analyze_pair(
-        exch=exch,
-        symbol=symbol,
-        ohlcv_fn=ohlcv_fn,
-        funding_rate=funding_rate,
-        regime=regime,
-    )
-
-    if result is None or not result.is_valid:
-        return None
-
-    return {
-        "action":          result.signal,   # "LONG" / "SHORT"
-        "side":            result.signal,   # alias — TradingLoop usa signal.get("side")
-        "signal":          result.signal,
-        "entry_mode":      result.entry_mode,
-        "score":           result.score,
-        "max_score":       result.max_score,
-        "min_score_ratio": result.extra.get("effective_min_ratio", MIN_SCORE_RATIO),
-        "entry":           result.entry,
-        "sl":              result.sl,
-        "tp1":             result.tp1,
-        "tp2":             result.tp2,
-        "atr":             result.atr,
-        "rr":              result.rr,
-        "suggested_lev":   result.suggested_lev,
-        "indicators":      result.indicators,
-        "extra":           result.extra,
-        "reason":          result.reason,
-    }
