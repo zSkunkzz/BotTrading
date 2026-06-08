@@ -9,6 +9,10 @@ v10 — Kelly sizing:
     KELLY_ENABLED=true, multiplica el tamaño base por la fracción de Kelly.
   - Config: KELLY_ENABLED (default false), KELLY_MIN_FRACTION (default 0.05),
             KELLY_MAX_FRACTION (default 0.25).
+
+fix: clase DecisionEngine añadida para que bot/core/decision_engine.py
+     pueda hacer `from bot.decision_engine import DecisionEngine` sin
+     ImportError. Envuelve compute_kelly_fraction y calc_position_size.
 """
 
 import logging
@@ -24,7 +28,7 @@ _MAX_LEVERAGE          = int(os.getenv("MAX_LEVERAGE",             "10"))
 _EF_PENALTY_REDUCTION  = float(os.getenv("EF_PENALTY_REDUCTION",   "0.10"))  # 10% reducción por penalización
 
 # ─ Kelly ───────────────────────────────────────────────────────────────────────────
-_KELLY_ENABLED     = os.getenv("KELLY_ENABLED",     "false").lower() not in ("false", "0", "no")
+_KELLY_ENABLED      = os.getenv("KELLY_ENABLED",     "false").lower() not in ("false", "0", "no")
 _KELLY_MIN_FRACTION = float(os.getenv("KELLY_MIN_FRACTION", "0.05"))   # 5% mínimo de Kelly
 _KELLY_MAX_FRACTION = float(os.getenv("KELLY_MAX_FRACTION", "0.25"))   # 25% máximo de Kelly
 
@@ -129,3 +133,48 @@ def calc_position_size(
         entry, sl, lev, kelly_fraction, effective_risk, qty,
     )
     return qty
+
+
+class DecisionEngine:
+    """
+    Fachada orientada a objetos sobre las funciones de sizing de este módulo.
+
+    Permite que bot/core/decision_engine.py haga:
+        from bot.decision_engine import DecisionEngine  # re-export
+    sin ImportError.
+
+    Uso:
+        de = DecisionEngine()
+        qty = de.calc_position_size(entry=..., sl=..., leverage=...)
+        frac = de.compute_kelly_fraction(win_rate=..., avg_win=..., avg_loss=...)
+    """
+
+    def calc_position_size(
+        self,
+        entry:       float,
+        sl:          float,
+        leverage:    int,
+        capital:     Optional[float] = None,
+        ef_penalty:  int             = 0,
+        kelly_stats: Optional[dict]  = None,
+    ) -> float:
+        return calc_position_size(
+            entry=entry,
+            sl=sl,
+            leverage=leverage,
+            capital=capital,
+            ef_penalty=ef_penalty,
+            kelly_stats=kelly_stats,
+        )
+
+    def compute_kelly_fraction(
+        self,
+        win_rate: float,
+        avg_win:  float,
+        avg_loss: float,
+    ) -> float:
+        return compute_kelly_fraction(
+            win_rate=win_rate,
+            avg_win=avg_win,
+            avg_loss=avg_loss,
+        )
