@@ -2,31 +2,21 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
-v29 — Fix kelly_multiplier: propagar min_ratio desde signal (2026-06-08):
-  - _do_open_order() paso 5b: lee signal.get('min_score_ratio', 0.62)
-    y lo pasa como parámetro min_ratio a kelly_multiplier().
-    Antes, min_ratio quedaba hardcodeado a 0.62 en kelly_sizer.py
-    ignorando el valor real que usa signal_engine para filtrar señales.
+v30 — Fix CRÍTICO: guardia SL/TP obligatoria también en dry-run (2026-06-09):
+  - _do_open_order() paso 2: la guardia _confirm_margin() ya NO está
+    condicionada a `not self.dry_run`. Ahora bloquea en cualquier modo
+    si sl_price o tp1_price son None/0 ANTES del rebase.
+  - Paso 2b (nuevo): segunda comprobación POST-rebase para cubrir el caso
+    en que el rebase limpiara algún nivel. Si tras el rebase sl o tp1
+    siguen siendo None, se aborta igual en ambos modos.
+  - Paso 7 (fallback place_market): eliminado el bloque `if sl_price or
+    tp1_price` que permitía abrir sin protección. Ahora si la guardia
+    previa ya pasó, se garantiza que sl_price y tp1_price existen; si
+    _place_tpsl falla de todas formas se cierra la posición igual que antes.
 
-v28 — Fix: self.atr no se seteaba al abrir posición (2026-06-08):
-  - _do_open_order() Paso 6 (DRY-RUN) y Paso 9 (LIVE):
-    ahora incluyen self.atr, self.trailing_sl_activated=False,
-    self._trailing_peak=None al actualizar estado post-apertura.
-  - __init__: declarados self.atr=0.0, self.trailing_sl_activated=False,
-    self._trailing_peak=None.
-  - Restauración desde state en __init__: si trailing_activated=True
-    y 'atr' guardado > 0, los restaura para que el trailing SL
-    sobreviva reinicios correctamente.
-  Sin este fix, position_manager._read_atr() siempre devolvía 0.0
-  y el trailing SL usaba modo 'pct' aunque TRAILING_SL_MODE=atr.
-
-v27 — Conectar kelly_multiplier al sizing (2026-06-08):
-  - _do_open_order() paso 5b: tras calcular qty bruta, aplica kelly_multiplier()
-    usando entry_mode, rr y score_ratio del signal.
-  - score_ratio = signal.score / signal.max_score (fallback 1.0 si ausente).
-  - qty_kelly usa los mismos decimales del exchange que qty.
-  - Guardia defensiva: si qty_kelly <= 0, se usa qty original.
-
+v29 — Fix kelly_multiplier: propagar min_ratio desde signal (2026-06-08).
+v28 — Fix: self.atr no se seteaba al abrir posición (2026-06-08).
+v27 — Conectar kelly_multiplier al sizing (2026-06-08).
 v26 — Fix get_ohlcv_fn: delegar en ohlcv_cache (2026-06-08).
 v25 — Persistencia BE y restauración tras restart (2026-06-07).
 v24 — Rebase automático de niveles al precio de mercado (2026-06-07).
@@ -568,12 +558,12 @@ class FuturesTrader:
         usdc_per_trade = float(getattr(risk, "usdc_per_trade", 20.0))
         leverage       = int(getattr(risk, "leverage", self.leverage) or self.leverage)
 
-        # ── 2. GUARDIA DURA: SL y TP1 obligatorios antes de tocar el exchange ──
-        if not self.dry_run:
-            guard_err = self._confirm_margin(sl_price, tp1_price)
-            if guard_err:
-                logger.error("[%s] 🚫 %s", self.symbol, guard_err)
-                return
+        # ── 2. GUARDIA DURA PRE-REBASE: SL y TP1 obligatorios en CUALQUIER modo ──
+        # v30 FIX: eliminado `if not self.dry_run` — la guardia aplica siempre.
+        guard_err = self._confirm_margin(sl_price, tp1_price)
+        if guard_err:
+            logger.error("[%s] 🚫 %s", self.symbol, guard_err)
+            return
 
         # ── 3. Obtener precio de referencia ───────────────────────────────
         try:
@@ -590,6 +580,16 @@ class FuturesTrader:
 
         sl_price  = float(signal.get("sl")  or 0) or None
         tp1_price = float(signal.get("tp1") or 0) or None
+
+        # ── 2b. GUARDIA DURA POST-REBASE: segunda comprobación tras reescalar ──
+        # v30 FIX: el rebase podría haber dejado sl/tp1 en 0 si entry era 0.
+        guard_err_post = self._confirm_margin(sl_price, tp1_price)
+        if guard_err_post:
+            logger.error(
+                "[%s] 🚫 Post-rebase: %s — abortando.",
+                self.symbol, guard_err_post,
+            )
+            return
 
         # ── 5. Calcular qty ───────────────────────────────────────────────
         notional = usdc_per_trade * leverage
@@ -749,6 +749,9 @@ class FuturesTrader:
                 filled_price = None
 
         if filled_price is None:
+            # v30 FIX: el fallback place_market SIEMPRE intenta colocar SL/TP
+            # porque la guardia del paso 2 ya garantiza que sl_price y tp1_price
+            # existen. El bloque `if sl_price or tp1_price` fue eliminado.
             try:
                 result = await asyncio.to_thread(
                     self._bingx_client.place_market,
@@ -780,40 +783,39 @@ class FuturesTrader:
                     pass
                 await asyncio.sleep(_FILL_DELAY)
 
-            if sl_price or tp1_price:
-                sl_placed = await self._place_tpsl(
-                    qty=qty,
-                    sl_price=sl_price,
-                    tp_price=tp1_price,
-                    is_long=is_long,
-                    reduce_only=True,
+            sl_placed = await self._place_tpsl(
+                qty=qty,
+                sl_price=sl_price,
+                tp_price=tp1_price,
+                is_long=is_long,
+                reduce_only=True,
+            )
+            if sl_placed:
+                self._protection_ok = True
+            else:
+                logger.error(
+                    "[%s] 🚨 SL NO colocado en fallback — cerrando posición "
+                    "para evitar exposición sin stop loss.",
+                    self.symbol,
                 )
-                if sl_placed:
-                    self._protection_ok = True
-                else:
-                    logger.error(
-                        "[%s] 🚨 SL NO colocado en fallback — cerrando posición "
-                        "para evitar exposición sin stop loss.",
-                        self.symbol,
+                try:
+                    await self.close_position(reason="NO_SL")
+                    logger.warning("[%s] Posición cerrada preventivamente por falta de SL.", self.symbol)
+                except Exception as close_exc:
+                    logger.critical(
+                        "[%s] ❌❌ FALLO CRÍTICO: no se pudo colocar SL NI cerrar la posición: %s",
+                        self.symbol, close_exc,
                     )
-                    try:
-                        await self.close_position(reason="NO_SL")
-                        logger.warning("[%s] Posición cerrada preventivamente por falta de SL.", self.symbol)
-                    except Exception as close_exc:
-                        logger.critical(
-                            "[%s] ❌❌ FALLO CRÍTICO: no se pudo colocar SL NI cerrar la posición: %s",
-                            self.symbol, close_exc,
-                        )
-                    try:
-                        from bot.telegram_bot import send_message
-                        await send_message(
-                            f"🚨 *ALERTA CRÍTICA* `{self.symbol}`\n"
-                            f"SL no pudo colocarse tras el fallback place_market.\n"
-                            f"Posición cerrada preventivamente."
-                        )
-                    except Exception:
-                        pass
-                    return
+                try:
+                    from bot.telegram_bot import send_message
+                    await send_message(
+                        f"🚨 *ALERTA CRÍTICA* `{self.symbol}`\n"
+                        f"SL no pudo colocarse tras el fallback place_market.\n"
+                        f"Posición cerrada preventivamente."
+                    )
+                except Exception:
+                    pass
+                return
 
         # ── 8. Ajustar niveles al fill real ───────────────────────────────
         sl_adj, tp1_adj = _adjust_levels_to_fill(signal, filled_price, ref_price)
