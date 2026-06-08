@@ -383,6 +383,108 @@ def _ema_slope(ema_series: list, lookback: int = 3) -> float:
     base = tail[0]
     return delta / base if base != 0 else 0.0
 
+
+# ---------------------------------------------------------------------------
+# _compute_indicators — calcula todos los indicadores técnicos de un timeframe
+# ---------------------------------------------------------------------------
+
+def _compute_indicators(bars: list) -> dict:
+    """Calcula todos los indicadores técnicos para un conjunto de velas OHLCV."""
+    if not bars or len(bars) < 10:
+        return {}
+
+    closes = [float(_b_close(b)) for b in bars]
+    highs  = [float(_b_high(b))  for b in bars]
+    lows   = [float(_b_low(b))   for b in bars]
+    vols   = [float(_b_vol(b))   for b in bars]
+
+    # EMA 9, 21, 50
+    ema9_series  = ema(closes, 9)
+    ema21_series = ema(closes, 21)
+    ema50_series = ema(closes, 50)
+
+    ema9_val  = ema9_series[-1]  if ema9_series  else None
+    ema21_val = ema21_series[-1] if ema21_series else None
+    ema50_val = ema50_series[-1] if ema50_series else None
+
+    close_last = closes[-1]
+
+    ema_bull = bool(
+        ema9_val and ema21_val and ema50_val
+        and ema9_val > ema21_val > ema50_val
+        and close_last > ema21_val
+    )
+    ema_bear = bool(
+        ema9_val and ema21_val and ema50_val
+        and ema9_val < ema21_val < ema50_val
+        and close_last < ema21_val
+    )
+
+    # RSI
+    rsi_val = rsi(closes, 14)
+
+    # MACD
+    macd_line, signal_line, hist = macd(closes)
+    macd_bull = bool(macd_line > signal_line and hist > 0)
+    macd_bear = bool(macd_line < signal_line and hist < 0)
+
+    # ATR
+    atr_val = calc_atr(highs, lows, closes, 14)
+
+    # Supertrend
+    st_dir, st_val = supertrend(highs, lows, closes, period=10, factor=3.0)
+    st_bull = st_dir == 1
+    st_bear = st_dir == -1
+
+    # Volume ratio
+    avg_vol = (
+        sum(vols[-_VOL_AVG_WINDOW:]) / _VOL_AVG_WINDOW
+        if len(vols) >= _VOL_AVG_WINDOW
+        else (sum(vols) / len(vols) if vols else 1.0)
+    )
+    vol_ratio = round(vols[-1] / avg_vol, 3) if avg_vol > 0 else 1.0
+
+    # VWAP (anclado a sesión activa)
+    try:
+        from bot.indicators import vwap as calc_vwap
+        vwap_val = calc_vwap(bars)
+    except Exception:
+        vwap_val = 0.0
+
+    # RSI divergence
+    try:
+        div = rsi_divergence(bars)
+    except Exception:
+        div = "NONE"
+
+    return {
+        "close":          close_last,
+        "ema9":           ema9_val,
+        "ema21":          ema21_val,
+        "ema50":          ema50_val,
+        "ema_bull":       ema_bull,
+        "ema_bear":       ema_bear,
+        "rsi_val":        rsi_val,
+        "macd_line":      macd_line,
+        "macd_signal":    signal_line,
+        "macd_hist":      hist,
+        "macd_bull":      macd_bull,
+        "macd_bear":      macd_bear,
+        "atr":            atr_val,
+        "st_dir":         st_dir,
+        "st_val":         st_val,
+        "st_bull":        st_bull,
+        "st_bear":        st_bear,
+        "vol_ratio":      vol_ratio,
+        "vwap":           vwap_val,
+        "rsi_divergence": div,
+        "rsi_div_bull":   div == "BULLISH",
+        "rsi_div_bear":   div == "BEARISH",
+        "_ema21_series":  ema21_series,
+        "_avg_vol":       avg_vol,
+    }
+
+
 async def analyze_pair(
     exch,
     symbol: str,
@@ -1322,3 +1424,47 @@ async def evaluate(symbol: str, price: float, ohlcv_fn) -> Optional[dict]:
         "signal_block":  result.signal_block,
         **result.extra,
     }
+
+
+# ---------------------------------------------------------------------------
+# _hold_result / _fetch_bars — helpers internos
+# ---------------------------------------------------------------------------
+
+def _hold_result(
+    symbol: str,
+    reason: str = "",
+    max_score: int = MAX_SCORE_NEUTRAL,
+) -> SignalResult:
+    return SignalResult(
+        symbol=symbol,
+        signal="NEUTRAL",
+        entry_mode="HOLD",
+        score=0,
+        max_score=max_score,
+        entry=0.0,
+        sl=0.0,
+        tp1=0.0,
+        tp2=0.0,
+        atr=0.0,
+        rr=0.0,
+        suggested_lev=1,
+        indicators={},
+        is_valid=False,
+        reason=reason,
+    )
+
+
+async def _fetch_bars(
+    exch,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+) -> list:
+    """Fetch OHLCV bars usando el exchange ccxt pasado como parámetro."""
+    try:
+        ccxt_symbol = _to_ccxt_symbol(symbol)
+        bars = await exch.fetch_ohlcv(ccxt_symbol, timeframe=timeframe, limit=limit)
+        return bars or []
+    except Exception as e:
+        log.warning("[signal_engine] _fetch_bars(%s, %s) error: %s", symbol, timeframe, e)
+        return []
