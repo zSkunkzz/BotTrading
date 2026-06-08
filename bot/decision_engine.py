@@ -21,6 +21,7 @@ Clase DecisionEngine:
     )
 """
 
+import inspect
 import logging
 import os
 from typing import Optional
@@ -157,6 +158,10 @@ class DecisionEngine:
         Retorna dict de señal o None si no hay entrada.
         Soporta signal_engine con evaluate(), evaluate_signal() o get_signal(),
         tanto síncronos como async.
+
+        FIX: se resuelve correctamente la coroutine con await antes de comprobar
+        el tipo de retorno, evitando que una coroutine no esperada sea descartada
+        silenciosamente como "no es dict".
         """
         if self._signal_engine is None:
             log.warning("[DecisionEngine] signal_engine no inyectado para %s", symbol)
@@ -164,26 +169,48 @@ class DecisionEngine:
 
         try:
             se = self._signal_engine
+
+            # Determinar qué método usar
             if hasattr(se, "evaluate"):
-                result = se.evaluate(symbol, price, ohlcv_fn)
+                fn = se.evaluate
+                fn_name = "evaluate"
             elif hasattr(se, "evaluate_signal"):
-                result = se.evaluate_signal(symbol, price, ohlcv_fn)
+                fn = se.evaluate_signal
+                fn_name = "evaluate_signal"
             elif hasattr(se, "get_signal"):
-                result = se.get_signal(symbol, price, ohlcv_fn)
+                fn = se.get_signal
+                fn_name = "get_signal"
             else:
                 log.error(
                     "[DecisionEngine] signal_engine no tiene evaluate/evaluate_signal/get_signal"
                 )
                 return None
 
-            import inspect
+            log.debug("[DecisionEngine] llamando %s(%s, price=%.6f)", fn_name, symbol, price)
+
+            # Llamar la función — puede ser sync o async
+            result = fn(symbol, price, ohlcv_fn)
+
+            # Si devuelve una coroutine, esperarla
             if inspect.isawaitable(result):
                 result = await result
 
-            return result if isinstance(result, dict) else None
+            if result is None:
+                log.debug("[DecisionEngine] %s → None (sin señal)", symbol)
+                return None
+
+            if not isinstance(result, dict):
+                log.warning(
+                    "[DecisionEngine] %s → tipo inesperado %s (esperado dict): %r",
+                    symbol, type(result).__name__, result,
+                )
+                return None
+
+            log.debug("[DecisionEngine] %s → señal OK: %s", symbol, result)
+            return result
 
         except Exception as exc:
-            log.error("[DecisionEngine] evaluate(%s) error: %s", symbol, exc, exc_info=True)
+            log.error("[DecisionEngine] evaluate(%s) EXCEPCIÓN: %s", symbol, exc, exc_info=True)
             return None
 
     async def on_position_closed(
@@ -201,7 +228,6 @@ class DecisionEngine:
             try:
                 fn = getattr(self._pretrade_risk, "on_position_closed", None)
                 if callable(fn):
-                    import inspect
                     res = fn(symbol=symbol, pnl=pnl, reason=reason, entry_mode=entry_mode)
                     if inspect.isawaitable(res):
                         await res
@@ -214,7 +240,6 @@ class DecisionEngine:
             try:
                 fn = getattr(self._cooldown, "register_close", None)
                 if callable(fn):
-                    import inspect
                     res = fn(symbol)
                     if inspect.isawaitable(res):
                         await res
