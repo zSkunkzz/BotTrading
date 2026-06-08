@@ -337,7 +337,7 @@ async def main():
     if not _BINGX_API_KEY:
         logger.warning("\u26a0\ufe0f  BINGX_API_KEY no configurado — operando en DRY-RUN.")
 
-    # ── Balance service ──────────────────────────────────────────────
+    # ── Balance service ────────────────────────────────────
     try:
         balance_svc.init_bingx(_BINGX_API_KEY, _BINGX_API_SECRET, testnet=_USE_TESTNET)
         logger.info("\u2705 Balance service inicializado (BingX, testnet=%s)", _USE_TESTNET)
@@ -346,13 +346,18 @@ async def main():
     except Exception as e:
         logger.warning("\u26a0\ufe0f  Balance service no pudo inicializarse: %s", e)
 
-    # ── Purge stale state ───────────────────────────────────────────────
+    # ── Purge stale state ─────────────────────────────────────
     logger.info("\U0001f50d Verificando state local contra BingX...")
     real_open_symbols = await _purge_stale_state()
 
+    # Fix (2026-06-08): GlobalRisk ahora trabaja en USDT absolutos.
+    # Variable de entorno: MAX_GLOBAL_DAILY_LOSS_USDT (default: 50 USDT).
+    # Si tenías MAX_GLOBAL_DAILY_LOSS_PCT=10 en Railway, cámbiala a
+    # MAX_GLOBAL_DAILY_LOSS_USDT con el equivalente en USDT de tu balance
+    # (p.ej. si tu balance es 500 USDT y querías limitar al 10% → pon 50).
     global_risk = GlobalRisk(
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", str(MAX_ACTIVE_TRADERS))),
-        max_global_daily_loss_pct=float(os.getenv("MAX_GLOBAL_DAILY_LOSS_PCT", "10.0")),
+        max_global_daily_loss_usdt=float(os.getenv("MAX_GLOBAL_DAILY_LOSS_USDT", "50.0")),
     )
 
     await global_risk.sync_open_count(len(real_open_symbols))
@@ -365,7 +370,7 @@ async def main():
     asyncio.create_task(kill_switch.run())
     asyncio.create_task(_idle_rotation_loop(scanner))
 
-    # ── Telegram: comandos + backtest scheduler ───────────────────────────
+    # ── Telegram: comandos + backtest scheduler ───────────────────────
     setup_telegram_commands()
 
     _notifier = _TelegramNotifier()

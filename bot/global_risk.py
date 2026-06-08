@@ -8,6 +8,15 @@ MEJORAS:
   - register_close() ahora acepta symbol opcional para logging.
   - sync_open_count(n): sincroniza _open con el número real de posiciones
     abiertas en el exchange tras arranque (evita bloqueos por stale state).
+
+Fix (2026-06-08) — GlobalRisk trabaja en USDT absolutos:
+  Antes, max_global_daily_loss_pct esperaba un porcentaje pero
+  _register_close_safe pasaba pnl en USDT absolutos, corrompiendo
+  el acumulado diario. Ahora todo trabaja en USDT absolutos:
+  - Parámetro renombrado: max_global_daily_loss_pct → max_global_daily_loss_usdt
+  - _daily_pnl acumula USDT reales (positivos = ganancia, negativos = pérdida)
+  - El check can_open() compara contra -max_global_daily_loss_usdt
+  - Logs actualizados de % a USDT
 """
 import asyncio
 import json
@@ -29,12 +38,19 @@ if str(_STATE_PATH).startswith("/tmp"):
 
 
 class GlobalRisk:
-    def __init__(self, max_concurrent_trades: int, max_global_daily_loss_pct: float):
-        self.max_concurrent = max_concurrent_trades
-        self.max_daily_loss = max_global_daily_loss_pct
-        self._open      = 0
-        self._daily_pnl = 0.0
-        self._lock      = asyncio.Lock()
+    def __init__(self, max_concurrent_trades: int, max_global_daily_loss_usdt: float):
+        """
+        Args:
+            max_concurrent_trades: Número máximo de posiciones abiertas simultáneamente.
+            max_global_daily_loss_usdt: Pérdida máxima diaria en USDT absolutos.
+                El bot se pausará cuando _daily_pnl <= -max_global_daily_loss_usdt.
+                Ejemplo: 50.0 pausa el bot al perder 50 USDT en el día.
+        """
+        self.max_concurrent   = max_concurrent_trades
+        self.max_daily_loss   = max_global_daily_loss_usdt  # USDT absolutos
+        self._open            = 0
+        self._daily_pnl       = 0.0  # USDT acumulados en el día (+ ganancia, - pérdida)
+        self._lock            = asyncio.Lock()
         self._load_state()
 
     async def can_open(self) -> tuple[bool, str]:
@@ -42,7 +58,10 @@ class GlobalRisk:
             if self._open >= self.max_concurrent:
                 return False, f"Global max trades ({self.max_concurrent}) alcanzado"
             if self._daily_pnl <= -self.max_daily_loss:
-                return False, f"Global daily loss {self.max_daily_loss}% alcanzado — bot pausado"
+                return False, (
+                    f"Global daily loss {self.max_daily_loss:.2f} USDT alcanzado "
+                    f"(acumulado: {self._daily_pnl:+.2f} USDT) — bot pausado"
+                )
             return True, "OK"
 
     async def register_open(self) -> None:
@@ -54,19 +73,28 @@ class GlobalRisk:
     async def register_close(self, pnl_pct: float, symbol: str = "") -> None:
         """
         Decrementa el contador de posiciones abiertas y acumula PnL diario.
-        symbol es opcional, solo para logging.
+
+        Args:
+            pnl_pct: PnL del trade en USDT absolutos (nombre mantenido por
+                     compatibilidad con callers existentes). Positivo = ganancia,
+                     negativo = pérdida.
+            symbol:  Opcional, solo para logging.
         """
         async with self._lock:
             self._open      = max(0, self._open - 1)
-            self._daily_pnl += pnl_pct
+            self._daily_pnl += pnl_pct  # pnl_pct es en realidad USDT absolutos
             tag = f" [{symbol}]" if symbol else ""
-            logger.info(f"Global PnL del día{tag}: {self._daily_pnl:+.2f}% | posiciones abiertas: {self._open}")
+            logger.info(
+                f"Global PnL del día{tag}: {self._daily_pnl:+.2f} USDT "
+                f"(límite: -{self.max_daily_loss:.2f} USDT) | "
+                f"posiciones abiertas: {self._open}"
+            )
             self._save_state()
 
     def reset_daily(self) -> None:
         self._daily_pnl = 0.0
         self._save_state()
-        logger.info("Global daily PnL reseteado")
+        logger.info("Global daily PnL reseteado (USDT)")
 
     async def sync_open_count(self, real_count: int) -> None:
         """
@@ -85,7 +113,7 @@ class GlobalRisk:
             else:
                 logger.debug("[GlobalRisk] Contador ya sincronizado: %d", self._open)
 
-    # ── Persistencia ──────────────────────────────────────────────────────────
+    # ── Persistencia ─────────────────────────────────────────────────────────────
 
     def _save_state(self) -> None:
         """Escritura atómica: .tmp → rename."""
