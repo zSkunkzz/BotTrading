@@ -80,18 +80,18 @@ Fix Bug3 (2026-06-07) — BUG RAÍZ del TypeError:
   Fix: siempre pasar exch explícitamente. Si no hay exchange disponible,
   pasar exch=None para que analyze_pair use la rama ohlcv_fn interna.
 
-feat: SentimentGate v2 (2026-06-08) — SIN BLOQUEO, solo sizing:
+feat: SentimentGate v3 (2026-06-08) — SIN BLOQUEO, size_multiplier real:
   Gate 2.5 — entre pretrade_risk y la señal técnica.
   El SentimentGate NUNCA bloquea una entrada, ni LONG ni SHORT.
   Fear & Greed en Extreme Fear sigue siendo una oportunidad válida:
     - Longs: posibles rebotes desde capitulación.
     - Shorts: continuación de tendencia bajista.
-  El score 0-100 solo ajusta el size_multiplier:
-    score >= SENTIMENT_SIZE_BOOST (65) → size 100%
-    score >= SENTIMENT_SIZE_MID   (50) → size 75%
-    score >= SENTIMENT_OPEN_MIN   (35) → size 50%
-    score <  SENTIMENT_OPEN_MIN        → size 35% (mínimo, nunca 0)
-  allowed siempre True — el técnico manda, el sentimiento solo pondera.
+  El score 0-100 se traduce en size_multiplier REAL (no booleano):
+    score >= SENTIMENT_SIZE_BOOST (65) → size_multiplier = 1.00 (full)
+    score >= SENTIMENT_SIZE_MID   (50) → size_multiplier = 0.75
+    score >= SENTIMENT_OPEN_MIN   (35) → size_multiplier = 0.50
+    score <  SENTIMENT_OPEN_MIN        → size_multiplier = 0.35 (mínimo, nunca 0)
+  allowed siempre True — el técnico manda, el sentimiento solo pondera el size.
 """
 from __future__ import annotations
 
@@ -173,18 +173,36 @@ class DecisionEngine:
 
         # Gate 2.5: SentimentGate (Fear&Greed + Groq macro)
         # IMPORTANTE: el gate NUNCA bloquea — allowed es siempre True.
-        # Solo reduce el effective_margin según el size_multiplier.
-        # F&G en Extreme Fear es oportunidad válida para LONG (rebote) y SHORT (continuación).
+        # Aplica el size_multiplier REAL calculado por el score 0-100:
+        #   score >= 65 → 1.00x (full)
+        #   score >= 50 → 0.75x
+        #   score >= 35 → 0.50x
+        #   score <  35 → 0.35x (mínimo absoluto, nunca 0)
+        # F&G en Extreme Fear es oportunidad válida:
+        #   LONG → posible rebote desde capitulación
+        #   SHORT → continuación de tendencia bajista
         try:
-            from bot.sentiment_gate import sentiment_gate_check
+            from bot.sentiment_gate import sentiment_gate_check, _score_to_size_multiplier
             _sg_allowed, sg_reason, sg_full_size = await sentiment_gate_check()
             # _sg_allowed ignorado — siempre continuamos independientemente del sentimiento
+
             if not sg_full_size:
+                # Extraer el size_multiplier real del reason string ("size=XX%")
+                # Si no se puede parsear, usar 0.50 como fallback conservador
+                size_mult = 0.50
+                try:
+                    import re as _re
+                    m = _re.search(r"size=(\d+(?:\.\d+)?)%", sg_reason)
+                    if m:
+                        size_mult = float(m.group(1)) / 100.0
+                except Exception:
+                    pass
+
                 prev = effective_margin
-                effective_margin = effective_margin * 0.5
+                effective_margin = effective_margin * size_mult
                 log.info(
-                    "[%s] evaluate: SentimentGate size reducido 50%% — %s (%.2f → %.2f USDC)",
-                    symbol, sg_reason, prev, effective_margin,
+                    "[%s] evaluate: SentimentGate size reducido %.0f%% — %s (%.2f → %.2f USDC)",
+                    symbol, size_mult * 100, sg_reason, prev, effective_margin,
                 )
             else:
                 log.debug(
