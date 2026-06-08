@@ -108,6 +108,12 @@ Fix #3 (2026-06-08) — _make_ohlcv_fn descartaba TFs distintos a 15m:
   '1h' o '4h', recibía datos vacíos y descartaba la señal silenciosamente.
   Fix: devolver ohlcv_data para cualquier TF — el legado no conoce el TF
   y analyze_pair decidirá si los datos son suficientes.
+
+log: Gate 3 señal técnica DEBUG → INFO (2026-06-08):
+  Los logs de señal inválida y NEUTRAL/HOLD se suben a INFO para facilitar
+  el diagnóstico en producción sin necesidad de activar DEBUG.
+  - "señal inválida" ahora incluye fallback 'result=None' cuando result es None.
+  - "señal NEUTRAL/HOLD" ahora incluye signal, score y max_score.
 """
 from __future__ import annotations
 
@@ -230,11 +236,17 @@ class DecisionEngine:
                 log.info("[%s] evaluate: analyze_pair recuperado tras %d errores", symbol, prev)
 
         if result is None or not result.is_valid:
-            log.debug("[%s] evaluate: señal inválida — %s", symbol, getattr(result, 'reason', ''))
+            log.info("[%s] evaluate: señal inválida — %s", symbol, getattr(result, 'reason', 'result=None'))
             return None
 
         if result.signal not in ("LONG", "SHORT"):
-            log.debug("[%s] evaluate: señal NEUTRAL/HOLD — sin entrada", symbol)
+            log.info(
+                "[%s] evaluate: señal NEUTRAL/HOLD — sin entrada (signal=%s score=%s/%s)",
+                symbol,
+                getattr(result, "signal", "?"),
+                getattr(result, "score", "?"),
+                getattr(result, "max_score", "?"),
+            )
             return None
 
         # Calcular confirm_margin (puede ser reducido por reentry_guard)
