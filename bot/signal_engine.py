@@ -13,13 +13,18 @@ from bot.indicators import ema, rsi, macd, supertrend, atr as calc_atr, rsi_dive
 
 log = logging.getLogger(__name__)
 
-MIN_SCORE: int     = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
+# FIX: leer MIN_SCORE como alias de MIN_SIGNAL_SCORE para compatibilidad con Railway.
+# Railway puede tener configurada la variable como MIN_SCORE (sin el prefijo MIN_SIGNAL_).
+# Orden de prioridad: MIN_SIGNAL_SCORE > MIN_SCORE > default (7).
+_env_min_score = os.getenv("MIN_SIGNAL_SCORE") or os.getenv("MIN_SCORE")
+MIN_SCORE: int     = int(_env_min_score) if _env_min_score else 7
 MIN_RR: float      = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
 PREMIUM_SCORE: int = int(os.getenv("PREMIUM_SIGNAL_SCORE", "10"))
 
 MAX_SCORE_NEUTRAL: int = 10
 
-MIN_SCORE_RATIO: float = float(os.getenv("MIN_SCORE_RATIO", "0.62"))
+# FIX: default bajado de 0.62 → 0.50 para permitir más señales válidas.
+MIN_SCORE_RATIO: float = float(os.getenv("MIN_SCORE_RATIO", "0.50"))
 MIN_SCORE_RATIO_BEAR: float = float(os.getenv("MIN_SCORE_RATIO_BEAR", "0.72"))
 
 _MIN_RR_TRENDING  = float(os.getenv("MIN_RR_TRENDING",  "1.6"))
@@ -90,6 +95,10 @@ _WR = {
     "ST_4H":   _w("W_REV_ST_4H",   1.0),
 }
 
+log.info(
+    "[signal_engine] Configuración: MIN_SCORE=%d MIN_SCORE_RATIO=%.2f MIN_SCORE_RATIO_BEAR=%.2f",
+    MIN_SCORE, MIN_SCORE_RATIO, MIN_SCORE_RATIO_BEAR,
+)
 log.info(
     "[signal_engine] Pesos TENDENCIA: %s",
     " | ".join(f"{k}={v:.2f}" for k, v in _WT.items()),
@@ -912,7 +921,6 @@ def _score_tendencia(
                 reasons.append("Sin estructura LL/LH en 15m")
 
     # --- LOG DE DIAGNÓSTICO TENDENCIA ---
-    # Bug 1 fix: usar literal "signal_engine" en lugar de _score_tendencia.__module__
     st15m_diag = i15.get("st_bull") if direction == "LONG" else i15.get("st_bear")
     adx_diag   = _adx_simple(
         [float(_b_high(b)) for b in bars_15m],
@@ -973,7 +981,6 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
                    current_close <= range_low * (1 + _BREAKOUT_RETEST_TOL))
 
     if not broke_up and not broke_down and not retest_up and not retest_down:
-        # --- LOG DE DIAGNÓSTICO BREAKOUT (sin rotura) ---
         rsi_val = i15.get("rsi_val") or 0.0
         st1h_ok = (i1h.get("st_bull") or i1h.get("st_bear")) if i1h else False
         st4h_ok = (i4h.get("st_bull") or i4h.get("st_bear")) if i4h else False
@@ -1031,7 +1038,6 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     if is_retest:
         w = _WB["RETEST"]
         score += w
-        # Bug 5 fix: "score parcial" en lugar de "score total" — los indicadores ST/RSI/MACD aún no se han sumado
         reasons.append(
             f"Retesteo del nivel {'superior' if retest_up else 'inferior'} "
             f"(close={current_close:.4f} ≈ {range_high if retest_up else range_low:.4f}) "
@@ -1090,7 +1096,6 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         else:
             reasons.append("MACD1h en contra")
 
-    # --- LOG DE DIAGNÓSTICO BREAKOUT (con rotura/retest) ---
     log.info(
         "[signal_engine] EVAL BREAKOUT(%s) → score=%.2f/%d | "
         "BrokeUp=%s | BrokeDown=%s | Retest=%s | "
@@ -1114,10 +1119,6 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     return "BREAKOUT", direction, score, MAX, reasons
 
 def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[str, str, float, int, List[str]]:
-    # Bug 3 fix: MAX corregido de 14 → 10
-    # Suma máxima teórica real: BASE(2)+SWING(2)+EMA50(1)+MACD(1)+VOL(1)+RSI(1)+VWAP(1)+ST_4H(1) = 10
-    # Con MAX=14 un setup perfecto obtenía ratio 10/14=0.71 en lugar de 1.0,
-    # haciendo que el umbral MIN_SCORE_RATIO se aplicase sobre un denominador inflado.
     MAX = 10
     reasons: List[str] = []
     rsi_1h = i1h.get("rsi_val") if i1h else None
@@ -1126,7 +1127,6 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     is_long  = rsi_1h <= _REVERSAL_RSI_LOW
     is_short = rsi_1h >= _REVERSAL_RSI_HIGH
     if not is_long and not is_short:
-        # --- LOG DE DIAGNÓSTICO REVERSAL (RSI no extremo) ---
         log.info(
             "[signal_engine] EVAL REVERSAL → score=0/%d | "
             "RSI1h=%.1f (umbral: LOW≤%.0f HIGH≥%.0f) | ST1h=%s | Div=%s | umbral=%d",
@@ -1262,7 +1262,6 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         else:
             reasons.append("ST4h en contra (sin penalización)")
 
-    # --- LOG DE DIAGNÓSTICO REVERSAL ---
     log.info(
         "[signal_engine] EVAL REVERSAL(%s) → score=%.2f/%d | "
         "RSI1h=%.1f ✅ | ST1h=✅ | Div=✅ | EMA50=%s | MACD1h=%s | "
@@ -1359,7 +1358,6 @@ def _compute_indicators(bars: list) -> dict:
             cumulative_vol = sum(today_volumes)
             vwap_val = cumulative_pv / cumulative_vol
         elif sum(volumes) > 0:
-            # fallback: VWAP acumulado si no hay velas del día (e.g. timeframe > 1d)
             cumulative_pv = sum(c * v for c, v in zip(closes, volumes))
             cumulative_vol = sum(volumes)
             vwap_val = cumulative_pv / cumulative_vol if cumulative_vol > 0 else 0.0
