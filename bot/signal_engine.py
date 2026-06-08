@@ -1269,3 +1269,56 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     )
 
     return "REVERSAL", direction, score, MAX, reasons
+
+
+# ---------------------------------------------------------------------------
+# WRAPPER evaluate() — requerido por DecisionEngine
+# ---------------------------------------------------------------------------
+# DecisionEngine busca signal_engine.evaluate(symbol, price, ohlcv_fn).
+# Este wrapper adapta esa firma a analyze_pair() y devuelve un dict
+# compatible, o None si la señal no es válida.
+# ---------------------------------------------------------------------------
+
+async def evaluate(symbol: str, price: float, ohlcv_fn) -> Optional[dict]:
+    """
+    Punto de entrada para DecisionEngine.evaluate().
+    Llama a analyze_pair con ohlcv_fn y convierte SignalResult → dict.
+    Devuelve None si is_valid=False o signal=NEUTRAL.
+    """
+    try:
+        result: SignalResult = await analyze_pair(
+            exch=None,
+            symbol=symbol,
+            ohlcv_fn=ohlcv_fn,
+        )
+    except Exception as exc:
+        log.error("[signal_engine] evaluate(%s) error: %s", symbol, exc, exc_info=True)
+        return None
+
+    if result is None:
+        return None
+    if result.signal == "NEUTRAL" or not result.is_valid:
+        log.debug(
+            "[signal_engine] evaluate(%s) → sin señal válida (signal=%s is_valid=%s reason=%s)",
+            symbol, result.signal, result.is_valid, result.reason,
+        )
+        return None
+
+    return {
+        "symbol":        result.symbol,
+        "signal":        result.signal,
+        "entry_mode":    result.entry_mode,
+        "score":         result.score,
+        "max_score":     result.max_score,
+        "entry":         result.entry,
+        "sl":            result.sl,
+        "tp1":           result.tp1,
+        "tp2":           result.tp2,
+        "atr":           result.atr,
+        "rr":            result.rr,
+        "suggested_lev": result.suggested_lev,
+        "indicators":    result.indicators,
+        "reason":        result.reason,
+        "signal_block":  result.signal_block,
+        **result.extra,
+    }
