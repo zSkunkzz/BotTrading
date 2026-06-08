@@ -1310,3 +1310,64 @@ async def _fetch_bars(exch, symbol: str, tf: str, limit: int) -> list:
     except Exception as e:
         log.error("[signal_engine] Error fetching %s %s: %s", symbol, tf, e)
         raise
+
+
+# ---------------------------------------------------------------------------
+# evaluate() — wrapper para DecisionEngine
+#
+# DecisionEngine.evaluate() busca signal_engine.evaluate(symbol, price, ohlcv_fn).
+# Este wrapper traduce esa interfaz → analyze_pair().
+#
+# Opción B (cero riesgo): exch=None es seguro porque cuando ohlcv_fn is not None,
+# _analyze_pair_inner usa directamente ohlcv_fn("15m/1h/4h") y nunca llama
+# a _fetch_bars(exch, ...). El parámetro `price` no se usa en analyze_pair
+# (el entry se calcula desde el close de la última vela); se acepta aquí
+# solo para compatibilidad con la firma de DecisionEngine.
+#
+# El dict retornado incluye `min_score_ratio` para que trader.py v29 lo use
+# como min_ratio en kelly_multiplier() sin necesidad de hardcodear el valor.
+# ---------------------------------------------------------------------------
+
+async def evaluate(
+    symbol: str,
+    price: float,  # noqa: ARG001 — no usado, mantenido para compatibilidad con DecisionEngine
+    ohlcv_fn: Optional[Callable] = None,
+    exch=None,
+    funding_rate: float = 0.0,
+    regime: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Wrapper para DecisionEngine.evaluate().
+    Traduce la interfaz (symbol, price, ohlcv_fn) → analyze_pair().
+    Retorna None si la señal no es válida (NEUTRAL / score insuficiente).
+    """
+    result = await analyze_pair(
+        exch=exch,
+        symbol=symbol,
+        ohlcv_fn=ohlcv_fn,
+        funding_rate=funding_rate,
+        regime=regime,
+    )
+
+    if result is None or not result.is_valid:
+        return None
+
+    return {
+        "action":          result.signal,   # "LONG" / "SHORT"
+        "side":            result.signal,   # alias — TradingLoop usa signal.get("side")
+        "signal":          result.signal,
+        "entry_mode":      result.entry_mode,
+        "score":           result.score,
+        "max_score":       result.max_score,
+        "min_score_ratio": result.extra.get("effective_min_ratio", MIN_SCORE_RATIO),
+        "entry":           result.entry,
+        "sl":              result.sl,
+        "tp1":             result.tp1,
+        "tp2":             result.tp2,
+        "atr":             result.atr,
+        "rr":              result.rr,
+        "suggested_lev":   result.suggested_lev,
+        "indicators":      result.indicators,
+        "extra":           result.extra,
+        "reason":          result.reason,
+    }
