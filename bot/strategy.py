@@ -6,6 +6,8 @@ Flujo (sin IA para el caso normal):
   score < MIN_SIGNAL_SCORE  → HOLD directo
   RR < MIN_RR_REQUIRED      → HOLD directo
   NEUTRAL                   → HOLD directo
+  session_gate              → bloquea TENDENCIA/BREAKOUT fuera de 07:00-18:00 UTC
+  correlation_gate          → bloquea si hay demasiadas posiciones en la misma dirección
   regime_gate               → bloquea por tipo de setup + score
   score < AI_CALL_MIN_SCORE → HOLD (evita fetch_enriched innecesario)
   STRONG (score >=9)        → pasa por enriched_filter
@@ -49,6 +51,13 @@ v23 — A+B+C:
       Preserva scores tanto negativos (malas noticias) como positivos
       (buenas noticias) entre ciclos.
 
+v24 — session_gate + correlation_gate:
+  session_filter.check_session(setup_type): bloquea TENDENCIA/BREAKOUT
+  fuera de 07:00–18:00 UTC. REVERSAL permitido 24h.
+  correlation_guard.check_correlation(direction, open_positions): bloquea
+  si hay ≥MAX_SAME_DIR posiciones en la misma dirección o ≥MAX_OPEN total.
+  Ambos gates se ejecutan antes del regime_gate.
+
 Variables de entorno:
   MIN_SIGNAL_SCORE             (default: 8)
   MIN_RR_REQUIRED              (default: 1.8)
@@ -63,6 +72,13 @@ Variables de entorno:
   RANGING_BLOCK_EARLY          (default: true)
   REGIME_BLOCK_TREND_ON_RANGING    (default: true)
   REGIME_BLOCK_REVERSAL_ON_TRENDING (default: true)
+  SESSION_FILTER_ENABLED       (default: true)
+  SESSION_START_UTC            (default: 7)
+  SESSION_END_UTC              (default: 18)
+  SESSION_ALLOW_REVERSAL       (default: true)
+  CORR_ENABLED                 (default: true)
+  CORR_MAX_SAME_DIR            (default: 3)
+  CORR_MAX_OPEN                (default: 5)
 """
 
 import logging
@@ -305,6 +321,7 @@ async def decide(
     has_open_position: bool = False,
     current_pnl: Optional[float] = None,
     ohlcv_fn: Optional[Callable] = None,
+    open_positions: Optional[dict] = None,
 ) -> dict:
     """
     Retorna:
@@ -358,6 +375,33 @@ async def decide(
             "HOLD", signal, False,
             f"RR {signal.rr:.2f} < mínimo {MIN_RR_REQUIRED}"
         )
+
+    # ── v24: Gate de sesión ─────────────────────────────────────────────────
+    # Bloquea TENDENCIA/BREAKOUT fuera de 07:00–18:00 UTC (baja liquidez).
+    # REVERSAL se permite 24h (SESSION_ALLOW_REVERSAL=true por defecto).
+    try:
+        from bot.session_filter import check_session
+        setup_type = signal.extra.get("setup_type") if signal.extra else None
+        session_block = check_session(setup_type)
+        if session_block:
+            return _result("HOLD", signal, False, session_block)
+    except Exception as _se:
+        log.debug("[strategy] session_filter error (ignorado): %s", _se)
+
+    # ── v24: Gate de correlación ─────────────────────────────────────────────
+    # Bloquea si hay ≥MAX_SAME_DIR posiciones en la misma dirección
+    # o ≥MAX_OPEN posiciones abiertas en total.
+    try:
+        from bot.correlation_guard import check_correlation
+        _positions = open_positions or {}
+        corr_ok, corr_reason = check_correlation(
+            proposed_direction=signal.signal,  # "LONG" / "SHORT"
+            open_positions=_positions,
+        )
+        if not corr_ok:
+            return _result("HOLD", signal, False, f"🔒 correlation_guard: {corr_reason}")
+    except Exception as _ce:
+        log.debug("[strategy] correlation_guard error (ignorado): %s", _ce)
 
     gate_result = _apply_regime_gate(signal, symbol)
     if gate_result is not None:
