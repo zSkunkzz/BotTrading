@@ -2,16 +2,14 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
+v33 — Fix SL/TP + margen fijo 20 USDT (2026-06-09):
+  - usdc_per_trade = 20.0 fijo (no depende de risk ni Kelly).
+  - Eliminado bloque Kelly fraccionado (5b): qty siempre proporcional a 20 USDT.
+  - Desactivado place_market_with_tpsl: se usa SIEMPRE place_market + _place_tpsl.
+    Evita comportamiento inconsistente del endpoint combinado de BingX.
+
 v32 — Fix CRÍTICO: guardia dura de side en _do_open_order.
-  - Si raw_side no es long/buy/short/sell, se aborta con ERROR.
-  - Elimina el fallback silencioso a 'short' para valores no reconocidos
-    (ej. 'neutral') que causaba aperturas de SHORT involuntarias.
-
-v31 — Fix CRÍTICO: side leído desde 'signal' (campo de SignalResult):
-  - _do_open_order() paso 1: raw_side ahora lee también signal.get('signal')
-    como tercer fallback. SignalResult.signal = 'LONG'/'SHORT' → side siempre
-    correcto, nunca hardcodeado a SHORT.
-
+v31 — Fix CRÍTICO: side leído desde 'signal' (campo de SignalResult).
 v30 — Fix CRÍTICO: guardia SL/TP obligatoria también en dry-run (2026-06-09).
 v29 — Fix kelly_multiplier: propagar min_ratio desde signal (2026-06-08).
 v28 — Fix: self.atr no se seteaba al abrir posición (2026-06-08).
@@ -54,6 +52,9 @@ _USE_TESTNET = os.getenv("BINGX_TESTNET", "false").lower() in ("true", "1", "yes
 _OHLCV_BARS             = int(os.getenv("BARS_NEEDED",            "100"))
 _PRICE_FETCH_RETRIES    = int(os.getenv("PRICE_FETCH_RETRIES",    "3"))
 _SET_LEVERAGE_TIMEOUT_S = float(os.getenv("SET_LEVERAGE_TIMEOUT_S", "15"))
+
+# v33: margen fijo por operación — ignora cualquier valor dinámico de risk
+_FIXED_USDC_PER_TRADE: float = float(os.getenv("USDC_PER_TRADE", "20.0"))
 
 # Mapa de timeframe → intervalo BingX (coincide con parámetro "interval")
 _TF_BINGX = {
@@ -545,10 +546,6 @@ class FuturesTrader:
 
         # ── 1. Extraer y validar side ─────────────────────────────────────
         # v32 FIX: guardia dura — abortar si side no es long/buy/short/sell.
-        # Elimina el fallback silencioso a 'short' que causaba aperturas
-        # involuntarias cuando signal='NEUTRAL' pasaba por error hasta aquí.
-        #
-        # Orden de prioridad: side → action → signal
         raw_side = str(
             signal.get("side")
             or signal.get("action")
@@ -562,7 +559,6 @@ class FuturesTrader:
             signal.get("side"), signal.get("action"), signal.get("signal"),
         )
 
-        # v32: guardia dura — valores no reconocidos abortan la orden
         if raw_side not in _VALID_SIDES:
             logger.error(
                 "[%s] 🚫 _do_open_order: side=%r no reconocido "
@@ -587,8 +583,14 @@ class FuturesTrader:
         # v28: ATR de la señal — fuente primaria para trailing SL
         signal_atr = float(signal.get("atr") or 0.0)
 
-        usdc_per_trade = float(getattr(risk, "usdc_per_trade", 20.0))
+        # v33: margen FIJO — nunca dinámico, nunca ajustado por Kelly
+        usdc_per_trade = _FIXED_USDC_PER_TRADE
         leverage       = int(getattr(risk, "leverage", self.leverage) or self.leverage)
+
+        logger.info(
+            "[%s] _do_open_order: margen fijo=%.2f USDT lev=%dx (Kelly desactivado)",
+            self.symbol, usdc_per_trade, leverage,
+        )
 
         # ── 2. GUARDIA DURA PRE-REBASE: SL y TP1 obligatorios en CUALQUIER modo ──
         guard_err = self._confirm_margin(sl_price, tp1_price)
@@ -622,6 +624,7 @@ class FuturesTrader:
             return
 
         # ── 5. Calcular qty ───────────────────────────────────────────────
+        # v33: qty SIEMPRE basado en margen fijo × leverage — sin Kelly
         notional = usdc_per_trade * leverage
         raw_qty  = notional / ref_price
         qty = round(raw_qty, 4)
@@ -643,41 +646,6 @@ class FuturesTrader:
                 self.symbol, usdc_per_trade, leverage, ref_price,
             )
             return
-
-        # ── 5b. Ajuste Kelly fraccionado (v27 + v29 fix) ─────────────────
-        try:
-            from bot.kelly_sizer import kelly_multiplier
-            _entry_mode  = str(signal.get("entry_mode") or "NORMAL")
-            _rr          = float(signal.get("rr") or 0)
-            _score       = float(signal.get("score") or 0)
-            _max_score   = float(signal.get("max_score") or 0)
-            _score_ratio = (_score / _max_score) if _max_score > 0 else 0.0
-            _min_ratio   = float(signal.get("min_score_ratio") or 0.62)
-            _kelly_mult  = kelly_multiplier(
-                entry_mode  = _entry_mode,
-                rr          = _rr,
-                score_ratio = _score_ratio,
-                min_ratio   = _min_ratio,
-            )
-            qty_kelly = round(qty * _kelly_mult, dec) if dec > 0 else float(math.floor(qty * _kelly_mult))
-            if qty_kelly > 0:
-                logger.info(
-                    "[%s] 📐 Kelly sizing: mult=%.3f | qty %.6f → %.6f "
-                    "(mode=%s rr=%.2f score_ratio=%.2f min_ratio=%.2f)",
-                    self.symbol, _kelly_mult, qty, qty_kelly,
-                    _entry_mode, _rr, _score_ratio, _min_ratio,
-                )
-                qty = qty_kelly
-            else:
-                logger.warning(
-                    "[%s] Kelly devolvió qty_kelly=%.6f <= 0 — usando qty original %.6f.",
-                    self.symbol, qty_kelly, qty,
-                )
-        except Exception as _ke:
-            logger.warning(
-                "[%s] kelly_multiplier error (%s) — usando qty sin ajuste Kelly.",
-                self.symbol, _ke,
-            )
 
         logger.info(
             "[%s] 🚀 open_order: %s | price=%.4f | qty=%.6f | "
@@ -738,6 +706,8 @@ class FuturesTrader:
             return
 
         # ── 7. LIVE: set leverage + colocar orden ─────────────────────────
+        # v33: se usa SIEMPRE place_market + _place_tpsl por separado.
+        # place_market_with_tpsl desactivado — comportamiento inconsistente en BingX.
         if self._bingx_client is None:
             await self._get_ccxt()
 
@@ -745,102 +715,72 @@ class FuturesTrader:
 
         filled_price: Optional[float] = None
 
-        if (
-            hasattr(self._bingx_client, "place_market_with_tpsl")
-            and sl_price
-            and tp1_price
-        ):
-            try:
-                result = await asyncio.to_thread(
-                    self._bingx_client.place_market_with_tpsl,
-                    is_long,
-                    qty,
-                    sl_price,
-                    tp1_price,
-                )
-                if result and result.get("code") in (0, "0", None):
-                    logger.info("[%s] place_market_with_tpsl OK: %s", self.symbol, result)
-                    filled_price = float(
-                        (result.get("data") or [{}])[0].get("price")
-                        or (result.get("data") or [{}])[0].get("avgPrice")
-                        or ref_price
-                    )
-                    self._protection_ok = True
-                else:
-                    err = (result or {}).get("msg", "sin respuesta")
-                    raise RuntimeError(f"place_market_with_tpsl rechazado: {err}")
-            except Exception as e:
-                logger.warning(
-                    "[%s] place_market_with_tpsl falló (%s) — usando fallback place_market.",
-                    self.symbol, e,
-                )
-                filled_price = None
-
-        if filled_price is None:
-            try:
-                result = await asyncio.to_thread(
-                    self._bingx_client.place_market,
-                    is_long,
-                    qty,
-                )
-                if result and result.get("code") in (0, "0", None):
-                    filled_price = float(
-                        (result.get("data") or [{}])[0].get("price")
-                        or (result.get("data") or [{}])[0].get("avgPrice")
-                        or ref_price
-                    )
-                    logger.info("[%s] place_market OK: filled_price=%.4f", self.symbol, filled_price)
-                else:
-                    err = (result or {}).get("msg", "sin respuesta")
-                    logger.error("[%s] open_order: place_market rechazado: %s — abortando.", self.symbol, err)
-                    return
-            except Exception as e:
-                logger.error("[%s] open_order: place_market error: %s — abortando.", self.symbol, e)
-                return
-
-            for attempt in range(_FILL_RETRIES):
-                try:
-                    confirmed = await self.get_price()
-                    if confirmed > 0:
-                        filled_price = confirmed
-                        break
-                except Exception:
-                    pass
-                await asyncio.sleep(_FILL_DELAY)
-
-            sl_placed = await self._place_tpsl(
-                qty=qty,
-                sl_price=sl_price,
-                tp_price=tp1_price,
-                is_long=is_long,
-                reduce_only=True,
+        try:
+            result = await asyncio.to_thread(
+                self._bingx_client.place_market,
+                is_long,
+                qty,
             )
-            if sl_placed:
-                self._protection_ok = True
-            else:
-                logger.error(
-                    "[%s] 🚨 SL NO colocado en fallback — cerrando posición "
-                    "para evitar exposición sin stop loss.",
-                    self.symbol,
+            if result and result.get("code") in (0, "0", None):
+                filled_price = float(
+                    (result.get("data") or [{}])[0].get("price")
+                    or (result.get("data") or [{}])[0].get("avgPrice")
+                    or ref_price
                 )
-                try:
-                    await self.close_position(reason="NO_SL")
-                    logger.warning("[%s] Posición cerrada preventivamente por falta de SL.", self.symbol)
-                except Exception as close_exc:
-                    logger.critical(
-                        "[%s] ❌❌ FALLO CRÍTICO: no se pudo colocar SL NI cerrar la posición: %s",
-                        self.symbol, close_exc,
-                    )
-                try:
-                    from bot.telegram_bot import send_message
-                    await send_message(
-                        f"🚨 *ALERTA CRÍTICA* `{self.symbol}`\n"
-                        f"SL no pudo colocarse tras el fallback place_market.\n"
-                        f"Posición cerrada preventivamente."
-                    )
-                except Exception:
-                    pass
+                logger.info("[%s] place_market OK: filled_price=%.4f", self.symbol, filled_price)
+            else:
+                err = (result or {}).get("msg", "sin respuesta")
+                logger.error("[%s] open_order: place_market rechazado: %s — abortando.", self.symbol, err)
                 return
+        except Exception as e:
+            logger.error("[%s] open_order: place_market error: %s — abortando.", self.symbol, e)
+            return
+
+        # Confirmar fill con precio real
+        for attempt in range(_FILL_RETRIES):
+            try:
+                confirmed = await self.get_price()
+                if confirmed > 0:
+                    filled_price = confirmed
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(_FILL_DELAY)
+
+        # Colocar SL + TP1 por separado
+        sl_placed = await self._place_tpsl(
+            qty=qty,
+            sl_price=sl_price,
+            tp_price=tp1_price,
+            is_long=is_long,
+            reduce_only=True,
+        )
+        if sl_placed:
+            self._protection_ok = True
+        else:
+            logger.error(
+                "[%s] 🚨 SL NO colocado — cerrando posición "
+                "para evitar exposición sin stop loss.",
+                self.symbol,
+            )
+            try:
+                await self.close_position(reason="NO_SL")
+                logger.warning("[%s] Posición cerrada preventivamente por falta de SL.", self.symbol)
+            except Exception as close_exc:
+                logger.critical(
+                    "[%s] ❌❌ FALLO CRÍTICO: no se pudo colocar SL NI cerrar la posición: %s",
+                    self.symbol, close_exc,
+                )
+            try:
+                from bot.telegram_bot import send_message
+                await send_message(
+                    f"🚨 *ALERTA CRÍTICA* `{self.symbol}`\n"
+                    f"SL no pudo colocarse.\n"
+                    f"Posición cerrada preventivamente."
+                )
+            except Exception:
+                pass
+            return
 
         # ── 8. Ajustar niveles al fill real ───────────────────────────────
         sl_adj, tp1_adj = _adjust_levels_to_fill(signal, filled_price, ref_price)
