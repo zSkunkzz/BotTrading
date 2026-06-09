@@ -1,4 +1,4 @@
-"""main.py — Loop multi-par. Máximo MAX_POSITIONS abiertas simultáneamente."""
+"""main.py — Loop principal. Usa WebSocket feed para las velas."""
 import logging
 import time
 
@@ -7,6 +7,7 @@ import exchange
 import risk
 import signals
 import telegram
+from ws_feed import KlineFeed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +22,7 @@ def run() -> None:
         len(config.SYMBOLS), config.LEVERAGE, config.MARGIN_USDT, config.MAX_POSITIONS,
     )
 
-    # Setear apalancamiento en todos los pares al arrancar
+    # Setear apalancamiento en todos los pares
     for symbol in config.SYMBOLS:
         try:
             exchange.set_leverage(symbol)
@@ -33,8 +34,17 @@ def run() -> None:
         f"{config.LEVERAGE}x | max {config.MAX_POSITIONS} posiciones"
     )
 
-    # Estado en memoria: {symbol: {side, entry, qty, sl, tp}}
-    positions: dict = {}
+    # Arrancar WebSocket feed (precarga REST + suscripción WS)
+    feed = KlineFeed(config.SYMBOLS)
+    feed.start()
+
+    # Esperar a que el feed tenga velas suficientes
+    log.info("Esperando datos del feed...")
+    while not all(feed.ready(s) for s in config.SYMBOLS):
+        time.sleep(2)
+    log.info("Feed listo — iniciando loop de señales")
+
+    positions: dict = {}  # {symbol: {side, entry, qty, sl, tp}}
 
     while True:
         try:
@@ -42,7 +52,6 @@ def run() -> None:
             for symbol in list(positions.keys()):
                 pos_ex = exchange.get_position(symbol)
                 if not pos_ex:
-                    # Cerrada externamente (SL/TP)
                     p = positions.pop(symbol)
                     exit_price = exchange.get_price(symbol)
                     pnl = (
@@ -58,9 +67,9 @@ def run() -> None:
                         pnl_pct = pnl,
                         reason  = "SL/TP o cierre externo",
                     )
-                    log.info("[%s] Cerrada externamente | PnL=%+.2f%%", symbol, pnl)
+                    log.info("[%s] Cerrada | PnL=%+.2f%%", symbol, pnl)
 
-            # Recuperar posiciones abiertas en exchange que no están en memoria
+            # Recuperar posiciones abiertas en exchange no registradas
             for symbol in config.SYMBOLS:
                 if symbol not in positions:
                     pos_ex = exchange.get_position(symbol)
@@ -72,23 +81,25 @@ def run() -> None:
                             "sl":    pos_ex["sl"],
                             "tp":    pos_ex["tp"],
                         }
-                        log.info("[%s] Sincronizada desde exchange: %s @ %.4f",
+                        log.info("[%s] Sincronizada: %s @ %.4f",
                                  symbol, pos_ex["side"], pos_ex["entry"])
 
             open_count = len(positions)
             log.info("Posiciones abiertas: %d/%d", open_count, config.MAX_POSITIONS)
 
-            # ── Buscar señales en pares sin posición ─────────────────────────
+            # ── Buscar señales ────────────────────────────────────────────────
             if open_count < config.MAX_POSITIONS:
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
                         continue
                     if len(positions) >= config.MAX_POSITIONS:
                         break
+                    if not feed.ready(symbol):
+                        continue
 
                     try:
-                        candles_15m = exchange.get_ohlcv(symbol, interval="15m", limit=120)
-                        candles_1h  = exchange.get_ohlcv(symbol, interval="1h",  limit=220)
+                        candles_15m = feed.get(symbol, "15m")
+                        candles_1h  = feed.get(symbol, "1h")
                         signal      = signals.evaluate(candles_15m, candles_1h)
 
                         if not signal:
@@ -97,16 +108,16 @@ def run() -> None:
                         price  = exchange.get_price(symbol)
                         params = risk.calc(signal, price, candles_15m)
 
-                        log.info("[%s] Señal %s | entry=%.4f sl=%.4f tp=%.4f qty=%.4f",
+                        log.info("[%s] %s | entry=%.4f sl=%.4f tp=%.4f qty=%.4f",
                                  symbol, signal.upper(), price,
                                  params["sl"], params["tp"], params["qty"])
 
                         exchange.open_order(
-                            side    = signal,
-                            qty     = params["qty"],
-                            sl      = params["sl"],
-                            tp      = params["tp"],
-                            symbol  = symbol,
+                            side   = signal,
+                            qty    = params["qty"],
+                            sl     = params["sl"],
+                            tp     = params["tp"],
+                            symbol = symbol,
                         )
 
                         positions[symbol] = {
@@ -127,10 +138,10 @@ def run() -> None:
                         )
 
                     except Exception as e:
-                        log.error("[%s] Error escaneando: %s", symbol, e, exc_info=True)
+                        log.error("[%s] Error: %s", symbol, e, exc_info=True)
 
         except Exception as e:
-            log.error("Error en loop principal: %s", e, exc_info=True)
+            log.error("Error en loop: %s", e, exc_info=True)
             telegram.notify(f"⚠️ Error en bot: {e}")
 
         time.sleep(config.LOOP_SLEEP)
