@@ -16,9 +16,6 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # CONFIGURACIÓN PRINCIPAL — todos los valores son sobreescribibles por Railway
 # ---------------------------------------------------------------------------
-# MIN_SCORE / MIN_SIGNAL_SCORE — umbral mínimo de puntuación para emitir señal
-# Railway puede tener cualquiera de las dos; se respeta la prioridad:
-#   MIN_SIGNAL_SCORE > MIN_SCORE > default (7)
 _env_min_score = os.getenv("MIN_SIGNAL_SCORE") or os.getenv("MIN_SCORE")
 MIN_SCORE: int     = int(_env_min_score) if _env_min_score else 7
 MIN_RR: float      = float(os.getenv("MIN_RR_REQUIRED", "1.5"))
@@ -26,8 +23,8 @@ PREMIUM_SCORE: int = int(os.getenv("PREMIUM_SIGNAL_SCORE", "10"))
 
 MAX_SCORE_NEUTRAL: int = 10
 
-# Ratio mínimo score/max_score — bajado de 0.62 → 0.50 para más señales válidas
-MIN_SCORE_RATIO: float      = float(os.getenv("MIN_SCORE_RATIO",      "0.50"))
+# FIX #1: MIN_SCORE_RATIO subido de 0.50 → 0.62 para exigir más calidad de señal
+MIN_SCORE_RATIO: float      = float(os.getenv("MIN_SCORE_RATIO",      "0.62"))
 MIN_SCORE_RATIO_BEAR: float = float(os.getenv("MIN_SCORE_RATIO_BEAR", "0.72"))
 
 _MIN_RR_TRENDING  = float(os.getenv("MIN_RR_TRENDING",  "1.6"))
@@ -40,7 +37,6 @@ _MIN_RR_REVERSAL  = float(os.getenv("MIN_RR_REVERSAL",  "2.0"))
 # ---------------------------------------------------------------------------
 
 def _w(name: str, default: float) -> float:
-    """Lee un peso desde env var. Si no está definida devuelve el default."""
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -115,7 +111,6 @@ log.info(
     " | ".join(f"{k}={v:.2f}" for k, v in _WR.items()),
 )
 
-# FIX #1: _min_rr_for_regime cubre el caso REVERSAL explicitamente
 def _min_rr_for_regime(regime: Optional[str]) -> float:
     if not regime:
         return MIN_RR
@@ -138,7 +133,10 @@ def _min_score_ratio_for_regime(regime: Optional[str]) -> float:
         return MIN_SCORE_RATIO_BEAR
     return MIN_SCORE_RATIO
 
-_MTF_BLOCK_SCORE_OVERRIDE = int(os.getenv("MTF_BLOCK_SCORE_OVERRIDE", "999"))
+# FIX #2: MTF_BLOCK_SCORE_OVERRIDE bajado de 999 → 12
+# Con MAX posible de 15, un score de 12 es una señal casi perfecta.
+# Antes estaba en 999 lo que significa que el bloqueo MTF NUNCA se activaba.
+_MTF_BLOCK_SCORE_OVERRIDE = int(os.getenv("MTF_BLOCK_SCORE_OVERRIDE", "12"))
 
 _ANALYZE_PAIR_CONCURRENCY = int(os.getenv("ANALYZE_PAIR_CONCURRENCY", "6"))
 _analyze_pair_sem: Optional[asyncio.Semaphore] = None
@@ -171,24 +169,18 @@ _SL_STRUCTURE_ENABLED = os.getenv("SL_STRUCTURE_ENABLED", "true").lower() != "fa
 _SL_STRUCTURE_MAX_DIST_PCT = float(os.getenv("SL_STRUCTURE_MAX_DIST_PCT", "4.0").replace("%", "").strip()) / 100.0
 _VOL_AVG_WINDOW    = int(os.getenv("VOL_AVG_WINDOW", "20"))
 
-# --- FILTROS DE VOLUMEN (todos configurables) ---
-# VOL_SIGNAL_MIN: volumen de la vela de señal vs media — bajado 1.0 → 0.7
 _VOL_SIGNAL_MIN    = float(os.getenv("VOL_SIGNAL_MIN",  "0.7"))
-# VOL_MIN_GLOBAL: volumen global del mercado — bajado 0.6 → 0.5
 _VOL_MIN_GLOBAL    = float(os.getenv("VOL_MIN_GLOBAL",  "0.5"))
-# VOL_CONFIRM_MIN: volumen mínimo para bonus de confirmación — bajado 1.2 → 1.0
 _VOL_CONFIRM_MIN   = float(os.getenv("VOL_CONFIRM_MIN", "1.0"))
 
 _FUNDING_LONG_MAX  = float(os.getenv("FUNDING_LONG_MAX",  "0.0005"))
 _FUNDING_SHORT_MIN = float(os.getenv("FUNDING_SHORT_MIN", "-0.0005"))
 
-# --- FILTROS EMA SPREAD (configurables) ---
-# EMA_SPREAD_TREND_MIN: spread mínimo para considerar mercado en tendencia — bajado 0.002 → 0.001
+# FIX #3: EMA_SPREAD_RANGE_MAX subido de 0.003 → 0.005
+# Antes aceptaba spreads muy pequeños como "tendencia". Ahora exige una separación real de EMAs.
 _EMA_SPREAD_TREND_MIN  = float(os.getenv("EMA_SPREAD_TREND_MIN",  "0.001"))
-# EMA_SPREAD_RANGE_MAX: spread máximo antes de bloquear por "mercado en rango" — subido 0.0015 → 0.003
-_EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.003"))
+_EMA_SPREAD_RANGE_MAX  = float(os.getenv("EMA_SPREAD_RANGE_MAX",  "0.005"))
 
-# --- FILTROS BREAKOUT ---
 _BREAKOUT_WINDOW       = int(os.getenv("BREAKOUT_WINDOW", "20"))
 _BREAKOUT_VOL_MIN      = float(os.getenv("BREAKOUT_VOL_MIN",      "1.4"))
 _BREAKOUT_VOL_MIN_HARD = float(os.getenv("BREAKOUT_VOL_MIN_HARD", "1.2"))
@@ -196,37 +188,45 @@ _BREAKOUT_ATR_CONFIRM  = float(os.getenv("BREAKOUT_ATR_CONFIRM",  "0.3"))
 _BREAKOUT_SQUEEZE_PCT  = float(os.getenv("BREAKOUT_SQUEEZE_PCT",  "40"))
 _BREAKOUT_RETEST_TOL   = float(os.getenv("BREAKOUT_RETEST_TOL",   "0.005"))
 
-# --- FILTROS REVERSAL ---
 _REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "25"))
 _REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "75"))
-# FIX: bloquear reversal contra tendencia macro 1h+4h (cuchillo cayendo / pump vertical)
-# Poner "true" en Railway para PERMITIR reversals contra la macro (comportamiento anterior)
 _REVERSAL_ALLOW_AGAINST_MACRO = os.getenv("REVERSAL_ALLOW_AGAINST_MACRO", "false").lower() == "true"
 
 _PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "2"))
 _PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.005"))
 _EARLY_LEV_FACTOR      = float(os.getenv("EARLY_LEV_FACTOR", "0.2"))
 _DOJI_BODY_MIN_PCT     = float(os.getenv("DOJI_BODY_MIN_PCT", "0.20"))
-_ADX_MIN               = float(os.getenv("ADX_MIN", "20.0"))
+
+# FIX #4: ADX_MIN subido de 20 → 22 y se añade ADX_HARD_BLOCK
+# ADX_HARD_BLOCK: si el ADX cae por debajo de este umbral se bloquea la señal TENDENCIA directamente,
+# sin importar el score (antes solo penalizaba -2pts pero la señal podía pasar igual).
+_ADX_MIN           = float(os.getenv("ADX_MIN", "22.0"))
+_ADX_HARD_BLOCK    = float(os.getenv("ADX_HARD_BLOCK", "15.0"))
+
 _REVERSAL_SWING_TOL    = float(os.getenv("REVERSAL_SWING_TOL", "0.005"))
 _TP_VOL_HIGH_THRESHOLD = float(os.getenv("TP_VOL_HIGH_THRESHOLD", "2.0"))
 _TP_VOL_HIGH_MULT      = float(os.getenv("TP_VOL_HIGH_MULT",      "1.2"))
 _TP_VOL_LOW_THRESHOLD  = float(os.getenv("TP_VOL_LOW_THRESHOLD",  "0.9"))
 _TP_VOL_LOW_MULT       = float(os.getenv("TP_VOL_LOW_MULT",       "0.85"))
 
-# --- REQUISITOS OBLIGATORIOS TENDENCIA (configurables) ---
-# Poner "false" en Railway para desactivar el early-exit correspondiente
 _TENDENCIA_REQUIRE_MACD15M = os.getenv("TENDENCIA_REQUIRE_MACD15M", "true").lower() != "false"
 _TENDENCIA_REQUIRE_ST1H    = os.getenv("TENDENCIA_REQUIRE_ST1H",    "true").lower() != "false"
+
+# FIX #5: Bloqueo explícito 4H contra-tendencia para TENDENCIA y BREAKOUT
+# Si la macro 4H (EMA + ST) está en dirección contraria a la señal, se bloquea.
+# Poner REQUIRE_4H_ALIGNMENT=false en Railway para desactivar.
+_REQUIRE_4H_ALIGNMENT = os.getenv("REQUIRE_4H_ALIGNMENT", "true").lower() != "false"
 
 log.info(
     "[signal_engine] Filtros: EMA_SPREAD_RANGE_MAX=%.4f EMA_SPREAD_TREND_MIN=%.4f "
     "VOL_SIGNAL_MIN=%.2f VOL_MIN_GLOBAL=%.2f VOL_CONFIRM_MIN=%.2f "
-    "REQUIRE_MACD15M=%s REQUIRE_ST1H=%s REVERSAL_ALLOW_AGAINST_MACRO=%s",
+    "REQUIRE_MACD15M=%s REQUIRE_ST1H=%s REVERSAL_ALLOW_AGAINST_MACRO=%s "
+    "ADX_MIN=%.1f ADX_HARD_BLOCK=%.1f MTF_BLOCK_OVERRIDE=%d REQUIRE_4H=%s",
     _EMA_SPREAD_RANGE_MAX, _EMA_SPREAD_TREND_MIN,
     _VOL_SIGNAL_MIN, _VOL_MIN_GLOBAL, _VOL_CONFIRM_MIN,
     _TENDENCIA_REQUIRE_MACD15M, _TENDENCIA_REQUIRE_ST1H,
     _REVERSAL_ALLOW_AGAINST_MACRO,
+    _ADX_MIN, _ADX_HARD_BLOCK, _MTF_BLOCK_SCORE_OVERRIDE, _REQUIRE_4H_ALIGNMENT,
 )
 
 def _to_ccxt_symbol(symbol: str) -> str:
@@ -389,11 +389,10 @@ def _ema_slope(ema_series: list, lookback: int = 3) -> float:
 
 
 # ---------------------------------------------------------------------------
-# _compute_indicators — calcula todos los indicadores técnicos de un timeframe
+# _compute_indicators
 # ---------------------------------------------------------------------------
 
 def _compute_indicators(bars: list) -> dict:
-    """Calcula todos los indicadores técnicos para un conjunto de velas OHLCV."""
     if not bars or len(bars) < 10:
         return {}
 
@@ -402,7 +401,6 @@ def _compute_indicators(bars: list) -> dict:
     lows   = [float(_b_low(b))   for b in bars]
     vols   = [float(_b_vol(b))   for b in bars]
 
-    # EMA 9, 21, 50
     ema9_series  = ema(closes, 9)
     ema21_series = ema(closes, 21)
     ema50_series = ema(closes, 50)
@@ -424,23 +422,18 @@ def _compute_indicators(bars: list) -> dict:
         and close_last < ema21_val
     )
 
-    # RSI
     rsi_val = rsi(closes, 14)
 
-    # MACD
     macd_line, signal_line, hist = macd(closes)
     macd_bull = bool(macd_line > signal_line and hist > 0)
     macd_bear = bool(macd_line < signal_line and hist < 0)
 
-    # ATR
     atr_val = calc_atr(highs, lows, closes, 14)
 
-    # Supertrend
     st_dir, st_val = supertrend(highs, lows, closes, period=10, factor=3.0)
     st_bull = st_dir == 1
     st_bear = st_dir == -1
 
-    # Volume ratio
     avg_vol = (
         sum(vols[-_VOL_AVG_WINDOW:]) / _VOL_AVG_WINDOW
         if len(vols) >= _VOL_AVG_WINDOW
@@ -448,14 +441,12 @@ def _compute_indicators(bars: list) -> dict:
     )
     vol_ratio = round(vols[-1] / avg_vol, 3) if avg_vol > 0 else 1.0
 
-    # VWAP (anclado a sesión activa)
     try:
         from bot.indicators import vwap as calc_vwap
         vwap_val = calc_vwap(bars)
     except Exception:
         vwap_val = 0.0
 
-    # RSI divergence
     try:
         div = rsi_divergence(bars)
     except Exception:
@@ -586,11 +577,11 @@ async def _analyze_pair_inner(
             return _hold_result(
                 symbol,
                 f"MTF bloqueado: señal 15m={signal_str} vs bias 1h={bias_1h} "
-                f"(score={score} < {_MTF_BLOCK_SCORE_OVERRIDE})",
+                f"(score={score} < override={_MTF_BLOCK_SCORE_OVERRIDE})",
             )
         log.warning(
-            "[signal_engine] %s MTF desalineado (%s vs 1h=%s) — PERMITIDO por score alto (%d)",
-            symbol, signal_str, bias_1h, score,
+            "[signal_engine] %s MTF desalineado (%s vs 1h=%s) — PERMITIDO por score excepcional (%d >= %d)",
+            symbol, signal_str, bias_1h, score, _MTF_BLOCK_SCORE_OVERRIDE,
         )
 
     from bot.session_filter import check_session
@@ -806,7 +797,6 @@ def _score_tendencia(
     MAX = 15
     reasons: List[str] = []
 
-    # --- EARLY-EXIT DIAGNOSTICS ---
     if not i1h:
         log.info("[signal_engine] TENDENCIA early-exit: sin datos 1h")
         return "TENDENCIA", "NEUTRAL", 0, MAX, ["Sin datos 1h"]
@@ -840,13 +830,38 @@ def _score_tendencia(
         return "TENDENCIA", "NEUTRAL", 0, MAX, ["Sin tendencia definida en 1h"]
 
     direction = "LONG" if trend_1h_up else "SHORT"
+
+    # FIX #5: Bloqueo explícito 4H contra-tendencia
+    # Si la macro 4H está en dirección opuesta a la señal 1H, bloqueamos TENDENCIA.
+    # Esto evita exactamente el caso: BTC bajando en 4H pero 1H/15m dan LONG momentáneo.
+    if _REQUIRE_4H_ALIGNMENT and i4h:
+        macro_bear_4h = i4h.get("ema_bear", False) or i4h.get("st_bear", False)
+        macro_bull_4h = i4h.get("ema_bull", False) or i4h.get("st_bull", False)
+        if direction == "LONG" and macro_bear_4h:
+            log.info(
+                "[signal_engine] TENDENCIA LONG bloqueado — macro 4H bajista "
+                "(ema_bear_4h=%s st_bear_4h=%s) — señal contra la tendencia mayor",
+                i4h.get("ema_bear", False), i4h.get("st_bear", False),
+            )
+            return "TENDENCIA", "NEUTRAL", 0, MAX, [
+                f"TENDENCIA LONG bloqueado: macro 4H bajista (usa REQUIRE_4H_ALIGNMENT=false para desactivar)"
+            ]
+        if direction == "SHORT" and macro_bull_4h:
+            log.info(
+                "[signal_engine] TENDENCIA SHORT bloqueado — macro 4H alcista "
+                "(ema_bull_4h=%s st_bull_4h=%s) — señal contra la tendencia mayor",
+                i4h.get("ema_bull", False), i4h.get("st_bull", False),
+            )
+            return "TENDENCIA", "NEUTRAL", 0, MAX, [
+                f"TENDENCIA SHORT bloqueado: macro 4H alcista (usa REQUIRE_4H_ALIGNMENT=false para desactivar)"
+            ]
+
     log.debug(
         "[signal_engine] _score_tendencia direction=%s trend_1h_up=%s trend_1h_down=%s "
         "ema21_1h=%.4f ema50_1h=%.4f",
         direction, trend_1h_up, trend_1h_down, ema21_1h, ema50_1h,
     )
 
-    # MACD 15m — obligatorio si TENDENCIA_REQUIRE_MACD15M=true (default)
     macd_ok = (direction == "LONG" and i15.get("macd_bull")) or (direction == "SHORT" and i15.get("macd_bear"))
     if not macd_ok:
         if _TENDENCIA_REQUIRE_MACD15M:
@@ -864,7 +879,6 @@ def _score_tendencia(
             )
             reasons.append(f"MACD15m en contra de {direction} (no bloqueante, TENDENCIA_REQUIRE_MACD15M=false)")
 
-    # ST 1h — obligatorio si TENDENCIA_REQUIRE_ST1H=true (default)
     st1h_ok = (direction == "LONG" and i1h.get("st_bull")) or (direction == "SHORT" and i1h.get("st_bear"))
     if not st1h_ok:
         if _TENDENCIA_REQUIRE_ST1H:
@@ -881,6 +895,21 @@ def _score_tendencia(
                 direction,
             )
             reasons.append(f"ST1h en contra de {direction} (no bloqueante, TENDENCIA_REQUIRE_ST1H=false)")
+
+    # FIX #4: ADX hard-block — si el ADX cae por debajo del umbral mínimo absoluto, bloqueamos directamente
+    closes_15m = [float(_b_close(b)) for b in bars_15m]
+    highs_15m  = [float(_b_high(b))  for b in bars_15m]
+    lows_15m   = [float(_b_low(b))   for b in bars_15m]
+    adx_val = _adx_simple(highs_15m, lows_15m, closes_15m, 14)
+
+    if adx_val > 0 and adx_val < _ADX_HARD_BLOCK:
+        log.info(
+            "[signal_engine] TENDENCIA early-exit: ADX=%.1f < HARD_BLOCK=%.1f — mercado sin tendencia real",
+            adx_val, _ADX_HARD_BLOCK,
+        )
+        return "TENDENCIA", "NEUTRAL", 0, MAX, [
+            f"ADX={adx_val:.1f} < {_ADX_HARD_BLOCK} — mercado plano, sin tendencia real (hard block)"
+        ]
 
     score = 0.0
 
@@ -926,10 +955,6 @@ def _score_tendencia(
         score += w
         reasons.append(f"MACD15m en favor +{w:.2f}")
 
-    closes_15m = [float(_b_close(b)) for b in bars_15m]
-    highs_15m  = [float(_b_high(b))  for b in bars_15m]
-    lows_15m   = [float(_b_low(b))   for b in bars_15m]
-    adx_val = _adx_simple(highs_15m, lows_15m, closes_15m, 14)
     ema21_series = i15.get("_ema21_series", [])
 
     if ema21_series:
@@ -1076,14 +1101,7 @@ def _score_tendencia(
             else:
                 reasons.append("Sin estructura LL/LH en 15m")
 
-    # --- LOG DE DIAGNÓSTICO TENDENCIA ---
     st15m_diag = i15.get("st_bull") if direction == "LONG" else i15.get("st_bear")
-    adx_diag   = _adx_simple(
-        [float(_b_high(b)) for b in bars_15m],
-        [float(_b_low(b))  for b in bars_15m],
-        [float(_b_close(b)) for b in bars_15m],
-        14,
-    )
     log.info(
         "[signal_engine] EVAL TENDENCIA(%s) → score=%.2f/%d | "
         "EMA15m=%s | ST1h=%s | ST4h=%s | MACD15m=%s | MACD4h=%s | "
@@ -1098,7 +1116,7 @@ def _score_tendencia(
         "✅" if macd4h_ok   else "❌",
         i15.get("rsi_val") or 0.0,
         i15.get("vol_ratio", 1.0),
-        adx_diag,
+        adx_val,
         "✅" if (vwap_val and close_15m and ((direction == "LONG" and close_15m > vwap_val) or (direction == "SHORT" and close_15m < vwap_val))) else "❌",
         "✅" if pullback_detected else "❌",
         MIN_SCORE,
@@ -1162,6 +1180,30 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         ]
 
     direction = "LONG" if (broke_up or retest_up) else "SHORT"
+
+    # FIX #5 aplicado también a BREAKOUT: bloquear si la macro 4H va en contra
+    if _REQUIRE_4H_ALIGNMENT and i4h:
+        macro_bear_4h = i4h.get("ema_bear", False) or i4h.get("st_bear", False)
+        macro_bull_4h = i4h.get("ema_bull", False) or i4h.get("st_bull", False)
+        if direction == "LONG" and macro_bear_4h:
+            log.info(
+                "[signal_engine] BREAKOUT LONG bloqueado — macro 4H bajista "
+                "(ema_bear_4h=%s st_bear_4h=%s)",
+                i4h.get("ema_bear", False), i4h.get("st_bear", False),
+            )
+            return "BREAKOUT", "NEUTRAL", 0, MAX, [
+                "BREAKOUT LONG bloqueado: macro 4H bajista (usa REQUIRE_4H_ALIGNMENT=false para desactivar)"
+            ]
+        if direction == "SHORT" and macro_bull_4h:
+            log.info(
+                "[signal_engine] BREAKOUT SHORT bloqueado — macro 4H alcista "
+                "(ema_bull_4h=%s st_bull_4h=%s)",
+                i4h.get("ema_bull", False), i4h.get("st_bull", False),
+            )
+            return "BREAKOUT", "NEUTRAL", 0, MAX, [
+                "BREAKOUT SHORT bloqueado: macro 4H alcista (usa REQUIRE_4H_ALIGNMENT=false para desactivar)"
+            ]
+
     score = 0.0
 
     if broke_up or broke_down:
@@ -1211,7 +1253,6 @@ def _score_breakout(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             score += w
             reasons.append(f"MACD1h confirma {direction} +{w:.2f}")
 
-    # Squeeze check
     range_size = range_high - range_low
     avg_atr_approx = atr_val * _BREAKOUT_WINDOW
     is_squeeze = (range_size / avg_atr_approx * 100) < _BREAKOUT_SQUEEZE_PCT if avg_atr_approx > 0 else False
@@ -1256,12 +1297,6 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
 
     direction = "LONG" if is_oversold else "SHORT"
 
-    # ---------------------------------------------------------------------------
-    # FIX: bloquear reversal contra tendencia macro 1h + 4h
-    # Un LONG reversal en plena caída bajista macro = cuchillo cayendo.
-    # Un SHORT reversal en plena subida alcista macro = contra la marea.
-    # Se puede desactivar con REVERSAL_ALLOW_AGAINST_MACRO=true en Railway.
-    # ---------------------------------------------------------------------------
     if not _REVERSAL_ALLOW_AGAINST_MACRO:
         macro_bear_1h = i1h.get("ema_bear", False) if i1h else False
         macro_bull_1h = i1h.get("ema_bull", False) if i1h else False
@@ -1302,7 +1337,6 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
     score += w
     reasons.append(f"RSI15m={rsi_15m:.0f} en zona reversión {'sobrevendida' if is_oversold else 'sobrecomprada'} +{w:.2f}")
 
-    # Swing high/low check
     if len(bars_15m) >= 10:
         recent = bars_15m[-10:]
         if direction == "LONG":
@@ -1320,7 +1354,6 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
                 score += w
                 reasons.append(f"Swing high confirmado ({current_high:.6f} ≈ {swing_high:.6f}) +{w:.2f}")
 
-    # EMA50 soporte/resistencia
     ema50_15m = i15.get("ema50")
     close_15m  = i15.get("close", 0)
     if ema50_15m and close_15m:
@@ -1331,7 +1364,6 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             score += w
             reasons.append(f"EMA50_15m soporte/resistencia activo ({ema50_15m:.6f}) +{w:.2f}")
 
-    # MACD divergencia
     macd_div = (direction == "LONG" and i15.get("rsi_div_bull")) or \
                (direction == "SHORT" and i15.get("rsi_div_bear"))
     if macd_div:
@@ -1339,21 +1371,18 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         score += w
         reasons.append(f"Divergencia RSI {direction} confirmada +{w:.2f}")
 
-    # Volumen
     vol_ratio = i15.get("vol_ratio", 1.0)
     if vol_ratio >= _VOL_CONFIRM_MIN:
         w = _WR["VOL"]
         score += w
         reasons.append(f"Vol={vol_ratio:.1f}x confirmando reversión +{w:.2f}")
 
-    # RSI bonus (zona extrema)
     extreme_rsi = (direction == "LONG" and rsi_15m <= 20) or (direction == "SHORT" and rsi_15m >= 80)
     if extreme_rsi:
         w = _WR["RSI"]
         score += w
         reasons.append(f"RSI extremo {rsi_15m:.0f} — alta probabilidad reversión +{w:.2f}")
 
-    # VWAP
     vwap_val = i15.get("vwap", 0.0)
     if vwap_val and vwap_val > 0 and close_15m:
         vwap_rev_ok = (direction == "LONG" and close_15m < vwap_val) or \
@@ -1363,7 +1392,6 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             score += w
             reasons.append(f"Precio lejos del VWAP — tensión para reversión +{w:.2f}")
 
-    # ST4h contra-tendencia (válido en reversión)
     if i4h:
         st4h_against = (direction == "LONG" and i4h.get("st_bear")) or \
                        (direction == "SHORT" and i4h.get("st_bull"))
@@ -1373,45 +1401,4 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
             reasons.append(f"ST4h en contra — posible agotamiento de tendencia +{w:.2f}")
 
     log.info(
-        "[signal_engine] EVAL REVERSAL(%s) → score=%.2f/%d | "
-        "RSI=%.1f | Vol=%.2fx | VWAP=%s | Divergencia=%s | ST4h_contra=%s | umbral=%d | ratio=%.2f(min=%.2f)",
-        direction, score, MAX,
-        rsi_15m, vol_ratio,
-        "✅" if (vwap_val and close_15m and ((direction == "LONG" and close_15m < vwap_val) or (direction == "SHORT" and close_15m > vwap_val))) else "❌",
-        "✅" if macd_div else "❌",
-        "✅" if (i4h and ((direction == "LONG" and i4h.get("st_bear")) or (direction == "SHORT" and i4h.get("st_bull")))) else "❌",
-        MIN_SCORE, score / MAX if MAX > 0 else 0.0, _min_score_ratio_for_regime(None),
-    )
-
-    return "REVERSAL", direction, score, MAX, reasons
-
-
-def _hold_result(symbol: str, reason: str, max_score: int = MAX_SCORE_NEUTRAL) -> SignalResult:
-    return SignalResult(
-        symbol=symbol,
-        signal="NEUTRAL",
-        entry_mode="HOLD",
-        score=0,
-        max_score=max_score,
-        entry=0.0,
-        sl=0.0,
-        tp1=0.0,
-        tp2=0.0,
-        atr=0.0,
-        rr=0.0,
-        suggested_lev=1,
-        indicators={},
-        is_valid=False,
-        reason=reason,
-    )
-
-
-async def _fetch_bars(exch, symbol: str, timeframe: str, limit: int) -> list:
-    try:
-        bars = await exch.fetch_ohlcv(symbol, timeframe, limit=limit)
-        return bars or []
-    except Exception as e:
-        log.warning("[signal_engine] _fetch_bars %s %s error: %s", symbol, timeframe, e)
-        return []
-# Alias para compatibilidad con DecisionEngine
-evaluate = analyze_pair
+        "[signal_engine] EVAL REVERSAL(%s) → score=%.2f/%d | 
