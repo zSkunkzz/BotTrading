@@ -234,14 +234,19 @@ def run() -> None:
                             continue
 
                         price  = exchange.get_price(symbol)
-                        params = risk.calc(signal, price, candles_15m, score)
+                        # Pasamos symbol para que risk.calc() use el step-size
+                        # real del contrato en vez del hardcode de 3 decimales
+                        params = risk.calc(signal, price, candles_15m, score, symbol=symbol)
 
                         qty = params["qty"]
                         if symbol in _last_closed:
-                            qty = round(params["qty"] * REENTRY_SIZE_MULT, 4)
+                            qty = exchange.floor_qty(
+                                params["qty"] * REENTRY_SIZE_MULT,
+                                exchange._get_contract_info(symbol)["stepSize"],
+                            )
                             _last_closed.pop(symbol, None)
 
-                        log.info("[%s] SEÑAL %s | entry=%.4f sl=%.4f tp=%.4f qty=%.4f score=%d",
+                        log.info("[%s] SEÑAL %s | entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d",
                                  symbol, signal.upper(), price,
                                  params["sl"], params["tp"], qty, score)
 
@@ -268,8 +273,8 @@ def run() -> None:
 
                         telegram.notify_open(
                             symbol = symbol,
-                            side   = signal,
                             price  = price,
+                            side   = signal,
                             qty    = qty,
                             sl     = params["sl"],
                             tp     = params["tp"],
