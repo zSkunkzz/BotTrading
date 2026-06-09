@@ -16,9 +16,8 @@ log = logging.getLogger("main")
 
 
 def run() -> None:
-    log.info("Bot iniciado | %s | lev=%dx | size=%s USDT | SL=%.1f%% TP=%.1f%%",
-             config.SYMBOL, config.LEVERAGE, config.USDC_SIZE,
-             config.SL_PCT, config.TP_PCT)
+    log.info("Bot iniciado | %s | lev=%dx | size=%s USDT | SL=1.5×ATR TP=3×ATR",
+             config.SYMBOL, config.LEVERAGE, config.USDC_SIZE)
 
     exchange.set_leverage()
     telegram.notify(f"🤖 Bot iniciado — {config.SYMBOL} {config.LEVERAGE}x")
@@ -27,16 +26,16 @@ def run() -> None:
 
     while True:
         try:
-            # ── Sync posición con el exchange ─────────────────────────────────
+            # ── Sync posición con el exchange ──────────────────────────────────
             pos_exchange = exchange.get_position()
 
             if position and not pos_exchange:
-                # Posición cerrada externamente (SL/TP ejecutado)
+                # Cerrada externamente (SL/TP ejecutado en exchange)
                 exit_price = exchange.get_price()
-                pnl = ((exit_price - position["entry"]) / position["entry"] * 100
+                pnl = ((exit_price - position["entry"]) / position["entry"]
                        if position["side"] == "long"
-                       else (position["entry"] - exit_price) / position["entry"] * 100)
-                pnl *= config.LEVERAGE
+                       else (position["entry"] - exit_price) / position["entry"])
+                pnl *= config.LEVERAGE * 100
                 telegram.notify_close(
                     symbol  = config.SYMBOL,
                     side    = position["side"],
@@ -49,7 +48,7 @@ def run() -> None:
                 position = None
 
             elif pos_exchange and not position:
-                # Posición detectada en exchange que no tenemos en memoria
+                # Posición en exchange que no tenemos en memoria → sincronizar
                 position = {
                     "side":  pos_exchange["side"],
                     "entry": pos_exchange["entry"],
@@ -60,14 +59,16 @@ def run() -> None:
                 log.info("Posición sincronizada desde exchange: %s @ %.4f",
                          position["side"], position["entry"])
 
-            # ── Sin posición → buscar señal ───────────────────────────────────
+            # ── Sin posición → buscar señal ────────────────────────────────────
             if not position:
-                candles = exchange.get_ohlcv()
-                signal  = signals.evaluate(candles)
+                candles_15m = exchange.get_ohlcv(interval="15m", limit=100)
+                candles_1h  = exchange.get_ohlcv(interval="1h",  limit=210)
+
+                signal = signals.evaluate(candles_15m, candles_1h)
 
                 if signal:
                     price  = exchange.get_price()
-                    params = risk.calc(signal, price)
+                    params = risk.calc(signal, price, candles_15m)
 
                     log.info("Señal: %s | entry=%.4f sl=%.4f tp=%.4f qty=%.4f",
                              signal.upper(), price,
@@ -96,8 +97,6 @@ def run() -> None:
                         sl     = params["sl"],
                         tp     = params["tp"],
                     )
-                else:
-                    log.info("Sin señal")
 
         except Exception as e:
             log.error("Error en loop: %s", e, exc_info=True)
