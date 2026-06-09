@@ -199,6 +199,9 @@ _BREAKOUT_RETEST_TOL   = float(os.getenv("BREAKOUT_RETEST_TOL",   "0.005"))
 # --- FILTROS REVERSAL ---
 _REVERSAL_RSI_LOW      = float(os.getenv("REVERSAL_RSI_LOW",  "25"))
 _REVERSAL_RSI_HIGH     = float(os.getenv("REVERSAL_RSI_HIGH", "75"))
+# FIX: bloquear reversal contra tendencia macro 1h+4h (cuchillo cayendo / pump vertical)
+# Poner "true" en Railway para PERMITIR reversals contra la macro (comportamiento anterior)
+_REVERSAL_ALLOW_AGAINST_MACRO = os.getenv("REVERSAL_ALLOW_AGAINST_MACRO", "false").lower() == "true"
 
 _PULLBACK_LOOKBACK     = int(os.getenv("PULLBACK_LOOKBACK", "2"))
 _PULLBACK_TOLERANCE    = float(os.getenv("PULLBACK_TOLERANCE", "0.005"))
@@ -219,10 +222,11 @@ _TENDENCIA_REQUIRE_ST1H    = os.getenv("TENDENCIA_REQUIRE_ST1H",    "true").lowe
 log.info(
     "[signal_engine] Filtros: EMA_SPREAD_RANGE_MAX=%.4f EMA_SPREAD_TREND_MIN=%.4f "
     "VOL_SIGNAL_MIN=%.2f VOL_MIN_GLOBAL=%.2f VOL_CONFIRM_MIN=%.2f "
-    "REQUIRE_MACD15M=%s REQUIRE_ST1H=%s",
+    "REQUIRE_MACD15M=%s REQUIRE_ST1H=%s REVERSAL_ALLOW_AGAINST_MACRO=%s",
     _EMA_SPREAD_RANGE_MAX, _EMA_SPREAD_TREND_MIN,
     _VOL_SIGNAL_MIN, _VOL_MIN_GLOBAL, _VOL_CONFIRM_MIN,
     _TENDENCIA_REQUIRE_MACD15M, _TENDENCIA_REQUIRE_ST1H,
+    _REVERSAL_ALLOW_AGAINST_MACRO,
 )
 
 def _to_ccxt_symbol(symbol: str) -> str:
@@ -1251,6 +1255,47 @@ def _score_reversal(i15: dict, i1h: dict, i4h: dict, bars_15m: list) -> Tuple[st
         ]
 
     direction = "LONG" if is_oversold else "SHORT"
+
+    # ---------------------------------------------------------------------------
+    # FIX: bloquear reversal contra tendencia macro 1h + 4h
+    # Un LONG reversal en plena caída bajista macro = cuchillo cayendo.
+    # Un SHORT reversal en plena subida alcista macro = contra la marea.
+    # Se puede desactivar con REVERSAL_ALLOW_AGAINST_MACRO=true en Railway.
+    # ---------------------------------------------------------------------------
+    if not _REVERSAL_ALLOW_AGAINST_MACRO:
+        macro_bear_1h = i1h.get("ema_bear", False) if i1h else False
+        macro_bull_1h = i1h.get("ema_bull", False) if i1h else False
+        macro_bear_4h = i4h.get("ema_bear", False) or i4h.get("st_bear", False) if i4h else False
+        macro_bull_4h = i4h.get("ema_bull", False) or i4h.get("st_bull", False) if i4h else False
+
+        if direction == "LONG" and macro_bear_1h and (not i4h or macro_bear_4h):
+            log.info(
+                "[signal_engine] REVERSAL LONG bloqueado — tendencia macro 1h/4h bajista "
+                "(ema_bear_1h=%s ema_bear_4h=%s st_bear_4h=%s) RSI=%.1f — riesgo cuchillo cayendo",
+                macro_bear_1h,
+                i4h.get("ema_bear", False) if i4h else "N/A",
+                i4h.get("st_bear", False) if i4h else "N/A",
+                rsi_15m,
+            )
+            return "REVERSAL", "NEUTRAL", 0, MAX, [
+                f"REVERSAL LONG bloqueado: macro bajista 1h/4h con RSI={rsi_15m:.0f} "
+                f"(cuchillo cayendo — usa REVERSAL_ALLOW_AGAINST_MACRO=true para desactivar)"
+            ]
+
+        if direction == "SHORT" and macro_bull_1h and (not i4h or macro_bull_4h):
+            log.info(
+                "[signal_engine] REVERSAL SHORT bloqueado — tendencia macro 1h/4h alcista "
+                "(ema_bull_1h=%s ema_bull_4h=%s st_bull_4h=%s) RSI=%.1f — riesgo contra la marea",
+                macro_bull_1h,
+                i4h.get("ema_bull", False) if i4h else "N/A",
+                i4h.get("st_bull", False) if i4h else "N/A",
+                rsi_15m,
+            )
+            return "REVERSAL", "NEUTRAL", 0, MAX, [
+                f"REVERSAL SHORT bloqueado: macro alcista 1h/4h con RSI={rsi_15m:.0f} "
+                f"(contra la marea — usa REVERSAL_ALLOW_AGAINST_MACRO=true para desactivar)"
+            ]
+
     score = 0.0
 
     w = _WR["BASE"]
