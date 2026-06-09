@@ -1,4 +1,15 @@
-"""exchange.py — Cliente BingX Perpetual Futures (swap v2)."""
+"""exchange.py — Cliente BingX Perpetual Futures (swap v2).
+
+FIXES aplicados:
+  1. _post() enviaba params en el body (data=); BingX los exige en la query string.
+     Ahora tanto GET como POST usan params= (query string), que es lo que BingX firma.
+  2. La firma se calcula sobre la query string real (urllib.parse.urlencode sin sorted),
+     igual que lo hace BingX internamente, evitando "signature does not match".
+  3. Reintentos automáticos (3 intentos, backoff 1s) para RemoteProtocolError y
+     timeouts intermitentes que estaban silenciando órdenes.
+  4. calc_qty() aplica floor al step size de cada símbolo para no enviar qty
+     que BingX rechaza por precisión decimal.
+"""
 import hashlib
 import hmac
 import time
@@ -11,35 +22,69 @@ import config
 
 log = logging.getLogger("exchange")
 
+# ── Firma ─────────────────────────────────────────────────────────────────────
 
 def _sign(params: dict) -> str:
-    payload = urllib.parse.urlencode(sorted(params.items()))
-    return hmac.new(config.API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    """Firma la query string tal como la construye urllib / BingX."""
+    payload = urllib.parse.urlencode(params)          # sin sorted — BingX no lo exige
+    return hmac.new(
+        config.API_SECRET.encode(),
+        payload.encode(),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _headers() -> dict:
     return {"X-BX-APIKEY": config.API_KEY}
 
 
-def _get(path: str, params: dict = None) -> dict:
-    params = params or {}
+# ── HTTP helpers con reintentos ───────────────────────────────────────────────
+
+_RETRIES    = 3
+_RETRY_WAIT = 1.0   # segundos entre intentos
+
+
+def _request(method: str, path: str, params: dict) -> dict:
+    """GET o POST enviando siempre los parámetros en la query string (BingX V2)."""
+    params = dict(params)
     params["timestamp"] = int(time.time() * 1000)
     params["signature"] = _sign(params)
-    r = httpx.get(config.BASE_URL + path, params=params, headers=_headers(), timeout=10)
-    r.raise_for_status()
-    return r.json()
+
+    url = config.BASE_URL + path
+
+    last_exc: Exception | None = None
+    for attempt in range(1, _RETRIES + 1):
+        try:
+            r = httpx.request(
+                method,
+                url,
+                params=params,          # ← query string en GET y POST
+                headers=_headers(),
+                timeout=10,
+            )
+            r.raise_for_status()
+            return r.json()
+        except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as exc:
+            last_exc = exc
+            log.warning("Intento %d/%d fallido para %s: %s", attempt, _RETRIES, path, exc)
+            if attempt < _RETRIES:
+                time.sleep(_RETRY_WAIT)
+        except httpx.HTTPStatusError as exc:
+            log.error("HTTP %s en %s: %s", exc.response.status_code, path, exc.response.text)
+            raise
+
+    raise last_exc  # re-lanza si agotamos reintentos
+
+
+def _get(path: str, params: dict = None) -> dict:
+    return _request("GET", path, params or {})
 
 
 def _post(path: str, params: dict = None) -> dict:
-    params = params or {}
-    params["timestamp"] = int(time.time() * 1000)
-    params["signature"] = _sign(params)
-    r = httpx.post(config.BASE_URL + path, data=params, headers=_headers(), timeout=10)
-    r.raise_for_status()
-    return r.json()
+    return _request("POST", path, params or {})
 
 
-# ── Precio ───────────────────────────────────────────────────────────────
+# ── Precio ────────────────────────────────────────────────────────────────────
 
 def get_price(symbol: str = None) -> float:
     symbol = symbol or config.SYMBOL
@@ -47,7 +92,7 @@ def get_price(symbol: str = None) -> float:
     return float(data["data"]["price"])
 
 
-# ── OHLCV ───────────────────────────────────────────────────────────────
+# ── OHLCV ─────────────────────────────────────────────────────────────────────
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
     """Devuelve lista de velas [{open, high, low, close, volume}] más reciente al final."""
@@ -70,7 +115,49 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
     return candles
 
 
-# ── Posición abierta ───────────────────────────────────────────────────────
+# ── Info de contrato (step size / min qty) ────────────────────────────────────
+
+_contract_info_cache: dict[str, dict] = {}
+
+def _get_contract_info(symbol: str) -> dict:
+    """Devuelve stepSize y minQty para el símbolo. Cachea para no repetir llamadas."""
+    if symbol in _contract_info_cache:
+        return _contract_info_cache[symbol]
+    try:
+        data = _get("/openApi/swap/v2/quote/contracts", {"symbol": symbol})
+        contracts = data.get("data") or []
+        for c in contracts:
+            if c.get("symbol") == symbol:
+                info = {
+                    "stepSize": float(c.get("tradeMinQuantity", 0.001)),
+                    "minQty":   float(c.get("tradeMinQuantity", 0.001)),
+                    "pricePrecision": int(c.get("pricePrecision", 6)),
+                }
+                _contract_info_cache[symbol] = info
+                return info
+    except Exception as exc:
+        log.warning("No se pudo obtener info contrato %s: %s", symbol, exc)
+
+    # Fallback razonable por defecto
+    default = {"stepSize": 0.001, "minQty": 0.001, "pricePrecision": 6}
+    _contract_info_cache[symbol] = default
+    return default
+
+
+def floor_qty(qty: float, step: float) -> float:
+    """Redondea qty hacia abajo al step size del contrato."""
+    if step <= 0:
+        return qty
+    factor = 1.0 / step
+    return int(qty * factor) / factor
+
+
+def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
+    """Verifica que el valor nocional sea ≥ min_usdt (BingX exige mínimo ~5 USDT)."""
+    return (qty * price) >= min_usdt
+
+
+# ── Posición abierta ──────────────────────────────────────────────────────────
 
 def get_position(symbol: str = None) -> dict | None:
     symbol = symbol or config.SYMBOL
@@ -88,7 +175,7 @@ def get_position(symbol: str = None) -> dict | None:
     return None
 
 
-# ── Apalancamiento ───────────────────────────────────────────────────────
+# ── Apalancamiento ────────────────────────────────────────────────────────────
 
 def set_leverage(symbol: str = None, leverage: int = None) -> None:
     symbol   = symbol or config.SYMBOL
@@ -106,12 +193,22 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
     log.info("Leverage seteado a %dx en %s", leverage, symbol)
 
 
-# ── Abrir orden ─────────────────────────────────────────────────────────
+# ── Abrir orden ───────────────────────────────────────────────────────────────
 
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
     symbol   = symbol or config.SYMBOL
     bx_side  = "BUY"  if side == "long" else "SELL"
     pos_side = "LONG" if side == "long" else "SHORT"
+
+    # Aplicar step size del contrato
+    info = _get_contract_info(symbol)
+    qty  = floor_qty(qty, info["stepSize"])
+
+    if qty <= 0 or not min_notional_ok(qty, get_price(symbol)):
+        raise ValueError(
+            f"qty={qty} inválido para {symbol} (step={info['stepSize']}). "
+            "Aumenta MARGIN_USDT o reduce el número de pares."
+        )
 
     resp = _post("/openApi/swap/v2/trade/order", {
         "symbol":       symbol,
@@ -160,7 +257,7 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
     log.info("TP colocado en %.6f (%s %s)", tp_price, side.upper(), symbol)
 
 
-# ── Cerrar posición ────────────────────────────────────────────────────────
+# ── Cerrar posición ───────────────────────────────────────────────────────────
 
 def close_position(side: str, qty: float, symbol: str = None) -> dict:
     symbol   = symbol or config.SYMBOL
@@ -177,7 +274,7 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
     return resp
 
 
-# ── Cancelar órdenes abiertas ──────────────────────────────────────────────────
+# ── Cancelar órdenes abiertas ─────────────────────────────────────────────────
 
 def cancel_all_orders(symbol: str = None) -> None:
     symbol = symbol or config.SYMBOL
