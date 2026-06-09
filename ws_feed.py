@@ -149,8 +149,20 @@ class KlineFeed:
             if symbol not in self._data or tf not in TIMEFRAMES:
                 return
 
-            kline = msg.get("data", {})
-            if not kline:
+            raw_data = msg.get("data")
+            if not raw_data:
+                return
+
+            # BingX puede enviar data como dict o como lista de dicts.
+            # Normalizamos siempre a dict tomando el primer elemento si es lista.
+            if isinstance(raw_data, list):
+                if len(raw_data) == 0:
+                    return
+                kline = raw_data[0]
+            else:
+                kline = raw_data
+
+            if not isinstance(kline, dict):
                 return
 
             candle = {
