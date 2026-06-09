@@ -1,13 +1,14 @@
 """ws_feed.py — WebSocket kline feed de BingX perpetual.
 
-Suscribe todos los pares configurados a los streams de klines 15m y 1h.
+Suscribe todos los pares a streams de klines 15m, 1h y 4h.
 Mantiene un buffer de velas en memoria que signals.py consume.
 
 Uso:
     feed = KlineFeed(config.SYMBOLS)
-    feed.start()                      # arranca el thread en background
+    feed.start()
     candles_15m = feed.get("BTC-USDT", "15m")
     candles_1h  = feed.get("BTC-USDT", "1h")
+    candles_4h  = feed.get("BTC-USDT", "4h")
 """
 import gzip
 import json
@@ -24,17 +25,21 @@ import exchange
 
 log = logging.getLogger("ws_feed")
 
-WS_URL      = "wss://open-api-swap.bingx.com/swap-market"
-BUFFER_SIZE = 250   # velas por par/timeframe
-TIMEFRAMES  = ["15m", "1h"]
-PING_INTERVAL = 20  # segundos
+WS_URL        = "wss://open-api-swap.bingx.com/swap-market"
+BUFFER_SIZE   = 300
+TIMEFRAMES    = ["15m", "1h", "4h"]
+PING_INTERVAL = 20
+
+# velas mínimas para declarar el feed listo
+_READY_MIN = {"15m": 120, "1h": 215, "4h": 60}
+# velas a precargar vía REST
+_PRELOAD   = {"15m": 120, "1h": 220, "4h": 70}
 
 
 class KlineFeed:
     def __init__(self, symbols: list[str]):
-        self._symbols  = symbols
-        self._lock     = threading.Lock()
-        # _data[symbol][timeframe] = deque de velas
+        self._symbols = symbols
+        self._lock    = threading.Lock()
         self._data: dict[str, dict[str, deque]] = {
             s: {tf: deque(maxlen=BUFFER_SIZE) for tf in TIMEFRAMES}
             for s in symbols
@@ -42,42 +47,45 @@ class KlineFeed:
         self._ws      = None
         self._running = False
 
-    # ── API pública ─────────────────────────────────────────────────────────────
+    # ── API pública ─────────────────────────────────────────────────────
 
     def get(self, symbol: str, timeframe: str) -> list[dict]:
-        """Devuelve la lista de velas cerradas (excluye la vela viva)."""
+        """Devuelve la lista de velas (incluye la vela viva al final)."""
         with self._lock:
             buf = self._data.get(symbol, {}).get(timeframe, deque())
             candles = list(buf)
-        # excluimos la última (vela viva)
-        return candles[:-1] if len(candles) > 1 else []
+        return candles if candles else []
+
+    def has_tf(self, symbol: str, timeframe: str) -> bool:
+        """True si el feed tiene datos del timeframe pedido."""
+        with self._lock:
+            return len(self._data.get(symbol, {}).get(timeframe, [])) > 0
 
     def ready(self, symbol: str) -> bool:
-        """True si tenemos suficientes velas para evaluar señales."""
+        """True si tenemos velas suficientes en los TF obligatorios (15m + 1h)."""
         return (
-            len(self._data[symbol]["15m"]) >= 120 and
-            len(self._data[symbol]["1h"])  >= 215
+            len(self._data[symbol]["15m"]) >= _READY_MIN["15m"] and
+            len(self._data[symbol]["1h"])  >= _READY_MIN["1h"]
         )
 
     def start(self) -> None:
-        """Precarga velas REST y arranca el WebSocket en background."""
         log.info("Precargando velas REST para %d pares...", len(self._symbols))
         self._preload()
         self._running = True
         t = threading.Thread(target=self._run_forever, daemon=True)
         t.start()
-        log.info("WebSocket feed arrancado")
+        log.info("WebSocket feed arrancado (15m + 1h + 4h)")
 
     def stop(self) -> None:
         self._running = False
         if self._ws:
             self._ws.close()
 
-    # ── Precarga REST ───────────────────────────────────────────────────────────
+    # ── Precarga REST ───────────────────────────────────────────────────
 
     def _preload(self) -> None:
         for symbol in self._symbols:
-            for tf, limit in [("15m", 120), ("1h", 220)]:
+            for tf, limit in _PRELOAD.items():
                 try:
                     candles = exchange.get_ohlcv(symbol, interval=tf, limit=limit)
                     with self._lock:
@@ -86,7 +94,7 @@ class KlineFeed:
                 except Exception as e:
                     log.warning("[%s %s] error precarga: %s", symbol, tf, e)
 
-    # ── WebSocket ───────────────────────────────────────────────────────────────
+    # ── WebSocket ────────────────────────────────────────────────────────
 
     def _run_forever(self) -> None:
         while self._running:
@@ -105,43 +113,37 @@ class KlineFeed:
             on_close   = self._on_close,
         )
         self._ws = ws
-        # ping_interval interno de websocket-client
         ws.run_forever(ping_interval=PING_INTERVAL, ping_timeout=10)
 
     def _on_open(self, ws) -> None:
-        log.info("WebSocket conectado — suscribiendo %d streams",
-                 len(self._symbols) * len(TIMEFRAMES))
+        total = len(self._symbols) * len(TIMEFRAMES)
+        log.info("WebSocket conectado — suscribiendo %d streams", total)
         for symbol in self._symbols:
             for tf in TIMEFRAMES:
                 sub = {
-                    "id":      str(uuid.uuid4()),
-                    "reqType": "sub",
+                    "id":       str(uuid.uuid4()),
+                    "reqType":  "sub",
                     "dataType": f"{symbol}@kline_{tf}",
                 }
                 ws.send(json.dumps(sub))
 
     def _on_message(self, ws, raw) -> None:
-        # BingX envía los mensajes comprimidos en gzip
         try:
             if isinstance(raw, bytes):
                 data_str = gzip.decompress(raw).decode("utf-8")
             else:
                 data_str = raw
 
-            # Respuesta a ping del servidor
             if data_str == "Ping":
                 ws.send("Pong")
                 return
 
             msg = json.loads(data_str)
-
-            # Ignorar confirmaciones de suscripción
             if "dataType" not in msg:
                 return
 
-            # Formato: "BTC-USDT@kline_15m"
-            data_type = msg["dataType"]          # ej. "BTC-USDT@kline_15m"
-            parts = data_type.split("@kline_")  # ["BTC-USDT", "15m"]
+            data_type = msg["dataType"]
+            parts = data_type.split("@kline_")
             if len(parts) != 2:
                 return
 
@@ -153,8 +155,6 @@ class KlineFeed:
             if not raw_data:
                 return
 
-            # BingX puede enviar data como dict o como lista de dicts.
-            # Normalizamos siempre a dict tomando el primer elemento si es lista.
             if isinstance(raw_data, list):
                 if len(raw_data) == 0:
                     return
@@ -171,16 +171,14 @@ class KlineFeed:
                 "low":    float(kline["l"]),
                 "close":  float(kline["c"]),
                 "volume": float(kline["v"]),
-                "closed": kline.get("confirm", False),  # True = vela cerrada
+                "closed": kline.get("confirm", False),
             }
 
             with self._lock:
                 buf = self._data[symbol][tf]
                 if buf and not buf[-1].get("closed", True):
-                    # Actualizar la vela viva
                     buf[-1] = candle
                 else:
-                    # Nueva vela
                     buf.append(candle)
 
         except Exception as e:

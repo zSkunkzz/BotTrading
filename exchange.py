@@ -39,7 +39,7 @@ def _post(path: str, params: dict = None) -> dict:
     return r.json()
 
 
-# ── Precio ────────────────────────────────────────────────────────────────────
+# ── Precio ───────────────────────────────────────────────────────────────
 
 def get_price(symbol: str = None) -> float:
     symbol = symbol or config.SYMBOL
@@ -47,16 +47,16 @@ def get_price(symbol: str = None) -> float:
     return float(data["data"]["price"])
 
 
-# ── OHLCV ─────────────────────────────────────────────────────────────────────
+# ── OHLCV ───────────────────────────────────────────────────────────────
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
     """Devuelve lista de velas [{open, high, low, close, volume}] más reciente al final."""
     symbol   = symbol or config.SYMBOL
     interval = interval or config.TIMEFRAME
     data = _get("/openApi/swap/v3/quote/klines", {
-        "symbol": symbol,
+        "symbol":   symbol,
         "interval": interval,
-        "limit": limit,
+        "limit":    limit,
     })
     candles = []
     for c in data["data"]:
@@ -70,10 +70,9 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
     return candles
 
 
-# ── Posición abierta ──────────────────────────────────────────────────────────
+# ── Posición abierta ───────────────────────────────────────────────────────
 
 def get_position(symbol: str = None) -> dict | None:
-    """Devuelve la posición abierta o None si no hay ninguna."""
     symbol = symbol or config.SYMBOL
     data = _get("/openApi/swap/v2/user/positions", {"symbol": symbol})
     positions = data.get("data") or []
@@ -89,7 +88,7 @@ def get_position(symbol: str = None) -> dict | None:
     return None
 
 
-# ── Apalancamiento ────────────────────────────────────────────────────────────
+# ── Apalancamiento ───────────────────────────────────────────────────────
 
 def set_leverage(symbol: str = None, leverage: int = None) -> None:
     symbol   = symbol or config.SYMBOL
@@ -107,18 +106,13 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
     log.info("Leverage seteado a %dx en %s", leverage, symbol)
 
 
-# ── Abrir orden ───────────────────────────────────────────────────────────────
+# ── Abrir orden ─────────────────────────────────────────────────────────
 
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
-    """
-    Abre una orden market con SL y TP como stop-orders separadas.
-    side: 'long' | 'short'
-    """
-    symbol    = symbol or config.SYMBOL
-    bx_side   = "BUY"  if side == "long" else "SELL"
-    pos_side  = "LONG" if side == "long" else "SHORT"
+    symbol   = symbol or config.SYMBOL
+    bx_side  = "BUY"  if side == "long" else "SELL"
+    pos_side = "LONG" if side == "long" else "SHORT"
 
-    # Orden market de entrada
     resp = _post("/openApi/swap/v2/trade/order", {
         "symbol":       symbol,
         "side":         bx_side,
@@ -128,38 +122,47 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     })
     log.info("Orden abierta: %s %s qty=%.4f", side.upper(), symbol, qty)
 
-    # Stop Loss
-    sl_side = "SELL" if side == "long" else "BUY"
+    place_stop_order(symbol, side, qty, sl)
+    place_tp_order(symbol, side, qty, tp)
+
+    return resp
+
+
+def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
+    """Coloca (o reemplaza) la stop-loss order. Usada también por el trailing."""
+    sl_side  = "SELL" if side == "long" else "BUY"
+    pos_side = "LONG" if side == "long" else "SHORT"
     _post("/openApi/swap/v2/trade/order", {
         "symbol":        symbol,
         "side":          sl_side,
         "positionSide":  pos_side,
         "type":          "STOP_MARKET",
-        "stopPrice":     sl,
+        "stopPrice":     stop_price,
         "quantity":      qty,
         "closePosition": "true",
     })
-    log.info("SL colocado en %.4f", sl)
+    log.info("SL colocado en %.6f (%s %s)", stop_price, side.upper(), symbol)
 
-    # Take Profit
+
+def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
+    """Coloca la take-profit order."""
+    sl_side  = "SELL" if side == "long" else "BUY"
+    pos_side = "LONG" if side == "long" else "SHORT"
     _post("/openApi/swap/v2/trade/order", {
         "symbol":        symbol,
         "side":          sl_side,
         "positionSide":  pos_side,
         "type":          "TAKE_PROFIT_MARKET",
-        "stopPrice":     tp,
+        "stopPrice":     tp_price,
         "quantity":      qty,
         "closePosition": "true",
     })
-    log.info("TP colocado en %.4f", tp)
-
-    return resp
+    log.info("TP colocado en %.6f (%s %s)", tp_price, side.upper(), symbol)
 
 
-# ── Cerrar posición ───────────────────────────────────────────────────────────
+# ── Cerrar posición ────────────────────────────────────────────────────────
 
 def close_position(side: str, qty: float, symbol: str = None) -> dict:
-    """Cierra la posición con una orden market."""
     symbol   = symbol or config.SYMBOL
     bx_side  = "SELL" if side == "long" else "BUY"
     pos_side = "LONG" if side == "long" else "SHORT"
@@ -174,9 +177,9 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
     return resp
 
 
-# ── Cancelar todas las órdenes abiertas ───────────────────────────────────────
+# ── Cancelar órdenes abiertas ──────────────────────────────────────────────────
 
 def cancel_all_orders(symbol: str = None) -> None:
     symbol = symbol or config.SYMBOL
     _post("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
-    log.info("Órdenes abiertas canceladas para %s", symbol)
+    log.info("Órdenes canceladas para %s", symbol)
