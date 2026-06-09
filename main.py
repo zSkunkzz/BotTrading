@@ -8,6 +8,7 @@ import exchange
 import risk
 import signals
 import telegram
+import trade_logger
 from ws_feed import KlineFeed
 
 logging.basicConfig(
@@ -22,8 +23,8 @@ REENTRY_WINDOW      = 4 * 60
 REENTRY_SCORE_BOOST = 10
 REENTRY_SIZE_MULT   = 0.6
 
-READY_TIMEOUT = 120   # segundos máx esperando feed
-READY_MIN_PCT = 0.80  # arranca si ≥80% de los pares están listos
+READY_TIMEOUT = 120
+READY_MIN_PCT = 0.80
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
@@ -65,7 +66,6 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
 
 
 def _wait_feed_ready(feed: KlineFeed) -> None:
-    """Espera hasta que ≥80% de los pares estén listos o pasen 120s."""
     total    = len(config.SYMBOLS)
     needed   = max(1, int(total * READY_MIN_PCT))
     deadline = time.time() + READY_TIMEOUT
@@ -82,9 +82,8 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
             return
         time.sleep(2)
 
-    ready = feed.ready_count()
     log.warning("Timeout feed (%ds) — arrancando con %d/%d pares listos",
-                READY_TIMEOUT, ready, total)
+                READY_TIMEOUT, feed.ready_count(), total)
 
 
 def run() -> None:
@@ -115,23 +114,24 @@ def run() -> None:
         try:
             loop_count += 1
 
-            # ── Sync posiciones ───────────────────────────────────────────────
+            # ── Sync posiciones ──────────────────────────────────────────────
             for symbol in list(positions.keys()):
                 pos_ex = exchange.get_position(symbol)
                 if not pos_ex:
-                    p = positions.pop(symbol)
+                    p          = positions.pop(symbol)
                     exit_price = exchange.get_price(symbol)
-                    pnl = (
+                    pnl_pct = (
                         (exit_price - p["entry"]) / p["entry"]
                         if p["side"] == "long"
                         else (p["entry"] - exit_price) / p["entry"]
                     ) * config.LEVERAGE * 100
+                    pnl_usdt = (pnl_pct / 100) * (p["qty"] * p["entry"] / config.LEVERAGE)
 
                     hit_tp = (
                         (p["side"] == "long"  and exit_price >= p["tp"] * 0.995) or
                         (p["side"] == "short" and exit_price <= p["tp"] * 1.005)
                     )
-                    reason = "TP ✅" if hit_tp else "SL/cierre externo"
+                    reason = "TP" if hit_tp else "SL"
 
                     if hit_tp:
                         _last_closed[symbol] = {
@@ -140,15 +140,29 @@ def run() -> None:
                             "score": p.get("score", 70),
                         }
 
+                    # ── Log del trade ────────────────────────────────────────
+                    trade_logger.record(
+                        symbol     = symbol,
+                        side       = p["side"],
+                        entry      = p["entry"],
+                        exit_price = exit_price,
+                        pnl_pct    = pnl_pct,
+                        pnl_usdt   = pnl_usdt,
+                        score      = p.get("score", 0),
+                        reason     = reason,
+                        open_ts    = p.get("open_ts", time.time()),
+                    )
+
                     telegram.notify_close(
                         symbol  = symbol,
                         side    = p["side"],
                         entry   = p["entry"],
                         exit_p  = exit_price,
-                        pnl_pct = pnl,
-                        reason  = reason,
+                        pnl_pct = pnl_pct,
+                        reason  = reason + (" ✅" if hit_tp else " ❌"),
                     )
-                    log.info("[%s] Cerrada | %s | PnL=%+.2f%%", symbol, reason, pnl)
+                    log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT)",
+                             symbol, reason, pnl_pct, pnl_usdt)
 
             # Recuperar posiciones abiertas no registradas
             for symbol in config.SYMBOLS:
@@ -163,19 +177,19 @@ def run() -> None:
                             "tp":         pos_ex["tp"],
                             "trail_step": 0,
                             "score":      70,
+                            "open_ts":    time.time(),
                         }
                         log.info("[%s] Sincronizada: %s @ %.4f",
                                  symbol, pos_ex["side"], pos_ex["entry"])
 
             open_count = len(positions)
 
-            # Log de estado cada 10 ciclos (~5 min con sleep=30s)
             if loop_count % 10 == 1:
                 log.info("[loop #%d] Posiciones: %d/%d | Feed: %d/%d pares listos",
                          loop_count, open_count, config.MAX_POSITIONS,
                          feed.ready_count(), len(config.SYMBOLS))
 
-            # ── Trailing stop ─────────────────────────────────────────────────
+            # ── Trailing stop ────────────────────────────────────────────────
             for symbol, pos in list(positions.items()):
                 try:
                     current_price = exchange.get_price(symbol)
@@ -183,7 +197,7 @@ def run() -> None:
                 except Exception as e:
                     log.warning("[%s] Error trailing: %s", symbol, e)
 
-            # ── Buscar señales nuevas ─────────────────────────────────────────
+            # ── Buscar señales nuevas ────────────────────────────────────────
             if open_count < config.MAX_POSITIONS:
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
@@ -246,6 +260,7 @@ def run() -> None:
                             "trail_high": price,
                             "trail_low":  price,
                             "score":      score,
+                            "open_ts":    time.time(),
                         }
 
                         telegram.notify_open(

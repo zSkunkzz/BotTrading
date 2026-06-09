@@ -9,7 +9,6 @@ API_SECRET = os.environ["BINGX_API_SECRET"]
 BASE_URL   = "https://open-api.bingx.com"
 
 # Pares verificados en BingX perpetual futures (top market cap, junio 2026)
-# TON-USDT y PEPE-USDT excluidos: no disponibles en BingX perpetual
 SYMBOLS = [
     "BTC-USDT",  "ETH-USDT",  "BNB-USDT",  "XRP-USDT",  "SOL-USDT",
     "TRX-USDT",  "DOGE-USDT", "XLM-USDT",  "ADA-USDT",  "LINK-USDT",
@@ -21,7 +20,7 @@ SYMBOLS = [
     "HYPE-USDT", "GOLD-USDT",
 ]
 
-MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS", "3"))    # máximo simultáneo
+MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS", "5"))    # máximo simultáneo
 LEVERAGE       = int(os.getenv("LEVERAGE", "10"))
 MARGIN_USDT    = float(os.getenv("MARGIN_USDT", "20"))   # margen fijo por trade
 
