@@ -2,26 +2,27 @@
 
 Filtros y mejoras implementadas:
   1. Vela cerrada       : penúltima vela (ya cerrada)
-  2. Régimen de mercado : clasifica tendencia/rango — silencio en lateral puro (ADX<18)
+  2. Régimen de mercado : clasifica tendencia/rango — SOLO por alineación de EMAs
+                          (ADX ya NO es hard-block de régimen, pasa a penalización en score)
   3. Tendencia 4h       : EMA50 en 4h como componente de score (no hard-block)
-  4. Tendencia 1h       : EMA200 — ÚNICO hard-guard junto al régimen
-  5. ADX                : >35 bonus alto, >25 bonus medio, <25 penalización
+  4. Tendencia 1h       : EMA200 — hard-guard de dirección
+  5. ADX 15m            : >35 bonus alto, >25 bonus medio, <25 penalización, <18 penalización fuerte
   6. Volumen            : vela de señal con volumen > media(20) × 1.2 → bonus
   7. RSI 15m            : cruce del nivel 50 → bonus; RSI extremo contrario → penalización
   8. MACD 15m + 1h      : histograma confirma dirección → bonus por cada TF
   9. Divergencia RSI    : bearish/bullish divergence como bonus adicional
   10. Sesgo horario     : horas de alta directionalidad (08-10 UTC, 14-16 UTC) → bonus
   11. Filtro no-chase   : rango de vela ≤ 2×ATR (hard-guard)
-  12. Score 0-100       : señal proporcional, no binaria — sin hard-blocks en cascada
+  12. Score 0-100       : señal proporcional, no binaria
 
-Cambio clave respecto a versión anterior:
-  - Eliminado el bloque long_hard/short_hard que requería TODOS los filtros
-    simultáneos (rsi_cross_up + macd15 + macd1h + macro + trend), lo que
-    producía score=0 en prácticamente todos los casos.
-  - Ahora cada filtro aporta puntos. Solo hay 2 hard-guards reales:
-      a) trend_long / trend_short (EMA200 1h) — dirección macro
-      b) régimen != 'range'                   — no entrar en lateral
-  - MIN_SCORE=55 sigue siendo el umbral de emisión.
+Hard-guards reales (únicos que bloquean totalmente):
+  a) trend_long / trend_short (precio vs EMA200 1h)
+  b) EMAs 1h sin alineación mínima (price/ema20/ema50/ema200 sin orden)
+  c) Distancia < 0.3% al EMA200
+  d) Vela explosiva > 2×ATR
+
+ADX bajo → ya NO bloquea. Penaliza −8 (ADX<25) o −15 (ADX<18) en el score.
+Esto permite detectar el inicio de movimientos antes de que el ADX los confirme.
 """
 from __future__ import annotations
 import logging
@@ -148,7 +149,18 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
     return None
 
 
-def _market_regime(candles_1h: list[dict]) -> str:
+def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
+    """
+    Devuelve (regime, adx_1h).
+    regime: 'bull' | 'bear' | 'range'
+
+    CAMBIO: ADX ya NO es hard-block de régimen.
+    El régimen se determina SOLO por la alineación de EMAs.
+    ADX se devuelve para usarlo como penalización en el score.
+
+    'range' solo se emite si el precio no está del lado correcto
+    respecto al EMA200 y EMA50 (EMAs completamente entrecruzadas).
+    """
     closes = [c["close"] for c in candles_1h]
     ema20  = _ema(closes, 20)[-1]
     ema50  = _ema(closes, 50)[-1]
@@ -156,14 +168,19 @@ def _market_regime(candles_1h: list[dict]) -> str:
     adx    = _adx(candles_1h, 14)
     price  = closes[-1]
 
-    if adx < 18:
-        return "range"
-
+    # Alineación perfecta
     if price > ema20 > ema50 > ema200:
-        return "bull"
+        return "bull", adx
     if price < ema20 < ema50 < ema200:
-        return "bear"
-    return "range"
+        return "bear", adx
+
+    # Alineación parcial: precio del lado correcto respecto EMA200 y EMA50
+    if price > ema200 and price > ema50:
+        return "bull", adx
+    if price < ema200 and price < ema50:
+        return "bear", adx
+
+    return "range", adx
 
 
 def _volume_ok(candles: list[dict], window: int = 20) -> bool:
@@ -187,15 +204,18 @@ def evaluate(
       direccion : 'long' | 'short' | None
       score     : 0-100
 
-    Hard-guards (los únicos filtros que devuelven None directamente):
+    Hard-guards (únicos que devuelven None directamente):
       1. Datos insuficientes
-      2. Régimen lateral (ADX<18 o EMAs sin alineación)
+      2. EMAs 1h sin alineación mínima (regime == 'range')
       3. Precio demasiado cerca del EMA200 (<0.3%)
       4. Vela explosiva (rango > 2×ATR)
-      5. EMA200 1h en contra de la dirección (trend_long / trend_short)
+      5. EMA200 1h en contra de la dirección
 
-    Todo lo demás (RSI, MACD, macro 4h, volumen, sesgo horario) suma/resta
-    puntos en el score. Nunca bloquea la señal por sí solo.
+    ADX bajo ya NO es hard-guard. Penaliza en score:
+      ADX < 18  → −15 pts  (mercado muy lateral)
+      ADX < 25  → −8 pts   (tendencia débil)
+      ADX 25-35 → +6 pts
+      ADX > 35  → +12 pts
     """
     if len(candles_1h) < 210:
         log.warning("Pocas velas 1h (%d/210)", len(candles_1h))
@@ -211,10 +231,10 @@ def evaluate(
     closes_15m = [c["close"] for c in closed_15m]
     closes_1h  = [c["close"] for c in closed_1h]
 
-    # ── Hard-guard 1: Régimen de mercado ─────────────────────────────────────
-    regime = _market_regime(closed_1h)
+    # ── Hard-guard 1: Régimen de mercado (solo EMAs, sin ADX) ─────────────────
+    regime, adx_1h = _market_regime(closed_1h)
     if regime == "range":
-        log.info("⬛ Régimen lateral — sin señal")
+        log.info("⬛ Régimen lateral (EMAs sin alinear) — sin señal")
         return None, 0
 
     # ── Hard-guard 2: distancia mínima al EMA200 ─────────────────────────────
@@ -236,7 +256,7 @@ def evaluate(
         return None, 0
 
     # ── Componentes de score ──────────────────────────────────────────────────
-    adx = _adx(closed_15m, 14)
+    adx = _adx(closed_15m, 14)  # ADX en 15m para scoring (más reactivo)
 
     # Sesgo horario
     hour_utc = datetime.datetime.utcnow().hour
@@ -261,9 +281,9 @@ def evaluate(
     rsi_curr     = rsi_series[-1]
     rsi_cross_up   = rsi_prev < 50 <= rsi_curr
     rsi_cross_down = rsi_prev > 50 >= rsi_curr
-    rsi_bull = rsi_curr > 50          # RSI en zona alcista (sin exigir cruce)
+    rsi_bull = rsi_curr > 50
     rsi_bear = rsi_curr < 50
-    rsi_extreme_bull = rsi_curr > 60  # momentum positivo claro
+    rsi_extreme_bull = rsi_curr > 60
     rsi_extreme_bear = rsi_curr < 40
 
     # Divergencia RSI
@@ -286,14 +306,16 @@ def evaluate(
             return 0
         s = 20                          # base por pasar el hard-guard EMA200
         if macro_long:                  s += 15
-        else:                           s -= 10   # 4h en contra: penalización
+        else:                           s -= 10
+        # ADX como penalización/bonus (ya no es hard-block)
         if adx > 35:                    s += 12
         elif adx > 25:                  s += 6
-        else:                           s -= 8    # ADX bajo: penalización
-        if rsi_cross_up:                s += 15   # cruce exacto: máximo bonus
-        elif rsi_extreme_bull:          s += 8    # RSI>60 sin cruce: bonus parcial
-        elif rsi_bull:                  s += 4    # RSI>50: bonus mínimo
-        else:                           s -= 5    # RSI<50 en long: malo
+        elif adx > 18:                  s -= 8    # tendencia débil
+        else:                           s -= 15   # mercado muy lateral
+        if rsi_cross_up:                s += 15
+        elif rsi_extreme_bull:          s += 8
+        elif rsi_bull:                  s += 4
+        else:                           s -= 5
         if macd15_bull:                 s += 10
         else:                           s -= 5
         if macd1h_bull:                 s += 10
@@ -310,9 +332,11 @@ def evaluate(
         s = 20
         if macro_short:                 s += 15
         else:                           s -= 10
+        # ADX como penalización/bonus
         if adx > 35:                    s += 12
         elif adx > 25:                  s += 6
-        else:                           s -= 8
+        elif adx > 18:                  s -= 8
+        else:                           s -= 15
         if rsi_cross_down:              s += 15
         elif rsi_extreme_bear:          s += 8
         elif rsi_bear:                  s += 4
@@ -330,10 +354,10 @@ def evaluate(
     sc_short = score_short()
 
     log.info(
-        "regime=%s hour=%dUTC | price=%.4f ema200=%.4f dist=%.2f%% ADX=%.1f "
+        "regime=%s adx1h=%.1f hour=%dUTC | price=%.4f ema200=%.4f dist=%.2f%% ADX15m=%.1f "
         "rsi=%.1f→%.1f vol=%s diverg=%s macro_l=%s macro_s=%s "
         "macd15=%.4f macd1h=%.4f | score_long=%d score_short=%d (min=%d)",
-        regime, hour_utc, price, ema200, dist*100, adx,
+        regime, adx_1h, hour_utc, price, ema200, dist*100, adx,
         rsi_prev, rsi_curr, vol_ok, divergence,
         macro_long, macro_short,
         hist_15m[-1], hist_1h[-1],
