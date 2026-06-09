@@ -8,21 +8,24 @@ API_KEY    = os.environ["BINGX_API_KEY"]
 API_SECRET = os.environ["BINGX_API_SECRET"]
 BASE_URL   = "https://open-api.bingx.com"
 
-# Multi-par — top 30 por market cap
+# Pares verificados en BingX perpetual futures (top market cap, junio 2026)
+# TON-USDT y PEPE-USDT excluidos: no disponibles en BingX perpetual
 SYMBOLS = [
-    "BTC-USDT", "ETH-USDT", "BNB-USDT", "SOL-USDT", "XRP-USDT",
-    "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "SHIB-USDT", "TON-USDT",
-    "DOT-USDT", "LINK-USDT", "TRX-USDT", "MATIC-USDT", "LTC-USDT",
-    "BCH-USDT", "UNI-USDT", "NEAR-USDT", "ICP-USDT", "APT-USDT",
-    "ETC-USDT", "STX-USDT", "FIL-USDT", "INJ-USDT", "OP-USDT",
-    "ARB-USDT", "ATOM-USDT", "SUI-USDT", "VET-USDT", "HBAR-USDT",
+    "BTC-USDT",  "ETH-USDT",  "BNB-USDT",  "XRP-USDT",  "SOL-USDT",
+    "TRX-USDT",  "DOGE-USDT", "XLM-USDT",  "ADA-USDT",  "LINK-USDT",
+    "BCH-USDT",  "HBAR-USDT", "LTC-USDT",  "SUI-USDT",  "AVAX-USDT",
+    "NEAR-USDT", "SHIB-USDT", "DOT-USDT",  "UNI-USDT",  "ICP-USDT",
+    "ETC-USDT",  "FIL-USDT",  "INJ-USDT",  "APT-USDT",  "ARB-USDT",
+    "VET-USDT",  "STX-USDT",  "ATOM-USDT", "TAO-USDT",  "WLD-USDT",
+    "ONDO-USDT", "MNT-USDT",  "FET-USDT",  "OP-USDT",   "POL-USDT",
+    "HYPE-USDT",
 ]
 
 MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS", "3"))    # máximo simultáneo
 LEVERAGE       = int(os.getenv("LEVERAGE", "10"))
 MARGIN_USDT    = float(os.getenv("MARGIN_USDT", "20"))   # margen fijo por trade
 
-# SL/TP (ratio ATR — solo fallback)
+# SL/TP (fallback si ATR falla)
 SL_PCT         = float(os.getenv("SL_PCT", "1.5"))
 TP_PCT         = float(os.getenv("TP_PCT", "3.0"))
 
