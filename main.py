@@ -17,19 +17,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-# ── Re-entrada: recuerda el último símbolo/dirección cerrado con TP ───────────
-_last_closed: dict = {}   # {symbol: {"side": str, "ts": float, "score": int}}
-REENTRY_WINDOW  = 4 * 60   # segundos — ventana para re-entrada tras TP
-REENTRY_SCORE_BOOST = 10    # bonus de score en re-entrada (tendencia sigue viva)
-REENTRY_SIZE_MULT   = 0.6   # tamaño reducido en re-entrada
+_last_closed: dict = {}
+REENTRY_WINDOW      = 4 * 60
+REENTRY_SCORE_BOOST = 10
+REENTRY_SIZE_MULT   = 0.6
+
+READY_TIMEOUT = 120   # segundos máx esperando feed
+READY_MIN_PCT = 0.80  # arranca si ≥80% de los pares están listos
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
-    """
-    Mueve el SL cuando el precio avanza ≥ trail_step desde el último high/low.
-    Solo sube el SL (nunca lo baja).
-    Actualiza pos['sl'] y pos['trail_high'/'trail_low'] in-place.
-    """
     side       = pos["side"]
     trail_step = pos.get("trail_step", 0)
     if trail_step <= 0:
@@ -38,37 +35,56 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     if side == "long":
         peak = pos.get("trail_high", pos["entry"])
         if current_price > peak + trail_step:
-            new_peak = current_price
-            new_sl   = round(new_peak - 1.5 * trail_step, 6)
+            new_sl = round(current_price - 1.5 * trail_step, 6)
             if new_sl > pos["sl"]:
-                log.info("[%s] Trailing SL: %.4f → %.4f (peak=%.4f)",
-                         symbol, pos["sl"], new_sl, new_peak)
-                pos["trail_high"] = new_peak
+                log.info("[%s] Trailing SL: %.4f → %.4f", symbol, pos["sl"], new_sl)
+                pos["trail_high"] = current_price
                 pos["sl"]         = new_sl
-                # Reemplaza la stop-order en el exchange
                 try:
                     exchange.cancel_all_orders(symbol)
                     exchange.place_stop_order(symbol, "long", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "long", pos["qty"], pos["tp"])
+                    telegram.notify(f"🔼 Trailing SL movido\n{symbol} LONG\nNuevo SL: <code>{new_sl:.4f}</code>")
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
-
-    else:  # short
+    else:
         trough = pos.get("trail_low", pos["entry"])
         if current_price < trough - trail_step:
-            new_trough = current_price
-            new_sl     = round(new_trough + 1.5 * trail_step, 6)
+            new_sl = round(current_price + 1.5 * trail_step, 6)
             if new_sl < pos["sl"]:
-                log.info("[%s] Trailing SL: %.4f → %.4f (trough=%.4f)",
-                         symbol, pos["sl"], new_sl, new_trough)
-                pos["trail_low"] = new_trough
+                log.info("[%s] Trailing SL: %.4f → %.4f", symbol, pos["sl"], new_sl)
+                pos["trail_low"] = current_price
                 pos["sl"]        = new_sl
                 try:
                     exchange.cancel_all_orders(symbol)
                     exchange.place_stop_order(symbol, "short", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "short", pos["qty"], pos["tp"])
+                    telegram.notify(f"🔽 Trailing SL movido\n{symbol} SHORT\nNuevo SL: <code>{new_sl:.4f}</code>")
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
+
+
+def _wait_feed_ready(feed: KlineFeed) -> None:
+    """Espera hasta que ≥80% de los pares estén listos o pasen 120s."""
+    total    = len(config.SYMBOLS)
+    needed   = max(1, int(total * READY_MIN_PCT))
+    deadline = time.time() + READY_TIMEOUT
+    last_log = 0
+
+    while time.time() < deadline:
+        ready = feed.ready_count()
+        now   = time.time()
+        if now - last_log >= 10:
+            log.info("Feed: %d/%d pares listos (mínimo %d)", ready, total, needed)
+            last_log = now
+        if ready >= needed:
+            log.info("Feed listo — %d/%d pares con datos suficientes", ready, total)
+            return
+        time.sleep(2)
+
+    ready = feed.ready_count()
+    log.warning("Timeout feed (%ds) — arrancando con %d/%d pares listos",
+                READY_TIMEOUT, ready, total)
 
 
 def run() -> None:
@@ -90,16 +106,15 @@ def run() -> None:
 
     feed = KlineFeed(config.SYMBOLS)
     feed.start()
-
-    log.info("Esperando datos del feed...")
-    while not all(feed.ready(s) for s in config.SYMBOLS):
-        time.sleep(2)
-    log.info("Feed listo — iniciando loop de señales")
+    _wait_feed_ready(feed)
 
     positions: dict = {}
+    loop_count = 0
 
     while True:
         try:
+            loop_count += 1
+
             # ── Sync posiciones ───────────────────────────────────────────────
             for symbol in list(positions.keys()):
                 pos_ex = exchange.get_position(symbol)
@@ -112,7 +127,6 @@ def run() -> None:
                         else (p["entry"] - exit_price) / p["entry"]
                     ) * config.LEVERAGE * 100
 
-                    # Detectar si fue TP (precio llegó al target) para re-entrada
                     hit_tp = (
                         (p["side"] == "long"  and exit_price >= p["tp"] * 0.995) or
                         (p["side"] == "short" and exit_price <= p["tp"] * 1.005)
@@ -125,7 +139,6 @@ def run() -> None:
                             "ts":    time.time(),
                             "score": p.get("score", 70),
                         }
-                        log.info("[%s] Guardada para re-entrada (TP hit)", symbol)
 
                     telegram.notify_close(
                         symbol  = symbol,
@@ -155,10 +168,15 @@ def run() -> None:
                                  symbol, pos_ex["side"], pos_ex["entry"])
 
             open_count = len(positions)
-            log.info("Posiciones abiertas: %d/%d", open_count, config.MAX_POSITIONS)
 
-            # ── Trailing stop en posiciones abiertas ──────────────────────────
-            for symbol, pos in positions.items():
+            # Log de estado cada 10 ciclos (~5 min con sleep=30s)
+            if loop_count % 10 == 1:
+                log.info("[loop #%d] Posiciones: %d/%d | Feed: %d/%d pares listos",
+                         loop_count, open_count, config.MAX_POSITIONS,
+                         feed.ready_count(), len(config.SYMBOLS))
+
+            # ── Trailing stop ─────────────────────────────────────────────────
+            for symbol, pos in list(positions.items()):
                 try:
                     current_price = exchange.get_price(symbol)
                     _update_trailing(symbol, pos, current_price)
@@ -182,22 +200,18 @@ def run() -> None:
 
                         signal, score = signals.evaluate(candles_15m, candles_1h, candles_4h)
 
-                        # ── Re-entrada inteligente ────────────────────────────
+                        # Re-entrada inteligente
                         if signal is None and symbol in _last_closed:
                             last = _last_closed[symbol]
-                            elapsed = time.time() - last["ts"]
-                            if elapsed < REENTRY_WINDOW:
-                                # Comprobar si la tendencia sigue en la misma dirección
+                            if time.time() - last["ts"] < REENTRY_WINDOW:
                                 sig_re, sc_re = signals.evaluate(candles_15m, candles_1h, candles_4h)
-                                # Usar score boosted aunque la señal no alcance MIN_SCORE
-                                boosted = sc_re + REENTRY_SCORE_BOOST if sig_re is None else sc_re
+                                boosted = (sc_re or 0) + REENTRY_SCORE_BOOST
                                 if boosted >= signals.MIN_SCORE and last["side"] == (sig_re or last["side"]):
                                     signal = last["side"]
                                     score  = boosted
-                                    log.info("[%s] 🔄 Re-entrada | side=%s score=%d",
-                                             symbol, signal, score)
+                                    log.info("[%s] 🔄 Re-entrada | side=%s score=%d", symbol, signal, score)
                                 else:
-                                    _last_closed.pop(symbol, None)   # tendencia rota
+                                    _last_closed.pop(symbol, None)
 
                         if not signal:
                             continue
@@ -205,13 +219,12 @@ def run() -> None:
                         price  = exchange.get_price(symbol)
                         params = risk.calc(signal, price, candles_15m, score)
 
-                        # Re-entrada usa size reducido
                         qty = params["qty"]
                         if symbol in _last_closed:
                             qty = round(params["qty"] * REENTRY_SIZE_MULT, 4)
                             _last_closed.pop(symbol, None)
 
-                        log.info("[%s] %s | entry=%.4f sl=%.4f tp=%.4f qty=%.4f score=%d",
+                        log.info("[%s] SEÑAL %s | entry=%.4f sl=%.4f tp=%.4f qty=%.4f score=%d",
                                  symbol, signal.upper(), price,
                                  params["sl"], params["tp"], qty, score)
 

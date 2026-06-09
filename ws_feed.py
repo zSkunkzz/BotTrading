@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import websocket
 
@@ -29,10 +30,9 @@ WS_URL        = "wss://open-api-swap.bingx.com/swap-market"
 BUFFER_SIZE   = 300
 TIMEFRAMES    = ["15m", "1h", "4h"]
 PING_INTERVAL = 20
+PRELOAD_WORKERS = 8   # peticiones REST en paralelo
 
-# velas mínimas para declarar el feed listo
-_READY_MIN = {"15m": 120, "1h": 215, "4h": 60}
-# velas a precargar vía REST
+_READY_MIN = {"15m": 120, "1h": 215}
 _PRELOAD   = {"15m": 120, "1h": 220, "4h": 70}
 
 
@@ -47,30 +47,32 @@ class KlineFeed:
         self._ws      = None
         self._running = False
 
-    # ── API pública ─────────────────────────────────────────────────────
+    # ── API pública ──────────────────────────────────────────────────────
 
     def get(self, symbol: str, timeframe: str) -> list[dict]:
-        """Devuelve la lista de velas (incluye la vela viva al final)."""
         with self._lock:
-            buf = self._data.get(symbol, {}).get(timeframe, deque())
-            candles = list(buf)
-        return candles if candles else []
+            return list(self._data.get(symbol, {}).get(timeframe, []))
 
     def has_tf(self, symbol: str, timeframe: str) -> bool:
-        """True si el feed tiene datos del timeframe pedido."""
         with self._lock:
             return len(self._data.get(symbol, {}).get(timeframe, [])) > 0
 
     def ready(self, symbol: str) -> bool:
-        """True si tenemos velas suficientes en los TF obligatorios (15m + 1h)."""
-        return (
-            len(self._data[symbol]["15m"]) >= _READY_MIN["15m"] and
-            len(self._data[symbol]["1h"])  >= _READY_MIN["1h"]
-        )
+        """True si tenemos velas suficientes en 15m y 1h."""
+        with self._lock:
+            return (
+                len(self._data[symbol]["15m"]) >= _READY_MIN["15m"] and
+                len(self._data[symbol]["1h"])  >= _READY_MIN["1h"]
+            )
+
+    def ready_count(self) -> int:
+        """Cuántos pares tienen datos suficientes."""
+        return sum(1 for s in self._symbols if self.ready(s))
 
     def start(self) -> None:
-        log.info("Precargando velas REST para %d pares...", len(self._symbols))
-        self._preload()
+        log.info("Precargando velas REST para %d pares (paralelo, %d workers)...",
+                 len(self._symbols), PRELOAD_WORKERS)
+        self._preload_parallel()
         self._running = True
         t = threading.Thread(target=self._run_forever, daemon=True)
         t.start()
@@ -81,18 +83,31 @@ class KlineFeed:
         if self._ws:
             self._ws.close()
 
-    # ── Precarga REST ───────────────────────────────────────────────────
+    # ── Precarga REST en paralelo ────────────────────────────────────────
 
-    def _preload(self) -> None:
-        for symbol in self._symbols:
-            for tf, limit in _PRELOAD.items():
-                try:
-                    candles = exchange.get_ohlcv(symbol, interval=tf, limit=limit)
-                    with self._lock:
-                        self._data[symbol][tf].extend(candles)
-                    log.debug("[%s %s] precargadas %d velas", symbol, tf, len(candles))
-                except Exception as e:
-                    log.warning("[%s %s] error precarga: %s", symbol, tf, e)
+    def _preload_one(self, symbol: str, tf: str, limit: int) -> None:
+        try:
+            candles = exchange.get_ohlcv(symbol, interval=tf, limit=limit)
+            with self._lock:
+                self._data[symbol][tf].extend(candles)
+            log.debug("[%s %s] precargadas %d velas", symbol, tf, len(candles))
+        except Exception as e:
+            log.warning("[%s %s] error precarga: %s", symbol, tf, e)
+
+    def _preload_parallel(self) -> None:
+        tasks = [
+            (symbol, tf, limit)
+            for symbol in self._symbols
+            for tf, limit in _PRELOAD.items()
+        ]
+        with ThreadPoolExecutor(max_workers=PRELOAD_WORKERS) as ex:
+            futures = {ex.submit(self._preload_one, s, tf, lim): (s, tf)
+                       for s, tf, lim in tasks}
+            done = 0
+            for f in as_completed(futures):
+                done += 1
+                if done % 20 == 0 or done == len(tasks):
+                    log.info("Precarga: %d/%d completadas", done, len(tasks))
 
     # ── WebSocket ────────────────────────────────────────────────────────
 
@@ -120,19 +135,15 @@ class KlineFeed:
         log.info("WebSocket conectado — suscribiendo %d streams", total)
         for symbol in self._symbols:
             for tf in TIMEFRAMES:
-                sub = {
+                ws.send(json.dumps({
                     "id":       str(uuid.uuid4()),
                     "reqType":  "sub",
                     "dataType": f"{symbol}@kline_{tf}",
-                }
-                ws.send(json.dumps(sub))
+                }))
 
     def _on_message(self, ws, raw) -> None:
         try:
-            if isinstance(raw, bytes):
-                data_str = gzip.decompress(raw).decode("utf-8")
-            else:
-                data_str = raw
+            data_str = gzip.decompress(raw).decode("utf-8") if isinstance(raw, bytes) else raw
 
             if data_str == "Ping":
                 ws.send("Pong")
@@ -142,8 +153,7 @@ class KlineFeed:
             if "dataType" not in msg:
                 return
 
-            data_type = msg["dataType"]
-            parts = data_type.split("@kline_")
+            parts = msg["dataType"].split("@kline_")
             if len(parts) != 2:
                 return
 
@@ -155,13 +165,7 @@ class KlineFeed:
             if not raw_data:
                 return
 
-            if isinstance(raw_data, list):
-                if len(raw_data) == 0:
-                    return
-                kline = raw_data[0]
-            else:
-                kline = raw_data
-
+            kline = raw_data[0] if isinstance(raw_data, list) else raw_data
             if not isinstance(kline, dict):
                 return
 
