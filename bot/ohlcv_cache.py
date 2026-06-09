@@ -1,6 +1,13 @@
 """
 bot/ohlcv_cache.py — Caché de OHLCV con TTL por timeframe y LRU eviction.
 
+v6 — FIX: OHLCVCache.get() acepta kwarg limit= opcional:
+  Varios sitios del código llaman ohlcv_cache.get(..., limit=N), pero la firma
+  anterior solo tenía (coin, tf, fetch_fn), lanzando TypeError.
+  Ahora se acepta limit como parámetro explícito y se pasa a fetch_fn si este
+  lo soporta (inspección con inspect.signature). Retrocompatible: si no se
+  pasa limit, el comportamiento es idéntico al de v5.
+
 v5 — Backoff exponencial + jitter en fetch, semáforo bajado a 3:
   Con 10 traders × 3 TF = hasta 30 requests OHLCV simultáneas a BingX,
   la API puede devolver None de forma masiva (rate limit silencioso).
@@ -39,6 +46,7 @@ v2 — BUG #9 FIX: sin límite de entradas → OOM tras días de rotación de pa
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import random
@@ -100,6 +108,23 @@ def _ttl_for(tf: str) -> float:
     return _TTL_BY_TF.get(tf, _OHLCV_TTL_S)
 
 
+def _call_fetch_fn(fetch_fn: Callable, tf: str, limit: Optional[int]):
+    """
+    Llama fetch_fn(tf) o fetch_fn(tf, limit=limit) según si el callable
+    acepta el parámetro `limit`. Esto garantiza compatibilidad tanto con
+    fetch_fn de firma (tf,) como con los que aceptan (tf, limit=...).
+    """
+    if limit is None:
+        return fetch_fn(tf)
+    try:
+        sig = inspect.signature(fetch_fn)
+        if "limit" in sig.parameters:
+            return fetch_fn(tf, limit=limit)
+    except (ValueError, TypeError):
+        pass
+    return fetch_fn(tf)
+
+
 class OHLCVCache:
     """
     Caché OHLCV con TTL por timeframe + LRU eviction + semáforo de concurrencia
@@ -116,10 +141,19 @@ class OHLCVCache:
         coin: str,
         tf: str,
         fetch_fn: Callable[[str], Any],
+        limit: Optional[int] = None,
     ) -> list:
         """
         Devuelve OHLCV desde caché si está fresco (TTL por TF), si no llama
         fetch_fn con backoff exponencial + jitter.
+
+        Parámetros:
+          coin     — símbolo (usado como clave de caché)
+          tf       — timeframe ("15m", "1h", "4h"…)
+          fetch_fn — async callable(tf) o async callable(tf, limit=N)
+          limit    — número de velas a pedir (opcional). Si se pasa y fetch_fn
+                     lo soporta, se reenvía como kwarg. Si fetch_fn no lo acepta
+                     se ignora de forma segura.
 
         Estrategia de resiliencia:
           1. Lectura caliente del caché — no consume el semáforo.
@@ -149,7 +183,7 @@ class OHLCVCache:
             async with sem:
                 for attempt in range(_OHLCV_FETCH_RETRIES):
                     try:
-                        result = await fetch_fn(tf)
+                        result = await _call_fetch_fn(fetch_fn, tf, limit)
                         if result:  # lista no vacía → éxito
                             data = result
                             break
