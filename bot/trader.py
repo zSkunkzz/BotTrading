@@ -2,12 +2,18 @@
 """
 bot/trader.py — FuturesTrader: punto de entrada pública para main.py.
 
-v33 — Fix SL/TP + margen fijo 20 USDT (2026-06-09):
-  - usdc_per_trade = 20.0 fijo (no depende de risk ni Kelly).
-  - Eliminado bloque Kelly fraccionado (5b): qty siempre proporcional a 20 USDT.
-  - Desactivado place_market_with_tpsl: se usa SIEMPRE place_market + _place_tpsl.
-    Evita comportamiento inconsistente del endpoint combinado de BingX.
+v34 — Fix 3 bugs (2026-06-09):
+  Bug 1 (CRÍTICO): filled_price podía ser None si place_market devolvía
+    price=0/None y todos los reintentos de get_price() fallaban.
+    _adjust_levels_to_fill recibía None → TypeError.
+    Fix: filled_price = filled_price or ref_price antes de llamar
+    _adjust_levels_to_fill.
 
+  Bug 3 (MEDIO): _ohlcv_fn ignoraba el parámetro limit. Siempre usaba
+    _OHLCV_BARS del env aunque el caller pidiera más/menos velas.
+    Fix: limit se pasa a _raw_fetch y a ohlcv_cache.get().
+
+v33 — Fix SL/TP + margen fijo 20 USDT (2026-06-09).
 v32 — Fix CRÍTICO: guardia dura de side en _do_open_order.
 v31 — Fix CRÍTICO: side leído desde 'signal' (campo de SignalResult).
 v30 — Fix CRÍTICO: guardia SL/TP obligatoria también en dry-run (2026-06-09).
@@ -366,11 +372,13 @@ class FuturesTrader:
     def get_ohlcv_fn(self) -> Callable:
         """
         v26 FIX: Retorna un callable async que delega en ohlcv_cache.get().
+        v34 FIX Bug 3: el parámetro limit ahora se respeta — se pasa a
+          _raw_fetch y a ohlcv_cache.get() en lugar de ignorarlo siempre.
         """
-        symbol = self.symbol
+        symbol  = self.symbol
         inst_id = self.inst_id
 
-        async def _raw_fetch(timeframe: str) -> list[dict]:
+        async def _raw_fetch(timeframe: str, limit: int = _OHLCV_BARS) -> list[dict]:
             if self._bingx_client is None:
                 await self._get_ccxt()
 
@@ -380,9 +388,9 @@ class FuturesTrader:
                 lambda: _req.get(
                     f"{_BASE_URL}/openApi/swap/v3/quote/klines",
                     params={
-                        "symbol": inst_id,
+                        "symbol":   inst_id,
                         "interval": interval,
-                        "limit": _OHLCV_BARS,
+                        "limit":    limit,
                     },
                     timeout=10,
                 ).json()
@@ -399,16 +407,18 @@ class FuturesTrader:
                     "volume":    float(bar.get("volume") or bar.get("v") or 0),
                 })
             logger.debug(
-                "[%s] _raw_fetch: %d barras (%s) recibidas.",
-                symbol, len(candles), timeframe,
+                "[%s] _raw_fetch: %d barras (%s, limit=%d) recibidas.",
+                symbol, len(candles), timeframe, limit,
             )
             return candles
 
         async def _ohlcv_fn(timeframe: str = "15m", limit: int = _OHLCV_BARS) -> list[dict]:
+            # v34 fix Bug 3: pasar limit a ohlcv_cache para que sea respetado
             return await ohlcv_cache.get(
                 coin=symbol,
                 tf=timeframe,
-                fetch_fn=_raw_fetch,
+                fetch_fn=lambda tf: _raw_fetch(tf, limit),
+                limit=limit,
             )
 
         return _ohlcv_fn
@@ -746,6 +756,15 @@ class FuturesTrader:
             except Exception:
                 pass
             await asyncio.sleep(_FILL_DELAY)
+
+        # v34 fix Bug 1: garantizar que filled_price nunca es None/0 antes
+        # de pasarlo a _adjust_levels_to_fill — usar ref_price como fallback.
+        if not filled_price or filled_price <= 0:
+            logger.warning(
+                "[%s] filled_price inválido (%.4f) — usando ref_price=%.4f como fallback.",
+                self.symbol, filled_price or 0, ref_price,
+            )
+            filled_price = ref_price
 
         # Colocar SL + TP1 por separado
         sl_placed = await self._place_tpsl(
