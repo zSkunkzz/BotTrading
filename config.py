@@ -18,7 +18,7 @@ SYMBOLS = [
     "ETC-USDT",  "FIL-USDT",  "INJ-USDT",  "APT-USDT",  "ARB-USDT",
     "VET-USDT",  "STX-USDT",  "ATOM-USDT", "TAO-USDT",  "WLD-USDT",
     "ONDO-USDT", "MNT-USDT",  "FET-USDT",  "OP-USDT",   "POL-USDT",
-    "HYPE-USDT",
+    "HYPE-USDT", "GOLD-USDT",
 ]
 
 MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS", "3"))    # máximo simultáneo
