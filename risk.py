@@ -1,8 +1,14 @@
-"""risk.py — SL/TP con ATR. Margin fijo por trade.
+"""risk.py — Gestión de riesgo con sizing proporcional al score y trailing stop.
 
-qty = (MARGIN_USDT × LEVERAGE) / precio
-SL  = 1.5 × ATR
-TP  = 3.0 × ATR  (ratio 1:2)
+Sizing:
+  base_margin = MARGIN_USDT
+  score  55-69  →  0.7× base_margin
+  score  70-84  →  1.0× base_margin
+  score  85-100 →  1.4× base_margin
+
+Trailing stop:
+  Se gestiona en main.py — aquí se calcula el step inicial.
+  trail_step = 0.5 × ATR  (se mueve el SL cada vez que el precio avanza 0.5 ATR)
 """
 import math
 import logging
@@ -19,7 +25,15 @@ def _atr(candles: list[dict], period: int = 14) -> float:
     return sum(trs[-period:]) / min(period, len(trs)) if trs else 0.0
 
 
-def calc(side: str, entry: float, candles: list[dict]) -> dict:
+def _size_multiplier(score: int) -> float:
+    if score >= 85:
+        return 1.4
+    if score >= 70:
+        return 1.0
+    return 0.7   # score 55-69
+
+
+def calc(side: str, entry: float, candles: list[dict], score: int = 70) -> dict:
     atr = _atr(candles, period=14)
 
     if atr <= 0:
@@ -27,16 +41,30 @@ def calc(side: str, entry: float, candles: list[dict]) -> dict:
         atr = entry * (config.SL_PCT / 100) / 1.5
 
     sl_dist = 1.5 * atr
-    tp_dist = 3.0 * atr
+    tp_dist = 3.0 * atr   # ratio 1:2
 
     sl = (entry - sl_dist) if side == "long" else (entry + sl_dist)
     tp = (entry + tp_dist) if side == "long" else (entry - tp_dist)
 
-    # Margin fijo: MARGIN_USDT define el capital expuesto
-    raw_qty = (config.MARGIN_USDT * config.LEVERAGE) / entry
+    # Sizing proporcional al score
+    mult   = _size_multiplier(score)
+    margin = config.MARGIN_USDT * mult
+    raw_qty = (margin * config.LEVERAGE) / entry
     qty = math.floor(raw_qty * 1000) / 1000
 
-    log.info("[%s] ATR=%.4f SL=%.4f TP=%.4f qty=%.4f (margin=%.0f USDT)",
-             side.upper(), atr, sl, tp, qty, config.MARGIN_USDT)
+    # Trail step: SL se mueve cuando precio avanza 0.5 ATR
+    trail_step = round(0.5 * atr, 6)
 
-    return {"qty": qty, "sl": round(sl, 4), "tp": round(tp, 4), "atr": round(atr, 6)}
+    log.info(
+        "[%s] score=%d mult=%.1f margin=%.1f ATR=%.4f SL=%.4f TP=%.4f qty=%.4f trail=%.4f",
+        side.upper(), score, mult, margin, atr, sl, tp, qty, trail_step,
+    )
+
+    return {
+        "qty":        qty,
+        "sl":         round(sl, 6),
+        "tp":         round(tp, 6),
+        "atr":        round(atr, 6),
+        "trail_step": trail_step,
+        "score":      score,
+    }
