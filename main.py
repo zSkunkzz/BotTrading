@@ -8,6 +8,7 @@ import exchange
 import risk
 import signals
 import telegram
+import tg_commands
 import trade_logger
 from ws_feed import KlineFeed
 
@@ -108,6 +109,10 @@ def run() -> None:
     _wait_feed_ready(feed)
 
     positions: dict = {}
+
+    # ── Arrancar listener de comandos Telegram ──
+    tg_commands.start(get_positions_fn=lambda: positions, feed=feed)
+
     loop_count = 0
 
     while True:
@@ -140,7 +145,6 @@ def run() -> None:
                             "score": p.get("score", 70),
                         }
 
-                    # ── Log del trade ────────────────────────────────────────
                     trade_logger.record(
                         symbol     = symbol,
                         side       = p["side"],
@@ -214,7 +218,6 @@ def run() -> None:
 
                         signal, score = signals.evaluate(candles_15m, candles_1h, candles_4h)
 
-                        # Re-entrada inteligente
                         if signal is None and symbol in _last_closed:
                             last = _last_closed[symbol]
                             if time.time() - last["ts"] < REENTRY_WINDOW:
