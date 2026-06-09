@@ -1,5 +1,6 @@
 """main.py — Loop principal. Usa WebSocket feed para las velas."""
 import logging
+import sys
 import time
 
 import config
@@ -12,6 +13,7 @@ from ws_feed import KlineFeed
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    stream=sys.stdout,
 )
 log = logging.getLogger("main")
 
@@ -48,7 +50,7 @@ def run() -> None:
 
     while True:
         try:
-            # ── Sync posiciones con el exchange ──────────────────────────────
+            # ── Sync posiciones con el exchange ────────────────────────────────────
             for symbol in list(positions.keys()):
                 pos_ex = exchange.get_position(symbol)
                 if not pos_ex:
@@ -87,7 +89,7 @@ def run() -> None:
             open_count = len(positions)
             log.info("Posiciones abiertas: %d/%d", open_count, config.MAX_POSITIONS)
 
-            # ── Buscar señales ────────────────────────────────────────────────
+            # ── Buscar señales ────────────────────────────────────────────────────
             if open_count < config.MAX_POSITIONS:
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
