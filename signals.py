@@ -16,13 +16,12 @@ Filtros y mejoras implementadas:
   12. Score 0-100       : señal proporcional, no binaria
 
 Hard-guards reales (únicos que bloquean totalmente):
-  a) trend_long / trend_short (precio vs EMA200 1h)
-  b) EMAs 1h sin alineación mínima (price/ema20/ema50/ema200 sin orden)
-  c) Distancia < 0.3% al EMA200
-  d) Vela explosiva > 2×ATR
+  a) Régimen 'range' (EMAs 1h sin alineación mínima)
+  b) Precio demasiado cerca del EMA200 (<0.3%)
+  c) Vela explosiva > 2×ATR
+  d) Régimen contradice EMA200 (price < ema200 en bull, price > ema200 en bear)
 
 ADX bajo → ya NO bloquea. Penaliza −8 (ADX<25) o −15 (ADX<18) en el score.
-Esto permite detectar el inicio de movimientos antes de que el ADX los confirme.
 """
 from __future__ import annotations
 import logging
@@ -154,12 +153,13 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     Devuelve (regime, adx_1h).
     regime: 'bull' | 'bear' | 'range'
 
-    CAMBIO: ADX ya NO es hard-block de régimen.
     El régimen se determina SOLO por la alineación de EMAs.
     ADX se devuelve para usarlo como penalización en el score.
 
-    'range' solo se emite si el precio no está del lado correcto
-    respecto al EMA200 y EMA50 (EMAs completamente entrecruzadas).
+    Regla de consistencia (fix Bug 1+2):
+      - 'bull' solo si precio >= EMA200 (evita bull con precio bajo EMA200)
+      - 'bear' solo si precio <= EMA200 (evita bear con precio sobre EMA200)
+      - Si la alineación parcial contradice el EMA200 → 'range'
     """
     closes = [c["close"] for c in candles_1h]
     ema20  = _ema(closes, 20)[-1]
@@ -168,18 +168,26 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     adx    = _adx(candles_1h, 14)
     price  = closes[-1]
 
-    # Alineación perfecta
+    # Alineación perfecta alcista
     if price > ema20 > ema50 > ema200:
         return "bull", adx
+
+    # Alineación perfecta bajista
     if price < ema20 < ema50 < ema200:
         return "bear", adx
 
-    # Alineación parcial: precio del lado correcto respecto EMA200 y EMA50
-    if price > ema200 and price > ema50:
+    # Alineación parcial alcista:
+    # precio por encima de EMA200 Y EMA50, y además EMA20 > EMA200
+    # (garantiza que el precio NO contradice el EMA200)
+    if price > ema200 and price > ema50 and ema20 > ema200:
         return "bull", adx
-    if price < ema200 and price < ema50:
+
+    # Alineación parcial bajista:
+    # precio por debajo de EMA200 Y EMA50, y además EMA20 < EMA200
+    if price < ema200 and price < ema50 and ema20 < ema200:
         return "bear", adx
 
+    # Cualquier otra combinación = lateral / sin alineación clara
     return "range", adx
 
 
@@ -209,7 +217,7 @@ def evaluate(
       2. EMAs 1h sin alineación mínima (regime == 'range')
       3. Precio demasiado cerca del EMA200 (<0.3%)
       4. Vela explosiva (rango > 2×ATR)
-      5. EMA200 1h en contra de la dirección
+      5. EMA200 1h en contra de la dirección (usa régimen, no recalcula)
 
     ADX bajo ya NO es hard-guard. Penaliza en score:
       ADX < 18  → −15 pts  (mercado muy lateral)
@@ -245,8 +253,12 @@ def evaluate(
         log.info("⚠️  Precio cerca del EMA200 (%.4f%%) — sin señal", dist * 100)
         return None, 0
 
-    trend_long  = price > ema200
-    trend_short = price < ema200
+    # Dirección permitida según régimen (consistente con EMA200 por construcción)
+    # Bug 1+2 fix: usamos el régimen como única fuente de verdad de dirección,
+    # no recalculamos trend_long/short independientemente con solo EMA200.
+    # El régimen ya garantiza consistencia con EMA200 tras el fix de _market_regime.
+    trend_long  = regime == "bull"
+    trend_short = regime == "bear"
 
     # ── Hard-guard 3: filtro no-chase ─────────────────────────────────────────
     atr        = _atr(closed_15m, 14)
@@ -267,7 +279,9 @@ def evaluate(
         hour_bonus = -10
 
     # Macro 4h (bonus, no hard-block)
-    macro_long = macro_short = True
+    # Bug 5 fix: inicializar a False (conservador) en vez de True
+    # para evitar +15 pts falsos cuando no hay datos 4h disponibles.
+    macro_long = macro_short = False
     if closed_4h and len(closed_4h) >= 55:
         closes_4h = [c["close"] for c in closed_4h]
         ema50_4h  = _ema(closes_4h, 50)[-1]
@@ -302,7 +316,7 @@ def evaluate(
 
     # ── Scoring LONG ─────────────────────────────────────────────────────────
     def score_long() -> int:
-        if not trend_long:              # hard-guard de dirección
+        if not trend_long:              # hard-guard de dirección (regime == 'bull')
             return 0
         s = 20                          # base por pasar el hard-guard EMA200
         if macro_long:                  s += 15
@@ -327,7 +341,7 @@ def evaluate(
 
     # ── Scoring SHORT ────────────────────────────────────────────────────────
     def score_short() -> int:
-        if not trend_short:             # hard-guard de dirección
+        if not trend_short:             # hard-guard de dirección (regime == 'bear')
             return 0
         s = 20
         if macro_short:                 s += 15

@@ -218,12 +218,13 @@ def run() -> None:
 
                         signal, score = signals.evaluate(candles_15m, candles_1h, candles_4h)
 
+                        # Bug 3 fix: re-entrada reutiliza score de la primera llamada
+                        # en vez de llamar evaluate() dos veces con los mismos datos.
                         if signal is None and symbol in _last_closed:
                             last = _last_closed[symbol]
                             if time.time() - last["ts"] < REENTRY_WINDOW:
-                                sig_re, sc_re = signals.evaluate(candles_15m, candles_1h, candles_4h)
-                                boosted = (sc_re or 0) + REENTRY_SCORE_BOOST
-                                if boosted >= signals.MIN_SCORE and last["side"] == (sig_re or last["side"]):
+                                boosted = (score or 0) + REENTRY_SCORE_BOOST
+                                if boosted >= signals.MIN_SCORE and last["side"] == signal:
                                     signal = last["side"]
                                     score  = boosted
                                     log.info("[%s] 🔄 Re-entrada | side=%s score=%d", symbol, signal, score)
@@ -234,8 +235,6 @@ def run() -> None:
                             continue
 
                         price  = exchange.get_price(symbol)
-                        # Pasamos symbol para que risk.calc() use el step-size
-                        # real del contrato en vez del hardcode de 3 decimales
                         params = risk.calc(signal, price, candles_15m, score, symbol=symbol)
 
                         qty = params["qty"]
