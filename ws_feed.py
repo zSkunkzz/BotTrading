@@ -170,20 +170,30 @@ class KlineFeed:
                 return
 
             candle = {
+                "ts":     int(kline.get("T", kline.get("t", 0))),
                 "open":   float(kline["o"]),
                 "high":   float(kline["h"]),
                 "low":    float(kline["l"]),
                 "close":  float(kline["c"]),
                 "volume": float(kline["v"]),
-                "closed": kline.get("confirm", False),
+                "closed": bool(kline.get("confirm", False)),
             }
 
             with self._lock:
                 buf = self._data[symbol][tf]
-                if buf and not buf[-1].get("closed", True):
+                if buf and buf[-1]["ts"] == candle["ts"]:
+                    # Misma vela: actualizar siempre (ya sea abierta o cierre definitivo)
                     buf[-1] = candle
                 else:
-                    buf.append(candle)
+                    # Nueva vela: solo añadir si la anterior ya está cerrada
+                    # o si el buffer está vacío
+                    if not buf or buf[-1].get("closed", True):
+                        buf.append(candle)
+                    else:
+                        # La anterior sigue abierta pero llega un ts diferente:
+                        # forzar cierre de la anterior y añadir la nueva
+                        buf[-1] = dict(buf[-1], closed=True)
+                        buf.append(candle)
 
         except Exception as e:
             log.warning("Error procesando mensaje WS: %s", e)
