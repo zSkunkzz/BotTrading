@@ -19,10 +19,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
+# _last_closed guarda info del último TP cerrado para re-entrada
+# Estructura: {symbol: {"side": str, "ts": float, "score": int}}
 _last_closed: dict = {}
-REENTRY_WINDOW      = 4 * 60
-REENTRY_SCORE_BOOST = 10
-REENTRY_SIZE_MULT   = 0.6
+
+REENTRY_WINDOW    = 4 * 60    # segundos tras un TP para intentar re-entrada
+REENTRY_BOOST     = 8         # puntos extra que se añaden al score del cierre
+REENTRY_SIZE_MULT = 0.6       # tamaño reducido en re-entrada
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -71,7 +74,6 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
     needed   = max(1, int(total * READY_MIN_PCT))
     deadline = time.time() + READY_TIMEOUT
     last_log = 0
-
     while time.time() < deadline:
         ready = feed.ready_count()
         now   = time.time()
@@ -82,7 +84,6 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
             log.info("Feed listo — %d/%d pares con datos suficientes", ready, total)
             return
         time.sleep(2)
-
     log.warning("Timeout feed (%ds) — arrancando con %d/%d pares listos",
                 READY_TIMEOUT, feed.ready_count(), total)
 
@@ -109,8 +110,6 @@ def run() -> None:
     _wait_feed_ready(feed)
 
     positions: dict = {}
-
-    # ── Arrancar listener de comandos Telegram ──
     tg_commands.start(get_positions_fn=lambda: positions, feed=feed)
 
     loop_count = 0
@@ -119,7 +118,7 @@ def run() -> None:
         try:
             loop_count += 1
 
-            # ── Sync posiciones ──────────────────────────────────────────────
+            # ── Sync posiciones abiertas ──────────────────────────────────────────
             for symbol in list(positions.keys()):
                 pos_ex = exchange.get_position(symbol)
                 if not pos_ex:
@@ -138,6 +137,7 @@ def run() -> None:
                     )
                     reason = "TP" if hit_tp else "SL"
 
+                    # Solo guardar re-entrada si fue TP
                     if hit_tp:
                         _last_closed[symbol] = {
                             "side":  p["side"],
@@ -156,7 +156,6 @@ def run() -> None:
                         reason     = reason,
                         open_ts    = p.get("open_ts", time.time()),
                     )
-
                     telegram.notify_close(
                         symbol  = symbol,
                         side    = p["side"],
@@ -168,7 +167,7 @@ def run() -> None:
                     log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT)",
                              symbol, reason, pnl_pct, pnl_usdt)
 
-            # Recuperar posiciones abiertas no registradas
+            # Recuperar posiciones sincronizadas del exchange
             for symbol in config.SYMBOLS:
                 if symbol not in positions:
                     pos_ex = exchange.get_position(symbol)
@@ -196,8 +195,7 @@ def run() -> None:
             # ── Trailing stop ────────────────────────────────────────────────
             for symbol, pos in list(positions.items()):
                 try:
-                    current_price = exchange.get_price(symbol)
-                    _update_trailing(symbol, pos, current_price)
+                    _update_trailing(symbol, pos, exchange.get_price(symbol))
                 except Exception as e:
                     log.warning("[%s] Error trailing: %s", symbol, e)
 
@@ -218,18 +216,25 @@ def run() -> None:
 
                         signal, score = signals.evaluate(candles_15m, candles_1h, candles_4h)
 
-                        # Bug 3 fix: re-entrada reutiliza score de la primera llamada
-                        # en vez de llamar evaluate() dos veces con los mismos datos.
+                        # ── Re-entrada tras TP ──────────────────────────────────────
+                        # FIX: usar el score del trade anterior (guardado en _last_closed)
+                        # en vez del score de la evaluación fallida (que sería 0).
+                        # FIX: comparar last["side"] con signal solo si signal no es None.
+                        is_reentry = False
                         if signal is None and symbol in _last_closed:
                             last = _last_closed[symbol]
                             if time.time() - last["ts"] < REENTRY_WINDOW:
-                                boosted = (score or 0) + REENTRY_SCORE_BOOST
-                                if boosted >= signals.MIN_SCORE and last["side"] == signal:
-                                    signal = last["side"]
-                                    score  = boosted
-                                    log.info("[%s] 🔄 Re-entrada | side=%s score=%d", symbol, signal, score)
-                                else:
-                                    _last_closed.pop(symbol, None)
+                                # Intentar forzar la misma dirección que el TP anterior
+                                boosted = last["score"] + REENTRY_BOOST
+                                if boosted >= signals.MIN_SCORE:
+                                    signal     = last["side"]
+                                    score      = boosted
+                                    is_reentry = True
+                                    log.info("[%s] 🔄 Re-entrada | side=%s score=%d",
+                                             symbol, signal, score)
+                            # Limpiar si ventanó expirada
+                            if not is_reentry:
+                                _last_closed.pop(symbol, None)
 
                         if not signal:
                             continue
@@ -238,16 +243,20 @@ def run() -> None:
                         params = risk.calc(signal, price, candles_15m, score, symbol=symbol)
 
                         qty = params["qty"]
-                        if symbol in _last_closed:
+                        if is_reentry:
+                            # Tamaño reducido en re-entrada
                             qty = exchange.floor_qty(
                                 params["qty"] * REENTRY_SIZE_MULT,
                                 exchange._get_contract_info(symbol)["stepSize"],
                             )
                             _last_closed.pop(symbol, None)
 
-                        log.info("[%s] SEÑAL %s | entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d",
-                                 symbol, signal.upper(), price,
-                                 params["sl"], params["tp"], qty, score)
+                        log.info(
+                            "[%s] SEÑAL %s | entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d%s",
+                            symbol, signal.upper(), price,
+                            params["sl"], params["tp"], qty, score,
+                            " [RE-ENTRADA]" if is_reentry else "",
+                        )
 
                         exchange.open_order(
                             side   = signal,
