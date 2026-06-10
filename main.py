@@ -37,6 +37,11 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     if trail_step <= 0:
         return
 
+    # FIX: sl/tp pueden ser None si la posición fue sincronizada desde el exchange
+    # tras un reinicio. En ese caso el trailing no puede funcionar — salir limpiamente.
+    if pos.get("sl") is None or pos.get("tp") is None:
+        return
+
     if side == "long":
         peak = pos.get("trail_high", pos["entry"])
         if current_price > peak + trail_step:
@@ -88,6 +93,37 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
                 READY_TIMEOUT, feed.ready_count(), total)
 
 
+def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
+    """
+    FIX: calcula el precio de salida real usando el nivel TP/SL de la posición,
+    en vez del precio actual de mercado (que puede diferir si el cierre fue hace
+    varios segundos).
+    Devuelve (exit_price, reason).
+    """
+    side = pos["side"]
+    tp   = pos.get("tp")
+    sl   = pos.get("sl")
+
+    if tp is not None and sl is not None:
+        if side == "long":
+            if current_price >= tp * 0.995:
+                return tp, "TP"
+            if current_price <= sl * 1.005:
+                return sl, "SL"
+        else:
+            if current_price <= tp * 1.005:
+                return tp, "TP"
+            if current_price >= sl * 0.995:
+                return sl, "SL"
+
+    # Fallback: usar precio actual si no podemos determinar con certeza
+    hit_tp = (
+        (side == "long"  and tp is not None and current_price >= tp * 0.995) or
+        (side == "short" and tp is not None and current_price <= tp * 1.005)
+    )
+    return current_price, "TP" if hit_tp else "SL"
+
+
 def run() -> None:
     log.info(
         "Bot iniciado | %d pares | lev=%dx | margin=%s USDT | max=%d posiciones",
@@ -122,8 +158,12 @@ def run() -> None:
             for symbol in list(positions.keys()):
                 pos_ex = exchange.get_position(symbol)
                 if not pos_ex:
-                    p          = positions.pop(symbol)
-                    exit_price = exchange.get_price(symbol)
+                    p             = positions.pop(symbol)
+                    current_price = exchange.get_price(symbol)
+
+                    # FIX: usar precio TP/SL real en vez del precio actual de mercado
+                    exit_price, reason = _exit_price_for(p, current_price)
+
                     pnl_pct = (
                         (exit_price - p["entry"]) / p["entry"]
                         if p["side"] == "long"
@@ -131,11 +171,7 @@ def run() -> None:
                     ) * config.LEVERAGE * 100
                     pnl_usdt = (pnl_pct / 100) * (p["qty"] * p["entry"] / config.LEVERAGE)
 
-                    hit_tp = (
-                        (p["side"] == "long"  and exit_price >= p["tp"] * 0.995) or
-                        (p["side"] == "short" and exit_price <= p["tp"] * 1.005)
-                    )
-                    reason = "TP" if hit_tp else "SL"
+                    hit_tp = reason == "TP"
 
                     # Solo guardar re-entrada si fue TP
                     if hit_tp:
@@ -172,18 +208,21 @@ def run() -> None:
                 if symbol not in positions:
                     pos_ex = exchange.get_position(symbol)
                     if pos_ex:
+                        # FIX: sl/tp pueden ser None al sincronizar — guardar como None
+                        # y _update_trailing los ignorará limpiamente.
                         positions[symbol] = {
                             "side":       pos_ex["side"],
                             "entry":      pos_ex["entry"],
                             "qty":        pos_ex["size"],
-                            "sl":         pos_ex["sl"],
-                            "tp":         pos_ex["tp"],
-                            "trail_step": 0,
+                            "sl":         pos_ex["sl"],    # puede ser None
+                            "tp":         pos_ex["tp"],    # puede ser None
+                            "trail_step": 0,               # trailing desactivado sin sl/tp
                             "score":      70,
                             "open_ts":    time.time(),
                         }
-                        log.info("[%s] Sincronizada: %s @ %.4f",
-                                 symbol, pos_ex["side"], pos_ex["entry"])
+                        log.info("[%s] Sincronizada: %s @ %.4f (sl=%s tp=%s)",
+                                 symbol, pos_ex["side"], pos_ex["entry"],
+                                 pos_ex["sl"], pos_ex["tp"])
 
             open_count = len(positions)
 
@@ -217,14 +256,10 @@ def run() -> None:
                         signal, score = signals.evaluate(candles_15m, candles_1h, candles_4h)
 
                         # ── Re-entrada tras TP ──────────────────────────────────────
-                        # FIX: usar el score del trade anterior (guardado en _last_closed)
-                        # en vez del score de la evaluación fallida (que sería 0).
-                        # FIX: comparar last["side"] con signal solo si signal no es None.
                         is_reentry = False
                         if signal is None and symbol in _last_closed:
                             last = _last_closed[symbol]
                             if time.time() - last["ts"] < REENTRY_WINDOW:
-                                # Intentar forzar la misma dirección que el TP anterior
                                 boosted = last["score"] + REENTRY_BOOST
                                 if boosted >= signals.MIN_SCORE:
                                     signal     = last["side"]
@@ -232,7 +267,6 @@ def run() -> None:
                                     is_reentry = True
                                     log.info("[%s] 🔄 Re-entrada | side=%s score=%d",
                                              symbol, signal, score)
-                            # Limpiar si ventanó expirada
                             if not is_reentry:
                                 _last_closed.pop(symbol, None)
 
@@ -244,7 +278,6 @@ def run() -> None:
 
                         qty = params["qty"]
                         if is_reentry:
-                            # Tamaño reducido en re-entrada
                             qty = exchange.floor_qty(
                                 params["qty"] * REENTRY_SIZE_MULT,
                                 exchange._get_contract_info(symbol)["stepSize"],

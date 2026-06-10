@@ -9,6 +9,9 @@ FIXES aplicados:
      timeouts intermitentes que estaban silenciando órdenes.
   4. calc_qty() aplica floor al step size de cada símbolo para no enviar qty
      que BingX rechaza por precisión decimal.
+  5. cancel_all_orders usa DELETE (no POST) — BingX exige DELETE para este endpoint.
+  6. get_ohlcv incluye el timestamp 'ts' en cada vela para que ws_feed pueda
+     deduplicar correctamente al mezclar velas REST con las del WebSocket.
 """
 import hashlib
 import hmac
@@ -45,7 +48,7 @@ _RETRY_WAIT = 1.0   # segundos entre intentos
 
 
 def _request(method: str, path: str, params: dict) -> dict:
-    """GET o POST enviando siempre los parámetros en la query string (BingX V2)."""
+    """GET, POST o DELETE enviando siempre los parámetros en la query string (BingX V2)."""
     params = dict(params)
     params["timestamp"] = int(time.time() * 1000)
     params["signature"] = _sign(params)
@@ -58,7 +61,7 @@ def _request(method: str, path: str, params: dict) -> dict:
             r = httpx.request(
                 method,
                 url,
-                params=params,          # ← query string en GET y POST
+                params=params,          # ← query string en GET, POST y DELETE
                 headers=_headers(),
                 timeout=10,
             )
@@ -84,6 +87,10 @@ def _post(path: str, params: dict = None) -> dict:
     return _request("POST", path, params or {})
 
 
+def _delete(path: str, params: dict = None) -> dict:
+    return _request("DELETE", path, params or {})
+
+
 # ── Precio ────────────────────────────────────────────────────────────────────
 
 def get_price(symbol: str = None) -> float:
@@ -95,7 +102,11 @@ def get_price(symbol: str = None) -> float:
 # ── OHLCV ─────────────────────────────────────────────────────────────────────
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
-    """Devuelve lista de velas [{open, high, low, close, volume}] más reciente al final."""
+    """Devuelve lista de velas [{ts, open, high, low, close, volume}] más reciente al final.
+
+    FIX: se incluye 'ts' (timestamp en ms) para que ws_feed pueda deduplicar
+    correctamente las velas precargadas REST con las que llegan por WebSocket.
+    """
     symbol   = symbol or config.SYMBOL
     interval = interval or config.TIMEFRAME
     data = _get("/openApi/swap/v3/quote/klines", {
@@ -106,11 +117,13 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
     candles = []
     for c in data["data"]:
         candles.append({
+            "ts":     int(c.get("time", c.get("t", 0))),  # timestamp ms
             "open":   float(c["open"]),
             "high":   float(c["high"]),
             "low":    float(c["low"]),
             "close":  float(c["close"]),
             "volume": float(c["volume"]),
+            "closed": True,   # velas REST ya están cerradas
         })
     return candles
 
@@ -277,6 +290,9 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
 # ── Cancelar órdenes abiertas ─────────────────────────────────────────────────
 
 def cancel_all_orders(symbol: str = None) -> None:
+    """FIX: BingX exige DELETE (no POST) para cancelar todas las órdenes abiertas.
+    Con POST la API devuelve 405 silencioso, dejando SL/TP duplicados en el exchange.
+    """
     symbol = symbol or config.SYMBOL
-    _post("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
+    _delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
     log.info("Órdenes canceladas para %s", symbol)

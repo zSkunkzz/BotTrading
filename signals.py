@@ -116,22 +116,25 @@ def _adx(candles: list[dict], period: int = 14) -> float:
 
 
 def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
+    """
+    FIX: usaba list.index() sobre floats para encontrar el índice del mínimo/máximo,
+    lo que falla con duplicados o diferencias de precisión flotante.
+    Ahora usa enumerate + min/max para obtener el índice correcto.
+    """
     if len(closes) < lookback + 14:
         return None
     rsi_series    = _rsi(closes, 14)
     recent_closes = closes[-lookback:]
     recent_rsi    = rsi_series[-lookback:]
 
-    price_lo1 = min(recent_closes[:-3])
-    price_lo2 = recent_closes[-1]
-    idx_lo1   = recent_closes.index(price_lo1)
-    if price_lo2 < price_lo1 and recent_rsi[-1] > recent_rsi[idx_lo1] + 2:
+    # Bullish divergence: precio hace mínimo más bajo pero RSI hace mínimo más alto
+    lo_val, lo_idx = min((v, i) for i, v in enumerate(recent_closes[:-3]))
+    if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
-    price_hi1 = max(recent_closes[:-3])
-    price_hi2 = recent_closes[-1]
-    idx_hi1   = recent_closes.index(price_hi1)
-    if price_hi2 > price_hi1 and recent_rsi[-1] < recent_rsi[idx_hi1] - 2:
+    # Bearish divergence: precio hace máximo más alto pero RSI hace máximo más bajo
+    hi_val, hi_idx = max((v, i) for i, v in enumerate(recent_closes[:-3]))
+    if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
 
     return None
@@ -213,8 +216,6 @@ def evaluate(
     hour_utc   = datetime.datetime.utcnow().hour
     hour_bonus = 8 if hour_utc in HIGH_BIAS_HOURS else (-10 if hour_utc in LOW_BIAS_HOURS else 0)
 
-    # Macro 4h: None = sin datos (neutro, 0 pts) | True = a favor (+15) | False = en contra (-10)
-    # FIX: antes False por defecto restaba 10 pts incluso sin datos 4h disponibles.
     macro_long = macro_short = None
     if closed_4h and len(closed_4h) >= 55:
         closes_4h   = [c["close"] for c in closed_4h]
@@ -245,10 +246,6 @@ def evaluate(
     vol_ok = _volume_ok(closed_15m)
 
     def _macro_pts(macro: bool | None, favor: bool) -> int:
-        """Devuelve puntos del componente macro:
-           None (sin datos) → 0  (neutro)
-           True/False según si coincide con la dirección → +15 o -10
-        """
         if macro is None:
             return 0
         return 15 if (macro and favor) else (-10 if (not macro and favor) else 0)
