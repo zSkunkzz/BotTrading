@@ -21,6 +21,7 @@ MIN_SCORE configurable via env var MIN_SCORE (default 55)
 from __future__ import annotations
 import logging
 import datetime
+from datetime import timezone
 
 import config
 
@@ -119,10 +120,14 @@ def _adx(candles: list[dict], period: int = 14) -> float:
 
 
 def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
-    """
-    FIX: usaba list.index() sobre floats para encontrar el índice del mínimo/máximo,
-    lo que falla con duplicados o diferencias de precisión flotante.
-    Ahora usa enumerate + min/max para obtener el índice correcto.
+    """Detecta divergencia RSI-precio en la ventana reciente.
+
+    FIX #2: La versión anterior usaba min((v, i) ...) y max((v, i) ...) para
+    encontrar simultáneamente el valor y el índice del pivote. Con empates de
+    precio, Python desempata por el índice de forma lexicográfica (el menor),
+    no por el más reciente — que es el correcto para detectar divergencia.
+    Ahora buscamos el valor extremo primero y luego tomamos el ÚLTIMO índice
+    que lo contiene, lo que refleja mejor el pivote más relevante.
     """
     if len(closes) < lookback + 14:
         return None
@@ -131,12 +136,16 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
     recent_rsi    = rsi_series[-lookback:]
 
     # Bullish divergence: precio hace mínimo más bajo pero RSI hace mínimo más alto
-    lo_val, lo_idx = min((v, i) for i, v in enumerate(recent_closes[:-3]))
+    # FIX: elegir el último índice del mínimo en caso de empate
+    lo_val = min(recent_closes[:-3])
+    lo_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == lo_val)
     if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
     # Bearish divergence: precio hace máximo más alto pero RSI hace máximo más bajo
-    hi_val, hi_idx = max((v, i) for i, v in enumerate(recent_closes[:-3]))
+    # FIX: elegir el último índice del máximo en caso de empate
+    hi_val = max(recent_closes[:-3])
+    hi_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == hi_val)
     if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
 
@@ -216,7 +225,8 @@ def evaluate(
     # ── Componentes de score ───────────────────────────────────────────────
     adx = _adx(closed_15m, 14)
 
-    hour_utc   = datetime.datetime.utcnow().hour
+    # FIX #5: datetime.utcnow() deprecado en Python 3.12 → datetime.now(timezone.utc)
+    hour_utc   = datetime.datetime.now(timezone.utc).hour
     hour_bonus = 8 if hour_utc in HIGH_BIAS_HOURS else (-10 if hour_utc in LOW_BIAS_HOURS else 0)
 
     macro_long = macro_short = None

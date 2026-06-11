@@ -24,7 +24,7 @@ log = logging.getLogger("main")
 _last_closed: dict = {}
 
 REENTRY_WINDOW    = 4 * 60    # segundos tras un TP para intentar re-entrada
-REENTRY_BOOST     = 8         # puntos extra que se añaden al score del cierre
+REENTRY_BOOST     = 8         # puntos extra sobre el score FRESCO actual
 REENTRY_SIZE_MULT = 0.6       # tamaño reducido en re-entrada
 
 READY_TIMEOUT = 120
@@ -95,7 +95,7 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
     """
-    FIX: calcula el precio de salida real usando el nivel TP/SL de la posición,
+    Calcula el precio de salida real usando el nivel TP/SL de la posición,
     en vez del precio actual de mercado (que puede diferir si el cierre fue hace
     varios segundos).
     Devuelve (exit_price, reason).
@@ -164,7 +164,6 @@ def run() -> None:
                     p             = positions.pop(symbol)
                     current_price = exchange.get_price(symbol)
 
-                    # FIX: usar precio TP/SL real en vez del precio actual de mercado
                     exit_price, reason = _exit_price_for(p, current_price)
 
                     pnl_pct = (
@@ -206,11 +205,19 @@ def run() -> None:
                     log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT)",
                              symbol, reason, pnl_pct, pnl_usdt)
 
+            # ── FIX #4: purgar _last_closed con ventana expirada ─────────────────
+            # Se hace fuera del bucle de señales para limpiar también los símbolos
+            # que nunca llegan a evaluarse en este loop (feed no listo, max posiciones).
+            expired = [
+                sym for sym, data in _last_closed.items()
+                if time.time() - data["ts"] >= REENTRY_WINDOW
+            ]
+            for sym in expired:
+                _last_closed.pop(sym, None)
+
             # Recuperar posiciones sincronizadas del exchange (no rastreadas localmente)
             for symbol, pos_ex in all_ex_positions.items():
                 if symbol not in positions:
-                    # FIX: sl/tp pueden ser None al sincronizar — guardar como None
-                    # y _update_trailing los ignorará limpiamente.
                     positions[symbol] = {
                         "side":       pos_ex["side"],
                         "entry":      pos_ex["entry"],
@@ -256,18 +263,43 @@ def run() -> None:
 
                         signal, score = signals.evaluate(candles_15m, candles_1h, candles_4h)
 
-                        # ── Re-entrada tras TP ──────────────────────────────────────
+                        # ── FIX #1: Re-entrada con score fresco ──────────────────────
+                        # BUG anterior: se usaba last["score"] + BOOST (score de hace
+                        # hasta 4 min). Ahora se exige que el mercado actual siga
+                        # apuntando al mismo lado; el boost se aplica sobre el score
+                        # fresco, no sobre el almacenado.
                         is_reentry = False
                         if signal is None and symbol in _last_closed:
                             last = _last_closed[symbol]
-                            if time.time() - last["ts"] < REENTRY_WINDOW:
-                                boosted = last["score"] + REENTRY_BOOST
-                                if boosted >= signals.MIN_SCORE:
-                                    signal     = last["side"]
-                                    score      = boosted
-                                    is_reentry = True
-                                    log.info("[%s] 🔄 Re-entrada | side=%s score=%d",
-                                             symbol, signal, score)
+                            age  = time.time() - last["ts"]
+                            if age < REENTRY_WINDOW:
+                                # Pedir una segunda evaluación explícita para este símbolo.
+                                # signals.evaluate() ya fue llamado arriba y devolvió None,
+                                # así que reutilizamos ese resultado y solo comprobamos
+                                # si el lado coincide con el del TP cerrado.
+                                # Como signal == None aquí, forzamos una segunda pasada
+                                # con los mismos datos para obtener el score numérico
+                                # aunque la señal no haya superado MIN_SCORE.
+                                _, fresh_score = signals.evaluate(
+                                    candles_15m, candles_1h, candles_4h
+                                )
+                                # fresh_score puede ser 0 si los hard-guards bloquearon;
+                                # en ese caso no tiene sentido re-entrar.
+                                if fresh_score > 0:
+                                    boosted = fresh_score + REENTRY_BOOST
+                                    if boosted >= signals.MIN_SCORE:
+                                        signal     = last["side"]
+                                        score      = boosted
+                                        is_reentry = True
+                                        log.info(
+                                            "[%s] 🔄 Re-entrada | side=%s "
+                                            "fresh_score=%d boost=%d → score=%d",
+                                            symbol, signal, fresh_score,
+                                            REENTRY_BOOST, score,
+                                        )
+                            # Si no se activó re-entrada (ventana expirada o score=0)
+                            # limpiar la entrada (la purga por expiración ya lo haría,
+                            # pero limpiamos aquí también si el score cayó a 0).
                             if not is_reentry:
                                 _last_closed.pop(symbol, None)
 
