@@ -154,9 +154,12 @@ def run() -> None:
         try:
             loop_count += 1
 
+            # ── BATCH: 1 sola llamada para todas las posiciones del exchange ──────
+            all_ex_positions = exchange.get_all_positions()
+
             # ── Sync posiciones abiertas ──────────────────────────────────────────
             for symbol in list(positions.keys()):
-                pos_ex = exchange.get_position(symbol)
+                pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
                     p             = positions.pop(symbol)
                     current_price = exchange.get_price(symbol)
@@ -203,26 +206,24 @@ def run() -> None:
                     log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT)",
                              symbol, reason, pnl_pct, pnl_usdt)
 
-            # Recuperar posiciones sincronizadas del exchange
-            for symbol in config.SYMBOLS:
+            # Recuperar posiciones sincronizadas del exchange (no rastreadas localmente)
+            for symbol, pos_ex in all_ex_positions.items():
                 if symbol not in positions:
-                    pos_ex = exchange.get_position(symbol)
-                    if pos_ex:
-                        # FIX: sl/tp pueden ser None al sincronizar — guardar como None
-                        # y _update_trailing los ignorará limpiamente.
-                        positions[symbol] = {
-                            "side":       pos_ex["side"],
-                            "entry":      pos_ex["entry"],
-                            "qty":        pos_ex["size"],
-                            "sl":         pos_ex["sl"],    # puede ser None
-                            "tp":         pos_ex["tp"],    # puede ser None
-                            "trail_step": 0,               # trailing desactivado sin sl/tp
-                            "score":      70,
-                            "open_ts":    time.time(),
-                        }
-                        log.info("[%s] Sincronizada: %s @ %.4f (sl=%s tp=%s)",
-                                 symbol, pos_ex["side"], pos_ex["entry"],
-                                 pos_ex["sl"], pos_ex["tp"])
+                    # FIX: sl/tp pueden ser None al sincronizar — guardar como None
+                    # y _update_trailing los ignorará limpiamente.
+                    positions[symbol] = {
+                        "side":       pos_ex["side"],
+                        "entry":      pos_ex["entry"],
+                        "qty":        pos_ex["size"],
+                        "sl":         pos_ex["sl"],    # puede ser None
+                        "tp":         pos_ex["tp"],    # puede ser None
+                        "trail_step": 0,               # trailing desactivado sin sl/tp
+                        "score":      70,
+                        "open_ts":    time.time(),
+                    }
+                    log.info("[%s] Sincronizada: %s @ %.4f (sl=%s tp=%s)",
+                             symbol, pos_ex["side"], pos_ex["entry"],
+                             pos_ex["sl"], pos_ex["tp"])
 
             open_count = len(positions)
 

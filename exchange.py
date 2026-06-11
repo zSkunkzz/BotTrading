@@ -12,6 +12,8 @@ FIXES aplicados:
   5. cancel_all_orders usa DELETE (no POST) — BingX exige DELETE para este endpoint.
   6. get_ohlcv incluye el timestamp 'ts' en cada vela para que ws_feed pueda
      deduplicar correctamente al mezclar velas REST con las del WebSocket.
+  7. get_all_positions() obtiene TODAS las posiciones abiertas en 1 sola llamada
+     (sin 'symbol'), reduciendo 74 llamadas por loop a 1.
 """
 import hashlib
 import hmac
@@ -170,21 +172,46 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
     return (qty * price) >= min_usdt
 
 
-# ── Posición abierta ──────────────────────────────────────────────────────────
+# ── Posiciones ────────────────────────────────────────────────────────────────
+
+def _parse_position(p: dict) -> dict:
+    """Convierte un objeto de posición raw de BingX al formato interno del bot."""
+    return {
+        "side":  "long" if float(p["positionAmt"]) > 0 else "short",
+        "entry": float(p["avgPrice"]),
+        "size":  abs(float(p["positionAmt"])),
+        "sl":    float(p.get("stopLossPrice") or 0) or None,
+        "tp":    float(p.get("takeProfitPrice") or 0) or None,
+    }
+
+
+def get_all_positions() -> dict[str, dict]:
+    """BATCH: devuelve {symbol: pos_dict} para todas las posiciones abiertas.
+
+    Hace UNA sola llamada GET sin parámetro 'symbol', lo que hace que BingX
+    devuelva todas las posiciones con qty != 0. Antes se hacían 37 llamadas
+    individuales por loop; ahora es 1.
+    """
+    try:
+        data = _get("/openApi/swap/v2/user/positions", {})
+        result: dict[str, dict] = {}
+        for p in (data.get("data") or []):
+            if float(p.get("positionAmt", 0)) != 0:
+                result[p["symbol"]] = _parse_position(p)
+        return result
+    except Exception as exc:
+        log.warning("get_all_positions falló, devolviendo vacío: %s", exc)
+        return {}
+
 
 def get_position(symbol: str = None) -> dict | None:
+    """Consulta individual por símbolo. Mantenida para compatibilidad."""
     symbol = symbol or config.SYMBOL
     data = _get("/openApi/swap/v2/user/positions", {"symbol": symbol})
     positions = data.get("data") or []
     for p in positions:
         if float(p.get("positionAmt", 0)) != 0:
-            return {
-                "side":  "long" if float(p["positionAmt"]) > 0 else "short",
-                "entry": float(p["avgPrice"]),
-                "size":  abs(float(p["positionAmt"])),
-                "sl":    float(p.get("stopLossPrice") or 0) or None,
-                "tp":    float(p.get("takeProfitPrice") or 0) or None,
-            }
+            return _parse_position(p)
     return None
 
 
