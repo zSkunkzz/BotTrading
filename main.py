@@ -19,13 +19,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-# _last_closed guarda info del último TP cerrado para re-entrada
-# Estructura: {symbol: {"side": str, "ts": float, "score": int}}
-_last_closed: dict = {}
+# _cooldown guarda el timestamp del último cierre (TP o SL) por símbolo.
+# El símbolo queda bloqueado para nuevas entradas durante COOLDOWN segundos.
+# Esto evita re-entradas prematuras cuando la vela está sobreextendida
+# o cuando el mercado sigue en la misma dirección tras un SL.
+_cooldown: dict[str, float] = {}
 
-REENTRY_WINDOW    = 4 * 60    # segundos tras un TP para intentar re-entrada
-REENTRY_BOOST     = 8         # puntos extra sobre el score FRESCO actual
-REENTRY_SIZE_MULT = 0.6       # tamaño reducido en re-entrada
+COOLDOWN          = 60 * 60  # 1 hora tras cualquier cierre
+REENTRY_BOOST     = 8        # puntos extra en re-entrada (dentro del cooldown, no usado ahora)
+REENTRY_SIZE_MULT = 0.6      # tamaño reducido (reservado para uso futuro)
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -37,8 +39,6 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     if trail_step <= 0:
         return
 
-    # FIX: sl/tp pueden ser None si la posición fue sincronizada desde el exchange
-    # tras un reinicio. En ese caso el trailing no puede funcionar — salir limpiamente.
     if pos.get("sl") is None or pos.get("tp") is None:
         return
 
@@ -94,12 +94,6 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
-    """
-    Calcula el precio de salida real usando el nivel TP/SL de la posición,
-    en vez del precio actual de mercado (que puede diferir si el cierre fue hace
-    varios segundos).
-    Devuelve (exit_price, reason).
-    """
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
@@ -116,7 +110,6 @@ def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
             if current_price >= sl * 0.995:
                 return sl, "SL"
 
-    # Fallback: usar precio actual si no podemos determinar con certeza
     hit_tp = (
         (side == "long"  and tp is not None and current_price >= tp * 0.995) or
         (side == "short" and tp is not None and current_price <= tp * 1.005)
@@ -157,7 +150,7 @@ def run() -> None:
             # ── BATCH: 1 sola llamada para todas las posiciones del exchange ──────
             all_ex_positions = exchange.get_all_positions()
 
-            # ── Sync posiciones abiertas ──────────────────────────────────────────
+            # ── Sync posiciones abiertas ────────────────────────────────────────
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
@@ -175,13 +168,13 @@ def run() -> None:
 
                     hit_tp = reason == "TP"
 
-                    # Solo guardar re-entrada si fue TP
-                    if hit_tp:
-                        _last_closed[symbol] = {
-                            "side":  p["side"],
-                            "ts":    time.time(),
-                            "score": p.get("score", 70),
-                        }
+                    # Activar cooldown en cualquier cierre (TP o SL).
+                    # Bloquea nuevas entradas en este símbolo durante COOLDOWN segundos.
+                    _cooldown[symbol] = time.time()
+                    log.info(
+                        "[%s] Cooldown activado (%dm) tras %s",
+                        symbol, COOLDOWN // 60, reason,
+                    )
 
                     trade_logger.record(
                         symbol     = symbol,
@@ -205,26 +198,25 @@ def run() -> None:
                     log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT)",
                              symbol, reason, pnl_pct, pnl_usdt)
 
-            # ── FIX #4: purgar _last_closed con ventana expirada ─────────────────
-            # Se hace fuera del bucle de señales para limpiar también los símbolos
-            # que nunca llegan a evaluarse en este loop (feed no listo, max posiciones).
+            # ── Purgar cooldowns expirados ───────────────────────────────────────
             expired = [
-                sym for sym, data in _last_closed.items()
-                if time.time() - data["ts"] >= REENTRY_WINDOW
+                sym for sym, ts in _cooldown.items()
+                if time.time() - ts >= COOLDOWN
             ]
             for sym in expired:
-                _last_closed.pop(sym, None)
+                _cooldown.pop(sym, None)
+                log.info("[%s] Cooldown expirado — símbolo disponible", sym)
 
-            # Recuperar posiciones sincronizadas del exchange (no rastreadas localmente)
+            # Recuperar posiciones sincronizadas del exchange
             for symbol, pos_ex in all_ex_positions.items():
                 if symbol not in positions:
                     positions[symbol] = {
                         "side":       pos_ex["side"],
                         "entry":      pos_ex["entry"],
                         "qty":        pos_ex["size"],
-                        "sl":         pos_ex["sl"],    # puede ser None
-                        "tp":         pos_ex["tp"],    # puede ser None
-                        "trail_step": 0,               # trailing desactivado sin sl/tp
+                        "sl":         pos_ex["sl"],
+                        "tp":         pos_ex["tp"],
+                        "trail_step": 0,
                         "score":      70,
                         "open_ts":    time.time(),
                     }
@@ -235,18 +227,18 @@ def run() -> None:
             open_count = len(positions)
 
             if loop_count % 10 == 1:
-                log.info("[loop #%d] Posiciones: %d/%d | Feed: %d/%d pares listos",
+                log.info("[loop #%d] Posiciones: %d/%d | Feed: %d/%d pares listos | Cooldowns: %d",
                          loop_count, open_count, config.MAX_POSITIONS,
-                         feed.ready_count(), len(config.SYMBOLS))
+                         feed.ready_count(), len(config.SYMBOLS), len(_cooldown))
 
-            # ── Trailing stop ────────────────────────────────────────────────
+            # ── Trailing stop ───────────────────────────────────────────────────
             for symbol, pos in list(positions.items()):
                 try:
                     _update_trailing(symbol, pos, exchange.get_price(symbol))
                 except Exception as e:
                     log.warning("[%s] Error trailing: %s", symbol, e)
 
-            # ── Buscar señales nuevas ────────────────────────────────────────
+            # ── Buscar señales nuevas ──────────────────────────────────────────────
             if open_count < config.MAX_POSITIONS:
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
@@ -256,6 +248,12 @@ def run() -> None:
                     if not feed.ready(symbol):
                         continue
 
+                    # ── Cooldown activo: saltar este símbolo ─────────────────────
+                    if symbol in _cooldown:
+                        remaining = int(COOLDOWN - (time.time() - _cooldown[symbol]))
+                        log.debug("[%s] En cooldown (%ds restantes)", symbol, remaining)
+                        continue
+
                     try:
                         candles_15m = feed.get(symbol, "15m")
                         candles_1h  = feed.get(symbol, "1h")
@@ -263,70 +261,21 @@ def run() -> None:
 
                         signal, score = signals.evaluate(candles_15m, candles_1h, candles_4h)
 
-                        # ── FIX #1: Re-entrada con score fresco ──────────────────────
-                        # BUG anterior: se usaba last["score"] + BOOST (score de hace
-                        # hasta 4 min). Ahora se exige que el mercado actual siga
-                        # apuntando al mismo lado; el boost se aplica sobre el score
-                        # fresco, no sobre el almacenado.
-                        is_reentry = False
-                        if signal is None and symbol in _last_closed:
-                            last = _last_closed[symbol]
-                            age  = time.time() - last["ts"]
-                            if age < REENTRY_WINDOW:
-                                # Pedir una segunda evaluación explícita para este símbolo.
-                                # signals.evaluate() ya fue llamado arriba y devolvió None,
-                                # así que reutilizamos ese resultado y solo comprobamos
-                                # si el lado coincide con el del TP cerrado.
-                                # Como signal == None aquí, forzamos una segunda pasada
-                                # con los mismos datos para obtener el score numérico
-                                # aunque la señal no haya superado MIN_SCORE.
-                                _, fresh_score = signals.evaluate(
-                                    candles_15m, candles_1h, candles_4h
-                                )
-                                # fresh_score puede ser 0 si los hard-guards bloquearon;
-                                # en ese caso no tiene sentido re-entrar.
-                                if fresh_score > 0:
-                                    boosted = fresh_score + REENTRY_BOOST
-                                    if boosted >= signals.MIN_SCORE:
-                                        signal     = last["side"]
-                                        score      = boosted
-                                        is_reentry = True
-                                        log.info(
-                                            "[%s] 🔄 Re-entrada | side=%s "
-                                            "fresh_score=%d boost=%d → score=%d",
-                                            symbol, signal, fresh_score,
-                                            REENTRY_BOOST, score,
-                                        )
-                            # Si no se activó re-entrada (ventana expirada o score=0)
-                            # limpiar la entrada (la purga por expiración ya lo haría,
-                            # pero limpiamos aquí también si el score cayó a 0).
-                            if not is_reentry:
-                                _last_closed.pop(symbol, None)
-
                         if not signal:
                             continue
 
                         price  = exchange.get_price(symbol)
                         params = risk.calc(signal, price, candles_15m, score, symbol=symbol)
 
-                        qty = params["qty"]
-                        if is_reentry:
-                            qty = exchange.floor_qty(
-                                params["qty"] * REENTRY_SIZE_MULT,
-                                exchange._get_contract_info(symbol)["stepSize"],
-                            )
-                            _last_closed.pop(symbol, None)
-
                         log.info(
-                            "[%s] SEÑAL %s | entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d%s",
+                            "[%s] SEÑAL %s | entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d",
                             symbol, signal.upper(), price,
-                            params["sl"], params["tp"], qty, score,
-                            " [RE-ENTRADA]" if is_reentry else "",
+                            params["sl"], params["tp"], params["qty"], score,
                         )
 
                         exchange.open_order(
                             side   = signal,
-                            qty    = qty,
+                            qty    = params["qty"],
                             sl     = params["sl"],
                             tp     = params["tp"],
                             symbol = symbol,
@@ -335,7 +284,7 @@ def run() -> None:
                         positions[symbol] = {
                             "side":       signal,
                             "entry":      price,
-                            "qty":        qty,
+                            "qty":        params["qty"],
                             "sl":         params["sl"],
                             "tp":         params["tp"],
                             "trail_step": params["trail_step"],
@@ -349,7 +298,7 @@ def run() -> None:
                             symbol = symbol,
                             price  = price,
                             side   = signal,
-                            qty    = qty,
+                            qty    = params["qty"],
                             sl     = params["sl"],
                             tp     = params["tp"],
                         )
