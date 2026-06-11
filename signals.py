@@ -16,10 +16,13 @@ Filtros:
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
 Sizing en risk.py: mult=0.7 (score<70) | 1.0 (70-84) | 1.4 (≥85)
+MIN_SCORE configurable via env var MIN_SCORE (default 55)
 """
 from __future__ import annotations
 import logging
 import datetime
+
+import config
 
 log = logging.getLogger("signals")
 
@@ -27,7 +30,7 @@ log = logging.getLogger("signals")
 EMA200_MIN_DIST = 0.003   # 0.3% distancia mínima al EMA200 en 1h
 NO_CHASE_MULT   = 2.0
 VOLUME_MULT     = 1.2
-MIN_SCORE       = 55
+MIN_SCORE       = config.MIN_SCORE   # configurable via env: MIN_SCORE=55
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
