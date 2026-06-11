@@ -3,6 +3,8 @@
 Filtros:
   1. Vela cerrada       : penúltima vela (ya cerrada)
   2. Régimen de mercado : clasificación por EMAs 1h (ADX no bloquea, penaliza)
+                          NUEVO: requiere REGIME_CONFIRM_BARS velas 1h consecutivas
+                          confirmando el mismo régimen antes de habilitar señales
   3. Macro 4h           : EMA50 en 4h — bonus/penalización/neutro según disponibilidad
   4. EMA200 1h          : hard-guard de dirección
   5. ADX 15m            : >35 +12, >25 +6, >18 -8, <18 -15
@@ -28,10 +30,11 @@ import config
 log = logging.getLogger("signals")
 
 # ── Umbrales configurables ────────────────────────────────────────────────────
-EMA200_MIN_DIST = 0.003   # 0.3% distancia mínima al EMA200 en 1h
-NO_CHASE_MULT   = 2.0
-VOLUME_MULT     = 1.2
-MIN_SCORE       = config.MIN_SCORE   # configurable via env: MIN_SCORE=55
+EMA200_MIN_DIST     = 0.003   # 0.3% distancia mínima al EMA200 en 1h
+NO_CHASE_MULT       = 2.0
+VOLUME_MULT         = 1.2
+MIN_SCORE           = config.MIN_SCORE   # configurable via env: MIN_SCORE=55
+REGIME_CONFIRM_BARS = 2   # velas 1h cerradas consecutivas con el mismo régimen
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
@@ -135,15 +138,11 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
     recent_closes = closes[-lookback:]
     recent_rsi    = rsi_series[-lookback:]
 
-    # Bullish divergence: precio hace mínimo más bajo pero RSI hace mínimo más alto
-    # FIX: elegir el último índice del mínimo en caso de empate
     lo_val = min(recent_closes[:-3])
     lo_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == lo_val)
     if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
-    # Bearish divergence: precio hace máximo más alto pero RSI hace máximo más bajo
-    # FIX: elegir el último índice del máximo en caso de empate
     hi_val = max(recent_closes[:-3])
     hi_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == hi_val)
     if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
@@ -169,6 +168,35 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     if price < ema200 and price < ema50 and ema20 < ema200:
         return "bear", adx
     return "range", adx
+
+
+def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
+    """Devuelve el régimen solo si las últimas n velas cerradas coinciden.
+
+    Evalúa el régimen sobre las últimas n+1 velas cerradas (ventanas deslizantes).
+    Si todas coinciden, devuelve (regime, adx). Si no hay consenso,
+    devuelve ("range", adx) para bloquear la señal.
+    """
+    if len(candles_1h) < 200 + n + 1:
+        return "range", 0.0
+
+    regimes = []
+    # Evaluar el régimen en las últimas n velas cerradas (ventanas deslizantes)
+    for offset in range(n, 0, -1):
+        window = candles_1h[:-offset]   # excluye las últimas `offset` velas
+        regime, adx = _market_regime(window)
+        regimes.append(regime)
+
+    # Añadir el régimen sobre todas las velas cerradas (el más reciente)
+    regime_now, adx_now = _market_regime(candles_1h)
+    regimes.append(regime_now)
+
+    if len(set(regimes)) == 1:
+        log.debug("régimen confirmado ×%d: %s", n, regime_now)
+        return regime_now, adx_now
+
+    log.info("⚠️  Régimen inestable %s — esperando confirmación", regimes)
+    return "range", adx_now
 
 
 def _volume_ok(candles: list[dict], window: int = 20) -> bool:
@@ -198,10 +226,12 @@ def evaluate(
     closes_15m = [c["close"] for c in closed_15m]
     closes_1h  = [c["close"] for c in closed_1h]
 
-    # ── Hard-guard 1: Régimen ───────────────────────────────────────────────
-    regime, adx_1h = _market_regime(closed_1h)
+    # ── Hard-guard 1: Régimen confirmado ─────────────────────────────────────
+    # Requiere REGIME_CONFIRM_BARS velas 1h consecutivas con el mismo régimen.
+    # Un solo cambio de vela no es suficiente para habilitar señales.
+    regime, adx_1h = _regime_confirmed(closed_1h)
     if regime == "range":
-        log.info("⬛ Régimen lateral — sin señal")
+        log.info("⬛ Régimen lateral o inestable — sin señal")
         return None, 0
 
     # ── Hard-guard 2: distancia EMA200 ───────────────────────────────────────
@@ -215,17 +245,16 @@ def evaluate(
     trend_long  = regime == "bull"
     trend_short = regime == "bear"
 
-    # ── Hard-guard 3: no-chase ─────────────────────────────────────────────
+    # ── Hard-guard 3: no-chase ────────────────────────────────────────────────
     atr        = _atr(closed_15m, 14)
     last_range = closed_15m[-1]["high"] - closed_15m[-1]["low"]
     if atr > 0 and last_range > NO_CHASE_MULT * atr:
         log.info("⚠️  Vela explosiva — sin señal")
         return None, 0
 
-    # ── Componentes de score ───────────────────────────────────────────────
+    # ── Componentes de score ──────────────────────────────────────────────────
     adx = _adx(closed_15m, 14)
 
-    # FIX #5: datetime.utcnow() deprecado en Python 3.12 → datetime.now(timezone.utc)
     hour_utc   = datetime.datetime.now(timezone.utc).hour
     hour_bonus = 8 if hour_utc in HIGH_BIAS_HOURS else (-10 if hour_utc in LOW_BIAS_HOURS else 0)
 
@@ -263,7 +292,7 @@ def evaluate(
             return 0
         return 15 if (macro and favor) else (-10 if (not macro and favor) else 0)
 
-    # ── Scoring LONG ─────────────────────────────────────────────────────────
+    # ── Scoring LONG ──────────────────────────────────────────────────────────
     def score_long() -> int:
         if not trend_long:
             return 0
@@ -286,7 +315,7 @@ def evaluate(
         s += hour_bonus
         return min(max(s, 0), 100)
 
-    # ── Scoring SHORT ────────────────────────────────────────────────────────
+    # ── Scoring SHORT ─────────────────────────────────────────────────────────
     def score_short() -> int:
         if not trend_short:
             return 0
@@ -316,10 +345,10 @@ def evaluate(
     macro_s_str = "None" if macro_short is None else str(macro_short)
 
     log.info(
-        "regime=%s adx1h=%.1f hour=%dUTC | price=%.4f ema200=%.4f dist=%.3f%% "
+        "regime=%s(×%d) adx1h=%.1f hour=%dUTC | price=%.4f ema200=%.4f dist=%.3f%% "
         "ADX15m=%.1f rsi=%.1f→%.1f vol=%s diverg=%s macro_l=%s macro_s=%s "
         "macd15=%.5f macd1h=%.5f | score_long=%d score_short=%d (min=%d)",
-        regime, adx_1h, hour_utc, price, ema200, dist * 100,
+        regime, REGIME_CONFIRM_BARS, adx_1h, hour_utc, price, ema200, dist * 100,
         adx, rsi_prev, rsi_curr, vol_ok, divergence,
         macro_l_str, macro_s_str,
         hist_15m[-1], hist_1h[-1],
