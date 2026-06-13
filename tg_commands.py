@@ -77,7 +77,6 @@ def _fetch_trade_history() -> list[dict]:
             log.warning("Error leyendo CSV de trades: %s", e)
 
     # 2. Añadir trades en memoria que no estén ya en el CSV
-    #    (el CSV se escribe en cada record(), así que normalmente ya están)
     seen = {(t["date"], t["symbol"]) for t in trades}
     for t in trade_logger._cache:
         key = (t["date"], t["symbol"])
@@ -137,7 +136,9 @@ def _cmd_stats() -> str:
 def _cmd_posiciones() -> str:
     if _get_positions is None:
         return "⚠️ No disponible."
-    positions = _get_positions()
+    # FIX: copia del dict para evitar RuntimeError si main.py modifica
+    # positions mientras iteramos (dictionary changed size during iteration)
+    positions = dict(_get_positions())
     if not positions:
         return "📊 <b>Posiciones abiertas</b>\nNinguna en este momento."
 
@@ -160,7 +161,7 @@ def _cmd_status() -> str:
     uptime_s   = int(time.time() - _start_ts)
     h, rem     = divmod(uptime_s, 3600)
     m, s       = divmod(rem, 60)
-    positions  = _get_positions() if _get_positions else {}
+    positions  = dict(_get_positions()) if _get_positions else {}
     feed_info  = ""
     if _feed:
         feed_info = f"Feed:        <code>{_feed.ready_count()}/{len(config.SYMBOLS)} pares</code>\n"

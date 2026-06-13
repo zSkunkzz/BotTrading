@@ -18,6 +18,7 @@ Formato del mensaje:
 import csv
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -27,11 +28,14 @@ import config
 
 log = logging.getLogger("trade_logger")
 
-LOG_FILE = os.getenv("TRADES_CSV", "trades.csv")
-HEADER   = ["date","symbol","side","entry","exit","pnl_pct","pnl_usdt","score","reason","duration_min"]
+LOG_FILE  = os.getenv("TRADES_CSV", "trades.csv")
+HEADER    = ["date","symbol","side","entry","exit","pnl_pct","pnl_usdt","score","reason","duration_min"]
 
 _API         = f"https://api.telegram.org/bot{config.TG_TOKEN}"
 _LOG_CHAT_ID = os.getenv("TG_LOG_CHAT_ID") or config.TG_CHAT_ID
+
+# Lock para escritura concurrente al CSV
+_csv_lock: threading.Lock = threading.Lock()
 
 # caché en memoria (se pierde al reiniciar, pero Telegram tiene el historial completo)
 _cache: list[dict] = []
@@ -51,16 +55,18 @@ def _tg_send(text: str) -> None:
 
 
 def _write_csv(row: list) -> None:
-    write_header = not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0
-    try:
-        with open(LOG_FILE, "a", newline="") as f:
-            w = csv.writer(f)
-            if write_header:
-                w.writerow(HEADER)
-            w.writerow(row)
-            f.flush()
-    except Exception as e:
-        log.warning("CSV write error: %s", e)
+    """Escribe una fila en el CSV con lock para evitar corrupción concurrente."""
+    with _csv_lock:
+        write_header = not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0
+        try:
+            with open(LOG_FILE, "a", newline="") as f:
+                w = csv.writer(f)
+                if write_header:
+                    w.writerow(HEADER)
+                w.writerow(row)
+                f.flush()
+        except Exception as e:
+            log.warning("CSV write error: %s", e)
 
 
 def record(
@@ -95,7 +101,7 @@ def record(
     )
     _tg_send(msg)
 
-    # ── 2. CSV local (caché) ──
+    # ── 2. CSV local (protegido por lock) ──
     _write_csv(row)
 
     # ── 3. Caché en memoria ──
@@ -108,16 +114,14 @@ def record(
 
 
 def send_daily_summary() -> None:
-    """Envía un resumen de todos los trades de la sesión actual.
-    Llama a esta función desde un scheduler o manualmente.
-    """
+    """Envía un resumen de todos los trades de la sesión actual."""
     if not _cache:
         _tg_send("📊 <b>Resumen del día</b>\nSin trades en esta sesión.")
         return
 
-    total   = len(_cache)
-    wins    = sum(1 for t in _cache if t["pnl_pct"] >= 0)
-    losses  = total - wins
+    total     = len(_cache)
+    wins      = sum(1 for t in _cache if t["pnl_pct"] >= 0)
+    losses    = total - wins
     total_pnl = sum(t["pnl_usdt"] for t in _cache)
     win_rate  = wins / total * 100
 
@@ -129,3 +133,32 @@ def send_daily_summary() -> None:
         lines.append(f"{icon} {t['symbol']} {t['side'].upper()} {t['pnl_pct']:+.2f}%")
 
     _tg_send("\n".join(lines))
+
+
+def _daily_summary_scheduler() -> None:
+    """Hilo que dispara send_daily_summary cada día a las 00:00 UTC."""
+    while True:
+        now = datetime.now(timezone.utc)
+        # Segundos hasta la próxima medianoche UTC
+        seconds_until_midnight = (
+            (23 - now.hour) * 3600
+            + (59 - now.minute) * 60
+            + (60 - now.second)
+        )
+        time.sleep(seconds_until_midnight)
+        try:
+            send_daily_summary()
+        except Exception as e:
+            log.warning("Error en resumen diario: %s", e)
+        # Pequeña pausa para no disparar dos veces si el sleep se adelanta
+        time.sleep(5)
+
+
+def start_scheduler() -> None:
+    """Arranca el scheduler de resumen diario en un hilo daemon."""
+    threading.Thread(
+        target=_daily_summary_scheduler,
+        daemon=True,
+        name="daily-summary",
+    ).start()
+    log.info("Scheduler de resumen diario iniciado (00:00 UTC)")
