@@ -7,6 +7,8 @@ FIXES aplicados:
      igual que lo hace BingX internamente, evitando "signature does not match".
   3. Reintentos automáticos (3 intentos, backoff 1s) para RemoteProtocolError y
      timeouts intermitentes que estaban silenciando órdenes.
+     FIX: timestamp y firma se renuevan en CADA intento para evitar que un timeout
+     de 10s deje el segundo reintento con un timestamp ya expirado (BingX rechaza >5s).
   4. calc_qty() aplica floor al step size de cada símbolo para no enviar qty
      que BingX rechaza por precisión decimal.
   5. cancel_all_orders usa DELETE (no POST) — BingX exige DELETE para este endpoint.
@@ -14,6 +16,8 @@ FIXES aplicados:
      deduplicar correctamente al mezclar velas REST con las del WebSocket.
   7. get_all_positions() obtiene TODAS las posiciones abiertas en 1 sola llamada
      (sin 'symbol'), reduciendo 74 llamadas por loop a 1.
+     FIX: si la llamada falla, lanza excepción en vez de devolver {} silencioso
+     para evitar que main.py interprete todas las posiciones como cerradas.
 """
 import hashlib
 import hmac
@@ -50,20 +54,27 @@ _RETRY_WAIT = 1.0   # segundos entre intentos
 
 
 def _request(method: str, path: str, params: dict) -> dict:
-    """GET, POST o DELETE enviando siempre los parámetros en la query string (BingX V2)."""
-    params = dict(params)
-    params["timestamp"] = int(time.time() * 1000)
-    params["signature"] = _sign(params)
+    """GET, POST o DELETE enviando siempre los parámetros en la query string (BingX V2).
 
+    FIX: timestamp y firma se renuevan en cada intento para que un timeout en el
+    primer intento no deje el segundo con un timestamp expirado (BingX rechaza >5s).
+    """
+    # Copiar params sin timestamp/signature para poder renovarlos en cada intento
+    base_params = {k: v for k, v in params.items() if k not in ("timestamp", "signature")}
     url = config.BASE_URL + path
 
     last_exc: Exception | None = None
     for attempt in range(1, _RETRIES + 1):
+        # Renovar timestamp y firma en cada intento
+        signed = dict(base_params)
+        signed["timestamp"] = int(time.time() * 1000)
+        signed["signature"] = _sign(signed)
+
         try:
             r = httpx.request(
                 method,
                 url,
-                params=params,          # ← query string en GET, POST y DELETE
+                params=signed,
                 headers=_headers(),
                 timeout=10,
             )
@@ -188,20 +199,17 @@ def _parse_position(p: dict) -> dict:
 def get_all_positions() -> dict[str, dict]:
     """BATCH: devuelve {symbol: pos_dict} para todas las posiciones abiertas.
 
-    Hace UNA sola llamada GET sin parámetro 'symbol', lo que hace que BingX
-    devuelva todas las posiciones con qty != 0. Antes se hacían 37 llamadas
-    individuales por loop; ahora es 1.
+    FIX: ya no captura la excepción silenciosamente. Si la llamada falla, lanza
+    la excepción para que main.py la capture en su try/except de loop y salte
+    la iteración completa, evitando que un {} vacío provoque el cierre falso
+    de todas las posiciones rastreadas.
     """
-    try:
-        data = _get("/openApi/swap/v2/user/positions", {})
-        result: dict[str, dict] = {}
-        for p in (data.get("data") or []):
-            if float(p.get("positionAmt", 0)) != 0:
-                result[p["symbol"]] = _parse_position(p)
-        return result
-    except Exception as exc:
-        log.warning("get_all_positions falló, devolviendo vacío: %s", exc)
-        return {}
+    data = _get("/openApi/swap/v2/user/positions", {})
+    result: dict[str, dict] = {}
+    for p in (data.get("data") or []):
+        if float(p.get("positionAmt", 0)) != 0:
+            result[p["symbol"]] = _parse_position(p)
+    return result
 
 
 def get_position(symbol: str = None) -> dict | None:
