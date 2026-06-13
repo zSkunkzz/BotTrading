@@ -37,7 +37,7 @@ TP_PCT         = float(os.getenv("TP_PCT", "3.0"))
 
 # Señales
 TIMEFRAME      = os.getenv("TIMEFRAME", "15m")
-LOOP_SLEEP     = int(os.getenv("LOOP_SLEEP", "15"))      # segundos entre scans
+LOOP_SLEEP     = int(os.getenv("LOOP_SLEEP", "20"))      # segundos entre scans (20s con 50 pares)
 MIN_SCORE      = int(os.getenv("MIN_SCORE", "55"))       # score mínimo para abrir posición
 
 # Telegram
