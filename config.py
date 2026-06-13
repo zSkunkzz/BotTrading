@@ -10,17 +10,24 @@ BASE_URL   = "https://open-api.bingx.com"
 
 # Pares verificados en BingX perpetual futures (top market cap, junio 2026)
 SYMBOLS = [
+    # --- Top 10 ---
     "BTC-USDT",  "ETH-USDT",  "BNB-USDT",  "XRP-USDT",  "SOL-USDT",
     "TRX-USDT",  "DOGE-USDT", "XLM-USDT",  "ADA-USDT",  "LINK-USDT",
+    # --- 11–20 ---
     "BCH-USDT",  "HBAR-USDT", "LTC-USDT",  "SUI-USDT",  "AVAX-USDT",
     "NEAR-USDT", "SHIB-USDT", "DOT-USDT",  "UNI-USDT",  "ICP-USDT",
+    # --- 21–30 ---
     "ETC-USDT",  "FIL-USDT",  "INJ-USDT",  "APT-USDT",  "ARB-USDT",
     "VET-USDT",  "STX-USDT",  "ATOM-USDT", "TAO-USDT",  "WLD-USDT",
+    # --- 31–40 ---
     "ONDO-USDT", "MNT-USDT",  "FET-USDT",  "OP-USDT",   "POL-USDT",
-    "HYPE-USDT", "GOLD-USDT",
+    "HYPE-USDT", "GOLD-USDT", "JUP-USDT",  "PENGU-USDT","TIA-USDT",
+    # --- 41–50 ---
+    "RENDER-USDT","SEI-USDT", "BONK-USDT", "PEPE-USDT", "NOT-USDT",
+    "ZK-USDT",   "EIGEN-USDT","LISTA-USDT","MANTA-USDT","AERO-USDT",
 ]
 
-MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS", "5"))    # máximo simultáneo
+MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS", "7"))    # máximo simultáneo
 LEVERAGE       = int(os.getenv("LEVERAGE", "10"))
 MARGIN_USDT    = float(os.getenv("MARGIN_USDT", "20"))   # margen fijo por trade
 
