@@ -8,12 +8,13 @@ Filtros:
   3. Macro 4h           : EMA50 en 4h — bonus/penalización/neutro según disponibilidad
   4. EMA200 1h          : hard-guard de dirección
   5. ADX 15m            : >35 +12, >25 +6, >18 -8, <18 -15
-  6. Volumen            : >media×1.2 → +8
-  7. RSI 15m            : cruce 50 +15, extremo +8, direccional +4, contrario -5
-  8. MACD 15m + 1h      : histograma confirma → +10 cada uno
-  9. Divergencia RSI    : +8
-  10. Sesgo horario     : hora alta +8, hora baja -10
-  11. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
+  6. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
+  7. Volumen            : última vela CERRADA >media×1.2 → +8
+  8. RSI 15m            : cruce 50 +15, extremo +8, direccional +4, contrario -5
+  9. MACD 15m + 1h      : histograma confirma → +10 cada uno
+  10. Divergencia RSI   : +8
+  11. Sesgo horario     : hora alta +8, hora baja -10
+  12. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
 
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
@@ -29,18 +30,18 @@ import config
 
 log = logging.getLogger("signals")
 
-# ── Umbrales configurables ────────────────────────────────────────────────────
-EMA200_MIN_DIST     = 0.003   # 0.3% distancia mínima al EMA200 en 1h
+# ── Umbrales configurables ────────────────────────────────────────────────
+EMA200_MIN_DIST     = 0.003
 NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
-MIN_SCORE           = config.MIN_SCORE   # configurable via env: MIN_SCORE=55
-REGIME_CONFIRM_BARS = 2   # velas 1h cerradas consecutivas con el mismo régimen
+MIN_SCORE           = config.MIN_SCORE
+REGIME_CONFIRM_BARS = 2
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
 
 
-# ── Indicadores ───────────────────────────────────────────────────────────────
+# ── Indicadores ───────────────────────────────────────────────────────────────────
 
 def _ema(closes: list[float], period: int) -> list[float]:
     k = 2 / (period + 1)
@@ -123,15 +124,7 @@ def _adx(candles: list[dict], period: int = 14) -> float:
 
 
 def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
-    """Detecta divergencia RSI-precio en la ventana reciente.
-
-    FIX #2: La versión anterior usaba min((v, i) ...) y max((v, i) ...) para
-    encontrar simultáneamente el valor y el índice del pivote. Con empates de
-    precio, Python desempata por el índice de forma lexicográfica (el menor),
-    no por el más reciente — que es el correcto para detectar divergencia.
-    Ahora buscamos el valor extremo primero y luego tomamos el ÚLTIMO índice
-    que lo contiene, lo que refleja mejor el pivote más relevante.
-    """
+    """Detecta divergencia RSI-precio en la ventana reciente."""
     if len(closes) < lookback + 14:
         return None
     rsi_series    = _rsi(closes, 14)
@@ -171,23 +164,16 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
 
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
-    """Devuelve el régimen solo si las últimas n velas cerradas coinciden.
-
-    Evalúa el régimen sobre las últimas n+1 velas cerradas (ventanas deslizantes).
-    Si todas coinciden, devuelve (regime, adx). Si no hay consenso,
-    devuelve ("range", adx) para bloquear la señal.
-    """
+    """Devuelve el régimen solo si las últimas n velas cerradas coinciden."""
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
 
     regimes = []
-    # Evaluar el régimen en las últimas n velas cerradas (ventanas deslizantes)
     for offset in range(n, 0, -1):
-        window = candles_1h[:-offset]   # excluye las últimas `offset` velas
+        window = candles_1h[:-offset]
         regime, adx = _market_regime(window)
         regimes.append(regime)
 
-    # Añadir el régimen sobre todas las velas cerradas (el más reciente)
     regime_now, adx_now = _market_regime(candles_1h)
     regimes.append(regime_now)
 
@@ -200,14 +186,20 @@ def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> t
 
 
 def _volume_ok(candles: list[dict], window: int = 20) -> bool:
-    if len(candles) < window + 1:
+    """Comprueba si el volumen de la última vela CERRADA supera la media.
+
+    FIX: usa candles[-2] (penúltima = última cerrada) en lugar de candles[-1]
+    (vela abierta que puede llevar solo unos minutos y tiene volumen artificialmente
+    bajo, filtrando señales válidas por volumen insuficiente).
+    """
+    if len(candles) < window + 2:
         return True
-    vols = [c["volume"] for c in candles[-(window + 1):-1]]
+    vols = [c["volume"] for c in candles[-(window + 2):-2]]
     avg  = sum(vols) / len(vols)
-    return candles[-1]["volume"] >= avg * VOLUME_MULT
+    return candles[-2]["volume"] >= avg * VOLUME_MULT
 
 
-# ── Función principal ─────────────────────────────────────────────────────────
+# ── Función principal ──────────────────────────────────────────────────────────────
 
 def evaluate(
     candles_15m: list[dict],
@@ -226,15 +218,13 @@ def evaluate(
     closes_15m = [c["close"] for c in closed_15m]
     closes_1h  = [c["close"] for c in closed_1h]
 
-    # ── Hard-guard 1: Régimen confirmado ─────────────────────────────────────
-    # Requiere REGIME_CONFIRM_BARS velas 1h consecutivas con el mismo régimen.
-    # Un solo cambio de vela no es suficiente para habilitar señales.
+    # ── Hard-guard 1: Régimen confirmado ──────────────────────────────────
     regime, adx_1h = _regime_confirmed(closed_1h)
     if regime == "range":
         log.info("⬛ Régimen lateral o inestable — sin señal")
         return None, 0
 
-    # ── Hard-guard 2: distancia EMA200 ───────────────────────────────────────
+    # ── Hard-guard 2: distancia EMA200 ──────────────────────────────────
     ema200 = _ema(closes_1h, 200)[-1]
     price  = closes_15m[-1]
     dist   = abs(price - ema200) / ema200
@@ -245,14 +235,14 @@ def evaluate(
     trend_long  = regime == "bull"
     trend_short = regime == "bear"
 
-    # ── Hard-guard 3: no-chase ────────────────────────────────────────────────
+    # ── Hard-guard 3: no-chase ──────────────────────────────────────────
     atr        = _atr(closed_15m, 14)
     last_range = closed_15m[-1]["high"] - closed_15m[-1]["low"]
     if atr > 0 and last_range > NO_CHASE_MULT * atr:
         log.info("⚠️  Vela explosiva — sin señal")
         return None, 0
 
-    # ── Componentes de score ──────────────────────────────────────────────────
+    # ── Componentes de score ───────────────────────────────────────────────
     adx = _adx(closed_15m, 14)
 
     hour_utc   = datetime.datetime.now(timezone.utc).hour
@@ -298,10 +288,14 @@ def evaluate(
             return 0
         s = 20
         s += _macro_pts(macro_long, favor=True)
+        # ADX 15m — fuerza de tendencia en marco de entrada
         if adx > 35:        s += 12
         elif adx > 25:      s += 6
         elif adx > 18:      s -= 8
         else:               s -= 15
+        # ADX 1h — fuerza de tendencia en marco superior (suave)
+        if adx_1h < 18:     s -= 5
+        elif adx_1h > 25:   s += 5
         if rsi_cross_up:    s += 15
         elif rsi_ext_bull:  s += 8
         elif rsi_bull:      s += 4
@@ -321,10 +315,14 @@ def evaluate(
             return 0
         s = 20
         s += _macro_pts(macro_short, favor=True)
+        # ADX 15m — fuerza de tendencia en marco de entrada
         if adx > 35:         s += 12
         elif adx > 25:       s += 6
         elif adx > 18:       s -= 8
         else:                s -= 15
+        # ADX 1h — fuerza de tendencia en marco superior (suave)
+        if adx_1h < 18:      s -= 5
+        elif adx_1h > 25:    s += 5
         if rsi_cross_down:   s += 15
         elif rsi_ext_bear:   s += 8
         elif rsi_bear:       s += 4
