@@ -3,6 +3,11 @@
 Suscribe todos los pares a streams de klines 15m, 1h y 4h.
 Mantiene un buffer de velas en memoria que signals.py consume.
 
+FIX: se añade _last_update[symbol][tf] que registra el timestamp de la última
+vela recibida. ready() devuelve False si los datos de 15m o 1h tienen más de
+STALE_THRESHOLD segundos sin actualizarse, evitando que el bot evalúe señales
+con datos obsoletos cuando el WebSocket se cae sin reconectar.
+
 Uso:
     feed = KlineFeed(config.SYMBOLS)
     feed.start()
@@ -30,10 +35,16 @@ WS_URL        = "wss://open-api-swap.bingx.com/swap-market"
 BUFFER_SIZE   = 300
 TIMEFRAMES    = ["15m", "1h", "4h"]
 PING_INTERVAL = 20
-PRELOAD_WORKERS = 8   # peticiones REST en paralelo
+PRELOAD_WORKERS = 8
 
 _READY_MIN = {"15m": 120, "1h": 215}
 _PRELOAD   = {"15m": 120, "1h": 220, "4h": 70}
+
+# Si 15m o 1h llevan más de este umbral sin recibir datos, el símbolo se
+# considera obsoleto y ready() devuelve False.
+# Las velas 15m llegan cada 15 min como máximo; 10 min detecta desconexiones
+# sin generar falsos positivos en condiciones normales.
+STALE_THRESHOLD = 10 * 60  # 10 minutos
 
 
 class KlineFeed:
@@ -44,10 +55,17 @@ class KlineFeed:
             s: {tf: deque(maxlen=BUFFER_SIZE) for tf in TIMEFRAMES}
             for s in symbols
         }
+        # Timestamp (time.time()) de la última actualización por símbolo y tf.
+        # Se inicializa a 0. La precarga REST lo actualiza al terminar para que
+        # los símbolos no aparezcan como obsoletos nada más arrancar.
+        self._last_update: dict[str, dict[str, float]] = {
+            s: {tf: 0.0 for tf in TIMEFRAMES}
+            for s in symbols
+        }
         self._ws      = None
         self._running = False
 
-    # ── API pública ──────────────────────────────────────────────────────
+    # ── API pública ────────────────────────────────────────────────────
 
     def get(self, symbol: str, timeframe: str) -> list[dict]:
         with self._lock:
@@ -58,15 +76,35 @@ class KlineFeed:
             return len(self._data.get(symbol, {}).get(timeframe, [])) > 0
 
     def ready(self, symbol: str) -> bool:
-        """True si tenemos velas suficientes en 15m y 1h."""
+        """True si tenemos velas suficientes en 15m y 1h Y los datos son frescos.
+
+        FIX: comprueba que la última actualización de 15m y 1h fue hace menos
+        de STALE_THRESHOLD segundos. Si el WebSocket lleva más tiempo sin enviar
+        datos para este símbolo, devuelve False y el bot omite la evaluación.
+        """
         with self._lock:
-            return (
+            has_enough = (
                 len(self._data[symbol]["15m"]) >= _READY_MIN["15m"] and
                 len(self._data[symbol]["1h"])  >= _READY_MIN["1h"]
             )
+            if not has_enough:
+                return False
+
+            now     = time.time()
+            age_15m = now - self._last_update[symbol]["15m"]
+            age_1h  = now - self._last_update[symbol]["1h"]
+
+            if age_15m > STALE_THRESHOLD or age_1h > STALE_THRESHOLD:
+                log.warning(
+                    "[%s] Datos obsoletos: 15m=%.0fs 1h=%.0fs sin actualizar (umbral %ds)",
+                    symbol, age_15m, age_1h, STALE_THRESHOLD,
+                )
+                return False
+
+            return True
 
     def ready_count(self) -> int:
-        """Cuántos pares tienen datos suficientes."""
+        """Cuántos pares tienen datos suficientes y frescos."""
         return sum(1 for s in self._symbols if self.ready(s))
 
     def start(self) -> None:
@@ -83,13 +121,16 @@ class KlineFeed:
         if self._ws:
             self._ws.close()
 
-    # ── Precarga REST en paralelo ────────────────────────────────────────
+    # ── Precarga REST en paralelo ───────────────────────────────────────
 
     def _preload_one(self, symbol: str, tf: str, limit: int) -> None:
         try:
             candles = exchange.get_ohlcv(symbol, interval=tf, limit=limit)
             with self._lock:
                 self._data[symbol][tf].extend(candles)
+                # Marcar como actualizado para que ready() no lo descarte
+                # inmediatamente tras la precarga REST.
+                self._last_update[symbol][tf] = time.time()
             log.debug("[%s %s] precargadas %d velas", symbol, tf, len(candles))
         except Exception as e:
             log.warning("[%s %s] error precarga: %s", symbol, tf, e)
@@ -109,7 +150,7 @@ class KlineFeed:
                 if done % 20 == 0 or done == len(tasks):
                     log.info("Precarga: %d/%d completadas", done, len(tasks))
 
-    # ── WebSocket ────────────────────────────────────────────────────────
+    # ── WebSocket ──────────────────────────────────────────────────────────
 
     def _run_forever(self) -> None:
         while self._running:
@@ -182,18 +223,16 @@ class KlineFeed:
             with self._lock:
                 buf = self._data[symbol][tf]
                 if buf and buf[-1]["ts"] == candle["ts"]:
-                    # Misma vela: actualizar siempre (ya sea abierta o cierre definitivo)
                     buf[-1] = candle
                 else:
-                    # Nueva vela: solo añadir si la anterior ya está cerrada
-                    # o si el buffer está vacío
                     if not buf or buf[-1].get("closed", True):
                         buf.append(candle)
                     else:
-                        # La anterior sigue abierta pero llega un ts diferente:
-                        # forzar cierre de la anterior y añadir la nueva
                         buf[-1] = dict(buf[-1], closed=True)
                         buf.append(candle)
+
+                # Actualizar timestamp de frescura en cada mensaje recibido
+                self._last_update[symbol][tf] = time.time()
 
         except Exception as e:
             log.warning("Error procesando mensaje WS: %s", e)
