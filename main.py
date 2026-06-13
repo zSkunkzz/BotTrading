@@ -138,6 +138,7 @@ def run() -> None:
 
     positions: dict = {}
     tg_commands.start(get_positions_fn=lambda: positions, feed=feed)
+    trade_logger.start_scheduler()
 
     loop_count = 0
 
@@ -148,7 +149,7 @@ def run() -> None:
             # ── BATCH: 1 sola llamada para todas las posiciones del exchange ──────
             all_ex_positions = exchange.get_all_positions()
 
-            # ── Sync posiciones abiertas ────────────────────────────────────
+            # ── Sync posiciones abiertas ────────────────────────────────
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
@@ -194,7 +195,7 @@ def run() -> None:
                     log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT)",
                              symbol, reason, pnl_pct, pnl_usdt)
 
-            # ── Purgar cooldowns expirados ──────────────────────────────────
+            # ── Purgar cooldowns expirados ──────────────────────────────
             expired = [
                 sym for sym, ts in _cooldown.items()
                 if time.time() - ts >= COOLDOWN
@@ -227,14 +228,14 @@ def run() -> None:
                          loop_count, open_count, config.MAX_POSITIONS,
                          feed.ready_count(), len(config.SYMBOLS), len(_cooldown))
 
-            # ── Trailing stop ───────────────────────────────────────────────
+            # ── Trailing stop ──────────────────────────────────────────────
             for symbol, pos in list(positions.items()):
                 try:
                     _update_trailing(symbol, pos, exchange.get_price(symbol))
                 except Exception as e:
                     log.warning("[%s] Error trailing: %s", symbol, e)
 
-            # ── Buscar señales nuevas ───────────────────────────────────────────
+            # ── Buscar señales nuevas ──────────────────────────────────────────
             if open_count < config.MAX_POSITIONS:
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
