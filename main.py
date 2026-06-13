@@ -21,13 +21,11 @@ log = logging.getLogger("main")
 
 # _cooldown guarda el timestamp del último cierre (TP o SL) por símbolo.
 # El símbolo queda bloqueado para nuevas entradas durante COOLDOWN segundos.
-# Esto evita re-entradas prematuras cuando la vela está sobreextendida
-# o cuando el mercado sigue en la misma dirección tras un SL.
 _cooldown: dict[str, float] = {}
 
 COOLDOWN          = 60 * 60  # 1 hora tras cualquier cierre
-REENTRY_BOOST     = 8        # puntos extra en re-entrada (dentro del cooldown, no usado ahora)
-REENTRY_SIZE_MULT = 0.6      # tamaño reducido (reservado para uso futuro)
+REENTRY_BOOST     = 8
+REENTRY_SIZE_MULT = 0.6
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -150,7 +148,7 @@ def run() -> None:
             # ── BATCH: 1 sola llamada para todas las posiciones del exchange ──────
             all_ex_positions = exchange.get_all_positions()
 
-            # ── Sync posiciones abiertas ────────────────────────────────────────
+            # ── Sync posiciones abiertas ────────────────────────────────────
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
@@ -168,8 +166,6 @@ def run() -> None:
 
                     hit_tp = reason == "TP"
 
-                    # Activar cooldown en cualquier cierre (TP o SL).
-                    # Bloquea nuevas entradas en este símbolo durante COOLDOWN segundos.
                     _cooldown[symbol] = time.time()
                     log.info(
                         "[%s] Cooldown activado (%dm) tras %s",
@@ -198,7 +194,7 @@ def run() -> None:
                     log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT)",
                              symbol, reason, pnl_pct, pnl_usdt)
 
-            # ── Purgar cooldowns expirados ───────────────────────────────────────
+            # ── Purgar cooldowns expirados ──────────────────────────────────
             expired = [
                 sym for sym, ts in _cooldown.items()
                 if time.time() - ts >= COOLDOWN
@@ -231,14 +227,14 @@ def run() -> None:
                          loop_count, open_count, config.MAX_POSITIONS,
                          feed.ready_count(), len(config.SYMBOLS), len(_cooldown))
 
-            # ── Trailing stop ───────────────────────────────────────────────────
+            # ── Trailing stop ───────────────────────────────────────────────
             for symbol, pos in list(positions.items()):
                 try:
                     _update_trailing(symbol, pos, exchange.get_price(symbol))
                 except Exception as e:
                     log.warning("[%s] Error trailing: %s", symbol, e)
 
-            # ── Buscar señales nuevas ──────────────────────────────────────────────
+            # ── Buscar señales nuevas ───────────────────────────────────────────
             if open_count < config.MAX_POSITIONS:
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
@@ -248,7 +244,6 @@ def run() -> None:
                     if not feed.ready(symbol):
                         continue
 
-                    # ── Cooldown activo: saltar este símbolo ─────────────────────
                     if symbol in _cooldown:
                         remaining = int(COOLDOWN - (time.time() - _cooldown[symbol]))
                         log.debug("[%s] En cooldown (%ds restantes)", symbol, remaining)
@@ -264,13 +259,23 @@ def run() -> None:
                         if not signal:
                             continue
 
+                        # Obtener régimen de mercado para TP_RR dinámico
+                        try:
+                            regime, _ = signals._market_regime(candles_1h)
+                        except Exception:
+                            regime = "bull"
+
                         price  = exchange.get_price(symbol)
-                        params = risk.calc(signal, price, candles_15m, score, symbol=symbol)
+                        params = risk.calc(
+                            signal, price, candles_15m,
+                            score=score, symbol=symbol, regime=regime,
+                        )
 
                         log.info(
-                            "[%s] SEÑAL %s | entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d",
-                            symbol, signal.upper(), price,
-                            params["sl"], params["tp"], params["qty"], score,
+                            "[%s] SEÑAL %s | regime=%s RR=%.1f | "
+                            "entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d",
+                            symbol, signal.upper(), regime, params["tp_rr"],
+                            price, params["sl"], params["tp"], params["qty"], score,
                         )
 
                         exchange.open_order(
