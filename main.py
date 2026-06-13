@@ -2,6 +2,7 @@
 import logging
 import sys
 import time
+from datetime import datetime, timezone
 
 import config
 import exchange
@@ -29,6 +30,17 @@ REENTRY_SIZE_MULT = 0.6
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
+
+# Score mínimo para operar en fin de semana
+WEEKEND_MIN_SCORE = 90
+
+# Aviso de fin de semana: sólo notifica 1 vez por jornada
+_weekend_notified_day: int = -1
+
+
+def _is_weekend() -> bool:
+    """Devuelve True si es sábado (5) o domingo (6) en UTC."""
+    return datetime.now(timezone.utc).weekday() >= 5
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
@@ -116,6 +128,8 @@ def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
 
 
 def run() -> None:
+    global _weekend_notified_day
+
     log.info(
         "Bot iniciado | %d pares | lev=%dx | margin=%s USDT | max=%d posiciones",
         len(config.SYMBOLS), config.LEVERAGE, config.MARGIN_USDT, config.MAX_POSITIONS,
@@ -235,8 +249,26 @@ def run() -> None:
                 except Exception as e:
                     log.warning("[%s] Error trailing: %s", symbol, e)
 
+            # ── Filtro fin de semana ────────────────────────────────────────
+            weekend = _is_weekend()
+            if weekend:
+                today = datetime.now(timezone.utc).weekday()
+                if today != _weekend_notified_day:
+                    _weekend_notified_day = today
+                    day_name = "Sábado" if today == 5 else "Domingo"
+                    log.info("Modo fin de semana activo (%s UTC) — score mínimo %d para nuevas entradas",
+                             day_name, WEEKEND_MIN_SCORE)
+                    telegram.notify(
+                        f"🚫 Modo fin de semana ({day_name})\n"
+                        f"No se abrirán posiciones nuevas salvo score ≥ {WEEKEND_MIN_SCORE}.\n"
+                        f"Posiciones actuales siguen gestionándose con normalidad."
+                    )
+
             # ── Buscar señales nuevas ──────────────────────────────────────────
             if open_count < config.MAX_POSITIONS:
+                # Score mínimo efectivo: normal entre semana, estricto en finde
+                effective_min_score = WEEKEND_MIN_SCORE if weekend else config.MIN_SCORE
+
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
                         continue
@@ -255,7 +287,10 @@ def run() -> None:
                         candles_1h  = feed.get(symbol, "1h")
                         candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
 
-                        signal, score = signals.evaluate(candles_15m, candles_1h, candles_4h)
+                        signal, score = signals.evaluate(
+                            candles_15m, candles_1h, candles_4h,
+                            min_score=effective_min_score,
+                        )
 
                         if not signal:
                             continue
