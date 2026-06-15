@@ -11,7 +11,9 @@ Filtros:
   6. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
   7. Volumen            : última vela CERRADA >media×1.2 → +8
   8. RSI 15m            : cruce 50 +15, extremo +8, direccional +4, contrario -5
-  9. MACD 15m + 1h      : histograma confirma → +10 cada uno
+  9. MACD 15m + 1h      : histograma positivo/negativo → +10 | neutro 0 | contrario -5
+                          (ya no se penaliza si el histograma va en la dirección correcta
+                          pero no está acelerando)
   10. Divergencia RSI   : +8
   11. Sesgo horario     : hora alta +8, hora baja -10
   12. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
@@ -272,10 +274,17 @@ def evaluate(
 
     divergence = _rsi_divergence(closes_15m, closed_15m)
 
-    hist_15m    = _macd_histogram(closes_15m)
-    hist_1h     = _macd_histogram(closes_1h)
-    macd15_bull = hist_15m[-1] > 0 and hist_15m[-1] > hist_15m[-2]
-    macd15_bear = hist_15m[-1] < 0 and hist_15m[-1] < hist_15m[-2]
+    hist_15m = _macd_histogram(closes_15m)
+    hist_1h  = _macd_histogram(closes_1h)
+
+    # MACD 15m: +10 si histograma va en dirección correcta (positivo para bull,
+    # negativo para bear), 0 si neutro/contrario pero en zona correcta sin acelerar,
+    # -5 solo si el histograma va claramente en contra.
+    macd15_bull_strong = hist_15m[-1] > 0 and hist_15m[-1] > hist_15m[-2]  # acelerando
+    macd15_bull_weak   = hist_15m[-1] > 0                                   # positivo pero no acelerando
+    macd15_bear_strong = hist_15m[-1] < 0 and hist_15m[-1] < hist_15m[-2]
+    macd15_bear_weak   = hist_15m[-1] < 0
+
     macd1h_bull = hist_1h[-1] > 0
     macd1h_bear = hist_1h[-1] < 0
 
@@ -302,8 +311,11 @@ def evaluate(
         elif rsi_ext_bull:  s += 8
         elif rsi_bull:      s += 4
         else:               s -= 5
-        if macd15_bull:     s += 10
-        else:               s -= 5
+        # MACD 15m: +10 acelerando, +5 positivo sin acelerar, -5 en contra
+        if macd15_bull_strong:   s += 10
+        elif macd15_bull_weak:   s += 5
+        elif not macd15_bear_weak: s += 0   # neutro (raro)
+        else:                    s -= 5
         if macd1h_bull:     s += 10
         else:               s -= 5
         if vol_ok:          s += 8
@@ -327,8 +339,11 @@ def evaluate(
         elif rsi_ext_bear:   s += 8
         elif rsi_bear:       s += 4
         else:                s -= 5
-        if macd15_bear:      s += 10
-        else:                s -= 5
+        # MACD 15m: +10 acelerando, +5 negativo sin acelerar, -5 en contra
+        if macd15_bear_strong:   s += 10
+        elif macd15_bear_weak:   s += 5
+        elif not macd15_bull_weak: s += 0
+        else:                    s -= 5
         if macd1h_bear:      s += 10
         else:                s -= 5
         if vol_ok:           s += 8
