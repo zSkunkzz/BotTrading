@@ -31,8 +31,9 @@ REENTRY_SIZE_MULT = 0.6
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
 
-# Score mínimo para operar en fin de semana
-WEEKEND_MIN_SCORE = 90
+# Score mínimo según sesión
+WEEKDAY_MIN_SCORE = 70  # lunes–viernes
+WEEKEND_MIN_SCORE = 90  # sábado y domingo
 
 # Aviso de fin de semana: sólo notifica 1 vez por jornada
 _weekend_notified_day: int = -1
@@ -266,8 +267,8 @@ def run() -> None:
 
             # ── Buscar señales nuevas ──────────────────────────────────────────
             if open_count < config.MAX_POSITIONS:
-                # Score mínimo efectivo: normal entre semana, estricto en finde
-                effective_min_score = WEEKEND_MIN_SCORE if weekend else config.MIN_SCORE
+                # Score mínimo efectivo: 70 entre semana, 90 en finde
+                effective_min_score = WEEKEND_MIN_SCORE if weekend else WEEKDAY_MIN_SCORE
 
                 for symbol in config.SYMBOLS:
                     if symbol in positions:

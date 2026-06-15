@@ -205,7 +205,11 @@ def evaluate(
     candles_15m: list[dict],
     candles_1h:  list[dict],
     candles_4h:  list[dict] | None = None,
+    min_score:   int | None = None,
 ) -> tuple[str | None, int]:
+    """Evalúa señales. min_score sobreescribe MIN_SCORE global si se especifica."""
+    effective_min = min_score if min_score is not None else MIN_SCORE
+
     if len(candles_1h) < 210:
         return None, 0
     if len(candles_15m) < 60:
@@ -288,12 +292,10 @@ def evaluate(
             return 0
         s = 20
         s += _macro_pts(macro_long, favor=True)
-        # ADX 15m — fuerza de tendencia en marco de entrada
         if adx > 35:        s += 12
         elif adx > 25:      s += 6
         elif adx > 18:      s -= 8
         else:               s -= 15
-        # ADX 1h — fuerza de tendencia en marco superior (suave)
         if adx_1h < 18:     s -= 5
         elif adx_1h > 25:   s += 5
         if rsi_cross_up:    s += 15
@@ -315,12 +317,10 @@ def evaluate(
             return 0
         s = 20
         s += _macro_pts(macro_short, favor=True)
-        # ADX 15m — fuerza de tendencia en marco de entrada
         if adx > 35:         s += 12
         elif adx > 25:       s += 6
         elif adx > 18:       s -= 8
         else:                s -= 15
-        # ADX 1h — fuerza de tendencia en marco superior (suave)
         if adx_1h < 18:      s -= 5
         elif adx_1h > 25:    s += 5
         if rsi_cross_down:   s += 15
@@ -350,16 +350,16 @@ def evaluate(
         adx, rsi_prev, rsi_curr, vol_ok, divergence,
         macro_l_str, macro_s_str,
         hist_15m[-1], hist_1h[-1],
-        sc_long, sc_short, MIN_SCORE,
+        sc_long, sc_short, effective_min,
     )
 
-    if sc_long >= MIN_SCORE and sc_long >= sc_short:
+    if sc_long >= effective_min and sc_long >= sc_short:
         log.info("✅ LONG score=%d", sc_long)
         return "long", sc_long
 
-    if sc_short >= MIN_SCORE:
+    if sc_short >= effective_min:
         log.info("✅ SHORT score=%d", sc_short)
         return "short", sc_short
 
-    log.info("⬛ Sin señal (score L=%d S=%d < %d)", sc_long, sc_short, MIN_SCORE)
+    log.info("⬛ Sin señal (score L=%d S=%d < %d)", sc_long, sc_short, effective_min)
     return None, 0
