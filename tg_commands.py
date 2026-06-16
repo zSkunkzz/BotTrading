@@ -2,10 +2,12 @@
 
 Comandos:
     /start      — Lista de comandos
-    /historial  — Historial completo de todos los trades (lee CSV local)
+    /historial  — Histórico completo de todos los trades (lee CSV local)
     /stats      — Win rate y PnL del histórico completo
     /posiciones — Posiciones abiertas ahora
     /status     — Estado del bot
+    /stop       — Pausa la búsqueda de señales nuevas
+    /resume     — Reanuda el bot
 """
 import csv
 import logging
@@ -16,6 +18,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+import bot_state
 import config
 import trade_logger
 
@@ -44,15 +47,9 @@ def _send(text: str, chat_id: str = None) -> None:
 
 
 def _fetch_trade_history() -> list[dict]:
-    """
-    Lee el historial de trades desde el CSV local (trades.csv).
-    Complementa con el caché en memoria para trades de la sesión actual
-    que aún no se hayan flusheado al disco.
-    """
     trades = []
     csv_path = trade_logger.LOG_FILE
 
-    # 1. Leer CSV persistente
     if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
         try:
             with open(csv_path, newline="") as f:
@@ -76,7 +73,6 @@ def _fetch_trade_history() -> list[dict]:
         except Exception as e:
             log.warning("Error leyendo CSV de trades: %s", e)
 
-    # 2. Añadir trades en memoria que no estén ya en el CSV
     seen = {(t["date"], t["symbol"]) for t in trades}
     for t in trade_logger._cache:
         key = (t["date"], t["symbol"])
@@ -136,8 +132,6 @@ def _cmd_stats() -> str:
 def _cmd_posiciones() -> str:
     if _get_positions is None:
         return "⚠️ No disponible."
-    # FIX: copia del dict para evitar RuntimeError si main.py modifica
-    # positions mientras iteramos (dictionary changed size during iteration)
     positions = dict(_get_positions())
     if not positions:
         return "📊 <b>Posiciones abiertas</b>\nNinguna en este momento."
@@ -146,13 +140,15 @@ def _cmd_posiciones() -> str:
     for symbol, p in positions.items():
         side_icon = "🟢" if p["side"] == "long" else "🔴"
         dur = round((time.time() - p.get("open_ts", time.time())) / 60, 0)
+        ext = p.get("tp_extensions", 0)
+        ext_str = f" | Ext: <code>{ext}</code>" if ext > 0 else ""
         lines.append(
             f"{side_icon} <b>{symbol}</b> {p['side'].upper()}\n"
             f"   Entry: <code>{p['entry']:.4f}</code> | "
             f"SL: <code>{p['sl']:.4f}</code> | "
             f"TP: <code>{p['tp']:.4f}</code>\n"
             f"   Score: <code>{p.get('score','?')}</code> | "
-            f"Dur: <code>{dur:.0f} min</code>"
+            f"Dur: <code>{dur:.0f} min</code>{ext_str}"
         )
     return "\n".join(lines)
 
@@ -165,9 +161,11 @@ def _cmd_status() -> str:
     feed_info  = ""
     if _feed:
         feed_info = f"Feed:        <code>{_feed.ready_count()}/{len(config.SYMBOLS)} pares</code>\n"
-    csv_trades = len(_fetch_trade_history())
+    csv_trades  = len(_fetch_trade_history())
+    paused_str  = "🛑 <b>PAUSADO</b> — no se abrirán posiciones nuevas\n" if bot_state.is_paused() else ""
     return (
         f"🤖 <b>Estado del bot</b>\n\n"
+        f"{paused_str}"
         f"Uptime:      <code>{h}h {m}m {s}s</code>\n"
         f"{feed_info}"
         f"Posiciones:  <code>{len(positions)}/{config.MAX_POSITIONS}</code>\n"
@@ -176,18 +174,44 @@ def _cmd_status() -> str:
     )
 
 
+def _cmd_stop() -> str:
+    if bot_state.is_paused():
+        return "🛑 El bot ya está pausado. Usa /resume para reanudarlo."
+    bot_state.pause()
+    log.info("Bot PAUSADO por comando Telegram")
+    return (
+        "🛑 <b>Bot pausado</b>\n\n"
+        "No se abrirán posiciones nuevas.\n"
+        "Las posiciones ya abiertas siguen gestionándose con normalidad "
+        "(trailing, TP dinámico, SL).\n\n"
+        "Usa /resume para reanudar."
+    )
+
+
+def _cmd_resume() -> str:
+    if not bot_state.is_paused():
+        return "▶️ El bot ya está activo."
+    bot_state.resume()
+    log.info("Bot REANUDADO por comando Telegram")
+    return "▶️ <b>Bot reanudado</b>\nVolverá a buscar señales en el próximo ciclo."
+
+
 COMMANDS = {
     "/historial":  _cmd_historial,
     "/stats":      _cmd_stats,
     "/posiciones": _cmd_posiciones,
     "/status":     _cmd_status,
+    "/stop":       _cmd_stop,
+    "/resume":     _cmd_resume,
     "/start": lambda: (
         "🤖 <b>Bot de trading activo</b>\n\n"
         "Comandos disponibles:\n"
         "/historial — Histórico completo de todos los trades\n"
         "/stats — Win rate y PnL históricos\n"
         "/posiciones — Posiciones abiertas ahora\n"
-        "/status — Estado general del bot"
+        "/status — Estado general del bot\n"
+        "/stop — Pausar búsqueda de señales nuevas\n"
+        "/resume — Reanudar el bot"
     ),
 }
 
