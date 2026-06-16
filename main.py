@@ -1,4 +1,4 @@
-"""main.py — Loop principal con trailing stop y re-entrada inteligente."""
+"""main.py — Loop principal con trailing stop y TP dinámico (extend_tp)."""
 import logging
 import sys
 import time
@@ -20,20 +20,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-# _cooldown guarda el timestamp del último cierre (TP o SL) por símbolo.
-# El símbolo queda bloqueado para nuevas entradas durante COOLDOWN segundos.
+# _cooldown guarda el timestamp del último cierre por SL por símbolo.
+# Tras un TP con señal inválida también se activa.
 _cooldown: dict[str, float] = {}
 
-COOLDOWN          = 60 * 60  # 1 hora tras cualquier cierre
-REENTRY_BOOST     = 8
-REENTRY_SIZE_MULT = 0.6
+COOLDOWN          = 60 * 60   # 1 hora tras cierre por SL o TP sin señal
+MAX_TP_EXTENSIONS = 3         # máximo de veces que se puede estirar el TP
+TP_EXTEND_RR      = 1.5       # multiplicador de distancia entry→TP para cada extensión
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
 
 # Score mínimo según sesión
-WEEKDAY_MIN_SCORE = 70  # lunes–viernes
-WEEKEND_MIN_SCORE = 90  # sábado y domingo
+WEEKDAY_MIN_SCORE = 70   # lunes–viernes
+WEEKEND_MIN_SCORE = 90   # sábado y domingo
 
 # Aviso de fin de semana: sólo notifica 1 vez por jornada
 _weekend_notified_day: int = -1
@@ -83,6 +83,85 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                     telegram.notify(f"🔽 Trailing SL movido\n{symbol} SHORT\nNuevo SL: <code>{new_sl:.4f}</code>")
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
+
+
+def _try_extend_tp(
+    symbol: str,
+    pos: dict,
+    current_price: float,
+    feed,
+    effective_min_score: int,
+) -> bool:
+    """Intenta estirar el TP en lugar de cerrar la posición.
+
+    Devuelve True si se extendió el TP (la posición NO debe cerrarse).
+    Devuelve False si no aplica extension (cerrar normalmente).
+    """
+    extensions = pos.get("tp_extensions", 0)
+    if extensions >= MAX_TP_EXTENSIONS:
+        log.info("[%s] Máx extensiones TP alcanzadas (%d) — cerrando", symbol, MAX_TP_EXTENSIONS)
+        return False
+
+    # Evaluar si la señal sigue activa
+    try:
+        candles_15m = feed.get(symbol, "15m")
+        candles_1h  = feed.get(symbol, "1h")
+        candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
+        signal, score = signals.evaluate(
+            candles_15m, candles_1h, candles_4h,
+            min_score=effective_min_score,
+        )
+    except Exception as e:
+        log.warning("[%s] Error evaluando señal para extend_tp: %s", symbol, e)
+        return False
+
+    # La señal debe coincidir con el lado de la posición abierta
+    if not signal or signal != pos["side"]:
+        log.info("[%s] Señal no válida para extend_tp (signal=%s, pos=%s) — cerrando",
+                 symbol, signal, pos["side"])
+        return False
+
+    # Calcular nuevo TP: entrada + (distancia original) * multiplicador
+    entry       = pos["entry"]
+    tp_orig_dist = abs(pos.get("tp_original", pos["tp"]) - entry)
+    side        = pos["side"]
+
+    if side == "long":
+        new_tp = round(entry + tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
+        # SL sube a breakeven (entrada) para proteger ganancia
+        new_sl = round(entry * 1.0005, 6)   # +0.05% sobre entrada (cubre comisión)
+    else:
+        new_tp = round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
+        new_sl = round(entry * 0.9995, 6)
+
+    try:
+        exchange.cancel_all_orders(symbol)
+        exchange.place_stop_order(symbol, side, pos["qty"], new_sl)
+        exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
+    except Exception as e:
+        log.warning("[%s] Error colocando órdenes en extend_tp: %s", symbol, e)
+        return False
+
+    old_tp = pos["tp"]
+    pos["tp"]           = new_tp
+    pos["sl"]           = new_sl
+    pos["tp_extensions"] = extensions + 1
+    pos["trail_high"]   = current_price
+    pos["trail_low"]    = current_price
+
+    log.info(
+        "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL→BE=%.6f | score=%d",
+        symbol, extensions + 1, old_tp, new_tp, new_sl, score,
+    )
+    telegram.notify(
+        f"📈 TP Extendido #{extensions + 1}\n"
+        f"{symbol} {side.upper()}\n"
+        f"TP anterior: <code>{old_tp:.6f}</code>\n"
+        f"Nuevo TP: <code>{new_tp:.6f}</code>\n"
+        f"SL → Breakeven: <code>{new_sl:.6f}</code>\n"
+        f"Score: {score}"
+    )
+    return True
 
 
 def _wait_feed_ready(feed: KlineFeed) -> None:
@@ -161,6 +240,9 @@ def run() -> None:
         try:
             loop_count += 1
 
+            weekend = _is_weekend()
+            effective_min_score = WEEKEND_MIN_SCORE if weekend else WEEKDAY_MIN_SCORE
+
             # ── BATCH: 1 sola llamada para todas las posiciones del exchange ──────
             all_ex_positions = exchange.get_all_positions()
 
@@ -168,10 +250,22 @@ def run() -> None:
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
-                    p             = positions.pop(symbol)
+                    p             = positions[symbol]
                     current_price = exchange.get_price(symbol)
 
                     exit_price, reason = _exit_price_for(p, current_price)
+
+                    # ── Intentar extend_tp antes de cerrar ─────────────
+                    if reason == "TP":
+                        extended = _try_extend_tp(
+                            symbol, p, current_price, feed, effective_min_score
+                        )
+                        if extended:
+                            # Posición sigue abierta con nuevo TP — no cerrar
+                            continue
+
+                    # Cerrar definitivamente
+                    positions.pop(symbol)
 
                     pnl_pct = (
                         (exit_price - p["entry"]) / p["entry"]
@@ -182,6 +276,7 @@ def run() -> None:
 
                     hit_tp = reason == "TP"
 
+                    # Cooldown solo si cierra por SL, o por TP sin señal válida
                     _cooldown[symbol] = time.time()
                     log.info(
                         "[%s] Cooldown activado (%dm) tras %s",
@@ -207,8 +302,9 @@ def run() -> None:
                         pnl_pct = pnl_pct,
                         reason  = reason + (" ✅" if hit_tp else " ❌"),
                     )
-                    log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT)",
-                             symbol, reason, pnl_pct, pnl_usdt)
+                    log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT) | ext=%d",
+                             symbol, reason, pnl_pct, pnl_usdt,
+                             p.get("tp_extensions", 0))
 
             # ── Purgar cooldowns expirados ──────────────────────────────
             expired = [
@@ -223,14 +319,16 @@ def run() -> None:
             for symbol, pos_ex in all_ex_positions.items():
                 if symbol not in positions:
                     positions[symbol] = {
-                        "side":       pos_ex["side"],
-                        "entry":      pos_ex["entry"],
-                        "qty":        pos_ex["size"],
-                        "sl":         pos_ex["sl"],
-                        "tp":         pos_ex["tp"],
-                        "trail_step": 0,
-                        "score":      70,
-                        "open_ts":    time.time(),
+                        "side":          pos_ex["side"],
+                        "entry":         pos_ex["entry"],
+                        "qty":           pos_ex["size"],
+                        "sl":            pos_ex["sl"],
+                        "tp":            pos_ex["tp"],
+                        "tp_original":   pos_ex["tp"],
+                        "tp_extensions": 0,
+                        "trail_step":    0,
+                        "score":         70,
+                        "open_ts":       time.time(),
                     }
                     log.info("[%s] Sincronizada: %s @ %.4f (sl=%s tp=%s)",
                              symbol, pos_ex["side"], pos_ex["entry"],
@@ -251,7 +349,6 @@ def run() -> None:
                     log.warning("[%s] Error trailing: %s", symbol, e)
 
             # ── Filtro fin de semana ────────────────────────────────────────
-            weekend = _is_weekend()
             if weekend:
                 today = datetime.now(timezone.utc).weekday()
                 if today != _weekend_notified_day:
@@ -267,9 +364,6 @@ def run() -> None:
 
             # ── Buscar señales nuevas ──────────────────────────────────────────
             if open_count < config.MAX_POSITIONS:
-                # Score mínimo efectivo: 70 entre semana, 90 en finde
-                effective_min_score = WEEKEND_MIN_SCORE if weekend else WEEKDAY_MIN_SCORE
-
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
                         continue
@@ -296,7 +390,6 @@ def run() -> None:
                         if not signal:
                             continue
 
-                        # Obtener régimen de mercado para TP_RR dinámico
                         try:
                             regime, _ = signals._market_regime(candles_1h)
                         except Exception:
@@ -324,16 +417,18 @@ def run() -> None:
                         )
 
                         positions[symbol] = {
-                            "side":       signal,
-                            "entry":      price,
-                            "qty":        params["qty"],
-                            "sl":         params["sl"],
-                            "tp":         params["tp"],
-                            "trail_step": params["trail_step"],
-                            "trail_high": price,
-                            "trail_low":  price,
-                            "score":      score,
-                            "open_ts":    time.time(),
+                            "side":          signal,
+                            "entry":         price,
+                            "qty":           params["qty"],
+                            "sl":            params["sl"],
+                            "tp":            params["tp"],
+                            "tp_original":   params["tp"],
+                            "tp_extensions": 0,
+                            "trail_step":    params["trail_step"],
+                            "trail_high":    price,
+                            "trail_low":     price,
+                            "score":         score,
+                            "open_ts":       time.time(),
                         }
 
                         telegram.notify_open(
