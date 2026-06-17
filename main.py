@@ -26,6 +26,7 @@ _cooldown: dict[str, float] = {}
 COOLDOWN          = 60 * 60
 MAX_TP_EXTENSIONS = 3
 TP_EXTEND_RR      = 1.5
+TP_EXTEND_THRESH  = 0.015  # extiende cuando precio está a <1.5% del TP
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -80,18 +81,46 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
 
 
-def _try_extend_tp(
+def _check_tp_extension(
     symbol: str,
     pos: dict,
     current_price: float,
     feed,
     effective_min_score: int,
-) -> bool:
+) -> None:
+    """Evalua proactivamente si extender el TP mientras la posición sigue abierta.
+
+    Se activa cuando el precio se acerca al TP dentro de TP_EXTEND_THRESH (1.5%).
+    Si la señal sigue activa, cancela la orden TP del exchange y coloca una nueva
+    más lejos, SIN cerrar la posición.
+    """
     extensions = pos.get("tp_extensions", 0)
     if extensions >= MAX_TP_EXTENSIONS:
-        log.info("[%s] Máx extensiones TP alcanzadas (%d) — cerrando", symbol, MAX_TP_EXTENSIONS)
-        return False
+        return
 
+    tp   = pos.get("tp")
+    side = pos["side"]
+    if tp is None:
+        return
+
+    # Comprobar proximidad al TP
+    dist_pct = abs(current_price - tp) / tp
+    if side == "long":
+        near_tp = current_price >= tp * (1 - TP_EXTEND_THRESH)
+    else:
+        near_tp = current_price <= tp * (1 + TP_EXTEND_THRESH)
+
+    if not near_tp:
+        return
+
+    # Evitar evaluar más de una vez por acercamiento (flag)
+    if pos.get("_extending"):
+        return
+    pos["_extending"] = True
+
+    log.info("[%s] Precio a %.2f%% del TP — evaluando extensión", symbol, dist_pct * 100)
+
+    # Evaluar señal
     try:
         candles_15m = feed.get(symbol, "15m")
         candles_1h  = feed.get(symbol, "1h")
@@ -102,16 +131,17 @@ def _try_extend_tp(
         )
     except Exception as e:
         log.warning("[%s] Error evaluando señal para extend_tp: %s", symbol, e)
-        return False
+        pos["_extending"] = False
+        return
 
-    if not signal or signal != pos["side"]:
-        log.info("[%s] Señal no válida para extend_tp (signal=%s, pos=%s) — cerrando",
-                 symbol, signal, pos["side"])
-        return False
+    if not signal or signal != side:
+        log.info("[%s] Señal no válida para extend_tp (signal=%s) — dejando TP actual", symbol, signal)
+        pos["_extending"] = False
+        return
 
+    # Calcular nuevo TP y SL breakeven
     entry        = pos["entry"]
-    tp_orig_dist = abs(pos.get("tp_original", pos["tp"]) - entry)
-    side         = pos["side"]
+    tp_orig_dist = abs(pos.get("tp_original", tp) - entry)
 
     if side == "long":
         new_tp = round(entry + tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
@@ -126,7 +156,8 @@ def _try_extend_tp(
         exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
     except Exception as e:
         log.warning("[%s] Error colocando órdenes en extend_tp: %s", symbol, e)
-        return False
+        pos["_extending"] = False
+        return
 
     old_tp = pos["tp"]
     pos["tp"]            = new_tp
@@ -134,6 +165,7 @@ def _try_extend_tp(
     pos["tp_extensions"] = extensions + 1
     pos["trail_high"]    = current_price
     pos["trail_low"]     = current_price
+    pos["_extending"]    = False   # reset para próxima extensión
 
     log.info(
         "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL→BE=%.6f | score=%d",
@@ -147,7 +179,6 @@ def _try_extend_tp(
         f"SL → Breakeven: <code>{new_sl:.6f}</code>\n"
         f"Score: {score}"
     )
-    return True
 
 
 def _wait_feed_ready(feed: KlineFeed) -> None:
@@ -235,18 +266,10 @@ def run() -> None:
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
-                    p             = positions[symbol]
+                    # Posición cerrada por el exchange (TP o SL ejecutado)
+                    p             = positions.pop(symbol)
                     current_price = exchange.get_price(symbol)
                     exit_price, reason = _exit_price_for(p, current_price)
-
-                    if reason == "TP":
-                        extended = _try_extend_tp(
-                            symbol, p, current_price, feed, effective_min_score
-                        )
-                        if extended:
-                            continue
-
-                    positions.pop(symbol)
 
                     pnl_pct = (
                         (exit_price - p["entry"]) / p["entry"]
@@ -297,6 +320,7 @@ def run() -> None:
                         "tp":            pos_ex["tp"],
                         "tp_original":   pos_ex["tp"],
                         "tp_extensions": 0,
+                        "_extending":    False,
                         "trail_step":    0,
                         "score":         70,
                         "open_ts":       time.time(),
@@ -313,12 +337,14 @@ def run() -> None:
                          feed.ready_count(), len(config.SYMBOLS), len(_cooldown),
                          bot_state.is_paused())
 
-            # ── Trailing stop ──────────────────────────────────────────────────
+            # ── Trailing stop + extend TP proactivo ────────────────────────────
             for symbol, pos in list(positions.items()):
                 try:
-                    _update_trailing(symbol, pos, exchange.get_price(symbol))
+                    price = exchange.get_price(symbol)
+                    _update_trailing(symbol, pos, price)
+                    _check_tp_extension(symbol, pos, price, feed, effective_min_score)
                 except Exception as e:
-                    log.warning("[%s] Error trailing: %s", symbol, e)
+                    log.warning("[%s] Error gestión posición: %s", symbol, e)
 
             # ── Filtro fin de semana ────────────────────────────────────────────
             if weekend:
@@ -396,6 +422,7 @@ def run() -> None:
                             "tp":            params["tp"],
                             "tp_original":   params["tp"],
                             "tp_extensions": 0,
+                            "_extending":    False,
                             "trail_step":    params["trail_step"],
                             "trail_high":    price,
                             "trail_low":     price,
