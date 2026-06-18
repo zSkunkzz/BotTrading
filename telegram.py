@@ -41,17 +41,16 @@ def notify_open(
     score: int = 0,
     tp_rr: float = 0.0,
 ) -> None:
-    emoji      = "🟢" if side == "long" else "🔴"
+    emoji      = "\U0001f7e2" if side == "long" else "\U0001f534"
     sl_pct     = abs(price - sl) / price * 100
     tp_pct     = abs(tp - price) / price * 100
     margin     = round(qty * price / config.LEVERAGE, 2)
     rr_str     = f"{tp_rr:.1f}" if tp_rr else "?"
     score_str  = f"{score}" if score else "?"
     _send(
-        f"{emoji} <b>ABIERTA — {symbol}</b>\n"
-        f"────────────────────
-"
-        f"Dirección: <b>{side.upper()}</b> | Score: <b>{score_str}</b> | RR: <b>{rr_str}</b>\n"
+        f"{emoji} <b>ABIERTA \u2014 {symbol}</b>\n"
+        "\u2500" * 20 + "\n"
+        f"Direcci\u00f3n: <b>{side.upper()}</b> | Score: <b>{score_str}</b> | RR: <b>{rr_str}</b>\n"
         f"Entry:  <code>{price:.4f}</code>\n"
         f"SL:     <code>{sl:.4f}</code>  <i>(-{sl_pct:.2f}%)</i>\n"
         f"TP:     <code>{tp:.4f}</code>  <i>(+{tp_pct:.2f}%)</i>\n"
@@ -70,9 +69,9 @@ def notify_close(
     reason: str = "",
     open_ts: float = 0.0,
 ) -> None:
-    emoji = "✅" if pnl_pct >= 0 else "❌"
+    emoji = "\u2705" if pnl_pct >= 0 else "\u274c"
 
-    # Duración
+    # Duraci\u00f3n
     if open_ts:
         dur_s = int(time.time() - open_ts)
         h, rem = divmod(dur_s, 3600)
@@ -82,17 +81,16 @@ def notify_close(
         dur_str = "?"
 
     # Limpiar reason (quitar emoji duplicado si viene de main.py)
-    reason_clean = reason.replace(" ✅", "").replace(" ❌", "").strip()
-    reason_icon  = "✅" if reason_clean == "TP" else ("❌" if reason_clean == "SL" else "")
+    reason_clean = reason.replace(" \u2705", "").replace(" \u274c", "").strip()
+    reason_icon  = "\u2705" if reason_clean == "TP" else ("\u274c" if reason_clean == "SL" else "")
     reason_str   = f"{reason_icon} {reason_clean}".strip()
 
     pnl_usdt_str = f"{pnl_usdt:+.4f} USDT" if pnl_usdt else ""
 
     _send(
-        f"{emoji} <b>CERRADA — {symbol}</b>\n"
-        f"────────────────────
-"
-        f"Dirección: <b>{side.upper()}</b> | Razón: <b>{reason_str}</b>\n"
+        f"{emoji} <b>CERRADA \u2014 {symbol}</b>\n"
+        + "\u2500" * 20 + "\n"
+        + f"Direcci\u00f3n: <b>{side.upper()}</b> | Raz\u00f3n: <b>{reason_str}</b>\n"
         f"Entry:  <code>{entry:.4f}</code>\n"
         f"Exit:   <code>{exit_p:.4f}</code>\n"
         f"PnL:    <code>{pnl_pct:+.2f}%</code>"
