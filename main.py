@@ -22,10 +22,10 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 _cooldown: dict[str, float] = {}
-_manual_alert_cooldown: dict[str, float] = {}  # cooldown independiente para alertas manuales
+_manual_alert_cooldown: dict[str, float] = {}
 
 COOLDOWN               = 60 * 60
-MANUAL_ALERT_COOLDOWN  = 60 * 60   # no repetir la misma alerta manual en 1h
+MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
 TP_EXTEND_THRESH       = 0.015
@@ -269,7 +269,6 @@ def run() -> None:
                     ) * config.LEVERAGE * 100
                     pnl_usdt = (pnl_pct / 100) * (p["qty"] * p["entry"] / config.LEVERAGE)
 
-                    hit_tp = reason == "TP"
                     _cooldown[symbol] = time.time()
                     log.info("[%s] Cooldown activado (%dm) tras %s", symbol, COOLDOWN // 60, reason)
 
@@ -285,12 +284,14 @@ def run() -> None:
                         open_ts    = p.get("open_ts", time.time()),
                     )
                     telegram.notify_close(
-                        symbol  = symbol,
-                        side    = p["side"],
-                        entry   = p["entry"],
-                        exit_p  = exit_price,
-                        pnl_pct = pnl_pct,
-                        reason  = reason + (" ✅" if hit_tp else " ❌"),
+                        symbol   = symbol,
+                        side     = p["side"],
+                        entry    = p["entry"],
+                        exit_p   = exit_price,
+                        pnl_pct  = pnl_pct,
+                        pnl_usdt = pnl_usdt,
+                        reason   = reason,
+                        open_ts  = p.get("open_ts", 0.0),
                     )
                     log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT) | ext=%d",
                              symbol, reason, pnl_pct, pnl_usdt, p.get("tp_extensions", 0))
@@ -370,11 +371,9 @@ def run() -> None:
 
                     is_manual = symbol in config.MANUAL_ALERT_SYMBOLS
 
-                    # Para alertas manuales: cooldown independiente
                     if is_manual and symbol in _manual_alert_cooldown:
                         continue
 
-                    # Para auto: respetar límite de posiciones
                     if not is_manual and open_count >= config.MAX_POSITIONS:
                         break
 
@@ -417,7 +416,7 @@ def run() -> None:
                             log.info("[%s] ALERTA MANUAL enviada | %s score=%d", symbol, signal.upper(), score)
                             continue
 
-                        # ── Modo automático ────────────────────────────────────
+                        # ── Modo automático ───────────────────────────────────
                         log.info(
                             "[%s] SEÑAL %s | regime=%s RR=%.1f | "
                             "entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d",
@@ -457,6 +456,8 @@ def run() -> None:
                             qty    = params["qty"],
                             sl     = params["sl"],
                             tp     = params["tp"],
+                            score  = score,
+                            tp_rr  = params["tp_rr"],
                         )
 
                     except Exception as e:
