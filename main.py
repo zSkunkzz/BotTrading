@@ -22,11 +22,13 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 _cooldown: dict[str, float] = {}
+_manual_alert_cooldown: dict[str, float] = {}  # cooldown independiente para alertas manuales
 
-COOLDOWN          = 60 * 60
-MAX_TP_EXTENSIONS = 3
-TP_EXTEND_RR      = 1.5
-TP_EXTEND_THRESH  = 0.015  # extiende cuando precio está a <1.5% del TP
+COOLDOWN               = 60 * 60
+MANUAL_ALERT_COOLDOWN  = 60 * 60   # no repetir la misma alerta manual en 1h
+MAX_TP_EXTENSIONS      = 3
+TP_EXTEND_RR           = 1.5
+TP_EXTEND_THRESH       = 0.015
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -88,12 +90,6 @@ def _check_tp_extension(
     feed,
     effective_min_score: int,
 ) -> None:
-    """Evalua proactivamente si extender el TP mientras la posición sigue abierta.
-
-    Se activa cuando el precio se acerca al TP dentro de TP_EXTEND_THRESH (1.5%).
-    Si la señal sigue activa, cancela la orden TP del exchange y coloca una nueva
-    más lejos, SIN cerrar la posición.
-    """
     extensions = pos.get("tp_extensions", 0)
     if extensions >= MAX_TP_EXTENSIONS:
         return
@@ -103,8 +99,6 @@ def _check_tp_extension(
     if tp is None:
         return
 
-    # Comprobar proximidad al TP
-    dist_pct = abs(current_price - tp) / tp
     if side == "long":
         near_tp = current_price >= tp * (1 - TP_EXTEND_THRESH)
     else:
@@ -113,14 +107,13 @@ def _check_tp_extension(
     if not near_tp:
         return
 
-    # Evitar evaluar más de una vez por acercamiento (flag)
     if pos.get("_extending"):
         return
     pos["_extending"] = True
 
+    dist_pct = abs(current_price - tp) / tp
     log.info("[%s] Precio a %.2f%% del TP — evaluando extensión", symbol, dist_pct * 100)
 
-    # Evaluar señal
     try:
         candles_15m = feed.get(symbol, "15m")
         candles_1h  = feed.get(symbol, "1h")
@@ -139,7 +132,6 @@ def _check_tp_extension(
         pos["_extending"] = False
         return
 
-    # Calcular nuevo TP y SL breakeven
     entry        = pos["entry"]
     tp_orig_dist = abs(pos.get("tp_original", tp) - entry)
 
@@ -165,7 +157,7 @@ def _check_tp_extension(
     pos["tp_extensions"] = extensions + 1
     pos["trail_high"]    = current_price
     pos["trail_low"]     = current_price
-    pos["_extending"]    = False   # reset para próxima extensión
+    pos["_extending"]    = False
 
     log.info(
         "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL→BE=%.6f | score=%d",
@@ -266,7 +258,6 @@ def run() -> None:
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
-                    # Posición cerrada por el exchange (TP o SL ejecutado)
                     p             = positions.pop(symbol)
                     current_price = exchange.get_price(symbol)
                     exit_price, reason = _exit_price_for(p, current_price)
@@ -309,6 +300,11 @@ def run() -> None:
             for sym in expired:
                 _cooldown.pop(sym, None)
                 log.info("[%s] Cooldown expirado — símbolo disponible", sym)
+
+            expired_alerts = [sym for sym, ts in _manual_alert_cooldown.items()
+                              if time.time() - ts >= MANUAL_ALERT_COOLDOWN]
+            for sym in expired_alerts:
+                _manual_alert_cooldown.pop(sym, None)
 
             for symbol, pos_ex in all_ex_positions.items():
                 if symbol not in positions:
@@ -360,21 +356,27 @@ def run() -> None:
                         f"Posiciones actuales siguen gestionándose con normalidad."
                     )
 
-            # ── Buscar señales nuevas (omitir si pausado) ──────────────────────
+            # ── Buscar señales ──────────────────────────────────────────────────
             if bot_state.is_paused():
                 log.debug("Bot pausado — saltando búsqueda de señales")
-            elif open_count < config.MAX_POSITIONS:
+            else:
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
                         continue
-                    if len(positions) >= config.MAX_POSITIONS:
-                        break
                     if not feed.ready(symbol):
                         continue
                     if symbol in _cooldown:
-                        remaining = int(COOLDOWN - (time.time() - _cooldown[symbol]))
-                        log.debug("[%s] En cooldown (%ds restantes)", symbol, remaining)
                         continue
+
+                    is_manual = symbol in config.MANUAL_ALERT_SYMBOLS
+
+                    # Para alertas manuales: cooldown independiente
+                    if is_manual and symbol in _manual_alert_cooldown:
+                        continue
+
+                    # Para auto: respetar límite de posiciones
+                    if not is_manual and open_count >= config.MAX_POSITIONS:
+                        break
 
                     try:
                         candles_15m = feed.get(symbol, "15m")
@@ -399,6 +401,23 @@ def run() -> None:
                             score=score, symbol=symbol, regime=regime,
                         )
 
+                        # ── Modo alerta manual ──────────────────────────────
+                        if is_manual:
+                            _manual_alert_cooldown[symbol] = time.time()
+                            side_icon = "🟡" if signal == "long" else "🔴"
+                            telegram.notify(
+                                f"🚨 <b>Alerta manual — {symbol}</b>\n\n"
+                                f"{side_icon} Dirección: <b>{signal.upper()}</b>\n"
+                                f"Precio actual: <code>{price:.2f}</code>\n"
+                                f"SL sugerido:   <code>{params['sl']:.2f}</code>\n"
+                                f"TP sugerido:   <code>{params['tp']:.2f}</code>\n"
+                                f"Score: <b>{score}</b>\n\n"
+                                f"⚠️ <i>Operación NO abierta automáticamente. Ábrela tú si lo consideras.</i>"
+                            )
+                            log.info("[%s] ALERTA MANUAL enviada | %s score=%d", symbol, signal.upper(), score)
+                            continue
+
+                        # ── Modo automático ────────────────────────────────────
                         log.info(
                             "[%s] SEÑAL %s | regime=%s RR=%.1f | "
                             "entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d",
@@ -429,6 +448,7 @@ def run() -> None:
                             "score":         score,
                             "open_ts":       time.time(),
                         }
+                        open_count += 1
 
                         telegram.notify_open(
                             symbol = symbol,

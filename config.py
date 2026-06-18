@@ -27,6 +27,10 @@ SYMBOLS = [
     "ZK-USDT",   "EIGEN-USDT","LISTA-USDT","MANTA-USDT","AERO-USDT",
 ]
 
+# Pares en modo alerta manual: el bot detecta la señal pero NO abre posición.
+# En su lugar manda un aviso a Telegram para que el usuario la ejecute a mano.
+MANUAL_ALERT_SYMBOLS = {"GOLD-USDT"}
+
 MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS", "7"))    # máximo simultáneo
 LEVERAGE       = int(os.getenv("LEVERAGE", "10"))
 MARGIN_USDT    = float(os.getenv("MARGIN_USDT", "20"))   # margen fijo por trade
