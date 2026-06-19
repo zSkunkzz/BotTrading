@@ -33,8 +33,8 @@ TP_EXTEND_THRESH       = 0.015
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
 
-WEEKDAY_MIN_SCORE = 70
-WEEKEND_MIN_SCORE = 90
+WEEKDAY_MIN_SCORE = config.MIN_SCORE
+WEEKEND_MIN_SCORE = config.WEEKEND_MIN_SCORE
 
 _weekend_notified_day: int = -1
 
@@ -193,37 +193,24 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _resolve_close(pos: dict, symbol: str) -> tuple[float, str]:
-    """Determina el precio de salida y razón real consultando el historial de BingX.
-
-    Prioridad:
-      1. Historial real de órdenes (get_closed_reason) — precio de ejecución exacto.
-      2. Fallback heurístico: compara precio actual con TP/SL conocidos.
-      3. Último fallback: precio de mercado actual + razón por PnL.
-    """
-    # 1. Historial real
+    """Determina el precio de salida y razón real consultando el historial de BingX."""
     reason, exit_price = exchange.get_closed_reason(symbol)
     if reason and exit_price:
         return exit_price, reason
 
-    # 2. Fallback heurístico con precio actual
     current_price = exchange.get_price(symbol)
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
 
     if tp is not None and sl is not None:
-        if side == "long":
-            dist_tp = abs(current_price - tp)
-            dist_sl = abs(current_price - sl)
-        else:
-            dist_tp = abs(current_price - tp)
-            dist_sl = abs(current_price - sl)
+        dist_tp = abs(current_price - tp)
+        dist_sl = abs(current_price - sl)
         if dist_tp < dist_sl:
             return tp, "TP"
         else:
             return sl, "SL"
 
-    # 3. Último fallback: precio actual, razón por PnL
     pnl_raw = (
         (current_price - pos["entry"]) / pos["entry"]
         if side == "long"
@@ -236,8 +223,10 @@ def run() -> None:
     global _weekend_notified_day
 
     log.info(
-        "Bot iniciado | %d pares | lev=%dx | margin=%s USDT | max=%d posiciones",
+        "Bot iniciado | %d pares | lev=%dx | margin=%s USDT | max=%d posiciones | "
+        "min_score=%d | weekend_min_score=%d",
         len(config.SYMBOLS), config.LEVERAGE, config.MARGIN_USDT, config.MAX_POSITIONS,
+        WEEKDAY_MIN_SCORE, WEEKEND_MIN_SCORE,
     )
 
     for symbol in config.SYMBOLS:
@@ -270,13 +259,11 @@ def run() -> None:
 
             all_ex_positions = exchange.get_all_positions()
 
-            # ── Sync posiciones abiertas ────────────────────────────────────────
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
                     p = positions.pop(symbol)
 
-                    # Precio de salida y razón real desde BingX
                     exit_price, reason = _resolve_close(p, symbol)
 
                     pnl_pct = (
@@ -313,7 +300,6 @@ def run() -> None:
                     log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT) | ext=%d",
                              symbol, reason, pnl_pct, pnl_usdt, p.get("tp_extensions", 0))
 
-            # ── Purgar cooldowns expirados ──────────────────────────────────────
             expired = [sym for sym, ts in _cooldown.items() if time.time() - ts >= COOLDOWN]
             for sym in expired:
                 _cooldown.pop(sym, None)
@@ -351,7 +337,6 @@ def run() -> None:
                          feed.ready_count(), len(config.SYMBOLS), len(_cooldown),
                          bot_state.is_paused())
 
-            # ── Trailing stop + extend TP proactivo ────────────────────────────
             for symbol, pos in list(positions.items()):
                 try:
                     price = exchange.get_price(symbol)
@@ -360,7 +345,6 @@ def run() -> None:
                 except Exception as e:
                     log.warning("[%s] Error gestión posición: %s", symbol, e)
 
-            # ── Filtro fin de semana ────────────────────────────────────────────
             if weekend:
                 today = datetime.now(timezone.utc).weekday()
                 if today != _weekend_notified_day:
@@ -374,7 +358,6 @@ def run() -> None:
                         f"Posiciones actuales siguen gestionándose con normalidad."
                     )
 
-            # ── Buscar señales ──────────────────────────────────────────────────
             if bot_state.is_paused():
                 log.debug("Bot pausado — saltando búsqueda de señales")
             else:
@@ -417,7 +400,6 @@ def run() -> None:
                             score=score, symbol=symbol, regime=regime,
                         )
 
-                        # ── Modo alerta manual ──────────────────────────────
                         if is_manual:
                             _manual_alert_cooldown[symbol] = time.time()
                             side_icon = "🟡" if signal == "long" else "🔴"
@@ -433,7 +415,6 @@ def run() -> None:
                             log.info("[%s] ALERTA MANUAL enviada | %s score=%d", symbol, signal.upper(), score)
                             continue
 
-                        # ── Modo automático ───────────────────────────────────
                         log.info(
                             "[%s] SEÑAL %s | regime=%s RR=%.1f | "
                             "entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d",

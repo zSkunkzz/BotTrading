@@ -42,9 +42,10 @@ SL_PCT         = float(os.getenv("SL_PCT", "1.5"))
 TP_PCT         = float(os.getenv("TP_PCT", "3.0"))
 
 # Señales
-TIMEFRAME      = os.getenv("TIMEFRAME", "15m")
-LOOP_SLEEP     = int(os.getenv("LOOP_SLEEP", "20"))      # segundos entre scans (20s con 50 pares)
-MIN_SCORE      = int(os.getenv("MIN_SCORE", "55"))       # score mínimo para abrir posición
+TIMEFRAME           = os.getenv("TIMEFRAME", "15m")
+LOOP_SLEEP          = int(os.getenv("LOOP_SLEEP", "20"))          # segundos entre scans
+MIN_SCORE           = int(os.getenv("MIN_SCORE", "55"))           # score mínimo días de semana
+WEEKEND_MIN_SCORE   = int(os.getenv("WEEKEND_MIN_SCORE", "90"))   # score mínimo fin de semana
 
 # Telegram
 TG_TOKEN       = os.getenv("TELEGRAM_TOKEN", "")
