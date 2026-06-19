@@ -5,6 +5,16 @@ NOVEDADES:
   - Persistencia de posiciones: guarda/restaura positions.json al arrancar.
     Sobrevive reinicios y deploys de Railway preservando open_ts, score,
     tp_original y tp_extensions.
+
+FIXES:
+  - spread inicializada a 0.0 antes del bloque is_manual para evitar
+    UnboundLocalError si el flujo llega al log.info de SEÑAL sin haberla
+    calculado (aunque is_manual hace continue antes, era un landmine).
+  - positions.json se borra cuando positions queda vacío para evitar
+    sincronización sucia en el siguiente reinicio.
+  - _extending se excluye del JSON persistido Y se marca False al restaurar;
+    se añade guard en _check_tp_extension para no re-extender si tp ya
+    supera tp_original * TP_EXTEND_RR (evita doble extensión tras reinicio).
 """
 import json
 import logging
@@ -42,8 +52,8 @@ TP_EXTEND_RR           = 1.5
 TP_EXTEND_THRESH       = 0.015
 
 # Breakeven: se activa cuando el precio alcanza entry + BE_RR × distancia_sl
-BE_RR          = 1.0   # 1 RR de ganancia → SL a breakeven
-BE_BUFFER      = 0.0003  # buffer mínimo sobre entry (0.03%) para cubrir fees
+BE_RR     = 1.0     # 1 RR de ganancia → SL a breakeven
+BE_BUFFER = 0.0003  # buffer mínimo sobre entry (0.03%) para cubrir fees
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -70,11 +80,22 @@ def _corr_group_count(symbol: str, positions: dict) -> int:
 # ── Persistencia de posiciones ────────────────────────────────────────────────
 
 def _save_positions(positions: dict) -> None:
-    """Serializa positions a JSON para sobrevivir reinicios."""
+    """Serializa positions a JSON para sobrevivir reinicios.
+
+    Si el dict está vacío se borra el fichero para no contaminar
+    la sincronización del siguiente arranque.
+    """
+    if not positions:
+        try:
+            if os.path.exists(POSITIONS_FILE):
+                os.remove(POSITIONS_FILE)
+        except Exception as e:
+            log.warning("Error borrando positions.json: %s", e)
+        return
     try:
         data = {}
         for sym, pos in positions.items():
-            # Excluye claves internas que no son serializables o son transitorias
+            # Excluye _extending: es estado transitorio, se restaura como False
             data[sym] = {k: v for k, v in pos.items() if k != "_extending"}
         with open(POSITIONS_FILE, "w") as f:
             json.dump(data, f)
@@ -95,10 +116,9 @@ def _load_positions() -> dict:
     try:
         with open(POSITIONS_FILE) as f:
             data = json.load(f)
-        # Asegura que todos los campos opcionales existen
         for sym, pos in data.items():
             pos.setdefault("tp_extensions", 0)
-            pos.setdefault("_extending", False)
+            pos.setdefault("_extending", False)   # siempre False al restaurar
             pos.setdefault("trail_step", 0)
             pos.setdefault("trail_high", pos.get("entry", 0))
             pos.setdefault("trail_low",  pos.get("entry", 0))
@@ -125,10 +145,10 @@ def _check_breakeven(symbol: str, pos: dict, current_price: float) -> None:
     if pos.get("sl") is None or pos.get("entry") is None:
         return
 
-    side  = pos["side"]
-    entry = pos["entry"]
-    sl    = pos["sl"]
-    risk_dist = abs(entry - sl)  # distancia entry→SL = 1 unidad de riesgo
+    side      = pos["side"]
+    entry     = pos["entry"]
+    sl        = pos["sl"]
+    risk_dist = abs(entry - sl)
 
     if risk_dist == 0:
         return
@@ -138,7 +158,7 @@ def _check_breakeven(symbol: str, pos: dict, current_price: float) -> None:
         if current_price < target:
             return
         new_sl = round(entry * (1 + BE_BUFFER), 6)
-        if new_sl <= sl:  # ya está mejor que entry — no mover hacia atrás
+        if new_sl <= sl:
             pos["breakeven_set"] = True
             return
     else:
@@ -164,8 +184,8 @@ def _check_breakeven(symbol: str, pos: dict, current_price: float) -> None:
         log.warning("[%s] Error colocando órdenes en breakeven: %s", symbol, e)
         return
 
-    pos["sl"]             = new_sl
-    pos["breakeven_set"]  = True
+    pos["sl"]            = new_sl
+    pos["breakeven_set"] = True
 
     telegram.notify(
         f"🔒 Breakeven activado\n"
@@ -233,6 +253,20 @@ def _check_tp_extension(
     side = pos["side"]
     if tp is None:
         return
+
+    # FIX: guard anti doble-extensión tras reinicio.
+    # Si _extending se restauró como False pero el TP ya fue extendido
+    # (tp > tp_original * TP_EXTEND_RR), no volvemos a extender en el mismo nivel.
+    entry        = pos["entry"]
+    tp_orig_dist = abs(pos.get("tp_original", tp) - entry)
+    if tp_orig_dist > 0:
+        expected_next_tp_dist = tp_orig_dist * TP_EXTEND_RR * (extensions + 2)
+        current_tp_dist       = abs(tp - entry)
+        if current_tp_dist >= expected_next_tp_dist * 0.95:
+            # TP ya está en el nivel que correspondía a la próxima extensión
+            log.debug("[%s] TP ya extendido al nivel correcto — saltando", symbol)
+            return
+
     if side == "long":
         near_tp = current_price >= tp * (1 - TP_EXTEND_THRESH)
     else:
@@ -264,9 +298,6 @@ def _check_tp_extension(
         pos["_extending"] = False
         return
 
-    entry        = pos["entry"]
-    tp_orig_dist = abs(pos.get("tp_original", tp) - entry)
-
     if side == "long":
         new_tp = round(entry + tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
         new_sl = round(entry * 1.0005, 6)
@@ -290,8 +321,7 @@ def _check_tp_extension(
     pos["trail_high"]    = current_price
     pos["trail_low"]     = current_price
     pos["_extending"]    = False
-    # Al extender TP el SL ya va a breakeven — marcar para no mover de nuevo
-    pos["breakeven_set"] = True
+    pos["breakeven_set"] = True  # extend_tp ya pone SL en BE
 
     log.info(
         "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL→BE=%.6f | score=%d",
@@ -373,10 +403,9 @@ def run() -> None:
     feed.start()
     _wait_feed_ready(feed)
 
-    # Restaurar posiciones desde JSON antes de sincronizar con exchange
     positions: dict = _load_positions()
     tg_commands.start(get_positions_fn=lambda: positions, feed=feed)
-    trade_logger.start_scheduler()   # también restaura daily loss desde CSV
+    trade_logger.start_scheduler()
 
     loop_count = 0
 
@@ -393,7 +422,7 @@ def run() -> None:
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
                     p = positions.pop(symbol)
-                    _save_positions(positions)  # persistir tras cierre
+                    _save_positions(positions)  # borra JSON si queda vacío
 
                     exit_price, reason = _resolve_close(p, symbol)
                     pnl_pct = (
@@ -455,7 +484,8 @@ def run() -> None:
                         "open_ts":       time.time(),
                         "breakeven_set": False,
                     }
-                    log.info("[%s] Sincronizada desde exchange: %s @ %.4f", symbol, pos_ex["side"], pos_ex["entry"])
+                    log.info("[%s] Sincronizada desde exchange: %s @ %.4f",
+                             symbol, pos_ex["side"], pos_ex["entry"])
 
             open_count = len(positions)
 
@@ -472,9 +502,9 @@ def run() -> None:
             for symbol, pos in list(positions.items()):
                 try:
                     price = exchange.get_price(symbol)
-                    _check_breakeven(symbol, pos, price)   # 1º: breakeven
-                    _update_trailing(symbol, pos, price)   # 2º: trailing
-                    _check_tp_extension(symbol, pos, price, feed, effective_min_score)  # 3º: extend
+                    _check_breakeven(symbol, pos, price)
+                    _update_trailing(symbol, pos, price)
+                    _check_tp_extension(symbol, pos, price, feed, effective_min_score)
                 except Exception as e:
                     log.warning("[%s] Error gestión posición: %s", symbol, e)
 
@@ -483,7 +513,8 @@ def run() -> None:
                 if today != _weekend_notified_day:
                     _weekend_notified_day = today
                     day_name = "Sábado" if today == 5 else "Domingo"
-                    log.info("Modo fin de semana activo (%s UTC) — score mínimo %d", day_name, WEEKEND_MIN_SCORE)
+                    log.info("Modo fin de semana activo (%s UTC) — score mínimo %d",
+                             day_name, WEEKEND_MIN_SCORE)
                     telegram.notify(
                         f"🚫 Modo fin de semana ({day_name})\n"
                         f"Score mínimo ≥ {WEEKEND_MIN_SCORE} para nuevas entradas."
@@ -531,6 +562,9 @@ def run() -> None:
                         if not signal:
                             continue
 
+                        # FIX: spread inicializada a 0.0 antes de cualquier rama
+                        # para evitar UnboundLocalError en el log.info de SEÑAL.
+                        spread = 0.0
                         if not is_manual:
                             spread = exchange.get_spread_pct(symbol)
                             if spread > config.MAX_SPREAD_PCT:
@@ -563,7 +597,8 @@ def run() -> None:
                                 f"Score: <b>{score}</b>\n\n"
                                 f"⚠️ <i>Operación NO abierta automáticamente.</i>"
                             )
-                            log.info("[%s] ALERTA MANUAL enviada | %s score=%d", symbol, signal.upper(), score)
+                            log.info("[%s] ALERTA MANUAL enviada | %s score=%d",
+                                     symbol, signal.upper(), score)
                             continue
 
                         log.info(
@@ -595,7 +630,7 @@ def run() -> None:
                             "breakeven_set": False,
                         }
                         open_count += 1
-                        _save_positions(positions)  # persistir tras apertura
+                        _save_positions(positions)
 
                         telegram.notify_open(
                             symbol=symbol, price=price, side=signal,

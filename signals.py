@@ -24,34 +24,11 @@ Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
 Sizing en risk.py: mult=0.7 (score<70) | 1.0 (70-84) | 1.4 (≥85)
 MIN_SCORE configurable via env var MIN_SCORE (default 55)
 
-NOTA sobre divergencia RSI 1h:
-  - Usa las últimas 15 velas 1h cerradas (ventana mayor = pivots más sólidos).
-  - Bullish: precio hace nuevo mínimo pero RSI no — momentum alcista oculto.
-  - Bearish: precio hace nuevo máximo pero RSI no — momentum bajista oculto.
-  - Se calcula sobre closed_1h (no incluye la vela abierta actual).
-  - Peso +12 vs +8 del 15m porque el marco superior tiene menos ruido.
-  - Independiente de la divergencia 15m: pueden darse ambas a la vez (+20).
-
-NOTA sobre S/R (price action):
-  - Pivots calculados sobre velas 1h (y 4h si disponibles) cerradas.
-  - Pivot alto: high[i] > max(high de N velas a cada lado). N=3 en 1h, N=2 en 4h.
-  - Pivot bajo: low[i]  < min(low  de N velas a cada lado).
-  - Zona: precio dentro del ZONE_PCT (0.4%) del nivel.
-  - Long cerca de soporte  → +10. Long cerca de resistencia → -10.
-  - Short cerca de resistencia → +10. Short cerca de soporte → -10.
-  - Si hay conflicto (soporte y resistencia a la vez), se aplica el más cercano.
-  - Si no hay ninguna zona cercana → 0 pts (neutro).
-
-NOTA sobre sesgo horario dinámico:
-  - Lee trades.csv y calcula el PnL medio por hora UTC.
-  - Si hay ≥20 trades en el CSV: usa PnL medio de la hora actual.
-    - PnL medio > +0.5% → +8 pts
-    - PnL medio < -0.5% → -10 pts
-    - Entre -0.5% y +0.5% → 0 pts (neutro)
-  - Si hay <20 trades (arranque): fallback a horas fijas:
-    - HIGH_BIAS_HOURS: {8,9,10,14,15,16,20,21} → +8
-    - LOW_BIAS_HOURS:  {2,3,4,5}               → -10
-  - El CSV se lee una vez por hora (caché con timestamp) para no penalizar I/O.
+FIXES:
+  - _rsi_divergence: max() con default=-1 para evitar ValueError con
+    generadores vacíos cuando los últimos 3 cierres dominan todo el lookback.
+  - _regime_confirmed: guard de longitud dentro del loop de offsets para
+    evitar pasar ventanas menores de 210 velas a _market_regime.
 """
 from __future__ import annotations
 import csv
@@ -81,15 +58,15 @@ HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
 
 # Sesgo horario dinámico — umbrales de PnL medio
-HOUR_BIAS_MIN_TRADES = 20    # mínimo de trades para activar el modo dinámico
-HOUR_BIAS_GOOD_PCT   = 0.5   # PnL medio > +0.5% → hora buena
-HOUR_BIAS_BAD_PCT    = -0.5  # PnL medio < -0.5% → hora mala
+HOUR_BIAS_MIN_TRADES = 20
+HOUR_BIAS_GOOD_PCT   = 0.5
+HOUR_BIAS_BAD_PCT    = -0.5
 
 # Caché del CSV horario (se recarga máx 1 vez/hora)
-_hour_bias_cache:      dict[int, float] = {}  # hora_utc → pnl_medio_%
-_hour_bias_cache_ts:   float = 0.0
-_hour_bias_cache_ttl:  float = 3600.0  # 1 hora
-_hour_bias_n_trades:   int   = 0
+_hour_bias_cache:     dict[int, float] = {}
+_hour_bias_cache_ts:  float = 0.0
+_hour_bias_cache_ttl: float = 3600.0
+_hour_bias_n_trades:  int   = 0
 
 
 # ── Indicadores ─────────────────────────────────────────────────────────
@@ -179,21 +156,33 @@ def _rsi_divergence(
     candles: list[dict],
     lookback: int = 10,
 ) -> str | None:
-    """Detecta divergencia RSI-precio en velas de cualquier timeframe."""
+    """Detecta divergencia RSI-precio en velas de cualquier timeframe.
+
+    FIX: max() usa default=-1 para evitar ValueError cuando el generador
+    queda vacío (todos los mínimos/máximos están en los últimos 3 elementos).
+    """
     if len(closes) < lookback + 14:
         return None
     rsi_series    = _rsi(closes, 14)
     recent_closes = closes[-lookback:]
     recent_rsi    = rsi_series[-lookback:]
 
+    # --- Divergencia alcista ---
     lo_val = min(recent_closes[:-3])
-    lo_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == lo_val)
-    if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
+    lo_idx = max(
+        (i for i, v in enumerate(recent_closes[:-3]) if v == lo_val),
+        default=-1,
+    )
+    if lo_idx != -1 and recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
+    # --- Divergencia bajista ---
     hi_val = max(recent_closes[:-3])
-    hi_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == hi_val)
-    if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
+    hi_idx = max(
+        (i for i, v in enumerate(recent_closes[:-3]) if v == hi_val),
+        default=-1,
+    )
+    if hi_idx != -1 and recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
 
     return None
@@ -285,7 +274,7 @@ def _load_hour_bias_from_csv() -> None:
 
     now = time.time()
     if now - _hour_bias_cache_ts < _hour_bias_cache_ttl:
-        return  # caché vigente
+        return
 
     csv_path = os.getenv("TRADES_CSV", "trades.csv")
     if not os.path.exists(csv_path):
@@ -300,7 +289,6 @@ def _load_hour_bias_from_csv() -> None:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
-                    # date format: "YYYY-MM-DD HH:MM"
                     hour = int(row["date"].split(" ")[1].split(":")[0])
                     pnl  = float(row["pnl_pct"])
                     hour_pnl[hour].append(pnl)
@@ -341,7 +329,6 @@ def _hour_bonus(hour_utc: int) -> int:
             return -10
         return 0
 
-    # Fallback: horas fijas
     if hour_utc in HIGH_BIAS_HOURS:
         return 8
     if hour_utc in LOW_BIAS_HOURS:
@@ -366,13 +353,20 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
 
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
-    """Devuelve el régimen solo si las últimas n velas cerradas coinciden."""
+    """Devuelve el régimen solo si las últimas n velas cerradas coinciden.
+
+    FIX: guard de longitud mínima (210 velas) dentro del loop para evitar
+    pasar ventanas demasiado cortas a _market_regime cuando n > 2.
+    """
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
 
     regimes = []
     for offset in range(n, 0, -1):
         window = candles_1h[:-offset]
+        # FIX: ventana demasiado corta para calcular EMA200 correctamente
+        if len(window) < 210:
+            return "range", 0.0
         regime, adx = _market_regime(window)
         regimes.append(regime)
 
@@ -419,13 +413,11 @@ def evaluate(
     closes_15m = [c["close"] for c in closed_15m]
     closes_1h  = [c["close"] for c in closed_1h]
 
-    # ── Hard-guard 1: Régimen confirmado ────────────────────────────────
     regime, adx_1h = _regime_confirmed(closed_1h)
     if regime == "range":
         log.info("⬛ Régimen lateral o inestable — sin señal")
         return None, 0
 
-    # ── Hard-guard 2: distancia EMA200 ──────────────────────────────────
     ema200 = _ema(closes_1h, 200)[-1]
     price  = closes_15m[-1]
     dist   = abs(price - ema200) / ema200
@@ -436,22 +428,19 @@ def evaluate(
     trend_long  = regime == "bull"
     trend_short = regime == "bear"
 
-    # ── Hard-guard 3: no-chase ──────────────────────────────────────────
     atr        = _atr(closed_15m, 14)
     last_range = closed_15m[-1]["high"] - closed_15m[-1]["low"]
     if atr > 0 and last_range > NO_CHASE_MULT * atr:
         log.info("⚠️  Vela explosiva — sin señal")
         return None, 0
 
-    # ── Hard-guard 4: ADX 15m mínimo ───────────────────────────────────
     adx = _adx(closed_15m, 14)
     if adx < ADX_MIN:
         log.info("⚠️  ADX 15m demasiado bajo (%.1f < %d) — mercado sin momentum", adx, ADX_MIN)
         return None, 0
 
-    # ── Componentes comunes ─────────────────────────────────────────────
     hour_utc   = datetime.datetime.now(timezone.utc).hour
-    hour_bonus = _hour_bonus(hour_utc)  # dinámico desde CSV o fallback fijo
+    hour_bonus = _hour_bonus(hour_utc)
 
     macro_long = macro_short = None
     if closed_4h and len(closed_4h) >= 55:
@@ -497,7 +486,6 @@ def evaluate(
             return 0
         return 15 if (macro and favor) else (-10 if (not macro and favor) else 0)
 
-    # ── Scoring LONG ────────────────────────────────────────────────────
     def score_long() -> int:
         if not trend_long:
             return 0
@@ -526,7 +514,6 @@ def evaluate(
         s += hour_bonus
         return min(max(s, 0), 100)
 
-    # ── Scoring SHORT ───────────────────────────────────────────────────
     def score_short() -> int:
         if not trend_short:
             return 0
