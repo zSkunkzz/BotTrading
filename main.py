@@ -15,6 +15,8 @@ FIXES:
   - _extending se excluye del JSON persistido Y se marca False al restaurar;
     se añade guard en _check_tp_extension para no re-extender si tp ya
     supera tp_original * TP_EXTEND_RR (evita doble extensión tras reinicio).
+  - FIX: exchange.set_leverage(symbol) → exchange.set_leverage(symbol, config.LEVERAGE)
+    El segundo argumento faltaba, causando WARNING en el arranque para los 52 pares.
 """
 import json
 import logging
@@ -388,9 +390,10 @@ def run() -> None:
         config.MAX_CORR_PER_GROUP, config.MAX_SPREAD_PCT,
     )
 
+    # FIX: se pasa config.LEVERAGE como segundo argumento (antes faltaba)
     for symbol in config.SYMBOLS:
         try:
-            exchange.set_leverage(symbol)
+            exchange.set_leverage(symbol, config.LEVERAGE)
         except Exception as e:
             log.warning("No se pudo setear leverage en %s: %s", symbol, e)
 
