@@ -13,14 +13,23 @@ Filtros:
   8. RSI 15m            : cruce 50 +15, extremo +8, direccional +4, contrario -5
   9. MACD 15m + 1h      : histograma acelerando +10 | positivo/negativo sin acelerar 0
                           | contrario -5
-  10. Divergencia RSI   : +8
-  11. Sesgo horario     : hora alta +8, hora baja -10
-  12. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
+  10. Divergencia RSI 15m: +8
+  11. Divergencia RSI 1h : +12 (marco superior — más fiable, menos ruido)
+  12. Sesgo horario     : hora alta +8, hora baja -10
+  13. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
 
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
 Sizing en risk.py: mult=0.7 (score<70) | 1.0 (70-84) | 1.4 (≥85)
 MIN_SCORE configurable via env var MIN_SCORE (default 55)
+
+NOTA sobre divergencia RSI 1h:
+  - Usa las últimas 15 velas 1h cerradas (ventana mayor = pivots más sólidos).
+  - Bullish: precio hace nuevo mínimo pero RSI no — momentum alcista oculto.
+  - Bearish: precio hace nuevo máximo pero RSI no — momentum bajista oculto.
+  - Se calcula sobre closed_1h (no incluye la vela abierta actual).
+  - Peso +12 vs +8 del 15m porque el marco superior tiene menos ruido.
+  - Independiente de la divergencia 15m: pueden darse ambas a la vez (+20).
 """
 from __future__ import annotations
 import logging
@@ -31,7 +40,7 @@ import config
 
 log = logging.getLogger("signals")
 
-# ── Umbrales configurables ────────────────────────────────────────────────
+# ── Umbrales configurables ────────────────────────────────────────────
 EMA200_MIN_DIST     = 0.003
 NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
@@ -43,7 +52,7 @@ HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
 
 
-# ── Indicadores ───────────────────────────────────────────────────────────────────
+# ── Indicadores ─────────────────────────────────────────────────────────────────────────
 
 def _ema(closes: list[float], period: int) -> list[float]:
     k = 2 / (period + 1)
@@ -125,19 +134,31 @@ def _adx(candles: list[dict], period: int = 14) -> float:
     return adx
 
 
-def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
-    """Detecta divergencia RSI-precio en la ventana reciente."""
+def _rsi_divergence(
+    closes: list[float],
+    candles: list[dict],
+    lookback: int = 10,
+) -> str | None:
+    """Detecta divergencia RSI-precio en velas de cualquier timeframe.
+
+    Bullish: precio hace nuevo mínimo pero RSI no — momentum alcista oculto.
+    Bearish: precio hace nuevo máximo pero RSI no — momentum bajista oculto.
+
+    Se evalúa sobre las últimas `lookback` velas ya cerradas.
+    """
     if len(closes) < lookback + 14:
         return None
     rsi_series    = _rsi(closes, 14)
     recent_closes = closes[-lookback:]
     recent_rsi    = rsi_series[-lookback:]
 
+    # Busca pivot de mínimo en los primeros (lookback - 3) puntos
     lo_val = min(recent_closes[:-3])
     lo_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == lo_val)
     if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
+    # Busca pivot de máximo en los primeros (lookback - 3) puntos
     hi_val = max(recent_closes[:-3])
     hi_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == hi_val)
     if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
@@ -147,15 +168,7 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
 
 
 def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
-    """Clasifica el régimen con alineación ESTRICTA de EMAs.
-
-    Bull:  price > ema20 > ema50 > ema200  (todas en orden ascendente)
-    Bear:  price < ema20 < ema50 < ema200  (todas en orden descendente)
-    Range: cualquier otra configuración — NO se abren posiciones.
-
-    FIX: eliminado el segundo bloque laxo que permitía bull/bear con solo
-    2 de las 3 condiciones, causando entradas en mercados laterales o contra-tendencia.
-    """
+    """Clasifica el régimen con alineación ESTRICTA de EMAs."""
     closes = [c["close"] for c in candles_1h]
     ema20  = _ema(closes, 20)[-1]
     ema50  = _ema(closes, 50)[-1]
@@ -193,12 +206,7 @@ def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> t
 
 
 def _volume_ok(candles: list[dict], window: int = 20) -> bool:
-    """Comprueba si el volumen de la última vela CERRADA supera la media.
-
-    FIX: usa candles[-2] (penúltima = última cerrada) en lugar de candles[-1]
-    (vela abierta que puede llevar solo unos minutos y tiene volumen artificialmente
-    bajo, filtrando señales válidas por volumen insuficiente).
-    """
+    """Comprueba si el volumen de la última vela CERRADA supera la media."""
     if len(candles) < window + 2:
         return True
     vols = [c["volume"] for c in candles[-(window + 2):-2]]
@@ -206,7 +214,7 @@ def _volume_ok(candles: list[dict], window: int = 20) -> bool:
     return candles[-2]["volume"] >= avg * VOLUME_MULT
 
 
-# ── Función principal ──────────────────────────────────────────────────────────────
+# ── Función principal ────────────────────────────────────────────────────────────────────────
 
 def evaluate(
     candles_15m: list[dict],
@@ -229,13 +237,13 @@ def evaluate(
     closes_15m = [c["close"] for c in closed_15m]
     closes_1h  = [c["close"] for c in closed_1h]
 
-    # ── Hard-guard 1: Régimen confirmado (alineación estricta de EMAs) ────
+    # ── Hard-guard 1: Régimen confirmado ────────────────────────────────
     regime, adx_1h = _regime_confirmed(closed_1h)
     if regime == "range":
         log.info("⬛ Régimen lateral o inestable — sin señal")
         return None, 0
 
-    # ── Hard-guard 2: distancia EMA200 ───────────────────────────────────
+    # ── Hard-guard 2: distancia EMA200 ──────────────────────────────────
     ema200 = _ema(closes_1h, 200)[-1]
     price  = closes_15m[-1]
     dist   = abs(price - ema200) / ema200
@@ -246,23 +254,20 @@ def evaluate(
     trend_long  = regime == "bull"
     trend_short = regime == "bear"
 
-    # ── Hard-guard 3: no-chase ────────────────────────────────────────────
+    # ── Hard-guard 3: no-chase ────────────────────────────────────────
     atr        = _atr(closed_15m, 14)
     last_range = closed_15m[-1]["high"] - closed_15m[-1]["low"]
     if atr > 0 and last_range > NO_CHASE_MULT * atr:
         log.info("⚠️  Vela explosiva — sin señal")
         return None, 0
 
-    # ── Hard-guard 4: ADX 15m mínimo ─────────────────────────────────────
-    # FIX: ADX < ADX_MIN indica mercado sin tendencia real en 15m.
-    # Antes solo penalizaba -15 pts (insuficiente para bloquear).
-    # Ahora es hard-guard: sin momentum direccional, sin señal.
+    # ── Hard-guard 4: ADX 15m mínimo ─────────────────────────────────
     adx = _adx(closed_15m, 14)
     if adx < ADX_MIN:
         log.info("⚠️  ADX 15m demasiado bajo (%.1f < %d) — mercado sin momentum", adx, ADX_MIN)
         return None, 0
 
-    # ── Componentes de score ──────────────────────────────────────────────
+    # ── Componentes comunes ────────────────────────────────────────────
     hour_utc   = datetime.datetime.now(timezone.utc).hour
     hour_bonus = 8 if hour_utc in HIGH_BIAS_HOURS else (-10 if hour_utc in LOW_BIAS_HOURS else 0)
 
@@ -284,16 +289,19 @@ def evaluate(
     rsi_ext_bull    = rsi_curr > 60
     rsi_ext_bear    = rsi_curr < 40
 
-    divergence = _rsi_divergence(closes_15m, closed_15m)
+    # Divergencia RSI en 15m (ventana 10 velas, lookback corto = reacción rápida)
+    divergence_15m = _rsi_divergence(closes_15m, closed_15m, lookback=10)
+
+    # Divergencia RSI en 1h (ventana 15 velas, peso mayor porque el marco es superior).
+    # Ventana más grande (15 vs 10) para capturar pivots de mayor entidad.
+    # Requiere al menos 15+14=29 velas 1h cerradas.
+    divergence_1h: str | None = None
+    if len(closes_1h) >= 29:
+        divergence_1h = _rsi_divergence(closes_1h, closed_1h, lookback=15)
 
     hist_15m = _macd_histogram(closes_15m)
     hist_1h  = _macd_histogram(closes_1h)
 
-    # MACD 15m:
-    #   +10 si histograma acelera en dirección correcta (momentum real)
-    #   0   si histograma está en dirección correcta pero desacelerando
-    #        FIX: antes era +5, lo que recompensaba momentum agotándose.
-    #   -5  si histograma va en contra
     macd15_bull_strong = hist_15m[-1] > 0 and hist_15m[-1] > hist_15m[-2]
     macd15_bull_weak   = hist_15m[-1] > 0
     macd15_bear_strong = hist_15m[-1] < 0 and hist_15m[-1] < hist_15m[-2]
@@ -309,36 +317,35 @@ def evaluate(
             return 0
         return 15 if (macro and favor) else (-10 if (not macro and favor) else 0)
 
-    # ── Scoring LONG ──────────────────────────────────────────────────────
+    # ── Scoring LONG ──────────────────────────────────────────────────
     def score_long() -> int:
         if not trend_long:
             return 0
         s = 20
         s += _macro_pts(macro_long, favor=True)
-        # ADX ya superó el hard-guard (>= ADX_MIN), scoring desde ahí
         if adx > 35:        s += 12
         elif adx > 25:      s += 6
         elif adx > 18:      s -= 8
-        # adx < 18 ya bloqueado arriba como hard-guard
         if adx_1h < 18:     s -= 5
         elif adx_1h > 25:   s += 5
         if rsi_cross_up:    s += 15
         elif rsi_ext_bull:  s += 8
         elif rsi_bull:      s += 4
         else:               s -= 5
-        # MACD 15m: +10 acelerando, 0 positivo sin acelerar (agotamiento), -5 en contra
-        if macd15_bull_strong:   s += 10
-        elif macd15_bull_weak:   s += 0
+        if macd15_bull_strong:    s += 10
+        elif macd15_bull_weak:    s += 0
         elif not macd15_bear_weak: s += 0
-        else:                    s -= 5
+        else:                     s -= 5
         if macd1h_bull:     s += 10
         else:               s -= 5
         if vol_ok:          s += 8
-        if divergence == "bullish": s += 8
+        # Divergencias (independientes entre sí, acumulables)
+        if divergence_15m == "bullish":  s += 8
+        if divergence_1h  == "bullish":  s += 12
         s += hour_bonus
         return min(max(s, 0), 100)
 
-    # ── Scoring SHORT ─────────────────────────────────────────────────────
+    # ── Scoring SHORT ─────────────────────────────────────────────────
     def score_short() -> int:
         if not trend_short:
             return 0
@@ -353,15 +360,16 @@ def evaluate(
         elif rsi_ext_bear:   s += 8
         elif rsi_bear:       s += 4
         else:                s -= 5
-        # MACD 15m: +10 acelerando, 0 negativo sin acelerar (agotamiento), -5 en contra
-        if macd15_bear_strong:   s += 10
-        elif macd15_bear_weak:   s += 0
+        if macd15_bear_strong:    s += 10
+        elif macd15_bear_weak:    s += 0
         elif not macd15_bull_weak: s += 0
-        else:                    s -= 5
+        else:                     s -= 5
         if macd1h_bear:      s += 10
-        else:                s -= 5
+        else:               s -= 5
         if vol_ok:           s += 8
-        if divergence == "bearish": s += 8
+        # Divergencias (independientes entre sí, acumulables)
+        if divergence_15m == "bearish":  s += 8
+        if divergence_1h  == "bearish":  s += 12
         s += hour_bonus
         return min(max(s, 0), 100)
 
@@ -373,21 +381,23 @@ def evaluate(
 
     log.info(
         "regime=%s(×%d) adx1h=%.1f hour=%dUTC | price=%.4f ema200=%.4f dist=%.3f%% "
-        "ADX15m=%.1f rsi=%.1f→%.1f vol=%s diverg=%s macro_l=%s macro_s=%s "
+        "ADX15m=%.1f rsi=%.1f→%.1f vol=%s "
+        "div15m=%s div1h=%s macro_l=%s macro_s=%s "
         "macd15=%.5f macd1h=%.5f | score_long=%d score_short=%d (min=%d)",
         regime, REGIME_CONFIRM_BARS, adx_1h, hour_utc, price, ema200, dist * 100,
-        adx, rsi_prev, rsi_curr, vol_ok, divergence,
+        adx, rsi_prev, rsi_curr, vol_ok,
+        divergence_15m, divergence_1h,
         macro_l_str, macro_s_str,
         hist_15m[-1], hist_1h[-1],
         sc_long, sc_short, effective_min,
     )
 
     if sc_long >= effective_min and sc_long >= sc_short:
-        log.info("✅ LONG score=%d", sc_long)
+        log.info("✅ LONG score=%d (div15m=%s div1h=%s)", sc_long, divergence_15m, divergence_1h)
         return "long", sc_long
 
     if sc_short >= effective_min:
-        log.info("✅ SHORT score=%d", sc_short)
+        log.info("✅ SHORT score=%d (div15m=%s div1h=%s)", sc_short, divergence_15m, divergence_1h)
         return "short", sc_short
 
     log.info("⬛ Sin señal (score L=%d S=%d < %d)", sc_long, sc_short, effective_min)
