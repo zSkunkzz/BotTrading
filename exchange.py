@@ -2,47 +2,24 @@
 
 FIXES aplicados:
   1. _post() enviaba params en el body (data=); BingX los exige en la query string.
-     Ahora tanto GET como POST usan params= (query string), que es lo que BingX firma.
-  2. La firma se calcula sobre la query string real (urllib.parse.urlencode sin sorted),
-     igual que lo hace BingX internamente, evitando "signature does not match".
-  3. Reintentos automáticos (3 intentos, backoff 1s) para RemoteProtocolError y
-     timeouts intermitentes que estaban silenciando órdenes.
-     FIX: timestamp y firma se renuevan en CADA intento para evitar que un timeout
-     de 10s deje el segundo reintento con un timestamp ya expirado (BingX rechaza >5s).
-  4. calc_qty() aplica floor al step size de cada símbolo para no enviar qty
-     que BingX rechaza por precisión decimal.
-  5. cancel_all_orders usa DELETE (no POST) — BingX exige DELETE para este endpoint.
-  6. get_ohlcv incluye el timestamp 'ts' en cada vela para que ws_feed pueda
-     deduplicar correctamente al mezclar velas REST con las del WebSocket.
-  7. get_all_positions() obtiene TODAS las posiciones abiertas en 1 sola llamada
-     (sin 'symbol'), reduciendo 74 llamadas por loop a 1.
-     FIX: si la llamada falla, lanza excepción en vez de devolver {} silencioso
-     para evitar que main.py interprete todas las posiciones como cerradas.
-  8. get_closed_reason() consulta el historial real de órdenes ejecutadas para
-     determinar si la posición cerró por TP o SL, junto con el precio de ejecución.
-     FIX: lookback ampliado a 30 minutos para cubrir loops lentos con muchos pares.
-  9. get_spread_pct() consulta el orderbook nivel 1 y devuelve el spread como
-     porcentaje del mid price. Usado en main.py para filtrar pares ilíquidos
-     antes de abrir posición.
-  10. FIX: _request() lanzaba `raise None` (TypeError) si todos los reintentos
-      fallaban por HTTPStatusError (que hace raise dentro del loop) seguido de
-      salida del bucle sin asignar last_exc. Ahora lanza RuntimeError explícito
-      si last_exc es None al final del loop.
-  11. FIX: añadida set_leverage() — faltaba por completo, causaba WARNING en
-      el arranque para los 52 pares.
-  12. FIX: añadidas open_order(), place_stop_order() y place_tp_order() —
-      faltaban por completo.
-  13. FIX: open_order() separada en MARKET + SL/TP independientes. Eliminado
-      positionSide (incompatible con cuentas One-way). reduceOnly como "true".
-  14. FIX CRITÍCO: _request() no verificaba el campo 'code' del body de BingX.
-      BingX devuelve errores de negocio con HTTP 200 y code != 0 en el JSON
-      (ej: {"code": -1102, "msg": "Mandatory parameter side was not sent"}).
-      Ahora se lanza RuntimeError con el mensaje de BingX si code != 0.
-      Esto explica por qué las órdenes no se ejecutaban: el bot recibía 200 OK,
-      no detectaba el error, registraba la posición en memoria y enviaba
-      la notificación de Telegram, pero la orden nunca llegó al exchange.
-  15. FIX: quantity enviada como string formateado (evita notación científica
-      en floats pequeños que BingX rechaza, ej: 1e-04 en vez de 0.0001).
+  2. La firma se calcula sobre la query string real (urllib.parse.urlencode sin sorted).
+  3. Reintentos automáticos con timestamp renovado en cada intento.
+  4. calc_qty() aplica floor al step size.
+  5. cancel_all_orders usa DELETE.
+  6. get_ohlcv incluye el timestamp 'ts' en cada vela.
+  7. get_all_positions() batch en 1 sola llamada.
+  8. get_closed_reason() lookback ampliado a 30 minutos.
+  9. get_spread_pct() consulta el orderbook nivel 1.
+  10. _request() lanza RuntimeError explícito si todos los reintentos fallan.
+  11. set_leverage() añadida.
+  12. open_order(), place_stop_order() y place_tp_order() añadidas.
+  13. open_order() separada en MARKET + SL/TP independientes.
+  14. FIX CRÍTICO: _request() ahora valida code != 0 en el body (HTTP 200 con error).
+  15. quantity y stopPrice enviados como strings formateados (evita notación científica).
+  16. FIX: añadido positionSide a todas las órdenes — la cuenta está en modo Hedge,
+      que requiere LONG/SHORT explícito. La orden de apertura usa el lado de la
+      posición. Las órdenes de cierre (SL/TP) usan el lado opuesto y eliminan
+      reduceOnly (incompatible con positionSide en BingX).
 """
 import hashlib
 import hmac
@@ -59,7 +36,6 @@ log = logging.getLogger("exchange")
 # ── Firma ─────────────────────────────────────────────────────────────────────────────
 
 def _sign(params: dict) -> str:
-    """Firma la query string tal como la construye urllib / BingX."""
     payload = urllib.parse.urlencode(params)
     return hmac.new(
         config.API_SECRET.encode(),
@@ -79,11 +55,6 @@ _RETRY_WAIT = 1.0
 
 
 def _request(method: str, path: str, params: dict) -> dict:
-    """GET, POST o DELETE enviando siempre los parámetros en la query string (BingX V2).
-
-    FIX: BingX devuelve errores de negocio con HTTP 200 y code != 0 en el body.
-    Ahora se verifica el campo 'code' y se lanza RuntimeError si no es 0.
-    """
     base_params = {k: v for k, v in params.items() if k not in ("timestamp", "signature")}
     url = config.BASE_URL + path
 
@@ -94,22 +65,14 @@ def _request(method: str, path: str, params: dict) -> dict:
         signed["signature"] = _sign(signed)
 
         try:
-            r = httpx.request(
-                method,
-                url,
-                params=signed,
-                headers=_headers(),
-                timeout=10,
-            )
+            r = httpx.request(method, url, params=signed, headers=_headers(), timeout=10)
             r.raise_for_status()
             body = r.json()
 
-            # FIX CRÍTICO: BingX usa HTTP 200 incluso para errores de negocio.
-            # El campo 'code' indica éxito (0) o error (!= 0).
             code = body.get("code", 0)
             if code != 0:
                 msg = body.get("msg", "sin mensaje")
-                log.error("[BingX] Error de negocio en %s: code=%s msg=%s | params=%s",
+                log.error("[BingX] Error en %s: code=%s msg=%s | params=%s",
                           path, code, msg, base_params)
                 raise RuntimeError(f"BingX error {code}: {msg}")
 
@@ -130,19 +93,26 @@ def _request(method: str, path: str, params: dict) -> dict:
 def _get(path: str, params: dict = None) -> dict:
     return _request("GET", path, params or {})
 
-
 def _post(path: str, params: dict = None) -> dict:
     return _request("POST", path, params or {})
-
 
 def _delete(path: str, params: dict = None) -> dict:
     return _request("DELETE", path, params or {})
 
 
+# ── Helpers de formato ───────────────────────────────────────────────────────────
+
+def _fmt_qty(qty: float) -> str:
+    """Sin notación científica (BingX rechaza '1e-04')."""
+    return f"{qty:.8f}".rstrip("0").rstrip(".")
+
+def _fmt_price(price: float) -> str:
+    return f"{price:.8f}".rstrip("0").rstrip(".")
+
+
 # ── Leverage ──────────────────────────────────────────────────────────────────────────
 
 def set_leverage(symbol: str, leverage: int) -> None:
-    """Configura el leverage para LONG y SHORT en BingX."""
     for side in ("LONG", "SHORT"):
         _post("/openApi/swap/v2/trade/leverage", {
             "symbol":   symbol,
@@ -163,7 +133,6 @@ def get_price(symbol: str = None) -> float:
 # ── Spread / liquidez ────────────────────────────────────────────────────────────
 
 def get_spread_pct(symbol: str) -> float:
-    """Consulta el orderbook nivel 1 y devuelve el spread como porcentaje del mid price."""
     try:
         data = _get("/openApi/swap/v2/quote/depth", {"symbol": symbol, "limit": 5})
         book = data.get("data", {})
@@ -185,7 +154,6 @@ def get_spread_pct(symbol: str) -> float:
 # ── OHLCV ───────────────────────────────────────────────────────────────────────────
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
-    """Devuelve lista de velas [{ts, open, high, low, close, volume}] más reciente al final."""
     symbol   = symbol or config.SYMBOL
     interval = interval or config.TIMEFRAME
     data = _get("/openApi/swap/v3/quote/klines", {
@@ -245,27 +213,21 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
     return (qty * price) >= min_usdt
 
 
-def _fmt_qty(qty: float) -> str:
-    """Formatea qty sin notación científica (BingX rechaza '1e-04')."""
-    return f"{qty:.8f}".rstrip("0").rstrip(".")
-
-
-def _fmt_price(price: float) -> str:
-    """Formatea precio sin notación científica."""
-    return f"{price:.8f}".rstrip("0").rstrip(".")
-
-
 # ── Órdenes ──────────────────────────────────────────────────────────────────────────
 
-def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
-    """Abre una posición MARKET y luego coloca SL y TP con llamadas separadas.
+# Mapa: lado de la posición (bot) → positionSide de BingX (Hedge mode)
+_POSITION_SIDE = {"long": "LONG", "short": "SHORT"}
 
-    FIX: eliminado stopLoss/takeProfit JSON en query string (URL-encoding lo rompe).
-    FIX: eliminado positionSide (cuenta One-way devuelve 400 si lo recibe).
-    FIX: quantity enviada como string formateado para evitar notación científica.
+
+def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
+    """Abre posición MARKET en modo Hedge (positionSide requerido por BingX).
+
+    Paso 1: orden MARKET de apertura con positionSide.
+    Paso 2: SL y TP con llamadas separadas tras 0.5s de espera.
     """
-    symbol     = symbol or config.SYMBOL
-    bingx_side = "BUY" if side == "long" else "SELL"
+    symbol       = symbol or config.SYMBOL
+    bingx_side   = "BUY" if side == "long" else "SELL"
+    position_side = _POSITION_SIDE[side]
 
     info = _get_contract_info(symbol)
     qty  = floor_qty(qty, info["stepSize"])
@@ -273,17 +235,17 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     log.info("[%s] Abriendo MARKET %s qty=%s sl=%s tp=%s",
              symbol, side.upper(), _fmt_qty(qty), _fmt_price(sl), _fmt_price(tp))
 
-    # Paso 1: orden MARKET (sin positionSide, sin SL/TP embebido)
     resp = _post("/openApi/swap/v2/trade/order", {
-        "symbol":   symbol,
-        "side":     bingx_side,
-        "type":     "MARKET",
-        "quantity": _fmt_qty(qty),
+        "symbol":       symbol,
+        "side":         bingx_side,
+        "positionSide": position_side,
+        "type":         "MARKET",
+        "quantity":     _fmt_qty(qty),
     })
     log.info("[%s] MARKET ejecutada: %s orderId=%s",
-             symbol, side.upper(), resp.get("data", {}).get("order", {}).get("orderId", "?"))
+             symbol, side.upper(),
+             resp.get("data", {}).get("order", {}).get("orderId", "?"))
 
-    # Paso 2: SL y TP por separado (BingX necesita que la posición exista)
     time.sleep(0.5)
     try:
         place_stop_order(symbol, side, qty, sl)
@@ -298,51 +260,53 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
 
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> dict:
-    """Coloca una orden STOP_MARKET de cierre (SL).
+    """SL (STOP_MARKET) en modo Hedge.
 
-    FIX: eliminado positionSide (One-way). reduceOnly como string "true".
-    FIX: stopPrice y quantity como strings formateados.
+    En Hedge mode la orden de cierre lleva el positionSide de la posición
+    que queremos cerrar (no el lado de la orden). reduceOnly es incompatible
+    con positionSide en BingX y se omite.
     """
-    close_side = "SELL" if side == "long" else "BUY"
-    params = {
-        "symbol":      symbol,
-        "side":        close_side,
-        "type":        "STOP_MARKET",
-        "quantity":    _fmt_qty(qty),
-        "stopPrice":   _fmt_price(stop_price),
-        "workingType": "MARK_PRICE",
-        "reduceOnly":  "true",
-    }
-    resp = _post("/openApi/swap/v2/trade/order", params)
+    # En Hedge: para cerrar un LONG se vende con side=SELL + positionSide=LONG
+    close_side    = "SELL" if side == "long" else "BUY"
+    position_side = _POSITION_SIDE[side]   # el lado de la posición que cierro
+
+    resp = _post("/openApi/swap/v2/trade/order", {
+        "symbol":       symbol,
+        "side":         close_side,
+        "positionSide": position_side,
+        "type":         "STOP_MARKET",
+        "quantity":     _fmt_qty(qty),
+        "stopPrice":    _fmt_price(stop_price),
+        "workingType":  "MARK_PRICE",
+    })
     log.info("[%s] SL colocado: %s qty=%s @ %s",
              symbol, side.upper(), _fmt_qty(qty), _fmt_price(stop_price))
     return resp
 
 
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> dict:
-    """Coloca una orden TAKE_PROFIT_MARKET de cierre (TP).
+    """TP (TAKE_PROFIT_MARKET) en modo Hedge.
 
-    FIX: eliminado positionSide (One-way). reduceOnly como string "true".
-    FIX: stopPrice y quantity como strings formateados.
+    Igual que place_stop_order: positionSide del lado que cierro, sin reduceOnly.
     """
-    close_side = "SELL" if side == "long" else "BUY"
-    params = {
-        "symbol":      symbol,
-        "side":        close_side,
-        "type":        "TAKE_PROFIT_MARKET",
-        "quantity":    _fmt_qty(qty),
-        "stopPrice":   _fmt_price(tp_price),
-        "workingType": "MARK_PRICE",
-        "reduceOnly":  "true",
-    }
-    resp = _post("/openApi/swap/v2/trade/order", params)
+    close_side    = "SELL" if side == "long" else "BUY"
+    position_side = _POSITION_SIDE[side]
+
+    resp = _post("/openApi/swap/v2/trade/order", {
+        "symbol":       symbol,
+        "side":         close_side,
+        "positionSide": position_side,
+        "type":         "TAKE_PROFIT_MARKET",
+        "quantity":     _fmt_qty(qty),
+        "stopPrice":    _fmt_price(tp_price),
+        "workingType":  "MARK_PRICE",
+    })
     log.info("[%s] TP colocado: %s qty=%s @ %s",
              symbol, side.upper(), _fmt_qty(qty), _fmt_price(tp_price))
     return resp
 
 
 def cancel_all_orders(symbol: str) -> dict:
-    """Cancela todas las órdenes abiertas para el símbolo (BingX exige DELETE)."""
     try:
         resp = _delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
         log.debug("[%s] Órdenes canceladas", symbol)
@@ -365,7 +329,6 @@ def _parse_position(p: dict) -> dict:
 
 
 def get_all_positions() -> dict[str, dict]:
-    """BATCH: devuelve {symbol: pos_dict} para todas las posiciones abiertas."""
     data = _get("/openApi/swap/v2/user/positions", {})
     result: dict[str, dict] = {}
     for p in (data.get("data") or []):
@@ -377,8 +340,7 @@ def get_all_positions() -> dict[str, dict]:
 def get_position(symbol: str = None) -> dict | None:
     symbol = symbol or config.SYMBOL
     data = _get("/openApi/swap/v2/user/positions", {"symbol": symbol})
-    positions = data.get("data") or []
-    for p in positions:
+    for p in (data.get("data") or []):
         if float(p.get("positionAmt", 0)) != 0:
             return _parse_position(p)
     return None
@@ -387,10 +349,9 @@ def get_position(symbol: str = None) -> dict | None:
 # ── Historial de cierre real ────────────────────────────────────────────────────
 
 _CLOSE_ORDER_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET"}
-_CLOSE_LOOK_BACK  = 30 * 60 * 1000   # 30 minutos en ms
+_CLOSE_LOOK_BACK  = 30 * 60 * 1000
 
 def get_closed_reason(symbol: str) -> tuple[str, float]:
-    """Consulta el historial de órdenes ejecutadas para determinar si cerró por TP o SL."""
     try:
         start_ts = int(time.time() * 1000) - _CLOSE_LOOK_BACK
         data = _get("/openApi/swap/v2/trade/allOrders", {
@@ -399,7 +360,6 @@ def get_closed_reason(symbol: str) -> tuple[str, float]:
             "limit":     20,
         })
         orders = data.get("data", {}).get("orders") or []
-
         filled = [
             o for o in orders
             if o.get("status") == "FILLED"
@@ -413,10 +373,8 @@ def get_closed_reason(symbol: str) -> tuple[str, float]:
         latest     = filled[0]
         order_type = latest.get("type", "")
         avg_price  = float(latest.get("avgPrice") or latest.get("stopPrice") or 0)
-
-        reason = "TP" if order_type == "TAKE_PROFIT_MARKET" else "SL"
-        log.info("[%s] Cierre detectado: %s @ %.6f (orden tipo=%s)",
-                 symbol, reason, avg_price, order_type)
+        reason     = "TP" if order_type == "TAKE_PROFIT_MARKET" else "SL"
+        log.info("[%s] Cierre detectado: %s @ %.6f", symbol, reason, avg_price)
         return reason, avg_price
 
     except Exception as exc:
