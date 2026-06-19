@@ -9,6 +9,10 @@ limite diario sobrevive reinicios y deploys de Railway.
 
 Variables de entorno:
     TG_LOG_CHAT_ID  : chat_id del canal de logs (si no se define, usa TG_CHAT_ID)
+
+FIX: _cache protegido con _cache_lock (threading.Lock) para evitar race conditions
+     entre el thread del loop principal (record/append) y el thread de Telegram
+     (_fetch_trade_history / _check_winrate).
 """
 import csv
 import logging
@@ -30,7 +34,10 @@ HEADER    = ["date","symbol","side","entry","exit","pnl_pct","pnl_usdt","score",
 _API         = f"https://api.telegram.org/bot{config.TG_TOKEN}"
 _LOG_CHAT_ID = os.getenv("TG_LOG_CHAT_ID") or config.TG_CHAT_ID
 
-_csv_lock: threading.Lock = threading.Lock()
+_csv_lock:   threading.Lock = threading.Lock()
+# FIX: lock independiente para _cache — protege accesos concurrentes entre
+# el loop principal (record) y el thread de Telegram (tg_commands._fetch_trade_history).
+_cache_lock: threading.Lock = threading.Lock()
 _cache: list[dict] = []
 
 # ── Daily drawdown tracking ───────────────────────────────────────────────────
@@ -84,18 +91,19 @@ def _restore_daily_loss_from_csv() -> None:
                         recovered_loss += abs(pnl)
                     recovered_trades += 1
                     # Reconstruir caché del día para win rate monitor
-                    _cache.append({
-                        "date":     row["date"],
-                        "symbol":   row["symbol"],
-                        "side":     row["side"],
-                        "entry":    float(row["entry"]),
-                        "exit":     float(row["exit"]),
-                        "pnl_pct":  float(row["pnl_pct"]),
-                        "pnl_usdt": pnl,
-                        "score":    int(row.get("score", 0)),
-                        "reason":   row["reason"],
-                        "duration": float(row.get("duration_min", 0)),
-                    })
+                    with _cache_lock:
+                        _cache.append({
+                            "date":     row["date"],
+                            "symbol":   row["symbol"],
+                            "side":     row["side"],
+                            "entry":    float(row["entry"]),
+                            "exit":     float(row["exit"]),
+                            "pnl_pct":  float(row["pnl_pct"]),
+                            "pnl_usdt": pnl,
+                            "score":    int(row.get("score", 0)),
+                            "reason":   row["reason"],
+                            "duration": float(row.get("duration_min", 0)),
+                        })
                 except (ValueError, KeyError):
                     continue
 
@@ -153,10 +161,13 @@ def _check_winrate() -> None:
     lookback  = config.WINRATE_LOOKBACK
     threshold = config.WINRATE_ALERT_PCT
 
-    if len(_cache) < lookback:
+    with _cache_lock:
+        cache_snapshot = list(_cache)
+
+    if len(cache_snapshot) < lookback:
         return
 
-    recent   = _cache[-lookback:]
+    recent   = cache_snapshot[-lookback:]
     wins     = sum(1 for t in recent if t["pnl_pct"] >= 0)
     win_rate = wins / lookback * 100
 
@@ -176,6 +187,12 @@ def _check_winrate() -> None:
     elif win_rate >= threshold and _winrate_alerted:
         _winrate_alerted = False
         log.info("Win rate recuperado: %.0f%% en últimos %d trades", win_rate, lookback)
+
+
+def get_cache_snapshot() -> list[dict]:
+    """Devuelve una copia thread-safe de _cache para lectura externa."""
+    with _cache_lock:
+        return list(_cache)
 
 
 def _tg_send(text: str) -> None:
@@ -237,37 +254,43 @@ def record(
     _tg_send(msg)
     _write_csv(row)
 
-    _cache.append({
-        "date": now_str, "symbol": symbol, "side": side,
-        "entry": entry, "exit": exit_price,
-        "pnl_pct": pnl_pct, "pnl_usdt": pnl_usdt,
-        "score": score, "reason": reason, "duration": duration,
-    })
+    with _cache_lock:
+        _cache.append({
+            "date": now_str, "symbol": symbol, "side": side,
+            "entry": entry, "exit": exit_price,
+            "pnl_pct": pnl_pct, "pnl_usdt": pnl_usdt,
+            "score": score, "reason": reason, "duration": duration,
+        })
 
     _check_daily_drawdown(pnl_usdt)
     _check_winrate()
 
 
 def send_daily_summary() -> None:
-    if not _cache:
+    with _cache_lock:
+        cache_snapshot = list(_cache)
+
+    if not cache_snapshot:
         _tg_send("📊 <b>Resumen del día</b>\nSin trades en esta sesión.")
         return
 
-    total     = len(_cache)
-    wins      = sum(1 for t in _cache if t["pnl_pct"] >= 0)
+    total     = len(cache_snapshot)
+    wins      = sum(1 for t in cache_snapshot if t["pnl_pct"] >= 0)
     losses    = total - wins
-    total_pnl = sum(t["pnl_usdt"] for t in _cache)
+    total_pnl = sum(t["pnl_usdt"] for t in cache_snapshot)
     win_rate  = wins / total * 100
 
     lines = [f"📊 <b>Resumen de sesión</b> ({total} trades)\n"]
     lines.append(f"Win rate: <code>{win_rate:.0f}%</code> ({wins}W / {losses}L)")
     lines.append(f"PnL total: <code>{total_pnl:+.4f} USDT</code>\n")
-    for t in _cache:
+    for t in cache_snapshot:
         icon = "✅" if t["pnl_pct"] >= 0 else "❌"
         lines.append(f"{icon} {t['symbol']} {t['side'].upper()} {t['pnl_pct']:+.2f}%")
 
     _tg_send("\n".join(lines))
-    _cache.clear()
+
+    with _cache_lock:
+        _cache.clear()
     with _daily_loss_lock:
         global _daily_loss_usdt, _daily_loss_date, _daily_limit_hit
         _daily_loss_usdt = 0.0

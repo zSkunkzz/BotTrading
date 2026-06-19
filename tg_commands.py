@@ -8,6 +8,11 @@ Comandos:
     /status     — Estado del bot
     /stop       — Pausa la búsqueda de señales nuevas
     /resume     — Reanuda el bot
+
+FIX: _fetch_trade_history usa trade_logger.get_cache_snapshot() en lugar de
+     acceder a trade_logger._cache directamente, respetando el lock del módulo.
+     /historial limita la visualización a los últimos 100 trades para no
+     bloquear el thread de polling en CSVs grandes.
 """
 import csv
 import logging
@@ -47,6 +52,11 @@ def _send(text: str, chat_id: str = None) -> None:
 
 
 def _fetch_trade_history() -> list[dict]:
+    """Devuelve el histórico combinando CSV + cache en memoria.
+
+    FIX: usa get_cache_snapshot() en lugar de acceder a _cache directamente
+    para respetar el _cache_lock de trade_logger y evitar race conditions.
+    """
     trades = []
     csv_path = trade_logger.LOG_FILE
 
@@ -73,8 +83,9 @@ def _fetch_trade_history() -> list[dict]:
         except Exception as e:
             log.warning("Error leyendo CSV de trades: %s", e)
 
+    # FIX: usa la función pública thread-safe en lugar de acceder a _cache directamente
     seen = {(t["date"], t["symbol"]) for t in trades}
-    for t in trade_logger._cache:
+    for t in trade_logger.get_cache_snapshot():
         key = (t["date"], t["symbol"])
         if key not in seen:
             trades.append(t)
@@ -89,18 +100,26 @@ def _cmd_historial() -> str:
     if not trades:
         return "📜 <b>Histórico completo</b>\nSin trades registrados todavía."
 
-    lines = [f"📜 <b>Histórico completo ({len(trades)} trades)</b>\n"]
-    for t in trades:
+    total = len(trades)
+    # FIX: limitar a los últimos 100 trades para no bloquear el thread de polling
+    # con CSVs grandes (lectura O(n) en el thread principal de Telegram).
+    display = trades[-100:]
+    omitted = total - len(display)
+
+    lines = [f"📜 <b>Histórico ({total} trades{', últimos 100' if omitted else ''})</b>\n"]
+    for t in display:
         icon = "✅" if t["pnl_pct"] >= 0 else "❌"
         lines.append(
             f"{icon} <b>{t['symbol']}</b> {t['side'].upper()} "
             f"<code>{t['pnl_pct']:+.2f}%</code> | "
             f"score {t['score']} | {t['date']}"
         )
+    if omitted:
+        lines.append(f"\n<i>... y {omitted} trades anteriores en CSV.</i>")
 
     msg = "\n".join(lines)
     if len(msg) > 3800:
-        msg = msg[:3800] + f"\n\n<i>... y {len(trades)} trades en total.</i>"
+        msg = msg[:3800] + f"\n\n<i>... mensaje truncado ({total} trades totales).</i>"
     return msg
 
 

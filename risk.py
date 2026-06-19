@@ -26,6 +26,9 @@ SL / TP:
 
 Trailing stop:
   trail_step = 0.3 × sl_dist
+
+FIX: qty=0 guard — si floor_qty devuelve 0 (raw_qty < step), se lanza
+     ValueError para que main.py salte la señal sin llamar a open_order.
 """
 import logging
 import config
@@ -81,6 +84,9 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 70,
         symbol  : símbolo BingX (e.g. 'BTC-USDT'). Si se pasa, se consulta
                   el step-size real del contrato para redondear qty.
         regime  : régimen de mercado ('bull' | 'bear' | 'range') para TP_RR dinámico.
+
+    Raises:
+        ValueError: si qty calculada es 0 o inferior al minQty del contrato.
     """
     atr = _atr(candles, period=14)
 
@@ -109,15 +115,26 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 70,
     if symbol:
         try:
             info = _exchange._get_contract_info(symbol)
-            step = info["stepSize"]
-            qty  = _exchange.floor_qty(raw_qty, step)
+            step    = info["stepSize"]
+            min_qty = info["minQty"]
+            qty     = _exchange.floor_qty(raw_qty, step)
         except Exception as exc:
             log.warning("No se pudo obtener step-size para %s: %s — usando 3 dec", symbol, exc)
             import math
-            qty = math.floor(raw_qty * 1000) / 1000
+            qty     = math.floor(raw_qty * 1000) / 1000
+            min_qty = 0.001
     else:
         import math
-        qty = math.floor(raw_qty * 1000) / 1000
+        qty     = math.floor(raw_qty * 1000) / 1000
+        min_qty = 0.001
+
+    # FIX: qty=0 guard — evita enviar órdenes con cantidad 0 a BingX.
+    if qty <= 0 or qty < min_qty:
+        raise ValueError(
+            f"[{symbol}] qty calculada ({qty:.8f}) es 0 o inferior al minQty ({min_qty}) "
+            f"— margin={margin:.2f} USDT, price={entry:.6f}, step={step if symbol else 0.001:.8f}. "
+            "Aumenta MARGIN_USDT o reduce el apalancamiento."
+        )
 
     trail_step = round(0.3 * sl_dist, 8)
 

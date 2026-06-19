@@ -20,9 +20,14 @@ FIXES aplicados:
      para evitar que main.py interprete todas las posiciones como cerradas.
   8. get_closed_reason() consulta el historial real de órdenes ejecutadas para
      determinar si la posición cerró por TP o SL, junto con el precio de ejecución.
+     FIX: lookback ampliado a 30 minutos para cubrir loops lentos con muchos pares.
   9. get_spread_pct() consulta el orderbook nivel 1 y devuelve el spread como
      porcentaje del mid price. Usado en main.py para filtrar pares ilíquidos
      antes de abrir posición.
+  10. FIX: _request() lanzaba `raise None` (TypeError) si todos los reintentos
+      fallaban por HTTPStatusError (que hace raise dentro del loop) seguido de
+      salida del bucle sin asignar last_exc. Ahora lanza RuntimeError explícito
+      si last_exc es None al final del loop.
 """
 import hashlib
 import hmac
@@ -63,7 +68,8 @@ def _request(method: str, path: str, params: dict) -> dict:
     base_params = {k: v for k, v in params.items() if k not in ("timestamp", "signature")}
     url = config.BASE_URL + path
 
-    last_exc: Exception | None = None
+    # FIX: last_exc inicializada a RuntimeError para que nunca sea None al hacer raise.
+    last_exc: Exception = RuntimeError(f"All {_RETRIES} attempts failed for {path}")
     for attempt in range(1, _RETRIES + 1):
         signed = dict(base_params)
         signed["timestamp"] = int(time.time() * 1000)
@@ -240,7 +246,8 @@ def get_position(symbol: str = None) -> dict | None:
 # ── Historial de cierre real ────────────────────────────────────────────────────
 
 _CLOSE_ORDER_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET"}
-_CLOSE_LOOK_BACK  = 10 * 60 * 1000   # 10 minutos en ms
+# FIX: ampliado a 30 minutos para cubrir loops lentos con muchos pares (antes 10 min).
+_CLOSE_LOOK_BACK  = 30 * 60 * 1000   # 30 minutos en ms
 
 def get_closed_reason(symbol: str) -> tuple[str, float]:
     """Consulta el historial de órdenes ejecutadas de BingX para determinar
@@ -260,7 +267,7 @@ def get_closed_reason(symbol: str) -> tuple[str, float]:
             and o.get("type") in _CLOSE_ORDER_TYPES
         ]
         if not filled:
-            log.warning("[%s] get_closed_reason: sin órdenes FILLED en últimos 10min", symbol)
+            log.warning("[%s] get_closed_reason: sin órdenes FILLED en últimos 30min", symbol)
             return None, 0.0
 
         filled.sort(key=lambda o: int(o.get("updateTime", 0)), reverse=True)
