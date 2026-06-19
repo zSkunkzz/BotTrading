@@ -192,28 +192,44 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
                 READY_TIMEOUT, feed.ready_count(), total)
 
 
-def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
+def _resolve_close(pos: dict, symbol: str) -> tuple[float, str]:
+    """Determina el precio de salida y razón real consultando el historial de BingX.
+
+    Prioridad:
+      1. Historial real de órdenes (get_closed_reason) — precio de ejecución exacto.
+      2. Fallback heurístico: compara precio actual con TP/SL conocidos.
+      3. Último fallback: precio de mercado actual + razón por PnL.
+    """
+    # 1. Historial real
+    reason, exit_price = exchange.get_closed_reason(symbol)
+    if reason and exit_price:
+        return exit_price, reason
+
+    # 2. Fallback heurístico con precio actual
+    current_price = exchange.get_price(symbol)
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
 
     if tp is not None and sl is not None:
         if side == "long":
-            if current_price >= tp * 0.995:
-                return tp, "TP"
-            if current_price <= sl * 1.005:
-                return sl, "SL"
+            dist_tp = abs(current_price - tp)
+            dist_sl = abs(current_price - sl)
         else:
-            if current_price <= tp * 1.005:
-                return tp, "TP"
-            if current_price >= sl * 0.995:
-                return sl, "SL"
+            dist_tp = abs(current_price - tp)
+            dist_sl = abs(current_price - sl)
+        if dist_tp < dist_sl:
+            return tp, "TP"
+        else:
+            return sl, "SL"
 
-    hit_tp = (
-        (side == "long"  and tp is not None and current_price >= tp * 0.995) or
-        (side == "short" and tp is not None and current_price <= tp * 1.005)
+    # 3. Último fallback: precio actual, razón por PnL
+    pnl_raw = (
+        (current_price - pos["entry"]) / pos["entry"]
+        if side == "long"
+        else (pos["entry"] - current_price) / pos["entry"]
     )
-    return current_price, "TP" if hit_tp else "SL"
+    return current_price, "TP" if pnl_raw > 0 else "SL"
 
 
 def run() -> None:
@@ -258,9 +274,10 @@ def run() -> None:
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
-                    p             = positions.pop(symbol)
-                    current_price = exchange.get_price(symbol)
-                    exit_price, reason = _exit_price_for(p, current_price)
+                    p = positions.pop(symbol)
+
+                    # Precio de salida y razón real desde BingX
+                    exit_price, reason = _resolve_close(p, symbol)
 
                     pnl_pct = (
                         (exit_price - p["entry"]) / p["entry"]

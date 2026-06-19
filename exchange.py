@@ -18,6 +18,8 @@ FIXES aplicados:
      (sin 'symbol'), reduciendo 74 llamadas por loop a 1.
      FIX: si la llamada falla, lanza excepción en vez de devolver {} silencioso
      para evitar que main.py interprete todas las posiciones como cerradas.
+  8. get_closed_reason() consulta el historial real de órdenes ejecutadas para
+     determinar si la posición cerró por TP o SL, junto con el precio de ejecución.
 """
 import hashlib
 import hmac
@@ -35,7 +37,7 @@ log = logging.getLogger("exchange")
 
 def _sign(params: dict) -> str:
     """Firma la query string tal como la construye urllib / BingX."""
-    payload = urllib.parse.urlencode(params)          # sin sorted — BingX no lo exige
+    payload = urllib.parse.urlencode(params)
     return hmac.new(
         config.API_SECRET.encode(),
         payload.encode(),
@@ -50,7 +52,7 @@ def _headers() -> dict:
 # ── HTTP helpers con reintentos ───────────────────────────────────────────────
 
 _RETRIES    = 3
-_RETRY_WAIT = 1.0   # segundos entre intentos
+_RETRY_WAIT = 1.0
 
 
 def _request(method: str, path: str, params: dict) -> dict:
@@ -59,13 +61,11 @@ def _request(method: str, path: str, params: dict) -> dict:
     FIX: timestamp y firma se renuevan en cada intento para que un timeout en el
     primer intento no deje el segundo con un timestamp expirado (BingX rechaza >5s).
     """
-    # Copiar params sin timestamp/signature para poder renovarlos en cada intento
     base_params = {k: v for k, v in params.items() if k not in ("timestamp", "signature")}
     url = config.BASE_URL + path
 
     last_exc: Exception | None = None
     for attempt in range(1, _RETRIES + 1):
-        # Renovar timestamp y firma en cada intento
         signed = dict(base_params)
         signed["timestamp"] = int(time.time() * 1000)
         signed["signature"] = _sign(signed)
@@ -89,7 +89,7 @@ def _request(method: str, path: str, params: dict) -> dict:
             log.error("HTTP %s en %s: %s", exc.response.status_code, path, exc.response.text)
             raise
 
-    raise last_exc  # re-lanza si agotamos reintentos
+    raise last_exc
 
 
 def _get(path: str, params: dict = None) -> dict:
@@ -115,11 +115,7 @@ def get_price(symbol: str = None) -> float:
 # ── OHLCV ─────────────────────────────────────────────────────────────────────
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
-    """Devuelve lista de velas [{ts, open, high, low, close, volume}] más reciente al final.
-
-    FIX: se incluye 'ts' (timestamp en ms) para que ws_feed pueda deduplicar
-    correctamente las velas precargadas REST con las que llegan por WebSocket.
-    """
+    """Devuelve lista de velas [{ts, open, high, low, close, volume}] más reciente al final."""
     symbol   = symbol or config.SYMBOL
     interval = interval or config.TIMEFRAME
     data = _get("/openApi/swap/v3/quote/klines", {
@@ -130,13 +126,13 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
     candles = []
     for c in data["data"]:
         candles.append({
-            "ts":     int(c.get("time", c.get("t", 0))),  # timestamp ms
+            "ts":     int(c.get("time", c.get("t", 0))),
             "open":   float(c["open"]),
             "high":   float(c["high"]),
             "low":    float(c["low"]),
             "close":  float(c["close"]),
             "volume": float(c["volume"]),
-            "closed": True,   # velas REST ya están cerradas
+            "closed": True,
         })
     return candles
 
@@ -164,7 +160,6 @@ def _get_contract_info(symbol: str) -> dict:
     except Exception as exc:
         log.warning("No se pudo obtener info contrato %s: %s", symbol, exc)
 
-    # Fallback razonable por defecto
     default = {"stepSize": 0.001, "minQty": 0.001, "pricePrecision": 6}
     _contract_info_cache[symbol] = default
     return default
@@ -179,14 +174,13 @@ def floor_qty(qty: float, step: float) -> float:
 
 
 def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
-    """Verifica que el valor nocional sea ≥ min_usdt (BingX exige mínimo ~5 USDT)."""
+    """Verifica que el valor nocional sea >= min_usdt."""
     return (qty * price) >= min_usdt
 
 
 # ── Posiciones ────────────────────────────────────────────────────────────────
 
 def _parse_position(p: dict) -> dict:
-    """Convierte un objeto de posición raw de BingX al formato interno del bot."""
     return {
         "side":  "long" if float(p["positionAmt"]) > 0 else "short",
         "entry": float(p["avgPrice"]),
@@ -199,10 +193,7 @@ def _parse_position(p: dict) -> dict:
 def get_all_positions() -> dict[str, dict]:
     """BATCH: devuelve {symbol: pos_dict} para todas las posiciones abiertas.
 
-    FIX: ya no captura la excepción silenciosamente. Si la llamada falla, lanza
-    la excepción para que main.py la capture en su try/except de loop y salte
-    la iteración completa, evitando que un {} vacío provoque el cierre falso
-    de todas las posiciones rastreadas.
+    FIX: ya no captura la excepción silenciosamente.
     """
     data = _get("/openApi/swap/v2/user/positions", {})
     result: dict[str, dict] = {}
@@ -223,111 +214,50 @@ def get_position(symbol: str = None) -> dict | None:
     return None
 
 
-# ── Apalancamiento ────────────────────────────────────────────────────────────
+# ── Historial de cierre real ──────────────────────────────────────────────────
 
-def set_leverage(symbol: str = None, leverage: int = None) -> None:
-    symbol   = symbol or config.SYMBOL
-    leverage = leverage or config.LEVERAGE
-    _post("/openApi/swap/v2/trade/leverage", {
-        "symbol":   symbol,
-        "side":     "LONG",
-        "leverage": leverage,
-    })
-    _post("/openApi/swap/v2/trade/leverage", {
-        "symbol":   symbol,
-        "side":     "SHORT",
-        "leverage": leverage,
-    })
-    log.info("Leverage seteado a %dx en %s", leverage, symbol)
+_CLOSE_ORDER_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET"}
+_CLOSE_LOOK_BACK  = 10 * 60 * 1000   # 10 minutos en ms
 
+def get_closed_reason(symbol: str) -> tuple[str, float]:
+    """Consulta el historial de órdenes ejecutadas de BingX para determinar
+    si la posición cerró por TP o SL y devuelve (reason, avg_price).
 
-# ── Abrir orden ───────────────────────────────────────────────────────────────
-
-def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
-    symbol   = symbol or config.SYMBOL
-    bx_side  = "BUY"  if side == "long" else "SELL"
-    pos_side = "LONG" if side == "long" else "SHORT"
-
-    # Aplicar step size del contrato
-    info = _get_contract_info(symbol)
-    qty  = floor_qty(qty, info["stepSize"])
-
-    if qty <= 0 or not min_notional_ok(qty, get_price(symbol)):
-        raise ValueError(
-            f"qty={qty} inválido para {symbol} (step={info['stepSize']}). "
-            "Aumenta MARGIN_USDT o reduce el número de pares."
-        )
-
-    resp = _post("/openApi/swap/v2/trade/order", {
-        "symbol":       symbol,
-        "side":         bx_side,
-        "positionSide": pos_side,
-        "type":         "MARKET",
-        "quantity":     qty,
-    })
-    log.info("Orden abierta: %s %s qty=%.4f", side.upper(), symbol, qty)
-
-    place_stop_order(symbol, side, qty, sl)
-    place_tp_order(symbol, side, qty, tp)
-
-    return resp
-
-
-def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
-    """Coloca (o reemplaza) la stop-loss order. Usada también por el trailing."""
-    sl_side  = "SELL" if side == "long" else "BUY"
-    pos_side = "LONG" if side == "long" else "SHORT"
-    _post("/openApi/swap/v2/trade/order", {
-        "symbol":        symbol,
-        "side":          sl_side,
-        "positionSide":  pos_side,
-        "type":          "STOP_MARKET",
-        "stopPrice":     stop_price,
-        "quantity":      qty,
-        "closePosition": "true",
-    })
-    log.info("SL colocado en %.6f (%s %s)", stop_price, side.upper(), symbol)
-
-
-def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
-    """Coloca la take-profit order."""
-    sl_side  = "SELL" if side == "long" else "BUY"
-    pos_side = "LONG" if side == "long" else "SHORT"
-    _post("/openApi/swap/v2/trade/order", {
-        "symbol":        symbol,
-        "side":          sl_side,
-        "positionSide":  pos_side,
-        "type":          "TAKE_PROFIT_MARKET",
-        "stopPrice":     tp_price,
-        "quantity":      qty,
-        "closePosition": "true",
-    })
-    log.info("TP colocado en %.6f (%s %s)", tp_price, side.upper(), symbol)
-
-
-# ── Cerrar posición ───────────────────────────────────────────────────────────
-
-def close_position(side: str, qty: float, symbol: str = None) -> dict:
-    symbol   = symbol or config.SYMBOL
-    bx_side  = "SELL" if side == "long" else "BUY"
-    pos_side = "LONG" if side == "long" else "SHORT"
-    resp = _post("/openApi/swap/v2/trade/order", {
-        "symbol":       symbol,
-        "side":         bx_side,
-        "positionSide": pos_side,
-        "type":         "MARKET",
-        "quantity":     qty,
-    })
-    log.info("Posición cerrada: %s %s", side.upper(), symbol)
-    return resp
-
-
-# ── Cancelar órdenes abiertas ─────────────────────────────────────────────────
-
-def cancel_all_orders(symbol: str = None) -> None:
-    """FIX: BingX exige DELETE (no POST) para cancelar todas las órdenes abiertas.
-    Con POST la API devuelve 405 silencioso, dejando SL/TP duplicados en el exchange.
+    Retorna:
+        ("TP", precio_ejecucion)  si la última orden FILLED fue TAKE_PROFIT_MARKET
+        ("SL", precio_ejecucion)  si la última orden FILLED fue STOP_MARKET
+        (None, 0.0)               si no se encontró ninguna orden relevante
+                                  (main.py cae en el fallback)
     """
-    symbol = symbol or config.SYMBOL
-    _delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
-    log.info("Órdenes canceladas para %s", symbol)
+    try:
+        start_ts = int(time.time() * 1000) - _CLOSE_LOOK_BACK
+        data = _get("/openApi/swap/v2/trade/allOrders", {
+            "symbol":    symbol,
+            "startTime": start_ts,
+            "limit":     20,
+        })
+        orders = data.get("data", {}).get("orders") or []
+
+        # Filtrar solo órdenes de cierre ejecutadas, ordenar por tiempo desc
+        filled = [
+            o for o in orders
+            if o.get("status") == "FILLED"
+            and o.get("type") in _CLOSE_ORDER_TYPES
+        ]
+        if not filled:
+            log.warning("[%s] get_closed_reason: sin órdenes FILLED en últimos 10min", symbol)
+            return None, 0.0
+
+        filled.sort(key=lambda o: int(o.get("updateTime", 0)), reverse=True)
+        latest = filled[0]
+        order_type  = latest.get("type", "")
+        avg_price   = float(latest.get("avgPrice") or latest.get("stopPrice") or 0)
+
+        reason = "TP" if order_type == "TAKE_PROFIT_MARKET" else "SL"
+        log.info("[%s] Cierre detectado: %s @ %.6f (orden tipo=%s)",
+                 symbol, reason, avg_price, order_type)
+        return reason, avg_price
+
+    except Exception as exc:
+        log.warning("[%s] get_closed_reason error: %s", symbol, exc)
+        return None, 0.0
