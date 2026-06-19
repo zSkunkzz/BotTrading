@@ -22,11 +22,11 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 _cooldown:              dict[str, float] = {}
-_cooldown_sl:           dict[str, float] = {}   # cooldown diferenciado para SL
+_cooldown_sl:           dict[str, float] = {}
 _manual_alert_cooldown: dict[str, float] = {}
 
-COOLDOWN               = 60 * 60       # 1h cooldown tras TP o cierre normal
-COOLDOWN_SL            = 2 * 60 * 60  # 2h cooldown tras SL (mercado probablemente sigue en contra)
+COOLDOWN               = 60 * 60
+COOLDOWN_SL            = 2 * 60 * 60
 MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
@@ -46,8 +46,6 @@ def _is_weekend() -> bool:
 
 
 def _corr_group_count(symbol: str, positions: dict) -> int:
-    """Devuelve cuántas posiciones abiertas pertenecen al mismo grupo de correlación
-    que `symbol`. Usado para limitar exposición correlacionada."""
     for group in config.CORR_GROUPS:
         if symbol in group:
             return sum(1 for s in positions if s in group)
@@ -104,20 +102,16 @@ def _check_tp_extension(
     extensions = pos.get("tp_extensions", 0)
     if extensions >= MAX_TP_EXTENSIONS:
         return
-
     tp   = pos.get("tp")
     side = pos["side"]
     if tp is None:
         return
-
     if side == "long":
         near_tp = current_price >= tp * (1 - TP_EXTEND_THRESH)
     else:
         near_tp = current_price <= tp * (1 + TP_EXTEND_THRESH)
-
     if not near_tp:
         return
-
     if pos.get("_extending"):
         return
     pos["_extending"] = True
@@ -139,7 +133,7 @@ def _check_tp_extension(
         return
 
     if not signal or signal != side:
-        log.info("[%s] Señal no válida para extend_tp (signal=%s) — dejando TP actual", symbol, signal)
+        log.info("[%s] Señal no válida para extend_tp — dejando TP actual", symbol)
         pos["_extending"] = False
         return
 
@@ -207,20 +201,14 @@ def _resolve_close(pos: dict, symbol: str) -> tuple[float, str]:
     reason, exit_price = exchange.get_closed_reason(symbol)
     if reason and exit_price:
         return exit_price, reason
-
     current_price = exchange.get_price(symbol)
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
-
     if tp is not None and sl is not None:
         dist_tp = abs(current_price - tp)
         dist_sl = abs(current_price - sl)
-        if dist_tp < dist_sl:
-            return tp, "TP"
-        else:
-            return sl, "SL"
-
+        return (tp, "TP") if dist_tp < dist_sl else (sl, "SL")
     pnl_raw = (
         (current_price - pos["entry"]) / pos["entry"]
         if side == "long"
@@ -235,10 +223,10 @@ def run() -> None:
     log.info(
         "Bot iniciado | %d pares | lev=%dx | margin=%s USDT | max=%d posiciones | "
         "min_score=%d | weekend_min_score=%d | max_daily_loss=%.0f USDT | "
-        "max_corr=%d | sl_min=0.6%%",
+        "max_corr=%d | sl_min=0.6%% | max_spread=%.2f%%",
         len(config.SYMBOLS), config.LEVERAGE, config.MARGIN_USDT, config.MAX_POSITIONS,
         WEEKDAY_MIN_SCORE, WEEKEND_MIN_SCORE, config.MAX_DAILY_LOSS_USDT,
-        config.MAX_CORR_PER_GROUP,
+        config.MAX_CORR_PER_GROUP, config.MAX_SPREAD_PCT,
     )
 
     for symbol in config.SYMBOLS:
@@ -258,7 +246,7 @@ def run() -> None:
 
     positions: dict = {}
     tg_commands.start(get_positions_fn=lambda: positions, feed=feed)
-    trade_logger.start_scheduler()
+    trade_logger.start_scheduler()   # también restaura daily loss desde CSV
 
     loop_count = 0
 
@@ -275,9 +263,7 @@ def run() -> None:
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
                     p = positions.pop(symbol)
-
                     exit_price, reason = _resolve_close(p, symbol)
-
                     pnl_pct = (
                         (exit_price - p["entry"]) / p["entry"]
                         if p["side"] == "long"
@@ -285,7 +271,6 @@ def run() -> None:
                     ) * config.LEVERAGE * 100
                     pnl_usdt = (pnl_pct / 100) * (p["qty"] * p["entry"] / config.LEVERAGE)
 
-                    # ── Cooldown diferenciado: SL → 2h, TP → 1h ──────────────
                     if reason == "SL":
                         _cooldown_sl[symbol] = time.time()
                         log.info("[%s] Cooldown SL activado (%dh)", symbol, COOLDOWN_SL // 3600)
@@ -294,25 +279,14 @@ def run() -> None:
                         log.info("[%s] Cooldown activado (%dm) tras %s", symbol, COOLDOWN // 60, reason)
 
                     trade_logger.record(
-                        symbol     = symbol,
-                        side       = p["side"],
-                        entry      = p["entry"],
-                        exit_price = exit_price,
-                        pnl_pct    = pnl_pct,
-                        pnl_usdt   = pnl_usdt,
-                        score      = p.get("score", 0),
-                        reason     = reason,
-                        open_ts    = p.get("open_ts", time.time()),
+                        symbol=symbol, side=p["side"], entry=p["entry"],
+                        exit_price=exit_price, pnl_pct=pnl_pct, pnl_usdt=pnl_usdt,
+                        score=p.get("score", 0), reason=reason, open_ts=p.get("open_ts", time.time()),
                     )
                     telegram.notify_close(
-                        symbol   = symbol,
-                        side     = p["side"],
-                        entry    = p["entry"],
-                        exit_p   = exit_price,
-                        pnl_pct  = pnl_pct,
-                        pnl_usdt = pnl_usdt,
-                        reason   = reason,
-                        open_ts  = p.get("open_ts", 0.0),
+                        symbol=symbol, side=p["side"], entry=p["entry"],
+                        exit_p=exit_price, pnl_pct=pnl_pct, pnl_usdt=pnl_usdt,
+                        reason=reason, open_ts=p.get("open_ts", 0.0),
                     )
                     log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT) | ext=%d",
                              symbol, reason, pnl_pct, pnl_usdt, p.get("tp_extensions", 0))
@@ -347,18 +321,19 @@ def run() -> None:
                         "score":         70,
                         "open_ts":       time.time(),
                     }
-                    log.info("[%s] Sincronizada: %s @ %.4f (sl=%s tp=%s)",
-                             symbol, pos_ex["side"], pos_ex["entry"],
-                             pos_ex["sl"], pos_ex["tp"])
+                    log.info("[%s] Sincronizada: %s @ %.4f", symbol, pos_ex["side"], pos_ex["entry"])
 
             open_count = len(positions)
 
             if loop_count % 10 == 1:
-                log.info("[loop #%d] Posiciones: %d/%d | Feed: %d/%d | Cooldowns: %d+%d SL | Pausado: %s | DailyLimit: %s",
-                         loop_count, open_count, config.MAX_POSITIONS,
-                         feed.ready_count(), len(config.SYMBOLS),
-                         len(_cooldown), len(_cooldown_sl),
-                         bot_state.is_paused(), trade_logger.is_daily_limit_hit())
+                log.info(
+                    "[loop #%d] Posiciones: %d/%d | Feed: %d/%d | "
+                    "Cooldowns: %d TP + %d SL | Pausado: %s | DailyLimit: %s",
+                    loop_count, open_count, config.MAX_POSITIONS,
+                    feed.ready_count(), len(config.SYMBOLS),
+                    len(_cooldown), len(_cooldown_sl),
+                    bot_state.is_paused(), trade_logger.is_daily_limit_hit(),
+                )
 
             for symbol, pos in list(positions.items()):
                 try:
@@ -373,14 +348,12 @@ def run() -> None:
                 if today != _weekend_notified_day:
                     _weekend_notified_day = today
                     day_name = "Sábado" if today == 5 else "Domingo"
-                    log.info("Modo fin de semana activo (%s UTC) — score mínimo %d",
-                             day_name, WEEKEND_MIN_SCORE)
+                    log.info("Modo fin de semana activo (%s UTC) — score mínimo %d", day_name, WEEKEND_MIN_SCORE)
                     telegram.notify(
                         f"🚫 Modo fin de semana ({day_name})\n"
                         f"Score mínimo ≥ {WEEKEND_MIN_SCORE} para nuevas entradas."
                     )
 
-            # ── Bloqueo por daily drawdown ─────────────────────────────────
             if trade_logger.is_daily_limit_hit():
                 log.debug("Daily drawdown límite activo — sin nuevas entradas")
                 time.sleep(config.LOOP_SLEEP)
@@ -401,18 +374,18 @@ def run() -> None:
 
                     if is_manual and symbol in _manual_alert_cooldown:
                         continue
-
                     if not is_manual and open_count >= config.MAX_POSITIONS:
                         break
 
-                    # ── Filtro de correlación ──────────────────────────────
+                    # ── Filtro de correlación ─────────────────────────────
                     if not is_manual:
                         corr_count = _corr_group_count(symbol, positions)
                         if corr_count >= config.MAX_CORR_PER_GROUP:
-                            log.debug("[%s] Correlación: %d/%d en grupo — saltando",
+                            log.debug("[%s] Correlación: %d/%d — saltando",
                                       symbol, corr_count, config.MAX_CORR_PER_GROUP)
                             continue
 
+                    # ── Evaluación de señal ────────────────────────────
                     try:
                         candles_15m = feed.get(symbol, "15m")
                         candles_1h  = feed.get(symbol, "1h")
@@ -424,6 +397,18 @@ def run() -> None:
                         )
                         if not signal:
                             continue
+
+                        # ── Filtro de spread (solo si hay señal) ────────────
+                        # Se consulta DESPUÉS de la evaluación para no hacer
+                        # una llamada REST por cada par en cada loop.
+                        if not is_manual:
+                        	spread = exchange.get_spread_pct(symbol)
+                        	if spread > config.MAX_SPREAD_PCT:
+                        	    log.info(
+                        	        "[%s] Spread demasiado alto (%.3f%% > %.3f%%) — saltando",
+                        	        symbol, spread, config.MAX_SPREAD_PCT,
+                        	    )
+                        	    continue
 
                         try:
                             regime, _ = signals._market_regime(candles_1h)
@@ -452,18 +437,15 @@ def run() -> None:
                             continue
 
                         log.info(
-                            "[%s] SEÑAL %s | regime=%s RR=%.1f | "
+                            "[%s] SEÑAL %s | regime=%s RR=%.1f spread=%.3f%% | "
                             "entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d",
-                            symbol, signal.upper(), regime, params["tp_rr"],
+                            symbol, signal.upper(), regime, params["tp_rr"], spread,
                             price, params["sl"], params["tp"], params["qty"], score,
                         )
 
                         exchange.open_order(
-                            side   = signal,
-                            qty    = params["qty"],
-                            sl     = params["sl"],
-                            tp     = params["tp"],
-                            symbol = symbol,
+                            side=signal, qty=params["qty"],
+                            sl=params["sl"], tp=params["tp"], symbol=symbol,
                         )
 
                         positions[symbol] = {
@@ -484,14 +466,9 @@ def run() -> None:
                         open_count += 1
 
                         telegram.notify_open(
-                            symbol = symbol,
-                            price  = price,
-                            side   = signal,
-                            qty    = params["qty"],
-                            sl     = params["sl"],
-                            tp     = params["tp"],
-                            score  = score,
-                            tp_rr  = params["tp_rr"],
+                            symbol=symbol, price=price, side=signal,
+                            qty=params["qty"], sl=params["sl"], tp=params["tp"],
+                            score=score, tp_rr=params["tp_rr"],
                         )
 
                     except Exception as e:

@@ -4,16 +4,11 @@ Cada trade cerrado se envía como mensaje a TG_LOG_CHAT_ID (puede ser el mismo
 chat o un canal/grupo separado sólo para logs).
 Además guarda en CSV local como caché hasta el próximo reinicio.
 
+Al arrancar, restaura el daily_loss del día actual leyendo el CSV — así el
+limite diario sobrevive reinicios y deploys de Railway.
+
 Variables de entorno:
     TG_LOG_CHAT_ID  : chat_id del canal de logs (si no se define, usa TG_CHAT_ID)
-
-Formato del mensaje:
-    📌 BTC-USDT | LONG | TP ✅
-    Entry:    67420.0000
-    Exit:     68850.0000
-    PnL:      +4.23% | +8.46 USDT
-    Score:    78 | Dur: 187 min
-    2026-06-09 09:14 UTC
 """
 import csv
 import logging
@@ -39,19 +34,17 @@ _csv_lock: threading.Lock = threading.Lock()
 _cache: list[dict] = []
 
 # ── Daily drawdown tracking ───────────────────────────────────────────────────
-_daily_loss_usdt: float = 0.0          # pérdida acumulada hoy (solo trades negativos)
-_daily_loss_date: str   = ""           # fecha UTC del día actual (YYYY-MM-DD)
-_daily_limit_hit: bool  = False        # True si se alcanzó el límite hoy
+_daily_loss_usdt: float = 0.0
+_daily_loss_date: str   = ""
+_daily_limit_hit: bool  = False
 _daily_loss_lock: threading.Lock = threading.Lock()
 
 
 def is_daily_limit_hit() -> bool:
-    """Devuelve True si el bot debe pausarse por daily drawdown."""
     return _daily_limit_hit
 
 
 def _reset_daily_if_needed() -> None:
-    """Resetea el contador diario si cambió el día UTC."""
     global _daily_loss_usdt, _daily_loss_date, _daily_limit_hit
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if today != _daily_loss_date:
@@ -61,8 +54,76 @@ def _reset_daily_if_needed() -> None:
         log.info("Daily drawdown reseteado para %s", today)
 
 
+def _restore_daily_loss_from_csv() -> None:
+    """Lee el CSV al arrancar y recalcula la pérdida acumulada del día UTC actual.
+
+    Esto garantiza que el daily drawdown limit sobrevive reinicios y deploys.
+    Si el CSV no existe o falla la lectura, arranca desde 0 sin interrumpir el bot.
+    """
+    global _daily_loss_usdt, _daily_loss_date, _daily_limit_hit
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _daily_loss_date = today
+
+    if not os.path.exists(LOG_FILE):
+        log.info("CSV no encontrado — daily loss arranca desde 0")
+        return
+
+    recovered_loss = 0.0
+    recovered_trades = 0
+    try:
+        with open(LOG_FILE, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Filtra solo trades del día UTC actual
+                if not row.get("date", "").startswith(today):
+                    continue
+                try:
+                    pnl = float(row["pnl_usdt"])
+                    if pnl < 0:
+                        recovered_loss += abs(pnl)
+                    recovered_trades += 1
+                    # Reconstruir caché del día para win rate monitor
+                    _cache.append({
+                        "date":     row["date"],
+                        "symbol":   row["symbol"],
+                        "side":     row["side"],
+                        "entry":    float(row["entry"]),
+                        "exit":     float(row["exit"]),
+                        "pnl_pct":  float(row["pnl_pct"]),
+                        "pnl_usdt": pnl,
+                        "score":    int(row.get("score", 0)),
+                        "reason":   row["reason"],
+                        "duration": float(row.get("duration_min", 0)),
+                    })
+                except (ValueError, KeyError):
+                    continue
+
+        _daily_loss_usdt = recovered_loss
+
+        if recovered_loss >= config.MAX_DAILY_LOSS_USDT:
+            _daily_limit_hit = True
+            log.warning(
+                "Daily limit ya alcanzado antes del reinicio: -%.2f USDT (límite %.2f)",
+                recovered_loss, config.MAX_DAILY_LOSS_USDT,
+            )
+            _tg.notify(
+                f"⚠️ Bot reiniciado — daily limit ya alcanzado\n"
+                f"Pérdida acumulada hoy: <code>-{recovered_loss:.2f} USDT</code>\n"
+                f"⛔ Sin nuevas entradas hasta 00:00 UTC."
+            )
+        else:
+            log.info(
+                "Daily loss restaurado desde CSV: -%.2f USDT (%d trades hoy, límite %.2f)",
+                recovered_loss, recovered_trades, config.MAX_DAILY_LOSS_USDT,
+            )
+
+    except Exception as e:
+        log.warning("Error restaurando daily loss desde CSV: %s — arrancando desde 0", e)
+        _daily_loss_usdt = 0.0
+
+
 def _check_daily_drawdown(pnl_usdt: float) -> None:
-    """Acumula pérdida y activa el límite si se supera MAX_DAILY_LOSS_USDT."""
     global _daily_loss_usdt, _daily_limit_hit
     if pnl_usdt >= 0:
         return
@@ -72,8 +133,7 @@ def _check_daily_drawdown(pnl_usdt: float) -> None:
         if not _daily_limit_hit and _daily_loss_usdt >= config.MAX_DAILY_LOSS_USDT:
             _daily_limit_hit = True
             log.warning(
-                "🚨 Daily drawdown límite alcanzado: -%.2f USDT (límite %.2f USDT) — "
-                "bot pausado hasta mañana UTC",
+                "🚨 Daily drawdown límite alcanzado: -%.2f USDT (límite %.2f USDT)",
                 _daily_loss_usdt, config.MAX_DAILY_LOSS_USDT,
             )
             _tg.notify(
@@ -85,11 +145,10 @@ def _check_daily_drawdown(pnl_usdt: float) -> None:
 
 
 # ── Win rate monitor ──────────────────────────────────────────────────────────
-_winrate_alerted: bool = False   # evita spam: solo avisa una vez por racha mala
+_winrate_alerted: bool = False
 
 
 def _check_winrate() -> None:
-    """Alerta si el win rate de los últimos N trades cae por debajo del umbral."""
     global _winrate_alerted
     lookback  = config.WINRATE_LOOKBACK
     threshold = config.WINRATE_ALERT_PCT
@@ -115,7 +174,6 @@ def _check_winrate() -> None:
             f"Revisa las condiciones de mercado."
         )
     elif win_rate >= threshold and _winrate_alerted:
-        # Se recuperó — resetear alerta
         _winrate_alerted = False
         log.info("Win rate recuperado: %.0f%% en últimos %d trades", win_rate, lookback)
 
@@ -186,7 +244,6 @@ def record(
         "score": score, "reason": reason, "duration": duration,
     })
 
-    # ── Post-trade checks ──────────────────────────────────────────────────
     _check_daily_drawdown(pnl_usdt)
     _check_winrate()
 
@@ -210,7 +267,6 @@ def send_daily_summary() -> None:
         lines.append(f"{icon} {t['symbol']} {t['side'].upper()} {t['pnl_pct']:+.2f}%")
 
     _tg_send("\n".join(lines))
-    # Reset caché y contadores diarios tras el resumen de medianoche
     _cache.clear()
     with _daily_loss_lock:
         global _daily_loss_usdt, _daily_loss_date, _daily_limit_hit
@@ -236,6 +292,8 @@ def _daily_summary_scheduler() -> None:
 
 
 def start_scheduler() -> None:
+    """Restaura el estado del día desde CSV y arranca el scheduler de resumen diario."""
+    _restore_daily_loss_from_csv()
     threading.Thread(
         target=_daily_summary_scheduler,
         daemon=True,

@@ -20,6 +20,9 @@ FIXES aplicados:
      para evitar que main.py interprete todas las posiciones como cerradas.
   8. get_closed_reason() consulta el historial real de órdenes ejecutadas para
      determinar si la posición cerró por TP o SL, junto con el precio de ejecución.
+  9. get_spread_pct() consulta el orderbook nivel 1 y devuelve el spread como
+     porcentaje del mid price. Usado en main.py para filtrar pares ilíquidos
+     antes de abrir posición.
 """
 import hashlib
 import hmac
@@ -33,7 +36,7 @@ import config
 
 log = logging.getLogger("exchange")
 
-# ── Firma ─────────────────────────────────────────────────────────────────────
+# ── Firma ─────────────────────────────────────────────────────────────────────────────
 
 def _sign(params: dict) -> str:
     """Firma la query string tal como la construye urllib / BingX."""
@@ -49,18 +52,14 @@ def _headers() -> dict:
     return {"X-BX-APIKEY": config.API_KEY}
 
 
-# ── HTTP helpers con reintentos ───────────────────────────────────────────────
+# ── HTTP helpers con reintentos ──────────────────────────────────────────────
 
 _RETRIES    = 3
 _RETRY_WAIT = 1.0
 
 
 def _request(method: str, path: str, params: dict) -> dict:
-    """GET, POST o DELETE enviando siempre los parámetros en la query string (BingX V2).
-
-    FIX: timestamp y firma se renuevan en cada intento para que un timeout en el
-    primer intento no deje el segundo con un timestamp expirado (BingX rechaza >5s).
-    """
+    """GET, POST o DELETE enviando siempre los parámetros en la query string (BingX V2)."""
     base_params = {k: v for k, v in params.items() if k not in ("timestamp", "signature")}
     url = config.BASE_URL + path
 
@@ -104,7 +103,7 @@ def _delete(path: str, params: dict = None) -> dict:
     return _request("DELETE", path, params or {})
 
 
-# ── Precio ────────────────────────────────────────────────────────────────────
+# ── Precio ───────────────────────────────────────────────────────────────────────────
 
 def get_price(symbol: str = None) -> float:
     symbol = symbol or config.SYMBOL
@@ -112,7 +111,34 @@ def get_price(symbol: str = None) -> float:
     return float(data["data"]["price"])
 
 
-# ── OHLCV ─────────────────────────────────────────────────────────────────────
+# ── Spread / liquidez ────────────────────────────────────────────────────────────
+
+def get_spread_pct(symbol: str) -> float:
+    """Consulta el orderbook nivel 1 y devuelve el spread como porcentaje del mid price.
+
+    Ejemplo: best_ask=1.002, best_bid=1.000 → spread = 0.002 / 1.001 = 0.1997%
+
+    Retorna 999.0 si no se puede obtener el orderbook (falla segura: bloquea la entrada).
+    """
+    try:
+        data = _get("/openApi/swap/v2/quote/depth", {"symbol": symbol, "limit": 5})
+        book = data.get("data", {})
+        asks = book.get("asks") or []
+        bids = book.get("bids") or []
+        if not asks or not bids:
+            return 999.0
+        best_ask = float(asks[0][0])
+        best_bid = float(bids[0][0])
+        if best_ask <= 0 or best_bid <= 0:
+            return 999.0
+        mid = (best_ask + best_bid) / 2
+        return (best_ask - best_bid) / mid * 100
+    except Exception as exc:
+        log.warning("[%s] get_spread_pct error: %s", symbol, exc)
+        return 999.0
+
+
+# ── OHLCV ───────────────────────────────────────────────────────────────────────────
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
     """Devuelve lista de velas [{ts, open, high, low, close, volume}] más reciente al final."""
@@ -142,7 +168,7 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
 _contract_info_cache: dict[str, dict] = {}
 
 def _get_contract_info(symbol: str) -> dict:
-    """Devuelve stepSize y minQty para el símbolo. Cachea para no repetir llamadas."""
+    """Devuelve stepSize y minQty para el símbolo. Cachéa para no repetir llamadas."""
     if symbol in _contract_info_cache:
         return _contract_info_cache[symbol]
     try:
@@ -178,7 +204,7 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
     return (qty * price) >= min_usdt
 
 
-# ── Posiciones ────────────────────────────────────────────────────────────────
+# ── Posiciones ─────────────────────────────────────────────────────────────────────
 
 def _parse_position(p: dict) -> dict:
     return {
@@ -191,10 +217,7 @@ def _parse_position(p: dict) -> dict:
 
 
 def get_all_positions() -> dict[str, dict]:
-    """BATCH: devuelve {symbol: pos_dict} para todas las posiciones abiertas.
-
-    FIX: ya no captura la excepción silenciosamente.
-    """
+    """BATCH: devuelve {symbol: pos_dict} para todas las posiciones abiertas."""
     data = _get("/openApi/swap/v2/user/positions", {})
     result: dict[str, dict] = {}
     for p in (data.get("data") or []):
@@ -214,21 +237,14 @@ def get_position(symbol: str = None) -> dict | None:
     return None
 
 
-# ── Historial de cierre real ──────────────────────────────────────────────────
+# ── Historial de cierre real ────────────────────────────────────────────────────
 
 _CLOSE_ORDER_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET"}
 _CLOSE_LOOK_BACK  = 10 * 60 * 1000   # 10 minutos en ms
 
 def get_closed_reason(symbol: str) -> tuple[str, float]:
     """Consulta el historial de órdenes ejecutadas de BingX para determinar
-    si la posición cerró por TP o SL y devuelve (reason, avg_price).
-
-    Retorna:
-        ("TP", precio_ejecucion)  si la última orden FILLED fue TAKE_PROFIT_MARKET
-        ("SL", precio_ejecucion)  si la última orden FILLED fue STOP_MARKET
-        (None, 0.0)               si no se encontró ninguna orden relevante
-                                  (main.py cae en el fallback)
-    """
+    si la posición cerró por TP o SL y devuelve (reason, avg_price)."""
     try:
         start_ts = int(time.time() * 1000) - _CLOSE_LOOK_BACK
         data = _get("/openApi/swap/v2/trade/allOrders", {
@@ -238,7 +254,6 @@ def get_closed_reason(symbol: str) -> tuple[str, float]:
         })
         orders = data.get("data", {}).get("orders") or []
 
-        # Filtrar solo órdenes de cierre ejecutadas, ordenar por tiempo desc
         filled = [
             o for o in orders
             if o.get("status") == "FILLED"
@@ -249,9 +264,9 @@ def get_closed_reason(symbol: str) -> tuple[str, float]:
             return None, 0.0
 
         filled.sort(key=lambda o: int(o.get("updateTime", 0)), reverse=True)
-        latest = filled[0]
-        order_type  = latest.get("type", "")
-        avg_price   = float(latest.get("avgPrice") or latest.get("stopPrice") or 0)
+        latest     = filled[0]
+        order_type = latest.get("type", "")
+        avg_price  = float(latest.get("avgPrice") or latest.get("stopPrice") or 0)
 
         reason = "TP" if order_type == "TAKE_PROFIT_MARKET" else "SL"
         log.info("[%s] Cierre detectado: %s @ %.6f (orden tipo=%s)",
