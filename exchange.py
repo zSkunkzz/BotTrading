@@ -31,6 +31,9 @@ FIXES aplicados:
   11. FIX: añadida set_leverage() — faltaba por completo, causaba WARNING en
       el arranque para los 52 pares: "module 'exchange' has no attribute 'set_leverage'".
       BingX requiere dos llamadas separadas (LONG y SHORT) por símbolo.
+  12. FIX: añadidas open_order(), place_stop_order() y place_tp_order() —
+      faltaban por completo. main.py las llama para abrir posiciones y colocar
+      las órdenes de protección SL/TP tras una señal.
 """
 import hashlib
 import hmac
@@ -71,7 +74,6 @@ def _request(method: str, path: str, params: dict) -> dict:
     base_params = {k: v for k, v in params.items() if k not in ("timestamp", "signature")}
     url = config.BASE_URL + path
 
-    # FIX: last_exc inicializada a RuntimeError para que nunca sea None al hacer raise.
     last_exc: Exception = RuntimeError(f"All {_RETRIES} attempts failed for {path}")
     for attempt in range(1, _RETRIES + 1):
         signed = dict(base_params)
@@ -115,12 +117,7 @@ def _delete(path: str, params: dict = None) -> dict:
 # ── Leverage ──────────────────────────────────────────────────────────────────────────
 
 def set_leverage(symbol: str, leverage: int) -> None:
-    """Configura el leverage para LONG y SHORT en BingX.
-
-    BingX requiere dos llamadas separadas (una por side). Si alguna falla
-    con HTTPStatusError se deja propagar; el caller (main.py) lo captura
-    y loguea como WARNING sin detener el arranque.
-    """
+    """Configura el leverage para LONG y SHORT en BingX."""
     for side in ("LONG", "SHORT"):
         _post("/openApi/swap/v2/trade/leverage", {
             "symbol":   symbol,
@@ -141,12 +138,7 @@ def get_price(symbol: str = None) -> float:
 # ── Spread / liquidez ────────────────────────────────────────────────────────────
 
 def get_spread_pct(symbol: str) -> float:
-    """Consulta el orderbook nivel 1 y devuelve el spread como porcentaje del mid price.
-
-    Ejemplo: best_ask=1.002, best_bid=1.000 → spread = 0.002 / 1.001 = 0.1997%
-
-    Retorna 999.0 si no se puede obtener el orderbook (falla segura: bloquea la entrada).
-    """
+    """Consulta el orderbook nivel 1 y devuelve el spread como porcentaje del mid price."""
     try:
         data = _get("/openApi/swap/v2/quote/depth", {"symbol": symbol, "limit": 5})
         book = data.get("data", {})
@@ -195,7 +187,6 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
 _contract_info_cache: dict[str, dict] = {}
 
 def _get_contract_info(symbol: str) -> dict:
-    """Devuelve stepSize y minQty para el símbolo. Cachéa para no repetir llamadas."""
     if symbol in _contract_info_cache:
         return _contract_info_cache[symbol]
     try:
@@ -219,7 +210,6 @@ def _get_contract_info(symbol: str) -> dict:
 
 
 def floor_qty(qty: float, step: float) -> float:
-    """Redondea qty hacia abajo al step size del contrato."""
     if step <= 0:
         return qty
     factor = 1.0 / step
@@ -227,8 +217,101 @@ def floor_qty(qty: float, step: float) -> float:
 
 
 def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
-    """Verifica que el valor nocional sea >= min_usdt."""
     return (qty * price) >= min_usdt
+
+
+# ── Órdenes ──────────────────────────────────────────────────────────────────────────
+
+def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
+    """Abre una posición MARKET con SL y TP adjuntos en BingX.
+
+    side: 'long' o 'short'
+    qty: cantidad de contratos (ya ajustada al step size por risk.calc)
+    sl: precio de stop loss
+    tp: precio de take profit
+    symbol: símbolo del par (usa config.SYMBOL si no se especifica)
+
+    BingX acepta stopLoss y takeProfit como JSON embebido en la query.
+    El side BingX para abrir LONG es BUY; para SHORT es SELL.
+    """
+    symbol = symbol or config.SYMBOL
+    bingx_side = "BUY" if side == "long" else "SELL"
+
+    info  = _get_contract_info(symbol)
+    step  = info["stepSize"]
+    qty   = floor_qty(qty, step)
+
+    if not min_notional_ok(qty, get_price(symbol)):
+        raise ValueError(f"[{symbol}] Notional demasiado bajo para qty={qty}")
+
+    params = {
+        "symbol":           symbol,
+        "side":             bingx_side,
+        "positionSide":     "LONG" if side == "long" else "SHORT",
+        "type":             "MARKET",
+        "quantity":         qty,
+        "stopLoss":         f'{{"type":"STOP_MARKET","stopPrice":{sl},"price":{sl},"workingType":"MARK_PRICE"}}',
+        "takeProfit":       f'{{"type":"TAKE_PROFIT_MARKET","stopPrice":{tp},"price":{tp},"workingType":"MARK_PRICE"}}',
+    }
+    resp = _post("/openApi/swap/v2/trade/order", params)
+    log.info("[%s] Orden abierta: %s qty=%.6f sl=%.6f tp=%.6f",
+             symbol, side.upper(), qty, sl, tp)
+    return resp
+
+
+def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> dict:
+    """Coloca una orden STOP_MARKET de cierre (SL) para una posición abierta.
+
+    Para cerrar un LONG se envía SELL; para cerrar un SHORT se envía BUY.
+    positionSide debe ser el lado de la posición que se quiere cerrar.
+    """
+    close_side      = "SELL" if side == "long" else "BUY"
+    position_side   = "LONG" if side == "long" else "SHORT"
+
+    params = {
+        "symbol":       symbol,
+        "side":         close_side,
+        "positionSide": position_side,
+        "type":         "STOP_MARKET",
+        "quantity":     qty,
+        "stopPrice":    stop_price,
+        "workingType":  "MARK_PRICE",
+        "reduceOnly":   "true",
+    }
+    resp = _post("/openApi/swap/v2/trade/order", params)
+    log.info("[%s] SL colocado: %s qty=%.6f @ %.6f", symbol, side.upper(), qty, stop_price)
+    return resp
+
+
+def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> dict:
+    """Coloca una orden TAKE_PROFIT_MARKET de cierre (TP) para una posición abierta."""
+    close_side      = "SELL" if side == "long" else "BUY"
+    position_side   = "LONG" if side == "long" else "SHORT"
+
+    params = {
+        "symbol":       symbol,
+        "side":         close_side,
+        "positionSide": position_side,
+        "type":         "TAKE_PROFIT_MARKET",
+        "quantity":     qty,
+        "stopPrice":    tp_price,
+        "workingType":  "MARK_PRICE",
+        "reduceOnly":   "true",
+    }
+    resp = _post("/openApi/swap/v2/trade/order", params)
+    log.info("[%s] TP colocado: %s qty=%.6f @ %.6f", symbol, side.upper(), qty, tp_price)
+    return resp
+
+
+def cancel_all_orders(symbol: str) -> dict:
+    """Cancela todas las órdenes abiertas para el símbolo (BingX exige DELETE)."""
+    try:
+        resp = _delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
+        log.debug("[%s] Órdenes canceladas", symbol)
+        return resp
+    except Exception as exc:
+        log.warning("[%s] cancel_all_orders error: %s", symbol, exc)
+        return {}
 
 
 # ── Posiciones ─────────────────────────────────────────────────────────────────────
@@ -254,7 +337,6 @@ def get_all_positions() -> dict[str, dict]:
 
 
 def get_position(symbol: str = None) -> dict | None:
-    """Consulta individual por símbolo. Mantenida para compatibilidad."""
     symbol = symbol or config.SYMBOL
     data = _get("/openApi/swap/v2/user/positions", {"symbol": symbol})
     positions = data.get("data") or []
@@ -267,12 +349,10 @@ def get_position(symbol: str = None) -> dict | None:
 # ── Historial de cierre real ────────────────────────────────────────────────────
 
 _CLOSE_ORDER_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET"}
-# FIX: ampliado a 30 minutos para cubrir loops lentos con muchos pares (antes 10 min).
 _CLOSE_LOOK_BACK  = 30 * 60 * 1000   # 30 minutos en ms
 
 def get_closed_reason(symbol: str) -> tuple[str, float]:
-    """Consulta el historial de órdenes ejecutadas de BingX para determinar
-    si la posición cerró por TP o SL y devuelve (reason, avg_price)."""
+    """Consulta el historial de órdenes ejecutadas para determinar si cerró por TP o SL."""
     try:
         start_ts = int(time.time() * 1000) - _CLOSE_LOOK_BACK
         data = _get("/openApi/swap/v2/trade/allOrders", {
