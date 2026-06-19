@@ -28,6 +28,9 @@ FIXES aplicados:
       fallaban por HTTPStatusError (que hace raise dentro del loop) seguido de
       salida del bucle sin asignar last_exc. Ahora lanza RuntimeError explícito
       si last_exc es None al final del loop.
+  11. FIX: añadida set_leverage() — faltaba por completo, causaba WARNING en
+      el arranque para los 52 pares: "module 'exchange' has no attribute 'set_leverage'".
+      BingX requiere dos llamadas separadas (LONG y SHORT) por símbolo.
 """
 import hashlib
 import hmac
@@ -107,6 +110,24 @@ def _post(path: str, params: dict = None) -> dict:
 
 def _delete(path: str, params: dict = None) -> dict:
     return _request("DELETE", path, params or {})
+
+
+# ── Leverage ──────────────────────────────────────────────────────────────────────────
+
+def set_leverage(symbol: str, leverage: int) -> None:
+    """Configura el leverage para LONG y SHORT en BingX.
+
+    BingX requiere dos llamadas separadas (una por side). Si alguna falla
+    con HTTPStatusError se deja propagar; el caller (main.py) lo captura
+    y loguea como WARNING sin detener el arranque.
+    """
+    for side in ("LONG", "SHORT"):
+        _post("/openApi/swap/v2/trade/leverage", {
+            "symbol":   symbol,
+            "side":     side,
+            "leverage": leverage,
+        })
+    log.debug("[%s] Leverage seteado a %dx (LONG+SHORT)", symbol, leverage)
 
 
 # ── Precio ───────────────────────────────────────────────────────────────────────────
