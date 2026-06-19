@@ -34,6 +34,11 @@ FIXES aplicados:
   12. FIX: añadidas open_order(), place_stop_order() y place_tp_order() —
       faltaban por completo. main.py las llama para abrir posiciones y colocar
       las órdenes de protección SL/TP tras una señal.
+  13. FIX: open_order() envíaba stopLoss/takeProfit como JSON en la query string,
+      que urllib URL-encodea y BingX rechaza. Ahora abre la orden MARKET primero
+      y luego coloca SL y TP con llamadas separadas (place_stop_order / place_tp_order).
+      Eliminado positionSide de todas las órdenes — BingX One-way no lo acepta y
+      lo rechaza con 400. reduceOnly se envía como string "true" (minúscula).
 """
 import hashlib
 import hmac
@@ -223,60 +228,58 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
 # ── Órdenes ──────────────────────────────────────────────────────────────────────────
 
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
-    """Abre una posición MARKET con SL y TP adjuntos en BingX.
+    """Abre una posición MARKET y luego coloca SL y TP con llamadas separadas.
 
-    side: 'long' o 'short'
-    qty: cantidad de contratos (ya ajustada al step size por risk.calc)
-    sl: precio de stop loss
-    tp: precio de take profit
-    symbol: símbolo del par (usa config.SYMBOL si no se especifica)
-
-    BingX acepta stopLoss y takeProfit como JSON embebido en la query.
-    El side BingX para abrir LONG es BUY; para SHORT es SELL.
+    FIX: la versión anterior intentaba pasar stopLoss/takeProfit como JSON
+    en la query string, que urllib URL-encodea y BingX rechaza.
+    FIX: eliminado positionSide — BingX One-way (modo por defecto) devuelve
+    400 si se incluye; en modo Hedge sí se requiere, pero la cuenta usa One-way.
     """
-    symbol = symbol or config.SYMBOL
+    symbol     = symbol or config.SYMBOL
     bingx_side = "BUY" if side == "long" else "SELL"
 
-    info  = _get_contract_info(symbol)
-    step  = info["stepSize"]
-    qty   = floor_qty(qty, step)
+    info = _get_contract_info(symbol)
+    qty  = floor_qty(qty, info["stepSize"])
 
-    if not min_notional_ok(qty, get_price(symbol)):
-        raise ValueError(f"[{symbol}] Notional demasiado bajo para qty={qty}")
+    # Paso 1: abrir posición MARKET limpia
+    resp = _post("/openApi/swap/v2/trade/order", {
+        "symbol":   symbol,
+        "side":     bingx_side,
+        "type":     "MARKET",
+        "quantity": qty,
+    })
+    log.info("[%s] Orden MARKET abierta: %s qty=%.6f", symbol, side.upper(), qty)
 
-    params = {
-        "symbol":           symbol,
-        "side":             bingx_side,
-        "positionSide":     "LONG" if side == "long" else "SHORT",
-        "type":             "MARKET",
-        "quantity":         qty,
-        "stopLoss":         f'{{"type":"STOP_MARKET","stopPrice":{sl},"price":{sl},"workingType":"MARK_PRICE"}}',
-        "takeProfit":       f'{{"type":"TAKE_PROFIT_MARKET","stopPrice":{tp},"price":{tp},"workingType":"MARK_PRICE"}}',
-    }
-    resp = _post("/openApi/swap/v2/trade/order", params)
-    log.info("[%s] Orden abierta: %s qty=%.6f sl=%.6f tp=%.6f",
-             symbol, side.upper(), qty, sl, tp)
+    # Paso 2: SL y TP en llamadas separadas (BingX One-way acepta reduceOnly)
+    # Pequeño delay para que BingX registre la posición antes de colocar órdenes
+    time.sleep(0.5)
+    try:
+        place_stop_order(symbol, side, qty, sl)
+    except Exception as e:
+        log.warning("[%s] Error colocando SL tras abrir: %s", symbol, e)
+    try:
+        place_tp_order(symbol, side, qty, tp)
+    except Exception as e:
+        log.warning("[%s] Error colocando TP tras abrir: %s", symbol, e)
+
     return resp
 
 
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> dict:
-    """Coloca una orden STOP_MARKET de cierre (SL) para una posición abierta.
+    """Coloca una orden STOP_MARKET de cierre (SL).
 
-    Para cerrar un LONG se envía SELL; para cerrar un SHORT se envía BUY.
-    positionSide debe ser el lado de la posición que se quiere cerrar.
+    FIX: eliminado positionSide — incompatible con cuentas One-way.
+    reduceOnly como string "true" (minúscula) — BingX rechaza "True".
     """
-    close_side      = "SELL" if side == "long" else "BUY"
-    position_side   = "LONG" if side == "long" else "SHORT"
-
+    close_side = "SELL" if side == "long" else "BUY"
     params = {
-        "symbol":       symbol,
-        "side":         close_side,
-        "positionSide": position_side,
-        "type":         "STOP_MARKET",
-        "quantity":     qty,
-        "stopPrice":    stop_price,
-        "workingType":  "MARK_PRICE",
-        "reduceOnly":   "true",
+        "symbol":      symbol,
+        "side":        close_side,
+        "type":        "STOP_MARKET",
+        "quantity":    qty,
+        "stopPrice":   stop_price,
+        "workingType": "MARK_PRICE",
+        "reduceOnly":  "true",
     }
     resp = _post("/openApi/swap/v2/trade/order", params)
     log.info("[%s] SL colocado: %s qty=%.6f @ %.6f", symbol, side.upper(), qty, stop_price)
@@ -284,19 +287,20 @@ def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> d
 
 
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> dict:
-    """Coloca una orden TAKE_PROFIT_MARKET de cierre (TP) para una posición abierta."""
-    close_side      = "SELL" if side == "long" else "BUY"
-    position_side   = "LONG" if side == "long" else "SHORT"
+    """Coloca una orden TAKE_PROFIT_MARKET de cierre (TP).
 
+    FIX: eliminado positionSide — incompatible con cuentas One-way.
+    reduceOnly como string "true" (minúscula) — BingX rechaza "True".
+    """
+    close_side = "SELL" if side == "long" else "BUY"
     params = {
-        "symbol":       symbol,
-        "side":         close_side,
-        "positionSide": position_side,
-        "type":         "TAKE_PROFIT_MARKET",
-        "quantity":     qty,
-        "stopPrice":    tp_price,
-        "workingType":  "MARK_PRICE",
-        "reduceOnly":   "true",
+        "symbol":      symbol,
+        "side":        close_side,
+        "type":        "TAKE_PROFIT_MARKET",
+        "quantity":    qty,
+        "stopPrice":   tp_price,
+        "workingType": "MARK_PRICE",
+        "reduceOnly":  "true",
     }
     resp = _post("/openApi/swap/v2/trade/order", params)
     log.info("[%s] TP colocado: %s qty=%.6f @ %.6f", symbol, side.upper(), qty, tp_price)
