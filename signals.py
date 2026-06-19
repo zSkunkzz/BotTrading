@@ -2,18 +2,17 @@
 
 Filtros:
   1. Vela cerrada       : penúltima vela (ya cerrada)
-  2. Régimen de mercado : clasificación por EMAs 1h (ADX no bloquea, penaliza)
-                          NUEVO: requiere REGIME_CONFIRM_BARS velas 1h consecutivas
-                          confirmando el mismo régimen antes de habilitar señales
+  2. Régimen de mercado : clasificación por EMAs 1h — requiere alineación ESTRICTA
+                          price > ema20 > ema50 > ema200 (bull) o inverso (bear).
+                          Requiere REGIME_CONFIRM_BARS velas 1h consecutivas confirmando.
   3. Macro 4h           : EMA50 en 4h — bonus/penalización/neutro según disponibilidad
   4. EMA200 1h          : hard-guard de dirección
-  5. ADX 15m            : >35 +12, >25 +6, >18 -8, <18 -15
+  5. ADX 15m            : <18 → HARD-GUARD (sin señal) | >35 +12 | >25 +6 | >18 -8
   6. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
   7. Volumen            : última vela CERRADA >media×1.2 → +8
   8. RSI 15m            : cruce 50 +15, extremo +8, direccional +4, contrario -5
-  9. MACD 15m + 1h      : histograma positivo/negativo → +10 | neutro 0 | contrario -5
-                          (ya no se penaliza si el histograma va en la dirección correcta
-                          pero no está acelerando)
+  9. MACD 15m + 1h      : histograma acelerando +10 | positivo/negativo sin acelerar 0
+                          | contrario -5
   10. Divergencia RSI   : +8
   11. Sesgo horario     : hora alta +8, hora baja -10
   12. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
@@ -38,6 +37,7 @@ NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
 MIN_SCORE           = config.MIN_SCORE
 REGIME_CONFIRM_BARS = 2
+ADX_MIN             = 18   # por debajo → hard-guard, sin señal
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
@@ -147,6 +147,15 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
 
 
 def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
+    """Clasifica el régimen con alineación ESTRICTA de EMAs.
+
+    Bull:  price > ema20 > ema50 > ema200  (todas en orden ascendente)
+    Bear:  price < ema20 < ema50 < ema200  (todas en orden descendente)
+    Range: cualquier otra configuración — NO se abren posiciones.
+
+    FIX: eliminado el segundo bloque laxo que permitía bull/bear con solo
+    2 de las 3 condiciones, causando entradas en mercados laterales o contra-tendencia.
+    """
     closes = [c["close"] for c in candles_1h]
     ema20  = _ema(closes, 20)[-1]
     ema50  = _ema(closes, 50)[-1]
@@ -157,10 +166,6 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     if price > ema20 > ema50 > ema200:
         return "bull", adx
     if price < ema20 < ema50 < ema200:
-        return "bear", adx
-    if price > ema200 and price > ema50 and ema20 > ema200:
-        return "bull", adx
-    if price < ema200 and price < ema50 and ema20 < ema200:
         return "bear", adx
     return "range", adx
 
@@ -224,13 +229,13 @@ def evaluate(
     closes_15m = [c["close"] for c in closed_15m]
     closes_1h  = [c["close"] for c in closed_1h]
 
-    # ── Hard-guard 1: Régimen confirmado ──────────────────────────────────
+    # ── Hard-guard 1: Régimen confirmado (alineación estricta de EMAs) ────
     regime, adx_1h = _regime_confirmed(closed_1h)
     if regime == "range":
         log.info("⬛ Régimen lateral o inestable — sin señal")
         return None, 0
 
-    # ── Hard-guard 2: distancia EMA200 ──────────────────────────────────
+    # ── Hard-guard 2: distancia EMA200 ───────────────────────────────────
     ema200 = _ema(closes_1h, 200)[-1]
     price  = closes_15m[-1]
     dist   = abs(price - ema200) / ema200
@@ -241,16 +246,23 @@ def evaluate(
     trend_long  = regime == "bull"
     trend_short = regime == "bear"
 
-    # ── Hard-guard 3: no-chase ──────────────────────────────────────────
+    # ── Hard-guard 3: no-chase ────────────────────────────────────────────
     atr        = _atr(closed_15m, 14)
     last_range = closed_15m[-1]["high"] - closed_15m[-1]["low"]
     if atr > 0 and last_range > NO_CHASE_MULT * atr:
         log.info("⚠️  Vela explosiva — sin señal")
         return None, 0
 
-    # ── Componentes de score ───────────────────────────────────────────────
+    # ── Hard-guard 4: ADX 15m mínimo ─────────────────────────────────────
+    # FIX: ADX < ADX_MIN indica mercado sin tendencia real en 15m.
+    # Antes solo penalizaba -15 pts (insuficiente para bloquear).
+    # Ahora es hard-guard: sin momentum direccional, sin señal.
     adx = _adx(closed_15m, 14)
+    if adx < ADX_MIN:
+        log.info("⚠️  ADX 15m demasiado bajo (%.1f < %d) — mercado sin momentum", adx, ADX_MIN)
+        return None, 0
 
+    # ── Componentes de score ──────────────────────────────────────────────
     hour_utc   = datetime.datetime.now(timezone.utc).hour
     hour_bonus = 8 if hour_utc in HIGH_BIAS_HOURS else (-10 if hour_utc in LOW_BIAS_HOURS else 0)
 
@@ -277,11 +289,13 @@ def evaluate(
     hist_15m = _macd_histogram(closes_15m)
     hist_1h  = _macd_histogram(closes_1h)
 
-    # MACD 15m: +10 si histograma va en dirección correcta (positivo para bull,
-    # negativo para bear), 0 si neutro/contrario pero en zona correcta sin acelerar,
-    # -5 solo si el histograma va claramente en contra.
-    macd15_bull_strong = hist_15m[-1] > 0 and hist_15m[-1] > hist_15m[-2]  # acelerando
-    macd15_bull_weak   = hist_15m[-1] > 0                                   # positivo pero no acelerando
+    # MACD 15m:
+    #   +10 si histograma acelera en dirección correcta (momentum real)
+    #   0   si histograma está en dirección correcta pero desacelerando
+    #        FIX: antes era +5, lo que recompensaba momentum agotándose.
+    #   -5  si histograma va en contra
+    macd15_bull_strong = hist_15m[-1] > 0 and hist_15m[-1] > hist_15m[-2]
+    macd15_bull_weak   = hist_15m[-1] > 0
     macd15_bear_strong = hist_15m[-1] < 0 and hist_15m[-1] < hist_15m[-2]
     macd15_bear_weak   = hist_15m[-1] < 0
 
@@ -295,26 +309,27 @@ def evaluate(
             return 0
         return 15 if (macro and favor) else (-10 if (not macro and favor) else 0)
 
-    # ── Scoring LONG ──────────────────────────────────────────────────────────
+    # ── Scoring LONG ──────────────────────────────────────────────────────
     def score_long() -> int:
         if not trend_long:
             return 0
         s = 20
         s += _macro_pts(macro_long, favor=True)
+        # ADX ya superó el hard-guard (>= ADX_MIN), scoring desde ahí
         if adx > 35:        s += 12
         elif adx > 25:      s += 6
         elif adx > 18:      s -= 8
-        else:               s -= 15
+        # adx < 18 ya bloqueado arriba como hard-guard
         if adx_1h < 18:     s -= 5
         elif adx_1h > 25:   s += 5
         if rsi_cross_up:    s += 15
         elif rsi_ext_bull:  s += 8
         elif rsi_bull:      s += 4
         else:               s -= 5
-        # MACD 15m: +10 acelerando, +5 positivo sin acelerar, -5 en contra
+        # MACD 15m: +10 acelerando, 0 positivo sin acelerar (agotamiento), -5 en contra
         if macd15_bull_strong:   s += 10
-        elif macd15_bull_weak:   s += 5
-        elif not macd15_bear_weak: s += 0   # neutro (raro)
+        elif macd15_bull_weak:   s += 0
+        elif not macd15_bear_weak: s += 0
         else:                    s -= 5
         if macd1h_bull:     s += 10
         else:               s -= 5
@@ -323,7 +338,7 @@ def evaluate(
         s += hour_bonus
         return min(max(s, 0), 100)
 
-    # ── Scoring SHORT ─────────────────────────────────────────────────────────
+    # ── Scoring SHORT ─────────────────────────────────────────────────────
     def score_short() -> int:
         if not trend_short:
             return 0
@@ -332,16 +347,15 @@ def evaluate(
         if adx > 35:         s += 12
         elif adx > 25:       s += 6
         elif adx > 18:       s -= 8
-        else:                s -= 15
         if adx_1h < 18:      s -= 5
         elif adx_1h > 25:    s += 5
         if rsi_cross_down:   s += 15
         elif rsi_ext_bear:   s += 8
         elif rsi_bear:       s += 4
         else:                s -= 5
-        # MACD 15m: +10 acelerando, +5 negativo sin acelerar, -5 en contra
+        # MACD 15m: +10 acelerando, 0 negativo sin acelerar (agotamiento), -5 en contra
         if macd15_bear_strong:   s += 10
-        elif macd15_bear_weak:   s += 5
+        elif macd15_bear_weak:   s += 0
         elif not macd15_bull_weak: s += 0
         else:                    s -= 5
         if macd1h_bear:      s += 10
