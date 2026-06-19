@@ -16,7 +16,7 @@ Filtros:
   10. Divergencia RSI 15m: +8
   11. Divergencia RSI 1h : +12 (marco superior — más fiable, menos ruido)
   12. Soporte/Resistencia: pivots 1h/4h — soporte +10, resistencia -10
-  13. Sesgo horario     : hora alta +8, hora baja -10
+  13. Sesgo horario     : dinámico desde CSV (≥20 trades) o fijo si pocos datos
   14. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
 
 Score base: 20 pts (por superar hard-guards)
@@ -41,32 +41,58 @@ NOTA sobre S/R (price action):
   - Short cerca de resistencia → +10. Short cerca de soporte → -10.
   - Si hay conflicto (soporte y resistencia a la vez), se aplica el más cercano.
   - Si no hay ninguna zona cercana → 0 pts (neutro).
+
+NOTA sobre sesgo horario dinámico:
+  - Lee trades.csv y calcula el PnL medio por hora UTC.
+  - Si hay ≥20 trades en el CSV: usa PnL medio de la hora actual.
+    - PnL medio > +0.5% → +8 pts
+    - PnL medio < -0.5% → -10 pts
+    - Entre -0.5% y +0.5% → 0 pts (neutro)
+  - Si hay <20 trades (arranque): fallback a horas fijas:
+    - HIGH_BIAS_HOURS: {8,9,10,14,15,16,20,21} → +8
+    - LOW_BIAS_HOURS:  {2,3,4,5}               → -10
+  - El CSV se lee una vez por hora (caché con timestamp) para no penalizar I/O.
 """
 from __future__ import annotations
+import csv
 import logging
 import datetime
+import os
+import time
 from datetime import timezone
+from collections import defaultdict
 
 import config
 
 log = logging.getLogger("signals")
 
-# ── Umbrales configurables ────────────────────────────────────────────
+# ── Umbrales configurables ────────────────────────────────────────────────
 EMA200_MIN_DIST     = 0.003
 NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
 MIN_SCORE           = config.MIN_SCORE
 REGIME_CONFIRM_BARS = 2
-ADX_MIN             = 18   # por debajo → hard-guard, sin señal
-SR_ZONE_PCT         = 0.004  # 0.4% — zona de proximidad a S/R
-SR_PIVOT_BARS_1H    = 3      # velas a cada lado para detectar pivot en 1h
-SR_PIVOT_BARS_4H    = 2      # velas a cada lado para detectar pivot en 4h
+ADX_MIN             = 18
+SR_ZONE_PCT         = 0.004
+SR_PIVOT_BARS_1H    = 3
+SR_PIVOT_BARS_4H    = 2
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
 
+# Sesgo horario dinámico — umbrales de PnL medio
+HOUR_BIAS_MIN_TRADES = 20    # mínimo de trades para activar el modo dinámico
+HOUR_BIAS_GOOD_PCT   = 0.5   # PnL medio > +0.5% → hora buena
+HOUR_BIAS_BAD_PCT    = -0.5  # PnL medio < -0.5% → hora mala
 
-# ── Indicadores ─────────────────────────────────────────────────────────────────────────
+# Caché del CSV horario (se recarga máx 1 vez/hora)
+_hour_bias_cache:      dict[int, float] = {}  # hora_utc → pnl_medio_%
+_hour_bias_cache_ts:   float = 0.0
+_hour_bias_cache_ttl:  float = 3600.0  # 1 hora
+_hour_bias_n_trades:   int   = 0
+
+
+# ── Indicadores ─────────────────────────────────────────────────────────
 
 def _ema(closes: list[float], period: int) -> list[float]:
     k = 2 / (period + 1)
@@ -178,16 +204,9 @@ def _pivot_levels(
     n: int,
     max_pivots: int = 8,
 ) -> tuple[list[float], list[float]]:
-    """Extrae los últimos `max_pivots` niveles de soporte y resistencia.
-
-    Pivot alto (resistencia): high[i] > max(high de las n velas anteriores y siguientes)
-    Pivot bajo (soporte):     low[i]  < min(low  de las n velas anteriores y siguientes)
-
-    Solo usa velas ya cerradas. Excluye la vela más reciente (puede no ser pivot).
-    """
-    supports:     list[float] = []
-    resistances:  list[float] = []
-    # Deja margen de n a cada lado; excluye las últimas n velas (pueden no estar consolidadas)
+    """Extrae los últimos `max_pivots` niveles de soporte y resistencia."""
+    supports:    list[float] = []
+    resistances: list[float] = []
     start = n
     end   = len(candles) - n
     if end <= start:
@@ -199,12 +218,11 @@ def _pivot_levels(
         if candles[i]["high"] > max(left_high) and candles[i]["high"] > max(right_high):
             resistances.append(candles[i]["high"])
 
-        left_low   = [candles[j]["low"] for j in range(i - n, i)]
-        right_low  = [candles[j]["low"] for j in range(i + 1, i + n + 1)]
+        left_low  = [candles[j]["low"] for j in range(i - n, i)]
+        right_low = [candles[j]["low"] for j in range(i + 1, i + n + 1)]
         if candles[i]["low"] < min(left_low) and candles[i]["low"] < min(right_low):
             supports.append(candles[i]["low"])
 
-    # Devuelve los más recientes primero
     return supports[-max_pivots:], resistances[-max_pivots:]
 
 
@@ -214,24 +232,12 @@ def _sr_context(
     candles_4h: list[dict] | None,
     zone_pct: float = SR_ZONE_PCT,
 ) -> str:
-    """Determina si el precio está cerca de un soporte o resistencia significativo.
-
-    Combina pivots de 1h y 4h. Los niveles de 4h tienen más peso (zona más amplia).
-
-    Retorna:
-        'support'    — precio cerca de un soporte (relevante para long)
-        'resistance' — precio cerca de una resistencia (relevante para short)
-        'none'       — sin contexto estructural relevante
-
-    Si hay conflicto (precio entre soporte y resistencia simultáneos),
-    devuelve el más cercano al precio actual.
-    """
+    """Determina si el precio está cerca de un soporte o resistencia significativo."""
     near_support    = False
     near_resistance = False
     dist_sup        = float("inf")
     dist_res        = float("inf")
 
-    # ─ Pivots 1h ──────────────────────────────────────────────────
     if len(candles_1h) >= 2 * SR_PIVOT_BARS_1H + 5:
         sups_1h, ress_1h = _pivot_levels(candles_1h, SR_PIVOT_BARS_1H)
         for lvl in sups_1h:
@@ -245,7 +251,6 @@ def _sr_context(
                 near_resistance = True
                 dist_res        = d
 
-    # ─ Pivots 4h (zona más amplia ×1.5 para dar margen al marco mayor) ───
     if candles_4h and len(candles_4h) >= 2 * SR_PIVOT_BARS_4H + 5:
         zone_4h = zone_pct * 1.5
         sups_4h, ress_4h = _pivot_levels(candles_4h, SR_PIVOT_BARS_4H)
@@ -261,13 +266,87 @@ def _sr_context(
                 dist_res        = d
 
     if near_support and near_resistance:
-        # Conflicto: devuelve el más cercano
         return "support" if dist_sup <= dist_res else "resistance"
     if near_support:
         return "support"
     if near_resistance:
         return "resistance"
     return "none"
+
+
+def _load_hour_bias_from_csv() -> None:
+    """Carga o refresca el mapa hora→PnL_medio desde trades.csv.
+
+    Se ejecuta máx 1 vez/hora (caché con TTL). Si el archivo no existe
+    o tiene <HOUR_BIAS_MIN_TRADES filas, deja _hour_bias_n_trades = 0
+    para que evaluate() use el fallback de horas fijas.
+    """
+    global _hour_bias_cache, _hour_bias_cache_ts, _hour_bias_n_trades
+
+    now = time.time()
+    if now - _hour_bias_cache_ts < _hour_bias_cache_ttl:
+        return  # caché vigente
+
+    csv_path = os.getenv("TRADES_CSV", "trades.csv")
+    if not os.path.exists(csv_path):
+        _hour_bias_cache_ts = now
+        _hour_bias_n_trades = 0
+        return
+
+    hour_pnl: dict[int, list[float]] = defaultdict(list)
+    total = 0
+    try:
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    # date format: "YYYY-MM-DD HH:MM"
+                    hour = int(row["date"].split(" ")[1].split(":")[0])
+                    pnl  = float(row["pnl_pct"])
+                    hour_pnl[hour].append(pnl)
+                    total += 1
+                except (KeyError, ValueError, IndexError):
+                    continue
+    except Exception as e:
+        log.debug("Error leyendo CSV para sesgo horario: %s", e)
+        _hour_bias_cache_ts = now
+        _hour_bias_n_trades = 0
+        return
+
+    _hour_bias_cache    = {h: sum(v) / len(v) for h, v in hour_pnl.items()}
+    _hour_bias_cache_ts = now
+    _hour_bias_n_trades = total
+    log.debug("Sesgo horario dinámico cargado: %d trades, %d horas", total, len(_hour_bias_cache))
+
+
+def _hour_bonus(hour_utc: int) -> int:
+    """Devuelve el bonus/penalización de la hora actual.
+
+    Modo dinámico (≥HOUR_BIAS_MIN_TRADES en CSV):
+      PnL medio > +HOUR_BIAS_GOOD_PCT% → +8
+      PnL medio < +HOUR_BIAS_BAD_PCT%  → -10
+      Resto                            →  0
+
+    Modo estático (fallback):
+      HIGH_BIAS_HOURS → +8
+      LOW_BIAS_HOURS  → -10
+    """
+    _load_hour_bias_from_csv()
+
+    if _hour_bias_n_trades >= HOUR_BIAS_MIN_TRADES:
+        mean_pnl = _hour_bias_cache.get(hour_utc, 0.0)
+        if mean_pnl > HOUR_BIAS_GOOD_PCT:
+            return 8
+        if mean_pnl < HOUR_BIAS_BAD_PCT:
+            return -10
+        return 0
+
+    # Fallback: horas fijas
+    if hour_utc in HIGH_BIAS_HOURS:
+        return 8
+    if hour_utc in LOW_BIAS_HOURS:
+        return -10
+    return 0
 
 
 def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
@@ -317,7 +396,7 @@ def _volume_ok(candles: list[dict], window: int = 20) -> bool:
     return candles[-2]["volume"] >= avg * VOLUME_MULT
 
 
-# ── Función principal ────────────────────────────────────────────────────────────────────────
+# ── Función principal ────────────────────────────────────────────────────
 
 def evaluate(
     candles_15m: list[dict],
@@ -357,22 +436,22 @@ def evaluate(
     trend_long  = regime == "bull"
     trend_short = regime == "bear"
 
-    # ── Hard-guard 3: no-chase ────────────────────────────────────────
+    # ── Hard-guard 3: no-chase ──────────────────────────────────────────
     atr        = _atr(closed_15m, 14)
     last_range = closed_15m[-1]["high"] - closed_15m[-1]["low"]
     if atr > 0 and last_range > NO_CHASE_MULT * atr:
         log.info("⚠️  Vela explosiva — sin señal")
         return None, 0
 
-    # ── Hard-guard 4: ADX 15m mínimo ─────────────────────────────────
+    # ── Hard-guard 4: ADX 15m mínimo ───────────────────────────────────
     adx = _adx(closed_15m, 14)
     if adx < ADX_MIN:
         log.info("⚠️  ADX 15m demasiado bajo (%.1f < %d) — mercado sin momentum", adx, ADX_MIN)
         return None, 0
 
-    # ── Componentes comunes ────────────────────────────────────────────
+    # ── Componentes comunes ─────────────────────────────────────────────
     hour_utc   = datetime.datetime.now(timezone.utc).hour
-    hour_bonus = 8 if hour_utc in HIGH_BIAS_HOURS else (-10 if hour_utc in LOW_BIAS_HOURS else 0)
+    hour_bonus = _hour_bonus(hour_utc)  # dinámico desde CSV o fallback fijo
 
     macro_long = macro_short = None
     if closed_4h and len(closed_4h) >= 55:
@@ -398,7 +477,6 @@ def evaluate(
     if len(closes_1h) >= 29:
         divergence_1h = _rsi_divergence(closes_1h, closed_1h, lookback=15)
 
-    # S/R: pivots 1h + 4h sobre velas ya cerradas
     sr = _sr_context(price, closed_1h, closed_4h)
 
     hist_15m = _macd_histogram(closes_15m)
@@ -419,7 +497,7 @@ def evaluate(
             return 0
         return 15 if (macro and favor) else (-10 if (not macro and favor) else 0)
 
-    # ── Scoring LONG ──────────────────────────────────────────────────
+    # ── Scoring LONG ────────────────────────────────────────────────────
     def score_long() -> int:
         if not trend_long:
             return 0
@@ -434,22 +512,21 @@ def evaluate(
         elif rsi_ext_bull:  s += 8
         elif rsi_bull:      s += 4
         else:               s -= 5
-        if macd15_bull_strong:    s += 10
-        elif macd15_bull_weak:    s += 0
+        if macd15_bull_strong:     s += 10
+        elif macd15_bull_weak:     s += 0
         elif not macd15_bear_weak: s += 0
-        else:                     s -= 5
+        else:                      s -= 5
         if macd1h_bull:     s += 10
         else:               s -= 5
         if vol_ok:          s += 8
-        if divergence_15m == "bullish":  s += 8
-        if divergence_1h  == "bullish":  s += 12
-        # S/R price action
-        if sr == "support":    s += 10
-        elif sr == "resistance": s -= 10
+        if divergence_15m == "bullish":   s += 8
+        if divergence_1h  == "bullish":   s += 12
+        if sr == "support":               s += 10
+        elif sr == "resistance":          s -= 10
         s += hour_bonus
         return min(max(s, 0), 100)
 
-    # ── Scoring SHORT ─────────────────────────────────────────────────
+    # ── Scoring SHORT ───────────────────────────────────────────────────
     def score_short() -> int:
         if not trend_short:
             return 0
@@ -464,18 +541,17 @@ def evaluate(
         elif rsi_ext_bear:   s += 8
         elif rsi_bear:       s += 4
         else:                s -= 5
-        if macd15_bear_strong:    s += 10
-        elif macd15_bear_weak:    s += 0
+        if macd15_bear_strong:     s += 10
+        elif macd15_bear_weak:     s += 0
         elif not macd15_bull_weak: s += 0
-        else:                     s -= 5
+        else:                      s -= 5
         if macd1h_bear:      s += 10
         else:               s -= 5
         if vol_ok:           s += 8
-        if divergence_15m == "bearish":  s += 8
-        if divergence_1h  == "bearish":  s += 12
-        # S/R price action
-        if sr == "resistance":  s += 10
-        elif sr == "support":   s -= 10
+        if divergence_15m == "bearish":   s += 8
+        if divergence_1h  == "bearish":   s += 12
+        if sr == "resistance":            s += 10
+        elif sr == "support":             s -= 10
         s += hour_bonus
         return min(max(s, 0), 100)
 
@@ -486,11 +562,12 @@ def evaluate(
     macro_s_str = "None" if macro_short is None else str(macro_short)
 
     log.info(
-        "regime=%s(×%d) adx1h=%.1f hour=%dUTC | price=%.4f ema200=%.4f dist=%.3f%% "
+        "regime=%s(×%d) adx1h=%.1f hour=%dUTC(bias=%+d) | price=%.4f ema200=%.4f dist=%.3f%% "
         "ADX15m=%.1f rsi=%.1f→%.1f vol=%s "
         "div15m=%s div1h=%s sr=%s macro_l=%s macro_s=%s "
         "macd15=%.5f macd1h=%.5f | score_long=%d score_short=%d (min=%d)",
-        regime, REGIME_CONFIRM_BARS, adx_1h, hour_utc, price, ema200, dist * 100,
+        regime, REGIME_CONFIRM_BARS, adx_1h, hour_utc, hour_bonus,
+        price, ema200, dist * 100,
         adx, rsi_prev, rsi_curr, vol_ok,
         divergence_15m, divergence_1h, sr,
         macro_l_str, macro_s_str,
@@ -499,13 +576,13 @@ def evaluate(
     )
 
     if sc_long >= effective_min and sc_long >= sc_short:
-        log.info("✅ LONG score=%d (div15m=%s div1h=%s sr=%s)",
-                 sc_long, divergence_15m, divergence_1h, sr)
+        log.info("✅ LONG score=%d (div15m=%s div1h=%s sr=%s bias=%+d)",
+                 sc_long, divergence_15m, divergence_1h, sr, hour_bonus)
         return "long", sc_long
 
     if sc_short >= effective_min:
-        log.info("✅ SHORT score=%d (div15m=%s div1h=%s sr=%s)",
-                 sc_short, divergence_15m, divergence_1h, sr)
+        log.info("✅ SHORT score=%d (div15m=%s div1h=%s sr=%s bias=%+d)",
+                 sc_short, divergence_15m, divergence_1h, sr, hour_bonus)
         return "short", sc_short
 
     log.info("⬛ Sin señal (score L=%d S=%d < %d)", sc_long, sc_short, effective_min)

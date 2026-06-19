@@ -1,5 +1,14 @@
-"""main.py — Loop principal con trailing stop y TP dinámico (extend_tp)."""
+"""main.py — Loop principal con trailing stop, breakeven automático y TP dinámico.
+
+NOVEDADES:
+  - Breakeven automático: mueve SL a entrada cuando precio alcanza +1 RR.
+  - Persistencia de posiciones: guarda/restaura positions.json al arrancar.
+    Sobrevive reinicios y deploys de Railway preservando open_ts, score,
+    tp_original y tp_extensions.
+"""
+import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -32,11 +41,17 @@ MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
 TP_EXTEND_THRESH       = 0.015
 
+# Breakeven: se activa cuando el precio alcanza entry + BE_RR × distancia_sl
+BE_RR          = 1.0   # 1 RR de ganancia → SL a breakeven
+BE_BUFFER      = 0.0003  # buffer mínimo sobre entry (0.03%) para cubrir fees
+
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
 
 WEEKDAY_MIN_SCORE = config.MIN_SCORE
 WEEKEND_MIN_SCORE = config.WEEKEND_MIN_SCORE
+
+POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
 
 _weekend_notified_day: int = -1
 
@@ -51,6 +66,116 @@ def _corr_group_count(symbol: str, positions: dict) -> int:
             return sum(1 for s in positions if s in group)
     return 0
 
+
+# ── Persistencia de posiciones ────────────────────────────────────────────────
+
+def _save_positions(positions: dict) -> None:
+    """Serializa positions a JSON para sobrevivir reinicios."""
+    try:
+        data = {}
+        for sym, pos in positions.items():
+            # Excluye claves internas que no son serializables o son transitorias
+            data[sym] = {k: v for k, v in pos.items() if k != "_extending"}
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        log.warning("Error guardando positions.json: %s", e)
+
+
+def _load_positions() -> dict:
+    """Restaura positions desde JSON si existe.
+
+    Recupera open_ts, score, tp_original, tp_extensions y tp/sl reales
+    de la sesión anterior. Si el archivo no existe o está corrupto,
+    arranca con dict vacío (sincronización normal desde exchange).
+    """
+    if not os.path.exists(POSITIONS_FILE):
+        log.info("positions.json no encontrado — sincronización normal desde exchange")
+        return {}
+    try:
+        with open(POSITIONS_FILE) as f:
+            data = json.load(f)
+        # Asegura que todos los campos opcionales existen
+        for sym, pos in data.items():
+            pos.setdefault("tp_extensions", 0)
+            pos.setdefault("_extending", False)
+            pos.setdefault("trail_step", 0)
+            pos.setdefault("trail_high", pos.get("entry", 0))
+            pos.setdefault("trail_low",  pos.get("entry", 0))
+            pos.setdefault("score", 70)
+            pos.setdefault("open_ts", time.time())
+            pos.setdefault("breakeven_set", False)
+        log.info("Posiciones restauradas desde JSON: %s", list(data.keys()))
+        return data
+    except Exception as e:
+        log.warning("Error leyendo positions.json: %s — arrancando vacío", e)
+        return {}
+
+
+# ── Breakeven automático ──────────────────────────────────────────────────────
+
+def _check_breakeven(symbol: str, pos: dict, current_price: float) -> None:
+    """Mueve SL a entry+buffer cuando el precio alcanza entry + BE_RR × riesgo.
+
+    Solo actúa una vez por posición (pos['breakeven_set'] = True).
+    No interfiere con el trailing ni con extend_tp — son capas independientes.
+    """
+    if pos.get("breakeven_set"):
+        return
+    if pos.get("sl") is None or pos.get("entry") is None:
+        return
+
+    side  = pos["side"]
+    entry = pos["entry"]
+    sl    = pos["sl"]
+    risk_dist = abs(entry - sl)  # distancia entry→SL = 1 unidad de riesgo
+
+    if risk_dist == 0:
+        return
+
+    if side == "long":
+        target = entry + BE_RR * risk_dist
+        if current_price < target:
+            return
+        new_sl = round(entry * (1 + BE_BUFFER), 6)
+        if new_sl <= sl:  # ya está mejor que entry — no mover hacia atrás
+            pos["breakeven_set"] = True
+            return
+    else:
+        target = entry - BE_RR * risk_dist
+        if current_price > target:
+            return
+        new_sl = round(entry * (1 - BE_BUFFER), 6)
+        if new_sl >= sl:
+            pos["breakeven_set"] = True
+            return
+
+    log.info(
+        "[%s] Breakeven activado | entry=%.4f SL: %.4f → %.4f (precio=%.4f target=%.4f)",
+        symbol, entry, sl, new_sl, current_price, target,
+    )
+
+    try:
+        exchange.cancel_all_orders(symbol)
+        exchange.place_stop_order(symbol, side, pos["qty"], new_sl)
+        if pos.get("tp") is not None:
+            exchange.place_tp_order(symbol, side, pos["qty"], pos["tp"])
+    except Exception as e:
+        log.warning("[%s] Error colocando órdenes en breakeven: %s", symbol, e)
+        return
+
+    pos["sl"]             = new_sl
+    pos["breakeven_set"]  = True
+
+    telegram.notify(
+        f"🔒 Breakeven activado\n"
+        f"{symbol} {side.upper()}\n"
+        f"SL movido a entrada: <code>{new_sl:.4f}</code>\n"
+        f"(precio: <code>{current_price:.4f}</code> | +{BE_RR:.0f}R alcanzado)"
+    )
+
+
+# ── Trailing stop ─────────────────────────────────────────────────────────────
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     side       = pos["side"]
@@ -91,6 +216,8 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
 
+
+# ── TP extension ──────────────────────────────────────────────────────────────
 
 def _check_tp_extension(
     symbol: str,
@@ -163,6 +290,8 @@ def _check_tp_extension(
     pos["trail_high"]    = current_price
     pos["trail_low"]     = current_price
     pos["_extending"]    = False
+    # Al extender TP el SL ya va a breakeven — marcar para no mover de nuevo
+    pos["breakeven_set"] = True
 
     log.info(
         "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL→BE=%.6f | score=%d",
@@ -244,7 +373,8 @@ def run() -> None:
     feed.start()
     _wait_feed_ready(feed)
 
-    positions: dict = {}
+    # Restaurar posiciones desde JSON antes de sincronizar con exchange
+    positions: dict = _load_positions()
     tg_commands.start(get_positions_fn=lambda: positions, feed=feed)
     trade_logger.start_scheduler()   # también restaura daily loss desde CSV
 
@@ -263,6 +393,8 @@ def run() -> None:
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
                     p = positions.pop(symbol)
+                    _save_positions(positions)  # persistir tras cierre
+
                     exit_price, reason = _resolve_close(p, symbol)
                     pnl_pct = (
                         (exit_price - p["entry"]) / p["entry"]
@@ -288,8 +420,9 @@ def run() -> None:
                         exit_p=exit_price, pnl_pct=pnl_pct, pnl_usdt=pnl_usdt,
                         reason=reason, open_ts=p.get("open_ts", 0.0),
                     )
-                    log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT) | ext=%d",
-                             symbol, reason, pnl_pct, pnl_usdt, p.get("tp_extensions", 0))
+                    log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT) | ext=%d | be=%s",
+                             symbol, reason, pnl_pct, pnl_usdt,
+                             p.get("tp_extensions", 0), p.get("breakeven_set", False))
 
             expired = [sym for sym, ts in _cooldown.items() if time.time() - ts >= COOLDOWN]
             for sym in expired:
@@ -320,8 +453,9 @@ def run() -> None:
                         "trail_step":    0,
                         "score":         70,
                         "open_ts":       time.time(),
+                        "breakeven_set": False,
                     }
-                    log.info("[%s] Sincronizada: %s @ %.4f", symbol, pos_ex["side"], pos_ex["entry"])
+                    log.info("[%s] Sincronizada desde exchange: %s @ %.4f", symbol, pos_ex["side"], pos_ex["entry"])
 
             open_count = len(positions)
 
@@ -338,8 +472,9 @@ def run() -> None:
             for symbol, pos in list(positions.items()):
                 try:
                     price = exchange.get_price(symbol)
-                    _update_trailing(symbol, pos, price)
-                    _check_tp_extension(symbol, pos, price, feed, effective_min_score)
+                    _check_breakeven(symbol, pos, price)   # 1º: breakeven
+                    _update_trailing(symbol, pos, price)   # 2º: trailing
+                    _check_tp_extension(symbol, pos, price, feed, effective_min_score)  # 3º: extend
                 except Exception as e:
                     log.warning("[%s] Error gestión posición: %s", symbol, e)
 
@@ -377,7 +512,6 @@ def run() -> None:
                     if not is_manual and open_count >= config.MAX_POSITIONS:
                         break
 
-                    # ── Filtro de correlación ─────────────────────────────
                     if not is_manual:
                         corr_count = _corr_group_count(symbol, positions)
                         if corr_count >= config.MAX_CORR_PER_GROUP:
@@ -385,7 +519,6 @@ def run() -> None:
                                       symbol, corr_count, config.MAX_CORR_PER_GROUP)
                             continue
 
-                    # ── Evaluación de señal ────────────────────────────
                     try:
                         candles_15m = feed.get(symbol, "15m")
                         candles_1h  = feed.get(symbol, "1h")
@@ -398,17 +531,14 @@ def run() -> None:
                         if not signal:
                             continue
 
-                        # ── Filtro de spread (solo si hay señal) ────────────
-                        # Se consulta DESPUÉS de la evaluación para no hacer
-                        # una llamada REST por cada par en cada loop.
                         if not is_manual:
-                        	spread = exchange.get_spread_pct(symbol)
-                        	if spread > config.MAX_SPREAD_PCT:
-                        	    log.info(
-                        	        "[%s] Spread demasiado alto (%.3f%% > %.3f%%) — saltando",
-                        	        symbol, spread, config.MAX_SPREAD_PCT,
-                        	    )
-                        	    continue
+                            spread = exchange.get_spread_pct(symbol)
+                            if spread > config.MAX_SPREAD_PCT:
+                                log.info(
+                                    "[%s] Spread demasiado alto (%.3f%% > %.3f%%) — saltando",
+                                    symbol, spread, config.MAX_SPREAD_PCT,
+                                )
+                                continue
 
                         try:
                             regime, _ = signals._market_regime(candles_1h)
@@ -462,8 +592,10 @@ def run() -> None:
                             "trail_low":     price,
                             "score":         score,
                             "open_ts":       time.time(),
+                            "breakeven_set": False,
                         }
                         open_count += 1
+                        _save_positions(positions)  # persistir tras apertura
 
                         telegram.notify_open(
                             symbol=symbol, price=price, side=signal,
