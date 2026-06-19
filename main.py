@@ -17,6 +17,11 @@ FIXES:
     supera tp_original * TP_EXTEND_RR (evita doble extensión tras reinicio).
   - FIX: exchange.set_leverage(symbol) → exchange.set_leverage(symbol, config.LEVERAGE)
     El segundo argumento faltaba, causando WARNING en el arranque para los 52 pares.
+  - FIX: _check_tp_extension valida que new_sl sea válido respecto al precio
+    actual antes de cancelar órdenes. Para SHORT: SL (BUY-STOP) requiere
+    stopPrice > currentPrice. Si el precio ya bajó por debajo del SL calculado
+    (breakeven), se omite el SL y se deja el TP extendido sin mover el SL,
+    evitando el error BingX 110412 y el riesgo de quedar sin protección.
 """
 import json
 import logging
@@ -241,6 +246,20 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
 
 # ── TP extension ──────────────────────────────────────────────────────────────
 
+def _sl_price_valid(side: str, sl_price: float, current_price: float) -> bool:
+    """Verifica que el precio del SL sea válido según BingX antes de enviarlo.
+
+    Para cerrar un SHORT: orden BUY-STOP → stopPrice debe ser > currentPrice.
+    Para cerrar un LONG:  orden SELL-STOP → stopPrice debe ser < currentPrice.
+    Si el precio actual ya cruzó el nivel del SL, la orden sería rechazada
+    con error 110412 y además dejaría la posición sin protección temporal.
+    """
+    if side == "short":
+        return sl_price > current_price
+    else:
+        return sl_price < current_price
+
+
 def _check_tp_extension(
     symbol: str,
     pos: dict,
@@ -307,6 +326,52 @@ def _check_tp_extension(
         new_tp = round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
         new_sl = round(entry * 0.9995, 6)
 
+    # FIX BingX 110412: validar que new_sl sea colocable con el precio actual.
+    # Para SHORT: el SL es BUY-STOP → stopPrice debe ser > currentPrice.
+    # Si el precio ya bajó por debajo de new_sl (breakeven), omitimos mover el SL
+    # y solo extendemos el TP. Así evitamos el error y no dejamos la posición
+    # sin protección por un cancel_all_orders sin SL posterior.
+    sl_valid = _sl_price_valid(side, new_sl, current_price)
+    if not sl_valid:
+        log.warning(
+            "[%s] extend_tp: new_sl=%.6f no válido con precio=%.6f (%s) — "
+            "extendiendo solo TP sin mover SL",
+            symbol, new_sl, current_price, side,
+        )
+        try:
+            # Cancelar solo el TP viejo y reponer el nuevo; el SL existente se mantiene
+            exchange.cancel_all_orders(symbol)
+            if pos.get("sl") is not None:
+                exchange.place_stop_order(symbol, side, pos["qty"], pos["sl"])
+            exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
+        except Exception as e:
+            log.warning("[%s] Error extendiendo TP sin SL: %s", symbol, e)
+            pos["_extending"] = False
+            return
+
+        old_tp = pos["tp"]
+        pos["tp"]            = new_tp
+        pos["tp_extensions"] = extensions + 1
+        pos["trail_high"]    = current_price
+        pos["trail_low"]     = current_price
+        pos["_extending"]    = False
+        pos["breakeven_set"] = True
+
+        log.info(
+            "[%s] TP extendido #%d (sin mover SL) | old_tp=%.6f → new_tp=%.6f | score=%d",
+            symbol, extensions + 1, old_tp, new_tp, score,
+        )
+        telegram.notify(
+            f"📈 TP Extendido #{extensions + 1}\n"
+            f"{symbol} {side.upper()}\n"
+            f"TP anterior: <code>{old_tp:.6f}</code>\n"
+            f"Nuevo TP: <code>{new_tp:.6f}</code>\n"
+            f"⚠️ SL no movido (precio cerca del nivel BE)\n"
+            f"Score: {score}"
+        )
+        return
+
+    # Flujo normal: SL válido → cancelar todo y reponer SL + TP nuevos
     try:
         exchange.cancel_all_orders(symbol)
         exchange.place_stop_order(symbol, side, pos["qty"], new_sl)
