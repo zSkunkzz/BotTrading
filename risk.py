@@ -21,8 +21,8 @@ SL / TP:
     score < 70      →  1.7  (señal débil, asegurar beneficio antes)
 
   Valores fijos:
-    SL_MIN_PCT = 0.4%   — mínimo SL
-    SL_MAX_PCT = 2.5%   — máximo SL
+    SL_MIN_PCT = 0.006   — mínimo SL (0.6%): evita stops prematuros por ruido de mercado
+    SL_MAX_PCT = 2.5%    — máximo SL
 
 Trailing stop:
   trail_step = 0.3 × sl_dist
@@ -34,17 +34,15 @@ import exchange as _exchange
 log = logging.getLogger("risk")
 
 # ── Límites porcentuales SL/TP ────────────────────────────────────────────────
-SL_MIN_PCT = 0.004   # 0.4%
+# FIX: SL_MIN_PCT subido de 0.4% a 0.6%.
+# Con 10x de apalancamiento, 0.4% = 4% de movimiento en capital, demasiado ajustado
+# para la volatilidad normal de altcoins en 15m → stops prematuros por ruido.
+SL_MIN_PCT = 0.006   # 0.6%
 SL_MAX_PCT = 0.025   # 2.5%
 
 
 def _tp_rr(score: int, regime: str) -> float:
-    """TP_RR dinámico: ajusta el ratio riesgo:beneficio según régimen y score.
-
-    En rango el precio no tiene recorrido largo → TP más conservador.
-    Con señal fuerte en tendencia se deja correr más.
-    Con señal débil se asegura el beneficio antes.
-    """
+    """TP_RR dinámico: ajusta el ratio riesgo:beneficio según régimen y score."""
     if regime == "range":
         return 1.5
     if score >= 85:

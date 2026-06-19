@@ -21,10 +21,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-_cooldown: dict[str, float] = {}
+_cooldown:              dict[str, float] = {}
+_cooldown_sl:           dict[str, float] = {}   # cooldown diferenciado para SL
 _manual_alert_cooldown: dict[str, float] = {}
 
-COOLDOWN               = 60 * 60
+COOLDOWN               = 60 * 60       # 1h cooldown tras TP o cierre normal
+COOLDOWN_SL            = 2 * 60 * 60  # 2h cooldown tras SL (mercado probablemente sigue en contra)
 MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
@@ -41,6 +43,15 @@ _weekend_notified_day: int = -1
 
 def _is_weekend() -> bool:
     return datetime.now(timezone.utc).weekday() >= 5
+
+
+def _corr_group_count(symbol: str, positions: dict) -> int:
+    """Devuelve cuántas posiciones abiertas pertenecen al mismo grupo de correlación
+    que `symbol`. Usado para limitar exposición correlacionada."""
+    for group in config.CORR_GROUPS:
+        if symbol in group:
+            return sum(1 for s in positions if s in group)
+    return 0
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
@@ -193,7 +204,6 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _resolve_close(pos: dict, symbol: str) -> tuple[float, str]:
-    """Determina el precio de salida y razón real consultando el historial de BingX."""
     reason, exit_price = exchange.get_closed_reason(symbol)
     if reason and exit_price:
         return exit_price, reason
@@ -224,9 +234,11 @@ def run() -> None:
 
     log.info(
         "Bot iniciado | %d pares | lev=%dx | margin=%s USDT | max=%d posiciones | "
-        "min_score=%d | weekend_min_score=%d",
+        "min_score=%d | weekend_min_score=%d | max_daily_loss=%.0f USDT | "
+        "max_corr=%d | sl_min=0.6%%",
         len(config.SYMBOLS), config.LEVERAGE, config.MARGIN_USDT, config.MAX_POSITIONS,
-        WEEKDAY_MIN_SCORE, WEEKEND_MIN_SCORE,
+        WEEKDAY_MIN_SCORE, WEEKEND_MIN_SCORE, config.MAX_DAILY_LOSS_USDT,
+        config.MAX_CORR_PER_GROUP,
     )
 
     for symbol in config.SYMBOLS:
@@ -273,8 +285,13 @@ def run() -> None:
                     ) * config.LEVERAGE * 100
                     pnl_usdt = (pnl_pct / 100) * (p["qty"] * p["entry"] / config.LEVERAGE)
 
-                    _cooldown[symbol] = time.time()
-                    log.info("[%s] Cooldown activado (%dm) tras %s", symbol, COOLDOWN // 60, reason)
+                    # ── Cooldown diferenciado: SL → 2h, TP → 1h ──────────────
+                    if reason == "SL":
+                        _cooldown_sl[symbol] = time.time()
+                        log.info("[%s] Cooldown SL activado (%dh)", symbol, COOLDOWN_SL // 3600)
+                    else:
+                        _cooldown[symbol] = time.time()
+                        log.info("[%s] Cooldown activado (%dm) tras %s", symbol, COOLDOWN // 60, reason)
 
                     trade_logger.record(
                         symbol     = symbol,
@@ -303,7 +320,12 @@ def run() -> None:
             expired = [sym for sym, ts in _cooldown.items() if time.time() - ts >= COOLDOWN]
             for sym in expired:
                 _cooldown.pop(sym, None)
-                log.info("[%s] Cooldown expirado — símbolo disponible", sym)
+                log.info("[%s] Cooldown TP expirado", sym)
+
+            expired_sl = [sym for sym, ts in _cooldown_sl.items() if time.time() - ts >= COOLDOWN_SL]
+            for sym in expired_sl:
+                _cooldown_sl.pop(sym, None)
+                log.info("[%s] Cooldown SL expirado", sym)
 
             expired_alerts = [sym for sym, ts in _manual_alert_cooldown.items()
                               if time.time() - ts >= MANUAL_ALERT_COOLDOWN]
@@ -332,10 +354,11 @@ def run() -> None:
             open_count = len(positions)
 
             if loop_count % 10 == 1:
-                log.info("[loop #%d] Posiciones: %d/%d | Feed: %d/%d pares listos | Cooldowns: %d | Pausado: %s",
+                log.info("[loop #%d] Posiciones: %d/%d | Feed: %d/%d | Cooldowns: %d+%d SL | Pausado: %s | DailyLimit: %s",
                          loop_count, open_count, config.MAX_POSITIONS,
-                         feed.ready_count(), len(config.SYMBOLS), len(_cooldown),
-                         bot_state.is_paused())
+                         feed.ready_count(), len(config.SYMBOLS),
+                         len(_cooldown), len(_cooldown_sl),
+                         bot_state.is_paused(), trade_logger.is_daily_limit_hit())
 
             for symbol, pos in list(positions.items()):
                 try:
@@ -350,13 +373,18 @@ def run() -> None:
                 if today != _weekend_notified_day:
                     _weekend_notified_day = today
                     day_name = "Sábado" if today == 5 else "Domingo"
-                    log.info("Modo fin de semana activo (%s UTC) — score mínimo %d para nuevas entradas",
+                    log.info("Modo fin de semana activo (%s UTC) — score mínimo %d",
                              day_name, WEEKEND_MIN_SCORE)
                     telegram.notify(
                         f"🚫 Modo fin de semana ({day_name})\n"
-                        f"No se abrirán posiciones nuevas salvo score ≥ {WEEKEND_MIN_SCORE}.\n"
-                        f"Posiciones actuales siguen gestionándose con normalidad."
+                        f"Score mínimo ≥ {WEEKEND_MIN_SCORE} para nuevas entradas."
                     )
+
+            # ── Bloqueo por daily drawdown ─────────────────────────────────
+            if trade_logger.is_daily_limit_hit():
+                log.debug("Daily drawdown límite activo — sin nuevas entradas")
+                time.sleep(config.LOOP_SLEEP)
+                continue
 
             if bot_state.is_paused():
                 log.debug("Bot pausado — saltando búsqueda de señales")
@@ -366,7 +394,7 @@ def run() -> None:
                         continue
                     if not feed.ready(symbol):
                         continue
-                    if symbol in _cooldown:
+                    if symbol in _cooldown or symbol in _cooldown_sl:
                         continue
 
                     is_manual = symbol in config.MANUAL_ALERT_SYMBOLS
@@ -376,6 +404,14 @@ def run() -> None:
 
                     if not is_manual and open_count >= config.MAX_POSITIONS:
                         break
+
+                    # ── Filtro de correlación ──────────────────────────────
+                    if not is_manual:
+                        corr_count = _corr_group_count(symbol, positions)
+                        if corr_count >= config.MAX_CORR_PER_GROUP:
+                            log.debug("[%s] Correlación: %d/%d en grupo — saltando",
+                                      symbol, corr_count, config.MAX_CORR_PER_GROUP)
+                            continue
 
                     try:
                         candles_15m = feed.get(symbol, "15m")
@@ -410,7 +446,7 @@ def run() -> None:
                                 f"SL sugerido:   <code>{params['sl']:.2f}</code>\n"
                                 f"TP sugerido:   <code>{params['tp']:.2f}</code>\n"
                                 f"Score: <b>{score}</b>\n\n"
-                                f"⚠️ <i>Operación NO abierta automáticamente. Ábrela tú si lo consideras.</i>"
+                                f"⚠️ <i>Operación NO abierta automáticamente.</i>"
                             )
                             log.info("[%s] ALERTA MANUAL enviada | %s score=%d", symbol, signal.upper(), score)
                             continue

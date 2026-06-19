@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 import httpx
 
 import config
+import telegram as _tg
 
 log = logging.getLogger("trade_logger")
 
@@ -34,11 +35,89 @@ HEADER    = ["date","symbol","side","entry","exit","pnl_pct","pnl_usdt","score",
 _API         = f"https://api.telegram.org/bot{config.TG_TOKEN}"
 _LOG_CHAT_ID = os.getenv("TG_LOG_CHAT_ID") or config.TG_CHAT_ID
 
-# Lock para escritura concurrente al CSV
 _csv_lock: threading.Lock = threading.Lock()
-
-# caché en memoria (se pierde al reiniciar, pero Telegram tiene el historial completo)
 _cache: list[dict] = []
+
+# ── Daily drawdown tracking ───────────────────────────────────────────────────
+_daily_loss_usdt: float = 0.0          # pérdida acumulada hoy (solo trades negativos)
+_daily_loss_date: str   = ""           # fecha UTC del día actual (YYYY-MM-DD)
+_daily_limit_hit: bool  = False        # True si se alcanzó el límite hoy
+_daily_loss_lock: threading.Lock = threading.Lock()
+
+
+def is_daily_limit_hit() -> bool:
+    """Devuelve True si el bot debe pausarse por daily drawdown."""
+    return _daily_limit_hit
+
+
+def _reset_daily_if_needed() -> None:
+    """Resetea el contador diario si cambió el día UTC."""
+    global _daily_loss_usdt, _daily_loss_date, _daily_limit_hit
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if today != _daily_loss_date:
+        _daily_loss_date  = today
+        _daily_loss_usdt  = 0.0
+        _daily_limit_hit  = False
+        log.info("Daily drawdown reseteado para %s", today)
+
+
+def _check_daily_drawdown(pnl_usdt: float) -> None:
+    """Acumula pérdida y activa el límite si se supera MAX_DAILY_LOSS_USDT."""
+    global _daily_loss_usdt, _daily_limit_hit
+    if pnl_usdt >= 0:
+        return
+    with _daily_loss_lock:
+        _reset_daily_if_needed()
+        _daily_loss_usdt += abs(pnl_usdt)
+        if not _daily_limit_hit and _daily_loss_usdt >= config.MAX_DAILY_LOSS_USDT:
+            _daily_limit_hit = True
+            log.warning(
+                "🚨 Daily drawdown límite alcanzado: -%.2f USDT (límite %.2f USDT) — "
+                "bot pausado hasta mañana UTC",
+                _daily_loss_usdt, config.MAX_DAILY_LOSS_USDT,
+            )
+            _tg.notify(
+                f"🚨 <b>Daily drawdown límite alcanzado</b>\n"
+                f"Pérdida acumulada hoy: <code>-{_daily_loss_usdt:.2f} USDT</code>\n"
+                f"Límite: <code>{config.MAX_DAILY_LOSS_USDT:.2f} USDT</code>\n"
+                f"⛔ No se abrirán nuevas posiciones hasta mañana (00:00 UTC)."
+            )
+
+
+# ── Win rate monitor ──────────────────────────────────────────────────────────
+_winrate_alerted: bool = False   # evita spam: solo avisa una vez por racha mala
+
+
+def _check_winrate() -> None:
+    """Alerta si el win rate de los últimos N trades cae por debajo del umbral."""
+    global _winrate_alerted
+    lookback  = config.WINRATE_LOOKBACK
+    threshold = config.WINRATE_ALERT_PCT
+
+    if len(_cache) < lookback:
+        return
+
+    recent   = _cache[-lookback:]
+    wins     = sum(1 for t in recent if t["pnl_pct"] >= 0)
+    win_rate = wins / lookback * 100
+
+    if win_rate < threshold and not _winrate_alerted:
+        _winrate_alerted = True
+        log.warning(
+            "⚠️ Win rate bajo: %.0f%% en últimos %d trades (umbral %.0f%%)",
+            win_rate, lookback, threshold,
+        )
+        _tg.notify(
+            f"⚠️ <b>Win rate bajo</b>\n"
+            f"Últimos {lookback} trades: <code>{win_rate:.0f}%</code> "
+            f"({wins}W / {lookback - wins}L)\n"
+            f"Umbral: <code>{threshold:.0f}%</code>\n"
+            f"Revisa las condiciones de mercado."
+        )
+    elif win_rate >= threshold and _winrate_alerted:
+        # Se recuperó — resetear alerta
+        _winrate_alerted = False
+        log.info("Win rate recuperado: %.0f%% en últimos %d trades", win_rate, lookback)
 
 
 def _tg_send(text: str) -> None:
@@ -55,7 +134,6 @@ def _tg_send(text: str) -> None:
 
 
 def _write_csv(row: list) -> None:
-    """Escribe una fila en el CSV con lock para evitar corrupción concurrente."""
     with _csv_lock:
         write_header = not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0
         try:
@@ -88,7 +166,6 @@ def record(
            round(pnl_pct, 2), round(pnl_usdt, 4),
            score, reason, duration]
 
-    # ── 1. Telegram log ──
     result_icon = "✅" if pnl_pct >= 0 else "❌"
     side_icon   = "🟢" if side == "long" else "🔴"
     msg = (
@@ -100,11 +177,8 @@ def record(
         f"<i>{now_str} UTC</i>"
     )
     _tg_send(msg)
-
-    # ── 2. CSV local (protegido por lock) ──
     _write_csv(row)
 
-    # ── 3. Caché en memoria ──
     _cache.append({
         "date": now_str, "symbol": symbol, "side": side,
         "entry": entry, "exit": exit_price,
@@ -112,9 +186,12 @@ def record(
         "score": score, "reason": reason, "duration": duration,
     })
 
+    # ── Post-trade checks ──────────────────────────────────────────────────
+    _check_daily_drawdown(pnl_usdt)
+    _check_winrate()
+
 
 def send_daily_summary() -> None:
-    """Envía un resumen de todos los trades de la sesión actual."""
     if not _cache:
         _tg_send("📊 <b>Resumen del día</b>\nSin trades en esta sesión.")
         return
@@ -133,13 +210,18 @@ def send_daily_summary() -> None:
         lines.append(f"{icon} {t['symbol']} {t['side'].upper()} {t['pnl_pct']:+.2f}%")
 
     _tg_send("\n".join(lines))
+    # Reset caché y contadores diarios tras el resumen de medianoche
+    _cache.clear()
+    with _daily_loss_lock:
+        global _daily_loss_usdt, _daily_loss_date, _daily_limit_hit
+        _daily_loss_usdt = 0.0
+        _daily_loss_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _daily_limit_hit = False
 
 
 def _daily_summary_scheduler() -> None:
-    """Hilo que dispara send_daily_summary cada día a las 00:00 UTC."""
     while True:
         now = datetime.now(timezone.utc)
-        # Segundos hasta la próxima medianoche UTC
         seconds_until_midnight = (
             (23 - now.hour) * 3600
             + (59 - now.minute) * 60
@@ -150,12 +232,10 @@ def _daily_summary_scheduler() -> None:
             send_daily_summary()
         except Exception as e:
             log.warning("Error en resumen diario: %s", e)
-        # Pequeña pausa para no disparar dos veces si el sleep se adelanta
         time.sleep(5)
 
 
 def start_scheduler() -> None:
-    """Arranca el scheduler de resumen diario en un hilo daemon."""
     threading.Thread(
         target=_daily_summary_scheduler,
         daemon=True,
