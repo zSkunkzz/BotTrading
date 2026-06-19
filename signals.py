@@ -15,8 +15,9 @@ Filtros:
                           | contrario -5
   10. Divergencia RSI 15m: +8
   11. Divergencia RSI 1h : +12 (marco superior — más fiable, menos ruido)
-  12. Sesgo horario     : hora alta +8, hora baja -10
-  13. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
+  12. Soporte/Resistencia: pivots 1h/4h — soporte +10, resistencia -10
+  13. Sesgo horario     : hora alta +8, hora baja -10
+  14. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
 
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
@@ -30,6 +31,16 @@ NOTA sobre divergencia RSI 1h:
   - Se calcula sobre closed_1h (no incluye la vela abierta actual).
   - Peso +12 vs +8 del 15m porque el marco superior tiene menos ruido.
   - Independiente de la divergencia 15m: pueden darse ambas a la vez (+20).
+
+NOTA sobre S/R (price action):
+  - Pivots calculados sobre velas 1h (y 4h si disponibles) cerradas.
+  - Pivot alto: high[i] > max(high de N velas a cada lado). N=3 en 1h, N=2 en 4h.
+  - Pivot bajo: low[i]  < min(low  de N velas a cada lado).
+  - Zona: precio dentro del ZONE_PCT (0.4%) del nivel.
+  - Long cerca de soporte  → +10. Long cerca de resistencia → -10.
+  - Short cerca de resistencia → +10. Short cerca de soporte → -10.
+  - Si hay conflicto (soporte y resistencia a la vez), se aplica el más cercano.
+  - Si no hay ninguna zona cercana → 0 pts (neutro).
 """
 from __future__ import annotations
 import logging
@@ -47,6 +58,9 @@ VOLUME_MULT         = 1.2
 MIN_SCORE           = config.MIN_SCORE
 REGIME_CONFIRM_BARS = 2
 ADX_MIN             = 18   # por debajo → hard-guard, sin señal
+SR_ZONE_PCT         = 0.004  # 0.4% — zona de proximidad a S/R
+SR_PIVOT_BARS_1H    = 3      # velas a cada lado para detectar pivot en 1h
+SR_PIVOT_BARS_4H    = 2      # velas a cada lado para detectar pivot en 4h
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
@@ -139,32 +153,121 @@ def _rsi_divergence(
     candles: list[dict],
     lookback: int = 10,
 ) -> str | None:
-    """Detecta divergencia RSI-precio en velas de cualquier timeframe.
-
-    Bullish: precio hace nuevo mínimo pero RSI no — momentum alcista oculto.
-    Bearish: precio hace nuevo máximo pero RSI no — momentum bajista oculto.
-
-    Se evalúa sobre las últimas `lookback` velas ya cerradas.
-    """
+    """Detecta divergencia RSI-precio en velas de cualquier timeframe."""
     if len(closes) < lookback + 14:
         return None
     rsi_series    = _rsi(closes, 14)
     recent_closes = closes[-lookback:]
     recent_rsi    = rsi_series[-lookback:]
 
-    # Busca pivot de mínimo en los primeros (lookback - 3) puntos
     lo_val = min(recent_closes[:-3])
     lo_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == lo_val)
     if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
-    # Busca pivot de máximo en los primeros (lookback - 3) puntos
     hi_val = max(recent_closes[:-3])
     hi_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == hi_val)
     if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
 
     return None
+
+
+def _pivot_levels(
+    candles: list[dict],
+    n: int,
+    max_pivots: int = 8,
+) -> tuple[list[float], list[float]]:
+    """Extrae los últimos `max_pivots` niveles de soporte y resistencia.
+
+    Pivot alto (resistencia): high[i] > max(high de las n velas anteriores y siguientes)
+    Pivot bajo (soporte):     low[i]  < min(low  de las n velas anteriores y siguientes)
+
+    Solo usa velas ya cerradas. Excluye la vela más reciente (puede no ser pivot).
+    """
+    supports:     list[float] = []
+    resistances:  list[float] = []
+    # Deja margen de n a cada lado; excluye las últimas n velas (pueden no estar consolidadas)
+    start = n
+    end   = len(candles) - n
+    if end <= start:
+        return [], []
+
+    for i in range(start, end):
+        left_high  = [candles[j]["high"] for j in range(i - n, i)]
+        right_high = [candles[j]["high"] for j in range(i + 1, i + n + 1)]
+        if candles[i]["high"] > max(left_high) and candles[i]["high"] > max(right_high):
+            resistances.append(candles[i]["high"])
+
+        left_low   = [candles[j]["low"] for j in range(i - n, i)]
+        right_low  = [candles[j]["low"] for j in range(i + 1, i + n + 1)]
+        if candles[i]["low"] < min(left_low) and candles[i]["low"] < min(right_low):
+            supports.append(candles[i]["low"])
+
+    # Devuelve los más recientes primero
+    return supports[-max_pivots:], resistances[-max_pivots:]
+
+
+def _sr_context(
+    price: float,
+    candles_1h: list[dict],
+    candles_4h: list[dict] | None,
+    zone_pct: float = SR_ZONE_PCT,
+) -> str:
+    """Determina si el precio está cerca de un soporte o resistencia significativo.
+
+    Combina pivots de 1h y 4h. Los niveles de 4h tienen más peso (zona más amplia).
+
+    Retorna:
+        'support'    — precio cerca de un soporte (relevante para long)
+        'resistance' — precio cerca de una resistencia (relevante para short)
+        'none'       — sin contexto estructural relevante
+
+    Si hay conflicto (precio entre soporte y resistencia simultáneos),
+    devuelve el más cercano al precio actual.
+    """
+    near_support    = False
+    near_resistance = False
+    dist_sup        = float("inf")
+    dist_res        = float("inf")
+
+    # ─ Pivots 1h ──────────────────────────────────────────────────
+    if len(candles_1h) >= 2 * SR_PIVOT_BARS_1H + 5:
+        sups_1h, ress_1h = _pivot_levels(candles_1h, SR_PIVOT_BARS_1H)
+        for lvl in sups_1h:
+            d = abs(price - lvl) / price
+            if d <= zone_pct and d < dist_sup:
+                near_support = True
+                dist_sup     = d
+        for lvl in ress_1h:
+            d = abs(price - lvl) / price
+            if d <= zone_pct and d < dist_res:
+                near_resistance = True
+                dist_res        = d
+
+    # ─ Pivots 4h (zona más amplia ×1.5 para dar margen al marco mayor) ───
+    if candles_4h and len(candles_4h) >= 2 * SR_PIVOT_BARS_4H + 5:
+        zone_4h = zone_pct * 1.5
+        sups_4h, ress_4h = _pivot_levels(candles_4h, SR_PIVOT_BARS_4H)
+        for lvl in sups_4h:
+            d = abs(price - lvl) / price
+            if d <= zone_4h and d < dist_sup:
+                near_support = True
+                dist_sup     = d
+        for lvl in ress_4h:
+            d = abs(price - lvl) / price
+            if d <= zone_4h and d < dist_res:
+                near_resistance = True
+                dist_res        = d
+
+    if near_support and near_resistance:
+        # Conflicto: devuelve el más cercano
+        return "support" if dist_sup <= dist_res else "resistance"
+    if near_support:
+        return "support"
+    if near_resistance:
+        return "resistance"
+    return "none"
 
 
 def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
@@ -289,15 +392,14 @@ def evaluate(
     rsi_ext_bull    = rsi_curr > 60
     rsi_ext_bear    = rsi_curr < 40
 
-    # Divergencia RSI en 15m (ventana 10 velas, lookback corto = reacción rápida)
     divergence_15m = _rsi_divergence(closes_15m, closed_15m, lookback=10)
 
-    # Divergencia RSI en 1h (ventana 15 velas, peso mayor porque el marco es superior).
-    # Ventana más grande (15 vs 10) para capturar pivots de mayor entidad.
-    # Requiere al menos 15+14=29 velas 1h cerradas.
     divergence_1h: str | None = None
     if len(closes_1h) >= 29:
         divergence_1h = _rsi_divergence(closes_1h, closed_1h, lookback=15)
+
+    # S/R: pivots 1h + 4h sobre velas ya cerradas
+    sr = _sr_context(price, closed_1h, closed_4h)
 
     hist_15m = _macd_histogram(closes_15m)
     hist_1h  = _macd_histogram(closes_1h)
@@ -339,9 +441,11 @@ def evaluate(
         if macd1h_bull:     s += 10
         else:               s -= 5
         if vol_ok:          s += 8
-        # Divergencias (independientes entre sí, acumulables)
         if divergence_15m == "bullish":  s += 8
         if divergence_1h  == "bullish":  s += 12
+        # S/R price action
+        if sr == "support":    s += 10
+        elif sr == "resistance": s -= 10
         s += hour_bonus
         return min(max(s, 0), 100)
 
@@ -367,9 +471,11 @@ def evaluate(
         if macd1h_bear:      s += 10
         else:               s -= 5
         if vol_ok:           s += 8
-        # Divergencias (independientes entre sí, acumulables)
         if divergence_15m == "bearish":  s += 8
         if divergence_1h  == "bearish":  s += 12
+        # S/R price action
+        if sr == "resistance":  s += 10
+        elif sr == "support":   s -= 10
         s += hour_bonus
         return min(max(s, 0), 100)
 
@@ -382,22 +488,24 @@ def evaluate(
     log.info(
         "regime=%s(×%d) adx1h=%.1f hour=%dUTC | price=%.4f ema200=%.4f dist=%.3f%% "
         "ADX15m=%.1f rsi=%.1f→%.1f vol=%s "
-        "div15m=%s div1h=%s macro_l=%s macro_s=%s "
+        "div15m=%s div1h=%s sr=%s macro_l=%s macro_s=%s "
         "macd15=%.5f macd1h=%.5f | score_long=%d score_short=%d (min=%d)",
         regime, REGIME_CONFIRM_BARS, adx_1h, hour_utc, price, ema200, dist * 100,
         adx, rsi_prev, rsi_curr, vol_ok,
-        divergence_15m, divergence_1h,
+        divergence_15m, divergence_1h, sr,
         macro_l_str, macro_s_str,
         hist_15m[-1], hist_1h[-1],
         sc_long, sc_short, effective_min,
     )
 
     if sc_long >= effective_min and sc_long >= sc_short:
-        log.info("✅ LONG score=%d (div15m=%s div1h=%s)", sc_long, divergence_15m, divergence_1h)
+        log.info("✅ LONG score=%d (div15m=%s div1h=%s sr=%s)",
+                 sc_long, divergence_15m, divergence_1h, sr)
         return "long", sc_long
 
     if sc_short >= effective_min:
-        log.info("✅ SHORT score=%d (div15m=%s div1h=%s)", sc_short, divergence_15m, divergence_1h)
+        log.info("✅ SHORT score=%d (div15m=%s div1h=%s sr=%s)",
+                 sc_short, divergence_15m, divergence_1h, sr)
         return "short", sc_short
 
     log.info("⬛ Sin señal (score L=%d S=%d < %d)", sc_long, sc_short, effective_min)
