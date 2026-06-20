@@ -34,6 +34,12 @@ CAMBIOS v5:
   - Guard divergencia 1h subido de >=29 a >=35 para dar margen al lookback.
   - _ema y _atr importados de indicators.py (módulo compartido con risk.py).
 
+CAMBIOS v6:
+  - FIX: _rsi_divergence usaba min() para encontrar el índice del pivot
+    más reciente, cuando debería ser max() (índice más a la derecha =
+    pivot más reciente). Con min() se cogía el pivot más antiguo, lo que
+    generaba comparaciones RSI erróneas y falsas divergencias.
+
 FIXES ANTERIORES (historial):
   v1 - _rsi_divergence: max() con default=-1.
   v1 - _regime_confirmed: guard de longitud mínima.
@@ -171,13 +177,14 @@ def _rsi_divergence(
 ) -> str | None:
     """Detecta divergencia RSI-precio usando highs/lows reales de vela.
 
-    FIX v5 (apples-to-apples): antes hi_val/lo_val se calculaban sobre
-    closes mientras que hi_recent/lo_recent usaban candle highs/lows.
-    Esta mezcla generaba falsas divergencias cuando la shadow era grande
-    (hi_recent siempre > hi_val porque high >= close por definición).
-    Fix: calcular hi_val/lo_val también sobre los highs/lows reales de
-    los candles pasados para que ambas partes de la comparación sean
-    del mismo tipo.
+    FIX v5 (apples-to-apples): usa highs/lows reales tanto para el pivot
+    pasado como para el reciente, evitando falsas divergencias cuando la
+    shadow es grande.
+
+    FIX v6 (pivot más reciente): hi_idx/lo_idx usaban min() para encontrar
+    el índice del pivot, cogiendo el pivot MÁS ANTIGUO en lugar del MÁS
+    RECIENTE. Corregido a max() para que la comparación RSI use el pivot
+    más cercano en el tiempo, que es el correcto para la divergencia.
     """
     if len(closes) < lookback + 14:
         return None
@@ -189,10 +196,8 @@ def _rsi_divergence(
     recent_candles = candles[-lookback:]
 
     # --- Divergencia alcista: precio hace mínimo más bajo, RSI hace mínimo más alto ---
-    # FIX v5: usar lows reales de los candles pasados (no closes) para comparar
-    # contra lo_recent que también es un low real.
     lo_val  = min(c["low"] for c in recent_candles[:-3])
-    lo_idx  = min(
+    lo_idx  = max(
         (i for i, c in enumerate(recent_candles[:-3]) if c["low"] == lo_val),
         default=-1,
     )
@@ -202,7 +207,7 @@ def _rsi_divergence(
 
     # --- Divergencia bajista: precio hace máximo más alto, RSI hace máximo más bajo ---
     hi_val  = max(c["high"] for c in recent_candles[:-3])
-    hi_idx  = min(
+    hi_idx  = max(
         (i for i, c in enumerate(recent_candles[:-3]) if c["high"] == hi_val),
         default=-1,
     )
