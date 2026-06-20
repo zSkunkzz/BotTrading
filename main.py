@@ -22,6 +22,9 @@ FIXES:
   - FIX CALIDAD: get_closed_reason() se llama con side.
   - FIX CALIDAD: fill_entry sin sleep extra (open_order ya espera 0.5s).
   - FIX CALIDAD: get_position al obtener fill price pasa side=signal.
+  - FIX v5: signals.evaluate() retorna (signal, score, regime); regime
+    propagado a risk.calc() para TP_RR dinámico correcto.
+  - FIX v5: _check_tp_extension desempaqueta el tercer valor de evaluate().
 """
 import json
 import logging
@@ -129,14 +132,6 @@ def _load_positions() -> dict:
 # ── Sync SL/TP desde órdenes abiertas ───────────────────────────────────
 
 def _sync_sl_tp_from_orders(symbol: str, pos: dict) -> None:
-    """Rellena sl y tp desde las órdenes condicionales abiertas del exchange.
-
-    BingX devuelve stopLossPrice/takeProfitPrice como None en get_all_positions()
-    cuando el SL y TP son órdenes independientes (el caso habitual).
-
-    FIX: el filtro de positionSide acepta también positionSide vacío (''),
-    ya que BingX a veces lo omite en órdenes condicionales.
-    """
     try:
         orders = exchange._get_open_orders(symbol)
     except Exception as e:
@@ -328,7 +323,8 @@ def _check_tp_extension(
         candles_15m = feed.get(symbol, "15m")
         candles_1h  = feed.get(symbol, "1h")
         candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
-        signal, score = signals.evaluate(
+        # FIX v5: evaluate() retorna (signal, score, regime) — desempaquetar 3 valores
+        signal, score, _ = signals.evaluate(
             candles_15m, candles_1h, candles_4h,
             min_score=effective_min_score,
         )
@@ -434,7 +430,6 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _resolve_close(pos: dict, symbol: str, hint_price: float | None = None) -> tuple[float, str]:
-    """Determina precio y motivo de cierre. Pasa side para filtrar en Hedge mode."""
     reason, exit_price = exchange.get_closed_reason(symbol, side=pos.get("side"))
     if reason and exit_price:
         return exit_price, reason
@@ -498,10 +493,6 @@ def run() -> None:
 
             for symbol in list(positions.keys()):
                 pos = positions[symbol]
-                # FIX CRÍTICO: get_all_positions ahora devuelve dict[(symbol, side), dict]
-                # tras el fix de exchange.py. La clave anterior era solo el symbol (str),
-                # lo que hacía que .get(symbol) siempre devolviera None y el bot
-                # detectara todas las posiciones abiertas como cerradas cada ciclo.
                 pos_ex = all_ex_positions.get((symbol, pos["side"]))
                 if not pos_ex:
                     hint_price = exchange.get_price(symbol)
@@ -540,10 +531,8 @@ def run() -> None:
                     _save_positions(positions)
                     continue
 
-                # Posición activa — actualizar qty desde exchange
                 pos["qty"] = pos_ex["size"]
 
-                # Sincronizar entry con avgPrice real
                 if pos_ex.get("entry") and pos_ex["entry"] > 0:
                     old_entry = pos.get("entry", 0)
                     if old_entry and abs(old_entry - pos_ex["entry"]) / pos_ex["entry"] > 0.001:
@@ -553,7 +542,6 @@ def run() -> None:
                         )
                     pos["entry"] = pos_ex["entry"]
 
-                # Si sl o tp son None, intentar recuperarlos desde órdenes abiertas
                 if pos.get("sl") is None or pos.get("tp") is None:
                     _sync_sl_tp_from_orders(symbol, pos)
 
@@ -607,12 +595,13 @@ def run() -> None:
                 spread = 0.0
 
                 if manual_sig:
-                    signal, score = manual_sig, 80
+                    signal, score, regime = manual_sig, 80, "bull"
                     is_manual = True
                     log.info("[%s] Señal MANUAL: %s", symbol, signal)
                 else:
                     try:
-                        signal, score = signals.evaluate(
+                        # FIX v5: desempaquetar 3 valores — regime propagado a risk.calc()
+                        signal, score, regime = signals.evaluate(
                             candles_15m, candles_1h, candles_4h,
                             min_score=effective_min_score,
                         )
@@ -638,12 +627,14 @@ def run() -> None:
                     continue
 
                 try:
+                    # FIX v5: regime pasado para TP_RR dinámico correcto
                     params = risk.calc(
                         side=signal,
                         entry=price,
                         candles=candles_15m,
                         score=score,
                         symbol=symbol,
+                        regime=regime,
                     )
                 except ValueError as e:
                     log.info("[%s] risk.calc: %s — saltando", symbol, e)
@@ -653,10 +644,10 @@ def run() -> None:
                     continue
 
                 log.info(
-                    "[%s] SEÑAL %s | score=%d | spread=%.3f%% | "
-                    "entry=%.4f sl=%.4f tp=%.4f qty=%.4f",
-                    symbol, signal.upper(), score, spread,
-                    price, params["sl"], params["tp"], params["qty"],
+                    "[%s] SEÑAL %s | score=%d | regime=%s | spread=%.3f%% | "
+                    "entry=%.4f sl=%.4f tp=%.4f qty=%.4f rr=%.1f",
+                    symbol, signal.upper(), score, regime, spread,
+                    price, params["sl"], params["tp"], params["qty"], params["tp_rr"],
                 )
 
                 try:
@@ -671,7 +662,6 @@ def run() -> None:
                     log.error("[%s] Error abriendo orden: %s", symbol, e)
                     continue
 
-                # FIX: get_position pasa side para no leer el lado equivocado en Hedge mode
                 fill_entry = price
                 try:
                     pos_ex_new = exchange.get_position(symbol, side=signal)
@@ -704,7 +694,7 @@ def run() -> None:
 
                 telegram.notify(
                     f"🚀 Nueva posición\n"
-                    f"{symbol} {signal.upper()} | Score: {score}\n"
+                    f"{symbol} {signal.upper()} | Score: {score} | RR: {params['tp_rr']:.1f}\n"
                     f"Entry: <code>{fill_entry:.4f}</code>\n"
                     f"SL: <code>{params['sl']:.4f}</code>\n"
                     f"TP: <code>{params['tp']:.4f}</code>\n"

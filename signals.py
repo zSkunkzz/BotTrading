@@ -24,53 +24,33 @@ Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
 Sizing en risk.py: mult=0.7 (score<70) | 1.0 (70-84) | 1.4 (≥85)
 MIN_SCORE configurable via env var MIN_SCORE (default 55)
 
-FIXES:
-  v1 - _rsi_divergence: max() con default=-1 para evitar ValueError con
-       generadores vacíos cuando los últimos 3 cierres dominan todo el lookback.
-  v1 - _regime_confirmed: guard de longitud dentro del loop de offsets para
-       evitar pasar ventanas menores de 210 velas a _market_regime.
-  v2 - BUG CALIDAD: closed_15m[-1] era la vela VIVA (lookahead bias);
-       ahora se usa closed_15m[-2] para no-chase ATR y rango.
-  v2 - BUG CALIDAD: ADX scoring 18-25 daba -8 en lugar de 0 (umbral neutro).
-  v2 - BUG CALIDAD: MACD 1h bonus/penalización usado rsi_bull/bear en vez
-       de macd1h_bull/bear; también se añadió MACD 1h bear en score_long.
-  v2 - BUG CALIDAD: _rsi_divergence detectó bull cuando closes[-1] < lo_val
-       pero ese es el comportamiento correcto — lo que estaba mal era el
-       cálculo del índice hi_idx/lo_idx: se buscaba el útimo índice con max()
-       cuando debería buscarse el PRIMERO (para comparar el pivot pasado).
-  v2 - BUG CALIDAD: _volume_ok usaba candles[-2] (vela abierta) en vez de
-       closed_15m pasado como parámetro; internamente ya se llama con closed_15m
-       así que el índice [-2] no era la penúltima cerrada sino la anti-penúltima.
-       Corregido a [-1] para usar la última vela del slice ya cerrado.
-  v2 - BUG CALIDAD: evaluate() prefería LONG si empate (sc_long == sc_short
-       y ambos >= min), pero el código de SHORT no tenía guard sc_short > sc_long
-       — podía emitir SHORT aunque LONG también pasara el umbral. Corregido.
-  v3 - BUG: _rsi_divergence comparaba recent_closes[-1] con lo_val/hi_val
-       en lugar del min/max de las últimas 3 velas del slice. Esto hacía que
-       divergencias reales raramente se detectaran porque el último cierre
-       puntual difícilmente supera el extremo global del lookback completo.
-       Fix: usar min(recent_closes[-3:]) y max(recent_closes[-3:]).
-  v3 - BUG: score_long/short tenía un dead branch en la lógica MACD 15m.
-       La rama `elif not macd15_bear_weak` nunca se ejecutaba porque si
-       macd15_bull_weak es False el histograma es ≤0 (bear). Simplificado
-       a if/elif/else limpio.
-  v3 - BUG: _regime_confirmed con REGIME_CONFIRM_BARS=2 excluía 2 velas
-       cerradas en el primer offset, confirmando el régimen con 3h de
-       antigüedad. Cambiado el loop para que offset empiece en 1.
-  v3 - BUG LEVE: _hour_bonus usaba datetime.now() del sistema en lugar de
-       la hora de la última vela cerrada. Ahora recibe hour_utc calculado
-       desde el timestamp de la vela en evaluate().
-  v4 - MEJORA: _rsi_divergence ya no recibe el parámetro `candles` (nunca
-       se usaba). La divergencia ahora usa candle highs/lows reales para
-       comparar el extremo de precio (lo_recent / hi_recent) en vez de solo
-       closes, lo que la hace más precisa.
-  v4 - MEJORA: _macro_pts simplificada — el parámetro `favor` era siempre
-       True en las dos únicas llamadas; eliminado para reducir código muerto.
-  v4 - BUG: _volume_ok guard off-by-one corregido: `< window + 1` debería
-       ser `< window + 2` — con window=20 y len=21, vols quedaba vacío y
-       avg lanzaba ZeroDivisionError.
-  v4 - BUG: _ema no tenía guard para lista vacía; closes[0] lanzaba
-       IndexError silencioso. Añadido `if not closes: return []`.
+CAMBIOS v5:
+  - evaluate() ahora retorna (signal, score, regime) — el régimen se
+    propaga a risk.calc() para el TP_RR dinámico correcto.
+  - _rsi_divergence: comparación apples-to-apples usando highs/lows reales
+    tanto para el pivot pasado como para el reciente. Antes hi_val/lo_val
+    se calculaban sobre closes y hi_recent/lo_recent sobre candle extremos,
+    generando falsas divergencias cuando la shadow era grande.
+  - Guard divergencia 1h subido de >=29 a >=35 para dar margen al lookback.
+  - _ema y _atr importados de indicators.py (módulo compartido con risk.py).
+
+FIXES ANTERIORES (historial):
+  v1 - _rsi_divergence: max() con default=-1.
+  v1 - _regime_confirmed: guard de longitud mínima.
+  v2 - closed_15m[-1] era la vela viva (lookahead bias).
+  v2 - ADX scoring 18-25 daba -8 en lugar de 0.
+  v2 - MACD 1h bonus usaba rsi_bull/bear en vez de macd1h_bull/bear.
+  v2 - _rsi_divergence índice pivot buscado con min() en vez de max().
+  v2 - _volume_ok índice off-by-one.
+  v2 - evaluate() empate LONG/SHORT corregido.
+  v3 - _rsi_divergence comparación recent_closes[-1] → min/max[-3:].
+  v3 - dead branch MACD 15m eliminado.
+  v3 - _regime_confirmed offset loop empieza en 1.
+  v3 - _hour_bonus usa timestamp de la vela, no datetime.now().
+  v4 - _rsi_divergence usa highs/lows reales para el extremo reciente.
+  v4 - _macro_pts simplificada (parámetro `favor` eliminado).
+  v4 - _volume_ok guard off-by-one (window+1 → window+2).
+  v4 - _ema guard lista vacía.
 """
 from __future__ import annotations
 import csv
@@ -82,6 +62,7 @@ from datetime import timezone
 from collections import defaultdict
 
 import config
+import indicators as ind
 
 log = logging.getLogger("signals")
 
@@ -99,29 +80,20 @@ SR_PIVOT_BARS_4H    = 2
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
 
-# Sesgo horario dinámico — umbrales de PnL medio
 HOUR_BIAS_MIN_TRADES = 20
 HOUR_BIAS_GOOD_PCT   = 0.5
 HOUR_BIAS_BAD_PCT    = -0.5
 
-# Caché del CSV horario (se recarga máx 1 vez/hora)
 _hour_bias_cache:     dict[int, float] = {}
 _hour_bias_cache_ts:  float = 0.0
 _hour_bias_cache_ttl: float = 3600.0
 _hour_bias_n_trades:  int   = 0
 
 
-# ── Indicadores ───────────────────────────────────────────────────────────────────
+# ── Indicadores locales (los compartidos viven en indicators.py) ──────────
 
 def _ema(closes: list[float], period: int) -> list[float]:
-    # FIX v4: guard lista vacía para evitar IndexError silencioso.
-    if not closes:
-        return []
-    k = 2 / (period + 1)
-    emas = [closes[0]]
-    for c in closes[1:]:
-        emas.append(c * k + emas[-1] * (1 - k))
-    return emas
+    return ind.ema(closes, period)
 
 
 def _rsi(closes: list[float], period: int = 14) -> list[float]:
@@ -149,11 +121,7 @@ def _macd_histogram(closes: list[float], fast=12, slow=26, signal=9) -> list[flo
 
 
 def _atr(candles: list[dict], period: int = 14) -> float:
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    return sum(trs[-period:]) / min(period, len(trs)) if trs else 0.0
+    return ind.atr(candles, period)
 
 
 def _adx(candles: list[dict], period: int = 14) -> float:
@@ -203,53 +171,41 @@ def _rsi_divergence(
 ) -> str | None:
     """Detecta divergencia RSI-precio usando highs/lows reales de vela.
 
-    FIX v1: max() usa default=-1 para evitar ValueError cuando el generador
-    queda vacío.
-
-    FIX v2: El índice del pivot pasado se busca con min() (primer índice donde
-    ocurre el extremo), no max(). Usar max() devolvía el índice más reciente
-    del mismo valor extremo, comprimiendo la ventana temporal y haciendo que
-    muchas divergencias legítimas no se detectaran.
-
-    FIX v3: La comparación de precio actual usaba recent_closes[-1] (un punto
-    puntual) en vez del min/max de las últimas 3 velas del slice. Un único
-    cierre raramente supera el extremo global del lookback, así que las
-    divergencias reales casi nunca se detectaban. Fix: usar
-    min(recent_closes[-3:]) / max(recent_closes[-3:]) para la comparación.
-
-    FIX v4: El parámetro `candles` ya no es muerto — se usa para calcular
-    lo_recent / hi_recent con los lows/highs reales de las últimas 3 velas
-    en vez de solo sus closes. Más preciso porque los extremos intracandle
-    son más representativos del movimiento de precio que el cierre.
+    FIX v5 (apples-to-apples): antes hi_val/lo_val se calculaban sobre
+    closes mientras que hi_recent/lo_recent usaban candle highs/lows.
+    Esta mezcla generaba falsas divergencias cuando la shadow era grande
+    (hi_recent siempre > hi_val porque high >= close por definición).
+    Fix: calcular hi_val/lo_val también sobre los highs/lows reales de
+    los candles pasados para que ambas partes de la comparación sean
+    del mismo tipo.
     """
     if len(closes) < lookback + 14:
         return None
     if len(candles) < lookback:
         return None
 
-    rsi_series    = _rsi(closes, 14)
-    recent_closes = closes[-lookback:]
-    recent_rsi    = rsi_series[-lookback:]
+    rsi_series     = _rsi(closes, 14)
+    recent_rsi     = rsi_series[-lookback:]
     recent_candles = candles[-lookback:]
 
     # --- Divergencia alcista: precio hace mínimo más bajo, RSI hace mínimo más alto ---
-    lo_val    = min(recent_closes[:-3])
-    lo_idx    = min(
-        (i for i, v in enumerate(recent_closes[:-3]) if v == lo_val),
+    # FIX v5: usar lows reales de los candles pasados (no closes) para comparar
+    # contra lo_recent que también es un low real.
+    lo_val  = min(c["low"] for c in recent_candles[:-3])
+    lo_idx  = min(
+        (i for i, c in enumerate(recent_candles[:-3]) if c["low"] == lo_val),
         default=-1,
     )
-    # FIX v4: usar el low real de las últimas 3 velas en vez del close puntual
     lo_recent = min(c["low"] for c in recent_candles[-3:])
     if lo_idx != -1 and lo_recent < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
     # --- Divergencia bajista: precio hace máximo más alto, RSI hace máximo más bajo ---
-    hi_val    = max(recent_closes[:-3])
-    hi_idx    = min(
-        (i for i, v in enumerate(recent_closes[:-3]) if v == hi_val),
+    hi_val  = max(c["high"] for c in recent_candles[:-3])
+    hi_idx  = min(
+        (i for i, c in enumerate(recent_candles[:-3]) if c["high"] == hi_val),
         default=-1,
     )
-    # FIX v4: usar el high real de las últimas 3 velas en vez del close puntual
     hi_recent = max(c["high"] for c in recent_candles[-3:])
     if hi_idx != -1 and hi_recent > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
@@ -262,7 +218,6 @@ def _pivot_levels(
     n: int,
     max_pivots: int = 8,
 ) -> tuple[list[float], list[float]]:
-    """Extrae los últimos `max_pivots` niveles de soporte y resistencia."""
     supports:    list[float] = []
     resistances: list[float] = []
     start = n
@@ -290,7 +245,6 @@ def _sr_context(
     candles_4h: list[dict] | None,
     zone_pct: float = SR_ZONE_PCT,
 ) -> str:
-    """Determina si el precio está cerca de un soporte o resistencia significativo."""
     near_support    = False
     near_resistance = False
     dist_sup        = float("inf")
@@ -333,12 +287,6 @@ def _sr_context(
 
 
 def _load_hour_bias_from_csv() -> None:
-    """Carga o refresca el mapa hora→PnL_medio desde trades.csv.
-
-    Se ejecuta máx 1 vez/hora (caché con TTL). Si el archivo no existe
-    o tiene <HOUR_BIAS_MIN_TRADES filas, deja _hour_bias_n_trades = 0
-    para que evaluate() use el fallback de horas fijas.
-    """
     global _hour_bias_cache, _hour_bias_cache_ts, _hour_bias_n_trades
 
     now = time.time()
@@ -377,20 +325,6 @@ def _load_hour_bias_from_csv() -> None:
 
 
 def _hour_bonus(hour_utc: int) -> int:
-    """Devuelve el bonus/penalización de la hora indicada.
-
-    FIX v3: ya no llama a datetime.now() internamente — recibe la hora
-    calculada desde el timestamp de la vela cerrada en evaluate().
-
-    Modo dinámico (≥HOUR_BIAS_MIN_TRADES en CSV):
-      PnL medio > +HOUR_BIAS_GOOD_PCT% → +8
-      PnL medio < +HOUR_BIAS_BAD_PCT%  → -10
-      Resto                            →  0
-
-    Modo estático (fallback):
-      HIGH_BIAS_HOURS → +8
-      LOW_BIAS_HOURS  → -10
-    """
     _load_hour_bias_from_csv()
 
     if _hour_bias_n_trades >= HOUR_BIAS_MIN_TRADES:
@@ -409,7 +343,6 @@ def _hour_bonus(hour_utc: int) -> int:
 
 
 def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
-    """Clasifica el régimen con alineación ESTRICTA de EMAs."""
     closes = [c["close"] for c in candles_1h]
     ema20  = _ema(closes, 20)[-1]
     ema50  = _ema(closes, 50)[-1]
@@ -425,16 +358,6 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
 
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
-    """Devuelve el régimen solo si las últimas n velas cerradas coinciden.
-
-    FIX v1: guard de longitud mínima (210 velas) dentro del loop para evitar
-    pasar ventanas demasiado cortas a _market_regime cuando n > 2.
-
-    FIX v3: el loop de offsets ahora empieza en 1 en vez de n. Con n=2 y
-    offset empezando en 2, la primera ventana excluía 2 velas cerradas,
-    confirmando el régimen con 3h de antigüedad. Ahora offset=1,2,...,n
-    para que la confirmación use las velas más recientes posibles.
-    """
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
 
@@ -458,18 +381,6 @@ def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> t
 
 
 def _volume_ok(candles: list[dict], window: int = 20) -> bool:
-    """Comprueba si el volumen de la última vela del slice supera la media.
-
-    FIX v2: usaba candles[-2] asumiendo que se pasaba la lista raw con la
-    vela viva incluida, pero evaluate() ya le pasa closed_15m (sin vela viva).
-    El índice correcto es [-1] (la última vela del slice cerrado).
-
-    FIX v4: guard off-by-one corregido. Con `< window + 1` y len(candles)
-    == window + 1, el slice candles[-(window+1):-1] tenía exactamente window
-    elementos pero candles[-1] era el único elemento restante. Si len ==
-    window + 1 el slice vols quedaba con 0 elementos → ZeroDivisionError.
-    Corregido a `< window + 2`.
-    """
     if len(candles) < window + 2:
         return True
     vols = [c["volume"] for c in candles[-(window + 1):-1]]
@@ -477,21 +388,31 @@ def _volume_ok(candles: list[dict], window: int = 20) -> bool:
     return candles[-1]["volume"] >= avg * VOLUME_MULT
 
 
-# ── Función principal ────────────────────────────────────────────────────────────────────────
+# ── Función principal ─────────────────────────────────────────────────────
 
 def evaluate(
     candles_15m: list[dict],
     candles_1h:  list[dict],
     candles_4h:  list[dict] | None = None,
     min_score:   int | None = None,
-) -> tuple[str | None, int]:
-    """Evalúa señales. min_score sobreescribe MIN_SCORE global si se especifica."""
+) -> tuple[str | None, int, str]:
+    """Evalúa señales.
+
+    Returns:
+        (signal, score, regime)
+        signal : 'long' | 'short' | None
+        score  : 0-100
+        regime : 'bull' | 'bear' | 'range'
+
+    FIX v5: ahora retorna también el régimen para que main.py pueda
+    pasarlo a risk.calc() y obtener el TP_RR dinámico correcto.
+    """
     effective_min = min_score if min_score is not None else MIN_SCORE
 
     if len(candles_1h) < 210:
-        return None, 0
+        return None, 0, "range"
     if len(candles_15m) < 60:
-        return None, 0
+        return None, 0, "range"
 
     closed_15m = candles_15m[:-1]
     closed_1h  = candles_1h[:-1]
@@ -503,14 +424,14 @@ def evaluate(
     regime, adx_1h = _regime_confirmed(closed_1h)
     if regime == "range":
         log.info("⬛ Régimen lateral o inestable — sin señal")
-        return None, 0
+        return None, 0, "range"
 
     ema200 = _ema(closes_1h, 200)[-1]
     price  = closes_15m[-1]
     dist   = abs(price - ema200) / ema200
     if dist < EMA200_MIN_DIST:
         log.info("⚠️  Precio cerca del EMA200 (%.3f%%) — sin señal", dist * 100)
-        return None, 0
+        return None, 0, regime
 
     trend_long  = regime == "bull"
     trend_short = regime == "bear"
@@ -519,14 +440,13 @@ def evaluate(
     last_range = closed_15m[-1]["high"] - closed_15m[-1]["low"]
     if atr > 0 and last_range > NO_CHASE_MULT * atr:
         log.info("⚠️  Vela explosiva — sin señal")
-        return None, 0
+        return None, 0, regime
 
     adx = _adx(closed_15m, 14)
     if adx < ADX_MIN:
         log.info("⚠️  ADX 15m demasiado bajo (%.1f < %d) — mercado sin momentum", adx, ADX_MIN)
-        return None, 0
+        return None, 0, regime
 
-    # FIX v3: hora desde timestamp de la vela cerrada, no del sistema.
     candle_ts  = closed_15m[-1].get("time", 0)
     hour_utc   = datetime.datetime.utcfromtimestamp(candle_ts / 1000).hour if candle_ts else datetime.datetime.now(timezone.utc).hour
     hour_bonus = _hour_bonus(hour_utc)
@@ -551,8 +471,9 @@ def evaluate(
 
     divergence_15m = _rsi_divergence(closes_15m, closed_15m, lookback=10)
 
+    # FIX v5: guard subido de >=29 a >=35 para dar margen al lookback=15.
     divergence_1h: str | None = None
-    if len(closes_1h) >= 29:
+    if len(closes_1h) >= 35:
         divergence_1h = _rsi_divergence(closes_1h, closed_1h, lookback=15)
 
     sr = _sr_context(price, closed_1h, closed_4h)
@@ -570,7 +491,6 @@ def evaluate(
 
     vol_ok = _volume_ok(closed_15m)
 
-    # FIX v4: _macro_pts simplificada — `favor` era siempre True, eliminado.
     def _macro_pts(macro: bool | None) -> int:
         if macro is None:
             return 0
@@ -583,7 +503,6 @@ def evaluate(
         s += _macro_pts(macro_long)
         if adx > 35:        s += 12
         elif adx > 25:      s += 6
-        # 18-25: neutro (sin bonus ni penalización)
         if adx_1h < 18:     s -= 5
         elif adx_1h > 25:   s += 5
         if rsi_cross_up:    s += 15
@@ -610,7 +529,6 @@ def evaluate(
         s += _macro_pts(macro_short)
         if adx > 35:         s += 12
         elif adx > 25:       s += 6
-        # 18-25: neutro
         if adx_1h < 18:      s -= 5
         elif adx_1h > 25:    s += 5
         if rsi_cross_down:   s += 15
@@ -653,12 +571,12 @@ def evaluate(
     if sc_long >= effective_min and sc_long >= sc_short:
         log.info("✅ LONG score=%d (div15m=%s div1h=%s sr=%s bias=%+d)",
                  sc_long, divergence_15m, divergence_1h, sr, hour_bonus)
-        return "long", sc_long
+        return "long", sc_long, regime
 
     if sc_short >= effective_min and sc_short > sc_long:
         log.info("✅ SHORT score=%d (div15m=%s div1h=%s sr=%s bias=%+d)",
                  sc_short, divergence_15m, divergence_1h, sr, hour_bonus)
-        return "short", sc_short
+        return "short", sc_short, regime
 
     log.info("⬛ Sin señal (score L=%d S=%d < %d)", sc_long, sc_short, effective_min)
-    return None, 0
+    return None, 0, regime

@@ -15,35 +15,33 @@ SL / TP:
   tp_pct  = sl_pct × _tp_rr(score, regime)
 
   TP_RR dinámico:
-    regime="range"  →  1.5  (precio no viaja lejos, TP más conservador)
+    regime="range"  →  1.5  (nunca debería llegar aquí, pero por seguridad)
     score ≥ 85      →  2.5  (señal fuerte + tendencia, dejar correr)
     score ≥ 70      →  2.0  (normal)
     score < 70      →  1.7  (señal débil, asegurar beneficio antes)
 
   Valores fijos:
-    SL_MIN_PCT = 0.006   — mínimo SL (0.6%): evita stops prematuros por ruido de mercado
+    SL_MIN_PCT = 0.006   — mínimo SL (0.6%)
     SL_MAX_PCT = 2.5%    — máximo SL
 
 Trailing stop:
   trail_step = 0.3 × sl_dist
 
-FIX: qty=0 guard — si floor_qty devuelve 0 (raw_qty < step), se lanza
-     ValueError para que main.py salte la señal sin llamar a open_order.
+FIX v5: _atr importado de indicators.py (compartido con signals.py).
+FIX: qty=0 guard — si floor_qty devuelve 0, se lanza ValueError.
+FIX: step/min_qty inicializados antes del bloque try/except.
 """
 import logging
 import math
 
 import config
 import exchange as _exchange
+import indicators as ind
 
 log = logging.getLogger("risk")
 
-# ── Límites porcentuales SL/TP ────────────────────────────────────────────────
-# FIX: SL_MIN_PCT subido de 0.4% a 0.6%.
-# Con 10x de apalancamiento, 0.4% = 4% de movimiento en capital, demasiado ajustado
-# para la volatilidad normal de altcoins en 15m → stops prematuros por ruido.
-SL_MIN_PCT = 0.006   # 0.6%
-SL_MAX_PCT = 0.025   # 2.5%
+SL_MIN_PCT = 0.006
+SL_MAX_PCT = 0.025
 
 
 def _tp_rr(score: int, regime: str) -> float:
@@ -57,14 +55,6 @@ def _tp_rr(score: int, regime: str) -> float:
     return 1.7
 
 
-def _atr(candles: list[dict], period: int = 14) -> float:
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    return sum(trs[-period:]) / min(period, len(trs)) if trs else 0.0
-
-
 def _size_multiplier(score: int) -> float:
     if score >= 85:
         return 1.4
@@ -73,8 +63,14 @@ def _size_multiplier(score: int) -> float:
     return 0.7
 
 
-def calc(side: str, entry: float, candles: list[dict], score: int = 70,
-         symbol: str | None = None, regime: str = "bull") -> dict:
+def calc(
+    side: str,
+    entry: float,
+    candles: list[dict],
+    score: int = 70,
+    symbol: str | None = None,
+    regime: str = "bull",
+) -> dict:
     """
     Calcula SL, TP, qty y trail_step para una entrada.
 
@@ -85,12 +81,14 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 70,
         score   : score de la señal (0-100)
         symbol  : símbolo BingX (e.g. 'BTC-USDT'). Si se pasa, se consulta
                   el step-size real del contrato para redondear qty.
-        regime  : régimen de mercado ('bull' | 'bear' | 'range') para TP_RR dinámico.
+        regime  : régimen de mercado ('bull' | 'bear' | 'range') para TP_RR
+                  dinámico. Ahora recibido desde signals.evaluate().
 
     Raises:
         ValueError: si qty calculada es 0 o inferior al minQty del contrato.
     """
-    atr = _atr(candles, period=14)
+    # FIX v5: usar indicators.atr (compartido con signals.py)
+    atr = ind.atr(candles, period=14)
 
     if atr > 0 and entry > 0:
         atr_pct = atr / entry
@@ -114,10 +112,6 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 70,
     margin  = config.MARGIN_USDT * mult
     raw_qty = (margin * config.LEVERAGE) / entry
 
-    # FIX: inicializar step con valor por defecto antes del bloque try/except.
-    # Si symbol está definido pero _get_contract_info lanza excepción, el except
-    # asigna step=0.001 via min_qty, pero el ValueError posterior referenciaba
-    # 'step' que podía no estar definida → NameError.
     step    = 0.001
     min_qty = 0.001
 
@@ -133,7 +127,6 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 70,
     else:
         qty = math.floor(raw_qty * 1000) / 1000
 
-    # FIX: qty=0 guard — evita enviar órdenes con cantidad 0 a BingX.
     if qty <= 0 or qty < min_qty:
         raise ValueError(
             f"[{symbol}] qty calculada ({qty:.8f}) es 0 o inferior al minQty ({min_qty}) "
