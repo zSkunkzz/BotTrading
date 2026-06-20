@@ -7,45 +7,23 @@ NOVEDADES:
     tp_original y tp_extensions.
 
 FIXES:
-  - spread inicializada a 0.0 antes del bloque is_manual para evitar
-    UnboundLocalError si el flujo llega al log.info de SEÑAL sin haberla
-    calculado (aunque is_manual hace continue antes, era un landmine).
-  - positions.json se borra cuando positions queda vacío para evitar
-    sincronización sucia en el siguiente reinicio.
-  - _extending se excluye del JSON persistido Y se marca False al restaurar;
-    se añade guard en _check_tp_extension para no re-extender si tp ya
-    supera tp_original * TP_EXTEND_RR (evita doble extensión tras reinicio).
-  - FIX: exchange.set_leverage(symbol) → exchange.set_leverage(symbol, config.LEVERAGE)
-    El segundo argumento faltaba, causando WARNING en el arranque para los 52 pares.
-  - FIX: _check_tp_extension valida que new_sl sea válido respecto al precio
-    actual antes de cancelar órdenes. Para SHORT: SL (BUY-STOP) requiere
-    stopPrice > currentPrice. Si el precio ya bajó por debajo del SL calculado
-    (breakeven), se omite el SL y se deja el TP extendido sin mover el SL,
-    evitando el error BingX 110412 y el riesgo de quedar sin protección.
-  - FIX CRÍTICO: open_count reemplazado por len(positions) en el check
-    MAX_POSITIONS dentro del loop de señales. open_count se incrementaba
-    manualmente y podía desincronizarse si open_order lanzaba excepción
-    parcial, permitiendo abrir una posición extra por encima del límite.
-  - FIX MEDIO: _check_breakeven devuelve bool; si activó en este tick,
-    _update_trailing se salta para evitar doble cancel_all_orders en la
-    misma iteración (dejaba la posición sin TP).
-  - FIX MEDIO: _resolve_close acepta hint_price snapshot capturado antes
-    del pop() para aproximar mejor el precio de cierre real y evitar PnL
-    incorrecto cuando el mercado se mueve entre el cierre y la detección.
-  - FIX CRÍTICO: Sincronización SL/TP desde órdenes abiertas del exchange.
-    get_all_positions() devuelve stopLossPrice/takeProfitPrice como None en
-    BingX cuando las órdenes SL/TP son condicionales independientes (el caso
-    habitual). Al restaurar una posición tras reinicio, el bot quedaba con
-    sl=None y tp=None, desactivando breakeven, trailing y extensión de TP.
-    Ahora _sync_sl_tp_from_orders() consulta las órdenes abiertas del símbolo
-    y rellena sl y tp a partir de los stopPrice reales de las órdenes
-    STOP_MARKET y TAKE_PROFIT_MARKET encontradas.
-  - FIX CRÍTICO: entry guardada como precio de llenado real (pos_ex["entry"]
-    = avgPrice del exchange) en la sincronización, no como get_price() al
-    momento de detectar la señal. Esto afectaba al cálculo de breakeven,
-    trailing y extensión de TP, que usaban una entrada incorrecta.
-  - FIX CALIDAD: get_closed_reason() se llama con side para no atribuir el
-    cierre de un LONG al SHORT activo en el mismo símbolo (Hedge mode).
+  - spread inicializada a 0.0 antes del bloque is_manual.
+  - positions.json se borra cuando positions queda vacío.
+  - _extending excluido del JSON persistido; guard anti doble-extensión.
+  - set_leverage(symbol, config.LEVERAGE) — segundo argumento faltaba.
+  - _check_tp_extension valida new_sl antes de cancelar órdenes.
+  - len(positions) en check MAX_POSITIONS (era open_count, podía desincronizarse).
+  - _check_breakeven devuelve bool; si activó, se salta _update_trailing.
+  - _resolve_close acepta hint_price snapshot antes del pop().
+  - FIX CRÍTICO: risk.calc() llamada con argumentos en orden correcto:
+    risk.calc(side=signal, entry=price, candles=candles_15m, score=score, symbol=symbol)
+    Antes: risk.calc(price, signal, candles_15m) → side='long'/'short' como float,
+    entry=precio como string → SL/TP completamente erróneos.
+  - FIX CRÍTICO: _sync_sl_tp_from_orders filtro de positionSide permisivo:
+    acepta órdenes con positionSide correcto O positionSide vacío (BingX
+    a veces lo omite en órdenes condicionales).
+  - FIX CALIDAD: get_closed_reason() se llama con side.
+  - FIX CALIDAD: fill_entry sin sleep extra (open_order ya espera 0.5s).
 """
 import json
 import logging
@@ -82,9 +60,8 @@ MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
 TP_EXTEND_THRESH       = 0.015
 
-# Breakeven: se activa cuando el precio alcanza entry + BE_RR × distancia_sl
-BE_RR     = 1.0     # 1 RR de ganancia → SL a breakeven
-BE_BUFFER = 0.0003  # buffer mínimo sobre entry (0.03%) para cubrir fees
+BE_RR     = 1.0
+BE_BUFFER = 0.0003
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -108,14 +85,9 @@ def _corr_group_count(symbol: str, positions: dict) -> int:
     return 0
 
 
-# ── Persistencia de posiciones ────────────────────────────────────────────────
+# ── Persistencia ─────────────────────────────────────────────────────────
 
 def _save_positions(positions: dict) -> None:
-    """Serializa positions a JSON para sobrevivir reinicios.
-
-    Si el dict está vacío se borra el fichero para no contaminar
-    la sincronización del siguiente arranque.
-    """
     if not positions:
         try:
             if os.path.exists(POSITIONS_FILE):
@@ -126,7 +98,6 @@ def _save_positions(positions: dict) -> None:
     try:
         data = {}
         for sym, pos in positions.items():
-            # Excluye _extending: es estado transitorio, se restaura como False
             data[sym] = {k: v for k, v in pos.items() if k != "_extending"}
         with open(POSITIONS_FILE, "w") as f:
             json.dump(data, f)
@@ -135,12 +106,6 @@ def _save_positions(positions: dict) -> None:
 
 
 def _load_positions() -> dict:
-    """Restaura positions desde JSON si existe.
-
-    Recupera open_ts, score, tp_original, tp_extensions y tp/sl reales
-    de la sesión anterior. Si el archivo no existe o está corrupto,
-    arranca con dict vacío (sincronización normal desde exchange).
-    """
     if not os.path.exists(POSITIONS_FILE):
         log.info("positions.json no encontrado — sincronización normal desde exchange")
         return {}
@@ -149,7 +114,7 @@ def _load_positions() -> dict:
             data = json.load(f)
         for sym, pos in data.items():
             pos.setdefault("tp_extensions", 0)
-            pos.setdefault("_extending", False)   # siempre False al restaurar
+            pos.setdefault("_extending", False)
             pos.setdefault("trail_step", 0)
             pos.setdefault("trail_high", pos.get("entry", 0))
             pos.setdefault("trail_low",  pos.get("entry", 0))
@@ -163,18 +128,16 @@ def _load_positions() -> dict:
         return {}
 
 
-# ── FIX CRÍTICO: Sincronización SL/TP desde órdenes abiertas ─────────────────
+# ── Sync SL/TP desde órdenes abiertas ───────────────────────────────────
 
 def _sync_sl_tp_from_orders(symbol: str, pos: dict) -> None:
-    """Rellena sl y tp leyendo las órdenes condicionales abiertas del exchange.
+    """Rellena sl y tp desde las órdenes condicionales abiertas del exchange.
 
-    BingX devuelve stopLossPrice/takeProfitPrice como None (o 0) en
-    get_all_positions() cuando el SL y TP son órdenes independientes
-    (STOP_MARKET / TAKE_PROFIT_MARKET), que es el caso habitual de este bot.
+    BingX devuelve stopLossPrice/takeProfitPrice como None en get_all_positions()
+    cuando el SL y TP son órdenes independientes (el caso habitual).
 
-    Esta función consulta las órdenes abiertas del símbolo y extrae los
-    stopPrice reales de las órdenes de cierre condicionales, asignándolos
-    a pos["sl"] y pos["tp"] si aún faltan.
+    FIX: el filtro de positionSide acepta también positionSide vacío (''),
+    ya que BingX a veces lo omite en órdenes condicionales.
     """
     try:
         orders = exchange._get_open_orders(symbol)
@@ -182,18 +145,19 @@ def _sync_sl_tp_from_orders(symbol: str, pos: dict) -> None:
         log.warning("[%s] _sync_sl_tp_from_orders: error obteniendo órdenes: %s", symbol, e)
         return
 
-    side = pos.get("side", "")
-    # En Hedge mode el positionSide de la orden de cierre coincide con el de la posición
+    side          = pos.get("side", "")
     position_side = "LONG" if side == "long" else "SHORT"
 
     sl_price: float | None = None
     tp_price: float | None = None
 
     for order in orders:
-        if order.get("positionSide", "").upper() != position_side:
+        ps = order.get("positionSide", "").upper()
+        # FIX: aceptar positionSide correcto O vacío (BingX a veces lo omite)
+        if ps and ps != position_side:
             continue
-        order_type  = order.get("type", "")
-        stop_price  = float(order.get("stopPrice") or 0)
+        order_type = order.get("type", "")
+        stop_price = float(order.get("stopPrice") or 0)
         if stop_price <= 0:
             continue
         if order_type == "STOP_MARKET" and sl_price is None:
@@ -213,21 +177,15 @@ def _sync_sl_tp_from_orders(symbol: str, pos: dict) -> None:
         log.info("[%s] SL/TP recuperados desde órdenes abiertas: %s", symbol, ", ".join(updated))
     else:
         log.warning(
-            "[%s] _sync_sl_tp_from_orders: no se encontraron órdenes SL/TP "
-            "(sl=%s tp=%s) — breakeven/trailing desactivados para esta posición",
+            "[%s] _sync_sl_tp_from_orders: sin órdenes SL/TP "
+            "(sl=%s tp=%s) — breakeven/trailing desactivados",
             symbol, pos.get("sl"), pos.get("tp"),
         )
 
 
-# ── Breakeven automático ──────────────────────────────────────────────────────
+# ── Breakeven ────────────────────────────────────────────────────────────
 
 def _check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
-    """Mueve SL a entry+buffer cuando el precio alcanza entry + BE_RR × riesgo.
-
-    Solo actúa una vez por posición (pos['breakeven_set'] = True).
-    Devuelve True si se activó en este tick para que el caller pueda
-    saltarse _update_trailing y evitar un doble cancel_all_orders.
-    """
     if pos.get("breakeven_set"):
         return False
     if pos.get("sl") is None or pos.get("entry") is None:
@@ -259,8 +217,8 @@ def _check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
             return False
 
     log.info(
-        "[%s] Breakeven activado | entry=%.4f SL: %.4f → %.4f (precio=%.4f target=%.4f)",
-        symbol, entry, sl, new_sl, current_price, target,
+        "[%s] Breakeven activado | entry=%.4f SL: %.4f → %.4f (precio=%.4f)",
+        symbol, entry, sl, new_sl, current_price,
     )
 
     try:
@@ -284,7 +242,7 @@ def _check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
     return True
 
 
-# ── Trailing stop ─────────────────────────────────────────────────────────────
+# ── Trailing stop ─────────────────────────────────────────────────────────
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     side       = pos["side"]
@@ -326,16 +284,9 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
 
 
-# ── TP extension ──────────────────────────────────────────────────────────────
+# ── TP extension ──────────────────────────────────────────────────────────
 
 def _sl_price_valid(side: str, sl_price: float, current_price: float) -> bool:
-    """Verifica que el precio del SL sea válido según BingX antes de enviarlo.
-
-    Para cerrar un SHORT: orden BUY-STOP → stopPrice debe ser > currentPrice.
-    Para cerrar un LONG:  orden SELL-STOP → stopPrice debe ser < currentPrice.
-    Si el precio actual ya cruzó el nivel del SL, la orden sería rechazada
-    con error 110412 y además dejaría la posición sin protección temporal.
-    """
     if side == "short":
         return sl_price > current_price
     else:
@@ -357,7 +308,6 @@ def _check_tp_extension(
     if tp is None:
         return
 
-    # FIX: guard anti doble-extensión tras reinicio.
     entry        = pos["entry"]
     tp_orig_dist = abs(pos.get("tp_original", tp) - entry)
     if tp_orig_dist > 0:
@@ -376,9 +326,6 @@ def _check_tp_extension(
     if pos.get("_extending"):
         return
     pos["_extending"] = True
-
-    dist_pct = abs(current_price - tp) / tp
-    log.info("[%s] Precio a %.2f%% del TP — evaluando extensión", symbol, dist_pct * 100)
 
     try:
         candles_15m = feed.get(symbol, "15m")
@@ -421,7 +368,6 @@ def _check_tp_extension(
             log.warning("[%s] Error extendiendo TP sin SL: %s", symbol, e)
             pos["_extending"] = False
             return
-
         old_tp = pos["tp"]
         pos["tp"]            = new_tp
         pos["tp_extensions"] = extensions + 1
@@ -429,11 +375,8 @@ def _check_tp_extension(
         pos["trail_low"]     = current_price
         pos["_extending"]    = False
         pos["breakeven_set"] = True
-
-        log.info(
-            "[%s] TP extendido #%d (sin mover SL) | old_tp=%.6f → new_tp=%.6f | score=%d",
-            symbol, extensions + 1, old_tp, new_tp, score,
-        )
+        log.info("[%s] TP extendido #%d (sin mover SL) | %.6f → %.6f | score=%d",
+                 symbol, extensions + 1, old_tp, new_tp, score)
         telegram.notify(
             f"📈 TP Extendido #{extensions + 1}\n"
             f"{symbol} {side.upper()}\n"
@@ -462,10 +405,8 @@ def _check_tp_extension(
     pos["_extending"]    = False
     pos["breakeven_set"] = True
 
-    log.info(
-        "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL→BE=%.6f | score=%d",
-        symbol, extensions + 1, old_tp, new_tp, new_sl, score,
-    )
+    log.info("[%s] TP extendido #%d | %.6f → %.6f | SL→BE=%.6f | score=%d",
+             symbol, extensions + 1, old_tp, new_tp, new_sl, score)
     telegram.notify(
         f"📈 TP Extendido #{extensions + 1}\n"
         f"{symbol} {side.upper()}\n"
@@ -496,16 +437,7 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _resolve_close(pos: dict, symbol: str, hint_price: float | None = None) -> tuple[float, str]:
-    """Determina precio y motivo de cierre de una posición.
-
-    hint_price: precio capturado justo antes del pop() para aproximar
-    mejor el precio real de cierre cuando el mercado se ha movido entre
-    el cierre real y la detección por el loop.
-
-    FIX CALIDAD: se pasa pos["side"] a get_closed_reason para que filtre
-    por positionSide en Hedge mode y no confunda el cierre de un LONG con
-    el SHORT activo en el mismo símbolo.
-    """
+    """Determina precio y motivo de cierre. Pasa side para filtrar en Hedge mode."""
     reason, exit_price = exchange.get_closed_reason(symbol, side=pos.get("side"))
     if reason and exit_price:
         return exit_price, reason
@@ -552,8 +484,6 @@ def run() -> None:
     feed.start()
     _wait_feed_ready(feed)
 
-    # NOTA: positions es un dict mutable capturado por referencia en la lambda
-    # de tg_commands. Nunca reasignar (positions = {}); usar solo mutaciones.
     positions: dict = _load_positions()
     tg_commands.start(get_positions_fn=lambda: positions, feed=feed)
     trade_logger.start_scheduler()
@@ -572,7 +502,6 @@ def run() -> None:
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
-                    # Posición cerrada en el exchange — resolver y loguear
                     pos        = positions[symbol]
                     hint_price = exchange.get_price(symbol)
                     exit_price, reason = _resolve_close(pos, symbol, hint_price=hint_price)
@@ -614,23 +543,19 @@ def run() -> None:
                 pos = positions[symbol]
                 pos["qty"] = pos_ex["size"]
 
-                # FIX CRÍTICO: si sl o tp son None, recuperarlos desde órdenes abiertas.
-                # BingX no devuelve stopLossPrice/takeProfitPrice en get_all_positions()
-                # cuando son órdenes condicionales independientes.
-                if pos.get("sl") is None or pos.get("tp") is None:
-                    _sync_sl_tp_from_orders(symbol, pos)
-
-                # FIX CRÍTICO: sincronizar entry con el precio de llenado real (avgPrice).
-                # Corrige el caso en que el bot guardó el precio de mercado al momento de
-                # la señal en lugar del precio de llenado real, causando cálculos
-                # incorrectos de BE/trailing/extensión de TP.
+                # Sincronizar entry con avgPrice real (corrige entrada guardada incorrectamente)
                 if pos_ex.get("entry") and pos_ex["entry"] > 0:
-                    if abs(pos.get("entry", 0) - pos_ex["entry"]) / pos_ex["entry"] > 0.001:
+                    old_entry = pos.get("entry", 0)
+                    if old_entry and abs(old_entry - pos_ex["entry"]) / pos_ex["entry"] > 0.001:
                         log.info(
                             "[%s] Corrigiendo entry: %.6f → %.6f (diferencia >0.1%%)",
-                            symbol, pos.get("entry", 0), pos_ex["entry"],
+                            symbol, old_entry, pos_ex["entry"],
                         )
                     pos["entry"] = pos_ex["entry"]
+
+                # Si sl o tp son None, intentar recuperarlos desde órdenes abiertas
+                if pos.get("sl") is None or pos.get("tp") is None:
+                    _sync_sl_tp_from_orders(symbol, pos)
 
                 try:
                     current_price = exchange.get_price(symbol)
@@ -644,7 +569,7 @@ def run() -> None:
                 _check_tp_extension(symbol, pos, current_price, feed, effective_min_score)
                 _save_positions(positions)
 
-            # ── Señales nuevas ────────────────────────────────────────────────
+            # ── Señales nuevas ──────────────────────────────────────────────
             if _is_weekend():
                 today = datetime.now(timezone.utc).weekday()
                 if today != _weekend_notified_day:
@@ -677,10 +602,9 @@ def run() -> None:
                 except Exception:
                     continue
 
-                # ── Señal manual (override de Telegram) ───────────────────
                 is_manual = False
                 manual_sig = tg_commands.pop_manual_signal(symbol)
-                spread = 0.0  # inicializada antes del bloque para evitar UnboundLocalError
+                spread = 0.0
 
                 if manual_sig:
                     signal, score = manual_sig, 80
@@ -713,9 +637,22 @@ def run() -> None:
                     log.warning("[%s] Error obteniendo precio para señal: %s", symbol, e)
                     continue
 
-                params = risk.calc(price, signal, candles_15m)
-                if params is None:
-                    log.info("[%s] risk.calc devolvió None — saltando", symbol)
+                # FIX CRÍTICO: firma correcta de risk.calc()
+                # Antes: risk.calc(price, signal, candles_15m)  ← INCORRECTO
+                # Ahora: risk.calc(side=signal, entry=price, ...)  ← CORRECTO
+                try:
+                    params = risk.calc(
+                        side=signal,
+                        entry=price,
+                        candles=candles_15m,
+                        score=score,
+                        symbol=symbol,
+                    )
+                except ValueError as e:
+                    log.info("[%s] risk.calc: %s — saltando", symbol, e)
+                    continue
+                except Exception as e:
+                    log.warning("[%s] Error en risk.calc: %s", symbol, e)
                     continue
 
                 log.info(
@@ -737,12 +674,9 @@ def run() -> None:
                     log.error("[%s] Error abriendo orden: %s", symbol, e)
                     continue
 
-                # FIX: obtener el precio de llenado real del exchange en lugar
-                # de usar el precio de señal. Se consulta la posición recién
-                # abierta; si falla, se usa price como fallback.
+                # Obtener precio de llenado real (open_order ya esperó 0.5s internamente)
                 fill_entry = price
                 try:
-                    time.sleep(0.5)
                     pos_ex_new = exchange.get_position(symbol)
                     if pos_ex_new and pos_ex_new.get("entry") and pos_ex_new["entry"] > 0:
                         fill_entry = pos_ex_new["entry"]
@@ -754,7 +688,7 @@ def run() -> None:
                 trail_step = params.get("trail_step", 0)
                 positions[symbol] = {
                     "side":          signal,
-                    "entry":         fill_entry,   # FIX: precio de llenado real
+                    "entry":         fill_entry,
                     "qty":           params["qty"],
                     "sl":            params["sl"],
                     "tp":            params["tp"],
