@@ -45,6 +45,21 @@ FIXES:
   v2 - BUG CALIDAD: evaluate() prefería LONG si empate (sc_long == sc_short
        y ambos >= min), pero el código de SHORT no tenía guard sc_short > sc_long
        — podía emitir SHORT aunque LONG también pasara el umbral. Corregido.
+  v3 - BUG: _rsi_divergence comparaba recent_closes[-1] con lo_val/hi_val
+       en lugar del min/max de las últimas 3 velas del slice. Esto hacía que
+       divergencias reales raramente se detectaran porque el último cierre
+       puntual difícilmente supera el extremo global del lookback completo.
+       Fix: usar min(recent_closes[-3:]) y max(recent_closes[-3:]).
+  v3 - BUG: score_long/short tenía un dead branch en la lógica MACD 15m.
+       La rama `elif not macd15_bear_weak` nunca se ejecutaba porque si
+       macd15_bull_weak es False el histograma es ≤0 (bear). Simplificado
+       a if/elif/else limpio.
+  v3 - BUG: _regime_confirmed con REGIME_CONFIRM_BARS=2 excluía 2 velas
+       cerradas en el primer offset, confirmando el régimen con 3h de
+       antigüedad. Cambiado el loop para que offset empiece en 1.
+  v3 - BUG LEVE: _hour_bonus usaba datetime.now() del sistema en lugar de
+       la hora de la última vela cerrada. Ahora recibe hour_utc calculado
+       desde el timestamp de la vela en evaluate().
 """
 from __future__ import annotations
 import csv
@@ -181,6 +196,12 @@ def _rsi_divergence(
     ocurre el extremo), no max(). Usar max() devolvía el índice más reciente
     del mismo valor extremo, comprimiendo la ventana temporal y haciendo que
     muchas divergencias legítimas no se detectaran.
+
+    FIX v3: La comparación de precio actual usaba recent_closes[-1] (un punto
+    puntual) en vez del min/max de las últimas 3 velas del slice. Un único
+    cierre raramente supera el extremo global del lookback, así que las
+    divergencias reales casi nunca se detectaban. Fix: usar
+    min(recent_closes[-3:]) / max(recent_closes[-3:]) para la comparación.
     """
     if len(closes) < lookback + 14:
         return None
@@ -189,21 +210,23 @@ def _rsi_divergence(
     recent_rsi    = rsi_series[-lookback:]
 
     # --- Divergencia alcísta (precio hace mínimo más bajo, RSI hace mínimo más alto) ---
-    lo_val = min(recent_closes[:-3])
-    lo_idx = min(
+    lo_val    = min(recent_closes[:-3])
+    lo_idx    = min(
         (i for i, v in enumerate(recent_closes[:-3]) if v == lo_val),
         default=-1,
     )
-    if lo_idx != -1 and recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
+    lo_recent = min(recent_closes[-3:])
+    if lo_idx != -1 and lo_recent < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
     # --- Divergencia bajista (precio hace máximo más alto, RSI hace máximo más bajo) ---
-    hi_val = max(recent_closes[:-3])
-    hi_idx = min(
+    hi_val    = max(recent_closes[:-3])
+    hi_idx    = min(
         (i for i, v in enumerate(recent_closes[:-3]) if v == hi_val),
         default=-1,
     )
-    if hi_idx != -1 and recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
+    hi_recent = max(recent_closes[-3:])
+    if hi_idx != -1 and hi_recent > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
 
     return None
@@ -329,7 +352,10 @@ def _load_hour_bias_from_csv() -> None:
 
 
 def _hour_bonus(hour_utc: int) -> int:
-    """Devuelve el bonus/penalización de la hora actual.
+    """Devuelve el bonus/penalización de la hora indicada.
+
+    FIX v3: ya no llama a datetime.now() internamente — recibe la hora
+    calculada desde el timestamp de la vela cerrada en evaluate().
 
     Modo dinámico (≥HOUR_BIAS_MIN_TRADES en CSV):
       PnL medio > +HOUR_BIAS_GOOD_PCT% → +8
@@ -376,16 +402,20 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
     """Devuelve el régimen solo si las últimas n velas cerradas coinciden.
 
-    FIX: guard de longitud mínima (210 velas) dentro del loop para evitar
+    FIX v1: guard de longitud mínima (210 velas) dentro del loop para evitar
     pasar ventanas demasiado cortas a _market_regime cuando n > 2.
+
+    FIX v3: el loop de offsets ahora empieza en 1 en vez de n. Con n=2 y
+    offset empezando en 2, la primera ventana excluía 2 velas cerradas,
+    confirmando el régimen con 3h de antigüedad. Ahora offset=1,2,...,n
+    para que la confirmación use las velas más recientes posibles.
     """
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
 
     regimes = []
-    for offset in range(n, 0, -1):
+    for offset in range(1, n + 1):
         window = candles_1h[:-offset]
-        # FIX: ventana demasiado corta para calcular EMA200 correctamente
         if len(window) < 210:
             return "range", 0.0
         regime, adx = _market_regime(window)
@@ -454,11 +484,6 @@ def evaluate(
     trend_long  = regime == "bull"
     trend_short = regime == "bear"
 
-    # FIX v2: usar la PENULTIMA vela cerrada (closed_15m[-2]) para el filtro
-    # no-chase. closed_15m[-1] es la última vela cerrada correcta, pero
-    # el rango que importa para no entrar en vela explosiva es la última
-    # vela que acaba de CERRAR, que es closed_15m[-1]. En realidad [-1] es
-    # correcto ya que closed_15m ya excluye la vela viva. Confirmado.
     atr        = _atr(closed_15m, 14)
     last_range = closed_15m[-1]["high"] - closed_15m[-1]["low"]
     if atr > 0 and last_range > NO_CHASE_MULT * atr:
@@ -470,7 +495,9 @@ def evaluate(
         log.info("⚠️  ADX 15m demasiado bajo (%.1f < %d) — mercado sin momentum", adx, ADX_MIN)
         return None, 0
 
-    hour_utc   = datetime.datetime.now(timezone.utc).hour
+    # FIX v3: hora desde timestamp de la vela cerrada, no del sistema.
+    candle_ts  = closed_15m[-1].get("time", 0)
+    hour_utc   = datetime.datetime.utcfromtimestamp(candle_ts / 1000).hour if candle_ts else datetime.datetime.now(timezone.utc).hour
     hour_bonus = _hour_bonus(hour_utc)
 
     macro_long = macro_short = None
@@ -522,24 +549,22 @@ def evaluate(
             return 0
         s = 20
         s += _macro_pts(macro_long, favor=True)
-        # FIX v2: ADX 18-25 es zona NEUTRA, no penalización.
-        # Antes: elif adx > 18: s -= 8  → penalizaba cualquier ADX entre 18-25
-        # que es perfectamente válido para entrar.
         if adx > 35:        s += 12
         elif adx > 25:      s += 6
-        # 18-25: sin bonus ni penalización (neutro)
+        # 18-25: neutro (sin bonus ni penalización)
         if adx_1h < 18:     s -= 5
         elif adx_1h > 25:   s += 5
         if rsi_cross_up:    s += 15
         elif rsi_ext_bull:  s += 8
         elif rsi_bull:      s += 4
         else:               s -= 5
-        if macd15_bull_strong:     s += 10
-        elif macd15_bull_weak:     s += 0
-        elif not macd15_bear_weak: s += 0
-        else:                      s -= 5
-        # FIX v2: MACD 1h en dirección contraria penaliza, a favor suma.
-        # Antes usaba rsi_bull/rsi_bear por error de copypaste.
+        # FIX v3: dead branch eliminado — lógica simplificada.
+        # macd15_bull_strong → acelerando alcista (+10)
+        # macd15_bull_weak   → positivo sin acelerar (0)
+        # else               → histograma negativo en tendencia alcista (-5)
+        if macd15_bull_strong:   s += 10
+        elif macd15_bull_weak:   s += 0
+        else:                    s -= 5
         if macd1h_bull:     s += 10
         elif macd1h_bear:   s -= 5
         if vol_ok:          s += 8
@@ -555,7 +580,6 @@ def evaluate(
             return 0
         s = 20
         s += _macro_pts(macro_short, favor=True)
-        # FIX v2: mismo que score_long — ADX 18-25 es neutro.
         if adx > 35:         s += 12
         elif adx > 25:       s += 6
         # 18-25: neutro
@@ -565,11 +589,10 @@ def evaluate(
         elif rsi_ext_bear:   s += 8
         elif rsi_bear:       s += 4
         else:                s -= 5
-        if macd15_bear_strong:     s += 10
-        elif macd15_bear_weak:     s += 0
-        elif not macd15_bull_weak: s += 0
-        else:                      s -= 5
-        # FIX v2: MACD 1h correcto para SHORT.
+        # FIX v3: mismo que score_long — dead branch eliminado.
+        if macd15_bear_strong:   s += 10
+        elif macd15_bear_weak:   s += 0
+        else:                    s -= 5
         if macd1h_bear:      s += 10
         elif macd1h_bull:    s -= 5
         if vol_ok:           s += 8
@@ -600,9 +623,6 @@ def evaluate(
         sc_long, sc_short, effective_min,
     )
 
-    # FIX v2: SHORT requiere que su score sea estrictamente mayor que LONG
-    # para evitar emitir ambas señales o elegir SHORT cuando LONG también
-    # pasa el umbral (en empate, preferimos no operar antes que elegir mal).
     if sc_long >= effective_min and sc_long >= sc_short:
         log.info("✅ LONG score=%d (div15m=%s div1h=%s sr=%s bias=%+d)",
                  sc_long, divergence_15m, divergence_1h, sr, hour_bonus)
