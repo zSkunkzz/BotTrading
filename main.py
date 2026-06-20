@@ -22,6 +22,16 @@ FIXES:
     stopPrice > currentPrice. Si el precio ya bajó por debajo del SL calculado
     (breakeven), se omite el SL y se deja el TP extendido sin mover el SL,
     evitando el error BingX 110412 y el riesgo de quedar sin protección.
+  - FIX CRÍTICO: open_count reemplazado por len(positions) en el check
+    MAX_POSITIONS dentro del loop de señales. open_count se incrementaba
+    manualmente y podía desincronizarse si open_order lanzaba excepción
+    parcial, permitiendo abrir una posición extra por encima del límite.
+  - FIX MEDIO: _check_breakeven devuelve bool; si activó en este tick,
+    _update_trailing se salta para evitar doble cancel_all_orders en la
+    misma iteración (dejaba la posición sin TP).
+  - FIX MEDIO: _resolve_close acepta hint_price snapshot capturado antes
+    del pop() para aproximar mejor el precio de cierre real y evitar PnL
+    incorrecto cuando el mercado se mueve entre el cierre y la detección.
 """
 import json
 import logging
@@ -141,16 +151,17 @@ def _load_positions() -> dict:
 
 # ── Breakeven automático ──────────────────────────────────────────────────────
 
-def _check_breakeven(symbol: str, pos: dict, current_price: float) -> None:
+def _check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
     """Mueve SL a entry+buffer cuando el precio alcanza entry + BE_RR × riesgo.
 
     Solo actúa una vez por posición (pos['breakeven_set'] = True).
-    No interfiere con el trailing ni con extend_tp — son capas independientes.
+    Devuelve True si se activó en este tick para que el caller pueda
+    saltarse _update_trailing y evitar un doble cancel_all_orders.
     """
     if pos.get("breakeven_set"):
-        return
+        return False
     if pos.get("sl") is None or pos.get("entry") is None:
-        return
+        return False
 
     side      = pos["side"]
     entry     = pos["entry"]
@@ -158,24 +169,24 @@ def _check_breakeven(symbol: str, pos: dict, current_price: float) -> None:
     risk_dist = abs(entry - sl)
 
     if risk_dist == 0:
-        return
+        return False
 
     if side == "long":
         target = entry + BE_RR * risk_dist
         if current_price < target:
-            return
+            return False
         new_sl = round(entry * (1 + BE_BUFFER), 6)
         if new_sl <= sl:
             pos["breakeven_set"] = True
-            return
+            return False
     else:
         target = entry - BE_RR * risk_dist
         if current_price > target:
-            return
+            return False
         new_sl = round(entry * (1 - BE_BUFFER), 6)
         if new_sl >= sl:
             pos["breakeven_set"] = True
-            return
+            return False
 
     log.info(
         "[%s] Breakeven activado | entry=%.4f SL: %.4f → %.4f (precio=%.4f target=%.4f)",
@@ -189,7 +200,7 @@ def _check_breakeven(symbol: str, pos: dict, current_price: float) -> None:
             exchange.place_tp_order(symbol, side, pos["qty"], pos["tp"])
     except Exception as e:
         log.warning("[%s] Error colocando órdenes en breakeven: %s", symbol, e)
-        return
+        return False
 
     pos["sl"]            = new_sl
     pos["breakeven_set"] = True
@@ -200,6 +211,7 @@ def _check_breakeven(symbol: str, pos: dict, current_price: float) -> None:
         f"SL movido a entrada: <code>{new_sl:.4f}</code>\n"
         f"(precio: <code>{current_price:.4f}</code> | +{BE_RR:.0f}R alcanzado)"
     )
+    return True
 
 
 # ── Trailing stop ─────────────────────────────────────────────────────────────
@@ -423,11 +435,18 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
                 READY_TIMEOUT, feed.ready_count(), total)
 
 
-def _resolve_close(pos: dict, symbol: str) -> tuple[float, str]:
+def _resolve_close(pos: dict, symbol: str, hint_price: float | None = None) -> tuple[float, str]:
+    """Determina precio y motivo de cierre de una posición.
+
+    hint_price: precio capturado justo antes del pop() para aproximar
+    mejor el precio real de cierre cuando el mercado se ha movido entre
+    el cierre real y la detección por el loop. Solo se usa como fallback
+    si exchange.get_closed_reason no devuelve datos.
+    """
     reason, exit_price = exchange.get_closed_reason(symbol)
     if reason and exit_price:
         return exit_price, reason
-    current_price = exchange.get_price(symbol)
+    current_price = hint_price if hint_price is not None else exchange.get_price(symbol)
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
@@ -471,6 +490,10 @@ def run() -> None:
     feed.start()
     _wait_feed_ready(feed)
 
+    # NOTA: positions es un dict mutable capturado por referencia en la lambda
+    # de tg_commands. Nunca reasignar (positions = {}); usar solo mutaciones
+    # (pop, update, asignación de clave) para que la lambda siga apuntando
+    # al mismo objeto.
     positions: dict = _load_positions()
     tg_commands.start(get_positions_fn=lambda: positions, feed=feed)
     trade_logger.start_scheduler()
@@ -489,10 +512,12 @@ def run() -> None:
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
+                    # FIX: capturar precio antes del pop para hint_price en _resolve_close
+                    hint_price = exchange.get_price(symbol)
                     p = positions.pop(symbol)
                     _save_positions(positions)  # borra JSON si queda vacío
 
-                    exit_price, reason = _resolve_close(p, symbol)
+                    exit_price, reason = _resolve_close(p, symbol, hint_price=hint_price)
                     pnl_pct = (
                         (exit_price - p["entry"]) / p["entry"]
                         if p["side"] == "long"
@@ -555,13 +580,11 @@ def run() -> None:
                     log.info("[%s] Sincronizada desde exchange: %s @ %.4f",
                              symbol, pos_ex["side"], pos_ex["entry"])
 
-            open_count = len(positions)
-
             if loop_count % 10 == 1:
                 log.info(
                     "[loop #%d] Posiciones: %d/%d | Feed: %d/%d | "
                     "Cooldowns: %d TP + %d SL | Pausado: %s | DailyLimit: %s",
-                    loop_count, open_count, config.MAX_POSITIONS,
+                    loop_count, len(positions), config.MAX_POSITIONS,
                     feed.ready_count(), len(config.SYMBOLS),
                     len(_cooldown), len(_cooldown_sl),
                     bot_state.is_paused(), trade_logger.is_daily_limit_hit(),
@@ -570,8 +593,11 @@ def run() -> None:
             for symbol, pos in list(positions.items()):
                 try:
                     price = exchange.get_price(symbol)
-                    _check_breakeven(symbol, pos, price)
-                    _update_trailing(symbol, pos, price)
+                    # FIX: si breakeven se activa en este tick, saltamos trailing
+                    # para evitar doble cancel_all_orders que dejaría sin TP.
+                    be_activated = _check_breakeven(symbol, pos, price)
+                    if not be_activated:
+                        _update_trailing(symbol, pos, price)
                     _check_tp_extension(symbol, pos, price, feed, effective_min_score)
                 except Exception as e:
                     log.warning("[%s] Error gestión posición: %s", symbol, e)
@@ -608,7 +634,11 @@ def run() -> None:
 
                     if is_manual and symbol in _manual_alert_cooldown:
                         continue
-                    if not is_manual and open_count >= config.MAX_POSITIONS:
+                    # FIX CRÍTICO: usar len(positions) en lugar de open_count.
+                    # open_count se incrementaba manualmente y podía desincronizarse
+                    # si open_order lanzaba excepción parcial, permitiendo superar
+                    # MAX_POSITIONS durante ese loop.
+                    if not is_manual and len(positions) >= config.MAX_POSITIONS:
                         break
 
                     if not is_manual:
@@ -697,7 +727,6 @@ def run() -> None:
                             "open_ts":       time.time(),
                             "breakeven_set": False,
                         }
-                        open_count += 1
                         _save_positions(positions)
 
                         telegram.notify_open(
