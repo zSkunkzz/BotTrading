@@ -31,6 +31,8 @@ FIX: qty=0 guard — si floor_qty devuelve 0 (raw_qty < step), se lanza
      ValueError para que main.py salte la señal sin llamar a open_order.
 """
 import logging
+import math
+
 import config
 import exchange as _exchange
 
@@ -112,27 +114,30 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 70,
     margin  = config.MARGIN_USDT * mult
     raw_qty = (margin * config.LEVERAGE) / entry
 
+    # FIX: inicializar step con valor por defecto antes del bloque try/except.
+    # Si symbol está definido pero _get_contract_info lanza excepción, el except
+    # asigna step=0.001 via min_qty, pero el ValueError posterior referenciaba
+    # 'step' que podía no estar definida → NameError.
+    step    = 0.001
+    min_qty = 0.001
+
     if symbol:
         try:
-            info = _exchange._get_contract_info(symbol)
+            info    = _exchange._get_contract_info(symbol)
             step    = info["stepSize"]
             min_qty = info["minQty"]
             qty     = _exchange.floor_qty(raw_qty, step)
         except Exception as exc:
             log.warning("No se pudo obtener step-size para %s: %s — usando 3 dec", symbol, exc)
-            import math
-            qty     = math.floor(raw_qty * 1000) / 1000
-            min_qty = 0.001
+            qty = math.floor(raw_qty * 1000) / 1000
     else:
-        import math
-        qty     = math.floor(raw_qty * 1000) / 1000
-        min_qty = 0.001
+        qty = math.floor(raw_qty * 1000) / 1000
 
     # FIX: qty=0 guard — evita enviar órdenes con cantidad 0 a BingX.
     if qty <= 0 or qty < min_qty:
         raise ValueError(
             f"[{symbol}] qty calculada ({qty:.8f}) es 0 o inferior al minQty ({min_qty}) "
-            f"— margin={margin:.2f} USDT, price={entry:.6f}, step={step if symbol else 0.001:.8f}. "
+            f"— margin={margin:.2f} USDT, price={entry:.6f}, step={step:.8f}. "
             "Aumenta MARGIN_USDT o reduce el apalancamiento."
         )
 

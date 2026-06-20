@@ -34,6 +34,14 @@ FIXES aplicados:
       un LONG a un SHORT activo en el mismo símbolo. Ahora acepta parámetro side.
   21. FIX: _contract_info_cache no tenía TTL — ahora expira cada 24h para recoger
       cambios de parámetros de contrato sin necesidad de reiniciar.
+  22. FIX: get_all_positions en Hedge mode podía devolver LONG y SHORT para el mismo
+      símbolo; usar result[symbol] pisaba la segunda entrada. Ahora la clave es
+      (symbol, positionSide) y get_position acepta parámetro side opcional.
+  23. FIX: _request relanzaba RuntimeError genérico en lugar del último error real;
+      ahora hace raise last_exc para preservar el tipo y mensaje original.
+  24. FIX: open_order logueaba warning si SL/TP fallaban pero no lo suficientemente
+      visible; ahora usa log.error con contexto completo para facilitar detección
+      en Railway logs de posiciones abiertas sin protección.
 """
 import hashlib
 import hmac
@@ -72,6 +80,8 @@ def _request(method: str, path: str, params: dict) -> dict:
     base_params = {k: v for k, v in params.items() if k not in ("timestamp", "signature")}
     url = config.BASE_URL + path
 
+    # FIX: inicializar last_exc con el error real del último intento, no uno genérico.
+    # raise last_exc al final preserva tipo y mensaje del fallo real.
     last_exc: Exception = RuntimeError(f"All {_RETRIES} attempts failed for {path}")
     for attempt in range(1, _RETRIES + 1):
         signed = dict(base_params)
@@ -313,6 +323,9 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
     Paso 1: orden MARKET de apertura con positionSide.
     Paso 2: SL y TP con llamadas separadas tras 0.5s de espera.
+
+    FIX: si SL o TP fallan la posición queda abierta sin protección — se loguea
+    como ERROR (no warning) para visibilidad en Railway logs.
     """
     symbol       = symbol or config.SYMBOL
     bingx_side   = "BUY" if side == "long" else "SELL"
@@ -336,14 +349,24 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
              resp.get("data", {}).get("order", {}).get("orderId", "?"))
 
     time.sleep(0.5)
+    sl_ok = False
+    tp_ok = False
     try:
         place_stop_order(symbol, side, qty, sl)
+        sl_ok = True
     except Exception as e:
-        log.warning("[%s] Error colocando SL: %s", symbol, e)
+        log.error("[%s] ⚠️  POSICIÓN ABIERTA SIN SL — error colocando SL @ %s: %s",
+                  symbol, _fmt_price(sl), e)
     try:
         place_tp_order(symbol, side, qty, tp)
+        tp_ok = True
     except Exception as e:
-        log.warning("[%s] Error colocando TP: %s", symbol, e)
+        log.error("[%s] ⚠️  POSICIÓN ABIERTA SIN TP — error colocando TP @ %s: %s",
+                  symbol, _fmt_price(tp), e)
+
+    if not sl_ok or not tp_ok:
+        log.error("[%s] REVISAR MANUALMENTE: side=%s qty=%s sl=%s tp=%s sl_ok=%s tp_ok=%s",
+                  symbol, side, _fmt_qty(qty), _fmt_price(sl), _fmt_price(tp), sl_ok, tp_ok)
 
     return resp
 
@@ -416,21 +439,44 @@ def _parse_position(p: dict) -> dict:
     }
 
 
-def get_all_positions() -> dict[str, dict]:
+def get_all_positions() -> dict[tuple[str, str], dict]:
+    """Devuelve todas las posiciones activas.
+
+    FIX: en Hedge mode BingX puede devolver LONG y SHORT activos para el mismo
+    símbolo simultáneamente. Usar result[symbol] como clave pisaba la segunda
+    posición con la primera. La clave ahora es (symbol, side) — e.g.
+    ('BTC-USDT', 'long') — para preservar ambas.
+
+    Consumidores que sólo esperaban un dict[str, dict] deben actualizar el acceso:
+      antes : positions[symbol]
+      ahora : positions[(symbol, 'long')] o positions[(symbol, 'short')]
+    Para compatibilidad con código legado, usar get_position(symbol, side).
+    """
     data = _get("/openApi/swap/v2/user/positions", {})
-    result: dict[str, dict] = {}
+    result: dict[tuple[str, str], dict] = {}
     for p in (data.get("data") or []):
         if abs(float(p.get("positionAmt", 0))) > 1e-9:
-            result[p["symbol"]] = _parse_position(p)
+            parsed = _parse_position(p)
+            key = (p["symbol"], parsed["side"])
+            result[key] = parsed
     return result
 
 
-def get_position(symbol: str = None) -> dict | None:
+def get_position(symbol: str = None, side: str | None = None) -> dict | None:
+    """Devuelve la posición activa para un símbolo.
+
+    FIX: en Hedge mode puede haber LONG y SHORT activos al mismo tiempo.
+    Si se especifica side ('long' o 'short'), filtra por ese lado.
+    Sin side, devuelve la primera posición activa encontrada (comportamiento
+    anterior, válido cuando sólo hay un lado abierto).
+    """
     symbol = symbol or config.SYMBOL
     data = _get("/openApi/swap/v2/user/positions", {"symbol": symbol})
     for p in (data.get("data") or []):
         if abs(float(p.get("positionAmt", 0))) > 1e-9:
-            return _parse_position(p)
+            parsed = _parse_position(p)
+            if side is None or parsed["side"] == side:
+                return parsed
     return None
 
 
