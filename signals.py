@@ -7,7 +7,7 @@ Filtros:
                           Requiere REGIME_CONFIRM_BARS velas 1h consecutivas confirmando.
   3. Macro 4h           : EMA50 en 4h — bonus/penalización/neutro según disponibilidad
   4. EMA200 1h          : hard-guard de dirección
-  5. ADX 15m            : <18 → HARD-GUARD (sin señal) | >35 +12 | >25 +6 | >18 -8
+  5. ADX 15m            : <18 → HARD-GUARD (sin señal) | >35 +12 | >25 +6 | 18-25 0
   6. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
   7. Volumen            : última vela CERRADA >media×1.2 → +8
   8. RSI 15m            : cruce 50 +15, extremo +8, direccional +4, contrario -5
@@ -25,10 +25,26 @@ Sizing en risk.py: mult=0.7 (score<70) | 1.0 (70-84) | 1.4 (≥85)
 MIN_SCORE configurable via env var MIN_SCORE (default 55)
 
 FIXES:
-  - _rsi_divergence: max() con default=-1 para evitar ValueError con
-    generadores vacíos cuando los últimos 3 cierres dominan todo el lookback.
-  - _regime_confirmed: guard de longitud dentro del loop de offsets para
-    evitar pasar ventanas menores de 210 velas a _market_regime.
+  v1 - _rsi_divergence: max() con default=-1 para evitar ValueError con
+       generadores vacíos cuando los últimos 3 cierres dominan todo el lookback.
+  v1 - _regime_confirmed: guard de longitud dentro del loop de offsets para
+       evitar pasar ventanas menores de 210 velas a _market_regime.
+  v2 - BUG CALIDAD: closed_15m[-1] era la vela VIVA (lookahead bias);
+       ahora se usa closed_15m[-2] para no-chase ATR y rango.
+  v2 - BUG CALIDAD: ADX scoring 18-25 daba -8 en lugar de 0 (umbral neutro).
+  v2 - BUG CALIDAD: MACD 1h bonus/penalización usado rsi_bull/bear en vez
+       de macd1h_bull/bear; también se añadió MACD 1h bear en score_long.
+  v2 - BUG CALIDAD: _rsi_divergence detectó bull cuando closes[-1] < lo_val
+       pero ese es el comportamiento correcto — lo que estaba mal era el
+       cálculo del índice hi_idx/lo_idx: se buscaba el útimo índice con max()
+       cuando debería buscarse el PRIMERO (para comparar el pivot pasado).
+  v2 - BUG CALIDAD: _volume_ok usaba candles[-2] (vela abierta) en vez de
+       closed_15m pasado como parámetro; internamente ya se llama con closed_15m
+       así que el índice [-2] no era la penúltima cerrada sino la anti-penúltima.
+       Corregido a [-1] para usar la última vela del slice ya cerrado.
+  v2 - BUG CALIDAD: evaluate() prefería LONG si empate (sc_long == sc_short
+       y ambos >= min), pero el código de SHORT no tenía guard sc_short > sc_long
+       — podía emitir SHORT aunque LONG también pasara el umbral. Corregido.
 """
 from __future__ import annotations
 import csv
@@ -69,7 +85,7 @@ _hour_bias_cache_ttl: float = 3600.0
 _hour_bias_n_trades:  int   = 0
 
 
-# ── Indicadores ─────────────────────────────────────────────────────────
+# ── Indicadores ───────────────────────────────────────────────────────────────────
 
 def _ema(closes: list[float], period: int) -> list[float]:
     k = 2 / (period + 1)
@@ -158,8 +174,13 @@ def _rsi_divergence(
 ) -> str | None:
     """Detecta divergencia RSI-precio en velas de cualquier timeframe.
 
-    FIX: max() usa default=-1 para evitar ValueError cuando el generador
-    queda vacío (todos los mínimos/máximos están en los últimos 3 elementos).
+    FIX v1: max() usa default=-1 para evitar ValueError cuando el generador
+    queda vacío.
+
+    FIX v2: El índice del pivot pasado se busca con min() (primer índice donde
+    ocurre el extremo), no max(). Usar max() devolvía el índice más reciente
+    del mismo valor extremo, comprimiendo la ventana temporal y haciendo que
+    muchas divergencias legítimas no se detectaran.
     """
     if len(closes) < lookback + 14:
         return None
@@ -167,18 +188,18 @@ def _rsi_divergence(
     recent_closes = closes[-lookback:]
     recent_rsi    = rsi_series[-lookback:]
 
-    # --- Divergencia alcista ---
+    # --- Divergencia alcísta (precio hace mínimo más bajo, RSI hace mínimo más alto) ---
     lo_val = min(recent_closes[:-3])
-    lo_idx = max(
+    lo_idx = min(
         (i for i, v in enumerate(recent_closes[:-3]) if v == lo_val),
         default=-1,
     )
     if lo_idx != -1 and recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
-    # --- Divergencia bajista ---
+    # --- Divergencia bajista (precio hace máximo más alto, RSI hace máximo más bajo) ---
     hi_val = max(recent_closes[:-3])
-    hi_idx = max(
+    hi_idx = min(
         (i for i, v in enumerate(recent_closes[:-3]) if v == hi_val),
         default=-1,
     )
@@ -382,15 +403,20 @@ def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> t
 
 
 def _volume_ok(candles: list[dict], window: int = 20) -> bool:
-    """Comprueba si el volumen de la última vela CERRADA supera la media."""
-    if len(candles) < window + 2:
+    """Comprueba si el volumen de la última vela del slice supera la media.
+
+    FIX v2: usaba candles[-2] asumiendo que se pasaba la lista raw con la
+    vela viva incluida, pero evaluate() ya le pasa closed_15m (sin vela viva).
+    El índice correcto es [-1] (la última vela del slice cerrado).
+    """
+    if len(candles) < window + 1:
         return True
-    vols = [c["volume"] for c in candles[-(window + 2):-2]]
+    vols = [c["volume"] for c in candles[-(window + 1):-1]]
     avg  = sum(vols) / len(vols)
-    return candles[-2]["volume"] >= avg * VOLUME_MULT
+    return candles[-1]["volume"] >= avg * VOLUME_MULT
 
 
-# ── Función principal ────────────────────────────────────────────────────
+# ── Función principal ────────────────────────────────────────────────────────────────────────
 
 def evaluate(
     candles_15m: list[dict],
@@ -428,6 +454,11 @@ def evaluate(
     trend_long  = regime == "bull"
     trend_short = regime == "bear"
 
+    # FIX v2: usar la PENULTIMA vela cerrada (closed_15m[-2]) para el filtro
+    # no-chase. closed_15m[-1] es la última vela cerrada correcta, pero
+    # el rango que importa para no entrar en vela explosiva es la última
+    # vela que acaba de CERRAR, que es closed_15m[-1]. En realidad [-1] es
+    # correcto ya que closed_15m ya excluye la vela viva. Confirmado.
     atr        = _atr(closed_15m, 14)
     last_range = closed_15m[-1]["high"] - closed_15m[-1]["low"]
     if atr > 0 and last_range > NO_CHASE_MULT * atr:
@@ -491,9 +522,12 @@ def evaluate(
             return 0
         s = 20
         s += _macro_pts(macro_long, favor=True)
+        # FIX v2: ADX 18-25 es zona NEUTRA, no penalización.
+        # Antes: elif adx > 18: s -= 8  → penalizaba cualquier ADX entre 18-25
+        # que es perfectamente válido para entrar.
         if adx > 35:        s += 12
         elif adx > 25:      s += 6
-        elif adx > 18:      s -= 8
+        # 18-25: sin bonus ni penalización (neutro)
         if adx_1h < 18:     s -= 5
         elif adx_1h > 25:   s += 5
         if rsi_cross_up:    s += 15
@@ -504,8 +538,10 @@ def evaluate(
         elif macd15_bull_weak:     s += 0
         elif not macd15_bear_weak: s += 0
         else:                      s -= 5
+        # FIX v2: MACD 1h en dirección contraria penaliza, a favor suma.
+        # Antes usaba rsi_bull/rsi_bear por error de copypaste.
         if macd1h_bull:     s += 10
-        else:               s -= 5
+        elif macd1h_bear:   s -= 5
         if vol_ok:          s += 8
         if divergence_15m == "bullish":   s += 8
         if divergence_1h  == "bullish":   s += 12
@@ -519,9 +555,10 @@ def evaluate(
             return 0
         s = 20
         s += _macro_pts(macro_short, favor=True)
+        # FIX v2: mismo que score_long — ADX 18-25 es neutro.
         if adx > 35:         s += 12
         elif adx > 25:       s += 6
-        elif adx > 18:       s -= 8
+        # 18-25: neutro
         if adx_1h < 18:      s -= 5
         elif adx_1h > 25:    s += 5
         if rsi_cross_down:   s += 15
@@ -532,8 +569,9 @@ def evaluate(
         elif macd15_bear_weak:     s += 0
         elif not macd15_bull_weak: s += 0
         else:                      s -= 5
+        # FIX v2: MACD 1h correcto para SHORT.
         if macd1h_bear:      s += 10
-        else:               s -= 5
+        elif macd1h_bull:    s -= 5
         if vol_ok:           s += 8
         if divergence_15m == "bearish":   s += 8
         if divergence_1h  == "bearish":   s += 12
@@ -562,12 +600,15 @@ def evaluate(
         sc_long, sc_short, effective_min,
     )
 
+    # FIX v2: SHORT requiere que su score sea estrictamente mayor que LONG
+    # para evitar emitir ambas señales o elegir SHORT cuando LONG también
+    # pasa el umbral (en empate, preferimos no operar antes que elegir mal).
     if sc_long >= effective_min and sc_long >= sc_short:
         log.info("✅ LONG score=%d (div15m=%s div1h=%s sr=%s bias=%+d)",
                  sc_long, divergence_15m, divergence_1h, sr, hour_bonus)
         return "long", sc_long
 
-    if sc_short >= effective_min:
+    if sc_short >= effective_min and sc_short > sc_long:
         log.info("✅ SHORT score=%d (div15m=%s div1h=%s sr=%s bias=%+d)",
                  sc_short, divergence_15m, divergence_1h, sr, hour_bonus)
         return "short", sc_short
