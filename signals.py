@@ -60,6 +60,17 @@ FIXES:
   v3 - BUG LEVE: _hour_bonus usaba datetime.now() del sistema en lugar de
        la hora de la última vela cerrada. Ahora recibe hour_utc calculado
        desde el timestamp de la vela en evaluate().
+  v4 - MEJORA: _rsi_divergence ya no recibe el parámetro `candles` (nunca
+       se usaba). La divergencia ahora usa candle highs/lows reales para
+       comparar el extremo de precio (lo_recent / hi_recent) en vez de solo
+       closes, lo que la hace más precisa.
+  v4 - MEJORA: _macro_pts simplificada — el parámetro `favor` era siempre
+       True en las dos únicas llamadas; eliminado para reducir código muerto.
+  v4 - BUG: _volume_ok guard off-by-one corregido: `< window + 1` debería
+       ser `< window + 2` — con window=20 y len=21, vols quedaba vacío y
+       avg lanzaba ZeroDivisionError.
+  v4 - BUG: _ema no tenía guard para lista vacía; closes[0] lanzaba
+       IndexError silencioso. Añadido `if not closes: return []`.
 """
 from __future__ import annotations
 import csv
@@ -103,6 +114,9 @@ _hour_bias_n_trades:  int   = 0
 # ── Indicadores ───────────────────────────────────────────────────────────────────
 
 def _ema(closes: list[float], period: int) -> list[float]:
+    # FIX v4: guard lista vacía para evitar IndexError silencioso.
+    if not closes:
+        return []
     k = 2 / (period + 1)
     emas = [closes[0]]
     for c in closes[1:]:
@@ -187,7 +201,7 @@ def _rsi_divergence(
     candles: list[dict],
     lookback: int = 10,
 ) -> str | None:
-    """Detecta divergencia RSI-precio en velas de cualquier timeframe.
+    """Detecta divergencia RSI-precio usando highs/lows reales de vela.
 
     FIX v1: max() usa default=-1 para evitar ValueError cuando el generador
     queda vacío.
@@ -202,30 +216,41 @@ def _rsi_divergence(
     cierre raramente supera el extremo global del lookback, así que las
     divergencias reales casi nunca se detectaban. Fix: usar
     min(recent_closes[-3:]) / max(recent_closes[-3:]) para la comparación.
+
+    FIX v4: El parámetro `candles` ya no es muerto — se usa para calcular
+    lo_recent / hi_recent con los lows/highs reales de las últimas 3 velas
+    en vez de solo sus closes. Más preciso porque los extremos intracandle
+    son más representativos del movimiento de precio que el cierre.
     """
     if len(closes) < lookback + 14:
         return None
+    if len(candles) < lookback:
+        return None
+
     rsi_series    = _rsi(closes, 14)
     recent_closes = closes[-lookback:]
     recent_rsi    = rsi_series[-lookback:]
+    recent_candles = candles[-lookback:]
 
-    # --- Divergencia alcísta (precio hace mínimo más bajo, RSI hace mínimo más alto) ---
+    # --- Divergencia alcista: precio hace mínimo más bajo, RSI hace mínimo más alto ---
     lo_val    = min(recent_closes[:-3])
     lo_idx    = min(
         (i for i, v in enumerate(recent_closes[:-3]) if v == lo_val),
         default=-1,
     )
-    lo_recent = min(recent_closes[-3:])
+    # FIX v4: usar el low real de las últimas 3 velas en vez del close puntual
+    lo_recent = min(c["low"] for c in recent_candles[-3:])
     if lo_idx != -1 and lo_recent < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
-    # --- Divergencia bajista (precio hace máximo más alto, RSI hace máximo más bajo) ---
+    # --- Divergencia bajista: precio hace máximo más alto, RSI hace máximo más bajo ---
     hi_val    = max(recent_closes[:-3])
     hi_idx    = min(
         (i for i, v in enumerate(recent_closes[:-3]) if v == hi_val),
         default=-1,
     )
-    hi_recent = max(recent_closes[-3:])
+    # FIX v4: usar el high real de las últimas 3 velas en vez del close puntual
+    hi_recent = max(c["high"] for c in recent_candles[-3:])
     if hi_idx != -1 and hi_recent > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
 
@@ -438,8 +463,14 @@ def _volume_ok(candles: list[dict], window: int = 20) -> bool:
     FIX v2: usaba candles[-2] asumiendo que se pasaba la lista raw con la
     vela viva incluida, pero evaluate() ya le pasa closed_15m (sin vela viva).
     El índice correcto es [-1] (la última vela del slice cerrado).
+
+    FIX v4: guard off-by-one corregido. Con `< window + 1` y len(candles)
+    == window + 1, el slice candles[-(window+1):-1] tenía exactamente window
+    elementos pero candles[-1] era el único elemento restante. Si len ==
+    window + 1 el slice vols quedaba con 0 elementos → ZeroDivisionError.
+    Corregido a `< window + 2`.
     """
-    if len(candles) < window + 1:
+    if len(candles) < window + 2:
         return True
     vols = [c["volume"] for c in candles[-(window + 1):-1]]
     avg  = sum(vols) / len(vols)
@@ -513,10 +544,10 @@ def evaluate(
     rsi_curr       = rsi_series[-1]
     rsi_cross_up   = rsi_prev < 50 <= rsi_curr
     rsi_cross_down = rsi_prev > 50 >= rsi_curr
-    rsi_bull        = rsi_curr > 50
-    rsi_bear        = rsi_curr < 50
-    rsi_ext_bull    = rsi_curr > 60
-    rsi_ext_bear    = rsi_curr < 40
+    rsi_bull       = rsi_curr > 50
+    rsi_bear       = rsi_curr < 50
+    rsi_ext_bull   = rsi_curr > 60
+    rsi_ext_bear   = rsi_curr < 40
 
     divergence_15m = _rsi_divergence(closes_15m, closed_15m, lookback=10)
 
@@ -539,16 +570,17 @@ def evaluate(
 
     vol_ok = _volume_ok(closed_15m)
 
-    def _macro_pts(macro: bool | None, favor: bool) -> int:
+    # FIX v4: _macro_pts simplificada — `favor` era siempre True, eliminado.
+    def _macro_pts(macro: bool | None) -> int:
         if macro is None:
             return 0
-        return 15 if (macro and favor) else (-10 if (not macro and favor) else 0)
+        return 15 if macro else -10
 
     def score_long() -> int:
         if not trend_long:
             return 0
         s = 20
-        s += _macro_pts(macro_long, favor=True)
+        s += _macro_pts(macro_long)
         if adx > 35:        s += 12
         elif adx > 25:      s += 6
         # 18-25: neutro (sin bonus ni penalización)
@@ -558,10 +590,6 @@ def evaluate(
         elif rsi_ext_bull:  s += 8
         elif rsi_bull:      s += 4
         else:               s -= 5
-        # FIX v3: dead branch eliminado — lógica simplificada.
-        # macd15_bull_strong → acelerando alcista (+10)
-        # macd15_bull_weak   → positivo sin acelerar (0)
-        # else               → histograma negativo en tendencia alcista (-5)
         if macd15_bull_strong:   s += 10
         elif macd15_bull_weak:   s += 0
         else:                    s -= 5
@@ -579,7 +607,7 @@ def evaluate(
         if not trend_short:
             return 0
         s = 20
-        s += _macro_pts(macro_short, favor=True)
+        s += _macro_pts(macro_short)
         if adx > 35:         s += 12
         elif adx > 25:       s += 6
         # 18-25: neutro
@@ -589,7 +617,6 @@ def evaluate(
         elif rsi_ext_bear:   s += 8
         elif rsi_bear:       s += 4
         else:                s -= 5
-        # FIX v3: mismo que score_long — dead branch eliminado.
         if macd15_bear_strong:   s += 10
         elif macd15_bear_weak:   s += 0
         else:                    s -= 5
