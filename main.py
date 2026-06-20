@@ -25,6 +25,9 @@ FIXES:
   - FIX v5: signals.evaluate() retorna (signal, score, regime); regime
     propagado a risk.calc() para TP_RR dinámico correcto.
   - FIX v5: _check_tp_extension desempaqueta el tercer valor de evaluate().
+  - FIX v6: set_leverage filtra dinámicamente símbolos inválidos/offline
+    (BingX codes 109425 / 109418) — eliminados de config.SYMBOLS antes
+    de arrancar el feed; Telegram notifica lista de eliminados.
 """
 import json
 import logging
@@ -73,6 +76,9 @@ WEEKEND_MIN_SCORE = config.WEEKEND_MIN_SCORE
 POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
 
 _weekend_notified_day: int = -1
+
+# Códigos de error BingX que indican símbolo inexistente u offline
+_BINGX_INVALID_SYMBOL_CODES = {109425, 109418}
 
 
 def _is_weekend() -> bool:
@@ -452,6 +458,30 @@ def _resolve_close(pos: dict, symbol: str, hint_price: float | None = None) -> t
 def run() -> None:
     global _weekend_notified_day
 
+    # ── Filtrar símbolos inválidos/offline al arranque ────────────────────
+    invalid_symbols: list[str] = []
+    for symbol in list(config.SYMBOLS):
+        try:
+            exchange.set_leverage(symbol, config.LEVERAGE)
+        except Exception as e:
+            err_str = str(e)
+            if any(str(code) in err_str for code in _BINGX_INVALID_SYMBOL_CODES):
+                log.warning(
+                    "Símbolo %s no disponible en BingX — eliminado de la lista activa: %s",
+                    symbol, e,
+                )
+                invalid_symbols.append(symbol)
+            else:
+                log.warning("No se pudo setear leverage en %s: %s", symbol, e)
+
+    if invalid_symbols:
+        for sym in invalid_symbols:
+            config.SYMBOLS.remove(sym)
+        log.info(
+            "Símbolos eliminados (no disponibles en BingX): %s | Activos: %d",
+            invalid_symbols, len(config.SYMBOLS),
+        )
+
     log.info(
         "Bot iniciado | %d pares | lev=%dx | margin=%s USDT | max=%d posiciones | "
         "min_score=%d | weekend_min_score=%d | max_daily_loss=%.0f USDT | "
@@ -461,15 +491,10 @@ def run() -> None:
         config.MAX_CORR_PER_GROUP, config.MAX_SPREAD_PCT,
     )
 
-    for symbol in config.SYMBOLS:
-        try:
-            exchange.set_leverage(symbol, config.LEVERAGE)
-        except Exception as e:
-            log.warning("No se pudo setear leverage en %s: %s", symbol, e)
-
     telegram.notify(
         f"🤖 Bot iniciado — {len(config.SYMBOLS)} pares | "
         f"{config.LEVERAGE}x | max {config.MAX_POSITIONS} posiciones"
+        + (f"\n⚠️ Símbolos eliminados: {invalid_symbols}" if invalid_symbols else "")
     )
 
     feed = KlineFeed(config.SYMBOLS)

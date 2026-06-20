@@ -21,20 +21,18 @@ SYMBOLS = [
     "VET-USDT",  "STX-USDT",  "ATOM-USDT", "TAO-USDT",  "WLD-USDT",
     # --- 31-40 ---
     "ONDO-USDT", "MNT-USDT",  "FET-USDT",  "OP-USDT",   "POL-USDT",
-    "HYPE-USDT", "GOLD-USDT", "JUP-USDT",  "PENGU-USDT","TIA-USDT",
-    # --- 41-50 ---
-    "RENDER-USDT","SEI-USDT", "BONK-USDT", "PEPE-USDT", "NOT-USDT",
+    "HYPE-USDT", "JUP-USDT",  "PENGU-USDT","TIA-USDT",
+    # --- 41+ ---
+    "RENDER-USDT","SEI-USDT", "NOT-USDT",
     "ZK-USDT",   "EIGEN-USDT","LISTA-USDT","MANTA-USDT","AERO-USDT",
-    # --- Materias primas y forex (modo alerta manual) ---
-    "SILVER-USDT", "EUR-USDT",
 ]
 
-# Pares en modo alerta manual
-MANUAL_ALERT_SYMBOLS = {"GOLD-USDT", "SILVER-USDT", "EUR-USDT"}
+# Pares en modo alerta manual (no se tradean automáticamente)
+MANUAL_ALERT_SYMBOLS: set[str] = set()
 
 # Grupos de correlación
 CORR_GROUPS: list[set[str]] = [
-    {"DOGE-USDT", "SHIB-USDT", "BONK-USDT", "PEPE-USDT", "NOT-USDT"},
+    {"DOGE-USDT", "SHIB-USDT", "NOT-USDT"},
     {"BTC-USDT", "ETH-USDT", "BNB-USDT", "SOL-USDT", "AVAX-USDT", "APT-USDT",
      "SUI-USDT", "NEAR-USDT", "DOT-USDT", "ICP-USDT", "ARB-USDT", "OP-USDT"},
     {"LINK-USDT", "UNI-USDT", "AERO-USDT", "JUP-USDT", "ONDO-USDT"},
