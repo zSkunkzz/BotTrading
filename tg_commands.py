@@ -8,11 +8,17 @@ Comandos:
     /status     — Estado del bot
     /stop       — Pausa la búsqueda de señales nuevas
     /resume     — Reanuda el bot
+    /long <SYM> — Señal manual LONG para el símbolo
+    /short <SYM>— Señal manual SHORT para el símbolo
 
 FIX: _fetch_trade_history usa trade_logger.get_cache_snapshot() en lugar de
      acceder a trade_logger._cache directamente, respetando el lock del módulo.
      /historial limita la visualización a los últimos 100 trades para no
      bloquear el thread de polling en CSVs grandes.
+FIX: _cmd_posiciones formatea sl/tp con fallback 'N/A' si son None (posición
+     abierta sin SL/TP colocado por error en exchange).
+FIX: _poll strip del sufijo @botname en comandos (e.g. /status@MiBot).
+FIX: pop_manual_signal añadida — referenciada en main.py pero no existía.
 """
 import csv
 import logging
@@ -37,6 +43,19 @@ _start_ts = time.time()
 _get_positions = None
 _feed          = None
 
+# Señales manuales pendientes: symbol → side ('long' | 'short')
+_manual_signals: dict[str, str] = {}
+_manual_signals_lock = threading.Lock()
+
+
+def pop_manual_signal(symbol: str) -> str | None:
+    """Extrae y devuelve la señal manual pendiente para el símbolo, o None.
+
+    Llamada desde el loop principal de main.py. Thread-safe.
+    """
+    with _manual_signals_lock:
+        return _manual_signals.pop(symbol, None)
+
 
 def _send(text: str, chat_id: str = None) -> None:
     if not config.TG_TOKEN:
@@ -52,11 +71,7 @@ def _send(text: str, chat_id: str = None) -> None:
 
 
 def _fetch_trade_history() -> list[dict]:
-    """Devuelve el histórico combinando CSV + cache en memoria.
-
-    FIX: usa get_cache_snapshot() en lugar de acceder a _cache directamente
-    para respetar el _cache_lock de trade_logger y evitar race conditions.
-    """
+    """Devuelve el histórico combinando CSV + cache en memoria."""
     trades = []
     csv_path = trade_logger.LOG_FILE
 
@@ -83,7 +98,6 @@ def _fetch_trade_history() -> list[dict]:
         except Exception as e:
             log.warning("Error leyendo CSV de trades: %s", e)
 
-    # FIX: usa la función pública thread-safe en lugar de acceder a _cache directamente
     seen = {(t["date"], t["symbol"]) for t in trades}
     for t in trade_logger.get_cache_snapshot():
         key = (t["date"], t["symbol"])
@@ -101,8 +115,6 @@ def _cmd_historial() -> str:
         return "📜 <b>Histórico completo</b>\nSin trades registrados todavía."
 
     total = len(trades)
-    # FIX: limitar a los últimos 100 trades para no bloquear el thread de polling
-    # con CSVs grandes (lectura O(n) en el thread principal de Telegram).
     display = trades[-100:]
     omitted = total - len(display)
 
@@ -161,11 +173,15 @@ def _cmd_posiciones() -> str:
         dur = round((time.time() - p.get("open_ts", time.time())) / 60, 0)
         ext = p.get("tp_extensions", 0)
         ext_str = f" | Ext: <code>{ext}</code>" if ext > 0 else ""
+        # FIX: sl y tp pueden ser None si la orden de protección no se pudo colocar.
+        # Formatear con fallback 'N/A' para evitar TypeError en :.4f con None.
+        sl_str = f"{p['sl']:.4f}" if p.get('sl') is not None else "N/A"
+        tp_str = f"{p['tp']:.4f}" if p.get('tp') is not None else "N/A"
         lines.append(
             f"{side_icon} <b>{symbol}</b> {p['side'].upper()}\n"
             f"   Entry: <code>{p['entry']:.4f}</code> | "
-            f"SL: <code>{p['sl']:.4f}</code> | "
-            f"TP: <code>{p['tp']:.4f}</code>\n"
+            f"SL: <code>{sl_str}</code> | "
+            f"TP: <code>{tp_str}</code>\n"
             f"   Score: <code>{p.get('score','?')}</code> | "
             f"Dur: <code>{dur:.0f} min</code>{ext_str}"
         )
@@ -230,7 +246,9 @@ COMMANDS = {
         "/posiciones — Posiciones abiertas ahora\n"
         "/status — Estado general del bot\n"
         "/stop — Pausar búsqueda de señales nuevas\n"
-        "/resume — Reanudar el bot"
+        "/resume — Reanudar el bot\n"
+        "/long BTC-USDT — Señal manual LONG\n"
+        "/short BTC-USDT — Señal manual SHORT"
     ),
 }
 
@@ -250,10 +268,33 @@ def _poll() -> None:
                 msg  = update.get("message") or update.get("edited_message")
                 if not msg:
                     continue
-                text    = msg.get("text", "").strip().split()[0].lower()
+                parts   = msg.get("text", "").strip().split()
+                if not parts:
+                    continue
+                # FIX: strip del sufijo @botname en comandos enviados en grupos
+                # (e.g. /status@MiBot → /status). Sin esto el comando no se reconocía.
+                raw_cmd = parts[0].lower()
+                text    = raw_cmd.split("@")[0]
                 chat_id = str(msg["chat"]["id"])
                 if chat_id != str(_CHAT_ID):
                     continue
+
+                # Comandos manuales /long <SYM> y /short <SYM>
+                if text in ("/long", "/short") and len(parts) >= 2:
+                    side   = text.lstrip("/")   # 'long' | 'short'
+                    symbol = parts[1].upper()
+                    if symbol not in config.SYMBOLS:
+                        _send(f"⚠️ Símbolo no reconocido: <code>{symbol}</code>\n"
+                              f"Símbolos válidos: {', '.join(config.SYMBOLS[:10])}{'...' if len(config.SYMBOLS) > 10 else ''}",
+                              chat_id)
+                    else:
+                        with _manual_signals_lock:
+                            _manual_signals[symbol] = side
+                        log.info("Señal manual encolada: %s %s", side.upper(), symbol)
+                        _send(f"✅ Señal manual encolada: <b>{symbol} {side.upper()}</b>\n"
+                              f"Se ejecutará en el próximo ciclo del bot.", chat_id)
+                    continue
+
                 if text in COMMANDS:
                     log.info("Comando: %s", text)
                     _send(COMMANDS[text](), chat_id)

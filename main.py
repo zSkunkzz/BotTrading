@@ -15,15 +15,13 @@ FIXES:
   - len(positions) en check MAX_POSITIONS (era open_count, podía desincronizarse).
   - _check_breakeven devuelve bool; si activó, se salta _update_trailing.
   - _resolve_close acepta hint_price snapshot antes del pop().
-  - FIX CRÍTICO: risk.calc() llamada con argumentos en orden correcto:
-    risk.calc(side=signal, entry=price, candles=candles_15m, score=score, symbol=symbol)
-    Antes: risk.calc(price, signal, candles_15m) → side='long'/'short' como float,
-    entry=precio como string → SL/TP completamente erróneos.
-  - FIX CRÍTICO: _sync_sl_tp_from_orders filtro de positionSide permisivo:
-    acepta órdenes con positionSide correcto O positionSide vacío (BingX
-    a veces lo omite en órdenes condicionales).
+  - FIX CRÍTICO: risk.calc() llamada con argumentos en orden correcto.
+  - FIX CRÍTICO: _sync_sl_tp_from_orders filtro de positionSide permisivo.
+  - FIX CRÍTICO: get_all_positions clave (symbol, side) — fix compatibilidad
+    tras cambio de exchange.py. all_ex_positions.get(symbol) siempre era None.
   - FIX CALIDAD: get_closed_reason() se llama con side.
   - FIX CALIDAD: fill_entry sin sleep extra (open_order ya espera 0.5s).
+  - FIX CALIDAD: get_position al obtener fill price pasa side=signal.
 """
 import json
 import logging
@@ -153,7 +151,6 @@ def _sync_sl_tp_from_orders(symbol: str, pos: dict) -> None:
 
     for order in orders:
         ps = order.get("positionSide", "").upper()
-        # FIX: aceptar positionSide correcto O vacío (BingX a veces lo omite)
         if ps and ps != position_side:
             continue
         order_type = order.get("type", "")
@@ -500,9 +497,13 @@ def run() -> None:
             all_ex_positions = exchange.get_all_positions()
 
             for symbol in list(positions.keys()):
-                pos_ex = all_ex_positions.get(symbol)
+                pos = positions[symbol]
+                # FIX CRÍTICO: get_all_positions ahora devuelve dict[(symbol, side), dict]
+                # tras el fix de exchange.py. La clave anterior era solo el symbol (str),
+                # lo que hacía que .get(symbol) siempre devolviera None y el bot
+                # detectara todas las posiciones abiertas como cerradas cada ciclo.
+                pos_ex = all_ex_positions.get((symbol, pos["side"]))
                 if not pos_ex:
-                    pos        = positions[symbol]
                     hint_price = exchange.get_price(symbol)
                     exit_price, reason = _resolve_close(pos, symbol, hint_price=hint_price)
                     pnl_pct = (
@@ -540,10 +541,9 @@ def run() -> None:
                     continue
 
                 # Posición activa — actualizar qty desde exchange
-                pos = positions[symbol]
                 pos["qty"] = pos_ex["size"]
 
-                # Sincronizar entry con avgPrice real (corrige entrada guardada incorrectamente)
+                # Sincronizar entry con avgPrice real
                 if pos_ex.get("entry") and pos_ex["entry"] > 0:
                     old_entry = pos.get("entry", 0)
                     if old_entry and abs(old_entry - pos_ex["entry"]) / pos_ex["entry"] > 0.001:
@@ -637,9 +637,6 @@ def run() -> None:
                     log.warning("[%s] Error obteniendo precio para señal: %s", symbol, e)
                     continue
 
-                # FIX CRÍTICO: firma correcta de risk.calc()
-                # Antes: risk.calc(price, signal, candles_15m)  ← INCORRECTO
-                # Ahora: risk.calc(side=signal, entry=price, ...)  ← CORRECTO
                 try:
                     params = risk.calc(
                         side=signal,
@@ -674,10 +671,10 @@ def run() -> None:
                     log.error("[%s] Error abriendo orden: %s", symbol, e)
                     continue
 
-                # Obtener precio de llenado real (open_order ya esperó 0.5s internamente)
+                # FIX: get_position pasa side para no leer el lado equivocado en Hedge mode
                 fill_entry = price
                 try:
-                    pos_ex_new = exchange.get_position(symbol)
+                    pos_ex_new = exchange.get_position(symbol, side=signal)
                     if pos_ex_new and pos_ex_new.get("entry") and pos_ex_new["entry"] > 0:
                         fill_entry = pos_ex_new["entry"]
                         log.info("[%s] Precio de llenado real: %.6f (señal: %.6f)",
