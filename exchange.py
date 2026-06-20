@@ -25,6 +25,15 @@ FIXES aplicados:
       allOpenOrders de BingX Hedge mode no cancela estas órdenes condicionales,
       lo que causaba que se acumularan órdenes SL/TP duplicadas en cada extensión de TP
       o movimiento de trailing/breakeven.
+  18. FIX CRÍTICO: _parse_position usaba positionAmt > 0 para detectar LONG, pero en
+      Hedge mode BingX devuelve positionSide explícito. Ahora se lee positionSide
+      directamente para evitar clasificar un SHORT como LONG.
+  19. FIX: get_ohlcv marcaba todas las velas como closed=True, incluyendo la vela viva
+      (la última). Ahora la última vela se marca como closed=False.
+  20. FIX: get_closed_reason no filtraba por positionSide, podía atribuir el cierre de
+      un LONG a un SHORT activo en el mismo símbolo. Ahora acepta parámetro side.
+  21. FIX: _contract_info_cache no tenía TTL — ahora expira cada 24h para recoger
+      cambios de parámetros de contrato sin necesidad de reiniciar.
 """
 import hashlib
 import hmac
@@ -166,8 +175,13 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
         "interval": interval,
         "limit":    limit,
     })
+    raw = data["data"]
     candles = []
-    for c in data["data"]:
+    last_idx = len(raw) - 1
+    for idx, c in enumerate(raw):
+        # FIX: la última vela devuelta por la API es la vela VIVA (aún no cerrada).
+        # Marcarla como closed=False evita lookahead bias en consumidores que no
+        # hagan el slice [:-1] manualmente.
         candles.append({
             "ts":     int(c.get("time", c.get("t", 0))),
             "open":   float(c["open"]),
@@ -175,17 +189,22 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
             "low":    float(c["low"]),
             "close":  float(c["close"]),
             "volume": float(c["volume"]),
-            "closed": True,
+            "closed": idx < last_idx,
         })
     return candles
 
 
 # ── Info de contrato (step size / min qty) ────────────────────────────────
 
-_contract_info_cache: dict[str, dict] = {}
+# FIX: caché con TTL de 24h para recoger cambios de parámetros de contrato
+# sin necesidad de reiniciar el bot.
+_contract_info_cache:    dict[str, dict]  = {}
+_contract_info_cache_ts: dict[str, float] = {}
+_CONTRACT_CACHE_TTL = 86_400.0  # 24 horas
 
 def _get_contract_info(symbol: str) -> dict:
-    if symbol in _contract_info_cache:
+    now = time.time()
+    if symbol in _contract_info_cache and (now - _contract_info_cache_ts.get(symbol, 0)) < _CONTRACT_CACHE_TTL:
         return _contract_info_cache[symbol]
     try:
         data = _get("/openApi/swap/v2/quote/contracts", {"symbol": symbol})
@@ -197,13 +216,15 @@ def _get_contract_info(symbol: str) -> dict:
                     "minQty":   float(c.get("tradeMinQuantity", 0.001)),
                     "pricePrecision": int(c.get("pricePrecision", 6)),
                 }
-                _contract_info_cache[symbol] = info
+                _contract_info_cache[symbol]    = info
+                _contract_info_cache_ts[symbol] = now
                 return info
     except Exception as exc:
         log.warning("No se pudo obtener info contrato %s: %s", symbol, exc)
 
     default = {"stepSize": 0.001, "minQty": 0.001, "pricePrecision": 6}
-    _contract_info_cache[symbol] = default
+    _contract_info_cache[symbol]    = default
+    _contract_info_cache_ts[symbol] = now
     return default
 
 
@@ -377,8 +398,17 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> dict:
 # ── Posiciones ──────────────────────────────────────────────────────────────────────────────
 
 def _parse_position(p: dict) -> dict:
+    # FIX: en Hedge mode BingX devuelve positionSide explícito (LONG/SHORT).
+    # Usar positionAmt > 0 para inferir el lado es incorrecto porque ambos lados
+    # pueden tener positionAmt positivo en modo Hedge.
+    pos_side = p.get("positionSide", "").upper()
+    if pos_side in ("LONG", "SHORT"):
+        side = "long" if pos_side == "LONG" else "short"
+    else:
+        # Fallback para cuentas en modo One-Way
+        side = "long" if float(p["positionAmt"]) > 0 else "short"
     return {
-        "side":  "long" if float(p["positionAmt"]) > 0 else "short",
+        "side":  side,
         "entry": float(p["avgPrice"]),
         "size":  abs(float(p["positionAmt"])),
         "sl":    float(p.get("stopLossPrice") or 0) or None,
@@ -409,7 +439,10 @@ def get_position(symbol: str = None) -> dict | None:
 _CLOSE_ORDER_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET"}
 _CLOSE_LOOK_BACK  = 30 * 60 * 1000
 
-def get_closed_reason(symbol: str) -> tuple[str, float]:
+def get_closed_reason(symbol: str, side: str | None = None) -> tuple[str, float]:
+    # FIX: filtra por positionSide si se proporciona, para no atribuir el cierre
+    # de un LONG al SHORT activo en el mismo símbolo (o viceversa) en Hedge mode.
+    position_side_filter = side.upper() if side else None
     try:
         start_ts = int(time.time() * 1000) - _CLOSE_LOOK_BACK
         data = _get("/openApi/swap/v2/trade/allOrders", {
@@ -423,6 +456,10 @@ def get_closed_reason(symbol: str) -> tuple[str, float]:
             if o.get("status") == "FILLED"
             and o.get("type") in _CLOSE_ORDER_TYPES
             and o.get("symbol") == symbol
+            and (
+                position_side_filter is None
+                or o.get("positionSide", "").upper() == position_side_filter
+            )
         ]
         if not filled:
             log.warning("[%s] get_closed_reason: sin órdenes FILLED en últimos 30min", symbol)
