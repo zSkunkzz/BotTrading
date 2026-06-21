@@ -15,21 +15,31 @@ SL / TP:
   tp_pct  = sl_pct × _tp_rr(score, regime)
 
   TP_RR dinámico:
-    regime="range"  →  1.5  (nunca debería llegar aquí, pero por seguridad)
+    regime="range"  →  2.0  (margen suficiente para cubrir spread + comisión)
     score ≥ 85      →  2.5  (señal fuerte + tendencia, dejar correr)
     score ≥ 70      →  2.0  (normal)
-    score < 70      →  1.7  (señal débil, asegurar beneficio antes)
+    score < 70      →  1.8  (señal débil, mínimo viable con comisiones)
 
   Valores fijos:
     SL_MIN_PCT = 0.006   — mínimo SL (0.6%)
-    SL_MAX_PCT = 2.5%    — máximo SL
+    SL_MAX_PCT = 3.5%    — máximo SL (ampliado: crypto necesita respirar)
 
 Trailing stop:
-  trail_step = 0.3 × sl_dist
+  trail_step = 0.5 × sl_dist  (era 0.3 — demasiado sensible al ruido)
 
 FIX v5: _atr importado de indicators.py (compartido con signals.py).
 FIX: qty=0 guard — si floor_qty devuelve 0, se lanza ValueError.
 FIX: step/min_qty inicializados antes del bloque try/except.
+FIX: SL/TP redondeados con pricePrecision real del contrato en lugar de 8
+     decimales fijos (evita truncado silencioso por BingX).
+FIX: SL_MAX_PCT subido a 3.5% — el cap anterior (2.5%) provocaba SL
+     artificialmente ajustados que saltaban por ruido normal de mercado.
+FIX: trail_step subido a 0.5×sl_dist — el 0.3 anterior activaba el trailing
+     en rangos normales convirtiendo posiciones ganadoras en cierres prematuros.
+FIX: TP_RR de regime="range" subido a 2.0 — el 1.5 anterior dejaba el TP
+     tan cerca que spread + comisión lo anulaban.
+FIX: TP_RR mínimo (score<70) subido a 1.8 — el 1.7 no cubría comisiones
+     en señales débiles con SL ajustado.
 """
 import logging
 import math
@@ -41,18 +51,18 @@ import indicators as ind
 log = logging.getLogger("risk")
 
 SL_MIN_PCT = 0.006
-SL_MAX_PCT = 0.025
+SL_MAX_PCT = 0.035
 
 
 def _tp_rr(score: int, regime: str) -> float:
     """TP_RR dinámico: ajusta el ratio riesgo:beneficio según régimen y score."""
     if regime == "range":
-        return 1.5
+        return 2.0
     if score >= 85:
         return 2.5
     if score >= 70:
         return 2.0
-    return 1.7
+    return 1.8
 
 
 def _size_multiplier(score: int) -> float:
@@ -112,15 +122,17 @@ def calc(
     margin  = config.MARGIN_USDT * mult
     raw_qty = (margin * config.LEVERAGE) / entry
 
-    step    = 0.001
-    min_qty = 0.001
+    step       = 0.001
+    min_qty    = 0.001
+    price_prec = 8
 
     if symbol:
         try:
-            info    = _exchange._get_contract_info(symbol)
-            step    = info["stepSize"]
-            min_qty = info["minQty"]
-            qty     = _exchange.floor_qty(raw_qty, step)
+            info       = _exchange._get_contract_info(symbol)
+            step       = info["stepSize"]
+            min_qty    = info["minQty"]
+            price_prec = info["pricePrecision"]
+            qty        = _exchange.floor_qty(raw_qty, step)
         except Exception as exc:
             log.warning("No se pudo obtener step-size para %s: %s — usando 3 dec", symbol, exc)
             qty = math.floor(raw_qty * 1000) / 1000
@@ -134,7 +146,9 @@ def calc(
             "Aumenta MARGIN_USDT o reduce el apalancamiento."
         )
 
-    trail_step = round(0.3 * sl_dist, 8)
+    sl = round(sl, price_prec)
+    tp = round(tp, price_prec)
+    trail_step = round(0.5 * sl_dist, price_prec)
 
     log.info(
         "[%s] score=%d regime=%s RR=%.1f mult=%.1f margin=%.2f "
@@ -147,8 +161,8 @@ def calc(
 
     return {
         "qty":        qty,
-        "sl":         round(sl, 8),
-        "tp":         round(tp, 8),
+        "sl":         sl,
+        "tp":         tp,
         "atr":        round(atr, 8),
         "trail_step": trail_step,
         "score":      score,
