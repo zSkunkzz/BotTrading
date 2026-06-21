@@ -22,6 +22,14 @@ FIXES:
     Ahora el orderId se guarda en _closed_order_ids al procesar el cierre;
     loops siguientes lo descartan inmediatamente. El set se limpia de entradas
     antiguas (>35 min) para no crecer indefinidamente.
+  - FIX v9: Anti-spam robusto.
+    Bug v8: orderId se marcaba DESPUÉS del telegram.notify — una segunda
+    iteración del loop podía entrar antes de que se hiciera el pop().
+    Solución: registrar la clave de cierre ANTES de notify.
+    Además: cuando exchange no devuelve orderId (cierre inferido por precio),
+    se usa clave compuesta "symbol|side|entry_round" como fallback — antes
+    estos cierres podían spamear infinitamente porque order_id == "" nunca
+    entraba en _closed_order_ids.
 """
 import json
 import logging
@@ -52,7 +60,8 @@ _cooldown_sl:           dict[str, float] = {}
 _manual_alert_cooldown: dict[str, float] = {}
 _closing:               set[str]         = set()
 
-# orderId → timestamp cuando lo procesamos; para deduplicar cierres
+# clave_cierre → timestamp cuando lo procesamos; para deduplicar cierres.
+# Clave = orderId si existe; si no, "symbol|side|entry_round" como fallback.
 _closed_order_ids: dict[str, float] = {}
 _CLOSED_ID_TTL = 35 * 60  # 35 min — un poco más que el lookback de get_closed_reason
 
@@ -96,6 +105,20 @@ def _purge_closed_ids() -> None:
     stale = [k for k, ts in _closed_order_ids.items() if ts < cutoff]
     for k in stale:
         del _closed_order_ids[k]
+
+
+def _make_close_key(symbol: str, pos: dict, order_id: str) -> str:
+    """Genera una clave única para deduplicar un cierre.
+
+    Si el exchange devuelve orderId, úsalo directamente.
+    Si no (cierre inferido por precio), construye una clave compuesta
+    con symbol + side + entry redondeado a 4 decimales para que sea
+    estable entre loops pero no colisione con otros trades del mismo par.
+    """
+    if order_id:
+        return order_id
+    entry_r = round(pos.get("entry", 0), 4)
+    return f"{symbol}|{pos.get('side', '')}|{entry_r}"
 
 
 # ── Persistencia ─────────────────────────────────────────────────────────
@@ -536,21 +559,25 @@ def run() -> None:
                         hint_price = exchange.get_price(symbol)
                         exit_price, reason, order_id = _resolve_close(pos, symbol, hint_price=hint_price)
 
-                        # ── DEDUPLICACIÓN POR ORDER ID ──────────────────────
-                        # Si ya procesamos este orderId, es el mismo cierre que
-                        # get_closed_reason sigue devolviendo en loops siguientes
-                        # durante la ventana de 30 min. Ignorarlo silenciosamente.
-                        if order_id and order_id in _closed_order_ids:
+                        # ── DEDUPLICACIÓN DE CIERRES ────────────────────────
+                        # Construir clave única: orderId si existe, si no
+                        # "symbol|side|entry_round" para cubrir cierres inferidos.
+                        close_key = _make_close_key(symbol, pos, order_id)
+
+                        if close_key in _closed_order_ids:
                             log.debug(
-                                "[%s] Cierre ya notificado (orderId=%s) — saltando",
-                                symbol, order_id,
+                                "[%s] Cierre ya notificado (key=%s) — saltando",
+                                symbol, close_key,
                             )
-                            # La posición ya no existe en el exchange pero el orderId
-                            # está duplicado — limpiar del dict local si sigue ahí
+                            # La posición ya no existe en el exchange — limpiar local
                             if symbol in positions:
                                 positions.pop(symbol)
                                 _save_positions(positions)
                             continue
+
+                        # Registrar la clave ANTES de notify para que una segunda
+                        # iteración del loop (posible con sleeps cortos) no entre.
+                        _closed_order_ids[close_key] = time.time()
                         # ────────────────────────────────────────────────────
 
                         pnl_pct = (
@@ -583,10 +610,6 @@ def run() -> None:
                         bot_state.record_trade(pnl_usdt)
                         if reason == "SL":
                             _cooldown_sl[symbol] = time.time()
-
-                        # Marcar orderId como procesado ANTES del pop
-                        if order_id:
-                            _closed_order_ids[order_id] = time.time()
 
                         positions.pop(symbol)
                         _save_positions(positions)
