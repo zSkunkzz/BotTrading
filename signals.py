@@ -18,37 +18,34 @@ Filtros:
   12. Soporte/Resistencia: pivots 1h/4h — soporte +10, resistencia -10
   13. Sesgo horario     : dinámico desde CSV (≥20 trades) o fijo si pocos datos
   14. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
+  15. Confluencia mínima: al menos 2 pilares fuertes antes de emitir señal (v8)
+      Pilares: RSI cruce/extremo | MACD acelerando | divergencia | S/R | ADX>25
 
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
 Sizing en risk.py: mult=0.7 (score<70) | 1.0 (70-84) | 1.4 (≥85)
 MIN_SCORE configurable via env var MIN_SCORE (default 55)
 
+CAMBIOS v8 (calidad sobre cantidad):
+  Guard de confluencia mínima: antes de emitir cualquier señal se exige
+  que al menos 2 de estos 5 pilares fuertes estén presentes:
+    1. RSI cruzando 50 o RSI extremo (>60 long / <40 short)
+    2. MACD 15m acelerando en la dirección (histograma creciendo)
+    3. Divergencia RSI en 15m o 1h en la dirección
+    4. Precio en zona de soporte/resistencia relevante
+    5. ADX 15m > 25 (tendencia con fuerza real)
+  Sin esto, una señal puede llegar a score 57 por acumulación de
+  condiciones débiles (ADX 19, RSI 51, MACD débil, hora buena) sin
+  tener ninguna confluencia real detrás. Con el guard, se descartan
+  exactamente esas señales — el score sigue siendo la puerta de
+  entrada, pero la confluencia es la llave.
+
 CAMBIOS v7 (winrate):
   1. REGIME_CONFIRM_BARS bajado de 2 a 1.
-     Con 2, el régimen se declaraba 'range' si cualquier barra 1h
-     tenía una EMA ligeramente desalineada (consolidaciones normales
-     dentro de tendencias válidas). Con 1 solo se exige que la vela
-     actual confirme el régimen — sigue siendo estricto (las 4 EMAs
-     deben estar alineadas) pero no descarta tendencias reales por
-     ruido de un solo bar.
+  2. _rsi_divergence vuelve a usar closes para AMBOS pivots.
+  3. MACD débil da +5 (antes 0).
 
-  2. _rsi_divergence vuelve a usar closes para AMBOS pivots (pasado
-     y reciente). La v5/v6 usaba closes para el pasado pero highs/lows
-     para el reciente — comparación inconsistente que hacía más difícil
-     detectar divergencias reales y bajaba el score 8-12 pts en señales
-     donde antes sí sumaban. La detección apples-to-apples con closes
-     es más fiable para divergencias momentum y no produce más falsos
-     positivos (el umbral de +2 RSI ya filtra el ruido).
-
-  3. MACD débil (positivo/negativo sin acelerar) ahora da +5 en lugar
-     de 0. Un MACD positivo estable SIN aceleración es una condición
-     alcista real aunque no explosiva — darle 0 equivale a penalizarlo
-     vs. un MACD neutral. Con +5 una señal con MACD estable + soporte
-     + régimen confirmado llega a score 60-65 en vez de quedarse en
-     55-60 bajo el umbral.
-
-CAMBIOS anteriores (historial):
+CAMBIOS anteriores:
   v6 - _rsi_divergence: max() en lugar de min() para pivot más reciente.
   v5 - evaluate() retorna (signal, score, regime) para TP_RR dinámico.
   v5 - divergencia 1h guard subida de >=29 a >=35.
@@ -84,11 +81,13 @@ EMA200_MIN_DIST     = 0.003
 NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
 MIN_SCORE           = config.MIN_SCORE
-REGIME_CONFIRM_BARS = 1   # FIX v7: bajado de 2 a 1 — ver docstring
+REGIME_CONFIRM_BARS = 1
 ADX_MIN             = 18
+ADX_STRONG          = 25   # v8: umbral de fuerza real para pilar
 SR_ZONE_PCT         = 0.004
 SR_PIVOT_BARS_1H    = 3
 SR_PIVOT_BARS_4H    = 2
+MIN_CONFLUENCE      = 2    # v8: pilares fuertes mínimos para emitir señal
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
@@ -103,7 +102,7 @@ _hour_bias_cache_ttl: float = 3600.0
 _hour_bias_n_trades:  int   = 0
 
 
-# ── Indicadores locales (los compartidos viven en indicators.py) ──────────
+# ── Indicadores locales ───────────────────────────────────────────────────
 
 def _ema(closes: list[float], period: int) -> list[float]:
     return ind.ema(closes, period)
@@ -182,43 +181,30 @@ def _rsi_divergence(
     candles: list[dict],
     lookback: int = 10,
 ) -> str | None:
-    """Detecta divergencia RSI-precio usando closes para ambos pivots.
-
-    FIX v7: revertido a comparación closes vs closes (apples-to-apples
-    real). La v5 comparaba closes del pasado con highs/lows del reciente,
-    lo que hacía más difícil detectar divergencias reales y reducía el
-    score en 8-12 pts en señales válidas.
-
-    FIX v6 mantenido: max() con default=-1 para evitar ValueError.
-    FIX v1 mantenido: guard len mínima.
-    """
+    """Detecta divergencia RSI-precio usando closes para ambos pivots (apples-to-apples)."""
     if len(closes) < lookback + 14:
         return None
     if len(candles) < lookback:
         return None
 
-    rsi_series     = _rsi(closes, 14)
-    recent_closes  = closes[-lookback:]
-    recent_rsi     = rsi_series[-lookback:]
+    rsi_series    = _rsi(closes, 14)
+    recent_closes = closes[-lookback:]
+    recent_rsi    = rsi_series[-lookback:]
 
-    # --- Divergencia alcista: precio hace mínimo más bajo, RSI hace mínimo más alto ---
     lo_val = min(recent_closes[:-3])
     lo_idx = max(
         (i for i, v in enumerate(recent_closes[:-3]) if v == lo_val),
         default=-1,
     )
-    lo_recent = recent_closes[-1]
-    if lo_idx != -1 and lo_recent < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
+    if lo_idx != -1 and recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
-    # --- Divergencia bajista: precio hace máximo más alto, RSI hace máximo más bajo ---
     hi_val = max(recent_closes[:-3])
     hi_idx = max(
         (i for i, v in enumerate(recent_closes[:-3]) if v == hi_val),
         default=-1,
     )
-    hi_recent = recent_closes[-1]
-    if hi_idx != -1 and hi_recent > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
+    if hi_idx != -1 and recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
 
     return None
@@ -369,15 +355,7 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
 
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
-    """Devuelve el régimen solo si las últimas n velas cerradas coinciden.
-
-    FIX v7: REGIME_CONFIRM_BARS=1 — con n=1 el loop itera solo offset=1,
-    que es la vela cerrada más reciente. Sigue exigiendo las 4 EMAs
-    perfectamente alineadas (estricto) pero no descarta tendencias
-    reales por un bar de consolidación normal.
-
-    FIX v1 mantenido: guard de longitud mínima dentro del loop.
-    """
+    """Devuelve el régimen solo si las últimas n velas cerradas coinciden."""
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
 
@@ -525,7 +503,6 @@ def evaluate(
         elif rsi_ext_bull:  s += 8
         elif rsi_bull:      s += 4
         else:               s -= 5
-        # FIX v7: MACD débil da +5 (antes 0) — condición alcista real aunque no explosiva
         if macd15_bull_strong:   s += 10
         elif macd15_bull_weak:   s += 5
         else:                    s -= 5
@@ -552,7 +529,6 @@ def evaluate(
         elif rsi_ext_bear:   s += 8
         elif rsi_bear:       s += 4
         else:                s -= 5
-        # FIX v7: MACD débil da +5 (antes 0) — condición bajista real aunque no explosiva
         if macd15_bear_strong:   s += 10
         elif macd15_bear_weak:   s += 5
         else:                    s -= 5
@@ -586,14 +562,59 @@ def evaluate(
         sc_long, sc_short, effective_min,
     )
 
+    # ── v8: Guard de confluencia mínima ──────────────────────────────────
+    pilares_long = sum([
+        bool(rsi_cross_up or rsi_ext_bull),
+        bool(macd15_bull_strong),
+        bool(divergence_15m == "bullish" or divergence_1h == "bullish"),
+        bool(sr == "support"),
+        bool(adx > ADX_STRONG),
+    ])
+
+    pilares_short = sum([
+        bool(rsi_cross_down or rsi_ext_bear),
+        bool(macd15_bear_strong),
+        bool(divergence_15m == "bearish" or divergence_1h == "bearish"),
+        bool(sr == "resistance"),
+        bool(adx > ADX_STRONG),
+    ])
+
     if sc_long >= effective_min and sc_long >= sc_short:
-        log.info("✅ LONG score=%d (div15m=%s div1h=%s sr=%s bias=%+d)",
-                 sc_long, divergence_15m, divergence_1h, sr, hour_bonus)
+        if pilares_long < MIN_CONFLUENCE:
+            log.info(
+                "⬛ LONG score=%d pero solo %d pilar(es) fuerte(s) "
+                "[rsi=%s macd_accel=%s div=%s sr_sup=%s adx>25=%s] — calidad insuficiente",
+                sc_long, pilares_long,
+                rsi_cross_up or rsi_ext_bull,
+                macd15_bull_strong,
+                divergence_15m == "bullish" or divergence_1h == "bullish",
+                sr == "support",
+                adx > ADX_STRONG,
+            )
+            return None, 0, regime
+        log.info(
+            "✅ LONG score=%d pilares=%d/5 (div15m=%s div1h=%s sr=%s bias=%+d)",
+            sc_long, pilares_long, divergence_15m, divergence_1h, sr, hour_bonus,
+        )
         return "long", sc_long, regime
 
     if sc_short >= effective_min and sc_short > sc_long:
-        log.info("✅ SHORT score=%d (div15m=%s div1h=%s sr=%s bias=%+d)",
-                 sc_short, divergence_15m, divergence_1h, sr, hour_bonus)
+        if pilares_short < MIN_CONFLUENCE:
+            log.info(
+                "⬛ SHORT score=%d pero solo %d pilar(es) fuerte(s) "
+                "[rsi=%s macd_accel=%s div=%s sr_res=%s adx>25=%s] — calidad insuficiente",
+                sc_short, pilares_short,
+                rsi_cross_down or rsi_ext_bear,
+                macd15_bear_strong,
+                divergence_15m == "bearish" or divergence_1h == "bearish",
+                sr == "resistance",
+                adx > ADX_STRONG,
+            )
+            return None, 0, regime
+        log.info(
+            "✅ SHORT score=%d pilares=%d/5 (div15m=%s div1h=%s sr=%s bias=%+d)",
+            sc_short, pilares_short, divergence_15m, divergence_1h, sr, hour_bonus,
+        )
         return "short", sc_short, regime
 
     log.info("⬛ Sin señal (score L=%d S=%d < %d)", sc_long, sc_short, effective_min)
