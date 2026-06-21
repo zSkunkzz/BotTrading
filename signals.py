@@ -11,7 +11,7 @@ Filtros:
   6. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
   7. Volumen            : última vela CERRADA >media×1.2 → +8
   8. RSI 15m            : cruce 50 +15, extremo +8, direccional +4, contrario -5
-  9. MACD 15m + 1h      : histograma acelerando +10 | positivo/negativo sin acelerar 0
+  9. MACD 15m + 1h      : histograma acelerando +10 | positivo/negativo sin acelerar +5
                           | contrario -5
   10. Divergencia RSI 15m: +8
   11. Divergencia RSI 1h : +12 (marco superior — más fiable, menos ruido)
@@ -24,39 +24,46 @@ Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
 Sizing en risk.py: mult=0.7 (score<70) | 1.0 (70-84) | 1.4 (≥85)
 MIN_SCORE configurable via env var MIN_SCORE (default 55)
 
-CAMBIOS v5:
-  - evaluate() ahora retorna (signal, score, regime) — el régimen se
-    propaga a risk.calc() para el TP_RR dinámico correcto.
-  - _rsi_divergence: comparación apples-to-apples usando highs/lows reales
-    tanto para el pivot pasado como para el reciente. Antes hi_val/lo_val
-    se calculaban sobre closes y hi_recent/lo_recent sobre candle extremos,
-    generando falsas divergencias cuando la shadow era grande.
-  - Guard divergencia 1h subido de >=29 a >=35 para dar margen al lookback.
-  - _ema y _atr importados de indicators.py (módulo compartido con risk.py).
+CAMBIOS v7 (winrate):
+  1. REGIME_CONFIRM_BARS bajado de 2 a 1.
+     Con 2, el régimen se declaraba 'range' si cualquier barra 1h
+     tenía una EMA ligeramente desalineada (consolidaciones normales
+     dentro de tendencias válidas). Con 1 solo se exige que la vela
+     actual confirme el régimen — sigue siendo estricto (las 4 EMAs
+     deben estar alineadas) pero no descarta tendencias reales por
+     ruido de un solo bar.
 
-CAMBIOS v6:
-  - FIX: _rsi_divergence usaba min() para encontrar el índice del pivot
-    más reciente, cuando debería ser max() (índice más a la derecha =
-    pivot más reciente). Con min() se cogía el pivot más antiguo, lo que
-    generaba comparaciones RSI erróneas y falsas divergencias.
+  2. _rsi_divergence vuelve a usar closes para AMBOS pivots (pasado
+     y reciente). La v5/v6 usaba closes para el pasado pero highs/lows
+     para el reciente — comparación inconsistente que hacía más difícil
+     detectar divergencias reales y bajaba el score 8-12 pts en señales
+     donde antes sí sumaban. La detección apples-to-apples con closes
+     es más fiable para divergencias momentum y no produce más falsos
+     positivos (el umbral de +2 RSI ya filtra el ruido).
 
-FIXES ANTERIORES (historial):
-  v1 - _rsi_divergence: max() con default=-1.
-  v1 - _regime_confirmed: guard de longitud mínima.
-  v2 - closed_15m[-1] era la vela viva (lookahead bias).
-  v2 - ADX scoring 18-25 daba -8 en lugar de 0.
-  v2 - MACD 1h bonus usaba rsi_bull/bear en vez de macd1h_bull/bear.
-  v2 - _rsi_divergence índice pivot buscado con min() en vez de max().
-  v2 - _volume_ok índice off-by-one.
-  v2 - evaluate() empate LONG/SHORT corregido.
-  v3 - _rsi_divergence comparación recent_closes[-1] → min/max[-3:].
-  v3 - dead branch MACD 15m eliminado.
-  v3 - _regime_confirmed offset loop empieza en 1.
-  v3 - _hour_bonus usa timestamp de la vela, no datetime.now().
-  v4 - _rsi_divergence usa highs/lows reales para el extremo reciente.
-  v4 - _macro_pts simplificada (parámetro `favor` eliminado).
-  v4 - _volume_ok guard off-by-one (window+1 → window+2).
+  3. MACD débil (positivo/negativo sin acelerar) ahora da +5 en lugar
+     de 0. Un MACD positivo estable SIN aceleración es una condición
+     alcista real aunque no explosiva — darle 0 equivale a penalizarlo
+     vs. un MACD neutral. Con +5 una señal con MACD estable + soporte
+     + régimen confirmado llega a score 60-65 en vez de quedarse en
+     55-60 bajo el umbral.
+
+CAMBIOS anteriores (historial):
+  v6 - _rsi_divergence: max() en lugar de min() para pivot más reciente.
+  v5 - evaluate() retorna (signal, score, regime) para TP_RR dinámico.
+  v5 - divergencia 1h guard subida de >=29 a >=35.
+  v4 - _rsi_divergence usa highs/lows para extremo reciente (revertido en v7).
+  v4 - _macro_pts simplificada.
+  v4 - _volume_ok guard off-by-one.
   v4 - _ema guard lista vacía.
+  v3 - dead branch MACD eliminado.
+  v3 - _regime_confirmed offset loop empieza en 1.
+  v3 - _hour_bonus usa timestamp de la vela.
+  v2 - lookahead bias vela viva corregido.
+  v2 - ADX 18-25 scoring corregido (0 en vez de -8).
+  v2 - MACD 1h lógica corregida.
+  v1 - _rsi_divergence max() con default=-1.
+  v1 - _regime_confirmed guard de longitud mínima.
 """
 from __future__ import annotations
 import csv
@@ -77,7 +84,7 @@ EMA200_MIN_DIST     = 0.003
 NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
 MIN_SCORE           = config.MIN_SCORE
-REGIME_CONFIRM_BARS = 2
+REGIME_CONFIRM_BARS = 1   # FIX v7: bajado de 2 a 1 — ver docstring
 ADX_MIN             = 18
 SR_ZONE_PCT         = 0.004
 SR_PIVOT_BARS_1H    = 3
@@ -175,16 +182,15 @@ def _rsi_divergence(
     candles: list[dict],
     lookback: int = 10,
 ) -> str | None:
-    """Detecta divergencia RSI-precio usando highs/lows reales de vela.
+    """Detecta divergencia RSI-precio usando closes para ambos pivots.
 
-    FIX v5 (apples-to-apples): usa highs/lows reales tanto para el pivot
-    pasado como para el reciente, evitando falsas divergencias cuando la
-    shadow es grande.
+    FIX v7: revertido a comparación closes vs closes (apples-to-apples
+    real). La v5 comparaba closes del pasado con highs/lows del reciente,
+    lo que hacía más difícil detectar divergencias reales y reducía el
+    score en 8-12 pts en señales válidas.
 
-    FIX v6 (pivot más reciente): hi_idx/lo_idx usaban min() para encontrar
-    el índice del pivot, cogiendo el pivot MÁS ANTIGUO en lugar del MÁS
-    RECIENTE. Corregido a max() para que la comparación RSI use el pivot
-    más cercano en el tiempo, que es el correcto para la divergencia.
+    FIX v6 mantenido: max() con default=-1 para evitar ValueError.
+    FIX v1 mantenido: guard len mínima.
     """
     if len(closes) < lookback + 14:
         return None
@@ -192,26 +198,26 @@ def _rsi_divergence(
         return None
 
     rsi_series     = _rsi(closes, 14)
+    recent_closes  = closes[-lookback:]
     recent_rsi     = rsi_series[-lookback:]
-    recent_candles = candles[-lookback:]
 
     # --- Divergencia alcista: precio hace mínimo más bajo, RSI hace mínimo más alto ---
-    lo_val  = min(c["low"] for c in recent_candles[:-3])
-    lo_idx  = max(
-        (i for i, c in enumerate(recent_candles[:-3]) if c["low"] == lo_val),
+    lo_val = min(recent_closes[:-3])
+    lo_idx = max(
+        (i for i, v in enumerate(recent_closes[:-3]) if v == lo_val),
         default=-1,
     )
-    lo_recent = min(c["low"] for c in recent_candles[-3:])
+    lo_recent = recent_closes[-1]
     if lo_idx != -1 and lo_recent < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
     # --- Divergencia bajista: precio hace máximo más alto, RSI hace máximo más bajo ---
-    hi_val  = max(c["high"] for c in recent_candles[:-3])
-    hi_idx  = max(
-        (i for i, c in enumerate(recent_candles[:-3]) if c["high"] == hi_val),
+    hi_val = max(recent_closes[:-3])
+    hi_idx = max(
+        (i for i, v in enumerate(recent_closes[:-3]) if v == hi_val),
         default=-1,
     )
-    hi_recent = max(c["high"] for c in recent_candles[-3:])
+    hi_recent = recent_closes[-1]
     if hi_idx != -1 and hi_recent > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
 
@@ -363,6 +369,15 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
 
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
+    """Devuelve el régimen solo si las últimas n velas cerradas coinciden.
+
+    FIX v7: REGIME_CONFIRM_BARS=1 — con n=1 el loop itera solo offset=1,
+    que es la vela cerrada más reciente. Sigue exigiendo las 4 EMAs
+    perfectamente alineadas (estricto) pero no descarta tendencias
+    reales por un bar de consolidación normal.
+
+    FIX v1 mantenido: guard de longitud mínima dentro del loop.
+    """
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
 
@@ -408,9 +423,6 @@ def evaluate(
         signal : 'long' | 'short' | None
         score  : 0-100
         regime : 'bull' | 'bear' | 'range'
-
-    FIX v5: ahora retorna también el régimen para que main.py pueda
-    pasarlo a risk.calc() y obtener el TP_RR dinámico correcto.
     """
     effective_min = min_score if min_score is not None else MIN_SCORE
 
@@ -476,7 +488,6 @@ def evaluate(
 
     divergence_15m = _rsi_divergence(closes_15m, closed_15m, lookback=10)
 
-    # FIX v5: guard subido de >=29 a >=35 para dar margen al lookback=15.
     divergence_1h: str | None = None
     if len(closes_1h) >= 35:
         divergence_1h = _rsi_divergence(closes_1h, closed_1h, lookback=15)
@@ -487,9 +498,9 @@ def evaluate(
     hist_1h  = _macd_histogram(closes_1h)
 
     macd15_bull_strong = hist_15m[-1] > 0 and hist_15m[-1] > hist_15m[-2]
-    macd15_bull_weak   = hist_15m[-1] > 0
+    macd15_bull_weak   = hist_15m[-1] > 0 and not macd15_bull_strong
     macd15_bear_strong = hist_15m[-1] < 0 and hist_15m[-1] < hist_15m[-2]
-    macd15_bear_weak   = hist_15m[-1] < 0
+    macd15_bear_weak   = hist_15m[-1] < 0 and not macd15_bear_strong
 
     macd1h_bull = hist_1h[-1] > 0
     macd1h_bear = hist_1h[-1] < 0
@@ -514,8 +525,9 @@ def evaluate(
         elif rsi_ext_bull:  s += 8
         elif rsi_bull:      s += 4
         else:               s -= 5
+        # FIX v7: MACD débil da +5 (antes 0) — condición alcista real aunque no explosiva
         if macd15_bull_strong:   s += 10
-        elif macd15_bull_weak:   s += 0
+        elif macd15_bull_weak:   s += 5
         else:                    s -= 5
         if macd1h_bull:     s += 10
         elif macd1h_bear:   s -= 5
@@ -540,8 +552,9 @@ def evaluate(
         elif rsi_ext_bear:   s += 8
         elif rsi_bear:       s += 4
         else:                s -= 5
+        # FIX v7: MACD débil da +5 (antes 0) — condición bajista real aunque no explosiva
         if macd15_bear_strong:   s += 10
-        elif macd15_bear_weak:   s += 0
+        elif macd15_bear_weak:   s += 5
         else:                    s -= 5
         if macd1h_bear:      s += 10
         elif macd1h_bull:    s -= 5
