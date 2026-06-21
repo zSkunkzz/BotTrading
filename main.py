@@ -28,6 +28,9 @@ FIXES:
   - FIX v6: set_leverage filtra dinámicamente símbolos inválidos/offline
     (BingX codes 109425 / 109418) — eliminados de config.SYMBOLS antes
     de arrancar el feed; Telegram notifica lista de eliminados.
+  - FIX v7: _closing set — guard anti-spam de notificaciones de cierre.
+    Evita que el mismo símbolo dispare múltiples mensajes de cierre en
+    loops consecutivos antes de que se propague el pop().
 """
 import json
 import logging
@@ -56,6 +59,7 @@ log = logging.getLogger("main")
 _cooldown:              dict[str, float] = {}
 _cooldown_sl:           dict[str, float] = {}
 _manual_alert_cooldown: dict[str, float] = {}
+_closing:               set[str]         = set()   # guard anti-spam cierre
 
 COOLDOWN               = 60 * 60
 COOLDOWN_SL            = 2 * 60 * 60
@@ -329,7 +333,6 @@ def _check_tp_extension(
         candles_15m = feed.get(symbol, "15m")
         candles_1h  = feed.get(symbol, "1h")
         candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
-        # FIX v5: evaluate() retorna (signal, score, regime) — desempaquetar 3 valores
         signal, score, _ = signals.evaluate(
             candles_15m, candles_1h, candles_4h,
             min_score=effective_min_score,
@@ -517,43 +520,53 @@ def run() -> None:
             all_ex_positions = exchange.get_all_positions()
 
             for symbol in list(positions.keys()):
+                # ── Guard anti-spam: si ya estamos procesando el cierre, saltar ──
+                if symbol in _closing:
+                    continue
+
                 pos = positions[symbol]
                 pos_ex = all_ex_positions.get((symbol, pos["side"]))
                 if not pos_ex:
-                    hint_price = exchange.get_price(symbol)
-                    exit_price, reason = _resolve_close(pos, symbol, hint_price=hint_price)
-                    pnl_pct = (
-                        (exit_price - pos["entry"]) / pos["entry"]
-                        if pos["side"] == "long"
-                        else (pos["entry"] - exit_price) / pos["entry"]
-                    ) * 100
-                    duration_min = (time.time() - pos.get("open_ts", time.time())) / 60
-                    pnl_usdt = pnl_pct / 100 * float(config.MARGIN_USDT) * config.LEVERAGE
+                    # Marcar como en proceso de cierre ANTES de notificar
+                    _closing.add(symbol)
+                    try:
+                        hint_price = exchange.get_price(symbol)
+                        exit_price, reason = _resolve_close(pos, symbol, hint_price=hint_price)
+                        pnl_pct = (
+                            (exit_price - pos["entry"]) / pos["entry"]
+                            if pos["side"] == "long"
+                            else (pos["entry"] - exit_price) / pos["entry"]
+                        ) * 100
+                        duration_min = (time.time() - pos.get("open_ts", time.time())) / 60
+                        pnl_usdt = pnl_pct / 100 * float(config.MARGIN_USDT) * config.LEVERAGE
 
-                    log.info(
-                        "[%s] Posición cerrada | %s | precio=%.4f | PnL=%.2f%% (%.2f USDT) | dur=%.0fmin",
-                        symbol, reason, exit_price, pnl_pct, pnl_usdt, duration_min,
-                    )
-                    telegram.notify(
-                        f"{'✅' if pnl_pct > 0 else '❌'} Posición cerrada\n"
-                        f"{symbol} {pos['side'].upper()} ({reason})\n"
-                        f"PnL: <code>{pnl_pct:+.2f}%</code> ({pnl_usdt:+.2f} USDT)\n"
-                        f"Duración: {duration_min:.0f}min"
-                    )
-                    trade_logger.log_trade(
-                        symbol=symbol,
-                        side=pos["side"],
-                        entry=pos["entry"],
-                        exit_price=exit_price,
-                        reason=reason,
-                        score=pos.get("score", 0),
-                        duration_min=duration_min,
-                    )
-                    bot_state.record_trade(pnl_usdt)
-                    if reason == "SL":
-                        _cooldown_sl[symbol] = time.time()
-                    positions.pop(symbol)
-                    _save_positions(positions)
+                        log.info(
+                            "[%s] Posición cerrada | %s | precio=%.4f | PnL=%.2f%% (%.2f USDT) | dur=%.0fmin",
+                            symbol, reason, exit_price, pnl_pct, pnl_usdt, duration_min,
+                        )
+                        telegram.notify(
+                            f"{'✅' if pnl_pct > 0 else '❌'} Posición cerrada\n"
+                            f"{symbol} {pos['side'].upper()} ({reason})\n"
+                            f"PnL: <code>{pnl_pct:+.2f}%</code> ({pnl_usdt:+.2f} USDT)\n"
+                            f"Duración: {duration_min:.0f}min"
+                        )
+                        trade_logger.log_trade(
+                            symbol=symbol,
+                            side=pos["side"],
+                            entry=pos["entry"],
+                            exit_price=exit_price,
+                            reason=reason,
+                            score=pos.get("score", 0),
+                            duration_min=duration_min,
+                        )
+                        bot_state.record_trade(pnl_usdt)
+                        if reason == "SL":
+                            _cooldown_sl[symbol] = time.time()
+                        positions.pop(symbol)
+                        _save_positions(positions)
+                    finally:
+                        # Limpiar el guard siempre, incluso si hay excepción
+                        _closing.discard(symbol)
                     continue
 
                 pos["qty"] = pos_ex["size"]
@@ -625,7 +638,6 @@ def run() -> None:
                     log.info("[%s] Señal MANUAL: %s", symbol, signal)
                 else:
                     try:
-                        # FIX v5: desempaquetar 3 valores — regime propagado a risk.calc()
                         signal, score, regime = signals.evaluate(
                             candles_15m, candles_1h, candles_4h,
                             min_score=effective_min_score,
@@ -652,7 +664,6 @@ def run() -> None:
                     continue
 
                 try:
-                    # FIX v5: regime pasado para TP_RR dinámico correcto
                     params = risk.calc(
                         side=signal,
                         entry=price,
