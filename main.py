@@ -1,36 +1,27 @@
 """main.py — Loop principal con trailing stop, breakeven automático y TP dinámico.
 
-NOVEDADES:
-  - Breakeven automático: mueve SL a entrada cuando precio alcanza +1 RR.
-  - Persistencia de posiciones: guarda/restaura positions.json al arrancar.
-    Sobrevive reinicios y deploys de Railway preservando open_ts, score,
-    tp_original y tp_extensions.
-
 FIXES:
   - spread inicializada a 0.0 antes del bloque is_manual.
   - positions.json se borra cuando positions queda vacío.
   - _extending excluido del JSON persistido; guard anti doble-extensión.
   - set_leverage(symbol, config.LEVERAGE) — segundo argumento faltaba.
   - _check_tp_extension valida new_sl antes de cancelar órdenes.
-  - len(positions) en check MAX_POSITIONS (era open_count, podía desincronizarse).
+  - len(positions) en check MAX_POSITIONS.
   - _check_breakeven devuelve bool; si activó, se salta _update_trailing.
   - _resolve_close acepta hint_price snapshot antes del pop().
   - FIX CRÍTICO: risk.calc() llamada con argumentos en orden correcto.
   - FIX CRÍTICO: _sync_sl_tp_from_orders filtro de positionSide permisivo.
-  - FIX CRÍTICO: get_all_positions clave (symbol, side) — fix compatibilidad
-    tras cambio de exchange.py. all_ex_positions.get(symbol) siempre era None.
-  - FIX CALIDAD: get_closed_reason() se llama con side.
-  - FIX CALIDAD: fill_entry sin sleep extra (open_order ya espera 0.5s).
-  - FIX CALIDAD: get_position al obtener fill price pasa side=signal.
-  - FIX v5: signals.evaluate() retorna (signal, score, regime); regime
-    propagado a risk.calc() para TP_RR dinámico correcto.
+  - FIX CRÍTICO: get_all_positions clave (symbol, side).
+  - FIX v5: signals.evaluate() retorna (signal, score, regime).
   - FIX v5: _check_tp_extension desempaqueta el tercer valor de evaluate().
-  - FIX v6: set_leverage filtra dinámicamente símbolos inválidos/offline
-    (BingX codes 109425 / 109418) — eliminados de config.SYMBOLS antes
-    de arrancar el feed; Telegram notifica lista de eliminados.
-  - FIX v7: _closing set — guard anti-spam de notificaciones de cierre.
-    Evita que el mismo símbolo dispare múltiples mensajes de cierre en
-    loops consecutivos antes de que se propague el pop().
+  - FIX v6: set_leverage filtra dinámicamente símbolos inválidos/offline.
+  - FIX v7: _closing set — guard anti-spam (parcial).
+  - FIX v8 CRÍTICO: deduplicación de cierres por orderId (_closed_order_ids).
+    Causa raíz del spam: get_closed_reason encontraba el MISMO orderId FILLED
+    en cada loop durante 30 min, disparando la notificación repetidamente.
+    Ahora el orderId se guarda en _closed_order_ids al procesar el cierre;
+    loops siguientes lo descartan inmediatamente. El set se limpia de entradas
+    antiguas (>35 min) para no crecer indefinidamente.
 """
 import json
 import logging
@@ -59,7 +50,11 @@ log = logging.getLogger("main")
 _cooldown:              dict[str, float] = {}
 _cooldown_sl:           dict[str, float] = {}
 _manual_alert_cooldown: dict[str, float] = {}
-_closing:               set[str]         = set()   # guard anti-spam cierre
+_closing:               set[str]         = set()
+
+# orderId → timestamp cuando lo procesamos; para deduplicar cierres
+_closed_order_ids: dict[str, float] = {}
+_CLOSED_ID_TTL = 35 * 60  # 35 min — un poco más que el lookback de get_closed_reason
 
 COOLDOWN               = 60 * 60
 COOLDOWN_SL            = 2 * 60 * 60
@@ -81,7 +76,6 @@ POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
 
 _weekend_notified_day: int = -1
 
-# Códigos de error BingX que indican símbolo inexistente u offline
 _BINGX_INVALID_SYMBOL_CODES = {109425, 109418}
 
 
@@ -94,6 +88,14 @@ def _corr_group_count(symbol: str, positions: dict) -> int:
         if symbol in group:
             return sum(1 for s in positions if s in group)
     return 0
+
+
+def _purge_closed_ids() -> None:
+    """Elimina entradas antiguas de _closed_order_ids para no crecer indefinidamente."""
+    cutoff = time.time() - _CLOSED_ID_TTL
+    stale = [k for k, ts in _closed_order_ids.items() if ts < cutoff]
+    for k in stale:
+        del _closed_order_ids[k]
 
 
 # ── Persistencia ─────────────────────────────────────────────────────────
@@ -139,7 +141,7 @@ def _load_positions() -> dict:
         return {}
 
 
-# ── Sync SL/TP desde órdenes abiertas ───────────────────────────────────
+# ── Sync SL/TP desde órdenes abiertas ────────────────────────────────────
 
 def _sync_sl_tp_from_orders(symbol: str, pos: dict) -> None:
     try:
@@ -185,7 +187,7 @@ def _sync_sl_tp_from_orders(symbol: str, pos: dict) -> None:
         )
 
 
-# ── Breakeven ────────────────────────────────────────────────────────────
+# ── Breakeven ─────────────────────────────────────────────────────────────
 
 def _check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
     if pos.get("breakeven_set"):
@@ -244,7 +246,7 @@ def _check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
     return True
 
 
-# ── Trailing stop ─────────────────────────────────────────────────────────
+# ── Trailing stop ──────────────────────────────────────────────────────────
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     side       = pos["side"]
@@ -286,7 +288,7 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
 
 
-# ── TP extension ──────────────────────────────────────────────────────────
+# ── TP extension ───────────────────────────────────────────────────────────
 
 def _sl_price_valid(side: str, sl_price: float, current_price: float) -> bool:
     if side == "short":
@@ -438,10 +440,12 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
                 READY_TIMEOUT, feed.ready_count(), total)
 
 
-def _resolve_close(pos: dict, symbol: str, hint_price: float | None = None) -> tuple[float, str]:
-    reason, exit_price = exchange.get_closed_reason(symbol, side=pos.get("side"))
+def _resolve_close(pos: dict, symbol: str, hint_price: float | None = None) -> tuple[float, str, str]:
+    """Devuelve (exit_price, reason, order_id)."""
+    reason, exit_price, order_id = exchange.get_closed_reason(symbol, side=pos.get("side"))
     if reason and exit_price:
-        return exit_price, reason
+        return exit_price, reason, order_id
+    # Fallback: inferir por precio
     current_price = hint_price if hint_price is not None else exchange.get_price(symbol)
     side = pos["side"]
     tp   = pos.get("tp")
@@ -449,19 +453,18 @@ def _resolve_close(pos: dict, symbol: str, hint_price: float | None = None) -> t
     if tp is not None and sl is not None:
         dist_tp = abs(current_price - tp)
         dist_sl = abs(current_price - sl)
-        return (tp, "TP") if dist_tp < dist_sl else (sl, "SL")
+        return (tp, "TP", "") if dist_tp < dist_sl else (sl, "SL", "")
     pnl_raw = (
         (current_price - pos["entry"]) / pos["entry"]
         if side == "long"
         else (pos["entry"] - current_price) / pos["entry"]
     )
-    return current_price, "TP" if pnl_raw > 0 else "SL"
+    return current_price, ("TP" if pnl_raw > 0 else "SL"), ""
 
 
 def run() -> None:
     global _weekend_notified_day
 
-    # ── Filtrar símbolos inválidos/offline al arranque ────────────────────
     invalid_symbols: list[str] = []
     for symbol in list(config.SYMBOLS):
         try:
@@ -513,6 +516,7 @@ def run() -> None:
     while True:
         try:
             loop_count += 1
+            _purge_closed_ids()
 
             weekend = _is_weekend()
             effective_min_score = WEEKEND_MIN_SCORE if weekend else WEEKDAY_MIN_SCORE
@@ -520,18 +524,35 @@ def run() -> None:
             all_ex_positions = exchange.get_all_positions()
 
             for symbol in list(positions.keys()):
-                # ── Guard anti-spam: si ya estamos procesando el cierre, saltar ──
                 if symbol in _closing:
                     continue
 
-                pos = positions[symbol]
+                pos    = positions[symbol]
                 pos_ex = all_ex_positions.get((symbol, pos["side"]))
+
                 if not pos_ex:
-                    # Marcar como en proceso de cierre ANTES de notificar
                     _closing.add(symbol)
                     try:
                         hint_price = exchange.get_price(symbol)
-                        exit_price, reason = _resolve_close(pos, symbol, hint_price=hint_price)
+                        exit_price, reason, order_id = _resolve_close(pos, symbol, hint_price=hint_price)
+
+                        # ── DEDUPLICACIÓN POR ORDER ID ──────────────────────
+                        # Si ya procesamos este orderId, es el mismo cierre que
+                        # get_closed_reason sigue devolviendo en loops siguientes
+                        # durante la ventana de 30 min. Ignorarlo silenciosamente.
+                        if order_id and order_id in _closed_order_ids:
+                            log.debug(
+                                "[%s] Cierre ya notificado (orderId=%s) — saltando",
+                                symbol, order_id,
+                            )
+                            # La posición ya no existe en el exchange pero el orderId
+                            # está duplicado — limpiar del dict local si sigue ahí
+                            if symbol in positions:
+                                positions.pop(symbol)
+                                _save_positions(positions)
+                            continue
+                        # ────────────────────────────────────────────────────
+
                         pnl_pct = (
                             (exit_price - pos["entry"]) / pos["entry"]
                             if pos["side"] == "long"
@@ -562,10 +583,14 @@ def run() -> None:
                         bot_state.record_trade(pnl_usdt)
                         if reason == "SL":
                             _cooldown_sl[symbol] = time.time()
+
+                        # Marcar orderId como procesado ANTES del pop
+                        if order_id:
+                            _closed_order_ids[order_id] = time.time()
+
                         positions.pop(symbol)
                         _save_positions(positions)
                     finally:
-                        # Limpiar el guard siempre, incluso si hay excepción
                         _closing.discard(symbol)
                     continue
 
@@ -595,7 +620,7 @@ def run() -> None:
                 _check_tp_extension(symbol, pos, current_price, feed, effective_min_score)
                 _save_positions(positions)
 
-            # ── Señales nuevas ──────────────────────────────────────────────
+            # ── Señales nuevas ─────────────────────────────────────────────
             if _is_weekend():
                 today = datetime.now(timezone.utc).weekday()
                 if today != _weekend_notified_day:

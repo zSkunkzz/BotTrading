@@ -42,6 +42,9 @@ FIXES aplicados:
   24. FIX: open_order logueaba warning si SL/TP fallaban pero no lo suficientemente
       visible; ahora usa log.error con contexto completo para facilitar detección
       en Railway logs de posiciones abiertas sin protección.
+  25. FIX CRÍTICO: get_closed_reason devuelve ahora también el orderId del cierre.
+      El caller usa ese ID para deduplicar y no notificar el mismo cierre dos veces
+      en loops consecutivos (causa raíz del spam de Telegram).
 """
 import hashlib
 import hmac
@@ -55,7 +58,7 @@ import config
 
 log = logging.getLogger("exchange")
 
-# ── Firma ───────────────────────────────────────────────────────────────────────────────────
+# ── Firma ────────────────────────────────────────────────────────────────
 
 def _sign(params: dict) -> str:
     payload = urllib.parse.urlencode(params)
@@ -80,8 +83,6 @@ def _request(method: str, path: str, params: dict) -> dict:
     base_params = {k: v for k, v in params.items() if k not in ("timestamp", "signature")}
     url = config.BASE_URL + path
 
-    # FIX: inicializar last_exc con el error real del último intento, no uno genérico.
-    # raise last_exc al final preserva tipo y mensaje del fallo real.
     last_exc: Exception = RuntimeError(f"All {_RETRIES} attempts failed for {path}")
     for attempt in range(1, _RETRIES + 1):
         signed = dict(base_params)
@@ -124,17 +125,16 @@ def _delete(path: str, params: dict = None) -> dict:
     return _request("DELETE", path, params or {})
 
 
-# ── Helpers de formato ───────────────────────────────────────────────────────────────────
+# ── Helpers de formato ───────────────────────────────────────────────────
 
 def _fmt_qty(qty: float) -> str:
-    """Sin notación científica (BingX rechaza '1e-04')."""
     return f"{qty:.8f}".rstrip("0").rstrip(".")
 
 def _fmt_price(price: float) -> str:
     return f"{price:.8f}".rstrip("0").rstrip(".")
 
 
-# ── Leverage ─────────────────────────────────────────────────────────────────────────────────
+# ── Leverage ─────────────────────────────────────────────────────────────
 
 def set_leverage(symbol: str, leverage: int) -> None:
     for side in ("LONG", "SHORT"):
@@ -146,7 +146,7 @@ def set_leverage(symbol: str, leverage: int) -> None:
     log.debug("[%s] Leverage seteado a %dx (LONG+SHORT)", symbol, leverage)
 
 
-# ── Precio ─────────────────────────────────────────────────────────────────────────────────
+# ── Precio ───────────────────────────────────────────────────────────────
 
 def get_price(symbol: str = None) -> float:
     symbol = symbol or config.SYMBOL
@@ -154,7 +154,7 @@ def get_price(symbol: str = None) -> float:
     return float(data["data"]["price"])
 
 
-# ── Spread / liquidez ──────────────────────────────────────────────────────────────
+# ── Spread / liquidez ─────────────────────────────────────────────────────
 
 def get_spread_pct(symbol: str) -> float:
     try:
@@ -175,7 +175,7 @@ def get_spread_pct(symbol: str) -> float:
         return 999.0
 
 
-# ── OHLCV ──────────────────────────────────────────────────────────────────────────────
+# ── OHLCV ─────────────────────────────────────────────────────────────────
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
     symbol   = symbol or config.SYMBOL
@@ -189,9 +189,6 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
     candles = []
     last_idx = len(raw) - 1
     for idx, c in enumerate(raw):
-        # FIX: la última vela devuelta por la API es la vela VIVA (aún no cerrada).
-        # Marcarla como closed=False evita lookahead bias en consumidores que no
-        # hagan el slice [:-1] manualmente.
         candles.append({
             "ts":     int(c.get("time", c.get("t", 0))),
             "open":   float(c["open"]),
@@ -206,11 +203,9 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
 
 # ── Info de contrato (step size / min qty) ────────────────────────────────
 
-# FIX: caché con TTL de 24h para recoger cambios de parámetros de contrato
-# sin necesidad de reiniciar el bot.
 _contract_info_cache:    dict[str, dict]  = {}
 _contract_info_cache_ts: dict[str, float] = {}
-_CONTRACT_CACHE_TTL = 86_400.0  # 24 horas
+_CONTRACT_CACHE_TTL = 86_400.0
 
 def _get_contract_info(symbol: str) -> dict:
     now = time.time()
@@ -249,18 +244,13 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
     return (qty * price) >= min_usdt
 
 
-# ── Órdenes ───────────────────────────────────────────────────────────────────────────────────
+# ── Órdenes ───────────────────────────────────────────────────────────────
 
-# Mapa: lado de la posición (bot) → positionSide de BingX (Hedge mode)
 _POSITION_SIDE = {"long": "LONG", "short": "SHORT"}
-
-# Tipos de órdenes condicionales que BingX Hedge mode NO cancela
-# con el endpoint allOpenOrders — hay que cancelarlas una a una por orderId.
 _CONDITIONAL_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"}
 
 
 def _get_open_orders(symbol: str) -> list[dict]:
-    """Obtiene todas las órdenes abiertas para un símbolo."""
     try:
         data = _get("/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
         return data.get("data", {}).get("orders") or []
@@ -270,7 +260,6 @@ def _get_open_orders(symbol: str) -> list[dict]:
 
 
 def _cancel_order_by_id(symbol: str, order_id: str) -> None:
-    """Cancela una orden individual por orderId."""
     try:
         _delete("/openApi/swap/v2/trade/order", {
             "symbol":  symbol,
@@ -278,21 +267,10 @@ def _cancel_order_by_id(symbol: str, order_id: str) -> None:
         })
         log.debug("[%s] Orden %s cancelada", symbol, order_id)
     except Exception as exc:
-        # Si la orden ya se ejecutó o no existe, ignorar silenciosamente
         log.debug("[%s] cancel order %s: %s", symbol, order_id, exc)
 
 
 def cancel_all_orders(symbol: str) -> None:
-    """Cancela TODAS las órdenes abiertas del símbolo, incluyendo SL/TP condicionales.
-
-    BingX Hedge mode tiene un bug conocido: el endpoint DELETE allOpenOrders
-    cancela órdenes LIMIT/MARKET pendientes pero NO cancela las órdenes
-    STOP_MARKET ni TAKE_PROFIT_MARKET (las condicionales de SL/TP).
-    Estrategia:
-      1. Obtener todas las órdenes abiertas via GET openOrders.
-      2. Cancelar cada orden condicional individualmente por orderId.
-      3. Llamar al DELETE allOpenOrders como fallback para el resto.
-    """
     orders = _get_open_orders(symbol)
 
     conditional = [o for o in orders if o.get("type") in _CONDITIONAL_TYPES]
@@ -305,7 +283,6 @@ def cancel_all_orders(symbol: str) -> None:
             _cancel_order_by_id(symbol, order_id)
             cancelled += 1
 
-    # Fallback: cancelar el resto (LIMIT pendientes, etc.)
     if regular_count > 0:
         try:
             _delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
@@ -319,14 +296,6 @@ def cancel_all_orders(symbol: str) -> None:
 
 
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
-    """Abre posición MARKET en modo Hedge (positionSide requerido por BingX).
-
-    Paso 1: orden MARKET de apertura con positionSide.
-    Paso 2: SL y TP con llamadas separadas tras 0.5s de espera.
-
-    FIX: si SL o TP fallan la posición queda abierta sin protección — se loguea
-    como ERROR (no warning) para visibilidad en Railway logs.
-    """
     symbol       = symbol or config.SYMBOL
     bingx_side   = "BUY" if side == "long" else "SELL"
     position_side = _POSITION_SIDE[side]
@@ -372,15 +341,8 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
 
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> dict:
-    """SL (STOP_MARKET) en modo Hedge.
-
-    En Hedge mode la orden de cierre lleva el positionSide de la posición
-    que queremos cerrar (no el lado de la orden). reduceOnly es incompatible
-    con positionSide en BingX y se omite.
-    """
-    # En Hedge: para cerrar un LONG se vende con side=SELL + positionSide=LONG
     close_side    = "SELL" if side == "long" else "BUY"
-    position_side = _POSITION_SIDE[side]   # el lado de la posición que cierro
+    position_side = _POSITION_SIDE[side]
 
     resp = _post("/openApi/swap/v2/trade/order", {
         "symbol":       symbol,
@@ -397,10 +359,6 @@ def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> d
 
 
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> dict:
-    """TP (TAKE_PROFIT_MARKET) en modo Hedge.
-
-    Igual que place_stop_order: positionSide del lado que cierro, sin reduceOnly.
-    """
     close_side    = "SELL" if side == "long" else "BUY"
     position_side = _POSITION_SIDE[side]
 
@@ -418,17 +376,13 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> dict:
     return resp
 
 
-# ── Posiciones ──────────────────────────────────────────────────────────────────────────────
+# ── Posiciones ────────────────────────────────────────────────────────────
 
 def _parse_position(p: dict) -> dict:
-    # FIX: en Hedge mode BingX devuelve positionSide explícito (LONG/SHORT).
-    # Usar positionAmt > 0 para inferir el lado es incorrecto porque ambos lados
-    # pueden tener positionAmt positivo en modo Hedge.
     pos_side = p.get("positionSide", "").upper()
     if pos_side in ("LONG", "SHORT"):
         side = "long" if pos_side == "LONG" else "short"
     else:
-        # Fallback para cuentas en modo One-Way
         side = "long" if float(p["positionAmt"]) > 0 else "short"
     return {
         "side":  side,
@@ -440,18 +394,6 @@ def _parse_position(p: dict) -> dict:
 
 
 def get_all_positions() -> dict[tuple[str, str], dict]:
-    """Devuelve todas las posiciones activas.
-
-    FIX: en Hedge mode BingX puede devolver LONG y SHORT activos para el mismo
-    símbolo simultáneamente. Usar result[symbol] como clave pisaba la segunda
-    posición con la primera. La clave ahora es (symbol, side) — e.g.
-    ('BTC-USDT', 'long') — para preservar ambas.
-
-    Consumidores que sólo esperaban un dict[str, dict] deben actualizar el acceso:
-      antes : positions[symbol]
-      ahora : positions[(symbol, 'long')] o positions[(symbol, 'short')]
-    Para compatibilidad con código legado, usar get_position(symbol, side).
-    """
     data = _get("/openApi/swap/v2/user/positions", {})
     result: dict[tuple[str, str], dict] = {}
     for p in (data.get("data") or []):
@@ -463,13 +405,6 @@ def get_all_positions() -> dict[tuple[str, str], dict]:
 
 
 def get_position(symbol: str = None, side: str | None = None) -> dict | None:
-    """Devuelve la posición activa para un símbolo.
-
-    FIX: en Hedge mode puede haber LONG y SHORT activos al mismo tiempo.
-    Si se especifica side ('long' o 'short'), filtra por ese lado.
-    Sin side, devuelve la primera posición activa encontrada (comportamiento
-    anterior, válido cuando sólo hay un lado abierto).
-    """
     symbol = symbol or config.SYMBOL
     data = _get("/openApi/swap/v2/user/positions", {"symbol": symbol})
     for p in (data.get("data") or []):
@@ -480,14 +415,18 @@ def get_position(symbol: str = None, side: str | None = None) -> dict | None:
     return None
 
 
-# ── Historial de cierre real ──────────────────────────────────────────────────────
+# ── Historial de cierre real ──────────────────────────────────────────────
 
 _CLOSE_ORDER_TYPES = {"TAKE_PROFIT_MARKET", "STOP_MARKET"}
 _CLOSE_LOOK_BACK  = 30 * 60 * 1000
 
-def get_closed_reason(symbol: str, side: str | None = None) -> tuple[str, float]:
-    # FIX: filtra por positionSide si se proporciona, para no atribuir el cierre
-    # de un LONG al SHORT activo en el mismo símbolo (o viceversa) en Hedge mode.
+def get_closed_reason(symbol: str, side: str | None = None) -> tuple[str, float, str]:
+    """Devuelve (reason, exit_price, order_id).
+
+    FIX v8: devuelve también el orderId para que el caller pueda deduplicar
+    y no notificar el mismo cierre múltiples veces en loops consecutivos.
+    Retorna ("", 0.0, "") si no hay cierre encontrado.
+    """
     position_side_filter = side.upper() if side else None
     try:
         start_ts = int(time.time() * 1000) - _CLOSE_LOOK_BACK
@@ -509,16 +448,17 @@ def get_closed_reason(symbol: str, side: str | None = None) -> tuple[str, float]
         ]
         if not filled:
             log.warning("[%s] get_closed_reason: sin órdenes FILLED en últimos 30min", symbol)
-            return None, 0.0
+            return "", 0.0, ""
 
         filled.sort(key=lambda o: int(o.get("updateTime", 0)), reverse=True)
         latest     = filled[0]
         order_type = latest.get("type", "")
         avg_price  = float(latest.get("avgPrice") or latest.get("stopPrice") or 0)
+        order_id   = str(latest.get("orderId", ""))
         reason     = "TP" if order_type == "TAKE_PROFIT_MARKET" else "SL"
-        log.info("[%s] Cierre detectado: %s @ %.6f", symbol, reason, avg_price)
-        return reason, avg_price
+        log.info("[%s] Cierre detectado: %s @ %.6f (orderId=%s)", symbol, reason, avg_price, order_id)
+        return reason, avg_price, order_id
 
     except Exception as exc:
         log.warning("[%s] get_closed_reason error: %s", symbol, exc)
-        return None, 0.0
+        return "", 0.0, ""
