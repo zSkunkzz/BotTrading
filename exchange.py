@@ -18,6 +18,11 @@ FIXES aplicados:
      (sin 'symbol'), reduciendo 74 llamadas por loop a 1.
      FIX: si la llamada falla, lanza excepción en vez de devolver {} silencioso
      para evitar que main.py interprete todas las posiciones como cerradas.
+  8. _parse_position() prioriza positionSide (campo explícito en hedge mode) sobre
+     la inferencia por signo de positionAmt. En hedge mode BingX siempre devuelve
+     positionSide="LONG"|"SHORT"; positionAmt puede ser negativo o transitoriamente
+     cero en LONG si la orden aún no está completamente liquidada.
+     Fallback a positionAmt si positionSide no está disponible (one-way mode).
 """
 import hashlib
 import hmac
@@ -35,7 +40,7 @@ log = logging.getLogger("exchange")
 
 def _sign(params: dict) -> str:
     """Firma la query string tal como la construye urllib / BingX."""
-    payload = urllib.parse.urlencode(params)          # sin sorted — BingX no lo exige
+    payload = urllib.parse.urlencode(params)
     return hmac.new(
         config.API_SECRET.encode(),
         payload.encode(),
@@ -50,7 +55,7 @@ def _headers() -> dict:
 # ── HTTP helpers con reintentos ───────────────────────────────────────────────
 
 _RETRIES    = 3
-_RETRY_WAIT = 1.0   # segundos entre intentos
+_RETRY_WAIT = 1.0
 
 
 def _request(method: str, path: str, params: dict) -> dict:
@@ -59,13 +64,11 @@ def _request(method: str, path: str, params: dict) -> dict:
     FIX: timestamp y firma se renuevan en cada intento para que un timeout en el
     primer intento no deje el segundo con un timestamp expirado (BingX rechaza >5s).
     """
-    # Copiar params sin timestamp/signature para poder renovarlos en cada intento
     base_params = {k: v for k, v in params.items() if k not in ("timestamp", "signature")}
     url = config.BASE_URL + path
 
     last_exc: Exception | None = None
     for attempt in range(1, _RETRIES + 1):
-        # Renovar timestamp y firma en cada intento
         signed = dict(base_params)
         signed["timestamp"] = int(time.time() * 1000)
         signed["signature"] = _sign(signed)
@@ -89,7 +92,7 @@ def _request(method: str, path: str, params: dict) -> dict:
             log.error("HTTP %s en %s: %s", exc.response.status_code, path, exc.response.text)
             raise
 
-    raise last_exc  # re-lanza si agotamos reintentos
+    raise last_exc
 
 
 def _get(path: str, params: dict = None) -> dict:
@@ -130,13 +133,13 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
     candles = []
     for c in data["data"]:
         candles.append({
-            "ts":     int(c.get("time", c.get("t", 0))),  # timestamp ms
+            "ts":     int(c.get("time", c.get("t", 0))),
             "open":   float(c["open"]),
             "high":   float(c["high"]),
             "low":    float(c["low"]),
             "close":  float(c["close"]),
             "volume": float(c["volume"]),
-            "closed": True,   # velas REST ya están cerradas
+            "closed": True,
         })
     return candles
 
@@ -164,7 +167,6 @@ def _get_contract_info(symbol: str) -> dict:
     except Exception as exc:
         log.warning("No se pudo obtener info contrato %s: %s", symbol, exc)
 
-    # Fallback razonable por defecto
     default = {"stepSize": 0.001, "minQty": 0.001, "pricePrecision": 6}
     _contract_info_cache[symbol] = default
     return default
@@ -185,12 +187,52 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
 
 # ── Posiciones ────────────────────────────────────────────────────────────────
 
-def _parse_position(p: dict) -> dict:
-    """Convierte un objeto de posición raw de BingX al formato interno del bot."""
+# Mapa de positionSide (hedge mode) a valor interno del bot
+_POSITION_SIDE_MAP = {
+    "LONG":  "long",
+    "SHORT": "short",
+    "long":  "long",
+    "short": "short",
+}
+
+
+def _parse_position(p: dict) -> dict | None:
+    """Convierte un objeto de posición raw de BingX al formato interno del bot.
+
+    BingX hedge mode devuelve siempre positionSide="LONG"|"SHORT" — este campo
+    es el indicador canónico del lado de la posición y se usa con prioridad.
+
+    En one-way mode positionSide puede venir como "BOTH" o ausente; en ese caso
+    se infiere el lado por el signo de positionAmt (positivo → long, negativo → short).
+
+    Si ninguna de las dos fuentes produce un side válido, se devuelve None y
+    la posición se descarta con un warning — esto evita que un payload malformado
+    de BingX inyecte un side incorrecto en el estado del bot.
+    """
+    raw_side     = str(p.get("positionSide") or "").upper()
+    position_amt = float(p.get("positionAmt") or 0)
+
+    if raw_side in ("LONG", "SHORT"):
+        # Hedge mode: positionSide es explícito y fiable
+        side = _POSITION_SIDE_MAP[raw_side]
+    elif position_amt > 0:
+        # One-way mode long o fallback
+        side = "long"
+    elif position_amt < 0:
+        # One-way mode short o fallback
+        side = "short"
+    else:
+        # positionAmt == 0 y sin positionSide válido → posición vacía o en tránsito
+        log.warning(
+            "Posición descartada — positionSide=%r positionAmt=%s (símbolo=%s)",
+            p.get("positionSide"), p.get("positionAmt"), p.get("symbol"),
+        )
+        return None
+
     return {
-        "side":  "long" if float(p["positionAmt"]) > 0 else "short",
-        "entry": float(p["avgPrice"]),
-        "size":  abs(float(p["positionAmt"])),
+        "side":  side,
+        "entry": float(p.get("avgPrice") or 0),
+        "size":  abs(position_amt),
         "sl":    float(p.get("stopLossPrice") or 0) or None,
         "tp":    float(p.get("takeProfitPrice") or 0) or None,
     }
@@ -207,8 +249,11 @@ def get_all_positions() -> dict[str, dict]:
     data = _get("/openApi/swap/v2/user/positions", {})
     result: dict[str, dict] = {}
     for p in (data.get("data") or []):
-        if float(p.get("positionAmt", 0)) != 0:
-            result[p["symbol"]] = _parse_position(p)
+        if float(p.get("positionAmt", 0)) == 0:
+            continue
+        parsed = _parse_position(p)
+        if parsed is not None:
+            result[p["symbol"]] = parsed
     return result
 
 
@@ -248,7 +293,6 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     bx_side  = "BUY"  if side == "long" else "SELL"
     pos_side = "LONG" if side == "long" else "SHORT"
 
-    # Aplicar step size del contrato
     info = _get_contract_info(symbol)
     qty  = floor_qty(qty, info["stepSize"])
 
