@@ -7,8 +7,10 @@ Filtros:
                           confirmando el mismo régimen antes de habilitar señales
   3. Macro 4h           : EMA50 en 4h — bonus/penalización/neutro según disponibilidad
   4. EMA200 1h          : hard-guard de dirección (calculado sobre velas cerradas)
-  5. ADX 15m            : >35 +12, >25 +6, >18 -8, <18 -15
+  5. ADX 15m            : hard-guard <15 (sin tendencia, no operar)
+                          >35 +12, >25 +6, >18 -8, <18 -15
   6. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
+                          hard-guard short: bear + adx_1h < 18 → no entrar (rebote choppy)
   7. Volumen            : última vela CERRADA >media×1.2 → +8
   8. RSI 15m            : cruce 50 +15, extremo +8, direccional +4, contrario -5
   9. MACD 15m + 1h      : histograma positivo/negativo → +10 | neutro 0 | contrario -5
@@ -273,6 +275,12 @@ def evaluate(
 
     # ── 6. ADX 15m ────────────────────────────────────────────────────────
     adx_15m = _adx(candles_15m[:-1], 14)
+
+    # Hard-guard: sin tendencia mínima en 15m, no operar
+    if adx_15m < 15:
+        log.debug("Hard-guard ADX 15m demasiado bajo: %.1f — señal descartada", adx_15m)
+        return None, score
+
     if   adx_15m > 35: score += 12
     elif adx_15m > 25: score += 6
     elif adx_15m > 18: score -= 8
@@ -281,6 +289,14 @@ def evaluate(
     # ── 7. ADX 1h ─────────────────────────────────────────────────────────
     if   adx_1h > 25: score += 5
     elif adx_1h < 18: score -= 5
+
+    # Hard-guard short en bear choppy: régimen bear pero sin fuerza en 1h
+    if direction == "short" and adx_1h < 18:
+        log.debug(
+            "Hard-guard short: regime=bear pero adx_1h=%.1f — mercado rebotando sin tendencia",
+            adx_1h,
+        )
+        return None, score
 
     # ── 8. Volumen ────────────────────────────────────────────────────────
     if _volume_ok(candles_15m):
