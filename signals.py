@@ -17,40 +17,35 @@ Filtros:
   11. Divergencia RSI 1h : +12 (marco superior — más fiable, menos ruido)
   12. Soporte/Resistencia: pivots 1h/4h — soporte +10, resistencia -10
   13. Sesgo horario     : dinámico desde CSV (≥20 trades) o fijo si pocos datos
+                          HORA MALA = HARD BLOCK (no -10pts compensables, señal bloqueada)
   14. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
-  15. Confluencia mínima: al menos 2 pilares fuertes antes de emitir señal (v8)
-      Pilares: RSI cruce/extremo | MACD acelerando | divergencia | S/R | ADX>25
+  15. Confluencia mínima: al menos 3 pilares fuertes antes de emitir señal (v10)
+      Pilares: RSI cruce/extremo | MACD acelerando | divergencia | S/R | ADX>28
 
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
-Sizing en risk.py: mult=0.7 (score<70) | 1.0 (70-84) | 1.4 (≥85)
+Sizing en risk.py: mult=0.6 (score 70-84) | 1.0 (≥85)
 MIN_SCORE configurable via env var MIN_SCORE (default 55)
+
+CAMBIOS v10:
+  - MIN_CONFLUENCE subido de 2 a 3 pilares. El guard de 2 pilares dejaba pasar
+    señales con RSI débil + MACD débil + ADX justo en el límite. Con 3 pilares
+    se exige confluencia real antes de entrar.
+  - Hour bonus negativo ahora es HARD BLOCK: si la hora es mala, la señal
+    se bloquea directamente (return None) en lugar de restar -10pts que
+    se compensaban con otros factores débiles.
+  - ADX_STRONG subido de 25 a 28 — el pilar de ADX debe indicar tendencia
+    real, no momentum marginal.
 
 CAMBIOS v9 (bugfix crítico):
   _rsi_divergence: la condición para divergencia alcista era
   `recent_closes[-1] < lo_val` (IMPOSIBLE — lo_val es el mínimo),
   y para bajista `recent_closes[-1] > hi_val` (IMPOSIBLE — hi_val es el máximo).
-  Ambas condiciones nunca se cumplían, haciendo que divergence_15m y
-  divergence_1h devolvieran None siempre. Esto inutilizaba el pilar de
-  divergencia en el guard de confluencia v8, causando que el bot apenas
-  emitiera señales.
-  Fix: precio debe estar dentro del 0.5% del pivot (zona de retesteo):
-    bullish: recent_closes[-1] <= lo_val * 1.005
-    bearish: recent_closes[-1] >= hi_val * 0.995
+  Ambas condiciones nunca se cumplían. Fix: precio debe estar dentro del
+  0.5% del pivot (zona de retesteo real).
 
 CAMBIOS v8 (calidad sobre cantidad):
-  Guard de confluencia mínima: antes de emitir cualquier señal se exige
-  que al menos 2 de estos 5 pilares fuertes estén presentes:
-    1. RSI cruzando 50 o RSI extremo (>60 long / <40 short)
-    2. MACD 15m acelerando en la dirección (histograma creciendo)
-    3. Divergencia RSI en 15m o 1h en la dirección
-    4. Precio en zona de soporte/resistencia relevante
-    5. ADX 15m > 25 (tendencia con fuerza real)
-  Sin esto, una señal puede llegar a score 57 por acumulación de
-  condiciones débiles (ADX 19, RSI 51, MACD débil, hora buena) sin
-  tener ninguna confluencia real detrás. Con el guard, se descartan
-  exactamente esas señales — el score sigue siendo la puerta de
-  entrada, pero la confluencia es la llave.
+  Guard de confluencia mínima (MIN_CONFLUENCE pilares fuertes requeridos).
 
 CAMBIOS v7 (winrate):
   1. REGIME_CONFIRM_BARS bajado de 2 a 1.
@@ -95,11 +90,11 @@ VOLUME_MULT         = 1.2
 MIN_SCORE           = config.MIN_SCORE
 REGIME_CONFIRM_BARS = 1
 ADX_MIN             = 18
-ADX_STRONG          = 25   # v8: umbral de fuerza real para pilar
+ADX_STRONG          = 28   # v10: subido de 25 — pilar ADX debe ser tendencia real
 SR_ZONE_PCT         = 0.004
 SR_PIVOT_BARS_1H    = 3
 SR_PIVOT_BARS_4H    = 2
-MIN_CONFLUENCE      = 2    # v8: pilares fuertes mínimos para emitir señal
+MIN_CONFLUENCE      = 3    # v10: subido de 2 — exige confluencia real
 DIV_ZONE_PCT        = 0.005  # v9: tolerancia 0.5% para retesteo del pivot
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
@@ -217,8 +212,6 @@ def _rsi_divergence(
         (i for i, v in enumerate(recent_closes[:-3]) if v == lo_val),
         default=-1,
     )
-    # precio actual retestea el mínimo (está dentro de DIV_ZONE_PCT del pivot)
-    # y RSI está más alto que en ese mínimo → divergencia alcista
     if lo_idx != -1 and recent_closes[-1] <= lo_val * (1 + DIV_ZONE_PCT) and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
@@ -228,8 +221,6 @@ def _rsi_divergence(
         (i for i, v in enumerate(recent_closes[:-3]) if v == hi_val),
         default=-1,
     )
-    # precio actual retestea el máximo (está dentro de DIV_ZONE_PCT del pivot)
-    # y RSI está más bajo que en ese máximo → divergencia bajista
     if hi_idx != -1 and recent_closes[-1] >= hi_val * (1 - DIV_ZONE_PCT) and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
 
@@ -348,6 +339,7 @@ def _load_hour_bias_from_csv() -> None:
 
 
 def _hour_bonus(hour_utc: int) -> int:
+    """Retorna el bonus horario. Valores negativos indican hora mala."""
     _load_hour_bias_from_csv()
 
     if _hour_bias_n_trades >= HOUR_BIAS_MIN_TRADES:
@@ -355,13 +347,13 @@ def _hour_bonus(hour_utc: int) -> int:
         if mean_pnl > HOUR_BIAS_GOOD_PCT:
             return 8
         if mean_pnl < HOUR_BIAS_BAD_PCT:
-            return -10
+            return -10  # señal de hora mala — evaluate() bloqueará
         return 0
 
     if hour_utc in HIGH_BIAS_HOURS:
         return 8
     if hour_utc in LOW_BIAS_HOURS:
-        return -10
+        return -10  # señal de hora mala — evaluate() bloqueará
     return 0
 
 
@@ -471,6 +463,11 @@ def evaluate(
     candle_ts  = closed_15m[-1].get("time", 0)
     hour_utc   = datetime.datetime.utcfromtimestamp(candle_ts / 1000).hour if candle_ts else datetime.datetime.now(timezone.utc).hour
     hour_bonus = _hour_bonus(hour_utc)
+
+    # v10: hora mala = HARD BLOCK, no penalización compensable
+    if hour_bonus < 0:
+        log.info("⬛ Hora mala (UTC %d, bias=%+d) — sin señal", hour_utc, hour_bonus)
+        return None, 0, regime
 
     macro_long = macro_short = None
     if closed_4h and len(closed_4h) >= 55:
@@ -588,7 +585,7 @@ def evaluate(
         sc_long, sc_short, effective_min,
     )
 
-    # ── v8: Guard de confluencia mínima ──────────────────────────────────
+    # ── v10: Guard de confluencia mínima (3 pilares) ──────────────────────
     pilares_long = sum([
         bool(rsi_cross_up or rsi_ext_bull),
         bool(macd15_bull_strong),
@@ -608,9 +605,9 @@ def evaluate(
     if sc_long >= effective_min and sc_long >= sc_short:
         if pilares_long < MIN_CONFLUENCE:
             log.info(
-                "⬛ LONG score=%d pero solo %d pilar(es) fuerte(s) "
-                "[rsi=%s macd_accel=%s div=%s sr_sup=%s adx>25=%s] — calidad insuficiente",
-                sc_long, pilares_long,
+                "⬛ LONG score=%d pero solo %d pilar(es) fuerte(s) de %d requeridos "
+                "[rsi=%s macd_accel=%s div=%s sr_sup=%s adx>28=%s] — calidad insuficiente",
+                sc_long, pilares_long, MIN_CONFLUENCE,
                 rsi_cross_up or rsi_ext_bull,
                 macd15_bull_strong,
                 divergence_15m == "bullish" or divergence_1h == "bullish",
@@ -627,9 +624,9 @@ def evaluate(
     if sc_short >= effective_min and sc_short > sc_long:
         if pilares_short < MIN_CONFLUENCE:
             log.info(
-                "⬛ SHORT score=%d pero solo %d pilar(es) fuerte(s) "
-                "[rsi=%s macd_accel=%s div=%s sr_res=%s adx>25=%s] — calidad insuficiente",
-                sc_short, pilares_short,
+                "⬛ SHORT score=%d pero solo %d pilar(es) fuerte(s) de %d requeridos "
+                "[rsi=%s macd_accel=%s div=%s sr_res=%s adx>28=%s] — calidad insuficiente",
+                sc_short, pilares_short, MIN_CONFLUENCE,
                 rsi_cross_down or rsi_ext_bear,
                 macd15_bear_strong,
                 divergence_15m == "bearish" or divergence_1h == "bearish",

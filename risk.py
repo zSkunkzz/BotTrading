@@ -2,44 +2,37 @@
 
 Sizing:
   base_margin = MARGIN_USDT
-  score  55-69  →  0.7× base_margin
-  score  70-84  →  1.0× base_margin
-  score  85-100 →  1.4× base_margin
+  score  70-84  →  0.6× base_margin  (señal válida pero no probada — tamaño reducido)
+  score  ≥ 85   →  1.0× base_margin  (señal de alta calidad — tamaño completo)
+  (score < 70 nunca llega aquí — bloqueado en signals.py por MIN_SCORE)
 
 SL / TP:
   El ATR de las velas 15m se convierte a porcentaje del precio de entrada
-  y se clampea entre SL_MIN_PCT y SL_MAX_PCT para evitar valores
-  desorbitados en coins de bajo precio o alta volatilidad.
+  y se clampea entre SL_MIN_PCT y SL_MAX_PCT.
 
   sl_pct  = clamp(ATR/entry × 1.5, SL_MIN_PCT, SL_MAX_PCT)
   tp_pct  = sl_pct × _tp_rr(score, regime)
 
   TP_RR dinámico:
-    regime="range"  →  2.0  (margen suficiente para cubrir spread + comisión)
-    score ≥ 85      →  2.5  (señal fuerte + tendencia, dejar correr)
-    score ≥ 70      →  2.0  (normal)
-    score < 70      →  1.8  (señal débil, mínimo viable con comisiones)
+    regime="range"  →  2.0
+    score ≥ 85      →  2.5
+    score ≥ 70      →  2.0
+    score < 70      →  1.8
 
   Valores fijos:
-    SL_MIN_PCT = 0.006   — mínimo SL (0.6%)
-    SL_MAX_PCT = 3.5%    — máximo SL (ampliado: crypto necesita respirar)
+    SL_MIN_PCT = 0.008   — mínimo SL (0.8%) — evita saltar por ruido puro
+    SL_MAX_PCT = 0.020   — máximo SL (2.0%) — cap conservador, protege cuenta
 
 Trailing stop:
-  trail_step = 0.5 × sl_dist  (era 0.3 — demasiado sensible al ruido)
+  trail_step = 0.5 × sl_dist
 
-FIX v5: _atr importado de indicators.py (compartido con signals.py).
-FIX: qty=0 guard — si floor_qty devuelve 0, se lanza ValueError.
-FIX: step/min_qty inicializados antes del bloque try/except.
-FIX: SL/TP redondeados con pricePrecision real del contrato en lugar de 8
-     decimales fijos (evita truncado silencioso por BingX).
-FIX: SL_MAX_PCT subido a 3.5% — el cap anterior (2.5%) provocaba SL
-     artificialmente ajustados que saltaban por ruido normal de mercado.
-FIX: trail_step subido a 0.5×sl_dist — el 0.3 anterior activaba el trailing
-     en rangos normales convirtiendo posiciones ganadoras en cierres prematuros.
-FIX: TP_RR de regime="range" subido a 2.0 — el 1.5 anterior dejaba el TP
-     tan cerca que spread + comisión lo anulaban.
-FIX: TP_RR mínimo (score<70) subido a 1.8 — el 1.7 no cubría comisiones
-     en señales débiles con SL ajustado.
+CAMBIOS v10:
+  - Sizing INVERTIDO: score 70-84 → 0.6× (antes 1.0×), score ≥85 → 1.0× (antes 1.4×).
+    El multiplicador 1.4× en señales de score 70 era la causa principal de pérdidas
+    grandes — el bot apostaba el máximo en señales que apenas superaban el umbral.
+  - SL_MAX_PCT bajado de 3.5% a 2.0%. Un SL de 3.5% con apalancamiento alto
+    significa pérdidas enormes antes de salir. 2% es el máximo tolerable.
+  - SL_MIN_PCT subido de 0.6% a 0.8%. SL de 0.6% salta por ruido de mercado normal.
 """
 import logging
 import math
@@ -50,8 +43,8 @@ import indicators as ind
 
 log = logging.getLogger("risk")
 
-SL_MIN_PCT = 0.006
-SL_MAX_PCT = 0.035
+SL_MIN_PCT = 0.008   # 0.8% mínimo — evita SL que salta por ruido
+SL_MAX_PCT = 0.020   # 2.0% máximo — cap conservador
 
 
 def _tp_rr(score: int, regime: str) -> float:
@@ -66,11 +59,10 @@ def _tp_rr(score: int, regime: str) -> float:
 
 
 def _size_multiplier(score: int) -> float:
+    """Sizing conservador: máximo solo para señales de alta calidad (≥85)."""
     if score >= 85:
-        return 1.4
-    if score >= 70:
-        return 1.0
-    return 0.7
+        return 1.0   # tamaño completo solo para señales premium
+    return 0.6       # señales válidas 70-84 → tamaño reducido
 
 
 def calc(
@@ -92,12 +84,11 @@ def calc(
         symbol  : símbolo BingX (e.g. 'BTC-USDT'). Si se pasa, se consulta
                   el step-size real del contrato para redondear qty.
         regime  : régimen de mercado ('bull' | 'bear' | 'range') para TP_RR
-                  dinámico. Ahora recibido desde signals.evaluate().
+                  dinámico. Recibido desde signals.evaluate().
 
     Raises:
         ValueError: si qty calculada es 0 o inferior al minQty del contrato.
     """
-    # FIX v5: usar indicators.atr (compartido con signals.py)
     atr = ind.atr(candles, period=14)
 
     if atr > 0 and entry > 0:
