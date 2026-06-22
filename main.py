@@ -30,6 +30,9 @@ MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
 TP_EXTEND_THRESH       = 0.015
 
+# FIX 3: guard temporal — ni extend_tp ni trailing actúan en los primeros 5 min
+MIN_HOLD_SECS = 300
+
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
 
@@ -44,6 +47,10 @@ def _is_weekend() -> bool:
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
+    # FIX 3: no trailing en los primeros MIN_HOLD_SECS
+    if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
+        return
+
     side       = pos["side"]
     trail_step = pos.get("trail_step", 0)
     if trail_step <= 0:
@@ -90,6 +97,10 @@ def _check_tp_extension(
     feed,
     effective_min_score: int,
 ) -> None:
+    # FIX 3: no extend_tp en los primeros MIN_HOLD_SECS
+    if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
+        return
+
     extensions = pos.get("tp_extensions", 0)
     if extensions >= MAX_TP_EXTENSIONS:
         return
@@ -137,14 +148,16 @@ def _check_tp_extension(
 
     if side == "long":
         new_tp = round(entry + tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
-        new_sl = round(entry * 1.0005, 6)
     else:
         new_tp = round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
-        new_sl = round(entry * 0.9995, 6)
+
+    # FIX 1: extend_tp NO mueve el SL. El SL actual se mantiene intacto.
+    # El SL solo lo mueve _update_trailing cuando el precio lo justifica.
+    current_sl = pos["sl"]
 
     try:
         exchange.cancel_all_orders(symbol)
-        exchange.place_stop_order(symbol, side, pos["qty"], new_sl)
+        exchange.place_stop_order(symbol, side, pos["qty"], current_sl)
         exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
     except Exception as e:
         log.warning("[%s] Error colocando órdenes en extend_tp: %s", symbol, e)
@@ -153,22 +166,21 @@ def _check_tp_extension(
 
     old_tp = pos["tp"]
     pos["tp"]            = new_tp
-    pos["sl"]            = new_sl
     pos["tp_extensions"] = extensions + 1
     pos["trail_high"]    = current_price
     pos["trail_low"]     = current_price
     pos["_extending"]    = False
 
     log.info(
-        "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL→BE=%.6f | score=%d",
-        symbol, extensions + 1, old_tp, new_tp, new_sl, score,
+        "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL sin cambios=%.6f | score=%d",
+        symbol, extensions + 1, old_tp, new_tp, current_sl, score,
     )
     telegram.notify(
         f"📈 TP Extendido #{extensions + 1}\n"
         f"{symbol} {side.upper()}\n"
         f"TP anterior: <code>{old_tp:.6f}</code>\n"
         f"Nuevo TP: <code>{new_tp:.6f}</code>\n"
-        f"SL → Breakeven: <code>{new_sl:.6f}</code>\n"
+        f"SL sin cambios: <code>{current_sl:.6f}</code>\n"
         f"Score: {score}"
     )
 
@@ -193,6 +205,7 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
+    # FIX 2: lógica unificada sin bloque duplicado
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
@@ -208,12 +221,23 @@ def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
                 return tp, "TP"
             if current_price >= sl * 0.995:
                 return sl, "SL"
+    elif tp is not None:
+        hit_tp = (
+            (side == "long"  and current_price >= tp * 0.995) or
+            (side == "short" and current_price <= tp * 1.005)
+        )
+        if hit_tp:
+            return tp, "TP"
+    elif sl is not None:
+        hit_sl = (
+            (side == "long"  and current_price <= sl * 1.005) or
+            (side == "short" and current_price >= sl * 0.995)
+        )
+        if hit_sl:
+            return sl, "SL"
 
-    hit_tp = (
-        (side == "long"  and tp is not None and current_price >= tp * 0.995) or
-        (side == "short" and tp is not None and current_price <= tp * 1.005)
-    )
-    return current_price, "TP" if hit_tp else "SL"
+    # Cierre externo (manual o liquidación) — usamos precio actual, razón desconocida
+    return current_price, "MANUAL"
 
 
 def run() -> None:
@@ -361,6 +385,21 @@ def run() -> None:
             if bot_state.is_paused():
                 log.debug("Bot pausado — saltando búsqueda de señales")
             else:
+                # FIX 4: log de diagnóstico de régimen cada 10 loops
+                if loop_count % 10 == 1:
+                    regime_summary = []
+                    for sym in config.SYMBOLS:
+                        if not feed.ready(sym):
+                            continue
+                        try:
+                            c1h = feed.get(sym, "1h")
+                            reg, adx = signals._regime_confirmed(c1h)
+                            regime_summary.append(f"{sym.split('-')[0]}:{reg[0].upper()}{adx:.0f}")
+                        except Exception:
+                            pass
+                    if regime_summary:
+                        log.info("[regímenes] %s", "  ".join(regime_summary))
+
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
                         continue
