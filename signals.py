@@ -26,6 +26,18 @@ Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
 Sizing en risk.py: mult=0.7 (score<70) | 1.0 (70-84) | 1.4 (≥85)
 MIN_SCORE configurable via env var MIN_SCORE (default 55)
 
+CAMBIOS v9 (bugfix crítico):
+  _rsi_divergence: la condición para divergencia alcista era
+  `recent_closes[-1] < lo_val` (IMPOSIBLE — lo_val es el mínimo),
+  y para bajista `recent_closes[-1] > hi_val` (IMPOSIBLE — hi_val es el máximo).
+  Ambas condiciones nunca se cumplían, haciendo que divergence_15m y
+  divergence_1h devolvieran None siempre. Esto inutilizaba el pilar de
+  divergencia en el guard de confluencia v8, causando que el bot apenas
+  emitiera señales.
+  Fix: precio debe estar dentro del 0.5% del pivot (zona de retesteo):
+    bullish: recent_closes[-1] <= lo_val * 1.005
+    bearish: recent_closes[-1] >= hi_val * 0.995
+
 CAMBIOS v8 (calidad sobre cantidad):
   Guard de confluencia mínima: antes de emitir cualquier señal se exige
   que al menos 2 de estos 5 pilares fuertes estén presentes:
@@ -88,6 +100,7 @@ SR_ZONE_PCT         = 0.004
 SR_PIVOT_BARS_1H    = 3
 SR_PIVOT_BARS_4H    = 2
 MIN_CONFLUENCE      = 2    # v8: pilares fuertes mínimos para emitir señal
+DIV_ZONE_PCT        = 0.005  # v9: tolerancia 0.5% para retesteo del pivot
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
@@ -181,7 +194,14 @@ def _rsi_divergence(
     candles: list[dict],
     lookback: int = 10,
 ) -> str | None:
-    """Detecta divergencia RSI-precio usando closes para ambos pivots (apples-to-apples)."""
+    """Detecta divergencia RSI-precio usando closes para ambos pivots.
+
+    Divergencia alcista: precio retestea el mínimo reciente (dentro del 0.5%)
+    mientras RSI forma un mínimo más alto → señal de agotamiento bajista.
+
+    Divergencia bajista: precio retestea el máximo reciente (dentro del 0.5%)
+    mientras RSI forma un máximo más bajo → señal de agotamiento alcista.
+    """
     if len(closes) < lookback + 14:
         return None
     if len(candles) < lookback:
@@ -191,20 +211,26 @@ def _rsi_divergence(
     recent_closes = closes[-lookback:]
     recent_rsi    = rsi_series[-lookback:]
 
+    # ── Divergencia alcista ───────────────────────────────────────────────
     lo_val = min(recent_closes[:-3])
     lo_idx = max(
         (i for i, v in enumerate(recent_closes[:-3]) if v == lo_val),
         default=-1,
     )
-    if lo_idx != -1 and recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
+    # precio actual retestea el mínimo (está dentro de DIV_ZONE_PCT del pivot)
+    # y RSI está más alto que en ese mínimo → divergencia alcista
+    if lo_idx != -1 and recent_closes[-1] <= lo_val * (1 + DIV_ZONE_PCT) and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
+    # ── Divergencia bajista ───────────────────────────────────────────────
     hi_val = max(recent_closes[:-3])
     hi_idx = max(
         (i for i, v in enumerate(recent_closes[:-3]) if v == hi_val),
         default=-1,
     )
-    if hi_idx != -1 and recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
+    # precio actual retestea el máximo (está dentro de DIV_ZONE_PCT del pivot)
+    # y RSI está más bajo que en ese máximo → divergencia bajista
+    if hi_idx != -1 and recent_closes[-1] >= hi_val * (1 - DIV_ZONE_PCT) and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
 
     return None
