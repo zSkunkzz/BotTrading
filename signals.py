@@ -10,7 +10,7 @@ Filtros:
   5. ADX 15m            : <18 → HARD-GUARD (sin señal) | >35 +12 | >25 +6 | 18-25 0
   6. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
   7. Volumen            : última vela CERRADA >media×1.2 → +8
-  8. RSI 15m            : cruce 50 +15 (PILAR), extremo +8 (solo pts, no pilar),
+  8. RSI 15m            : cruce 50 +15 (PILAR), extremo >60/<40 +8 (PILAR),
                           direccional +4, contrario -5
   9. MACD 15m + 1h      : histograma acelerando +10 (PILAR 15m, PILAR 1h si acelerando)
                           | positivo/negativo sin acelerar +5/+10 (pts, no pilar)
@@ -21,8 +21,8 @@ Filtros:
   13. Sesgo horario     : dinámico desde CSV (≥20 trades) o fijo si pocos datos
                           HORA MALA = HARD BLOCK (no -10pts compensables, señal bloqueada)
   14. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
-  15. Confluencia mínima: al menos 3 pilares fuertes antes de emitir señal
-      Pilares (6 posibles): RSI cruce | MACD 15m acelerando | MACD 1h acelerando
+  15. Confluencia mínima: al menos 2 pilares fuertes antes de emitir señal
+      Pilares (6 posibles): RSI cruce o extremo | MACD 15m acelerando | MACD 1h acelerando
                             | divergencia 15m/1h | S/R | ADX>28
 
 Score base: 20 pts (por superar hard-guards)
@@ -30,19 +30,23 @@ Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
 Sizing en risk.py: mult=0.6 (score 70-84) | 1.0 (≥85)
 MIN_SCORE configurable via env var MIN_SCORE (default 55)
 
+CAMBIOS v12:
+  - MIN_CONFLUENCE bajado de 3 a 2. Con 3 pilares el bot se secaba: en tendencia
+    madura sin cruce RSI reciente, sin ADX>28 y con MACD 1h sin acelerar se podía
+    tener score 70+ y 0 señales. 2 pilares mantiene calidad sin secar el flujo.
+  - RSI extremo (>60 bull / <40 bear) vuelve a ser pilar de confluencia.
+    En v11 el pilar RSI quedó solo en cruce de 50, pero en tendencia establecida
+    el RSI vive sobre 60 sin cruzar → el pilar nunca se activaba. Fix: cruce Y
+    extremo son pilares válidos (no exclusivos). El cruce sigue sumando +15 y el
+    extremo sin cruce +8 puntos, sin cambio en el scoring.
+
 CAMBIOS v11:
-  - RSI pilar SOLO en cruce de 50 (rsi_cross_up/down). RSI extremo (>60/<40)
-    sin cruce sigue sumando +8 pts pero NO activa el pilar de confluencia.
-    Antes rsi_ext_bull activaba el pilar casi siempre en tendencia, reduciendo
-    MIN_CONFLUENCE=3 a 2 pilares reales en la práctica.
+  - RSI pilar SOLO en cruce de 50 (revertido en v12).
   - MACD 1h acelerando (hist_1h[-1] > hist_1h[-2]) cuenta como 6º pilar.
-    MACD 1h positivo sin aceleración sigue dando +10 pts pero no es pilar.
-  - DIV_ZONE_PCT_1H = 0.012 (1.2%) para divergencias en 1h. El 0.5% anterior
-    era demasiado estricto para velas 1h y la divergencia nunca se detectaba.
-    15m mantiene DIV_ZONE_PCT = 0.005.
+  - DIV_ZONE_PCT_1H = 0.012 (1.2%) para divergencias en 1h.
 
 CAMBIOS v10:
-  - MIN_CONFLUENCE subido de 2 a 3 pilares.
+  - MIN_CONFLUENCE subido de 2 a 3 pilares (bajado a 2 en v12).
   - Hour bonus negativo ahora es HARD BLOCK.
   - ADX_STRONG subido de 25 a 28.
 
@@ -100,7 +104,7 @@ ADX_STRONG          = 28
 SR_ZONE_PCT         = 0.004
 SR_PIVOT_BARS_1H    = 3
 SR_PIVOT_BARS_4H    = 2
-MIN_CONFLUENCE      = 3
+MIN_CONFLUENCE      = 2
 DIV_ZONE_PCT        = 0.005   # 15m: 0.5% — más ruido, más estricto
 DIV_ZONE_PCT_1H     = 0.012   # 1h:  1.2% — velas más grandes, zona más amplia
 
@@ -531,7 +535,7 @@ def evaluate(
         elif adx > 25:      s += 6
         if adx_1h < 18:     s -= 5
         elif adx_1h > 25:   s += 5
-        # RSI: cruce +15, extremo sin cruce +8 (solo pts), direccional +4
+        # RSI: cruce +15, extremo sin cruce +8, direccional +4
         if rsi_cross_up:    s += 15
         elif rsi_ext_bull:  s += 8
         elif rsi_bull:      s += 4
@@ -559,7 +563,7 @@ def evaluate(
         elif adx > 25:       s += 6
         if adx_1h < 18:      s -= 5
         elif adx_1h > 25:    s += 5
-        # RSI: cruce +15, extremo sin cruce +8 (solo pts), direccional +4
+        # RSI: cruce +15, extremo sin cruce +8, direccional +4
         if rsi_cross_down:   s += 15
         elif rsi_ext_bear:   s += 8
         elif rsi_bear:       s += 4
@@ -599,11 +603,12 @@ def evaluate(
         sc_long, sc_short, effective_min,
     )
 
-    # ── v11: Guard de confluencia mínima (3 de 6 pilares) ────────────────
-    # Pilar RSI: SOLO cruce de 50. Extremo sin cruce suma pts pero no es pilar.
+    # ── v12: Guard de confluencia mínima (2 de 6 pilares) ────────────────
+    # Pilar RSI: cruce de 50 O extremo >60/<40. En tendencia madura el RSI
+    # vive sobre 60 sin cruzar → ambas condiciones son pilares válidos.
     # Pilar MACD 1h: solo si está acelerando en la dirección correcta.
     pilares_long = sum([
-        bool(rsi_cross_up),                                               # RSI cruce alcista
+        bool(rsi_cross_up or rsi_ext_bull),                               # RSI cruce o extremo alcista
         bool(macd15_bull_strong),                                         # MACD 15m acelerando alcista
         bool(macd1h_bull_accel),                                          # MACD 1h acelerando alcista
         bool(divergence_15m == "bullish" or divergence_1h == "bullish"),  # divergencia
@@ -612,7 +617,7 @@ def evaluate(
     ])
 
     pilares_short = sum([
-        bool(rsi_cross_down),                                             # RSI cruce bajista
+        bool(rsi_cross_down or rsi_ext_bear),                             # RSI cruce o extremo bajista
         bool(macd15_bear_strong),                                         # MACD 15m acelerando bajista
         bool(macd1h_bear_accel),                                          # MACD 1h acelerando bajista
         bool(divergence_15m == "bearish" or divergence_1h == "bearish"),  # divergencia
@@ -624,9 +629,9 @@ def evaluate(
         if pilares_long < MIN_CONFLUENCE:
             log.info(
                 "⬛ LONG score=%d pero solo %d pilar(es) fuerte(s) de %d requeridos "
-                "[rsi_cruce=%s macd15_accel=%s macd1h_accel=%s div=%s sr_sup=%s adx>28=%s] — calidad insuficiente",
+                "[rsi=%s macd15_accel=%s macd1h_accel=%s div=%s sr_sup=%s adx>28=%s] — calidad insuficiente",
                 sc_long, pilares_long, MIN_CONFLUENCE,
-                rsi_cross_up,
+                rsi_cross_up or rsi_ext_bull,
                 macd15_bull_strong,
                 macd1h_bull_accel,
                 divergence_15m == "bullish" or divergence_1h == "bullish",
@@ -635,9 +640,9 @@ def evaluate(
             )
             return None, 0, regime
         log.info(
-            "✅ LONG score=%d pilares=%d/6 (rsi_cruce=%s macd15=%s macd1h_accel=%s div15m=%s div1h=%s sr=%s bias=%+d)",
+            "✅ LONG score=%d pilares=%d/6 (rsi=%s macd15=%s macd1h_accel=%s div15m=%s div1h=%s sr=%s bias=%+d)",
             sc_long, pilares_long,
-            rsi_cross_up, macd15_bull_strong, macd1h_bull_accel,
+            rsi_cross_up or rsi_ext_bull, macd15_bull_strong, macd1h_bull_accel,
             divergence_15m, divergence_1h, sr, hour_bonus,
         )
         return "long", sc_long, regime
@@ -646,9 +651,9 @@ def evaluate(
         if pilares_short < MIN_CONFLUENCE:
             log.info(
                 "⬛ SHORT score=%d pero solo %d pilar(es) fuerte(s) de %d requeridos "
-                "[rsi_cruce=%s macd15_accel=%s macd1h_accel=%s div=%s sr_res=%s adx>28=%s] — calidad insuficiente",
+                "[rsi=%s macd15_accel=%s macd1h_accel=%s div=%s sr_res=%s adx>28=%s] — calidad insuficiente",
                 sc_short, pilares_short, MIN_CONFLUENCE,
-                rsi_cross_down,
+                rsi_cross_down or rsi_ext_bear,
                 macd15_bear_strong,
                 macd1h_bear_accel,
                 divergence_15m == "bearish" or divergence_1h == "bearish",
@@ -657,9 +662,9 @@ def evaluate(
             )
             return None, 0, regime
         log.info(
-            "✅ SHORT score=%d pilares=%d/6 (rsi_cruce=%s macd15=%s macd1h_accel=%s div15m=%s div1h=%s sr=%s bias=%+d)",
+            "✅ SHORT score=%d pilares=%d/6 (rsi=%s macd15=%s macd1h_accel=%s div15m=%s div1h=%s sr=%s bias=%+d)",
             sc_short, pilares_short,
-            rsi_cross_down, macd15_bear_strong, macd1h_bear_accel,
+            rsi_cross_down or rsi_ext_bear, macd15_bear_strong, macd1h_bear_accel,
             divergence_15m, divergence_1h, sr, hour_bonus,
         )
         return "short", sc_short, regime
