@@ -41,6 +41,8 @@ WEEKEND_MIN_SCORE = 90
 
 _weekend_notified_day: int = -1
 
+VALID_SIDES = {"long", "short"}
+
 
 def _is_weekend() -> bool:
     return datetime.now(timezone.utc).weekday() >= 5
@@ -333,8 +335,16 @@ def run() -> None:
 
             for symbol, pos_ex in all_ex_positions.items():
                 if symbol not in positions:
+                    # FIX: validar que el side del exchange sea "long" o "short"
+                    ex_side = pos_ex.get("side")
+                    if ex_side not in VALID_SIDES:
+                        log.warning(
+                            "[%s] Posición ignorada en sync — side inválido del exchange: %r",
+                            symbol, ex_side,
+                        )
+                        continue
                     positions[symbol] = {
-                        "side":          pos_ex["side"],
+                        "side":          ex_side,
                         "entry":         pos_ex["entry"],
                         "qty":           pos_ex["size"],
                         "sl":            pos_ex["sl"],
@@ -347,7 +357,7 @@ def run() -> None:
                         "open_ts":       time.time(),
                     }
                     log.info("[%s] Sincronizada: %s @ %.4f (sl=%s tp=%s)",
-                             symbol, pos_ex["side"], pos_ex["entry"],
+                             symbol, ex_side, pos_ex["entry"],
                              pos_ex["sl"], pos_ex["tp"])
 
             open_count = len(positions)
@@ -425,7 +435,14 @@ def run() -> None:
                             candles_15m, candles_1h, candles_4h,
                             min_score=effective_min_score,
                         )
-                        if not signal:
+
+                        # FIX: rechazar señal si side es None o inválido
+                        if not signal or signal not in VALID_SIDES:
+                            if signal is not None:
+                                log.warning(
+                                    "[%s] Señal ignorada — side inválido: %r (score=%d)",
+                                    symbol, signal, score,
+                                )
                             continue
 
                         try:
