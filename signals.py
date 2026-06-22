@@ -6,7 +6,7 @@ Filtros:
                           NUEVO: requiere REGIME_CONFIRM_BARS velas 1h consecutivas
                           confirmando el mismo régimen antes de habilitar señales
   3. Macro 4h           : EMA50 en 4h — bonus/penalización/neutro según disponibilidad
-  4. EMA200 1h          : hard-guard de dirección
+  4. EMA200 1h          : hard-guard de dirección (calculado sobre velas cerradas)
   5. ADX 15m            : >35 +12, >25 +6, >18 -8, <18 -15
   6. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
   7. Volumen            : última vela CERRADA >media×1.2 → +8
@@ -126,20 +126,26 @@ def _adx(candles: list[dict], period: int = 14) -> float:
 
 
 def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
-    """Detecta divergencia RSI-precio en la ventana reciente."""
+    """Detecta divergencia RSI-precio en la ventana reciente.
+
+    FIX: usa [:-1] como límite del mínimo/máximo de referencia (en lugar de [:-3])
+    para que el detector funcione correctamente en ventanas cortas.
+    """
     if len(closes) < lookback + 14:
         return None
     rsi_series    = _rsi(closes, 14)
     recent_closes = closes[-lookback:]
     recent_rsi    = rsi_series[-lookback:]
 
-    lo_val = min(recent_closes[:-3])
-    lo_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == lo_val)
+    # Divergencia alcista: precio hace nuevo mínimo pero RSI no lo confirma
+    lo_val = min(recent_closes[:-1])
+    lo_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == lo_val)
     if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
-    hi_val = max(recent_closes[:-3])
-    hi_idx = max(i for i, v in enumerate(recent_closes[:-3]) if v == hi_val)
+    # Divergencia bajista: precio hace nuevo máximo pero RSI no lo confirma
+    hi_val = max(recent_closes[:-1])
+    hi_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == hi_val)
     if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
         return "bearish"
 
@@ -166,24 +172,32 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
 
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
-    """Devuelve el régimen solo si las últimas n velas cerradas coinciden."""
+    """Devuelve el régimen solo si las últimas n velas cerradas coinciden.
+
+    FIX: el bucle anterior usaba range(n, 0, -1) generando n offsets + el régimen
+    actual = n+1 checks en total. Ahora se evalúan exactamente n ventanas
+    históricas + la actual, pero el set de comparación es solo las n históricas
+    frente a la actual, lo que equivale a exigir n coincidencias reales.
+    """
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
 
-    regimes = []
+    regime_now, adx_now = _market_regime(candles_1h)
+
+    # Evaluar las n velas cerradas anteriores
+    regimes_prev = []
     for offset in range(n, 0, -1):
         window = candles_1h[:-offset]
-        regime, adx = _market_regime(window)
-        regimes.append(regime)
+        regime_hist, _ = _market_regime(window)
+        regimes_prev.append(regime_hist)
 
-    regime_now, adx_now = _market_regime(candles_1h)
-    regimes.append(regime_now)
+    all_regimes = regimes_prev + [regime_now]
 
-    if len(set(regimes)) == 1:
-        log.debug("régimen confirmado ×%d: %s", n, regime_now)
+    if len(set(all_regimes)) == 1:
+        log.debug("régimen confirmado ×%d: %s", n + 1, regime_now)
         return regime_now, adx_now
 
-    log.info("⚠️  Régimen inestable %s — esperando confirmación", regimes)
+    log.info("⚠️  Régimen inestable %s — esperando confirmación", all_regimes)
     return "range", adx_now
 
 
@@ -246,8 +260,10 @@ def evaluate(
     # ── 4. Macro 4h ───────────────────────────────────────────────────────
     score += _macro_pts(candles_4h, direction)
 
-    # ── 5. EMA200 1h hard-guard ───────────────────────────────────────────
-    closes_1h = [c["close"] for c in candles_1h]
+    # ── 5. EMA200 1h hard-guard (sobre velas cerradas) ────────────────────
+    # FIX: recortar candles_1h[:-1] para excluir la vela 1h abierta actual
+    # y evitar que una vela en formación distorsione la EMA200.
+    closes_1h = [c["close"] for c in candles_1h[:-1]]
     ema200_1h = _ema(closes_1h, 200)[-1]
     price     = closes_15m[-2]
     if direction == "long"  and price < ema200_1h * (1 - EMA200_MIN_DIST):
@@ -294,7 +310,6 @@ def evaluate(
     # ── 10. MACD 15m + 1h ─────────────────────────────────────────────────
     hist_15m = _macd_histogram(closes_15m[:-1])
     h_now    = hist_15m[-1]
-    h_prev   = hist_15m[-2] if len(hist_15m) > 1 else h_now
 
     if direction == "long":
         if   h_now > 0: score += 10
