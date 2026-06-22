@@ -25,7 +25,9 @@ SL / TP:
     SL_MAX_PCT = 2.5%   — máximo SL
 
 Trailing stop:
-  trail_step = 0.3 × sl_dist
+  trail_step = max(0.3 × sl_dist, 1 tick del contrato)
+  FIX: el suelo de 1 tick evita que en altcoins de precio muy bajo
+  (SHIB, LISTA…) el trailing se dispare por ruido de spread.
 """
 import logging
 import math
@@ -121,7 +123,10 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 70,
     else:
         qty = math.floor(raw_qty * 1000) / 1000
 
-    trail_step = round(0.3 * sl_dist, 8)
+    # FIX: trail_step mínimo = 1 tick del contrato para evitar que en altcoins
+    # de precio muy bajo el trailing se dispare por ruido de spread.
+    raw_trail = 0.3 * sl_dist
+    trail_step = round(max(raw_trail, step), 8)
 
     log.info(
         "[%s] score=%d regime=%s RR=%.1f mult=%.1f margin=%.2f "
