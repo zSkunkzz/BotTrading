@@ -7,23 +7,23 @@ Filtros:
                           confirmando el mismo régimen antes de habilitar señales
   3. Macro 4h           : EMA50 en 4h — bonus/penalización/neutro según disponibilidad
   4. EMA200 1h          : hard-guard de dirección (calculado sobre velas cerradas)
-  5. ADX 15m            : hard-guard <15 (sin tendencia, no operar)
+  5. ATR volátil        : hard-guard — si atr_pct > 3.5% mercado en evento/noticia,
+                          SL real desborda el cap de 2.5% → no entrar
+  6. ADX 15m            : hard-guard <15 (sin tendencia, no operar)
                           >35 +12, >25 +6, >18 -8, <18 -15
-  6. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
+  7. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
                           hard-guard short: bear + adx_1h < 18 → no entrar (rebote choppy)
-  7. Volumen            : última vela CERRADA >media×1.2 → +8
-  8. RSI 15m            : cruce 50 +15, extremo +8, direccional +4, contrario -5
-  9. MACD 15m + 1h      : histograma positivo/negativo → +10 | neutro 0 | contrario -5
-                          (ya no se penaliza si el histograma va en la dirección correcta
-                          pero no está acelerando)
-  10. Divergencia RSI   : +8
-  11. Sesgo horario     : hora alta +8, hora baja -10
-  12. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
+  8. Volumen            : última vela CERRADA >media×1.2 → +8
+  9. RSI 15m            : cruce 50 +15, extremo +8, direccional +4, contrario -5
+  10. MACD 15m + 1h     : histograma positivo/negativo → +10 | neutro 0 | contrario -5
+  11. Divergencia RSI   : +8
+  12. Sesgo horario     : hora alta +8, hora baja -10
+  13. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
 
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
-Sizing en risk.py: mult=0.7 (score<70) | 1.0 (70-84) | 1.4 (≥85)
-MIN_SCORE configurable via env var MIN_SCORE (default 55)
+Sizing en risk.py: mult=1.0 (score 70-84) | 1.4 (≥85)
+MIN_SCORE configurable via env var MIN_SCORE (default 70)
 """
 from __future__ import annotations
 import logging
@@ -40,6 +40,10 @@ NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
 MIN_SCORE           = config.MIN_SCORE
 REGIME_CONFIRM_BARS = 2
+
+# Guard de volatilidad extrema: si atr_pct supera este umbral el mercado
+# está en modo evento/noticias y el SL se desborda del cap → no operar.
+ATR_VOLATILE_PCT    = 0.035   # 3.5%
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
@@ -128,24 +132,18 @@ def _adx(candles: list[dict], period: int = 14) -> float:
 
 
 def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
-    """Detecta divergencia RSI-precio en la ventana reciente.
-
-    FIX: usa [:-1] como límite del mínimo/máximo de referencia (en lugar de [:-3])
-    para que el detector funcione correctamente en ventanas cortas.
-    """
+    """Detecta divergencia RSI-precio en la ventana reciente."""
     if len(closes) < lookback + 14:
         return None
     rsi_series    = _rsi(closes, 14)
     recent_closes = closes[-lookback:]
     recent_rsi    = rsi_series[-lookback:]
 
-    # Divergencia alcista: precio hace nuevo mínimo pero RSI no lo confirma
     lo_val = min(recent_closes[:-1])
     lo_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == lo_val)
     if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
         return "bullish"
 
-    # Divergencia bajista: precio hace nuevo máximo pero RSI no lo confirma
     hi_val = max(recent_closes[:-1])
     hi_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == hi_val)
     if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
@@ -174,19 +172,12 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
 
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
-    """Devuelve el régimen solo si las últimas n velas cerradas coinciden.
-
-    FIX: el bucle anterior usaba range(n, 0, -1) generando n offsets + el régimen
-    actual = n+1 checks en total. Ahora se evalúan exactamente n ventanas
-    históricas + la actual, pero el set de comparación es solo las n históricas
-    frente a la actual, lo que equivale a exigir n coincidencias reales.
-    """
+    """Devuelve el régimen solo si las últimas n velas cerradas coinciden."""
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
 
     regime_now, adx_now = _market_regime(candles_1h)
 
-    # Evaluar las n velas cerradas anteriores
     regimes_prev = []
     for offset in range(n, 0, -1):
         window = candles_1h[:-offset]
@@ -204,17 +195,12 @@ def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> t
 
 
 def _volume_ok(candles: list[dict], window: int = 20) -> bool:
-    """Comprueba si el volumen de la última vela CERRADA supera la media.
-
-    FIX: usa candles[-2] (penúltima = última cerrada) en lugar de candles[-1]
-    (vela abierta que puede llevar solo unos minutos y tiene volumen artificialmente
-    bajo).
-    """
+    """Comprueba si el volumen de la última vela CERRADA supera la media."""
     if len(candles) < window + 2:
         return False
-    recent   = candles[-(window + 2):-1]   # window velas cerradas anteriores
+    recent   = candles[-(window + 2):-1]
     avg_vol  = sum(c["volume"] for c in recent) / len(recent)
-    last_vol = candles[-2]["volume"]        # última vela cerrada
+    last_vol = candles[-2]["volume"]
     return last_vol > avg_vol * VOLUME_MULT
 
 
@@ -263,14 +249,23 @@ def evaluate(
     score += _macro_pts(candles_4h, direction)
 
     # ── 5. EMA200 1h hard-guard (sobre velas cerradas) ────────────────────
-    # FIX: recortar candles_1h[:-1] para excluir la vela 1h abierta actual
-    # y evitar que una vela en formación distorsione la EMA200.
     closes_1h = [c["close"] for c in candles_1h[:-1]]
     ema200_1h = _ema(closes_1h, 200)[-1]
     price     = closes_15m[-2]
     if direction == "long"  and price < ema200_1h * (1 - EMA200_MIN_DIST):
         return None, score
     if direction == "short" and price > ema200_1h * (1 + EMA200_MIN_DIST):
+        return None, score
+
+    # ── 5b. Guard ATR volátil ─────────────────────────────────────────────
+    # Si el ATR 15m supera el 3.5% del precio, el mercado está en modo
+    # evento/noticias: el SL real desbordaría el cap de 2.5% → no entrar.
+    atr_15m_raw = _atr(candles_15m[:-1])
+    if price > 0 and atr_15m_raw / price > ATR_VOLATILE_PCT:
+        log.info(
+            "Hard-guard ATR volátil: atr_pct=%.2f%% > %.1f%% — mercado en evento, señal descartada",
+            atr_15m_raw / price * 100, ATR_VOLATILE_PCT * 100,
+        )
         return None, score
 
     # ── 6. ADX 15m ────────────────────────────────────────────────────────
@@ -355,7 +350,7 @@ def evaluate(
     elif hour in LOW_BIAS_HOURS:  score -= 10
 
     # ── 13. Filtro no-chase ───────────────────────────────────────────────
-    atr_15m   = _atr(candles_15m[:-1])
+    atr_15m   = atr_15m_raw   # reutilizar el ya calculado en guard ATR
     candle_rng = candle["high"] - candle["low"]
     if atr_15m > 0 and candle_rng > NO_CHASE_MULT * atr_15m:
         log.debug("No-chase: rng=%.4f > %.1f×ATR=%.4f", candle_rng, NO_CHASE_MULT, atr_15m)

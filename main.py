@@ -22,15 +22,18 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 _cooldown: dict[str, float] = {}
+_cooldown_reason: dict[str, str] = {}   # 'tp' | 'sl'
 _manual_alert_cooldown: dict[str, float] = {}
 
-COOLDOWN               = 60 * 60
+# ── Cooldown asimétrico: TP corto (no bloquear pares ganadores), SL largo ──
+COOLDOWN_SL           = 60 * 60       # 60 min tras SL
+COOLDOWN_TP           = 15 * 60       # 15 min tras TP
 MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
 TP_EXTEND_THRESH       = 0.015
 
-# FIX 3: guard temporal — ni extend_tp ni trailing actúan en los primeros 5 min
+# Guard temporal — ni extend_tp ni trailing actúan en los primeros 5 min
 MIN_HOLD_SECS = 300
 
 READY_TIMEOUT = 120
@@ -38,6 +41,14 @@ READY_MIN_PCT = 0.80
 
 WEEKDAY_MIN_SCORE = 70
 WEEKEND_MIN_SCORE = 90
+
+# ── Daily drawdown cap ──────────────────────────────────────────────────────
+# Si el PnL acumulado del día cae por debajo de este porcentaje del capital
+# estimado, el bot se pausa automáticamente hasta las 00:00 UTC.
+DAILY_MAX_LOSS_PCT = float(getattr(config, "DAILY_MAX_LOSS_PCT", -3.0))  # -3% default
+_daily_pnl_usdt: float = 0.0
+_daily_reset_date: int = -1  # día UTC del último reset
+_daily_paused: bool = False
 
 _weekend_notified_day: int = -1
 
@@ -48,8 +59,51 @@ def _is_weekend() -> bool:
     return datetime.now(timezone.utc).weekday() >= 5
 
 
+def _reset_daily_pnl_if_needed() -> None:
+    """Resetea el PnL diario a las 00:00 UTC y despausa si estaba pausado por drawdown."""
+    global _daily_pnl_usdt, _daily_reset_date, _daily_paused
+    today = datetime.now(timezone.utc).day
+    if today != _daily_reset_date:
+        _daily_reset_date = today
+        _daily_pnl_usdt   = 0.0
+        if _daily_paused:
+            _daily_paused = False
+            log.info("[drawdown] Nuevo día UTC — drawdown diario reseteado, bot activo")
+            telegram.notify("🌅 Nuevo día UTC — límite de pérdidas diario reseteado. Bot activo.")
+
+
+def _register_pnl(pnl_usdt: float, symbol: str) -> None:
+    """Acumula el PnL del día y pausa si se supera el límite de drawdown."""
+    global _daily_pnl_usdt, _daily_paused
+    _daily_pnl_usdt += pnl_usdt
+    # Estimación de capital: MARGIN_USDT × MAX_POSITIONS (capital en juego máximo)
+    capital_estimate = config.MARGIN_USDT * config.MAX_POSITIONS
+    daily_pct = (_daily_pnl_usdt / capital_estimate) * 100 if capital_estimate else 0.0
+    log.info("[drawdown] PnL acum. hoy: %+.2f USDT (%+.2f%% de ~%.0f USDT capital)",
+             _daily_pnl_usdt, daily_pct, capital_estimate)
+    if daily_pct <= DAILY_MAX_LOSS_PCT and not _daily_paused:
+        _daily_paused = True
+        msg = (
+            f"🛑 <b>Límite de pérdidas diario alcanzado</b>\n"
+            f"PnL hoy: <code>{_daily_pnl_usdt:+.2f} USDT</code> ({daily_pct:+.2f}%)\n"
+            f"Umbral: {DAILY_MAX_LOSS_PCT}% — bot pausado hasta las 00:00 UTC.\n"
+            f"Las posiciones abiertas siguen gestionándose (trailing/TP)."
+        )
+        log.warning("[drawdown] %s", msg.replace("\n", " "))
+        telegram.notify(msg)
+
+
+def _is_daily_paused() -> bool:
+    return _daily_paused
+
+
+def _cooldown_for(symbol: str) -> int:
+    """Devuelve el tiempo de cooldown apropiado según el motivo del cierre."""
+    reason = _cooldown_reason.get(symbol, "sl")
+    return COOLDOWN_TP if reason == "tp" else COOLDOWN_SL
+
+
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
-    # FIX 3: no trailing en los primeros MIN_HOLD_SECS
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -99,7 +153,6 @@ def _check_tp_extension(
     feed,
     effective_min_score: int,
 ) -> None:
-    # FIX 3: no extend_tp en los primeros MIN_HOLD_SECS
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -153,8 +206,6 @@ def _check_tp_extension(
     else:
         new_tp = round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
 
-    # FIX 1: extend_tp NO mueve el SL. El SL actual se mantiene intacto.
-    # El SL solo lo mueve _update_trailing cuando el precio lo justifica.
     current_sl = pos["sl"]
 
     try:
@@ -207,7 +258,6 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
-    # FIX 2: lógica unificada sin bloque duplicado
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
@@ -238,8 +288,32 @@ def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
         if hit_sl:
             return sl, "SL"
 
-    # Cierre externo (manual o liquidación) — usamos precio actual, razón desconocida
     return current_price, "MANUAL"
+
+
+def _get_real_exit_price(symbol: str, pos: dict, fallback: float) -> tuple[float, str]:
+    """Intenta obtener el precio real de cierre del exchange.
+
+    Consulta el historial de órdenes del símbolo y busca la última orden
+    de cierre ejecutada (reduce_only o cierre de posición). Si falla,
+    cae al precio estimado por _exit_price_for.
+    """
+    try:
+        closed_orders = exchange.get_closed_orders(symbol, limit=5)
+        if closed_orders:
+            # La orden más reciente ejecutada es el cierre
+            last = closed_orders[0]
+            real_price = float(last.get("avgPrice") or last.get("price") or 0)
+            if real_price > 0:
+                order_type = last.get("type", "").upper()
+                if "STOP" in order_type or "TAKE_PROFIT" in order_type or "MARKET" in order_type:
+                    reason = "TP" if "TAKE_PROFIT" in order_type else ("SL" if "STOP" in order_type else "MANUAL")
+                    log.debug("[%s] Precio real de cierre del exchange: %.6f (%s)", symbol, real_price, reason)
+                    return real_price, reason
+    except Exception as exc:
+        log.debug("[%s] No se pudo obtener precio real de cierre: %s", symbol, exc)
+    # Fallback al precio estimado
+    return fallback, pos.get("_exit_reason", "MANUAL")
 
 
 def run() -> None:
@@ -275,18 +349,26 @@ def run() -> None:
         try:
             loop_count += 1
 
+            # ── Reset PnL diario a las 00:00 UTC ───────────────────────────
+            _reset_daily_pnl_if_needed()
+
             weekend = _is_weekend()
             effective_min_score = WEEKEND_MIN_SCORE if weekend else WEEKDAY_MIN_SCORE
 
             all_ex_positions = exchange.get_all_positions()
 
-            # ── Sync posiciones abiertas ────────────────────────────────────────
+            # ── Sync posiciones abiertas ────────────────────────────────────
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if not pos_ex:
                     p             = positions.pop(symbol)
                     current_price = exchange.get_price(symbol)
-                    exit_price, reason = _exit_price_for(p, current_price)
+                    exit_price_est, reason_est = _exit_price_for(p, current_price)
+
+                    # FIX Gap 2: intentar obtener precio real de cierre del exchange
+                    exit_price, reason = _get_real_exit_price(symbol, p, exit_price_est)
+                    if reason == "MANUAL" and reason_est != "MANUAL":
+                        reason = reason_est  # si el exchange no aclara, usar estimación
 
                     pnl_pct = (
                         (exit_price - p["entry"]) / p["entry"]
@@ -295,8 +377,14 @@ def run() -> None:
                     ) * config.LEVERAGE * 100
                     pnl_usdt = (pnl_pct / 100) * (p["qty"] * p["entry"] / config.LEVERAGE)
 
-                    _cooldown[symbol] = time.time()
-                    log.info("[%s] Cooldown activado (%dm) tras %s", symbol, COOLDOWN // 60, reason)
+                    # FIX Gap 1: cooldown asimétrico — TP corto, SL largo
+                    _cooldown[symbol]        = time.time()
+                    _cooldown_reason[symbol] = "tp" if reason == "TP" else "sl"
+                    cd_mins = (COOLDOWN_TP if reason == "TP" else COOLDOWN_SL) // 60
+                    log.info("[%s] Cooldown %dm activado tras %s", symbol, cd_mins, reason)
+
+                    # FIX: acumular PnL diario para drawdown cap
+                    _register_pnl(pnl_usdt, symbol)
 
                     trade_logger.record(
                         symbol     = symbol,
@@ -322,10 +410,14 @@ def run() -> None:
                     log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT) | ext=%d",
                              symbol, reason, pnl_pct, pnl_usdt, p.get("tp_extensions", 0))
 
-            # ── Purgar cooldowns expirados ──────────────────────────────────────
-            expired = [sym for sym, ts in _cooldown.items() if time.time() - ts >= COOLDOWN]
+            # ── Purgar cooldowns expirados ──────────────────────────────────
+            expired = [
+                sym for sym, ts in _cooldown.items()
+                if time.time() - ts >= _cooldown_for(sym)
+            ]
             for sym in expired:
                 _cooldown.pop(sym, None)
+                _cooldown_reason.pop(sym, None)
                 log.info("[%s] Cooldown expirado — símbolo disponible", sym)
 
             expired_alerts = [sym for sym, ts in _manual_alert_cooldown.items()
@@ -335,7 +427,6 @@ def run() -> None:
 
             for symbol, pos_ex in all_ex_positions.items():
                 if symbol not in positions:
-                    # FIX: validar que el side del exchange sea "long" o "short"
                     ex_side = pos_ex.get("side")
                     if ex_side not in VALID_SIDES:
                         log.warning(
@@ -363,12 +454,14 @@ def run() -> None:
             open_count = len(positions)
 
             if loop_count % 10 == 1:
-                log.info("[loop #%d] Posiciones: %d/%d | Feed: %d/%d pares listos | Cooldowns: %d | Pausado: %s",
+                daily_status = f" | PnL hoy: {_daily_pnl_usdt:+.2f} USDT"
+                paused_str = "PAUSADO(drawdown)" if _daily_paused else ("PAUSADO" if bot_state.is_paused() else "activo")
+                log.info("[loop #%d] Posiciones: %d/%d | Feed: %d/%d | Cooldowns: %d | Estado: %s%s",
                          loop_count, open_count, config.MAX_POSITIONS,
                          feed.ready_count(), len(config.SYMBOLS), len(_cooldown),
-                         bot_state.is_paused())
+                         paused_str, daily_status)
 
-            # ── Trailing stop + extend TP proactivo ────────────────────────────
+            # ── Trailing stop + extend TP proactivo ────────────────────────
             for symbol, pos in list(positions.items()):
                 try:
                     price = exchange.get_price(symbol)
@@ -377,7 +470,7 @@ def run() -> None:
                 except Exception as e:
                     log.warning("[%s] Error gestión posición: %s", symbol, e)
 
-            # ── Filtro fin de semana ────────────────────────────────────────────
+            # ── Filtro fin de semana ────────────────────────────────────────
             if weekend:
                 today = datetime.now(timezone.utc).weekday()
                 if today != _weekend_notified_day:
@@ -391,11 +484,13 @@ def run() -> None:
                         f"Posiciones actuales siguen gestionándose con normalidad."
                     )
 
-            # ── Buscar señales ──────────────────────────────────────────────────
-            if bot_state.is_paused():
-                log.debug("Bot pausado — saltando búsqueda de señales")
+            # ── Buscar señales ──────────────────────────────────────────────
+            if bot_state.is_paused() or _is_daily_paused():
+                if _is_daily_paused():
+                    log.debug("Bot pausado por drawdown diario — saltando búsqueda de señales")
+                else:
+                    log.debug("Bot pausado — saltando búsqueda de señales")
             else:
-                # FIX 4: log de diagnóstico de régimen cada 10 loops
                 if loop_count % 10 == 1:
                     regime_summary = []
                     for sym in config.SYMBOLS:
@@ -436,7 +531,6 @@ def run() -> None:
                             min_score=effective_min_score,
                         )
 
-                        # FIX: rechazar señal si side es None o inválido
                         if not signal or signal not in VALID_SIDES:
                             if signal is not None:
                                 log.warning(

@@ -2,9 +2,9 @@
 
 Sizing:
   base_margin = MARGIN_USDT
-  score  55-69  →  0.7× base_margin
-  score  70-84  →  1.0× base_margin
-  score  85-100 →  1.4× base_margin
+  score 70-84  →  1.0× base_margin
+  score ≥ 85   →  1.4× base_margin
+  (eliminado tier 55-69 con 0.7×: por debajo de MIN_SCORE=70 no se entra)
 
 SL / TP:
   El ATR de las velas 15m se convierte a porcentaje del precio de entrada
@@ -18,7 +18,7 @@ SL / TP:
     regime="range"  →  1.5  (precio no viaja lejos, TP más conservador)
     score ≥ 85      →  2.5  (señal fuerte + tendencia, dejar correr)
     score ≥ 70      →  2.0  (normal)
-    score < 70      →  1.7  (señal débil, asegurar beneficio antes)
+    (eliminado tier score<70: ya no alcanzable con MIN_SCORE=70)
 
   Valores fijos:
     SL_MIN_PCT = 0.4%   — mínimo SL
@@ -46,15 +46,12 @@ def _tp_rr(score: int, regime: str) -> float:
 
     En rango el precio no tiene recorrido largo → TP más conservador.
     Con señal fuerte en tendencia se deja correr más.
-    Con señal débil se asegura el beneficio antes.
     """
     if regime == "range":
         return 1.5
     if score >= 85:
         return 2.5
-    if score >= 70:
-        return 2.0
-    return 1.7
+    return 2.0   # score 70-84: RR estándar (tier <70 eliminado)
 
 
 def _atr(candles: list[dict], period: int = 14) -> float:
@@ -66,11 +63,15 @@ def _atr(candles: list[dict], period: int = 14) -> float:
 
 
 def _size_multiplier(score: int) -> float:
+    """Sizing limpio en 2 tiers: score<85 → 1.0×, score≥85 → 1.4×.
+
+    El antiguo tier 0.7× (score 55-69) se ha eliminado porque con
+    MIN_SCORE=70 ya no es alcanzable. Entrar pequeño con el mismo SL%
+    generaba asimetría negativa: perdías casi igual que en trades buenos.
+    """
     if score >= 85:
         return 1.4
-    if score >= 70:
-        return 1.0
-    return 0.7
+    return 1.0
 
 
 def calc(side: str, entry: float, candles: list[dict], score: int = 70,
@@ -123,8 +124,6 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 70,
     else:
         qty = math.floor(raw_qty * 1000) / 1000
 
-    # FIX: trail_step mínimo = 1 tick del contrato para evitar que en altcoins
-    # de precio muy bajo el trailing se dispare por ruido de spread.
     raw_trail = 0.3 * sl_dist
     trail_step = round(max(raw_trail, step), 8)
 
