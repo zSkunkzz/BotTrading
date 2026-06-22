@@ -1,9 +1,9 @@
 """risk.py — Gestión de riesgo con sizing proporcional al score y trailing stop.
 
 Sizing:
-  base_margin = MARGIN_USDT
-  score  70-84  →  0.6× base_margin  (señal válida pero no probada — tamaño reducido)
-  score  ≥ 85   →  1.0× base_margin  (señal de alta calidad — tamaño completo)
+  base_margin = MARGIN_USDT (20 USDT por defecto)
+  score  70-89  →  1.0× base_margin  (20 USDT — tamaño completo)
+  score  ≥ 90   →  1.35× base_margin (27 USDT — señal excepcional)
   (score < 70 nunca llega aquí — bloqueado en signals.py por MIN_SCORE)
 
 SL / TP:
@@ -26,13 +26,12 @@ SL / TP:
 Trailing stop:
   trail_step = 0.5 × sl_dist
 
-CAMBIOS v10:
-  - Sizing INVERTIDO: score 70-84 → 0.6× (antes 1.0×), score ≥85 → 1.0× (antes 1.4×).
-    El multiplicador 1.4× en señales de score 70 era la causa principal de pérdidas
-    grandes — el bot apostaba el máximo en señales que apenas superaban el umbral.
-  - SL_MAX_PCT bajado de 3.5% a 2.0%. Un SL de 3.5% con apalancamiento alto
-    significa pérdidas enormes antes de salir. 2% es el máximo tolerable.
-  - SL_MIN_PCT subido de 0.6% a 0.8%. SL de 0.6% salta por ruido de mercado normal.
+CAMBIOS v13:
+  - Sizing revertido: score 70-89 → 1.0× (20 USDT), score ≥90 → 1.35× (27 USDT).
+    El recorte de v10 (0.6× para 70-84) no tenía sentido si el filtro de señales
+    ya garantiza calidad desde score 55+. Una señal que pasa todos los filtros
+    merece tamaño completo.
+  - SL_MIN_PCT y SL_MAX_PCT sin cambios (0.8% / 2.0%).
 """
 import logging
 import math
@@ -59,10 +58,10 @@ def _tp_rr(score: int, regime: str) -> float:
 
 
 def _size_multiplier(score: int) -> float:
-    """Sizing conservador: máximo solo para señales de alta calidad (≥85)."""
-    if score >= 85:
-        return 1.0   # tamaño completo solo para señales premium
-    return 0.6       # señales válidas 70-84 → tamaño reducido
+    """Sizing por score: completo para señales normales, extra para excepcionales."""
+    if score >= 90:
+        return 1.35  # 27 USDT — señal excepcional
+    return 1.0       # 20 USDT — señal estándar (70-89)
 
 
 def calc(
