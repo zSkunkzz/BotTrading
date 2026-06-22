@@ -28,8 +28,15 @@ FIXES:
     Solución: registrar la clave de cierre ANTES de notify.
     Además: cuando exchange no devuelve orderId (cierre inferido por precio),
     se usa clave compuesta "symbol|side|entry_round" como fallback — antes
-    estos cierres podían spamear infinitamente porque order_id == "" nunca
+    estos cierres podên spamear infinitamente porque order_id == "" nunca
     entraba en _closed_order_ids.
+  - FIX v10: Guard temporal MIN_HOLD_SECS (5 min) para BE y TP extension.
+    Bug: _check_tp_extension ejecutaba new_sl=entry*1.0005 al primer loop
+    tras abrir, moviendo el SL a BE inmediatamente. Ahora ni breakeven
+    ni TP extension pueden actuar en los primeros 5 minutos.
+    Además: _check_tp_extension ya NO mueve el SL nunca — solo extiende
+    el TP. El SL únicamente lo mueve _check_breakeven cuando el precio
+    alcanza entry + BE_RR * riesgo (comportamiento correcto).
 """
 import json
 import logging
@@ -60,10 +67,8 @@ _cooldown_sl:           dict[str, float] = {}
 _manual_alert_cooldown: dict[str, float] = {}
 _closing:               set[str]         = set()
 
-# clave_cierre → timestamp cuando lo procesamos; para deduplicar cierres.
-# Clave = orderId si existe; si no, "symbol|side|entry_round" como fallback.
 _closed_order_ids: dict[str, float] = {}
-_CLOSED_ID_TTL = 35 * 60  # 35 min — un poco más que el lookback de get_closed_reason
+_CLOSED_ID_TTL = 35 * 60
 
 COOLDOWN               = 60 * 60
 COOLDOWN_SL            = 2 * 60 * 60
@@ -74,6 +79,9 @@ TP_EXTEND_THRESH       = 0.015
 
 BE_RR     = 1.0
 BE_BUFFER = 0.0003
+
+# Guard temporal: BE y TP extension no activan en los primeros 5 min de vida
+MIN_HOLD_SECS = 300
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -100,7 +108,6 @@ def _corr_group_count(symbol: str, positions: dict) -> int:
 
 
 def _purge_closed_ids() -> None:
-    """Elimina entradas antiguas de _closed_order_ids para no crecer indefinidamente."""
     cutoff = time.time() - _CLOSED_ID_TTL
     stale = [k for k, ts in _closed_order_ids.items() if ts < cutoff]
     for k in stale:
@@ -108,20 +115,13 @@ def _purge_closed_ids() -> None:
 
 
 def _make_close_key(symbol: str, pos: dict, order_id: str) -> str:
-    """Genera una clave única para deduplicar un cierre.
-
-    Si el exchange devuelve orderId, úsalo directamente.
-    Si no (cierre inferido por precio), construye una clave compuesta
-    con symbol + side + entry redondeado a 4 decimales para que sea
-    estable entre loops pero no colisione con otros trades del mismo par.
-    """
     if order_id:
         return order_id
     entry_r = round(pos.get("entry", 0), 4)
     return f"{symbol}|{pos.get('side', '')}|{entry_r}"
 
 
-# ── Persistencia ─────────────────────────────────────────────────────────
+# ── Persistencia ─────────────────────────────────────────────────────
 
 def _save_positions(positions: dict) -> None:
     if not positions:
@@ -164,7 +164,7 @@ def _load_positions() -> dict:
         return {}
 
 
-# ── Sync SL/TP desde órdenes abiertas ────────────────────────────────────
+# ── Sync SL/TP desde órdenes abiertas ────────────────────────────────────────
 
 def _sync_sl_tp_from_orders(symbol: str, pos: dict) -> None:
     try:
@@ -210,12 +210,17 @@ def _sync_sl_tp_from_orders(symbol: str, pos: dict) -> None:
         )
 
 
-# ── Breakeven ─────────────────────────────────────────────────────────────
+# ── Breakeven ────────────────────────────────────────────────────────────
 
 def _check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
     if pos.get("breakeven_set"):
         return False
     if pos.get("sl") is None or pos.get("entry") is None:
+        return False
+
+    # Guard temporal: no activar BE en los primeros MIN_HOLD_SECS
+    age_secs = time.time() - pos.get("open_ts", time.time())
+    if age_secs < MIN_HOLD_SECS:
         return False
 
     side      = pos["side"]
@@ -269,7 +274,7 @@ def _check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
     return True
 
 
-# ── Trailing stop ──────────────────────────────────────────────────────────
+# ── Trailing stop ───────────────────────────────────────────────────────────
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     side       = pos["side"]
@@ -311,7 +316,7 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
 
 
-# ── TP extension ───────────────────────────────────────────────────────────
+# ── TP extension ────────────────────────────────────────────────────────────
 
 def _sl_price_valid(side: str, sl_price: float, current_price: float) -> bool:
     if side == "short":
@@ -333,6 +338,11 @@ def _check_tp_extension(
     tp   = pos.get("tp")
     side = pos["side"]
     if tp is None:
+        return
+
+    # Guard temporal: no extender TP en los primeros MIN_HOLD_SECS
+    age_secs = time.time() - pos.get("open_ts", time.time())
+    if age_secs < MIN_HOLD_SECS:
         return
 
     entry        = pos["entry"]
@@ -372,74 +382,39 @@ def _check_tp_extension(
         pos["_extending"] = False
         return
 
-    if side == "long":
-        new_tp = round(entry + tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
-        new_sl = round(entry * 1.0005, 6)
-    else:
-        new_tp = round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
-        new_sl = round(entry * 0.9995, 6)
-
-    sl_valid = _sl_price_valid(side, new_sl, current_price)
-    if not sl_valid:
-        log.warning(
-            "[%s] extend_tp: new_sl=%.6f no válido con precio=%.6f (%s) — "
-            "extendiendo solo TP sin mover SL",
-            symbol, new_sl, current_price, side,
-        )
-        try:
-            exchange.cancel_all_orders(symbol)
-            if pos.get("sl") is not None:
-                exchange.place_stop_order(symbol, side, pos["qty"], pos["sl"])
-            exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
-        except Exception as e:
-            log.warning("[%s] Error extendiendo TP sin SL: %s", symbol, e)
-            pos["_extending"] = False
-            return
-        old_tp = pos["tp"]
-        pos["tp"]            = new_tp
-        pos["tp_extensions"] = extensions + 1
-        pos["trail_high"]    = current_price
-        pos["trail_low"]     = current_price
-        pos["_extending"]    = False
-        pos["breakeven_set"] = True
-        log.info("[%s] TP extendido #%d (sin mover SL) | %.6f → %.6f | score=%d",
-                 symbol, extensions + 1, old_tp, new_tp, score)
-        telegram.notify(
-            f"📈 TP Extendido #{extensions + 1}\n"
-            f"{symbol} {side.upper()}\n"
-            f"TP anterior: <code>{old_tp:.6f}</code>\n"
-            f"Nuevo TP: <code>{new_tp:.6f}</code>\n"
-            f"⚠️ SL no movido (precio cerca del nivel BE)\n"
-            f"Score: {score}"
-        )
-        return
+    # Solo extender el TP — el SL NO se toca aquí nunca.
+    # El SL solo lo mueve _check_breakeven cuando el precio alcanza entry+BE_RR*riesgo.
+    new_tp = (
+        round(entry + tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
+        if side == "long"
+        else round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
+    )
 
     try:
         exchange.cancel_all_orders(symbol)
-        exchange.place_stop_order(symbol, side, pos["qty"], new_sl)
+        if pos.get("sl") is not None:
+            exchange.place_stop_order(symbol, side, pos["qty"], pos["sl"])
         exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
     except Exception as e:
-        log.warning("[%s] Error colocando órdenes en extend_tp: %s", symbol, e)
+        log.warning("[%s] Error extendiendo TP: %s", symbol, e)
         pos["_extending"] = False
         return
 
     old_tp = pos["tp"]
     pos["tp"]            = new_tp
-    pos["sl"]            = new_sl
     pos["tp_extensions"] = extensions + 1
     pos["trail_high"]    = current_price
     pos["trail_low"]     = current_price
     pos["_extending"]    = False
-    pos["breakeven_set"] = True
 
-    log.info("[%s] TP extendido #%d | %.6f → %.6f | SL→BE=%.6f | score=%d",
-             symbol, extensions + 1, old_tp, new_tp, new_sl, score)
+    log.info("[%s] TP extendido #%d | %.6f → %.6f | score=%d (SL sin cambios: %.6f)",
+             symbol, extensions + 1, old_tp, new_tp, score, pos.get("sl", 0))
     telegram.notify(
         f"📈 TP Extendido #{extensions + 1}\n"
         f"{symbol} {side.upper()}\n"
         f"TP anterior: <code>{old_tp:.6f}</code>\n"
         f"Nuevo TP: <code>{new_tp:.6f}</code>\n"
-        f"SL → Breakeven: <code>{new_sl:.6f}</code>\n"
+        f"SL sin cambios: <code>{pos.get('sl', 0):.6f}</code>\n"
         f"Score: {score}"
     )
 
@@ -464,11 +439,9 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _resolve_close(pos: dict, symbol: str, hint_price: float | None = None) -> tuple[float, str, str]:
-    """Devuelve (exit_price, reason, order_id)."""
     reason, exit_price, order_id = exchange.get_closed_reason(symbol, side=pos.get("side"))
     if reason and exit_price:
         return exit_price, reason, order_id
-    # Fallback: inferir por precio
     current_price = hint_price if hint_price is not None else exchange.get_price(symbol)
     side = pos["side"]
     tp   = pos.get("tp")
@@ -559,9 +532,6 @@ def run() -> None:
                         hint_price = exchange.get_price(symbol)
                         exit_price, reason, order_id = _resolve_close(pos, symbol, hint_price=hint_price)
 
-                        # ── DEDUPLICACIÓN DE CIERRES ────────────────────────
-                        # Construir clave única: orderId si existe, si no
-                        # "symbol|side|entry_round" para cubrir cierres inferidos.
                         close_key = _make_close_key(symbol, pos, order_id)
 
                         if close_key in _closed_order_ids:
@@ -569,16 +539,12 @@ def run() -> None:
                                 "[%s] Cierre ya notificado (key=%s) — saltando",
                                 symbol, close_key,
                             )
-                            # La posición ya no existe en el exchange — limpiar local
                             if symbol in positions:
                                 positions.pop(symbol)
                                 _save_positions(positions)
                             continue
 
-                        # Registrar la clave ANTES de notify para que una segunda
-                        # iteración del loop (posible con sleeps cortos) no entre.
                         _closed_order_ids[close_key] = time.time()
-                        # ────────────────────────────────────────────────────
 
                         pnl_pct = (
                             (exit_price - pos["entry"]) / pos["entry"]
@@ -593,7 +559,7 @@ def run() -> None:
                             symbol, reason, exit_price, pnl_pct, pnl_usdt, duration_min,
                         )
                         telegram.notify(
-                            f"{'✅' if pnl_pct > 0 else '❌'} Posición cerrada\n"
+                            f"{'\u2705' if pnl_pct > 0 else '\u274c'} Posición cerrada\n"
                             f"{symbol} {pos['side'].upper()} ({reason})\n"
                             f"PnL: <code>{pnl_pct:+.2f}%</code> ({pnl_usdt:+.2f} USDT)\n"
                             f"Duración: {duration_min:.0f}min"
@@ -643,7 +609,7 @@ def run() -> None:
                 _check_tp_extension(symbol, pos, current_price, feed, effective_min_score)
                 _save_positions(positions)
 
-            # ── Señales nuevas ─────────────────────────────────────────────
+            # ── Señales nuevas ─────────────────────────────────────────────────────
             if _is_weekend():
                 today = datetime.now(timezone.utc).weekday()
                 if today != _weekend_notified_day:
