@@ -43,16 +43,20 @@ WEEKDAY_MIN_SCORE = 70
 WEEKEND_MIN_SCORE = 90
 
 # ── Daily drawdown cap ──────────────────────────────────────────────────────
-# Si el PnL acumulado del día cae por debajo de este porcentaje del capital
-# estimado, el bot se pausa automáticamente hasta las 00:00 UTC.
 DAILY_MAX_LOSS_PCT = float(getattr(config, "DAILY_MAX_LOSS_PCT", -3.0))  # -3% default
 _daily_pnl_usdt: float = 0.0
-_daily_reset_date: int = -1  # día UTC del último reset
+_daily_reset_date: int = -1
 _daily_paused: bool = False
 
 _weekend_notified_day: int = -1
 
 VALID_SIDES = {"long", "short"}
+
+# ── Tolerancia de cierre: evita falsos cierres por flicker del exchange ────
+# Una posición se declara cerrada solo si desaparece del exchange durante
+# CLOSE_CONFIRM_LOOPS loops consecutivos (≈ LOOP_SLEEP × loops segundos).
+CLOSE_CONFIRM_LOOPS = 2
+_missing_count: dict[str, int] = {}   # symbol → nº de loops consecutivos sin verla
 
 
 def _is_weekend() -> bool:
@@ -60,7 +64,6 @@ def _is_weekend() -> bool:
 
 
 def _reset_daily_pnl_if_needed() -> None:
-    """Resetea el PnL diario a las 00:00 UTC y despausa si estaba pausado por drawdown."""
     global _daily_pnl_usdt, _daily_reset_date, _daily_paused
     today = datetime.now(timezone.utc).day
     if today != _daily_reset_date:
@@ -73,10 +76,8 @@ def _reset_daily_pnl_if_needed() -> None:
 
 
 def _register_pnl(pnl_usdt: float, symbol: str) -> None:
-    """Acumula el PnL del día y pausa si se supera el límite de drawdown."""
     global _daily_pnl_usdt, _daily_paused
     _daily_pnl_usdt += pnl_usdt
-    # Estimación de capital: MARGIN_USDT × MAX_POSITIONS (capital en juego máximo)
     capital_estimate = config.MARGIN_USDT * config.MAX_POSITIONS
     daily_pct = (_daily_pnl_usdt / capital_estimate) * 100 if capital_estimate else 0.0
     log.info("[drawdown] PnL acum. hoy: %+.2f USDT (%+.2f%% de ~%.0f USDT capital)",
@@ -98,7 +99,6 @@ def _is_daily_paused() -> bool:
 
 
 def _cooldown_for(symbol: str) -> int:
-    """Devuelve el tiempo de cooldown apropiado según el motivo del cierre."""
     reason = _cooldown_reason.get(symbol, "sl")
     return COOLDOWN_TP if reason == "tp" else COOLDOWN_SL
 
@@ -258,6 +258,12 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
+    """Estima precio y razón de cierre según los niveles SL/TP conocidos.
+
+    Si la posición fue sincronizada externamente (sl=None, tp=None), no podemos
+    inferir la razón y se devuelve MANUAL. En ese caso _infer_reason_from_price
+    intentará deducirla desde el precio actual vs entry.
+    """
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
@@ -288,32 +294,87 @@ def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
         if hit_sl:
             return sl, "SL"
 
+    # ── Inferencia por precio cuando sl/tp son None (posición externa) ──
+    # Si el precio se movió claramente a favor → TP, en contra → SL
+    entry = pos.get("entry", 0)
+    if entry > 0:
+        move_pct = ((current_price - entry) / entry) if side == "long" else ((entry - current_price) / entry)
+        if move_pct > 0.005:    # +0.5% a favor → TP
+            return current_price, "TP"
+        if move_pct < -0.003:   # -0.3% en contra → SL
+            return current_price, "SL"
+
     return current_price, "MANUAL"
 
 
-def _get_real_exit_price(symbol: str, pos: dict, fallback: float) -> tuple[float, str]:
-    """Intenta obtener el precio real de cierre del exchange.
+def _get_real_exit_price(symbol: str, pos: dict, fallback: float, fallback_reason: str) -> tuple[float, str]:
+    """Intenta obtener precio real de cierre desde el exchange.
 
-    Consulta el historial de órdenes del símbolo y busca la última orden
-    de cierre ejecutada (reduce_only o cierre de posición). Si falla,
-    cae al precio estimado por _exit_price_for.
+    Consulta el historial de órdenes cerradas del símbolo. Si falla o no hay
+    datos, devuelve el precio estimado (fallback).
     """
     try:
         closed_orders = exchange.get_closed_orders(symbol, limit=5)
         if closed_orders:
-            # La orden más reciente ejecutada es el cierre
             last = closed_orders[0]
             real_price = float(last.get("avgPrice") or last.get("price") or 0)
             if real_price > 0:
                 order_type = last.get("type", "").upper()
-                if "STOP" in order_type or "TAKE_PROFIT" in order_type or "MARKET" in order_type:
-                    reason = "TP" if "TAKE_PROFIT" in order_type else ("SL" if "STOP" in order_type else "MANUAL")
-                    log.debug("[%s] Precio real de cierre del exchange: %.6f (%s)", symbol, real_price, reason)
-                    return real_price, reason
+                if "TAKE_PROFIT" in order_type:
+                    return real_price, "TP"
+                if "STOP" in order_type:
+                    return real_price, "SL"
+                if "MARKET" in order_type:
+                    return real_price, fallback_reason
     except Exception as exc:
         log.debug("[%s] No se pudo obtener precio real de cierre: %s", symbol, exc)
-    # Fallback al precio estimado
-    return fallback, pos.get("_exit_reason", "MANUAL")
+    return fallback, fallback_reason
+
+
+def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
+    """Registra el cierre de una posición: PnL, cooldown, logger y Telegram."""
+    current_price = exchange.get_price(symbol)
+    exit_price_est, reason_est = _exit_price_for(p, current_price)
+    exit_price, reason = _get_real_exit_price(symbol, p, exit_price_est, reason_est)
+
+    pnl_pct = (
+        (exit_price - p["entry"]) / p["entry"]
+        if p["side"] == "long"
+        else (p["entry"] - exit_price) / p["entry"]
+    ) * config.LEVERAGE * 100
+    pnl_usdt = (pnl_pct / 100) * (p["qty"] * p["entry"] / config.LEVERAGE)
+
+    _cooldown[symbol]        = time.time()
+    _cooldown_reason[symbol] = "tp" if reason == "TP" else "sl"
+    cd_mins = (COOLDOWN_TP if reason == "TP" else COOLDOWN_SL) // 60
+    log.info("[%s] Cooldown %dm activado tras %s", symbol, cd_mins, reason)
+
+    _register_pnl(pnl_usdt, symbol)
+    _missing_count.pop(symbol, None)
+
+    trade_logger.record(
+        symbol     = symbol,
+        side       = p["side"],
+        entry      = p["entry"],
+        exit_price = exit_price,
+        pnl_pct    = pnl_pct,
+        pnl_usdt   = pnl_usdt,
+        score      = p.get("score", 0),
+        reason     = reason,
+        open_ts    = p.get("open_ts", time.time()),
+    )
+    telegram.notify_close(
+        symbol   = symbol,
+        side     = p["side"],
+        entry    = p["entry"],
+        exit_p   = exit_price,
+        pnl_pct  = pnl_pct,
+        pnl_usdt = pnl_usdt,
+        reason   = reason,
+        open_ts  = p.get("open_ts", 0.0),
+    )
+    log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT) | ext=%d",
+             symbol, reason, pnl_pct, pnl_usdt, p.get("tp_extensions", 0))
 
 
 def run() -> None:
@@ -349,7 +410,6 @@ def run() -> None:
         try:
             loop_count += 1
 
-            # ── Reset PnL diario a las 00:00 UTC ───────────────────────────
             _reset_daily_pnl_if_needed()
 
             weekend = _is_weekend()
@@ -357,58 +417,28 @@ def run() -> None:
 
             all_ex_positions = exchange.get_all_positions()
 
-            # ── Sync posiciones abiertas ────────────────────────────────────
+            # ── Sync posiciones abiertas con tolerancia de cierre ───────────
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
-                if not pos_ex:
-                    p             = positions.pop(symbol)
-                    current_price = exchange.get_price(symbol)
-                    exit_price_est, reason_est = _exit_price_for(p, current_price)
+                if pos_ex:
+                    # Posición sigue abierta — limpiar contador de ausencias
+                    _missing_count.pop(symbol, None)
+                    continue
 
-                    # FIX Gap 2: intentar obtener precio real de cierre del exchange
-                    exit_price, reason = _get_real_exit_price(symbol, p, exit_price_est)
-                    if reason == "MANUAL" and reason_est != "MANUAL":
-                        reason = reason_est  # si el exchange no aclara, usar estimación
+                # Posición no vista en este loop — incrementar contador
+                _missing_count[symbol] = _missing_count.get(symbol, 0) + 1
+                absent = _missing_count[symbol]
 
-                    pnl_pct = (
-                        (exit_price - p["entry"]) / p["entry"]
-                        if p["side"] == "long"
-                        else (p["entry"] - exit_price) / p["entry"]
-                    ) * config.LEVERAGE * 100
-                    pnl_usdt = (pnl_pct / 100) * (p["qty"] * p["entry"] / config.LEVERAGE)
-
-                    # FIX Gap 1: cooldown asimétrico — TP corto, SL largo
-                    _cooldown[symbol]        = time.time()
-                    _cooldown_reason[symbol] = "tp" if reason == "TP" else "sl"
-                    cd_mins = (COOLDOWN_TP if reason == "TP" else COOLDOWN_SL) // 60
-                    log.info("[%s] Cooldown %dm activado tras %s", symbol, cd_mins, reason)
-
-                    # FIX: acumular PnL diario para drawdown cap
-                    _register_pnl(pnl_usdt, symbol)
-
-                    trade_logger.record(
-                        symbol     = symbol,
-                        side       = p["side"],
-                        entry      = p["entry"],
-                        exit_price = exit_price,
-                        pnl_pct    = pnl_pct,
-                        pnl_usdt   = pnl_usdt,
-                        score      = p.get("score", 0),
-                        reason     = reason,
-                        open_ts    = p.get("open_ts", time.time()),
+                if absent < CLOSE_CONFIRM_LOOPS:
+                    log.debug(
+                        "[%s] No vista en exchange (intento %d/%d) — esperando confirmación",
+                        symbol, absent, CLOSE_CONFIRM_LOOPS,
                     )
-                    telegram.notify_close(
-                        symbol   = symbol,
-                        side     = p["side"],
-                        entry    = p["entry"],
-                        exit_p   = exit_price,
-                        pnl_pct  = pnl_pct,
-                        pnl_usdt = pnl_usdt,
-                        reason   = reason,
-                        open_ts  = p.get("open_ts", 0.0),
-                    )
-                    log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT) | ext=%d",
-                             symbol, reason, pnl_pct, pnl_usdt, p.get("tp_extensions", 0))
+                    continue
+
+                # Confirmado cerrada durante CLOSE_CONFIRM_LOOPS loops seguidos
+                p = positions.pop(symbol)
+                _declare_closed(symbol, p, positions)
 
             # ── Purgar cooldowns expirados ──────────────────────────────────
             expired = [
@@ -425,6 +455,7 @@ def run() -> None:
             for sym in expired_alerts:
                 _manual_alert_cooldown.pop(sym, None)
 
+            # ── Sincronizar posiciones externas al dict local ───────────────
             for symbol, pos_ex in all_ex_positions.items():
                 if symbol not in positions:
                     ex_side = pos_ex.get("side")
@@ -447,7 +478,7 @@ def run() -> None:
                         "score":         70,
                         "open_ts":       time.time(),
                     }
-                    log.info("[%s] Sincronizada: %s @ %.4f (sl=%s tp=%s)",
+                    log.info("[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s)",
                              symbol, ex_side, pos_ex["entry"],
                              pos_ex["sl"], pos_ex["tp"])
 

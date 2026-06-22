@@ -26,6 +26,29 @@ def _send(text: str) -> None:
         log.warning("Telegram error: %s", e)
 
 
+def _fmt_price(price: float) -> str:
+    """Formatea un precio con precisión adaptativa según su magnitud.
+
+    - Precios >= 1000   : 2 decimales  (BTC, ETH...)
+    - Precios >= 1      : 4 decimales  (SOL, BNB...)
+    - Precios >= 0.01   : 6 decimales  (XRP, DOGE...)
+    - Precios >= 0.0001 : 8 decimales  (SHIB, PEPE...)
+    - Precios menores   : notación e   (tokens muy pequeños)
+    """
+    if price == 0:
+        return "0"
+    if price >= 1000:
+        return f"{price:.2f}"
+    if price >= 1:
+        return f"{price:.4f}"
+    if price >= 0.01:
+        return f"{price:.6f}"
+    if price >= 0.0001:
+        return f"{price:.8f}"
+    # Tokens extremadamente pequeños — notación científica limpia
+    return f"{price:.2e}"
+
+
 def _fmt_qty(qty: float) -> str:
     """Formatea qty eliminando ceros superfluos."""
     if qty >= 1:
@@ -53,9 +76,9 @@ def notify_open(
         f"{emoji} <b>ABIERTA — {symbol}</b>\n"
         f"{SEP}\n"
         f"Dirección: <b>{side.upper()}</b> | Score: <b>{score_str}</b> | RR: <b>{rr_str}</b>\n"
-        f"Entry:  <code>{price:.6f}</code>\n"
-        f"SL:     <code>{sl:.6f}</code>  <i>(-{sl_pct:.2f}%)</i>\n"
-        f"TP:     <code>{tp:.6f}</code>  <i>(+{tp_pct:.2f}%)</i>\n"
+        f"Entry:  <code>{_fmt_price(price)}</code>\n"
+        f"SL:     <code>{_fmt_price(sl)}</code>  <i>(-{sl_pct:.2f}%)</i>\n"
+        f"TP:     <code>{_fmt_price(tp)}</code>  <i>(+{tp_pct:.2f}%)</i>\n"
         f"Qty:    <code>{_fmt_qty(qty)}</code>\n"
         f"Margen: <code>{margin} USDT</code> @ {config.LEVERAGE}x"
     )
@@ -90,8 +113,8 @@ def notify_close(
         f"{emoji} <b>CERRADA — {symbol}</b>\n"
         f"{SEP}\n"
         f"Dirección: <b>{side.upper()}</b> | Razón: <b>{reason_str}</b>\n"
-        f"Entry:  <code>{entry:.6f}</code>\n"
-        f"Exit:   <code>{exit_p:.6f}</code>\n"
+        f"Entry:  <code>{_fmt_price(entry)}</code>\n"
+        f"Exit:   <code>{_fmt_price(exit_p)}</code>\n"
         f"PnL:    <code>{pnl_pct:+.2f}%</code>"
         + (f"  <code>{pnl_usdt_str}</code>" if pnl_usdt_str else "") +
         f"\nDur:    <code>{dur_str}</code>"

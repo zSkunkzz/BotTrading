@@ -13,6 +13,10 @@ Variables de entorno:
 FIX: _cache protegido con _cache_lock (threading.Lock) para evitar race conditions
      entre el thread del loop principal (record/append) y el thread de Telegram
      (_fetch_trade_history / _check_winrate).
+
+NOTA: trade_logger.record() ya NO envía mensaje a Telegram — eso lo hace
+     telegram.notify_close() en main.py para evitar mensajes duplicados.
+     trade_logger solo persiste en CSV y en _cache para el resumen diario.
 """
 import csv
 import logging
@@ -21,22 +25,14 @@ import threading
 import time
 from datetime import datetime, timezone
 
-import httpx
-
 import config
-import telegram as _tg
 
 log = logging.getLogger("trade_logger")
 
 LOG_FILE  = os.getenv("TRADES_CSV", "trades.csv")
 HEADER    = ["date","symbol","side","entry","exit","pnl_pct","pnl_usdt","score","reason","duration_min"]
 
-_API         = f"https://api.telegram.org/bot{config.TG_TOKEN}"
-_LOG_CHAT_ID = os.getenv("TG_LOG_CHAT_ID") or config.TG_CHAT_ID
-
 _csv_lock:   threading.Lock = threading.Lock()
-# FIX: lock independiente para _cache — protege accesos concurrentes entre
-# el loop principal (record) y el thread de Telegram (tg_commands._fetch_trade_history).
 _cache_lock: threading.Lock = threading.Lock()
 _cache: list[dict] = []
 
@@ -62,11 +58,7 @@ def _reset_daily_if_needed() -> None:
 
 
 def _restore_daily_loss_from_csv() -> None:
-    """Lee el CSV al arrancar y recalcula la pérdida acumulada del día UTC actual.
-
-    Esto garantiza que el daily drawdown limit sobrevive reinicios y deploys.
-    Si el CSV no existe o falla la lectura, arranca desde 0 sin interrumpir el bot.
-    """
+    """Lee el CSV al arrancar y recalcula la pérdida acumulada del día UTC actual."""
     global _daily_loss_usdt, _daily_loss_date, _daily_limit_hit
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -82,7 +74,6 @@ def _restore_daily_loss_from_csv() -> None:
         with open(LOG_FILE, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                # Filtra solo trades del día UTC actual
                 if not row.get("date", "").startswith(today):
                     continue
                 try:
@@ -90,7 +81,6 @@ def _restore_daily_loss_from_csv() -> None:
                     if pnl < 0:
                         recovered_loss += abs(pnl)
                     recovered_trades += 1
-                    # Reconstruir caché del día para win rate monitor
                     with _cache_lock:
                         _cache.append({
                             "date":     row["date"],
@@ -108,23 +98,10 @@ def _restore_daily_loss_from_csv() -> None:
                     continue
 
         _daily_loss_usdt = recovered_loss
-
-        if recovered_loss >= config.MAX_DAILY_LOSS_USDT:
-            _daily_limit_hit = True
-            log.warning(
-                "Daily limit ya alcanzado antes del reinicio: -%.2f USDT (límite %.2f)",
-                recovered_loss, config.MAX_DAILY_LOSS_USDT,
-            )
-            _tg.notify(
-                f"⚠️ Bot reiniciado — daily limit ya alcanzado\n"
-                f"Pérdida acumulada hoy: <code>-{recovered_loss:.2f} USDT</code>\n"
-                f"⛔ Sin nuevas entradas hasta 00:00 UTC."
-            )
-        else:
-            log.info(
-                "Daily loss restaurado desde CSV: -%.2f USDT (%d trades hoy, límite %.2f)",
-                recovered_loss, recovered_trades, config.MAX_DAILY_LOSS_USDT,
-            )
+        log.info(
+            "Daily loss restaurado desde CSV: -%.2f USDT (%d trades hoy)",
+            recovered_loss, recovered_trades,
+        )
 
     except Exception as e:
         log.warning("Error restaurando daily loss desde CSV: %s — arrancando desde 0", e)
@@ -143,12 +120,6 @@ def _check_daily_drawdown(pnl_usdt: float) -> None:
             log.warning(
                 "🚨 Daily drawdown límite alcanzado: -%.2f USDT (límite %.2f USDT)",
                 _daily_loss_usdt, config.MAX_DAILY_LOSS_USDT,
-            )
-            _tg.notify(
-                f"🚨 <b>Daily drawdown límite alcanzado</b>\n"
-                f"Pérdida acumulada hoy: <code>-{_daily_loss_usdt:.2f} USDT</code>\n"
-                f"Límite: <code>{config.MAX_DAILY_LOSS_USDT:.2f} USDT</code>\n"
-                f"⛔ No se abrirán nuevas posiciones hasta mañana (00:00 UTC)."
             )
 
 
@@ -177,13 +148,18 @@ def _check_winrate() -> None:
             "⚠️ Win rate bajo: %.0f%% en últimos %d trades (umbral %.0f%%)",
             win_rate, lookback, threshold,
         )
-        _tg.notify(
-            f"⚠️ <b>Win rate bajo</b>\n"
-            f"Últimos {lookback} trades: <code>{win_rate:.0f}%</code> "
-            f"({wins}W / {lookback - wins}L)\n"
-            f"Umbral: <code>{threshold:.0f}%</code>\n"
-            f"Revisa las condiciones de mercado."
-        )
+        # Importar telegram aquí para evitar circular import
+        try:
+            import telegram as _tg
+            _tg.notify(
+                f"⚠️ <b>Win rate bajo</b>\n"
+                f"Últimos {lookback} trades: <code>{win_rate:.0f}%</code> "
+                f"({wins}W / {lookback - wins}L)\n"
+                f"Umbral: <code>{threshold:.0f}%</code>\n"
+                f"Revisa las condiciones de mercado."
+            )
+        except Exception:
+            pass
     elif win_rate >= threshold and _winrate_alerted:
         _winrate_alerted = False
         log.info("Win rate recuperado: %.0f%% en últimos %d trades", win_rate, lookback)
@@ -193,19 +169,6 @@ def get_cache_snapshot() -> list[dict]:
     """Devuelve una copia thread-safe de _cache para lectura externa."""
     with _cache_lock:
         return list(_cache)
-
-
-def _tg_send(text: str) -> None:
-    if not config.TG_TOKEN or not _LOG_CHAT_ID:
-        return
-    try:
-        httpx.post(f"{_API}/sendMessage", json={
-            "chat_id":    _LOG_CHAT_ID,
-            "text":       text,
-            "parse_mode": "HTML",
-        }, timeout=5)
-    except Exception as e:
-        log.warning("trade_logger TG error: %s", e)
 
 
 def _write_csv(row: list) -> None:
@@ -233,25 +196,15 @@ def record(
     reason:     str,
     open_ts:    float,
 ) -> None:
+    """Persiste el trade en CSV y _cache. NO envía mensaje Telegram — eso lo hace main.py."""
     duration = round((time.time() - open_ts) / 60, 1)
     now_str  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
     row = [now_str, symbol, side,
-           round(entry, 6), round(exit_price, 6),
+           round(entry, 8), round(exit_price, 8),
            round(pnl_pct, 2), round(pnl_usdt, 4),
            score, reason, duration]
 
-    result_icon = "✅" if pnl_pct >= 0 else "❌"
-    side_icon   = "🟢" if side == "long" else "🔴"
-    msg = (
-        f"📌 <b>{symbol}</b> | {side_icon} {side.upper()} | {reason} {result_icon}\n"
-        f"Entry:    <code>{entry:.4f}</code>\n"
-        f"Exit:     <code>{exit_price:.4f}</code>\n"
-        f"PnL:      <code>{pnl_pct:+.2f}%</code> | <code>{pnl_usdt:+.4f} USDT</code>\n"
-        f"Score:    <code>{score}</code> | Dur: <code>{duration} min</code>\n"
-        f"<i>{now_str} UTC</i>"
-    )
-    _tg_send(msg)
     _write_csv(row)
 
     with _cache_lock:
@@ -267,11 +220,16 @@ def record(
 
 
 def send_daily_summary() -> None:
+    try:
+        import telegram as _tg
+    except Exception:
+        return
+
     with _cache_lock:
         cache_snapshot = list(_cache)
 
     if not cache_snapshot:
-        _tg_send("📊 <b>Resumen del día</b>\nSin trades en esta sesión.")
+        _tg.notify("📊 <b>Resumen del día</b>\nSin trades en esta sesión.")
         return
 
     total     = len(cache_snapshot)
@@ -287,7 +245,7 @@ def send_daily_summary() -> None:
         icon = "✅" if t["pnl_pct"] >= 0 else "❌"
         lines.append(f"{icon} {t['symbol']} {t['side'].upper()} {t['pnl_pct']:+.2f}%")
 
-    _tg_send("\n".join(lines))
+    _tg.notify("\n".join(lines))
 
     with _cache_lock:
         _cache.clear()
