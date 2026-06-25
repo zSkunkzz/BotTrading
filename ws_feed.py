@@ -40,11 +40,13 @@ PRELOAD_WORKERS = 8
 _READY_MIN = {"15m": 120, "1h": 215}
 _PRELOAD   = {"15m": 120, "1h": 220, "4h": 70}
 
-# Si 15m o 1h llevan más de este umbral sin recibir datos, el símbolo se
-# considera obsoleto y ready() devuelve False.
-# Las velas 15m llegan cada 15 min como máximo; 10 min detecta desconexiones
-# sin generar falsos positivos en condiciones normales.
-STALE_THRESHOLD = 10 * 60  # 10 minutos
+# FIX #4: STALE_THRESHOLD reducido de 10 min a 4 min.
+# El loop principal corre cada 20s. Con 10 min el bot podía evaluar señales
+# con datos de hasta 9 min de antigüedad tras una caída del WS, abriendo
+# posiciones sobre precios que ya se habían movido significativamente.
+# Con 4 min (≈2 velas de 15m sin confirmar) se detecta la caída antes
+# de que los datos sean peligrosamente obsoletos.
+STALE_THRESHOLD = 4 * 60  # 4 minutos
 
 
 class KlineFeed:
@@ -65,7 +67,7 @@ class KlineFeed:
         self._ws      = None
         self._running = False
 
-    # ── API pública ────────────────────────────────────────────────────
+    # ── API pública ──────────────────────────────────────────────────
 
     def get(self, symbol: str, timeframe: str) -> list[dict]:
         with self._lock:
@@ -121,7 +123,7 @@ class KlineFeed:
         if self._ws:
             self._ws.close()
 
-    # ── Precarga REST en paralelo ───────────────────────────────────────
+    # ── Precarga REST en paralelo ───────────────────────────────────────────
 
     def _preload_one(self, symbol: str, tf: str, limit: int) -> None:
         try:
@@ -150,7 +152,7 @@ class KlineFeed:
                 if done % 20 == 0 or done == len(tasks):
                     log.info("Precarga: %d/%d completadas", done, len(tasks))
 
-    # ── WebSocket ──────────────────────────────────────────────────────────
+    # ── WebSocket ────────────────────────────────────────────────────────────────────────
 
     def _run_forever(self) -> None:
         while self._running:
