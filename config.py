@@ -50,12 +50,21 @@ SL_PCT         = float(os.getenv("SL_PCT", "1.5"))
 TP_PCT         = float(os.getenv("TP_PCT", "3.0"))
 
 # Señales
+# FIX #5: WEEKDAY_MIN_SCORE y WEEKEND_MIN_SCORE son ahora configurables por env var.
+# MIN_SCORE es alias legacy — apunta siempre a WEEKDAY_MIN_SCORE para que
+# cambiar cualquiera de los dos funcione en todos los sitios que lo leen.
 TIMEFRAME           = os.getenv("TIMEFRAME", "15m")
 LOOP_SLEEP          = int(os.getenv("LOOP_SLEEP", "20"))
-MIN_SCORE           = int(os.getenv("MIN_SCORE", "55"))
+WEEKDAY_MIN_SCORE   = int(os.getenv("WEEKDAY_MIN_SCORE", os.getenv("MIN_SCORE", "70")))
 WEEKEND_MIN_SCORE   = int(os.getenv("WEEKEND_MIN_SCORE", "90"))
+MIN_SCORE           = WEEKDAY_MIN_SCORE   # alias legacy
 
 # Riesgo diario
+# FIX #3: DAILY_MAX_LOSS_PCT ahora existe en config y es configurable por env var.
+# Antes main.py usaba getattr(config, "DAILY_MAX_LOSS_PCT", -3.0) pero la variable
+# no existía aquí — siempre usaba el -3.0 hardcodeado sin poder cambiarlo por env.
+# MAX_DAILY_LOSS_USDT se conserva para compatibilidad.
+DAILY_MAX_LOSS_PCT  = float(os.getenv("DAILY_MAX_LOSS_PCT", "-3.0"))
 MAX_DAILY_LOSS_USDT = float(os.getenv("MAX_DAILY_LOSS_USDT", "30"))
 
 # Win rate monitor
