@@ -25,16 +25,14 @@ _cooldown: dict[str, float] = {}
 _cooldown_reason: dict[str, str] = {}   # 'tp' | 'sl'
 _manual_alert_cooldown: dict[str, float] = {}
 
-# ── Cooldown asimétrico: TP corto (no bloquear pares ganadores), SL largo ──
+# ── Cooldown asimétrico ─────────────────────────────────────────────────────
 COOLDOWN_SL           = 60 * 60       # 60 min tras SL
 COOLDOWN_TP           = 15 * 60       # 15 min tras TP
 MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
 TP_EXTEND_THRESH       = 0.015
-
-# Guard temporal — ni extend_tp ni trailing actúan en los primeros 5 min
-MIN_HOLD_SECS = 300
+MIN_HOLD_SECS          = 300
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -42,60 +40,17 @@ READY_MIN_PCT = 0.80
 WEEKDAY_MIN_SCORE = 70
 WEEKEND_MIN_SCORE = 90
 
-# ── Daily drawdown cap ──────────────────────────────────────────────────────
-DAILY_MAX_LOSS_PCT = float(getattr(config, "DAILY_MAX_LOSS_PCT", -3.0))  # -3% default
-_daily_pnl_usdt: float = 0.0
-_daily_reset_date: int = -1
-_daily_paused: bool = False
-
-_weekend_notified_day: int = -1
-
 VALID_SIDES = {"long", "short"}
 
-# ── Tolerancia de cierre: evita falsos cierres por flicker del exchange ────
-# Una posición se declara cerrada solo si desaparece del exchange durante
-# CLOSE_CONFIRM_LOOPS loops consecutivos (≈ LOOP_SLEEP × loops segundos).
+# Tolerancia de cierre
 CLOSE_CONFIRM_LOOPS = 2
-_missing_count: dict[str, int] = {}   # symbol → nº de loops consecutivos sin verla
+_missing_count: dict[str, int] = {}
+
+_weekend_notified_day: int = -1
 
 
 def _is_weekend() -> bool:
     return datetime.now(timezone.utc).weekday() >= 5
-
-
-def _reset_daily_pnl_if_needed() -> None:
-    global _daily_pnl_usdt, _daily_reset_date, _daily_paused
-    today = datetime.now(timezone.utc).day
-    if today != _daily_reset_date:
-        _daily_reset_date = today
-        _daily_pnl_usdt   = 0.0
-        if _daily_paused:
-            _daily_paused = False
-            log.info("[drawdown] Nuevo día UTC — drawdown diario reseteado, bot activo")
-            telegram.notify("🌅 Nuevo día UTC — límite de pérdidas diario reseteado. Bot activo.")
-
-
-def _register_pnl(pnl_usdt: float, symbol: str) -> None:
-    global _daily_pnl_usdt, _daily_paused
-    _daily_pnl_usdt += pnl_usdt
-    capital_estimate = config.MARGIN_USDT * config.MAX_POSITIONS
-    daily_pct = (_daily_pnl_usdt / capital_estimate) * 100 if capital_estimate else 0.0
-    log.info("[drawdown] PnL acum. hoy: %+.2f USDT (%+.2f%% de ~%.0f USDT capital)",
-             _daily_pnl_usdt, daily_pct, capital_estimate)
-    if daily_pct <= DAILY_MAX_LOSS_PCT and not _daily_paused:
-        _daily_paused = True
-        msg = (
-            f"🛑 <b>Límite de pérdidas diario alcanzado</b>\n"
-            f"PnL hoy: <code>{_daily_pnl_usdt:+.2f} USDT</code> ({daily_pct:+.2f}%)\n"
-            f"Umbral: {DAILY_MAX_LOSS_PCT}% — bot pausado hasta las 00:00 UTC.\n"
-            f"Las posiciones abiertas siguen gestionándose (trailing/TP)."
-        )
-        log.warning("[drawdown] %s", msg.replace("\n", " "))
-        telegram.notify(msg)
-
-
-def _is_daily_paused() -> bool:
-    return _daily_paused
 
 
 def _cooldown_for(symbol: str) -> int:
@@ -126,7 +81,7 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                     exchange.cancel_all_orders(symbol)
                     exchange.place_stop_order(symbol, "long", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "long", pos["qty"], pos["tp"])
-                    telegram.notify(f"🔼 Trailing SL movido\n{symbol} LONG\nNuevo SL: <code>{new_sl:.4f}</code>")
+                    telegram.notify(f"\U0001f53c Trailing SL movido\n{symbol} LONG\nNuevo SL: <code>{new_sl:.6f}</code>")
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
     else:
@@ -141,7 +96,7 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                     exchange.cancel_all_orders(symbol)
                     exchange.place_stop_order(symbol, "short", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "short", pos["qty"], pos["tp"])
-                    telegram.notify(f"🔽 Trailing SL movido\n{symbol} SHORT\nNuevo SL: <code>{new_sl:.4f}</code>")
+                    telegram.notify(f"\U0001f53d Trailing SL movido\n{symbol} SHORT\nNuevo SL: <code>{new_sl:.6f}</code>")
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
 
@@ -172,7 +127,6 @@ def _check_tp_extension(
 
     if not near_tp:
         return
-
     if pos.get("_extending"):
         return
     pos["_extending"] = True
@@ -225,11 +179,11 @@ def _check_tp_extension(
     pos["_extending"]    = False
 
     log.info(
-        "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL sin cambios=%.6f | score=%d",
+        "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL=%.6f | score=%d",
         symbol, extensions + 1, old_tp, new_tp, current_sl, score,
     )
     telegram.notify(
-        f"📈 TP Extendido #{extensions + 1}\n"
+        f"\U0001f4c8 TP Extendido #{extensions + 1}\n"
         f"{symbol} {side.upper()}\n"
         f"TP anterior: <code>{old_tp:.6f}</code>\n"
         f"Nuevo TP: <code>{new_tp:.6f}</code>\n"
@@ -258,12 +212,6 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
-    """Estima precio y razón de cierre según los niveles SL/TP conocidos.
-
-    Si la posición fue sincronizada externamente (sl=None, tp=None), no podemos
-    inferir la razón y se devuelve MANUAL. En ese caso _infer_reason_from_price
-    intentará deducirla desde el precio actual vs entry.
-    """
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
@@ -294,25 +242,21 @@ def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
         if hit_sl:
             return sl, "SL"
 
-    # ── Inferencia por precio cuando sl/tp son None (posición externa) ──
-    # Si el precio se movió claramente a favor → TP, en contra → SL
     entry = pos.get("entry", 0)
     if entry > 0:
-        move_pct = ((current_price - entry) / entry) if side == "long" else ((entry - current_price) / entry)
-        if move_pct > 0.005:    # +0.5% a favor → TP
+        move_pct = (
+            (current_price - entry) / entry if side == "long"
+            else (entry - current_price) / entry
+        )
+        if move_pct > 0.005:
             return current_price, "TP"
-        if move_pct < -0.003:   # -0.3% en contra → SL
+        if move_pct < -0.003:
             return current_price, "SL"
 
     return current_price, "MANUAL"
 
 
 def _get_real_exit_price(symbol: str, pos: dict, fallback: float, fallback_reason: str) -> tuple[float, str]:
-    """Intenta obtener precio real de cierre desde el exchange.
-
-    Consulta el historial de órdenes cerradas del símbolo. Si falla o no hay
-    datos, devuelve el precio estimado (fallback).
-    """
     try:
         closed_orders = exchange.get_closed_orders(symbol, limit=5)
         if closed_orders:
@@ -344,14 +288,37 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
     ) * config.LEVERAGE * 100
     pnl_usdt = (pnl_pct / 100) * (p["qty"] * p["entry"] / config.LEVERAGE)
 
+    # Cooldown
     _cooldown[symbol]        = time.time()
     _cooldown_reason[symbol] = "tp" if reason == "TP" else "sl"
     cd_mins = (COOLDOWN_TP if reason == "TP" else COOLDOWN_SL) // 60
     log.info("[%s] Cooldown %dm activado tras %s", symbol, cd_mins, reason)
 
-    _register_pnl(pnl_usdt, symbol)
     _missing_count.pop(symbol, None)
 
+    # ── Registrar PnL en bot_state (fuente única de verdad) ──────────────
+    limit_hit = bot_state.record_trade(pnl_usdt)
+    daily_pnl = bot_state.get_daily_pnl()
+    capital   = config.MARGIN_USDT * config.MAX_POSITIONS
+    daily_pct = (daily_pnl / capital * 100) if capital else 0.0
+    daily_max = float(getattr(config, "DAILY_MAX_LOSS_PCT", -3.0))
+
+    log.info(
+        "[drawdown] PnL acum. hoy: %+.2f USDT (%+.2f%% de ~%.0f USDT capital)",
+        daily_pnl, daily_pct, capital,
+    )
+
+    if limit_hit:
+        msg = (
+            f"\U0001f6d1 <b>L\u00edmite de p\u00e9rdidas diario alcanzado</b>\n"
+            f"PnL hoy: <code>{daily_pnl:+.2f} USDT</code> ({daily_pct:+.2f}%)\n"
+            f"Umbral: {daily_max}% — bot pausado hasta las 00:00 UTC.\n"
+            f"Las posiciones abiertas siguen gestion\u00e1ndose (trailing/TP)."
+        )
+        log.warning("[drawdown] %s", msg.replace("\n", " "))
+        telegram.notify(msg)
+
+    # ── Persistir en CSV y _cache ─────────────────────────────────────────
     trade_logger.record(
         symbol     = symbol,
         side       = p["side"],
@@ -363,6 +330,8 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
         reason     = reason,
         open_ts    = p.get("open_ts", time.time()),
     )
+
+    # ── Notificación Telegram del cierre ──────────────────────────────────
     telegram.notify_close(
         symbol   = symbol,
         side     = p["side"],
@@ -372,7 +341,9 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
         pnl_usdt = pnl_usdt,
         reason   = reason,
         open_ts  = p.get("open_ts", 0.0),
+        daily_pnl= daily_pnl,
     )
+
     log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT) | ext=%d",
              symbol, reason, pnl_pct, pnl_usdt, p.get("tp_extensions", 0))
 
@@ -392,7 +363,7 @@ def run() -> None:
             log.warning("No se pudo setear leverage en %s: %s", symbol, e)
 
     telegram.notify(
-        f"🤖 Bot iniciado — {len(config.SYMBOLS)} pares | "
+        f"\U0001f916 Bot iniciado — {len(config.SYMBOLS)} pares | "
         f"{config.LEVERAGE}x | max {config.MAX_POSITIONS} posiciones"
     )
 
@@ -410,22 +381,23 @@ def run() -> None:
         try:
             loop_count += 1
 
-            _reset_daily_pnl_if_needed()
+            # ── Nuevo día UTC → resetear drawdown y reactivar bot ───────────
+            if bot_state.reset_daily_if_new_day():
+                log.info("[drawdown] Nuevo día UTC — bot reactivado")
+                telegram.notify("\U0001f305 Nuevo día UTC — límite de pérdidas reseteado. Bot activo.")
 
             weekend = _is_weekend()
             effective_min_score = WEEKEND_MIN_SCORE if weekend else WEEKDAY_MIN_SCORE
 
             all_ex_positions = exchange.get_all_positions()
 
-            # ── Sync posiciones abiertas con tolerancia de cierre ───────────
+            # ── Sync posiciones con tolerancia de cierre ────────────────────
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if pos_ex:
-                    # Posición sigue abierta — limpiar contador de ausencias
                     _missing_count.pop(symbol, None)
                     continue
 
-                # Posición no vista en este loop — incrementar contador
                 _missing_count[symbol] = _missing_count.get(symbol, 0) + 1
                 absent = _missing_count[symbol]
 
@@ -436,7 +408,6 @@ def run() -> None:
                     )
                     continue
 
-                # Confirmado cerrada durante CLOSE_CONFIRM_LOOPS loops seguidos
                 p = positions.pop(symbol)
                 _declare_closed(symbol, p, positions)
 
@@ -485,14 +456,19 @@ def run() -> None:
             open_count = len(positions)
 
             if loop_count % 10 == 1:
-                daily_status = f" | PnL hoy: {_daily_pnl_usdt:+.2f} USDT"
-                paused_str = "PAUSADO(drawdown)" if _daily_paused else ("PAUSADO" if bot_state.is_paused() else "activo")
-                log.info("[loop #%d] Posiciones: %d/%d | Feed: %d/%d | Cooldowns: %d | Estado: %s%s",
-                         loop_count, open_count, config.MAX_POSITIONS,
-                         feed.ready_count(), len(config.SYMBOLS), len(_cooldown),
-                         paused_str, daily_status)
+                daily_pnl = bot_state.get_daily_pnl()
+                paused_str = (
+                    "PAUSADO(drawdown)" if bot_state.is_daily_limit_hit()
+                    else ("PAUSADO" if bot_state.is_paused() else "activo")
+                )
+                log.info(
+                    "[loop #%d] Posiciones: %d/%d | Feed: %d/%d | Cooldowns: %d | Estado: %s | PnL hoy: %+.2f USDT",
+                    loop_count, open_count, config.MAX_POSITIONS,
+                    feed.ready_count(), len(config.SYMBOLS), len(_cooldown),
+                    paused_str, daily_pnl,
+                )
 
-            # ── Trailing stop + extend TP proactivo ────────────────────────
+            # ── Trailing stop + extend TP ───────────────────────────────────
             for symbol, pos in list(positions.items()):
                 try:
                     price = exchange.get_price(symbol)
@@ -507,20 +483,20 @@ def run() -> None:
                 if today != _weekend_notified_day:
                     _weekend_notified_day = today
                     day_name = "Sábado" if today == 5 else "Domingo"
-                    log.info("Modo fin de semana activo (%s UTC) — score mínimo %d para nuevas entradas",
+                    log.info("Modo fin de semana activo (%s UTC) — score mínimo %d",
                              day_name, WEEKEND_MIN_SCORE)
                     telegram.notify(
-                        f"🚫 Modo fin de semana ({day_name})\n"
-                        f"No se abrirán posiciones nuevas salvo score ≥ {WEEKEND_MIN_SCORE}.\n"
+                        f"\U0001f6ab Modo fin de semana ({day_name})\n"
+                        f"No se abrirán posiciones nuevas salvo score \u2265 {WEEKEND_MIN_SCORE}.\n"
                         f"Posiciones actuales siguen gestionándose con normalidad."
                     )
 
             # ── Buscar señales ──────────────────────────────────────────────
-            if bot_state.is_paused() or _is_daily_paused():
-                if _is_daily_paused():
+            if bot_state.is_paused() or bot_state.is_daily_limit_hit():
+                if bot_state.is_daily_limit_hit():
                     log.debug("Bot pausado por drawdown diario — saltando búsqueda de señales")
                 else:
-                    log.debug("Bot pausado — saltando búsqueda de señales")
+                    log.debug("Bot pausado manualmente — saltando búsqueda de señales")
             else:
                 if loop_count % 10 == 1:
                     regime_summary = []
@@ -584,15 +560,15 @@ def run() -> None:
                         # ── Modo alerta manual ──────────────────────────────
                         if is_manual:
                             _manual_alert_cooldown[symbol] = time.time()
-                            side_icon = "🟡" if signal == "long" else "🔴"
+                            side_icon = "\U0001f7e1" if signal == "long" else "\U0001f534"
                             telegram.notify(
-                                f"🚨 <b>Alerta manual — {symbol}</b>\n\n"
+                                f"\U0001f6a8 <b>Alerta manual — {symbol}</b>\n\n"
                                 f"{side_icon} Dirección: <b>{signal.upper()}</b>\n"
-                                f"Precio actual: <code>{price:.2f}</code>\n"
-                                f"SL sugerido:   <code>{params['sl']:.2f}</code>\n"
-                                f"TP sugerido:   <code>{params['tp']:.2f}</code>\n"
+                                f"Precio actual: <code>{price:.6f}</code>\n"
+                                f"SL sugerido:   <code>{params['sl']:.6f}</code>\n"
+                                f"TP sugerido:   <code>{params['tp']:.6f}</code>\n"
                                 f"Score: <b>{score}</b>\n\n"
-                                f"⚠️ <i>Operación NO abierta automáticamente. Ábrela tú si lo consideras.</i>"
+                                f"\u26a0\ufe0f <i>Operación NO abierta automáticamente.</i>"
                             )
                             log.info("[%s] ALERTA MANUAL enviada | %s score=%d", symbol, signal.upper(), score)
                             continue
@@ -646,7 +622,7 @@ def run() -> None:
 
         except Exception as e:
             log.error("Error en loop: %s", e, exc_info=True)
-            telegram.notify(f"⚠️ Error en bot: {e}")
+            telegram.notify(f"\u26a0\ufe0f Error en bot: {e}")
 
         time.sleep(config.LOOP_SLEEP)
 
