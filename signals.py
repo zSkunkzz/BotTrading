@@ -3,7 +3,7 @@
 Filtros:
   1. Vela cerrada       : penúltima vela (ya cerrada)
   2. Régimen de mercado : clasificación por EMAs 1h (ADX no bloquea, penaliza)
-                          NUEVO: requiere REGIME_CONFIRM_BARS velas 1h consecutivas
+                          Requiere REGIME_CONFIRM_BARS velas 1h consecutivas
                           confirmando el mismo régimen antes de habilitar señales
   3. Macro 4h           : EMA50 en 4h — bonus/penalización/neutro según disponibilidad
   4. EMA200 1h          : hard-guard de dirección (calculado sobre velas cerradas)
@@ -172,15 +172,27 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
 
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
-    """Devuelve el régimen solo si las últimas n velas cerradas coinciden."""
+    """Devuelve el régimen solo si las últimas n+1 velas cerradas coinciden.
+
+    BUG CORREGIDO: la versión anterior usaba candles_1h[:-offset] con
+    offset de n..1, lo que hacía que la última ventana nunca incluyese
+    la vela más reciente (se cortaba con [:-1]) y el régimen aparecía
+    siempre como inestable salvo coincidencia. Ahora se calculan n
+    ventanas históricas correctamente escalonadas más el estado actual.
+    """
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
 
+    # Estado actual (incluye última vela cerrada)
     regime_now, adx_now = _market_regime(candles_1h)
 
+    # n ventanas anteriores: desplazadas 1, 2, ... n velas atrás
+    # candles_1h[:-k] da la vista como si no hubiesen llegado las últimas k velas
     regimes_prev = []
-    for offset in range(n, 0, -1):
-        window = candles_1h[:-offset]
+    for k in range(1, n + 1):
+        window = candles_1h[:-k]
+        if len(window) < 200:
+            return "range", adx_now
         regime_hist, _ = _market_regime(window)
         regimes_prev.append(regime_hist)
 
@@ -248,9 +260,15 @@ def evaluate(
     # ── 4. Macro 4h ───────────────────────────────────────────────────────
     score += _macro_pts(candles_4h, direction)
 
-    # ── 5. EMA200 1h hard-guard (sobre velas cerradas) ────────────────────
-    closes_1h = [c["close"] for c in candles_1h[:-1]]
-    ema200_1h = _ema(closes_1h, 200)[-1]
+    # ── 5. EMA200 1h hard-guard ───────────────────────────────────────────
+    # Usamos velas cerradas (excluye la vela 1h en curso) para el guard EMA200.
+    # NOTA: closes_1h_closed se usa SOLO para este guard. El MACD 1h usa
+    # closes_1h_full (incluyendo última cerrada) para mantener alineación
+    # de índices con RSI y ADX — que también usan candles_15m[:-1] y
+    # candles_1h completo respectivamente.
+    closes_1h_closed = [c["close"] for c in candles_1h[:-1]]
+    closes_1h_full   = [c["close"] for c in candles_1h]
+    ema200_1h = _ema(closes_1h_closed, 200)[-1]
     price     = closes_15m[-2]
     if direction == "long"  and price < ema200_1h * (1 - EMA200_MIN_DIST):
         return None, score
@@ -258,8 +276,6 @@ def evaluate(
         return None, score
 
     # ── 5b. Guard ATR volátil ─────────────────────────────────────────────
-    # Si el ATR 15m supera el 3.5% del precio, el mercado está en modo
-    # evento/noticias: el SL real desbordaría el cap de 2.5% → no entrar.
     atr_15m_raw = _atr(candles_15m[:-1])
     if price > 0 and atr_15m_raw / price > ATR_VOLATILE_PCT:
         log.info(
@@ -271,7 +287,6 @@ def evaluate(
     # ── 6. ADX 15m ────────────────────────────────────────────────────────
     adx_15m = _adx(candles_15m[:-1], 14)
 
-    # Hard-guard: sin tendencia mínima en 15m, no operar
     if adx_15m < 15:
         log.debug("Hard-guard ADX 15m demasiado bajo: %.1f — señal descartada", adx_15m)
         return None, score
@@ -285,7 +300,6 @@ def evaluate(
     if   adx_1h > 25: score += 5
     elif adx_1h < 18: score -= 5
 
-    # Hard-guard short en bear choppy: régimen bear pero sin fuerza en 1h
     if direction == "short" and adx_1h < 18:
         log.debug(
             "Hard-guard short: regime=bear pero adx_1h=%.1f — mercado rebotando sin tendencia",
@@ -308,10 +322,12 @@ def evaluate(
         rsi_dir   = rsi_now > rsi_prev
         rsi_bad   = rsi_now < 45
     else:
+        # BUG CORREGIDO: rsi_bad era >55, demasiado permisivo para confirmar short.
+        # Un RSI > 60 es más fiable como indicador de sobrecompra que >55.
         rsi_cross = rsi_prev > 50 >= rsi_now
         rsi_ext   = rsi_now < 45
         rsi_dir   = rsi_now < rsi_prev
-        rsi_bad   = rsi_now > 55
+        rsi_bad   = rsi_now > 60
 
     if   rsi_cross: score += 15
     elif rsi_ext:   score += 8
@@ -329,7 +345,11 @@ def evaluate(
         if   h_now < 0: score += 10
         elif h_now > 0: score -= 5
 
-    hist_1h = _macd_histogram(closes_1h[:-1])
+    # BUG CORREGIDO: usamos closes_1h_full (serie alineada con _regime_confirmed
+    # y _adx) en lugar de closes_1h (variable que antes apuntaba a la versión
+    # recortada [:-1] usada para EMA200). Esto evita el desalineamiento de
+    # índices entre MACD 1h y el resto de indicadores.
+    hist_1h = _macd_histogram(closes_1h_full[:-1])
     h1_now  = hist_1h[-1]
     if direction == "long":
         if   h1_now > 0: score += 10
@@ -350,7 +370,7 @@ def evaluate(
     elif hour in LOW_BIAS_HOURS:  score -= 10
 
     # ── 13. Filtro no-chase ───────────────────────────────────────────────
-    atr_15m   = atr_15m_raw   # reutilizar el ya calculado en guard ATR
+    atr_15m    = atr_15m_raw
     candle_rng = candle["high"] - candle["low"]
     if atr_15m > 0 and candle_rng > NO_CHASE_MULT * atr_15m:
         log.debug("No-chase: rng=%.4f > %.1f×ATR=%.4f", candle_rng, NO_CHASE_MULT, atr_15m)

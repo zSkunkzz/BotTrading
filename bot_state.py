@@ -55,18 +55,33 @@ def is_paused() -> bool:
 # ── API de drawdown ─────────────────────────────────────────────────────────
 
 def record_trade(pnl_usdt: float) -> bool:
-    """Registra el PnL neto de un trade. Devuelve True si se supera el límite."""
+    """Registra el PnL neto de un trade. Devuelve True si se supera el límite.
+
+    BUG CORREGIDO: la versión anterior no validaba capital > 0 antes de
+    calcular pct. Si MARGIN_USDT o MAX_POSITIONS eran 0 por mala config,
+    capital=0, pct=0.0 y la condición 0.0 <= -3.0 es False — el bot
+    nunca se pausaría aunque hubiera pérdidas reales. Añadido guard
+    explícito: si capital <= 0 se compara el pnl_usdt absoluto contra
+    MAX_DAILY_LOSS_USDT como fallback.
+    """
     global _daily_pnl_usdt, _daily_limit_hit
     with _lock:
         _reset_if_new_day()
-        _daily_pnl_usdt += pnl_usdt          # suma algebraica — ganancias y pérdidas
+        _daily_pnl_usdt += pnl_usdt
         if not _daily_limit_hit:
-            capital = config.MARGIN_USDT * config.MAX_POSITIONS
-            pct = (_daily_pnl_usdt / capital * 100) if capital else 0.0
+            capital  = config.MARGIN_USDT * config.MAX_POSITIONS
             daily_max = float(getattr(config, "DAILY_MAX_LOSS_PCT", -3.0))
-            if pct <= daily_max:
-                _daily_limit_hit = True
-                return True
+            if capital > 0:
+                pct = _daily_pnl_usdt / capital * 100
+                if pct <= daily_max:
+                    _daily_limit_hit = True
+                    return True
+            else:
+                # Fallback: si capital no está configurado, usar límite absoluto
+                max_loss_usdt = float(getattr(config, "MAX_DAILY_LOSS_USDT", 30.0))
+                if _daily_pnl_usdt <= -abs(max_loss_usdt):
+                    _daily_limit_hit = True
+                    return True
         return False
 
 
@@ -99,6 +114,10 @@ def restore_from_csv(trades_today: list[dict]) -> None:
         _daily_date     = _today_utc()
         _daily_pnl_usdt = sum(t["pnl_usdt"] for t in trades_today)
         capital         = config.MARGIN_USDT * config.MAX_POSITIONS
-        pct             = (_daily_pnl_usdt / capital * 100) if capital else 0.0
         daily_max       = float(getattr(config, "DAILY_MAX_LOSS_PCT", -3.0))
-        _daily_limit_hit = pct <= daily_max
+        if capital > 0:
+            pct = (_daily_pnl_usdt / capital * 100)
+            _daily_limit_hit = pct <= daily_max
+        else:
+            max_loss_usdt    = float(getattr(config, "MAX_DAILY_LOSS_USDT", 30.0))
+            _daily_limit_hit = _daily_pnl_usdt <= -abs(max_loss_usdt)
