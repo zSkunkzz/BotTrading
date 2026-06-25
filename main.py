@@ -133,61 +133,95 @@ def _check_tp_extension(
     log.info("[%s] Precio a %.2f%% del TP — evaluando extensión", symbol, dist_pct * 100)
 
     try:
-        candles_15m = feed.get(symbol, "15m")
-        candles_1h  = feed.get(symbol, "1h")
-        candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
-        signal, score = signals.evaluate(
-            candles_15m, candles_1h, candles_4h,
-            min_score=effective_min_score,
+        # ── 1. Evaluar señal ────────────────────────────────────────────
+        try:
+            candles_15m = feed.get(symbol, "15m")
+            candles_1h  = feed.get(symbol, "1h")
+            candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
+            signal, score = signals.evaluate(
+                candles_15m, candles_1h, candles_4h,
+                min_score=effective_min_score,
+            )
+        except Exception as e:
+            log.warning("[%s] Error evaluando señal para extend_tp: %s", symbol, e)
+            return
+
+        if not signal or signal != side:
+            log.info(
+                "[%s] Señal no válida para extend_tp (signal=%s) — dejando TP actual",
+                symbol, signal,
+            )
+            return
+
+        # ── 2. Verificar que la posición sigue abierta en BingX ────────
+        # Race condition: el precio puede haber tocado el TP_original justo
+        # entre que detectamos near_tp y ahora. Si la posición ya cerró,
+        # cancel_all_orders + place_* fallarían silenciosamente dejando el
+        # estado del bot desincronizado.
+        try:
+            pos_live = exchange.get_position(symbol)
+        except Exception as e:
+            log.warning("[%s] No se pudo verificar posición antes de extend_tp: %s", symbol, e)
+            return
+
+        if pos_live is None:
+            log.info(
+                "[%s] Posición ya cerrada en BingX — extend_tp cancelado (TP original ejecutado)",
+                symbol,
+            )
+            return
+
+        # Confirmar que el side sigue siendo el mismo (protección extra)
+        if pos_live.get("side") != side:
+            log.warning(
+                "[%s] Side en exchange (%s) difiere del local (%s) — extend_tp cancelado",
+                symbol, pos_live.get("side"), side,
+            )
+            return
+
+        # ── 3. Calcular nuevo TP ────────────────────────────────────────
+        entry        = pos["entry"]
+        tp_orig_dist = abs(pos.get("tp_original", tp) - entry)
+
+        if side == "long":
+            new_tp = round(entry + tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
+        else:
+            new_tp = round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
+
+        current_sl = pos["sl"]
+
+        # ── 4. Recolocar órdenes ────────────────────────────────────────
+        try:
+            exchange.cancel_all_orders(symbol)
+            exchange.place_stop_order(symbol, side, pos["qty"], current_sl)
+            exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
+        except Exception as e:
+            log.warning("[%s] Error colocando órdenes en extend_tp: %s", symbol, e)
+            return
+
+        # ── 5. Actualizar estado local ──────────────────────────────────
+        old_tp = pos["tp"]
+        pos["tp"]            = new_tp
+        pos["tp_extensions"] = extensions + 1
+        pos["trail_high"]    = current_price
+        pos["trail_low"]     = current_price
+
+        log.info(
+            "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL=%.6f | score=%d",
+            symbol, extensions + 1, old_tp, new_tp, current_sl, score,
         )
-    except Exception as e:
-        log.warning("[%s] Error evaluando señal para extend_tp: %s", symbol, e)
+        telegram.notify(
+            f"\U0001f4c8 TP Extendido #{extensions + 1}\n"
+            f"{symbol} {side.upper()}\n"
+            f"TP anterior: <code>{old_tp:.6f}</code>\n"
+            f"Nuevo TP: <code>{new_tp:.6f}</code>\n"
+            f"SL sin cambios: <code>{current_sl:.6f}</code>\n"
+            f"Score: {score}"
+        )
+
+    finally:
+        # Siempre liberar el lock, incluso si hubo return anticipado o excepción
         pos["_extending"] = False
-        return
-
-    if not signal or signal != side:
-        log.info("[%s] Señal no válida para extend_tp (signal=%s) — dejando TP actual", symbol, signal)
-        pos["_extending"] = False
-        return
-
-    entry        = pos["entry"]
-    tp_orig_dist = abs(pos.get("tp_original", tp) - entry)
-
-    if side == "long":
-        new_tp = round(entry + tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
-    else:
-        new_tp = round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
-
-    current_sl = pos["sl"]
-
-    try:
-        exchange.cancel_all_orders(symbol)
-        exchange.place_stop_order(symbol, side, pos["qty"], current_sl)
-        exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
-    except Exception as e:
-        log.warning("[%s] Error colocando órdenes en extend_tp: %s", symbol, e)
-        pos["_extending"] = False
-        return
-
-    old_tp = pos["tp"]
-    pos["tp"]            = new_tp
-    pos["tp_extensions"] = extensions + 1
-    pos["trail_high"]    = current_price
-    pos["trail_low"]     = current_price
-    pos["_extending"]    = False
-
-    log.info(
-        "[%s] TP extendido #%d | old_tp=%.6f → new_tp=%.6f | SL=%.6f | score=%d",
-        symbol, extensions + 1, old_tp, new_tp, current_sl, score,
-    )
-    telegram.notify(
-        f"\U0001f4c8 TP Extendido #{extensions + 1}\n"
-        f"{symbol} {side.upper()}\n"
-        f"TP anterior: <code>{old_tp:.6f}</code>\n"
-        f"Nuevo TP: <code>{new_tp:.6f}</code>\n"
-        f"SL sin cambios: <code>{current_sl:.6f}</code>\n"
-        f"Score: {score}"
-    )
 
 
 def _wait_feed_ready(feed: KlineFeed) -> None:
