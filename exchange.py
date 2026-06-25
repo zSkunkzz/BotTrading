@@ -23,8 +23,9 @@ FIXES aplicados:
      positionSide="LONG"|"SHORT"; positionAmt puede ser negativo o transitoriamente
      cero en LONG si la orden aún no está completamente liquidada.
      Fallback a positionAmt si positionSide no está disponible (one-way mode).
-  9. get_closed_orders() añadida (FIX #2): antes no existía y _get_real_exit_price()
-     en main.py lanzaba AttributeError silenciado, devolviendo siempre precio estimado.
+  9. FIX #2: get_closed_orders() implementada — antes no existía, causando
+     AttributeError silenciado en _get_real_exit_price() y precios de cierre
+     siempre estimados. Ahora consulta /openApi/swap/v2/trade/allOrders.
 """
 import hashlib
 import hmac
@@ -54,7 +55,7 @@ def _headers() -> dict:
     return {"X-BX-APIKEY": config.API_KEY}
 
 
-# ── HTTP helpers con reintentos ────────────────────────────────────────────────────
+# ── HTTP helpers con reintentos ────────────────────────────────────────────────
 
 _RETRIES    = 3
 _RETRY_WAIT = 1.0
@@ -109,7 +110,7 @@ def _delete(path: str, params: dict = None) -> dict:
     return _request("DELETE", path, params or {})
 
 
-# ── Precio ──────────────────────────────────────────────────────────────────────────────────
+# ── Precio ─────────────────────────────────────────────────────────────────────────────────
 
 def get_price(symbol: str = None) -> float:
     symbol = symbol or config.SYMBOL
@@ -117,7 +118,7 @@ def get_price(symbol: str = None) -> float:
     return float(data["data"]["price"])
 
 
-# ── OHLCV ────────────────────────────────────────────────────────────────────────────────────
+# ── OHLCV ──────────────────────────────────────────────────────────────────────────────────
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
     """Devuelve lista de velas [{ts, open, high, low, close, volume}] más reciente al final.
@@ -146,12 +147,12 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
     return candles
 
 
-# ── Info de contrato (step size / min qty) ─────────────────────────────────────────────
+# ── Info de contrato (step size / min qty) ────────────────────────────────────────────
 
 _contract_info_cache: dict[str, dict] = {}
 
 def _get_contract_info(symbol: str) -> dict:
-    """Devuelve stepSize y minQty para el símbolo. Cachea para no repetir llamadas."""
+    """Devuelve stepSize y minQty para el símbolo. Cachéa para no repetir llamadas."""
     if symbol in _contract_info_cache:
         return _contract_info_cache[symbol]
     try:
@@ -187,7 +188,7 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
     return (qty * price) >= min_usdt
 
 
-# ── Posiciones ─────────────────────────────────────────────────────────────────────────────────
+# ── Posiciones ─────────────────────────────────────────────────────────────────────────────
 
 # Mapa de positionSide (hedge mode) a valor interno del bot
 _POSITION_SIDE_MAP = {
@@ -215,16 +216,12 @@ def _parse_position(p: dict) -> dict | None:
     position_amt = float(p.get("positionAmt") or 0)
 
     if raw_side in ("LONG", "SHORT"):
-        # Hedge mode: positionSide es explícito y fiable
         side = _POSITION_SIDE_MAP[raw_side]
     elif position_amt > 0:
-        # One-way mode long o fallback
         side = "long"
     elif position_amt < 0:
-        # One-way mode short o fallback
         side = "short"
     else:
-        # positionAmt == 0 y sin positionSide válido → posición vacía o en tránsito
         log.warning(
             "Posición descartada — positionSide=%r positionAmt=%s (símbolo=%s)",
             p.get("positionSide"), p.get("positionAmt"), p.get("symbol"),
@@ -270,7 +267,7 @@ def get_position(symbol: str = None) -> dict | None:
     return None
 
 
-# ── Apalancamiento ───────────────────────────────────────────────────────────────────────────────
+# ── Apalancamiento ──────────────────────────────────────────────────────────────────────────
 
 def set_leverage(symbol: str = None, leverage: int = None) -> None:
     symbol   = symbol or config.SYMBOL
@@ -288,7 +285,7 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
     log.info("Leverage seteado a %dx en %s", leverage, symbol)
 
 
-# ── Abrir orden ───────────────────────────────────────────────────────────────────────────────────
+# ── Abrir orden ────────────────────────────────────────────────────────────────────────────────
 
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
     symbol   = symbol or config.SYMBOL
@@ -351,7 +348,7 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
     log.info("TP colocado en %.6f (%s %s)", tp_price, side.upper(), symbol)
 
 
-# ── Cerrar posición ────────────────────────────────────────────────────────────────────────────────
+# ── Cerrar posición ────────────────────────────────────────────────────────────────────────────
 
 def close_position(side: str, qty: float, symbol: str = None) -> dict:
     symbol   = symbol or config.SYMBOL
@@ -368,7 +365,7 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
     return resp
 
 
-# ── Cancelar órdenes abiertas ────────────────────────────────────────────────────────────────────
+# ── Cancelar órdenes abiertas ─────────────────────────────────────────────────────────────────
 
 def cancel_all_orders(symbol: str = None) -> None:
     """FIX: BingX exige DELETE (no POST) para cancelar todas las órdenes abiertas.
@@ -379,19 +376,15 @@ def cancel_all_orders(symbol: str = None) -> None:
     log.info("Órdenes canceladas para %s", symbol)
 
 
-# ── Historial de órdenes cerradas ───────────────────────────────────────────────────────────────────
+# ── Historial de órdenes cerradas ─────────────────────────────────────────────────────────────
 
 def get_closed_orders(symbol: str = None, limit: int = 10) -> list[dict]:
     """FIX #2: Devuelve órdenes ejecutadas/cerradas del símbolo para obtener el
-    precio real de salida.
-
-    Antes esta función no existía. _get_real_exit_price() en main.py la llamaba
-    y lanzaba AttributeError silenciado por el except Exception, cayendo siempre
-    al precio estimado. El CSV y los mensajes de Telegram nunca reflejaban el
-    precio real de cierre del exchange.
+    precio real de salida. Antes esta función no existía, causando AttributeError
+    silenciado en _get_real_exit_price() y precios de cierre siempre estimados.
 
     BingX endpoint: GET /openApi/swap/v2/trade/allOrders
-    Se filtran solo órdenes en estado terminal (FILLED, CANCELED, etc.).
+    Se filtran solo las órdenes en estado terminal (FILLED / CANCELED / etc.).
     Si el endpoint falla o devuelve vacío, _get_real_exit_price() usa el fallback.
     """
     symbol = symbol or config.SYMBOL
