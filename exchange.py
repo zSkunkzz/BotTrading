@@ -26,9 +26,10 @@ FIXES aplicados:
   9. FIX #2: get_closed_orders() implementada — antes no existía, causando
      AttributeError silenciado en _get_real_exit_price() y precios de cierre
      siempre estimados. Ahora consulta /openApi/swap/v2/trade/allOrders.
- 10. get_balance() añadida — devuelve el equity real de la cuenta para que
-     bot_state.py calcule el daily loss como % del saldo real, no de un
-     capital ficticio (MARGIN_USDT × MAX_POSITIONS).
+ 10. get_balance() corregida según doc oficial BingX (BingX-API/api-ai-skills):
+     - Endpoint v3: /openApi/swap/v3/user/balance
+     - data es un ARRAY de objetos, no un dict — se filtra por asset=USDT
+     - Campos: equity (balance + unrealizedPnL), balance, availableMargin
 """
 import hashlib
 import hmac
@@ -116,26 +117,32 @@ def _delete(path: str, params: dict = None) -> dict:
 # ── Balance real ───────────────────────────────────────────────────────────────
 
 def get_balance() -> float:
-    """Devuelve el equity real de la cuenta de futuros perpetuos en USDT.
+    """Devuelve el equity real (balance + PnL no realizado) de la cuenta USDT.
 
-    Consulta /openApi/swap/v2/user/balance y devuelve el campo 'equity'
-    (balance + PnL no realizado), que es el capital real sobre el que debe
-    calcularse el daily loss. Si el campo no existe, usa 'availableMargin'
-    como fallback. Si la llamada falla por cualquier motivo, devuelve 0.0
-    para que bot_state.py pueda usar el capital ficticio como backup.
+    Endpoint oficial: GET /openApi/swap/v3/user/balance
+    Respuesta: { "data": [ { "asset": "USDT", "equity": "196.74", ... } ] }
 
-    Campos relevantes del payload de BingX:
-      data.balance.balance          — capital sin contar PnL abierto
-      data.balance.equity           — balance + unrealized PnL  ← preferido
-      data.balance.availableMargin  — margen disponible (no bloqueado en órdenes)
+    data es un ARRAY — se busca el objeto con asset=USDT y se lee 'equity'.
+    Fallback: 'balance' si no existe 'equity'. Devuelve 0.0 si falla la llamada
+    para que bot_state.py use el capital ficticio como backup.
+
+    Fuente: BingX-API/api-ai-skills/skills/swap-account/api-reference.md
     """
     try:
-        data = _get("/openApi/swap/v2/user/balance", {})
-        bal = (data.get("data") or {}).get("balance") or {}
-        equity = bal.get("equity") or bal.get("availableMargin") or bal.get("balance")
-        if equity is not None:
-            return float(equity)
-        log.warning("get_balance: payload inesperado de BingX: %s", data)
+        resp = _get("/openApi/swap/v3/user/balance", {})
+        items = resp.get("data") or []
+        # Buscar el asset USDT; si solo hay uno, usarlo directamente
+        usdt = next(
+            (x for x in items if str(x.get("asset", "")).upper() == "USDT"),
+            items[0] if items else None,
+        )
+        if usdt is None:
+            log.warning("get_balance: payload vacío de BingX: %s", resp)
+            return 0.0
+        val = usdt.get("equity") or usdt.get("balance") or usdt.get("availableMargin")
+        if val is not None:
+            return float(val)
+        log.warning("get_balance: ningún campo de balance en: %s", usdt)
         return 0.0
     except Exception as exc:
         log.warning("get_balance falló: %s — se usará capital ficticio como fallback", exc)
