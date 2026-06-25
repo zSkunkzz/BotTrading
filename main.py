@@ -25,9 +25,8 @@ _cooldown: dict[str, float] = {}
 _cooldown_reason: dict[str, str] = {}   # 'tp' | 'sl'
 _manual_alert_cooldown: dict[str, float] = {}
 
-# ── Cooldown asimétrico ─────────────────────────────────────────────────────
-COOLDOWN_SL           = 60 * 60       # 60 min tras SL
-COOLDOWN_TP           = 15 * 60       # 15 min tras TP
+COOLDOWN_SL           = 60 * 60
+COOLDOWN_TP           = 15 * 60
 MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
@@ -42,7 +41,6 @@ WEEKEND_MIN_SCORE = 90
 
 VALID_SIDES = {"long", "short"}
 
-# Tolerancia de cierre
 CLOSE_CONFIRM_LOOPS = 2
 _missing_count: dict[str, int] = {}
 
@@ -212,6 +210,7 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
+    """Estima precio y razón de cierre a partir del precio actual y los niveles guardados."""
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
@@ -256,37 +255,109 @@ def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
     return current_price, "MANUAL"
 
 
-def _get_real_exit_price(symbol: str, pos: dict, fallback: float, fallback_reason: str) -> tuple[float, str]:
+def _get_real_exit_price(
+    symbol: str,
+    pos: dict,
+    fallback: float,
+    fallback_reason: str,
+) -> tuple[float, str]:
+    """Busca el precio real de cierre en el historial de órdenes del exchange.
+
+    FIX: filtra órdenes por:
+      - Lado correcto (SELL para LONG, BUY para SHORT) — evita coger la apertura
+      - Tipo de cierre (STOP_MARKET o TAKE_PROFIT_MARKET) — evita órdenes MARKET
+      - Tiempo posterior a la apertura de la posición — evita órdenes de trades anteriores
+      - Precio plausible (dentro del ±30% de entry) — filtro de cordura final
+    """
+    side     = pos.get("side", "long")
+    entry    = pos.get("entry", 0.0)
+    open_ts  = pos.get("open_ts", 0.0)        # segundos UNIX
+    open_ms  = int(open_ts * 1000)             # BingX usa ms
+
+    # La orden de cierre va en dirección contraria a la posición
+    close_bx_side = "SELL" if side == "long" else "BUY"
+
+    # Tipos que BingX usa para SL y TP
+    CLOSE_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET"}
+
     try:
-        closed_orders = exchange.get_closed_orders(symbol, limit=5)
-        if closed_orders:
-            last = closed_orders[0]
-            real_price = float(last.get("avgPrice") or last.get("price") or 0)
-            if real_price > 0:
-                order_type = last.get("type", "").upper()
-                if "TAKE_PROFIT" in order_type:
-                    return real_price, "TP"
-                if "STOP" in order_type:
-                    return real_price, "SL"
-                if "MARKET" in order_type:
-                    return real_price, fallback_reason
+        closed_orders = exchange.get_closed_orders(symbol, limit=20)
     except Exception as exc:
-        log.debug("[%s] No se pudo obtener precio real de cierre: %s", symbol, exc)
+        log.debug("[%s] get_closed_orders falló: %s", symbol, exc)
+        return fallback, fallback_reason
+
+    for order in closed_orders:
+        # 1. Filtro por lado
+        if str(order.get("side", "")).upper() != close_bx_side:
+            continue
+
+        # 2. Filtro por tipo (solo órdenes de cierre)
+        order_type = str(order.get("type", "")).upper()
+        if order_type not in CLOSE_TYPES:
+            continue
+
+        # 3. Filtro por tiempo (debe ser posterior a la apertura)
+        order_time = int(order.get("time") or order.get("updateTime") or 0)
+        if order_time > 0 and order_time < open_ms:
+            continue
+
+        # 4. Precio plausible (±30% de entrada — cortafuegos de datos corruptos)
+        real_price = float(order.get("avgPrice") or order.get("price") or 0)
+        if real_price <= 0:
+            continue
+        if entry > 0 and abs(real_price - entry) / entry > 0.30:
+            log.warning(
+                "[%s] Orden descartada — precio %.6f fuera de rango razonable (entry=%.6f)",
+                symbol, real_price, entry,
+            )
+            continue
+
+        # Orden válida encontrada
+        if "TAKE_PROFIT" in order_type:
+            return real_price, "TP"
+        if "STOP" in order_type:
+            return real_price, "SL"
+
+    log.debug("[%s] Sin orden de cierre válida en historial — usando fallback %.6f", symbol, fallback)
     return fallback, fallback_reason
+
+
+def _calc_pnl(side: str, entry: float, exit_price: float, qty: float) -> tuple[float, float]:
+    """Calcula PnL en % (con leverage) y en USDT (absoluto).
+
+    FIX: la fórmula anterior calculaba pnl_usdt dividiendo por leverage dos veces.
+    Correcto:
+      pnl_pct  = movimiento_precio% * leverage
+      pnl_usdt = movimiento_precio * qty   (qty ya es en contratos/monedas base)
+
+    Ejemplo SHORT: entry=0.182, exit=0.184 (SL), qty=1089, leverage=5
+      movimiento = (0.182 - 0.184) / 0.182 = -1.099%
+      pnl_pct    = -1.099 * 5 = -5.49%
+      pnl_usdt   = (0.182 - 0.184) * 1089 = -2.178 USDT
+    """
+    if side == "long":
+        price_move = (exit_price - entry) / entry
+    else:
+        price_move = (entry - exit_price) / entry
+
+    pnl_pct  = price_move * config.LEVERAGE * 100
+    pnl_usdt = price_move * qty * entry          # qty * entry = valor nocional sin apalancamiento
+    return pnl_pct, pnl_usdt
 
 
 def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
     """Registra el cierre de una posición: PnL, cooldown, logger y Telegram."""
-    current_price = exchange.get_price(symbol)
+    current_price          = exchange.get_price(symbol)
     exit_price_est, reason_est = _exit_price_for(p, current_price)
-    exit_price, reason = _get_real_exit_price(symbol, p, exit_price_est, reason_est)
+    exit_price, reason     = _get_real_exit_price(symbol, p, exit_price_est, reason_est)
 
-    pnl_pct = (
-        (exit_price - p["entry"]) / p["entry"]
-        if p["side"] == "long"
-        else (p["entry"] - exit_price) / p["entry"]
-    ) * config.LEVERAGE * 100
-    pnl_usdt = (pnl_pct / 100) * (p["qty"] * p["entry"] / config.LEVERAGE)
+    pnl_pct, pnl_usdt = _calc_pnl(p["side"], p["entry"], exit_price, p["qty"])
+
+    log.info(
+        "[%s] Cierre detectado | side=%s entry=%.6f exit=%.6f reason=%s "
+        "pnl_pct=%+.2f%% pnl_usdt=%+.4f USDT",
+        symbol, p["side"], p["entry"], exit_price, reason, pnl_pct, pnl_usdt,
+    )
 
     # Cooldown
     _cooldown[symbol]        = time.time()
@@ -296,7 +367,7 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
 
     _missing_count.pop(symbol, None)
 
-    # ── Registrar PnL en bot_state (fuente única de verdad) ──────────────
+    # Registrar PnL en bot_state (fuente única de verdad)
     limit_hit = bot_state.record_trade(pnl_usdt)
     daily_pnl = bot_state.get_daily_pnl()
     capital   = config.MARGIN_USDT * config.MAX_POSITIONS
@@ -318,7 +389,7 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
         log.warning("[drawdown] %s", msg.replace("\n", " "))
         telegram.notify(msg)
 
-    # ── Persistir en CSV y _cache ─────────────────────────────────────────
+    # Persistir en CSV y _cache
     trade_logger.record(
         symbol     = symbol,
         side       = p["side"],
@@ -331,21 +402,18 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
         open_ts    = p.get("open_ts", time.time()),
     )
 
-    # ── Notificación Telegram del cierre ──────────────────────────────────
+    # Notificación Telegram del cierre
     telegram.notify_close(
-        symbol   = symbol,
-        side     = p["side"],
-        entry    = p["entry"],
-        exit_p   = exit_price,
-        pnl_pct  = pnl_pct,
-        pnl_usdt = pnl_usdt,
-        reason   = reason,
-        open_ts  = p.get("open_ts", 0.0),
-        daily_pnl= daily_pnl,
+        symbol    = symbol,
+        side      = p["side"],
+        entry     = p["entry"],
+        exit_p    = exit_price,
+        pnl_pct   = pnl_pct,
+        pnl_usdt  = pnl_usdt,
+        reason    = reason,
+        open_ts   = p.get("open_ts", 0.0),
+        daily_pnl = daily_pnl,
     )
-
-    log.info("[%s] Cerrada | %s | PnL=%+.2f%% (%+.4f USDT) | ext=%d",
-             symbol, reason, pnl_pct, pnl_usdt, p.get("tp_extensions", 0))
 
 
 def run() -> None:
@@ -381,7 +449,7 @@ def run() -> None:
         try:
             loop_count += 1
 
-            # ── Nuevo día UTC → resetear drawdown y reactivar bot ───────────
+            # Nuevo día UTC → resetear drawdown y reactivar bot
             if bot_state.reset_daily_if_new_day():
                 log.info("[drawdown] Nuevo día UTC — bot reactivado")
                 telegram.notify("\U0001f305 Nuevo día UTC — límite de pérdidas reseteado. Bot activo.")
@@ -391,7 +459,7 @@ def run() -> None:
 
             all_ex_positions = exchange.get_all_positions()
 
-            # ── Sync posiciones con tolerancia de cierre ────────────────────
+            # Sync posiciones con tolerancia de cierre
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
                 if pos_ex:
@@ -411,7 +479,7 @@ def run() -> None:
                 p = positions.pop(symbol)
                 _declare_closed(symbol, p, positions)
 
-            # ── Purgar cooldowns expirados ──────────────────────────────────
+            # Purgar cooldowns expirados
             expired = [
                 sym for sym, ts in _cooldown.items()
                 if time.time() - ts >= _cooldown_for(sym)
@@ -421,12 +489,14 @@ def run() -> None:
                 _cooldown_reason.pop(sym, None)
                 log.info("[%s] Cooldown expirado — símbolo disponible", sym)
 
-            expired_alerts = [sym for sym, ts in _manual_alert_cooldown.items()
-                              if time.time() - ts >= MANUAL_ALERT_COOLDOWN]
+            expired_alerts = [
+                sym for sym, ts in _manual_alert_cooldown.items()
+                if time.time() - ts >= MANUAL_ALERT_COOLDOWN
+            ]
             for sym in expired_alerts:
                 _manual_alert_cooldown.pop(sym, None)
 
-            # ── Sincronizar posiciones externas al dict local ───────────────
+            # Sincronizar posiciones externas al dict local
             for symbol, pos_ex in all_ex_positions.items():
                 if symbol not in positions:
                     ex_side = pos_ex.get("side")
@@ -456,7 +526,7 @@ def run() -> None:
             open_count = len(positions)
 
             if loop_count % 10 == 1:
-                daily_pnl = bot_state.get_daily_pnl()
+                daily_pnl  = bot_state.get_daily_pnl()
                 paused_str = (
                     "PAUSADO(drawdown)" if bot_state.is_daily_limit_hit()
                     else ("PAUSADO" if bot_state.is_paused() else "activo")
@@ -468,7 +538,7 @@ def run() -> None:
                     paused_str, daily_pnl,
                 )
 
-            # ── Trailing stop + extend TP ───────────────────────────────────
+            # Trailing stop + extend TP
             for symbol, pos in list(positions.items()):
                 try:
                     price = exchange.get_price(symbol)
@@ -477,7 +547,7 @@ def run() -> None:
                 except Exception as e:
                     log.warning("[%s] Error gestión posición: %s", symbol, e)
 
-            # ── Filtro fin de semana ────────────────────────────────────────
+            # Filtro fin de semana
             if weekend:
                 today = datetime.now(timezone.utc).weekday()
                 if today != _weekend_notified_day:
@@ -491,7 +561,7 @@ def run() -> None:
                         f"Posiciones actuales siguen gestionándose con normalidad."
                     )
 
-            # ── Buscar señales ──────────────────────────────────────────────
+            # Buscar señales
             if bot_state.is_paused() or bot_state.is_daily_limit_hit():
                 if bot_state.is_daily_limit_hit():
                     log.debug("Bot pausado por drawdown diario — saltando búsqueda de señales")
@@ -557,7 +627,7 @@ def run() -> None:
                             score=score, symbol=symbol, regime=regime,
                         )
 
-                        # ── Modo alerta manual ──────────────────────────────
+                        # Modo alerta manual
                         if is_manual:
                             _manual_alert_cooldown[symbol] = time.time()
                             side_icon = "\U0001f7e1" if signal == "long" else "\U0001f534"
@@ -573,7 +643,7 @@ def run() -> None:
                             log.info("[%s] ALERTA MANUAL enviada | %s score=%d", symbol, signal.upper(), score)
                             continue
 
-                        # ── Modo automático ───────────────────────────────────
+                        # Modo automático
                         log.info(
                             "[%s] SEÑAL %s | regime=%s RR=%.1f | "
                             "entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d",
