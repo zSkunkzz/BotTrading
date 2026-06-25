@@ -51,19 +51,20 @@ TP_PCT         = float(os.getenv("TP_PCT", "3.0"))
 
 # Señales
 # FIX #5: WEEKDAY_MIN_SCORE y WEEKEND_MIN_SCORE son ahora configurables por env var.
-# MIN_SCORE es alias legacy — apunta siempre a WEEKDAY_MIN_SCORE para que
-# cambiar cualquiera de los dos funcione en todos los sitios que lo leen.
+# Antes main.py tenía WEEKDAY_MIN_SCORE = 70 hardcodeado y cambiar MIN_SCORE
+# por env var no tenía efecto en las entradas normales, solo en extend_tp.
+# MIN_SCORE se mantiene como alias legacy que apunta a WEEKDAY_MIN_SCORE.
 TIMEFRAME           = os.getenv("TIMEFRAME", "15m")
 LOOP_SLEEP          = int(os.getenv("LOOP_SLEEP", "20"))
 WEEKDAY_MIN_SCORE   = int(os.getenv("WEEKDAY_MIN_SCORE", os.getenv("MIN_SCORE", "70")))
 WEEKEND_MIN_SCORE   = int(os.getenv("WEEKEND_MIN_SCORE", "90"))
-MIN_SCORE           = WEEKDAY_MIN_SCORE   # alias legacy
+MIN_SCORE           = WEEKDAY_MIN_SCORE   # alias legacy — no cambiar este nombre
 
 # Riesgo diario
-# FIX #3: DAILY_MAX_LOSS_PCT ahora existe en config y es configurable por env var.
+# FIX #3: DAILY_MAX_LOSS_PCT ahora existe aquí y es configurable por env var.
 # Antes main.py usaba getattr(config, "DAILY_MAX_LOSS_PCT", -3.0) pero la variable
-# no existía aquí — siempre usaba el -3.0 hardcodeado sin poder cambiarlo por env.
-# MAX_DAILY_LOSS_USDT se conserva para compatibilidad.
+# no existía en config, así que siempre usaba -3.0 sin poder cambiarlo por Railway.
+# MAX_DAILY_LOSS_USDT se conserva para compatibilidad con otros módulos.
 DAILY_MAX_LOSS_PCT  = float(os.getenv("DAILY_MAX_LOSS_PCT", "-3.0"))
 MAX_DAILY_LOSS_USDT = float(os.getenv("MAX_DAILY_LOSS_USDT", "30"))
 
