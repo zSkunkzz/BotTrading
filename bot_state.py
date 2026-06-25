@@ -3,14 +3,54 @@
 AQUI vive el ÚNICO contador de drawdown diario.
 Todo el código debe usar este módulo — trade_logger y main.py NO tienen
 sus propios contadores de PnL diario.
+
+FIX capital real: _get_capital() consulta exchange.get_balance() para obtener
+el equity real de la cuenta. El capital ficticio (MARGIN_USDT × MAX_POSITIONS)
+se usa solo si BingX no responde. El valor se cachea 5 minutos para no
+spammear la API en cada trade.
 """
 import threading
+import time
 from datetime import datetime, timezone
 
 import config
 
 _lock   = threading.Lock()
 _paused = False
+
+# ── Capital real cacheado ────────────────────────────────────────────────────
+_capital_cache: float = 0.0
+_capital_ts:    float = 0.0          # epoch seconds de la última consulta
+_CAPITAL_TTL:   float = 300.0        # refrescar cada 5 minutos
+
+
+def _get_capital() -> float:
+    """Devuelve el equity real de BingX, cacheado 5 min.
+
+    Importa exchange aquí (import diferido) para evitar import circular:
+    exchange importa config, no bot_state — así está bien.
+    Si BingX falla o devuelve 0, cae al capital ficticio MARGIN_USDT × MAX_POSITIONS.
+    """
+    global _capital_cache, _capital_ts
+    now = time.monotonic()
+    if now - _capital_ts < _CAPITAL_TTL and _capital_cache > 0:
+        return _capital_cache
+
+    try:
+        import exchange as _ex
+        bal = _ex.get_balance()
+    except Exception:
+        bal = 0.0
+
+    if bal > 0:
+        _capital_cache = bal
+        _capital_ts    = now
+        return bal
+
+    # Fallback: capital ficticio
+    fallback = config.MARGIN_USDT * config.MAX_POSITIONS
+    return fallback if fallback > 0 else 1.0  # evitar división por cero
+
 
 # ── Drawdown diario ─────────────────────────────────────────────────────────
 # _daily_pnl es el PnL NETO del día (positivo = ganancia, negativo = pérdida)
@@ -25,12 +65,13 @@ def _today_utc() -> str:
 
 def _reset_if_new_day() -> None:
     """Debe llamarse dentro de _lock."""
-    global _daily_pnl_usdt, _daily_date, _daily_limit_hit
+    global _daily_pnl_usdt, _daily_date, _daily_limit_hit, _capital_ts
     today = _today_utc()
     if today != _daily_date:
         _daily_pnl_usdt  = 0.0
         _daily_date      = today
         _daily_limit_hit = False
+        _capital_ts      = 0.0   # forzar refresco del balance al inicio del día
 
 
 # ── Pausa manual ────────────────────────────────────────────────────────────
@@ -57,31 +98,20 @@ def is_paused() -> bool:
 def record_trade(pnl_usdt: float) -> bool:
     """Registra el PnL neto de un trade. Devuelve True si se supera el límite.
 
-    BUG CORREGIDO: la versión anterior no validaba capital > 0 antes de
-    calcular pct. Si MARGIN_USDT o MAX_POSITIONS eran 0 por mala config,
-    capital=0, pct=0.0 y la condición 0.0 <= -3.0 es False — el bot
-    nunca se pausaría aunque hubiera pérdidas reales. Añadido guard
-    explícito: si capital <= 0 se compara el pnl_usdt absoluto contra
-    MAX_DAILY_LOSS_USDT como fallback.
+    El capital base se obtiene de BingX (equity real) o del fallback ficticio.
+    Se compara _daily_pnl_usdt / capital × 100 contra DAILY_MAX_LOSS_PCT.
     """
     global _daily_pnl_usdt, _daily_limit_hit
     with _lock:
         _reset_if_new_day()
         _daily_pnl_usdt += pnl_usdt
         if not _daily_limit_hit:
-            capital  = config.MARGIN_USDT * config.MAX_POSITIONS
+            capital   = _get_capital()
             daily_max = float(getattr(config, "DAILY_MAX_LOSS_PCT", -3.0))
-            if capital > 0:
-                pct = _daily_pnl_usdt / capital * 100
-                if pct <= daily_max:
-                    _daily_limit_hit = True
-                    return True
-            else:
-                # Fallback: si capital no está configurado, usar límite absoluto
-                max_loss_usdt = float(getattr(config, "MAX_DAILY_LOSS_USDT", 30.0))
-                if _daily_pnl_usdt <= -abs(max_loss_usdt):
-                    _daily_limit_hit = True
-                    return True
+            pct = _daily_pnl_usdt / capital * 100
+            if pct <= daily_max:
+                _daily_limit_hit = True
+                return True
         return False
 
 
@@ -113,11 +143,7 @@ def restore_from_csv(trades_today: list[dict]) -> None:
     with _lock:
         _daily_date     = _today_utc()
         _daily_pnl_usdt = sum(t["pnl_usdt"] for t in trades_today)
-        capital         = config.MARGIN_USDT * config.MAX_POSITIONS
+        capital         = _get_capital()
         daily_max       = float(getattr(config, "DAILY_MAX_LOSS_PCT", -3.0))
-        if capital > 0:
-            pct = (_daily_pnl_usdt / capital * 100)
-            _daily_limit_hit = pct <= daily_max
-        else:
-            max_loss_usdt    = float(getattr(config, "MAX_DAILY_LOSS_USDT", 30.0))
-            _daily_limit_hit = _daily_pnl_usdt <= -abs(max_loss_usdt)
+        pct             = _daily_pnl_usdt / capital * 100
+        _daily_limit_hit = pct <= daily_max

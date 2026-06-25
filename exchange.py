@@ -26,6 +26,9 @@ FIXES aplicados:
   9. FIX #2: get_closed_orders() implementada — antes no existía, causando
      AttributeError silenciado en _get_real_exit_price() y precios de cierre
      siempre estimados. Ahora consulta /openApi/swap/v2/trade/allOrders.
+ 10. get_balance() añadida — devuelve el equity real de la cuenta para que
+     bot_state.py calcule el daily loss como % del saldo real, no de un
+     capital ficticio (MARGIN_USDT × MAX_POSITIONS).
 """
 import hashlib
 import hmac
@@ -108,6 +111,35 @@ def _post(path: str, params: dict = None) -> dict:
 
 def _delete(path: str, params: dict = None) -> dict:
     return _request("DELETE", path, params or {})
+
+
+# ── Balance real ───────────────────────────────────────────────────────────────
+
+def get_balance() -> float:
+    """Devuelve el equity real de la cuenta de futuros perpetuos en USDT.
+
+    Consulta /openApi/swap/v2/user/balance y devuelve el campo 'equity'
+    (balance + PnL no realizado), que es el capital real sobre el que debe
+    calcularse el daily loss. Si el campo no existe, usa 'availableMargin'
+    como fallback. Si la llamada falla por cualquier motivo, devuelve 0.0
+    para que bot_state.py pueda usar el capital ficticio como backup.
+
+    Campos relevantes del payload de BingX:
+      data.balance.balance          — capital sin contar PnL abierto
+      data.balance.equity           — balance + unrealized PnL  ← preferido
+      data.balance.availableMargin  — margen disponible (no bloqueado en órdenes)
+    """
+    try:
+        data = _get("/openApi/swap/v2/user/balance", {})
+        bal = (data.get("data") or {}).get("balance") or {}
+        equity = bal.get("equity") or bal.get("availableMargin") or bal.get("balance")
+        if equity is not None:
+            return float(equity)
+        log.warning("get_balance: payload inesperado de BingX: %s", data)
+        return 0.0
+    except Exception as exc:
+        log.warning("get_balance falló: %s — se usará capital ficticio como fallback", exc)
+        return 0.0
 
 
 # ── Precio ─────────────────────────────────────────────────────────────────────────────────
