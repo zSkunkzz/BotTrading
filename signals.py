@@ -365,7 +365,15 @@ def evaluate(
         score += 8
 
     # ── 12. Sesgo horario ─────────────────────────────────────────────────
-    hour = datetime.datetime.now(timezone.utc).hour
+    # FIX: usar el timestamp de la vela cerrada (UTC) en lugar de now().
+    # BingX usa UTC+0 para K-lines; evaluar con now() puede desfasar el filtro
+    # si el loop procesa con retraso, tras reconexión WS o en fallback REST.
+    candle_ts = candle.get("ts")
+    if candle_ts:
+        hour = datetime.datetime.fromtimestamp(candle_ts / 1000, tz=timezone.utc).hour
+    else:
+        hour = datetime.datetime.now(timezone.utc).hour
+
     if   hour in HIGH_BIAS_HOURS: score += 8
     elif hour in LOW_BIAS_HOURS:  score -= 10
 
