@@ -14,20 +14,18 @@ Filtros:
                           >35 +12, >25 +6, >18 neutro, 15-18 -8
   8. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
                           hard-guard short: bear + adx_1h < 18 → no entrar (rebote choppy)
-  9. RSI 15m            : cruce 50 +15, extremo +8, direccional +4 (con umbral de zona),
+  9. RSI 15m            : cruce 50 +15, extremo >58/<42 +8, direccional +4,
                           contrario -5
                           hard-guard short: RSI < 38 → rebote probable, no entrar
   10. MACD 15m + 1h     : histograma positivo/negativo → +10 | neutro 0 | contrario -5
-  11. Divergencia RSI   : +8 (con validación de volumen para evitar señales espurias)
-  12. Sesgo horario     : hora alta +8, hora baja -10 (basado en ts de vela cerrada)
-  13. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
-  14. Filtro pullback   : precio dentro del 1.5% de EMA20_15m — evita entrar en
-                          sobreextensión. Si el precio lleva varias velas subiendo
-                          sin retroceder, esperar a que se acerque a la EMA20.
-                          Margen: ±1.5% sobre la EMA20 de 15m.
-  15. Score direccional : SHORTs requieren min_score+5 (default 77 vs 72 para LONGs)
-                          El crypto tiene sesgo alcista estructural — los SHORTs
-                          necesitan mayor convicción para justificar el riesgo.
+  11. Volumen           : >1.2×media +10 | <0.8×media -5
+  12. Divergencia RSI   : +8 (con validación de volumen para evitar señales espurias)
+  13. Sesgo horario     : hora alta +8, hora baja -10 (basado en ts de vela cerrada)
+                          HIGH_BIAS_HOURS incluye 13 UTC (máx volumen EU/pre-NY)
+  14. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
+  15. Filtro pullback   : precio dentro del 1.5% de EMA20_15m — evita entrar en
+                          sobreextensión.
+  16. Score direccional : SHORTs requieren min_score+5 (default 77 vs 72 para LONGs)
 
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
@@ -37,26 +35,27 @@ MIN_SCORE configurable via env var MIN_SCORE (default 72)
 FIXES aplicados:
   - _market_regime: usa closes[-2] (vela 1h cerrada) para price, no closes[-1]
   - _market_regime: EMAs calculadas sobre closes[:-1] (velas cerradas) — FIX BUG
-                    Antes las EMAs se calculaban incluyendo la vela 1h en curso, lo que
-                    sesgaba el régimen cuando la vela abierta tenía un close provisional
-                    muy alto o bajo. Ahora EMAs y price usan exclusivamente velas cerradas.
+  - _market_regime: _adx calculado sobre candles_1h[:-1] — FIX BUG (excluye vela abierta)
   - _regime_confirmed: estado actual calculado con candles_1h[:-1] igual que histórico
   - _macro_pts: FIX CRÍTICO — usa closes[-2] (vela 4h cerrada) en lugar de closes[-1]
-  - rsi_dir: añadido umbral de zona (LONG>45, SHORT<55) para evitar +4 en territorio contrario
-  - ADX hard-guard bajado de <18 a <15 (zona 15-18 = neutro, no bloqueado)
-  - evaluate(): devuelve (signal, score, regime) para que main.py no recalcule régimen
+  - _rsi_divergence: guard len corregido para listas ya recortadas — FIX BUG
   - _rsi_divergence: valida volumen mínimo de la última vela para evitar divergencias espurias
   - _rsi_divergence: protegido max() sobre generador vacío con try/except — FIX BUG
+  - rsi_dir: añadido umbral de zona (LONG>45, SHORT<55) para evitar +4 en territorio contrario
+  - rsi_ext LONG: umbral 55→58 (zona 55-58 no es momentum confirmado)
+  - ADX hard-guard bajado de <18 a <15 (zona 15-18 = neutro, no bloqueado)
+  - evaluate(): devuelve (signal, score, regime) para que main.py no recalcule régimen
   - REGIME_CONFIRM_BARS: 4 → 2 (3 velas consecutivas en vez de 5)
   - SHORT_MIN_SCORE_EXTRA: +10 → +5 (umbral short 82 → 77)
   - Hard-guard RSI < 38 para SHORTs (rebote probable en sobrevendido)
   - Hard-guard EMA200 15m: solo para SHORTs (eliminado en LONGs — redundante con EMA200 1h)
   - _ema: guard lista vacía → devuelve [] en lugar de IndexError — FIX BUG
   - _volume_ok: excluye vela evaluada (candles[-2]) del cálculo de la media — FIX BUG
-                Antes la vela evaluada estaba incluida en recent, sesgando la media al alza
-                cuando la propia vela tenía volumen alto, impidiendo que superase el umbral.
-  - Filtro pullback EMA20_15m: ±1.5% — evita entrar en sobreextensión (chase)
+  - Volumen: bonus +8→+10, penalización -5 si volumen bajo (<0.8×media)
+  - Filtro pullback EMA20_15m: ±1.5%
   - MIN_SCORE subido de 70 → 72 para filtrar señales borderline
+  - HIGH_BIAS_HOURS: añadida hora 13 UTC (pre-NY / máx volumen europeo)
+  - Log señal: añade margin= y pullback_dist= para diagnóstico en producción
 """
 from __future__ import annotations
 import logging
@@ -71,21 +70,17 @@ log = logging.getLogger("signals")
 EMA200_MIN_DIST     = 0.003
 NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
+VOLUME_WEAK         = 0.8   # por debajo → penalización
 MIN_SCORE           = config.MIN_SCORE
 
 # Margen pullback EMA20_15m: ±1.5% sobre la EMA20.
-# Si el precio está >1.5% por encima de la EMA20_15m en bull → sobreextendido, esperar.
-# Si el precio está >1.5% por debajo de la EMA20_15m en bear → sobreextendido, esperar.
-# Este filtro NO cancela señales en tendencias sostenidas donde el precio
-# sube ordenadamente cerca de la EMA20 — solo bloquea los chases después
-# de velas grandes consecutivas.
-PULLBACK_EMA20_DIST = 0.015  # 1.5%
+PULLBACK_EMA20_DIST = 0.015
 
 REGIME_CONFIRM_BARS   = 2
 SHORT_MIN_SCORE_EXTRA = 5
 ATR_VOLATILE_PCT      = 0.035
 
-HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
+HIGH_BIAS_HOURS = {8, 9, 10, 13, 14, 15, 16, 20, 21}   # 13 UTC = pre-NY / máx vol EU
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
 
 
@@ -174,14 +169,19 @@ def _adx(candles: list[dict], period: int = 14) -> float:
 
 
 def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
-    """Detecta divergencia RSI-precio en la ventana reciente."""
-    if len(closes) < lookback + 14 or len(candles) < lookback + 14:
+    """Detecta divergencia RSI-precio en la ventana reciente.
+
+    Recibe listas ya recortadas (vela en curso excluida).
+    """
+    # Guard: necesitamos al menos lookback + period para RSI fiable
+    if len(closes) < lookback + 14 or len(candles) < lookback + 1:
         return None
     rsi_series     = _rsi(closes, 14)
     recent_closes  = closes[-lookback:]
     recent_rsi     = rsi_series[-lookback:]
     recent_candles = candles[-lookback:]
 
+    # Validación de volumen: la última vela evaluada debe tener volumen decente
     avg_vol  = sum(c["volume"] for c in recent_candles[:-1]) / max(1, len(recent_candles) - 1)
     last_vol = recent_candles[-1].get("volume", 0.0)
     if avg_vol > 0 and last_vol < avg_vol * 0.6:
@@ -216,7 +216,8 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     ema20  = _ema(closes_closed, 20)[-1]
     ema50  = _ema(closes_closed, 50)[-1]
     ema200 = _ema(closes_closed, 200)[-1]
-    adx    = _adx(candles_1h, 14)
+    # FIX: ADX calculado sobre velas cerradas para excluir la vela 1h en curso
+    adx    = _adx(candles_1h[:-1], 14)
     price  = closes[-2] if len(closes) >= 2 else closes[-1]
 
     if price > ema20 > ema50 > ema200:
@@ -264,6 +265,18 @@ def _volume_ok(candles: list[dict], window: int = 20) -> bool:
     avg_vol  = sum(c["volume"] for c in recent) / len(recent)
     last_vol = candles[-2]["volume"]
     return last_vol > avg_vol * VOLUME_MULT
+
+
+def _volume_weak(candles: list[dict], window: int = 20) -> bool:
+    """Devuelve True si el volumen de la vela evaluada es débil (<0.8× media)."""
+    if len(candles) < window + 2:
+        return False
+    recent   = candles[-(window + 2):-2]
+    if not recent:
+        return False
+    avg_vol  = sum(c["volume"] for c in recent) / len(recent)
+    last_vol = candles[-2]["volume"]
+    return avg_vol > 0 and last_vol < avg_vol * VOLUME_WEAK
 
 
 def _macro_pts(candles_4h: list[dict] | None, direction: str) -> int:
@@ -320,8 +333,7 @@ def evaluate(
         return None, score, regime
 
     # ── 5b. EMA200 15m hard-guard — solo SHORTs ───────────────────────────
-    # En LONGs es redundante con EMA200 1h (si estás sobre EMA200_1h, casi
-    # siempre estás sobre EMA200_15m). En SHORTs añade una capa extra útil.
+    # En LONGs es redundante con EMA200 1h. En SHORTs añade capa extra útil.
     if len(closes_15m) >= 202:
         ema200_15m = _ema(closes_15m[:-1], 200)[-1]
         if direction == "short" and price > ema200_15m * 1.002:
@@ -364,8 +376,10 @@ def evaluate(
         return None, score, regime
 
     # ── 8. Volumen ────────────────────────────────────────────────────────
-    if _volume_ok(candles_15m):
-        score += 8
+    vol_strong = _volume_ok(candles_15m)
+    vol_weak   = _volume_weak(candles_15m)
+    if   vol_strong: score += 10
+    elif vol_weak:   score -= 5
 
     # ── 9. RSI 15m ────────────────────────────────────────────────────────
     rsi_vals = _rsi(closes_15m[:-1], 14)
@@ -381,12 +395,12 @@ def evaluate(
 
     if direction == "long":
         rsi_cross = rsi_prev < 50 <= rsi_now
-        rsi_ext   = rsi_now > 55
+        rsi_ext   = rsi_now > 58          # FIX: 55→58, zona 55-58 no es momentum confirmado
         rsi_dir   = rsi_now > rsi_prev and rsi_now > 45
         rsi_bad   = rsi_now < 45
     else:
         rsi_cross = rsi_prev > 50 >= rsi_now
-        rsi_ext   = rsi_now < 45
+        rsi_ext   = rsi_now < 42          # simétrico: <42 en vez de <45
         rsi_dir   = rsi_now < rsi_prev and rsi_now < 55
         rsi_bad   = rsi_now > 60
 
@@ -438,14 +452,10 @@ def evaluate(
         return None, score, regime
 
     # ── 14. Filtro pullback EMA20_15m ─────────────────────────────────────
-    # Evita entrar cuando el precio lleva varias velas seguidas alejándose
-    # de la EMA20 sin retroceder — el entry más arriba = SL más lejos del
-    # precio real de reversión = peor RR efectivo.
-    # Margen ±1.5%: suficientemente amplio para no bloquear tendencias
-    # sostenidas (precio sube ordenadamente pegado a EMA20), suficientemente
-    # estricto para bloquear chases tras velas grandes.
+    pullback_dist = None
     if len(closes_15m) >= 22:
-        ema20_15m = _ema(closes_15m[:-1], 20)[-1]
+        ema20_15m    = _ema(closes_15m[:-1], 20)[-1]
+        pullback_dist = (price - ema20_15m) / ema20_15m  # positivo = precio sobre EMA20
         if direction == "long" and price > ema20_15m * (1 + PULLBACK_EMA20_DIST):
             log.debug(
                 "Pullback-guard LONG: precio %.6f > EMA20_15m*%.3f %.6f — sobreextendido, esperar",
@@ -470,9 +480,13 @@ def evaluate(
         return None, score, regime
 
     log.info(
-        "✅ SEÑAL %s | score=%d (min=%d) | regime=%s adx1h=%.1f adx15m=%.1f "
-        "rsi=%.1f macd15=%+.4f macd1h=%+.4f vol=%s div=%s",
-        direction.upper(), score, min_score_directional, regime,
-        adx_1h, adx_15m, rsi_now, h_now, h1_now, _volume_ok(candles_15m), div,
+        "✅ SEÑAL %s | score=%d (min=%d, margin=%+d) | regime=%s "
+        "adx1h=%.1f adx15m=%.1f rsi=%.1f macd15=%+.4f macd1h=%+.4f "
+        "vol=%s div=%s pullback_dist=%s",
+        direction.upper(), score, min_score_directional, score - min_score_directional,
+        regime, adx_1h, adx_15m, rsi_now, h_now, h1_now,
+        "strong" if vol_strong else ("weak" if vol_weak else "normal"),
+        div,
+        f"{pullback_dist:+.3%}" if pullback_dist is not None else "n/a",
     )
     return direction, score, regime
