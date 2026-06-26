@@ -39,8 +39,10 @@ MIN_HOLD_SECS          = 90
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
 
-WEEKDAY_MIN_SCORE = 70
-WEEKEND_MIN_SCORE = 90
+# FIX: leer MIN_SCORE desde config para que los cambios en config.py
+# surtan efecto sin necesidad de tocar main.py.
+WEEKDAY_MIN_SCORE = int(getattr(config, "WEEKDAY_MIN_SCORE", 70))
+WEEKEND_MIN_SCORE = int(getattr(config, "WEEKEND_MIN_SCORE", 90))
 
 VALID_SIDES = {"long", "short"}
 
@@ -514,7 +516,7 @@ def _get_position_open_ts(symbol: str, pos_ex: dict) -> float:
     time.time() como fallback (comportamiento anterior, conservador).
     """
     try:
-        side       = pos_ex.get("side", "long")
+        side         = pos_ex.get("side", "long")
         open_bx_side = "BUY" if side == "long" else "SELL"
         closed = exchange.get_closed_orders(symbol, limit=20)
         for order in closed:
@@ -640,7 +642,9 @@ def run() -> None:
                         "trail_step":    trail_step,
                         "trail_high":    synced_entry,
                         "trail_low":     synced_entry,
-                        "score":         70,
+                        # FIX: usar config.WEEKDAY_MIN_SCORE como score base en posiciones
+                        # sincronizadas desde el exchange, en vez del 70 hardcodeado.
+                        "score":         getattr(config, "WEEKDAY_MIN_SCORE", 70),
                         "open_ts":       real_open_ts,
                     }
                     log.info("[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s trail=%.8f open_ts=%.0f)",
@@ -683,7 +687,7 @@ def run() -> None:
                              day_name, WEEKEND_MIN_SCORE)
                     telegram.notify(
                         f"\U0001f6ab Modo fin de semana ({day_name})\n"
-                        f"No se abrirán posiciones nuevas salvo score \u2265 {WEEKEND_MIN_SCORE}.\n"
+                        f"No se abrirán posiciones nuevas salvo score ≥ {WEEKEND_MIN_SCORE}.\n"
                         f"Posiciones actuales siguen gestionándose con normalidad."
                     )
 
@@ -705,7 +709,7 @@ def run() -> None:
                         except Exception:
                             pass
                     if regime_summary:
-                        log.info("[regímenes] %s", "  ".join(regime_summary))
+                        log.info("[regímenes] %s", "  \t".join(regime_summary))
 
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
@@ -763,7 +767,7 @@ def run() -> None:
                                 f"SL sugerido:   <code>{params['sl']:.6f}</code>\n"
                                 f"TP sugerido:   <code>{params['tp']:.6f}</code>\n"
                                 f"Score: <b>{score}</b>\n\n"
-                                f"\u26a0\ufe0f <i>Operación NO abierta automáticamente.</i>"
+                                f"⚠️ <i>Operación NO abierta automáticamente.</i>"
                             )
                             log.info("[%s] ALERTA MANUAL enviada | %s score=%d", symbol, signal.upper(), score)
                             continue
@@ -775,13 +779,32 @@ def run() -> None:
                             price, params["sl"], params["tp"], params["qty"], score,
                         )
 
-                        exchange.open_order(
-                            side   = signal,
-                            qty    = params["qty"],
-                            sl     = params["sl"],
-                            tp     = params["tp"],
-                            symbol = symbol,
-                        )
+                        # FIX: envolver open_order en try/except para hacer rollback
+                        # si la orden de mercado se abre pero falla place_stop_order
+                        # o place_tp_order. Sin esto la posición quedaba registrada
+                        # localmente sin SL/TP y el trailing la ignoraba indefinidamente.
+                        try:
+                            exchange.open_order(
+                                side   = signal,
+                                qty    = params["qty"],
+                                sl     = params["sl"],
+                                tp     = params["tp"],
+                                symbol = symbol,
+                            )
+                        except Exception as open_err:
+                            log.error(
+                                "[%s] open_order falló — posición NO registrada: %s",
+                                symbol, open_err,
+                            )
+                            try:
+                                exchange.close_position(symbol)
+                                log.warning("[%s] Rollback: posición parcial cerrada", symbol)
+                            except Exception as close_err:
+                                log.error(
+                                    "[%s] Rollback fallido — revisar posición manualmente: %s",
+                                    symbol, close_err,
+                                )
+                            continue
 
                         real_entry = _sync_entry_from_exchange(symbol, price, signal)
 
