@@ -47,11 +47,6 @@ _missing_count: dict[str, int] = {}
 _weekend_notified_day: int = -1
 
 # ── Guard de exposición direccional ──────────────────────────────────────────
-# Máximo de posiciones abiertas en la misma dirección (long o short).
-# Sin este límite el bot puede acumular 7 LONGs seguidos en mercado bull:
-# si el mercado gira, todos los SL saltan simultáneamente y el drawdown
-# del día se come de golpe. Con MAX_SAME_SIDE=4 siempre queda margen para
-# 3 posiciones en dirección contraria si aparece una señal de reversión.
 MAX_SAME_SIDE = int(getattr(config, "MAX_SAME_SIDE", 4))
 
 
@@ -73,21 +68,7 @@ def _corr_group_for(symbol: str) -> int | None:
 
 
 def _check_directional_guard(signal: str, positions: dict, symbol: str) -> bool:
-    """Devuelve True si se puede abrir la posición según los guards direccionales.
-
-    Guard 1 — MAX_SAME_SIDE:
-        Limita cuántas posiciones pueden estar en la misma dirección (long/short).
-        Evita concentrar todo el capital en una sola dirección durante mercados
-        bull/bear extremos. Si el mercado gira, todos los SL saltan a la vez.
-
-    Guard 2 — CORR_GROUPS / MAX_CORR_PER_GROUP:
-        CORR_GROUPS estaba definido en config.py pero nunca se aplicaba en el
-        loop de apertura. Este guard activa el filtro real: si un grupo de
-        correlación (ej. BTC+ETH+SOL+AVAX) ya tiene MAX_CORR_PER_GROUP=2
-        posiciones abiertas, no se abre otra del mismo grupo sin importar el
-        score. Los pares correlacionados se mueven prácticamente igual, así
-        que 3 posiciones en el mismo grupo = 1 posición con 3x el riesgo.
-    """
+    """Devuelve True si se puede abrir la posición según los guards direccionales."""
     # Guard 1: exposición direccional
     same_side_count = sum(1 for p in positions.values() if p["side"] == signal)
     if same_side_count >= MAX_SAME_SIDE:
@@ -260,6 +241,21 @@ def _check_tp_extension(
             new_tp = round(entry + tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
         else:
             new_tp = round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
+
+        # FIX Bug 1: verificar que el nuevo TP no quede por debajo/encima del precio
+        # actual, lo que provocaría que se ejecutase inmediatamente tras colocarlo.
+        if side == "long" and new_tp <= current_price * 1.001:
+            log.warning(
+                "[%s] extend_tp cancelado — new_tp %.6f <= precio_actual %.6f (se ejecutaría al momento)",
+                symbol, new_tp, current_price,
+            )
+            return
+        if side == "short" and new_tp >= current_price * 0.999:
+            log.warning(
+                "[%s] extend_tp cancelado — new_tp %.6f >= precio_actual %.6f (se ejecutaría al momento)",
+                symbol, new_tp, current_price,
+            )
+            return
 
         current_sl = pos["sl"]
 
@@ -482,6 +478,42 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
     )
 
 
+def _calc_trail_step_from_atr(symbol: str, feed, sl: float | None, entry: float) -> float:
+    """Recalcula trail_step desde ATR cuando se sincroniza una posición tras reinicio.
+
+    FIX Bug 2: las posiciones sincronizadas desde el exchange tenían trail_step=0
+    porque no se conservaba el ATR original. Este helper lo recalcula desde las
+    velas actuales del feed para que el trailing vuelva a funcionar tras un reinicio.
+    Si no hay datos de feed disponibles, usa el 30% de la distancia SL-entry
+    como fallback, que es la misma lógica de risk.py.
+    """
+    try:
+        candles_15m = feed.get(symbol, "15m")
+        if candles_15m and len(candles_15m) >= 15:
+            trs = []
+            for i in range(1, len(candles_15m)):
+                h  = candles_15m[i]["high"]
+                l  = candles_15m[i]["low"]
+                pc = candles_15m[i - 1]["close"]
+                trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+            atr  = sum(trs[-14:]) / min(14, len(trs))
+            step = round(max(0.3 * atr, atr * 0.05), 8)
+            log.info("[%s] trail_step recalculado desde ATR tras sync: %.8f", symbol, step)
+            return step
+    except Exception as exc:
+        log.debug("[%s] No se pudo recalcular trail_step desde ATR: %s", symbol, exc)
+
+    # Fallback: 30% de la distancia SL-entry (misma lógica que risk.py)
+    if sl is not None and entry > 0:
+        sl_dist = abs(entry - sl)
+        if sl_dist > 0:
+            step = round(0.3 * sl_dist, 8)
+            log.info("[%s] trail_step recalculado desde SL-dist tras sync: %.8f", symbol, step)
+            return step
+
+    return 0.0
+
+
 def run() -> None:
     global _weekend_notified_day
 
@@ -569,22 +601,32 @@ def run() -> None:
                             symbol, ex_side,
                         )
                         continue
+
+                    # FIX Bug 2: recalcular trail_step desde ATR en lugar de fijar 0.
+                    # Con trail_step=0 el trailing stop quedaba permanentemente desactivado
+                    # para cualquier posición que sobreviviera un reinicio del bot.
+                    synced_sl    = pos_ex.get("sl")
+                    synced_entry = pos_ex["entry"]
+                    trail_step   = _calc_trail_step_from_atr(symbol, feed, synced_sl, synced_entry)
+
                     positions[symbol] = {
                         "side":          ex_side,
-                        "entry":         pos_ex["entry"],
+                        "entry":         synced_entry,
                         "qty":           pos_ex["size"],
-                        "sl":            pos_ex["sl"],
+                        "sl":            synced_sl,
                         "tp":            pos_ex["tp"],
                         "tp_original":   pos_ex["tp"],
                         "tp_extensions": 0,
                         "_extending":    False,
-                        "trail_step":    0,
+                        "trail_step":    trail_step,
+                        "trail_high":    synced_entry,
+                        "trail_low":     synced_entry,
                         "score":         70,
                         "open_ts":       time.time(),
                     }
-                    log.info("[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s)",
-                             symbol, ex_side, pos_ex["entry"],
-                             pos_ex["sl"], pos_ex["tp"])
+                    log.info("[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s trail=%.8f)",
+                             symbol, ex_side, synced_entry,
+                             synced_sl, pos_ex["tp"], trail_step)
 
             open_count = len(positions)
 
@@ -740,7 +782,10 @@ def run() -> None:
                             "score":         score,
                             "open_ts":       time.time(),
                         }
-                        open_count += 1
+                        # FIX Bug 3: usar len(positions) en lugar de open_count += 1.
+                        # Si open_order lanzaba excepción y la capturaba el except,
+                        # open_count se desincronizaba del estado real de positions.
+                        open_count = len(positions)
 
                         telegram.notify_open(
                             symbol = symbol,
