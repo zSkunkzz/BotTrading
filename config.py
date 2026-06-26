@@ -35,37 +35,63 @@ MANUAL_ALERT_SYMBOLS: set[str] = set()
 # que se mueven de forma correlacionada. Abrir 3 pares del mismo grupo
 # es equivalente a 1 posición con 3x el riesgo.
 #
-# El grupo original BTC-mega tenía 12 símbolos con MAX_CORR_PER_GROUP=2,
-# lo que bloqueaba hasta 10 pares cuando BTC+ETH estaban abiertos.
-# Dividido en grupos semánticos más pequeños para evitar ese bloqueo:
+# Cobertura: los 47 pares de SYMBOLS están todos asignados a al menos un grupo.
+# Pares sin grupo quedan fuera del guard de correlación (único riesgo: no
+# limitaría su apertura simultánea con pares correlacionados).
 #
-#   mega_caps  (3): BTC, ETH, BNB     — correlación ~0.95, movimientos idénticos
-#   L1s        (5): SOL, AVAX, APT, SUI, NEAR  — correlacionadas entre sí pero
-#                   no tanto con BTC/ETH en el corto plazo
-#   L2s_infra  (4): ARB, OP, DOT, ICP — sector infra/L2, correlación alta
-#   defi       (5): LINK, UNI, AERO, JUP, ONDO — DeFi, menor correlación con L1s
+# Grupos (8) con MAX_CORR_PER_GROUP=2:
+#   mega_caps   (3): BTC, ETH, BNB             — correlación ~0.95
+#   l1s         (6): SOL, AVAX, APT, SUI, NEAR, TIA — alt-season rotation
+#   l2s_infra   (6): ARB, OP, DOT, ICP, POL, ZK    — L2/infra sector
+#   defi        (5): LINK, UNI, AERO, JUP, ONDO    — DeFi
+#   pagos       (6): XRP, XLM, TRX, HBAR, XLM, ADA — pagos/RippleNet
+#   ai_infra    (6): FIL, RENDER, TAO, EIGEN, FET, WLD — AI/storage
+#   cosmos_eco  (4): ATOM, INJ, SEI, MANTA          — ecosistema Cosmos/IBC
+#   misc_alts   (7): DOGE, SHIB, NOT, PENGU, VET, STX, LISTA — memes+misc
 CORR_GROUPS: list[set[str]] = [
-    # Memes — correlación extrema entre sí, mueven juntos en eventos de mercado
-    {"DOGE-USDT", "SHIB-USDT", "NOT-USDT"},
     # Mega caps — BTC/ETH/BNB se mueven casi idénticos
     {"BTC-USDT", "ETH-USDT", "BNB-USDT"},
-    # L1s alternativas — SOL, AVAX, APT, SUI, NEAR rotan juntos en alt-season
-    {"SOL-USDT", "AVAX-USDT", "APT-USDT", "SUI-USDT", "NEAR-USDT"},
-    # L2s e infraestructura
-    {"ARB-USDT", "OP-USDT", "DOT-USDT", "ICP-USDT"},
-    # DeFi
+    # L1s alternativas — rotan juntas en alt-season
+    {"SOL-USDT", "AVAX-USDT", "APT-USDT", "SUI-USDT", "NEAR-USDT", "TIA-USDT"},
+    # L2s e infraestructura — se mueven juntas en narrativas de escalado
+    {"ARB-USDT", "OP-USDT", "DOT-USDT", "ICP-USDT", "POL-USDT", "ZK-USDT"},
+    # DeFi — correlacionadas en narrativas DeFi
     {"LINK-USDT", "UNI-USDT", "AERO-USDT", "JUP-USDT", "ONDO-USDT"},
-    # Pagos / RippleNet
-    {"XRP-USDT", "XLM-USDT", "TRX-USDT", "HBAR-USDT"},
-    # Storage / AI infra
-    {"FIL-USDT", "RENDER-USDT", "TAO-USDT", "EIGEN-USDT"},
+    # Pagos / RippleNet — alta correlación en noticias regulatorias
+    {"XRP-USDT", "XLM-USDT", "TRX-USDT", "HBAR-USDT", "ADA-USDT"},
+    # AI e infraestructura de almacenamiento — narrativa AI crypto
+    {"FIL-USDT", "RENDER-USDT", "TAO-USDT", "EIGEN-USDT", "FET-USDT", "WLD-USDT"},
+    # Cosmos ecosystem — IBC, Cosmos SDK
+    {"ATOM-USDT", "INJ-USDT", "SEI-USDT", "MANTA-USDT"},
+    # Memes + misc alts — alta correlación en eventos de mercado especulativos
+    # BCH, LTC, ETC agrupados aquí como PoW-forks (correlación alta con BTC en
+    # rallies pero con beta diferente — grupo separado de mega_caps a propósito)
+    {"DOGE-USDT", "SHIB-USDT", "NOT-USDT", "PENGU-USDT",
+     "VET-USDT",  "STX-USDT",  "LISTA-USDT",
+     "BCH-USDT",  "LTC-USDT",  "ETC-USDT"},
+    # Infra modular + perp ecosystems — HYPE (HyperLiquid) y MNT (Mantle L2)
+    # tienen correlación moderada con L2s pero narrativa distinta; se agrupan
+    # juntos para no contaminar el grupo l2s_infra principal
+    {"HYPE-USDT", "MNT-USDT"},
 ]
 MAX_CORR_PER_GROUP = int(os.getenv("MAX_CORR_PER_GROUP", "2"))
 
+# Verificación en tiempo de importación: avisa si algún símbolo de SYMBOLS
+# no tiene grupo asignado (el guard de correlación no aplicaría para él).
+def _check_corr_coverage() -> None:
+    all_grouped = {sym for group in CORR_GROUPS for sym in group}
+    missing = [s for s in SYMBOLS if s not in all_grouped]
+    if missing:
+        import logging
+        logging.getLogger("config").warning(
+            "CORR_GROUPS: %d símbolos sin grupo de correlación asignado — "
+            "el guard no aplica para ellos: %s",
+            len(missing), missing,
+        )
+
+_check_corr_coverage()
+
 # Máximo de posiciones en la misma dirección (long o short) simultáneamente.
-# Evita concentrar todo el capital en una sola dirección en mercados bull/bear.
-# Con MAX_POSITIONS=7 y MAX_SAME_SIDE=4 siempre quedan 3 slots para la
-# dirección contraria si aparece una señal de reversión.
 MAX_SAME_SIDE  = int(os.getenv("MAX_SAME_SIDE", "4"))
 
 MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS", "7"))
