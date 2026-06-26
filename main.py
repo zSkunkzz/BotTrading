@@ -26,9 +26,6 @@ _cooldown_reason: dict[str, str] = {}   # 'tp' | 'sl'
 _manual_alert_cooldown: dict[str, float] = {}
 
 COOLDOWN_SL           = 60 * 60
-# FIX menor: elevado de 15 min a 30 min.
-# Con 15 min el bot podía re-entrar en el pull-back inmediato post-TP,
-# patrón muy común en altcoins que recorren tras alcanzar TP.
 COOLDOWN_TP           = 30 * 60
 MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
@@ -49,6 +46,14 @@ _missing_count: dict[str, int] = {}
 
 _weekend_notified_day: int = -1
 
+# ── Guard de exposición direccional ──────────────────────────────────────────
+# Máximo de posiciones abiertas en la misma dirección (long o short).
+# Sin este límite el bot puede acumular 7 LONGs seguidos en mercado bull:
+# si el mercado gira, todos los SL saltan simultáneamente y el drawdown
+# del día se come de golpe. Con MAX_SAME_SIDE=4 siempre queda margen para
+# 3 posiciones en dirección contraria si aparece una señal de reversión.
+MAX_SAME_SIDE = int(getattr(config, "MAX_SAME_SIDE", 4))
+
 
 def _is_weekend() -> bool:
     return datetime.now(timezone.utc).weekday() >= 5
@@ -59,20 +64,59 @@ def _cooldown_for(symbol: str) -> int:
     return COOLDOWN_TP if reason == "tp" else COOLDOWN_SL
 
 
-def _sync_entry_from_exchange(symbol: str, local_price: float, side: str) -> float:
-    """Lee el precio de fill real desde BingX tras abrir una orden.
+def _corr_group_for(symbol: str) -> int | None:
+    """Devuelve el índice del grupo de correlación al que pertenece el símbolo, o None."""
+    for idx, group in enumerate(config.CORR_GROUPS):
+        if symbol in group:
+            return idx
+    return None
 
-    FIX CRÍTICO: el precio consultado con get_price() ANTES de open_order()
-    puede diferir del fill real en 0.1-0.5% en altcoins con spread amplio
-    o en momentos de alta volatilidad. Usar ese precio como entry contamina:
-      - el trailing stop  (niveles calculados desde price falso)
-      - el extend_tp      (tp_orig_dist calculado desde entry incorrecto)
-      - el PnL registrado (ganancias/pérdidas incorrectas en el log)
 
-    Se hace un get_position() inmediatamente después de abrir para leer
-    el avgPrice real del fill. Si falla (timeout, posición no propagada
-    aún), se devuelve local_price como fallback.
+def _check_directional_guard(signal: str, positions: dict, symbol: str) -> bool:
+    """Devuelve True si se puede abrir la posición según los guards direccionales.
+
+    Guard 1 — MAX_SAME_SIDE:
+        Limita cuántas posiciones pueden estar en la misma dirección (long/short).
+        Evita concentrar todo el capital en una sola dirección durante mercados
+        bull/bear extremos. Si el mercado gira, todos los SL saltan a la vez.
+
+    Guard 2 — CORR_GROUPS / MAX_CORR_PER_GROUP:
+        CORR_GROUPS estaba definido en config.py pero nunca se aplicaba en el
+        loop de apertura. Este guard activa el filtro real: si un grupo de
+        correlación (ej. BTC+ETH+SOL+AVAX) ya tiene MAX_CORR_PER_GROUP=2
+        posiciones abiertas, no se abre otra del mismo grupo sin importar el
+        score. Los pares correlacionados se mueven prácticamente igual, así
+        que 3 posiciones en el mismo grupo = 1 posición con 3x el riesgo.
     """
+    # Guard 1: exposición direccional
+    same_side_count = sum(1 for p in positions.values() if p["side"] == signal)
+    if same_side_count >= MAX_SAME_SIDE:
+        log.debug(
+            "[%s] Guard MAX_SAME_SIDE: ya hay %d posiciones %s (máx %d) — skip",
+            symbol, same_side_count, signal.upper(), MAX_SAME_SIDE,
+        )
+        return False
+
+    # Guard 2: correlación por grupo
+    grp_idx = _corr_group_for(symbol)
+    if grp_idx is not None:
+        grp_count = sum(
+            1 for sym, p in positions.items()
+            if _corr_group_for(sym) == grp_idx
+        )
+        max_corr = getattr(config, "MAX_CORR_PER_GROUP", 2)
+        if grp_count >= max_corr:
+            log.debug(
+                "[%s] Guard CORR_GROUP[%d]: ya hay %d posiciones en el grupo (máx %d) — skip",
+                symbol, grp_idx, grp_count, max_corr,
+            )
+            return False
+
+    return True
+
+
+def _sync_entry_from_exchange(symbol: str, local_price: float, side: str) -> float:
+    """Lee el precio de fill real desde BingX tras abrir una orden."""
     try:
         pos_live = exchange.get_position(symbol)
         if pos_live and pos_live.get("side") == side:
@@ -170,7 +214,6 @@ def _check_tp_extension(
     log.info("[%s] Precio a %.2f%% del TP — evaluando extensión", symbol, dist_pct * 100)
 
     try:
-        # ── 1. Evaluar señal ────────────────────────────────────────────
         try:
             candles_15m = feed.get(symbol, "15m")
             candles_1h  = feed.get(symbol, "1h")
@@ -190,7 +233,6 @@ def _check_tp_extension(
             )
             return
 
-        # ── 2. Verificar que la posición sigue abierta en BingX ────────────
         try:
             pos_live = exchange.get_position(symbol)
         except Exception as e:
@@ -211,7 +253,6 @@ def _check_tp_extension(
             )
             return
 
-        # ── 3. Calcular nuevo TP ──────────────────────────────────────────
         entry        = pos["entry"]
         tp_orig_dist = abs(pos.get("tp_original", tp) - entry)
 
@@ -222,7 +263,6 @@ def _check_tp_extension(
 
         current_sl = pos["sl"]
 
-        # ── 4. Recolocar órdenes ──────────────────────────────────────────
         try:
             exchange.cancel_all_orders(symbol)
             exchange.place_stop_order(symbol, side, pos["qty"], current_sl)
@@ -231,7 +271,6 @@ def _check_tp_extension(
             log.warning("[%s] Error colocando órdenes en extend_tp: %s", symbol, e)
             return
 
-        # ── 5. Actualizar estado local ────────────────────────────────────
         old_tp = pos["tp"]
         pos["tp"]            = new_tp
         pos["tp_extensions"] = extensions + 1
@@ -275,7 +314,6 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
-    """Estima precio y razón de cierre a partir del precio actual y los niveles guardados."""
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
@@ -326,7 +364,6 @@ def _get_real_exit_price(
     fallback: float,
     fallback_reason: str,
 ) -> tuple[float, str]:
-    """Busca el precio real de cierre en el historial de órdenes del exchange."""
     side     = pos.get("side", "long")
     entry    = pos.get("entry", 0.0)
     open_ts  = pos.get("open_ts", 0.0)
@@ -369,7 +406,6 @@ def _get_real_exit_price(
 
 
 def _calc_pnl(side: str, entry: float, exit_price: float, qty: float) -> tuple[float, float]:
-    """Calcula PnL en % (con leverage) y en USDT (absoluto)."""
     if side == "long":
         price_move = (exit_price - entry) / entry
     else:
@@ -381,7 +417,6 @@ def _calc_pnl(side: str, entry: float, exit_price: float, qty: float) -> tuple[f
 
 
 def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
-    """Registra el cierre de una posición: PnL, cooldown, logger y Telegram."""
     current_price          = exchange.get_price(symbol)
     exit_price_est, reason_est = _exit_price_for(p, current_price)
     exit_price, reason     = _get_real_exit_price(symbol, p, exit_price_est, reason_est)
@@ -451,8 +486,9 @@ def run() -> None:
     global _weekend_notified_day
 
     log.info(
-        "Bot iniciado | %d pares | lev=%dx | margin=%s USDT | max=%d posiciones",
-        len(config.SYMBOLS), config.LEVERAGE, config.MARGIN_USDT, config.MAX_POSITIONS,
+        "Bot iniciado | %d pares | lev=%dx | margin=%s USDT | max=%d posiciones | max_same_side=%d",
+        len(config.SYMBOLS), config.LEVERAGE, config.MARGIN_USDT,
+        config.MAX_POSITIONS, MAX_SAME_SIDE,
     )
 
     for symbol in config.SYMBOLS:
@@ -558,9 +594,13 @@ def run() -> None:
                     "PAUSADO(drawdown)" if bot_state.is_daily_limit_hit()
                     else ("PAUSADO" if bot_state.is_paused() else "activo")
                 )
+                long_count  = sum(1 for p in positions.values() if p["side"] == "long")
+                short_count = sum(1 for p in positions.values() if p["side"] == "short")
                 log.info(
-                    "[loop #%d] Posiciones: %d/%d | Feed: %d/%d | Cooldowns: %d | Estado: %s | PnL hoy: %+.2f USDT",
+                    "[loop #%d] Posiciones: %d/%d (L:%d S:%d) | Feed: %d/%d | "
+                    "Cooldowns: %d | Estado: %s | PnL hoy: %+.2f USDT",
                     loop_count, open_count, config.MAX_POSITIONS,
+                    long_count, short_count,
                     feed.ready_count(), len(config.SYMBOLS), len(_cooldown),
                     paused_str, daily_pnl,
                 )
@@ -627,11 +667,6 @@ def run() -> None:
                         candles_1h  = feed.get(symbol, "1h")
                         candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
 
-                        # FIX BUG IMPORTANTE: evaluate() ahora devuelve (signal, score, regime).
-                        # Usamos el régimen ya confirmado del tercer elemento en lugar de
-                        # recalcular con _market_regime a secas (sin confirmación), lo que
-                        # antes podía devolver regime="range" cuando _regime_confirmed ya
-                        # había aprobado "bull"/"bear", resultando en RR=1.5 incorrecto.
                         signal, score, regime = signals.evaluate(
                             candles_15m, candles_1h, candles_4h,
                             min_score=effective_min_score,
@@ -645,9 +680,12 @@ def run() -> None:
                                 )
                             continue
 
-                        # regime ya viene confirmado desde evaluate() — fallback defensivo
                         if not regime:
                             regime = "bull" if signal == "long" else "bear"
+
+                        # ── Guards de exposición direccional y correlación ──────
+                        if not is_manual and not _check_directional_guard(signal, positions, symbol):
+                            continue
 
                         price  = exchange.get_price(symbol)
                         params = risk.calc(
@@ -685,10 +723,6 @@ def run() -> None:
                             symbol = symbol,
                         )
 
-                        # FIX CRÍTICO: sincronizar entry real desde exchange.
-                        # get_price() fue consultado antes de open_order() y puede
-                        # diferir del fill real. Se hace get_position() inmediatamente
-                        # para leer el avgPrice real. Fallback: price del feed.
                         real_entry = _sync_entry_from_exchange(symbol, price, signal)
 
                         positions[symbol] = {
