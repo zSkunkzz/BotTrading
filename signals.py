@@ -7,19 +7,23 @@ Filtros:
                           confirmando el mismo régimen antes de habilitar señales
   3. Macro 4h           : EMA50 en 4h — bonus/penalización/neutro según disponibilidad
   4. EMA200 1h          : hard-guard de dirección (calculado sobre velas cerradas)
-  5. ATR volátil        : hard-guard — si atr_pct > 3.5% mercado en evento/noticia,
+  5. EMA200 15m         : hard-guard de dirección en timeframe operativo
+  6. ATR volátil        : hard-guard — si atr_pct > 3.5% mercado en evento/noticia,
                           SL real desborda el cap de 2.5% → no entrar
-  6. ADX 15m            : hard-guard <18 (sin tendencia suficiente, no operar)
+  7. ADX 15m            : hard-guard <18 (sin tendencia suficiente, no operar)
                           >35 +12, >25 +6, >18 -8, ≤18 bloqueado
-  7. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
+  8. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
                           hard-guard short: bear + adx_1h < 18 → no entrar (rebote choppy)
-  8. Volumen            : última vela CERRADA >media×1.2 → +8
   9. RSI 15m            : cruce 50 +15, extremo +8, direccional +4 (con umbral de zona),
                           contrario -5
+                          hard-guard short: RSI < 38 → rebote probable, no entrar
   10. MACD 15m + 1h     : histograma positivo/negativo → +10 | neutro 0 | contrario -5
   11. Divergencia RSI   : +8 (con validación de volumen para evitar señales espurias)
   12. Sesgo horario     : hora alta +8, hora baja -10 (basado en ts de vela cerrada)
   13. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
+  14. Score direccional : SHORTs requieren min_score+10 (default 80 vs 70 para LONGs)
+                          El crypto tiene sesgo alcista estructural — los SHORTs
+                          necesitan mayor convicción para justificar el riesgo.
 
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
@@ -34,6 +38,10 @@ FIXES aplicados:
   - ADX hard-guard elevado de <15 a <18
   - evaluate(): devuelve (signal, score, regime) para que main.py no recalcule régimen
   - _rsi_divergence: valida volumen mínimo de la última vela para evitar divergencias espurias
+  - REGIME_CONFIRM_BARS: 2 → 4 (evita activar bear/bull en pullbacks de 2h)
+  - SHORT_MIN_SCORE_EXTRA: +10 sobre min_score para SHORTs (sesgo alcista estructural del crypto)
+  - Hard-guard RSI < 38 para SHORTs (rebote probable en sobrevendido)
+  - Hard-guard EMA200 15m: no SHORT si precio > EMA200_15m, no LONG si precio < EMA200_15m
 """
 from __future__ import annotations
 import logging
@@ -49,7 +57,20 @@ EMA200_MIN_DIST     = 0.003
 NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
 MIN_SCORE           = config.MIN_SCORE
-REGIME_CONFIRM_BARS = 2
+
+# FIX: elevado de 2 → 4.
+# Con 2 velas el régimen "bear" se activaba tras solo 2 horas bajistas,
+# que en crypto puede ser simplemente el pullback de un pump. Se necesitan
+# 4 velas 1h consecutivas confirmando el mismo régimen para habilitar señales.
+# Coste: señales más lentas al inicio de una tendencia.
+# Beneficio: no entrar SHORT en el medio de un pump alcista.
+REGIME_CONFIRM_BARS = 4
+
+# FIX: los SHORTs exigen min_score + SHORT_MIN_SCORE_EXTRA.
+# El crypto tiene sesgo alcista estructural — los squeezes van hacia arriba.
+# Un SHORT con score 70 (el mínimo) no tiene suficiente convicción.
+# Los 6 trades perdidos del 26-jun-2026 tenían score exactamente 70.
+SHORT_MIN_SCORE_EXTRA = 10
 
 # Guard de volatilidad extrema
 ATR_VOLATILE_PCT    = 0.035   # 3.5%
@@ -146,8 +167,6 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
     FIX: valida que la última vela cerrada tenga volumen >= 60% de la media
     de la ventana. En horas de bajo volumen (madrugada UTC) la divergencia
     RSI puede ser espuria porque el precio se mueve con poca liquidez.
-    Sin este filtro, velas de bajo volumen suman +8 pts y pueden empujar
-    el score sobre el MIN_SCORE en condiciones de mercado no operables.
     """
     if len(closes) < lookback + 14 or len(candles) < lookback + 14:
         return None
@@ -156,7 +175,6 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
     recent_rsi     = rsi_series[-lookback:]
     recent_candles = candles[-lookback:]
 
-    # FIX: filtro de volumen mínimo — divergencia en vela de bajo volumen es espuria
     avg_vol  = sum(c["volume"] for c in recent_candles[:-1]) / max(1, len(recent_candles) - 1)
     last_vol = recent_candles[-1].get("volume", 0.0)
     if avg_vol > 0 and last_vol < avg_vol * 0.6:
@@ -183,18 +201,13 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     """Clasifica el régimen usando SOLO velas cerradas.
 
     FIX: usa closes[-2] como precio de referencia (última vela CERRADA)
-    en lugar de closes[-1] (vela en curso). La vela 1h en curso puede
-    llevar solo 15-45 min y crear un régimen falso por rebote intravela.
-    El llamador debe pasar candles_1h[:-1] si quiere excluir la vela
-    en curso completamente, o bien esta función usa [-2] internamente.
+    en lugar de closes[-1] (vela en curso).
     """
     closes = [c["close"] for c in candles_1h]
     ema20  = _ema(closes, 20)[-1]
     ema50  = _ema(closes, 50)[-1]
     ema200 = _ema(closes, 200)[-1]
     adx    = _adx(candles_1h, 14)
-    # FIX Bug1+Bug4: usar el cierre de la última vela CERRADA ([-2])
-    # para comparar vs EMAs. closes[-1] es la vela 1h aún abierta.
     price  = closes[-2] if len(closes) >= 2 else closes[-1]
 
     if price > ema20 > ema50 > ema200:
@@ -211,21 +224,17 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
     """Devuelve el régimen solo si las últimas n+1 velas cerradas coinciden.
 
-    FIX Bug4 (asimetría temporal): el estado actual ahora se calcula con
-    candles_1h[:-1] (excluye vela en curso) igual que las ventanas
-    históricas. Antes el estado actual usaba candles_1h completo (vela
-    en curso incluida) mientras el histórico usaba [:-k] (cerradas), lo
-    que creaba una asimetría que hacía el régimen artificialmente inestable
-    o podía confirmar un régimen falso basado en precio intravela.
+    FIX: elevado REGIME_CONFIRM_BARS de 2 → 4. Con n=4 se necesitan
+    5 estados consecutivos iguales (estado actual + 4 ventanas previas),
+    equivalente a ~4-5 horas de régimen sostenido antes de habilitar señales.
+    Evita activar SHORTs en pullbacks breves dentro de tendencias alcistas.
     """
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
 
-    # FIX: estado actual con velas cerradas (excluye la 1h en curso)
     closed_1h = candles_1h[:-1]
     regime_now, adx_now = _market_regime(closed_1h)
 
-    # n ventanas anteriores: desplazadas 1, 2, ... n velas atrás
     regimes_prev = []
     for k in range(1, n + 1):
         window = closed_1h[:-k]
@@ -259,18 +268,12 @@ def _macro_pts(candles_4h: list[dict] | None, direction: str) -> int:
 
     +15 a favor  |  0 si sin datos  |  -10 en contra
 
-    FIX CRÍTICO: usa closes[-2] (última vela 4h CERRADA) en lugar de
-    closes[-1] (vela 4h en curso, puede llevar 1-3 horas incompleta).
-    Una vela 4h a medias puede cruzar temporalmente la EMA50 y dar
-    ±15 puntos basados en información falsa, degradando el winrate.
-    Requiere >= 52 velas (51 para EMA50 + 1 extra para poder usar [-2]).
+    FIX CRÍTICO: usa closes[-2] (última vela 4h CERRADA).
     """
     if not candles_4h or len(candles_4h) < 52:
         return 0
     closes = [c["close"] for c in candles_4h]
-    # FIX: EMA calculada sobre velas cerradas (excluye la última en curso)
     ema50  = _ema(closes[:-1], 50)[-1]
-    # FIX: precio de referencia = última vela 4h CERRADA
     price  = closes[-2] if len(closes) >= 2 else closes[-1]
     if direction == "long":
         return 15 if price > ema50 else -10
@@ -286,15 +289,6 @@ def evaluate(
     """Evalúa señal con scoring 0-100.
 
     Devuelve (signal, score, regime) o (None, score, None).
-
-    FIX BUG IMPORTANTE: ahora devuelve el régimen confirmado como tercer
-    elemento para que main.py no tenga que recalcularlo con _market_regime
-    a secas (sin confirmación). Antes, main.py hacía:
-        signal, score = signals.evaluate(...)        # usa _regime_confirmed ✓
-        regime, _ = signals._market_regime(c1h)      # SIN confirmación ✗ → RR incorrecto
-    Esto causaba que risk.calc recibiera regime="range" en momentos donde
-    _regime_confirmed ya había aprobado "bull"/"bear", resultando en RR=1.5
-    en lugar del correcto 2.0, recortando el beneficio esperado del trade.
     """
 
     # ── 0. Datos mínimos ──────────────────────────────────────────────────
@@ -302,7 +296,7 @@ def evaluate(
         return None, 0, None
 
     # ── 1. Vela cerrada ───────────────────────────────────────────────────
-    candle     = candles_15m[-2]          # penúltima = cerrada
+    candle     = candles_15m[-2]
     closes_15m = [c["close"] for c in candles_15m]
 
     # ── 2. Régimen de mercado ─────────────────────────────────────────────
@@ -328,7 +322,27 @@ def evaluate(
     if direction == "short" and price > ema200_1h * (1 + EMA200_MIN_DIST):
         return None, score, regime
 
-    # ── 5b. Guard ATR volátil ─────────────────────────────────────────────
+    # ── 5b. EMA200 15m hard-guard ─────────────────────────────────────────
+    # FIX: añadido guard en el timeframe operativo.
+    # Si el precio está sobre la EMA200 de 15m, la tendencia de medio plazo
+    # es alcista — abrir SHORT va en contra. Y viceversa para LONGs.
+    # Margen del 0.2% para evitar falsos bloqueos en zona de contacto.
+    if len(closes_15m) >= 202:
+        ema200_15m = _ema(closes_15m[:-1], 200)[-1]
+        if direction == "short" and price > ema200_15m * 1.002:
+            log.debug(
+                "Hard-guard EMA200 15m: precio %.6f > EMA200_15m %.6f — SHORT bloqueado",
+                price, ema200_15m,
+            )
+            return None, score, regime
+        if direction == "long" and price < ema200_15m * 0.998:
+            log.debug(
+                "Hard-guard EMA200 15m: precio %.6f < EMA200_15m %.6f — LONG bloqueado",
+                price, ema200_15m,
+            )
+            return None, score, regime
+
+    # ── 5c. Guard ATR volátil ─────────────────────────────────────────────
     atr_15m_raw = _atr(candles_15m[:-1])
     if price > 0 and atr_15m_raw / price > ATR_VOLATILE_PCT:
         log.info(
@@ -346,7 +360,7 @@ def evaluate(
 
     if   adx_15m > 35: score += 12
     elif adx_15m > 25: score += 6
-    else:              score -= 8   # 18 ≤ adx ≤ 25: tendencia débil, penalizar
+    else:              score -= 8
 
     # ── 7. ADX 1h ─────────────────────────────────────────────────────────
     if   adx_1h > 25: score += 5
@@ -367,6 +381,16 @@ def evaluate(
     rsi_vals = _rsi(closes_15m[:-1], 14)
     rsi_now  = rsi_vals[-1]
     rsi_prev = rsi_vals[-2] if len(rsi_vals) > 1 else rsi_now
+
+    # FIX: hard-guard RSI sobrevendido para SHORTs.
+    # RSI < 38 indica que el activo ya está muy vendido y un rebote es probable.
+    # Antes solo penalizaba -5 si RSI > 60, pero no bloqueaba en el extremo contrario.
+    if direction == "short" and rsi_now < 38:
+        log.debug(
+            "Hard-guard SHORT: RSI sobrevendido %.1f < 38 — rebote probable, señal descartada",
+            rsi_now,
+        )
+        return None, score, regime
 
     if direction == "long":
         rsi_cross = rsi_prev < 50 <= rsi_now
@@ -426,15 +450,25 @@ def evaluate(
         log.debug("No-chase: rng=%.4f > %.1f×ATR=%.4f", candle_rng, NO_CHASE_MULT, atr_15m_raw)
         return None, score, regime
 
-    # ── 14. Score mínimo ──────────────────────────────────────────────────
-    if score < min_score:
-        log.debug("Score insuficiente: %d < %d (%s)", score, min_score, direction)
+    # ── 14. Score mínimo (direccional) ───────────────────────────────────
+    # FIX: los SHORTs exigen min_score + SHORT_MIN_SCORE_EXTRA (default +10).
+    # El crypto tiene sesgo alcista estructural — los squeezes van hacia arriba.
+    # Con MIN_SCORE=70: LONGs necesitan 70, SHORTs necesitan 80.
+    # Los 6 trades perdidos del 26-jun tenían score exactamente 70 (SHORT) →
+    # habrían sido bloqueados con este guard.
+    min_score_directional = min_score + SHORT_MIN_SCORE_EXTRA if direction == "short" else min_score
+    if score < min_score_directional:
+        log.debug(
+            "Score insuficiente: %d < %d (%s, extra=%d)",
+            score, min_score_directional, direction,
+            SHORT_MIN_SCORE_EXTRA if direction == "short" else 0,
+        )
         return None, score, regime
 
     log.info(
-        "✅ SEÑAL %s | score=%d | regime=%s adx1h=%.1f adx15m=%.1f "
+        "✅ SEÑAL %s | score=%d (min=%d) | regime=%s adx1h=%.1f adx15m=%.1f "
         "rsi=%.1f macd15=%+.4f macd1h=%+.4f vol=%s div=%s",
-        direction.upper(), score, regime, adx_1h, adx_15m,
-        rsi_now, h_now, h1_now, _volume_ok(candles_15m), div,
+        direction.upper(), score, min_score_directional, regime,
+        adx_1h, adx_15m, rsi_now, h_now, h1_now, _volume_ok(candles_15m), div,
     )
     return direction, score, regime
