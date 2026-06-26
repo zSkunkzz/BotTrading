@@ -12,6 +12,35 @@ log = logging.getLogger("telegram")
 BASE_URL = f"https://api.telegram.org/bot{config.TG_TOKEN}"
 
 
+class _RedactTokenFilter(logging.Filter):
+    """Elimina el token de Telegram de cualquier mensaje de log."""
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._token = token
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._token:
+            record.msg = str(record.msg).replace(self._token, "***TG_TOKEN***")
+            record.args = tuple(
+                str(a).replace(self._token, "***TG_TOKEN***") if isinstance(a, str) else a
+                for a in (record.args or ())
+            )
+        return True
+
+
+def _install_filter() -> None:
+    """Instala el filtro en el logger de httpx para ocultar el token."""
+    if not config.TG_TOKEN:
+        return
+    f = _RedactTokenFilter(config.TG_TOKEN)
+    for name in ("httpx", "httpcore", "telegram"):
+        logging.getLogger(name).addFilter(f)
+
+
+_install_filter()
+
+
 def notify(text: str) -> None:
     """Envía un mensaje HTML al chat configurado."""
     try:
