@@ -26,7 +26,10 @@ _cooldown_reason: dict[str, str] = {}   # 'tp' | 'sl'
 _manual_alert_cooldown: dict[str, float] = {}
 
 COOLDOWN_SL           = 60 * 60
-COOLDOWN_TP           = 15 * 60
+# FIX menor: elevado de 15 min a 30 min.
+# Con 15 min el bot podía re-entrar en el pull-back inmediato post-TP,
+# patrón muy común en altcoins que recorren tras alcanzar TP.
+COOLDOWN_TP           = 30 * 60
 MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
@@ -54,6 +57,40 @@ def _is_weekend() -> bool:
 def _cooldown_for(symbol: str) -> int:
     reason = _cooldown_reason.get(symbol, "sl")
     return COOLDOWN_TP if reason == "tp" else COOLDOWN_SL
+
+
+def _sync_entry_from_exchange(symbol: str, local_price: float, side: str) -> float:
+    """Lee el precio de fill real desde BingX tras abrir una orden.
+
+    FIX CRÍTICO: el precio consultado con get_price() ANTES de open_order()
+    puede diferir del fill real en 0.1-0.5% en altcoins con spread amplio
+    o en momentos de alta volatilidad. Usar ese precio como entry contamina:
+      - el trailing stop  (niveles calculados desde price falso)
+      - el extend_tp      (tp_orig_dist calculado desde entry incorrecto)
+      - el PnL registrado (ganancias/pérdidas incorrectas en el log)
+
+    Se hace un get_position() inmediatamente después de abrir para leer
+    el avgPrice real del fill. Si falla (timeout, posición no propagada
+    aún), se devuelve local_price como fallback.
+    """
+    try:
+        pos_live = exchange.get_position(symbol)
+        if pos_live and pos_live.get("side") == side:
+            real_entry = float(pos_live.get("entry") or 0.0)
+            if real_entry > 0:
+                drift_pct = abs(real_entry - local_price) / local_price * 100
+                if drift_pct > 0.1:
+                    log.info(
+                        "[%s] Entry sincronizado desde exchange: %.6f → %.6f (drift %.3f%%)",
+                        symbol, local_price, real_entry, drift_pct,
+                    )
+                return real_entry
+    except Exception as exc:
+        log.warning(
+            "[%s] No se pudo sincronizar entry real tras apertura: %s — usando precio feed",
+            symbol, exc,
+        )
+    return local_price
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
@@ -138,7 +175,7 @@ def _check_tp_extension(
             candles_15m = feed.get(symbol, "15m")
             candles_1h  = feed.get(symbol, "1h")
             candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
-            signal, score = signals.evaluate(
+            signal, score, _ = signals.evaluate(
                 candles_15m, candles_1h, candles_4h,
                 min_score=effective_min_score,
             )
@@ -153,7 +190,7 @@ def _check_tp_extension(
             )
             return
 
-        # ── 2. Verificar que la posición sigue abierta en BingX ────────
+        # ── 2. Verificar que la posición sigue abierta en BingX ────────────
         try:
             pos_live = exchange.get_position(symbol)
         except Exception as e:
@@ -174,7 +211,7 @@ def _check_tp_extension(
             )
             return
 
-        # ── 3. Calcular nuevo TP ────────────────────────────────────────
+        # ── 3. Calcular nuevo TP ──────────────────────────────────────────
         entry        = pos["entry"]
         tp_orig_dist = abs(pos.get("tp_original", tp) - entry)
 
@@ -185,7 +222,7 @@ def _check_tp_extension(
 
         current_sl = pos["sl"]
 
-        # ── 4. Recolocar órdenes ────────────────────────────────────────
+        # ── 4. Recolocar órdenes ──────────────────────────────────────────
         try:
             exchange.cancel_all_orders(symbol)
             exchange.place_stop_order(symbol, side, pos["qty"], current_sl)
@@ -194,7 +231,7 @@ def _check_tp_extension(
             log.warning("[%s] Error colocando órdenes en extend_tp: %s", symbol, e)
             return
 
-        # ── 5. Actualizar estado local ──────────────────────────────────
+        # ── 5. Actualizar estado local ────────────────────────────────────
         old_tp = pos["tp"]
         pos["tp"]            = new_tp
         pos["tp_extensions"] = extensions + 1
@@ -556,11 +593,6 @@ def run() -> None:
                     log.debug("Bot pausado manualmente — saltando búsqueda de señales")
             else:
                 if loop_count % 10 == 1:
-                    # BUG CORREGIDO: usamos _market_regime (no _regime_confirmed)
-                    # para el log de regímenes. Solo es informativo — la decisión
-                    # real de entrar usa _regime_confirmed dentro de evaluate().
-                    # Esto evita llamar _regime_confirmed dos veces por símbolo
-                    # (coste extra) y unifica la función pública vs privada.
                     regime_summary = []
                     for sym in config.SYMBOLS:
                         if not feed.ready(sym):
@@ -595,7 +627,12 @@ def run() -> None:
                         candles_1h  = feed.get(symbol, "1h")
                         candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
 
-                        signal, score = signals.evaluate(
+                        # FIX BUG IMPORTANTE: evaluate() ahora devuelve (signal, score, regime).
+                        # Usamos el régimen ya confirmado del tercer elemento en lugar de
+                        # recalcular con _market_regime a secas (sin confirmación), lo que
+                        # antes podía devolver regime="range" cuando _regime_confirmed ya
+                        # había aprobado "bull"/"bear", resultando en RR=1.5 incorrecto.
+                        signal, score, regime = signals.evaluate(
                             candles_15m, candles_1h, candles_4h,
                             min_score=effective_min_score,
                         )
@@ -608,10 +645,9 @@ def run() -> None:
                                 )
                             continue
 
-                        try:
-                            regime, _ = signals._market_regime(candles_1h)
-                        except Exception:
-                            regime = "bull"
+                        # regime ya viene confirmado desde evaluate() — fallback defensivo
+                        if not regime:
+                            regime = "bull" if signal == "long" else "bear"
 
                         price  = exchange.get_price(symbol)
                         params = risk.calc(
@@ -649,9 +685,15 @@ def run() -> None:
                             symbol = symbol,
                         )
 
+                        # FIX CRÍTICO: sincronizar entry real desde exchange.
+                        # get_price() fue consultado antes de open_order() y puede
+                        # diferir del fill real. Se hace get_position() inmediatamente
+                        # para leer el avgPrice real. Fallback: price del feed.
+                        real_entry = _sync_entry_from_exchange(symbol, price, signal)
+
                         positions[symbol] = {
                             "side":          signal,
-                            "entry":         price,
+                            "entry":         real_entry,
                             "qty":           params["qty"],
                             "sl":            params["sl"],
                             "tp":            params["tp"],
@@ -659,8 +701,8 @@ def run() -> None:
                             "tp_extensions": 0,
                             "_extending":    False,
                             "trail_step":    params["trail_step"],
-                            "trail_high":    price,
-                            "trail_low":     price,
+                            "trail_high":    real_entry,
+                            "trail_low":     real_entry,
                             "score":         score,
                             "open_ts":       time.time(),
                         }
@@ -668,7 +710,7 @@ def run() -> None:
 
                         telegram.notify_open(
                             symbol = symbol,
-                            price  = price,
+                            price  = real_entry,
                             side   = signal,
                             qty    = params["qty"],
                             sl     = params["sl"],
