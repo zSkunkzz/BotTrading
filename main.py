@@ -31,7 +31,10 @@ MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
 TP_EXTEND_THRESH       = 0.015
-MIN_HOLD_SECS          = 300
+# FIX: reducido de 300 a 90 s. Con 300s el bot no podía extender TPs ni mover
+# el trailing en los primeros 5 minutos, perdiendo ventanas de momentum en
+# altcoins volátiles que tocan el TP en los primeros 2-3 loops (velas 15m).
+MIN_HOLD_SECS          = 90
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -69,7 +72,6 @@ def _corr_group_for(symbol: str) -> int | None:
 
 def _check_directional_guard(signal: str, positions: dict, symbol: str) -> bool:
     """Devuelve True si se puede abrir la posición según los guards direccionales."""
-    # Guard 1: exposición direccional
     same_side_count = sum(1 for p in positions.values() if p["side"] == signal)
     if same_side_count >= MAX_SAME_SIDE:
         log.debug(
@@ -78,7 +80,6 @@ def _check_directional_guard(signal: str, positions: dict, symbol: str) -> bool:
         )
         return False
 
-    # Guard 2: correlación por grupo
     grp_idx = _corr_group_for(symbol)
     if grp_idx is not None:
         grp_count = sum(
@@ -242,17 +243,15 @@ def _check_tp_extension(
         else:
             new_tp = round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
 
-        # FIX Bug 1: verificar que el nuevo TP no quede por debajo/encima del precio
-        # actual, lo que provocaría que se ejecutase inmediatamente tras colocarlo.
         if side == "long" and new_tp <= current_price * 1.001:
             log.warning(
-                "[%s] extend_tp cancelado — new_tp %.6f <= precio_actual %.6f (se ejecutaría al momento)",
+                "[%s] extend_tp cancelado — new_tp %.6f <= precio_actual %.6f",
                 symbol, new_tp, current_price,
             )
             return
         if side == "short" and new_tp >= current_price * 0.999:
             log.warning(
-                "[%s] extend_tp cancelado — new_tp %.6f >= precio_actual %.6f (se ejecutaría al momento)",
+                "[%s] extend_tp cancelado — new_tp %.6f >= precio_actual %.6f",
                 symbol, new_tp, current_price,
             )
             return
@@ -448,7 +447,7 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
             f"\U0001f6d1 <b>L\u00edmite de p\u00e9rdidas diario alcanzado</b>\n"
             f"PnL hoy: <code>{daily_pnl:+.2f} USDT</code> ({daily_pct:+.2f}%)\n"
             f"Umbral: {daily_max}% — bot pausado hasta las 00:00 UTC.\n"
-            f"Las posiciones abiertas siguen gestion\u00e1ndose (trailing/TP)."
+            f"Las posiciones abiertas siguen gestionándose (trailing/TP)."
         )
         log.warning("[drawdown] %s", msg.replace("\n", " "))
         telegram.notify(msg)
@@ -479,14 +478,7 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
 
 
 def _calc_trail_step_from_atr(symbol: str, feed, sl: float | None, entry: float) -> float:
-    """Recalcula trail_step desde ATR cuando se sincroniza una posición tras reinicio.
-
-    FIX Bug 2: las posiciones sincronizadas desde el exchange tenían trail_step=0
-    porque no se conservaba el ATR original. Este helper lo recalcula desde las
-    velas actuales del feed para que el trailing vuelva a funcionar tras un reinicio.
-    Si no hay datos de feed disponibles, usa el 30% de la distancia SL-entry
-    como fallback, que es la misma lógica de risk.py.
-    """
+    """Recalcula trail_step desde ATR cuando se sincroniza una posición tras reinicio."""
     try:
         candles_15m = feed.get(symbol, "15m")
         if candles_15m and len(candles_15m) >= 15:
@@ -503,7 +495,6 @@ def _calc_trail_step_from_atr(symbol: str, feed, sl: float | None, entry: float)
     except Exception as exc:
         log.debug("[%s] No se pudo recalcular trail_step desde ATR: %s", symbol, exc)
 
-    # Fallback: 30% de la distancia SL-entry (misma lógica que risk.py)
     if sl is not None and entry > 0:
         sl_dist = abs(entry - sl)
         if sl_dist > 0:
@@ -512,6 +503,34 @@ def _calc_trail_step_from_atr(symbol: str, feed, sl: float | None, entry: float)
             return step
 
     return 0.0
+
+
+def _get_position_open_ts(symbol: str, pos_ex: dict) -> float:
+    """Intenta obtener el timestamp real de apertura desde el historial de órdenes.
+
+    FIX: con time.time() en el sync, MIN_HOLD_SECS se reiniciaba en cada restart
+    aunque la posición llevase horas abierta. Ahora buscamos la orden de apertura
+    real en el historial de órdenes cerradas. Si no encontramos nada usamos
+    time.time() como fallback (comportamiento anterior, conservador).
+    """
+    try:
+        side       = pos_ex.get("side", "long")
+        open_bx_side = "BUY" if side == "long" else "SELL"
+        closed = exchange.get_closed_orders(symbol, limit=20)
+        for order in closed:
+            if str(order.get("side", "")).upper() != open_bx_side:
+                continue
+            order_type = str(order.get("type", "")).upper()
+            if "MARKET" not in order_type and "LIMIT" not in order_type:
+                continue
+            ts_ms = int(order.get("time") or order.get("updateTime") or 0)
+            if ts_ms > 0:
+                ts = ts_ms / 1000.0
+                log.info("[%s] open_ts real recuperado desde historial: %.0f", symbol, ts)
+                return ts
+    except Exception as exc:
+        log.debug("[%s] No se pudo recuperar open_ts real: %s — usando time.time()", symbol, exc)
+    return time.time()
 
 
 def run() -> None:
@@ -602,12 +621,12 @@ def run() -> None:
                         )
                         continue
 
-                    # FIX Bug 2: recalcular trail_step desde ATR en lugar de fijar 0.
-                    # Con trail_step=0 el trailing stop quedaba permanentemente desactivado
-                    # para cualquier posición que sobreviviera un reinicio del bot.
                     synced_sl    = pos_ex.get("sl")
                     synced_entry = pos_ex["entry"]
                     trail_step   = _calc_trail_step_from_atr(symbol, feed, synced_sl, synced_entry)
+                    # FIX: recuperar el open_ts real desde el historial de órdenes
+                    # para no reiniciar MIN_HOLD_SECS en cada restart del bot.
+                    real_open_ts = _get_position_open_ts(symbol, pos_ex)
 
                     positions[symbol] = {
                         "side":          ex_side,
@@ -622,11 +641,11 @@ def run() -> None:
                         "trail_high":    synced_entry,
                         "trail_low":     synced_entry,
                         "score":         70,
-                        "open_ts":       time.time(),
+                        "open_ts":       real_open_ts,
                     }
-                    log.info("[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s trail=%.8f)",
+                    log.info("[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s trail=%.8f open_ts=%.0f)",
                              symbol, ex_side, synced_entry,
-                             synced_sl, pos_ex["tp"], trail_step)
+                             synced_sl, pos_ex["tp"], trail_step, real_open_ts)
 
             open_count = len(positions)
 
@@ -725,7 +744,6 @@ def run() -> None:
                         if not regime:
                             regime = "bull" if signal == "long" else "bear"
 
-                        # ── Guards de exposición direccional y correlación ──────
                         if not is_manual and not _check_directional_guard(signal, positions, symbol):
                             continue
 
@@ -782,9 +800,6 @@ def run() -> None:
                             "score":         score,
                             "open_ts":       time.time(),
                         }
-                        # FIX Bug 3: usar len(positions) en lugar de open_count += 1.
-                        # Si open_order lanzaba excepción y la capturaba el except,
-                        # open_count se desincronizaba del estado real de positions.
                         open_count = len(positions)
 
                         telegram.notify_open(
