@@ -32,16 +32,25 @@ MIN_SCORE configurable via env var MIN_SCORE (default 70)
 
 FIXES aplicados:
   - _market_regime: usa closes[-2] (vela 1h cerrada) para price, no closes[-1]
+  - _market_regime: EMAs calculadas sobre closes[:-1] (velas cerradas) — FIX BUG
+                    Antes las EMAs se calculaban incluyendo la vela 1h en curso, lo que
+                    sesgaba el régimen cuando la vela abierta tenía un close provisional
+                    muy alto o bajo. Ahora EMAs y price usan exclusivamente velas cerradas.
   - _regime_confirmed: estado actual calculado con candles_1h[:-1] igual que histórico
   - _macro_pts: FIX CRÍTICO — usa closes[-2] (vela 4h cerrada) en lugar de closes[-1]
   - rsi_dir: añadido umbral de zona (LONG>45, SHORT<55) para evitar +4 en territorio contrario
   - ADX hard-guard elevado de <15 a <18
   - evaluate(): devuelve (signal, score, regime) para que main.py no recalcule régimen
   - _rsi_divergence: valida volumen mínimo de la última vela para evitar divergencias espurias
+  - _rsi_divergence: protegido max() sobre generador vacío con try/except — FIX BUG
   - REGIME_CONFIRM_BARS: 2 → 4 (evita activar bear/bull en pullbacks de 2h)
   - SHORT_MIN_SCORE_EXTRA: +10 sobre min_score para SHORTs (sesgo alcista estructural del crypto)
   - Hard-guard RSI < 38 para SHORTs (rebote probable en sobrevendido)
   - Hard-guard EMA200 15m: no SHORT si precio > EMA200_15m, no LONG si precio < EMA200_15m
+  - _ema: guard lista vacía → devuelve [] en lugar de IndexError — FIX BUG
+  - _volume_ok: excluye vela evaluada (candles[-2]) del cálculo de la media — FIX BUG
+                Antes la vela evaluada estaba incluida en recent, sesgando la media al alza
+                cuando la propia vela tenía volumen alto, impidiendo que superase el umbral.
 """
 from __future__ import annotations
 import logging
@@ -82,6 +91,9 @@ LOW_BIAS_HOURS  = {2, 3, 4, 5}
 # ── Indicadores ──────────────────────────────────────────────────────────
 
 def _ema(closes: list[float], period: int) -> list[float]:
+    # FIX: guard lista vacía — antes lanzaba IndexError en closes[0]
+    if not closes:
+        return []
     k = 2 / (period + 1)
     emas = [closes[0]]
     for c in closes[1:]:
@@ -167,6 +179,9 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
     FIX: valida que la última vela cerrada tenga volumen >= 60% de la media
     de la ventana. En horas de bajo volumen (madrugada UTC) la divergencia
     RSI puede ser espuria porque el precio se mueve con poca liquidez.
+
+    FIX: protegido max() sobre generador vacío con try/except para evitar
+    ValueError cuando todos los precios de la ventana son idénticos.
     """
     if len(closes) < lookback + 14 or len(candles) < lookback + 14:
         return None
@@ -184,15 +199,21 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
         )
         return None
 
-    lo_val = min(recent_closes[:-1])
-    lo_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == lo_val)
-    if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
-        return "bullish"
+    try:
+        lo_val = min(recent_closes[:-1])
+        lo_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == lo_val)
+        if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
+            return "bullish"
+    except (ValueError, IndexError):
+        pass
 
-    hi_val = max(recent_closes[:-1])
-    hi_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == hi_val)
-    if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
-        return "bearish"
+    try:
+        hi_val = max(recent_closes[:-1])
+        hi_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == hi_val)
+        if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
+            return "bearish"
+    except (ValueError, IndexError):
+        pass
 
     return None
 
@@ -202,11 +223,17 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
     FIX: usa closes[-2] como precio de referencia (última vela CERRADA)
     en lugar de closes[-1] (vela en curso).
+
+    FIX: EMAs calculadas sobre closes[:-1] (velas cerradas únicamente).
+    Antes se calculaban sobre closes completo, incluyendo la vela 1h en curso,
+    lo que sesgaba las EMAs cuando la vela abierta tenía un close provisional
+    muy extremo. Ahora tanto price como EMAs usan exclusivamente velas cerradas.
     """
-    closes = [c["close"] for c in candles_1h]
-    ema20  = _ema(closes, 20)[-1]
-    ema50  = _ema(closes, 50)[-1]
-    ema200 = _ema(closes, 200)[-1]
+    closes        = [c["close"] for c in candles_1h]
+    closes_closed = closes[:-1]  # solo velas cerradas
+    ema20  = _ema(closes_closed, 20)[-1]
+    ema50  = _ema(closes_closed, 50)[-1]
+    ema200 = _ema(closes_closed, 200)[-1]
     adx    = _adx(candles_1h, 14)
     price  = closes[-2] if len(closes) >= 2 else closes[-1]
 
@@ -254,10 +281,18 @@ def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> t
 
 
 def _volume_ok(candles: list[dict], window: int = 20) -> bool:
-    """Comprueba si el volumen de la última vela CERRADA supera la media."""
+    """Comprueba si el volumen de la última vela CERRADA supera la media.
+
+    FIX: excluye la vela evaluada (candles[-2]) del cálculo de la media.
+    Antes recent = candles[-(window+2):-1] incluía candles[-2], lo que
+    sesgaba la media al alza cuando la propia vela tenía volumen alto,
+    haciendo que no superase su propio umbral.
+    """
     if len(candles) < window + 2:
         return False
-    recent   = candles[-(window + 2):-1]
+    recent   = candles[-(window + 2):-2]  # excluye la vela evaluada
+    if not recent:
+        return False
     avg_vol  = sum(c["volume"] for c in recent) / len(recent)
     last_vol = candles[-2]["volume"]
     return last_vol > avg_vol * VOLUME_MULT
@@ -384,7 +419,6 @@ def evaluate(
 
     # FIX: hard-guard RSI sobrevendido para SHORTs.
     # RSI < 38 indica que el activo ya está muy vendido y un rebote es probable.
-    # Antes solo penalizaba -5 si RSI > 60, pero no bloqueaba en el extremo contrario.
     if direction == "short" and rsi_now < 38:
         log.debug(
             "Hard-guard SHORT: RSI sobrevendido %.1f < 38 — rebote probable, señal descartada",
@@ -454,8 +488,6 @@ def evaluate(
     # FIX: los SHORTs exigen min_score + SHORT_MIN_SCORE_EXTRA (default +10).
     # El crypto tiene sesgo alcista estructural — los squeezes van hacia arriba.
     # Con MIN_SCORE=70: LONGs necesitan 70, SHORTs necesitan 80.
-    # Los 6 trades perdidos del 26-jun tenían score exactamente 70 (SHORT) →
-    # habrían sido bloqueados con este guard.
     min_score_directional = min_score + SHORT_MIN_SCORE_EXTRA if direction == "short" else min_score
     if score < min_score_directional:
         log.debug(
