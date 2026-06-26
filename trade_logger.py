@@ -6,28 +6,42 @@ y llama a bot_state.record_trade() para actualizar el PnL.
 
 FIX: _cache protegido con _cache_lock (threading.Lock) para evitar race conditions.
 FIX: PnL neto real — ganancias y pérdidas se acumulan algebraicamente.
+
+GIST: Si GIST_TOKEN y GIST_ID están configurados en variables de entorno,
+      trades.csv se sincroniza con un Gist de GitHub tras cada trade y al arrancar.
+      Esto garantiza persistencia entre reinicios del contenedor Railway.
+      El CSV local se restaura desde el Gist al arrancar si está vacío.
+
+Variables de entorno necesarias para Gist:
+  GIST_TOKEN — GitHub Personal Access Token con scope 'gist'
+  GIST_ID    — ID del Gist donde guardar el CSV (crear uno vacío manualmente primero)
 """
 import csv
+import io
 import logging
 import os
 import threading
 import time
 from datetime import datetime, timezone
 
+import httpx
+
 import bot_state
 import config
 
 log = logging.getLogger("trade_logger")
 
-LOG_FILE = os.getenv("TRADES_CSV", "trades.csv")
-HEADER   = ["date", "symbol", "side", "entry", "exit",
-            "pnl_pct", "pnl_usdt", "score", "reason", "duration_min"]
+LOG_FILE   = os.getenv("TRADES_CSV", "trades.csv")
+GIST_TOKEN = os.getenv("GIST_TOKEN", "")
+GIST_ID    = os.getenv("GIST_ID", "")
+HEADER     = ["date", "symbol", "side", "entry", "exit",
+              "pnl_pct", "pnl_usdt", "score", "reason", "duration_min"]
 
 _csv_lock:   threading.Lock = threading.Lock()
 _cache_lock: threading.Lock = threading.Lock()
 _cache: list[dict] = []
 
-# ── Win rate monitor ─────────────────────────────────────────────────────────
+# ── Win rate monitor ───────────────────────────────────────────────────────────────
 _winrate_alerted: bool = False
 
 
@@ -35,7 +49,107 @@ def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-# ── CSV helpers ──────────────────────────────────────────────────────────────
+# ── Gist helpers ─────────────────────────────────────────────────────────────────
+
+def _gist_configured() -> bool:
+    return bool(GIST_TOKEN and GIST_ID)
+
+
+def _gist_push(content: str) -> None:
+    """Sube el contenido CSV al Gist. Llamada en background thread para no bloquear."""
+    if not _gist_configured():
+        return
+    try:
+        resp = httpx.patch(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers={
+                "Authorization": f"Bearer {GIST_TOKEN}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={"files": {"trades.csv": {"content": content}}},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            log.debug("Gist actualizado correctamente")
+        else:
+            log.warning("Gist push error %d: %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        log.warning("Gist push exception: %s", e)
+
+
+def _gist_push_async() -> None:
+    """Lee el CSV local y lo sube al Gist en un thread daemon."""
+    if not _gist_configured():
+        return
+    try:
+        with _csv_lock:
+            if not os.path.exists(LOG_FILE):
+                return
+            with open(LOG_FILE, "r") as f:
+                content = f.read()
+        threading.Thread(
+            target=_gist_push,
+            args=(content,),
+            daemon=True,
+            name="gist-push",
+        ).start()
+    except Exception as e:
+        log.warning("Gist push async error: %s", e)
+
+
+def _gist_pull() -> str | None:
+    """Descarga el contenido CSV del Gist. Devuelve el texto o None si falla."""
+    if not _gist_configured():
+        return None
+    try:
+        resp = httpx.get(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers={
+                "Authorization": f"Bearer {GIST_TOKEN}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            log.warning("Gist pull error %d", resp.status_code)
+            return None
+        files = resp.json().get("files", {})
+        csv_file = files.get("trades.csv")
+        if not csv_file:
+            return None
+        # Si el contenido está truncado, usar raw_url
+        if csv_file.get("truncated"):
+            raw = httpx.get(csv_file["raw_url"], timeout=15)
+            return raw.text if raw.status_code == 200 else None
+        return csv_file.get("content")
+    except Exception as e:
+        log.warning("Gist pull exception: %s", e)
+        return None
+
+
+def _restore_from_gist() -> bool:
+    """Intenta restaurar el CSV local desde el Gist.
+    Devuelve True si se restauró contenido, False si no.
+    """
+    content = _gist_pull()
+    if not content or not content.strip():
+        log.info("Gist vacío o no disponible — arrancando desde 0")
+        return False
+    try:
+        with _csv_lock:
+            with open(LOG_FILE, "w", newline="") as f:
+                f.write(content)
+        # Contar trades restaurados
+        lines = [l for l in content.strip().splitlines() if l]
+        trade_count = max(0, len(lines) - 1)  # restar cabecera
+        log.info("CSV restaurado desde Gist: %d trades", trade_count)
+        return True
+    except Exception as e:
+        log.warning("Error escribiendo CSV desde Gist: %s", e)
+        return False
+
+
+# ── CSV helpers ────────────────────────────────────────────────────────────────
 
 def _write_csv(row: list) -> None:
     with _csv_lock:
@@ -49,6 +163,8 @@ def _write_csv(row: list) -> None:
                 f.flush()
         except Exception as e:
             log.warning("CSV write error: %s", e)
+    # Sincronizar con Gist tras cada escritura (async, no bloquea el loop)
+    _gist_push_async()
 
 
 def _restore_from_csv() -> None:
@@ -64,7 +180,6 @@ def _restore_from_csv() -> None:
             reader = csv.DictReader(f)
             for row in reader:
                 row_date = row.get("date", "")
-                # Solo trades del día UTC actual
                 if not row_date.startswith(today):
                     continue
                 try:
@@ -87,7 +202,6 @@ def _restore_from_csv() -> None:
         with _cache_lock:
             _cache.extend(trades_today)
 
-        # Restaurar PnL neto en bot_state (fuente única de verdad)
         bot_state.restore_from_csv(trades_today)
 
         pnl_neto = sum(t["pnl_usdt"] for t in trades_today)
@@ -100,7 +214,7 @@ def _restore_from_csv() -> None:
         log.warning("Error restaurando desde CSV: %s — arrancando desde 0", e)
 
 
-# ── Win rate ─────────────────────────────────────────────────────────────────
+# ── Win rate ───────────────────────────────────────────────────────────────────
 
 def _check_winrate() -> None:
     global _winrate_alerted
@@ -139,7 +253,7 @@ def _check_winrate() -> None:
         log.info("Win rate recuperado: %.0f%% en últimos %d trades", win_rate, lookback)
 
 
-# ── API pública ──────────────────────────────────────────────────────────────
+# ── API pública ──────────────────────────────────────────────────────────────────
 
 def get_cache_snapshot() -> list[dict]:
     with _cache_lock:
@@ -191,7 +305,7 @@ def is_daily_limit_hit() -> bool:
     return bot_state.is_daily_limit_hit()
 
 
-# ── Resumen diario ────────────────────────────────────────────────────────────
+# ── Resumen diario ──────────────────────────────────────────────────────────────────
 
 def send_daily_summary() -> None:
     try:
@@ -203,7 +317,7 @@ def send_daily_summary() -> None:
         snapshot = list(_cache)
 
     if not snapshot:
-        _tg.notify("\U0001f4ca <b>Resumen del d\u00eda</b>\nSin trades en esta sesi\u00f3n.")
+        _tg.notify("📊 <b>Resumen del día</b>\nSin trades en esta sesión.")
         return
 
     total     = len(snapshot)
@@ -212,11 +326,11 @@ def send_daily_summary() -> None:
     total_pnl = sum(t["pnl_usdt"] for t in snapshot)
     win_rate  = wins / total * 100
 
-    lines = [f"\U0001f4ca <b>Resumen de sesi\u00f3n</b> ({total} trades)\n"]
+    lines = [f"📊 <b>Resumen de sesión</b> ({total} trades)\n"]
     lines.append(f"Win rate: <code>{win_rate:.0f}%</code> ({wins}W / {losses}L)")
     lines.append(f"PnL total: <code>{total_pnl:+.4f} USDT</code>\n")
     for t in snapshot:
-        icon = "\u2705" if t["pnl_pct"] >= 0 else "\u274c"
+        icon = "✅" if t["pnl_pct"] >= 0 else "❌"
         lines.append(
             f"{icon} {t['symbol']} {t['side'].upper()} "
             f"{t['pnl_pct']:+.2f}% ({t['pnl_usdt']:+.2f} USDT)"
@@ -245,8 +359,18 @@ def _daily_summary_scheduler() -> None:
 
 
 def start_scheduler() -> None:
-    """Restaura el estado desde CSV y arranca el scheduler de resumen diario."""
+    """Restaura el estado desde Gist/CSV y arranca el scheduler de resumen diario."""
+    # 1. Intentar restaurar desde Gist (sobrevive reinicios)
+    if _gist_configured():
+        log.info("Gist configurado (ID: %s...) — restaurando CSV", GIST_ID[:8])
+        _restore_from_gist()
+    else:
+        log.info("Gist no configurado — usando CSV local únicamente")
+
+    # 2. Cargar cache y PnL desde el CSV (local o recién restaurado)
     _restore_from_csv()
+
+    # 3. Arrancar scheduler de resumen diario
     threading.Thread(
         target=_daily_summary_scheduler,
         daemon=True,
