@@ -2,9 +2,8 @@
 
 Sizing:
   base_margin = MARGIN_USDT
-  score 70-84  →  1.0× base_margin
+  score 72-84  →  1.0× base_margin
   score ≥ 85   →  1.4× base_margin
-  (eliminado tier 55-69 con 0.7×: por debajo de MIN_SCORE=70 no se entra)
 
 SL / TP:
   El ATR de las velas 15m se convierte a porcentaje del precio de entrada
@@ -17,12 +16,17 @@ SL / TP:
   TP_RR dinámico:
     regime="range"  →  1.5  (precio no viaja lejos, TP más conservador)
     score ≥ 85      →  2.5  (señal fuerte + tendencia, dejar correr)
-    score ≥ 70      →  2.0  (normal)
-    (eliminado tier score<70: ya no alcanzable con MIN_SCORE=70)
+    score ≥ 72      →  2.0  (normal)
 
   Valores fijos:
-    SL_MIN_PCT = 0.4%   — mínimo SL
+    SL_MIN_PCT = 0.8%   — mínimo SL (subido de 0.4% → evitar stops por ruido)
     SL_MAX_PCT = 2.5%   — máximo SL
+
+  Razonamiento SL_MIN_PCT = 0.8%:
+    Con 10x de apalancamiento, un SL de 0.4% se toca con el ruido normal
+    de una vela de 15m (SOL, ETH mueven 0.3-0.6% por vela en mercado activo).
+    Subir a 0.8% da suficiente espacio para que el trade respire sin que
+    el sizing cambie — el RR se mantiene en 2.0 (SL 0.8% → TP 1.6%).
 
 Trailing stop:
   trail_step = max(0.3 × sl_dist, 1 tick del contrato)
@@ -37,21 +41,20 @@ import exchange as _exchange
 log = logging.getLogger("risk")
 
 # ── Límites porcentuales SL/TP ────────────────────────────────────────────────
-SL_MIN_PCT = 0.004   # 0.4%
+# SL_MIN_PCT subido de 0.004 (0.4%) → 0.008 (0.8%).
+# Con 10x, un SL de 0.4% equivale a solo 4% de movimiento real antes de
+# liquidar — demasiado ajustado para el ruido normal de velas de 15m en
+# altcoins líquidas (SOL, ETH, BNB mueven 0.3-0.7% por vela normalmente).
+SL_MIN_PCT = 0.008   # 0.8%
 SL_MAX_PCT = 0.025   # 2.5%
 
 
 def _tp_rr(score: int, regime: str) -> float:
-    """TP_RR dinámico: ajusta el ratio riesgo:beneficio según régimen y score.
-
-    En rango el precio no tiene recorrido largo → TP más conservador.
-    Con señal fuerte en tendencia se deja correr más.
-    """
     if regime == "range":
         return 1.5
     if score >= 85:
         return 2.5
-    return 2.0   # score 70-84: RR estándar (tier <70 eliminado)
+    return 2.0
 
 
 def _atr(candles: list[dict], period: int = 14) -> float:
@@ -63,30 +66,15 @@ def _atr(candles: list[dict], period: int = 14) -> float:
 
 
 def _size_multiplier(score: int) -> float:
-    """Sizing limpio en 2 tiers: score<85 → 1.0×, score≥85 → 1.4×.
-
-    El antiguo tier 0.7× (score 55-69) se ha eliminado porque con
-    MIN_SCORE=70 ya no es alcanzable. Entrar pequeño con el mismo SL%
-    generaba asimetría negativa: perdías casi igual que en trades buenos.
-    """
     if score >= 85:
         return 1.4
     return 1.0
 
 
-def calc(side: str, entry: float, candles: list[dict], score: int = 70,
+def calc(side: str, entry: float, candles: list[dict], score: int = 72,
          symbol: str | None = None, regime: str = "bull") -> dict:
     """
     Calcula SL, TP, qty y trail_step para una entrada.
-
-    Args:
-        side    : 'long' | 'short'
-        entry   : precio de entrada
-        candles : velas 15m (para ATR)
-        score   : score de la señal (0-100)
-        symbol  : símbolo BingX (e.g. 'BTC-USDT'). Si se pasa, se consulta
-                  el step-size real del contrato para redondear qty.
-        regime  : régimen de mercado ('bull' | 'bear' | 'range') para TP_RR dinámico.
     """
     atr = _atr(candles, period=14)
 
