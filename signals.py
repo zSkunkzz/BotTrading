@@ -9,21 +9,28 @@ Filtros:
   4. EMA200 1h          : hard-guard de dirección (calculado sobre velas cerradas)
   5. ATR volátil        : hard-guard — si atr_pct > 3.5% mercado en evento/noticia,
                           SL real desborda el cap de 2.5% → no entrar
-  6. ADX 15m            : hard-guard <15 (sin tendencia, no operar)
-                          >35 +12, >25 +6, >18 -8, <18 -15
+  6. ADX 15m            : hard-guard <18 (sin tendencia suficiente, no operar)
+                          >35 +12, >25 +6, >18 -8, ≤18 bloqueado
   7. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
                           hard-guard short: bear + adx_1h < 18 → no entrar (rebote choppy)
   8. Volumen            : última vela CERRADA >media×1.2 → +8
-  9. RSI 15m            : cruce 50 +15, extremo +8, direccional +4, contrario -5
+  9. RSI 15m            : cruce 50 +15, extremo +8, direccional +4 (con umbral de zona),
+                          contrario -5
   10. MACD 15m + 1h     : histograma positivo/negativo → +10 | neutro 0 | contrario -5
   11. Divergencia RSI   : +8
-  12. Sesgo horario     : hora alta +8, hora baja -10
+  12. Sesgo horario     : hora alta +8, hora baja -10 (basado en ts de vela cerrada)
   13. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
 
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
 Sizing en risk.py: mult=1.0 (score 70-84) | 1.4 (≥85)
 MIN_SCORE configurable via env var MIN_SCORE (default 70)
+
+FIXES aplicados:
+  - _market_regime: usa closes[-2] (vela 1h cerrada) para price, no closes[-1]
+  - _regime_confirmed: estado actual calculado con candles_1h[:-1] igual que histórico
+  - rsi_dir: añadido umbral de zona (LONG>45, SHORT<55) para evitar +4 en territorio contrario
+  - ADX hard-guard elevado de <15 a <18
 """
 from __future__ import annotations
 import logging
@@ -41,15 +48,14 @@ VOLUME_MULT         = 1.2
 MIN_SCORE           = config.MIN_SCORE
 REGIME_CONFIRM_BARS = 2
 
-# Guard de volatilidad extrema: si atr_pct supera este umbral el mercado
-# está en modo evento/noticias y el SL se desborda del cap → no operar.
+# Guard de volatilidad extrema
 ATR_VOLATILE_PCT    = 0.035   # 3.5%
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
 
 
-# ── Indicadores ───────────────────────────────────────────────────────────────────
+# ── Indicadores ──────────────────────────────────────────────────────────
 
 def _ema(closes: list[float], period: int) -> list[float]:
     k = 2 / (period + 1)
@@ -153,12 +159,22 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
 
 
 def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
+    """Clasifica el régimen usando SOLO velas cerradas.
+
+    FIX: usa closes[-2] como precio de referencia (última vela CERRADA)
+    en lugar de closes[-1] (vela en curso). La vela 1h en curso puede
+    llevar solo 15-45 min y crear un régimen falso por rebote intravela.
+    El llamador debe pasar candles_1h[:-1] si quiere excluir la vela
+    en curso completamente, o bien esta función usa [-2] internamente.
+    """
     closes = [c["close"] for c in candles_1h]
     ema20  = _ema(closes, 20)[-1]
     ema50  = _ema(closes, 50)[-1]
     ema200 = _ema(closes, 200)[-1]
     adx    = _adx(candles_1h, 14)
-    price  = closes[-1]
+    # FIX Bug1+Bug4: usar el cierre de la última vela CERRADA ([-2])
+    # para comparar vs EMAs. closes[-1] es la vela 1h aún abierta.
+    price  = closes[-2] if len(closes) >= 2 else closes[-1]
 
     if price > ema20 > ema50 > ema200:
         return "bull", adx
@@ -174,23 +190,24 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
     """Devuelve el régimen solo si las últimas n+1 velas cerradas coinciden.
 
-    BUG CORREGIDO: la versión anterior usaba candles_1h[:-offset] con
-    offset de n..1, lo que hacía que la última ventana nunca incluyese
-    la vela más reciente (se cortaba con [:-1]) y el régimen aparecía
-    siempre como inestable salvo coincidencia. Ahora se calculan n
-    ventanas históricas correctamente escalonadas más el estado actual.
+    FIX Bug4 (asimetría temporal): el estado actual ahora se calcula con
+    candles_1h[:-1] (excluye vela en curso) igual que las ventanas
+    históricas. Antes el estado actual usaba candles_1h completo (vela
+    en curso incluida) mientras el histórico usaba [:-k] (cerradas), lo
+    que creaba una asimetría que hacía el régimen artificialmente inestable
+    o podía confirmar un régimen falso basado en precio intravela.
     """
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
 
-    # Estado actual (incluye última vela cerrada)
-    regime_now, adx_now = _market_regime(candles_1h)
+    # FIX: estado actual con velas cerradas (excluye la 1h en curso)
+    closed_1h = candles_1h[:-1]
+    regime_now, adx_now = _market_regime(closed_1h)
 
     # n ventanas anteriores: desplazadas 1, 2, ... n velas atrás
-    # candles_1h[:-k] da la vista como si no hubiesen llegado las últimas k velas
     regimes_prev = []
     for k in range(1, n + 1):
-        window = candles_1h[:-k]
+        window = closed_1h[:-k]
         if len(window) < 200:
             return "range", adx_now
         regime_hist, _ = _market_regime(window)
@@ -244,7 +261,7 @@ def evaluate(
         return None, 0
 
     # ── 1. Vela cerrada ───────────────────────────────────────────────────
-    candle = candles_15m[-2]          # penúltima = cerrada
+    candle     = candles_15m[-2]          # penúltima = cerrada
     closes_15m = [c["close"] for c in candles_15m]
 
     # ── 2. Régimen de mercado ─────────────────────────────────────────────
@@ -261,11 +278,6 @@ def evaluate(
     score += _macro_pts(candles_4h, direction)
 
     # ── 5. EMA200 1h hard-guard ───────────────────────────────────────────
-    # Usamos velas cerradas (excluye la vela 1h en curso) para el guard EMA200.
-    # NOTA: closes_1h_closed se usa SOLO para este guard. El MACD 1h usa
-    # closes_1h_full (incluyendo última cerrada) para mantener alineación
-    # de índices con RSI y ADX — que también usan candles_15m[:-1] y
-    # candles_1h completo respectivamente.
     closes_1h_closed = [c["close"] for c in candles_1h[:-1]]
     closes_1h_full   = [c["close"] for c in candles_1h]
     ema200_1h = _ema(closes_1h_closed, 200)[-1]
@@ -287,14 +299,16 @@ def evaluate(
     # ── 6. ADX 15m ────────────────────────────────────────────────────────
     adx_15m = _adx(candles_15m[:-1], 14)
 
-    if adx_15m < 15:
-        log.debug("Hard-guard ADX 15m demasiado bajo: %.1f — señal descartada", adx_15m)
+    # FIX Bug3: hard-guard elevado de <15 a <18.
+    # ADX 15-17 es mercado sin tendencia real; la penalización de -15
+    # se cancelaba exactamente con macro +15, dejando pasar trades en rango.
+    if adx_15m < 18:
+        log.debug("Hard-guard ADX 15m insuficiente: %.1f — señal descartada", adx_15m)
         return None, score
 
     if   adx_15m > 35: score += 12
     elif adx_15m > 25: score += 6
-    elif adx_15m > 18: score -= 8
-    else:              score -= 15
+    else:              score -= 8   # 18 ≤ adx ≤ 25: tendencia débil, penalizar
 
     # ── 7. ADX 1h ─────────────────────────────────────────────────────────
     if   adx_1h > 25: score += 5
@@ -319,14 +333,16 @@ def evaluate(
     if direction == "long":
         rsi_cross = rsi_prev < 50 <= rsi_now
         rsi_ext   = rsi_now > 55
-        rsi_dir   = rsi_now > rsi_prev
+        # FIX Bug2: rsi_dir requiere zona mínima >45 para no sumar +4
+        # cuando el RSI sigue en territorio bajista (p.ej. 48→49).
+        rsi_dir   = rsi_now > rsi_prev and rsi_now > 45
         rsi_bad   = rsi_now < 45
     else:
-        # BUG CORREGIDO: rsi_bad era >55, demasiado permisivo para confirmar short.
-        # Un RSI > 60 es más fiable como indicador de sobrecompra que >55.
         rsi_cross = rsi_prev > 50 >= rsi_now
         rsi_ext   = rsi_now < 45
-        rsi_dir   = rsi_now < rsi_prev
+        # FIX Bug2: rsi_dir requiere zona mínima <55 para no sumar +4
+        # cuando el RSI sigue en territorio alcista (p.ej. 52→51).
+        rsi_dir   = rsi_now < rsi_prev and rsi_now < 55
         rsi_bad   = rsi_now > 60
 
     if   rsi_cross: score += 15
@@ -345,10 +361,6 @@ def evaluate(
         if   h_now < 0: score += 10
         elif h_now > 0: score -= 5
 
-    # BUG CORREGIDO: usamos closes_1h_full (serie alineada con _regime_confirmed
-    # y _adx) en lugar de closes_1h (variable que antes apuntaba a la versión
-    # recortada [:-1] usada para EMA200). Esto evita el desalineamiento de
-    # índices entre MACD 1h y el resto de indicadores.
     hist_1h = _macd_histogram(closes_1h_full[:-1])
     h1_now  = hist_1h[-1]
     if direction == "long":
@@ -365,9 +377,7 @@ def evaluate(
         score += 8
 
     # ── 12. Sesgo horario ─────────────────────────────────────────────────
-    # FIX: usar el timestamp de la vela cerrada (UTC) en lugar de now().
-    # BingX usa UTC+0 para K-lines; evaluar con now() puede desfasar el filtro
-    # si el loop procesa con retraso, tras reconexión WS o en fallback REST.
+    # FIX: timestamp de la vela cerrada (UTC) en lugar de now().
     candle_ts = candle.get("ts")
     if candle_ts:
         hour = datetime.datetime.fromtimestamp(candle_ts / 1000, tz=timezone.utc).hour
