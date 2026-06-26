@@ -7,11 +7,11 @@ Filtros:
                           confirmando el mismo régimen antes de habilitar señales
   3. Macro 4h           : EMA50 en 4h — bonus/penalización/neutro según disponibilidad
   4. EMA200 1h          : hard-guard de dirección (calculado sobre velas cerradas)
-  5. EMA200 15m         : hard-guard de dirección en timeframe operativo
+  5. EMA200 15m         : hard-guard de dirección en SHORTs únicamente
   6. ATR volátil        : hard-guard — si atr_pct > 3.5% mercado en evento/noticia,
                           SL real desborda el cap de 2.5% → no entrar
-  7. ADX 15m            : hard-guard <18 (sin tendencia suficiente, no operar)
-                          >35 +12, >25 +6, >18 -8, ≤18 bloqueado
+  7. ADX 15m            : hard-guard <15 (sin tendencia suficiente, no operar)
+                          >35 +12, >25 +6, >18 neutro, 15-18 -8
   8. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
                           hard-guard short: bear + adx_1h < 18 → no entrar (rebote choppy)
   9. RSI 15m            : cruce 50 +15, extremo +8, direccional +4 (con umbral de zona),
@@ -21,11 +21,11 @@ Filtros:
   11. Divergencia RSI   : +8 (con validación de volumen para evitar señales espurias)
   12. Sesgo horario     : hora alta +8, hora baja -10 (basado en ts de vela cerrada)
   13. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
-  14. Filtro pullback   : precio dentro del 1% de EMA20_15m — evita entrar en
+  14. Filtro pullback   : precio dentro del 1.5% de EMA20_15m — evita entrar en
                           sobreextensión. Si el precio lleva varias velas subiendo
                           sin retroceder, esperar a que se acerque a la EMA20.
-                          Margen: ±1.0% sobre la EMA20 de 15m.
-  15. Score direccional : SHORTs requieren min_score+10 (default 82 vs 72 para LONGs)
+                          Margen: ±1.5% sobre la EMA20 de 15m.
+  15. Score direccional : SHORTs requieren min_score+5 (default 77 vs 72 para LONGs)
                           El crypto tiene sesgo alcista estructural — los SHORTs
                           necesitan mayor convicción para justificar el riesgo.
 
@@ -43,19 +43,19 @@ FIXES aplicados:
   - _regime_confirmed: estado actual calculado con candles_1h[:-1] igual que histórico
   - _macro_pts: FIX CRÍTICO — usa closes[-2] (vela 4h cerrada) en lugar de closes[-1]
   - rsi_dir: añadido umbral de zona (LONG>45, SHORT<55) para evitar +4 en territorio contrario
-  - ADX hard-guard elevado de <15 a <18
+  - ADX hard-guard bajado de <18 a <15 (zona 15-18 = neutro, no bloqueado)
   - evaluate(): devuelve (signal, score, regime) para que main.py no recalcule régimen
   - _rsi_divergence: valida volumen mínimo de la última vela para evitar divergencias espurias
   - _rsi_divergence: protegido max() sobre generador vacío con try/except — FIX BUG
-  - REGIME_CONFIRM_BARS: 2 → 4 (evita activar bear/bull en pullbacks de 2h)
-  - SHORT_MIN_SCORE_EXTRA: +10 sobre min_score para SHORTs (sesgo alcista estructural del crypto)
+  - REGIME_CONFIRM_BARS: 4 → 2 (3 velas consecutivas en vez de 5)
+  - SHORT_MIN_SCORE_EXTRA: +10 → +5 (umbral short 82 → 77)
   - Hard-guard RSI < 38 para SHORTs (rebote probable en sobrevendido)
-  - Hard-guard EMA200 15m: no SHORT si precio > EMA200_15m, no LONG si precio < EMA200_15m
+  - Hard-guard EMA200 15m: solo para SHORTs (eliminado en LONGs — redundante con EMA200 1h)
   - _ema: guard lista vacía → devuelve [] en lugar de IndexError — FIX BUG
   - _volume_ok: excluye vela evaluada (candles[-2]) del cálculo de la media — FIX BUG
                 Antes la vela evaluada estaba incluida en recent, sesgando la media al alza
                 cuando la propia vela tenía volumen alto, impidiendo que superase el umbral.
-  - Filtro pullback EMA20_15m: ±1.0% — evita entrar en sobreextensión (chase)
+  - Filtro pullback EMA20_15m: ±1.5% — evita entrar en sobreextensión (chase)
   - MIN_SCORE subido de 70 → 72 para filtrar señales borderline
 """
 from __future__ import annotations
@@ -73,17 +73,17 @@ NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
 MIN_SCORE           = config.MIN_SCORE
 
-# Margen pullback EMA20_15m: ±1.0% sobre la EMA20.
-# Si el precio está >1% por encima de la EMA20_15m en bull → sobreextendido, esperar.
-# Si el precio está >1% por debajo de la EMA20_15m en bear → sobreextendido, esperar.
+# Margen pullback EMA20_15m: ±1.5% sobre la EMA20.
+# Si el precio está >1.5% por encima de la EMA20_15m en bull → sobreextendido, esperar.
+# Si el precio está >1.5% por debajo de la EMA20_15m en bear → sobreextendido, esperar.
 # Este filtro NO cancela señales en tendencias sostenidas donde el precio
 # sube ordenadamente cerca de la EMA20 — solo bloquea los chases después
 # de velas grandes consecutivas.
-PULLBACK_EMA20_DIST = 0.010  # 1.0%
+PULLBACK_EMA20_DIST = 0.015  # 1.5%
 
-REGIME_CONFIRM_BARS = 4
-SHORT_MIN_SCORE_EXTRA = 10
-ATR_VOLATILE_PCT    = 0.035
+REGIME_CONFIRM_BARS   = 2
+SHORT_MIN_SCORE_EXTRA = 5
+ATR_VOLATILE_PCT      = 0.035
 
 HIGH_BIAS_HOURS = {8, 9, 10, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
@@ -319,18 +319,14 @@ def evaluate(
     if direction == "short" and price > ema200_1h * (1 + EMA200_MIN_DIST):
         return None, score, regime
 
-    # ── 5b. EMA200 15m hard-guard ─────────────────────────────────────────
+    # ── 5b. EMA200 15m hard-guard — solo SHORTs ───────────────────────────
+    # En LONGs es redundante con EMA200 1h (si estás sobre EMA200_1h, casi
+    # siempre estás sobre EMA200_15m). En SHORTs añade una capa extra útil.
     if len(closes_15m) >= 202:
         ema200_15m = _ema(closes_15m[:-1], 200)[-1]
         if direction == "short" and price > ema200_15m * 1.002:
             log.debug(
                 "Hard-guard EMA200 15m: precio %.6f > EMA200_15m %.6f — SHORT bloqueado",
-                price, ema200_15m,
-            )
-            return None, score, regime
-        if direction == "long" and price < ema200_15m * 0.998:
-            log.debug(
-                "Hard-guard EMA200 15m: precio %.6f < EMA200_15m %.6f — LONG bloqueado",
                 price, ema200_15m,
             )
             return None, score, regime
@@ -347,13 +343,14 @@ def evaluate(
     # ── 6. ADX 15m ────────────────────────────────────────────────────────
     adx_15m = _adx(candles_15m[:-1], 14)
 
-    if adx_15m < 18:
+    if adx_15m < 15:
         log.debug("Hard-guard ADX 15m insuficiente: %.1f — señal descartada", adx_15m)
         return None, score, regime
 
     if   adx_15m > 35: score += 12
     elif adx_15m > 25: score += 6
-    else:              score -= 8
+    elif adx_15m > 18: score += 0   # zona media: neutro
+    else:              score -= 8   # zona 15-18: penaliza pero no bloquea
 
     # ── 7. ADX 1h ─────────────────────────────────────────────────────────
     if   adx_1h > 25: score += 5
@@ -444,7 +441,7 @@ def evaluate(
     # Evita entrar cuando el precio lleva varias velas seguidas alejándose
     # de la EMA20 sin retroceder — el entry más arriba = SL más lejos del
     # precio real de reversión = peor RR efectivo.
-    # Margen ±1.0%: suficientemente amplio para no bloquear tendencias
+    # Margen ±1.5%: suficientemente amplio para no bloquear tendencias
     # sostenidas (precio sube ordenadamente pegado a EMA20), suficientemente
     # estricto para bloquear chases tras velas grandes.
     if len(closes_15m) >= 22:
