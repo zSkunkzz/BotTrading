@@ -8,6 +8,7 @@ Comandos:
     /status     — Estado del bot
     /stop       — Pausa la búsqueda de señales nuevas
     /resume     — Reanuda el bot
+    /trades     — Envía el archivo trades.csv como documento descargable
     /long <SYM> — Señal manual LONG para el símbolo
     /short <SYM>— Señal manual SHORT para el símbolo
 
@@ -68,6 +69,26 @@ def _send(text: str, chat_id: str = None) -> None:
         }, timeout=5)
     except Exception as e:
         log.warning("tg_commands send error: %s", e)
+
+
+def _send_document(file_path: str, caption: str, chat_id: str = None) -> None:
+    """Envía un archivo como documento al chat de Telegram."""
+    if not config.TG_TOKEN:
+        return
+    try:
+        with open(file_path, "rb") as f:
+            httpx.post(
+                f"{_API}/sendDocument",
+                data={
+                    "chat_id":    chat_id or _CHAT_ID,
+                    "caption":    caption,
+                    "parse_mode": "HTML",
+                },
+                files={"document": (os.path.basename(file_path), f, "text/csv")},
+                timeout=15,
+            )
+    except Exception as e:
+        log.warning("tg_commands send_document error: %s", e)
 
 
 def _fetch_trade_history() -> list[dict]:
@@ -173,8 +194,6 @@ def _cmd_posiciones() -> str:
         dur = round((time.time() - p.get("open_ts", time.time())) / 60, 0)
         ext = p.get("tp_extensions", 0)
         ext_str = f" | Ext: <code>{ext}</code>" if ext > 0 else ""
-        # FIX: sl y tp pueden ser None si la orden de protección no se pudo colocar.
-        # Formatear con fallback 'N/A' para evitar TypeError en :.4f con None.
         sl_str = f"{p['sl']:.4f}" if p.get('sl') is not None else "N/A"
         tp_str = f"{p['tp']:.4f}" if p.get('tp') is not None else "N/A"
         lines.append(
@@ -245,6 +264,7 @@ COMMANDS = {
         "/stats — Win rate y PnL históricos\n"
         "/posiciones — Posiciones abiertas ahora\n"
         "/status — Estado general del bot\n"
+        "/trades — Descargar trades.csv\n"
         "/stop — Pausar búsqueda de señales nuevas\n"
         "/resume — Reanudar el bot\n"
         "/long BTC-USDT — Señal manual LONG\n"
@@ -271,17 +291,31 @@ def _poll() -> None:
                 parts   = msg.get("text", "").strip().split()
                 if not parts:
                     continue
-                # FIX: strip del sufijo @botname en comandos enviados en grupos
-                # (e.g. /status@MiBot → /status). Sin esto el comando no se reconocía.
                 raw_cmd = parts[0].lower()
                 text    = raw_cmd.split("@")[0]
                 chat_id = str(msg["chat"]["id"])
                 if chat_id != str(_CHAT_ID):
                     continue
 
+                # Comando /trades — envía el CSV como documento
+                if text == "/trades":
+                    csv_path = trade_logger.LOG_FILE
+                    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+                        _send("📂 <b>trades.csv</b>\nEl archivo está vacío o no existe todavía.", chat_id)
+                    else:
+                        trades = _fetch_trade_history()
+                        size_kb = os.path.getsize(csv_path) / 1024
+                        caption = (
+                            f"📂 <b>trades.csv</b>\n"
+                            f"{len(trades)} trades | {size_kb:.1f} KB"
+                        )
+                        log.info("Enviando trades.csv (%d trades, %.1f KB)", len(trades), size_kb)
+                        _send_document(csv_path, caption, chat_id)
+                    continue
+
                 # Comandos manuales /long <SYM> y /short <SYM>
                 if text in ("/long", "/short") and len(parts) >= 2:
-                    side   = text.lstrip("/")   # 'long' | 'short'
+                    side   = text.lstrip("/")
                     symbol = parts[1].upper()
                     if symbol not in config.SYMBOLS:
                         _send(f"⚠️ Símbolo no reconocido: <code>{symbol}</code>\n"
