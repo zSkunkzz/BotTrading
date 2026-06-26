@@ -17,7 +17,7 @@ Filtros:
   9. RSI 15m            : cruce 50 +15, extremo +8, direccional +4 (con umbral de zona),
                           contrario -5
   10. MACD 15m + 1h     : histograma positivo/negativo → +10 | neutro 0 | contrario -5
-  11. Divergencia RSI   : +8
+  11. Divergencia RSI   : +8 (con validación de volumen para evitar señales espurias)
   12. Sesgo horario     : hora alta +8, hora baja -10 (basado en ts de vela cerrada)
   13. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
 
@@ -29,8 +29,11 @@ MIN_SCORE configurable via env var MIN_SCORE (default 70)
 FIXES aplicados:
   - _market_regime: usa closes[-2] (vela 1h cerrada) para price, no closes[-1]
   - _regime_confirmed: estado actual calculado con candles_1h[:-1] igual que histórico
+  - _macro_pts: FIX CRÍTICO — usa closes[-2] (vela 4h cerrada) en lugar de closes[-1]
   - rsi_dir: añadido umbral de zona (LONG>45, SHORT<55) para evitar +4 en territorio contrario
   - ADX hard-guard elevado de <15 a <18
+  - evaluate(): devuelve (signal, score, regime) para que main.py no recalcule régimen
+  - _rsi_divergence: valida volumen mínimo de la última vela para evitar divergencias espurias
 """
 from __future__ import annotations
 import logging
@@ -138,12 +141,30 @@ def _adx(candles: list[dict], period: int = 14) -> float:
 
 
 def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
-    """Detecta divergencia RSI-precio en la ventana reciente."""
-    if len(closes) < lookback + 14:
+    """Detecta divergencia RSI-precio en la ventana reciente.
+
+    FIX: valida que la última vela cerrada tenga volumen >= 60% de la media
+    de la ventana. En horas de bajo volumen (madrugada UTC) la divergencia
+    RSI puede ser espuria porque el precio se mueve con poca liquidez.
+    Sin este filtro, velas de bajo volumen suman +8 pts y pueden empujar
+    el score sobre el MIN_SCORE en condiciones de mercado no operables.
+    """
+    if len(closes) < lookback + 14 or len(candles) < lookback + 14:
         return None
-    rsi_series    = _rsi(closes, 14)
-    recent_closes = closes[-lookback:]
-    recent_rsi    = rsi_series[-lookback:]
+    rsi_series     = _rsi(closes, 14)
+    recent_closes  = closes[-lookback:]
+    recent_rsi     = rsi_series[-lookback:]
+    recent_candles = candles[-lookback:]
+
+    # FIX: filtro de volumen mínimo — divergencia en vela de bajo volumen es espuria
+    avg_vol  = sum(c["volume"] for c in recent_candles[:-1]) / max(1, len(recent_candles) - 1)
+    last_vol = recent_candles[-1].get("volume", 0.0)
+    if avg_vol > 0 and last_vol < avg_vol * 0.6:
+        log.debug(
+            "_rsi_divergence descartada: volumen bajo (%.2f < 60%% de media %.2f)",
+            last_vol, avg_vol,
+        )
+        return None
 
     lo_val = min(recent_closes[:-1])
     lo_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == lo_val)
@@ -237,12 +258,20 @@ def _macro_pts(candles_4h: list[dict] | None, direction: str) -> int:
     """Bonus/penalización según EMA50 en 4h.
 
     +15 a favor  |  0 si sin datos  |  -10 en contra
+
+    FIX CRÍTICO: usa closes[-2] (última vela 4h CERRADA) en lugar de
+    closes[-1] (vela 4h en curso, puede llevar 1-3 horas incompleta).
+    Una vela 4h a medias puede cruzar temporalmente la EMA50 y dar
+    ±15 puntos basados en información falsa, degradando el winrate.
+    Requiere >= 52 velas (51 para EMA50 + 1 extra para poder usar [-2]).
     """
-    if not candles_4h or len(candles_4h) < 51:
+    if not candles_4h or len(candles_4h) < 52:
         return 0
     closes = [c["close"] for c in candles_4h]
-    ema50  = _ema(closes, 50)[-1]
-    price  = closes[-1]
+    # FIX: EMA calculada sobre velas cerradas (excluye la última en curso)
+    ema50  = _ema(closes[:-1], 50)[-1]
+    # FIX: precio de referencia = última vela 4h CERRADA
+    price  = closes[-2] if len(closes) >= 2 else closes[-1]
     if direction == "long":
         return 15 if price > ema50 else -10
     return 15 if price < ema50 else -10
@@ -253,12 +282,24 @@ def evaluate(
     candles_1h:  list[dict],
     candles_4h:  list[dict] | None = None,
     min_score:   int = MIN_SCORE,
-) -> tuple[str | None, int]:
-    """Evalúa señal con scoring 0-100. Devuelve (signal, score) o (None, score)."""
+) -> tuple[str | None, int, str | None]:
+    """Evalúa señal con scoring 0-100.
+
+    Devuelve (signal, score, regime) o (None, score, None).
+
+    FIX BUG IMPORTANTE: ahora devuelve el régimen confirmado como tercer
+    elemento para que main.py no tenga que recalcularlo con _market_regime
+    a secas (sin confirmación). Antes, main.py hacía:
+        signal, score = signals.evaluate(...)        # usa _regime_confirmed ✓
+        regime, _ = signals._market_regime(c1h)      # SIN confirmación ✗ → RR incorrecto
+    Esto causaba que risk.calc recibiera regime="range" en momentos donde
+    _regime_confirmed ya había aprobado "bull"/"bear", resultando en RR=1.5
+    en lugar del correcto 2.0, recortando el beneficio esperado del trade.
+    """
 
     # ── 0. Datos mínimos ──────────────────────────────────────────────────
     if len(candles_15m) < 50 or len(candles_1h) < 210:
-        return None, 0
+        return None, 0, None
 
     # ── 1. Vela cerrada ───────────────────────────────────────────────────
     candle     = candles_15m[-2]          # penúltima = cerrada
@@ -267,7 +308,7 @@ def evaluate(
     # ── 2. Régimen de mercado ─────────────────────────────────────────────
     regime, adx_1h = _regime_confirmed(candles_1h)
     if regime == "range":
-        return None, 0
+        return None, 0, regime
 
     direction = "long" if regime == "bull" else "short"
 
@@ -283,9 +324,9 @@ def evaluate(
     ema200_1h = _ema(closes_1h_closed, 200)[-1]
     price     = closes_15m[-2]
     if direction == "long"  and price < ema200_1h * (1 - EMA200_MIN_DIST):
-        return None, score
+        return None, score, regime
     if direction == "short" and price > ema200_1h * (1 + EMA200_MIN_DIST):
-        return None, score
+        return None, score, regime
 
     # ── 5b. Guard ATR volátil ─────────────────────────────────────────────
     atr_15m_raw = _atr(candles_15m[:-1])
@@ -294,17 +335,14 @@ def evaluate(
             "Hard-guard ATR volátil: atr_pct=%.2f%% > %.1f%% — mercado en evento, señal descartada",
             atr_15m_raw / price * 100, ATR_VOLATILE_PCT * 100,
         )
-        return None, score
+        return None, score, regime
 
     # ── 6. ADX 15m ────────────────────────────────────────────────────────
     adx_15m = _adx(candles_15m[:-1], 14)
 
-    # FIX Bug3: hard-guard elevado de <15 a <18.
-    # ADX 15-17 es mercado sin tendencia real; la penalización de -15
-    # se cancelaba exactamente con macro +15, dejando pasar trades en rango.
     if adx_15m < 18:
         log.debug("Hard-guard ADX 15m insuficiente: %.1f — señal descartada", adx_15m)
-        return None, score
+        return None, score, regime
 
     if   adx_15m > 35: score += 12
     elif adx_15m > 25: score += 6
@@ -319,7 +357,7 @@ def evaluate(
             "Hard-guard short: regime=bear pero adx_1h=%.1f — mercado rebotando sin tendencia",
             adx_1h,
         )
-        return None, score
+        return None, score, regime
 
     # ── 8. Volumen ────────────────────────────────────────────────────────
     if _volume_ok(candles_15m):
@@ -333,15 +371,11 @@ def evaluate(
     if direction == "long":
         rsi_cross = rsi_prev < 50 <= rsi_now
         rsi_ext   = rsi_now > 55
-        # FIX Bug2: rsi_dir requiere zona mínima >45 para no sumar +4
-        # cuando el RSI sigue en territorio bajista (p.ej. 48→49).
         rsi_dir   = rsi_now > rsi_prev and rsi_now > 45
         rsi_bad   = rsi_now < 45
     else:
         rsi_cross = rsi_prev > 50 >= rsi_now
         rsi_ext   = rsi_now < 45
-        # FIX Bug2: rsi_dir requiere zona mínima <55 para no sumar +4
-        # cuando el RSI sigue en territorio alcista (p.ej. 52→51).
         rsi_dir   = rsi_now < rsi_prev and rsi_now < 55
         rsi_bad   = rsi_now > 60
 
@@ -377,7 +411,6 @@ def evaluate(
         score += 8
 
     # ── 12. Sesgo horario ─────────────────────────────────────────────────
-    # FIX: timestamp de la vela cerrada (UTC) en lugar de now().
     candle_ts = candle.get("ts")
     if candle_ts:
         hour = datetime.datetime.fromtimestamp(candle_ts / 1000, tz=timezone.utc).hour
@@ -388,16 +421,15 @@ def evaluate(
     elif hour in LOW_BIAS_HOURS:  score -= 10
 
     # ── 13. Filtro no-chase ───────────────────────────────────────────────
-    atr_15m    = atr_15m_raw
     candle_rng = candle["high"] - candle["low"]
-    if atr_15m > 0 and candle_rng > NO_CHASE_MULT * atr_15m:
-        log.debug("No-chase: rng=%.4f > %.1f×ATR=%.4f", candle_rng, NO_CHASE_MULT, atr_15m)
-        return None, score
+    if atr_15m_raw > 0 and candle_rng > NO_CHASE_MULT * atr_15m_raw:
+        log.debug("No-chase: rng=%.4f > %.1f×ATR=%.4f", candle_rng, NO_CHASE_MULT, atr_15m_raw)
+        return None, score, regime
 
     # ── 14. Score mínimo ──────────────────────────────────────────────────
     if score < min_score:
         log.debug("Score insuficiente: %d < %d (%s)", score, min_score, direction)
-        return None, score
+        return None, score, regime
 
     log.info(
         "✅ SEÑAL %s | score=%d | regime=%s adx1h=%.1f adx15m=%.1f "
@@ -405,4 +437,4 @@ def evaluate(
         direction.upper(), score, regime, adx_1h, adx_15m,
         rsi_now, h_now, h1_now, _volume_ok(candles_15m), div,
     )
-    return direction, score
+    return direction, score, regime
