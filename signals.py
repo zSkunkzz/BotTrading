@@ -16,6 +16,8 @@ Mejoras estructurales v2:
      Volumen medio de las últimas 24 velas de 1h < umbral mínimo = par
      demasiado ilíquido para trading sistemático. Elimina pares tipo PENGU
      con spreads y spikes aleatorios.
+     Umbral: 1M USDT/h (≈24M/día). Pares que solo superan este umbral
+     en días de pump no tienen liquidez estructural fiable.
 
   D. Penalización por alejamiento del open diario
      Si el precio ya se ha movido >2.5% desde el open diario en la dirección
@@ -77,8 +79,11 @@ DAILY_CANDLE_BLOCK    = 0.015  # 1.5%
 DAILY_CANDLE_PENALTY  = 0.025  # 2.5% → penalización -10
 DAILY_CANDLE_GUARD    = 0.040  # 4.0% → hard-guard
 # Liquidez mínima del par: volumen medio por vela 1h (en USDT notional aprox)
-# Pares con volumen < este umbral tienen spreads y spikes impredecibles
-MIN_HOURLY_VOLUME     = 500_000   # 500k USDT/hora → ~12M/día
+# Subido de 500k → 1M USDT/h (≈24M/día).
+# 500k era demasiado permisivo: pares como ZK, EIGEN, MANTA pueden superar
+# ese umbral en días de pump sin tener liquidez estructural fiable en el book.
+# 1M filtra estos pares de forma más robusta en condiciones normales de mercado.
+MIN_HOURLY_VOLUME     = 1_000_000   # 1M USDT/hora → ~24M/día
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────
