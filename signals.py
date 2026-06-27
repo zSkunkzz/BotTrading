@@ -1,69 +1,47 @@
-"""signals.py — Sistema de señales premium con scoring 0-100.
+"""signals.py — Sistema de señales con estructura de precio real.
 
-Filtros:
+Mejoras estructurales v2:
+  A. Estructura de precio 1h (HH/HL vs LH/LL)
+     El régimen ya no se basa solo en EMAs. Se valida que el precio esté
+     construyendo máximos/mínimos crecientes (bull) o decrecientes (bear)
+     en las últimas 6 velas de 1h. Sin estructura confirmada = range.
+
+  B. Contexto de vela diaria
+     Se calcula la vela diaria sintética (desde medianoche UTC) con las
+     velas de 1h disponibles. LONGs bloqueados si la vela diaria baja >1.5%.
+     SHORTs bloqueados si la vela diaria sube >1.5%. Evita entrar contra
+     el momentum del día.
+
+  C. Filtro de liquidez del par
+     Volumen medio de las últimas 24 velas de 1h < umbral mínimo = par
+     demasiado ilíquido para trading sistemático. Elimina pares tipo PENGU
+     con spreads y spikes aleatorios.
+
+  D. Penalización por alejamiento del open diario
+     Si el precio ya se ha movido >2.5% desde el open diario en la dirección
+     del trade, el movimiento es sobreextensión y el score se penaliza -10.
+     Si se ha movido >4% = hard-guard (no entrar, el move ya ocurrió).
+
+Filtros heredados:
   1. Vela cerrada       : penúltima vela (ya cerrada)
-  2. Régimen de mercado : clasificación por EMAs 1h (ADX no bloquea, penaliza)
-                          Requiere REGIME_CONFIRM_BARS velas 1h consecutivas
-                          confirmando el mismo régimen antes de habilitar señales
-  3. Macro 4h           : EMA50 en 4h — bonus/penalización/neutro según disponibilidad
-  4. EMA200 1h          : hard-guard de dirección (calculado sobre velas cerradas)
-  5. EMA200 15m         : hard-guard de dirección en SHORTs únicamente
-  6. ATR volátil        : hard-guard — si atr_pct > 3.5% mercado en evento/noticia,
-                          SL real desborda el cap de 2.5% → no entrar
-  7. ADX 15m            : hard-guard <20 (sin tendencia suficiente, no operar)
-                          >35 +12, >25 +6, >20 -6 (penaliza ADX mediocre)
-  8. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
-                          hard-guard short: bear + adx_1h < 18 → no entrar (rebote choppy)
-  9. RSI 15m            : cruce 50 +15, extremo >58/<42 +8, direccional +4,
-                          contrario -5
-                          hard-guard short: RSI < 38 → rebote probable, no entrar
-  10. MACD 15m + 1h     : histograma positivo/negativo → +10 | neutro 0 | contrario -5
-  11. Volumen           : >1.2×media +10 | <0.8×media -5
-  12. Divergencia RSI   : +8 (con validación de volumen para evitar señales espurias)
-  13. Sesgo horario     : hora alta +8, hora baja -10 (basado en ts de vela cerrada)
-                          HIGH_BIAS_HOURS incluye 13 UTC (máx volumen EU/pre-NY)
-  14. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
-  15. Filtro pullback   : precio dentro del 1.5% de EMA20_15m — evita entrar en
-                          sobreextensión.
-  16. Score direccional : SHORTs requieren min_score+8 (default 86 vs 78 para LONGs)
+  2. Régimen de mercado : EMAs 1h + estructura HH/HL
+  3. Macro 4h           : EMA50 en 4h
+  4. EMA200 1h          : hard-guard de dirección
+  5. EMA200 15m         : hard-guard en SHORTs
+  6. ATR volátil        : hard-guard >3.5%
+  7. ADX 15m            : hard-guard <20
+  8. ADX 1h             : scoring + hard-guard SHORT
+  9. RSI 15m            : scoring + hard-guard SHORT sobrevendido
+  10. MACD 15m + 1h     : scoring
+  11. Volumen 15m       : scoring
+  12. Divergencia RSI   : scoring
+  13. Sesgo horario     : scoring
+  14. No-chase          : hard-guard rango vela
+  15. Pullback EMA20    : hard-guard sobreextensión 15m
+  16. Score mínimo      : LONGs ≥ MIN_SCORE, SHORTs ≥ MIN_SCORE+8
 
 REGLA FUNDAMENTAL:
-  - Régimen BEAR  → SOLO SHORTs. LONGs en bear bloqueados siempre.
-  - Régimen BULL  → SOLO LONGs.  SHORTs en bull bloqueados siempre.
-  El régimen determina la dirección. No hay contra-tendencia.
-
-Score base: 20 pts (por superar hard-guards)
-Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
-Sizing en risk.py: mult=1.0 (score 78-84) | 1.4 (≥85)
-MIN_SCORE configurable via env var MIN_SCORE (default 78)
-
-FIXES aplicados:
-  - _market_regime: usa closes[-2] (vela 1h cerrada) para price, no closes[-1]
-  - _market_regime: EMAs calculadas sobre closes[:-1] (velas cerradas) — FIX BUG
-  - _market_regime: _adx calculado sobre candles_1h[:-1] — FIX BUG (excluye vela abierta)
-  - _regime_confirmed: estado actual calculado con candles_1h[:-1] igual que histórico
-  - _macro_pts: FIX CRÍTICO — usa closes[-2] (vela 4h cerrada) en lugar de closes[-1]
-  - _rsi_divergence: guard len corregido para listas ya recortadas — FIX BUG
-  - _rsi_divergence: valida volumen mínimo de la última vela para evitar divergencias espurias
-  - _rsi_divergence: protegido max() sobre generador vacío con try/except — FIX BUG
-  - rsi_dir: añadido umbral de zona (LONG>45, SHORT<55) para evitar +4 en territorio contrario
-  - rsi_ext LONG: umbral 55→58 (zona 55-58 no es momentum confirmado)
-  - ADX hard-guard subido de <15 a <20 (zona 15-20 lateral — no operar)
-  - ADX zona 18-25: scoring 0 → -6 (penaliza ADX mediocre más agresivamente)
-  - REGIME_CONFIRM_BARS: 2 → 3 (exige 4 velas consecutivas de mismo régimen)
-  - MIN_SCORE: 72 → 78 (filtrar señales borderline y reducir trades en choppy)
-  - SHORT_MIN_SCORE_EXTRA: +5 → +8 (umbral short 86 vs 78 para LONGs)
-  - ELIMINADO hard-guard LONG bear con adx_1h < 22 — sustituido por bloqueo total
-  - NUEVO: régimen bear → dirección forzada a SHORT siempre (no hay LONGs en bear)
-  - NUEVO: régimen bull → dirección forzada a LONG siempre (no hay SHORTs en bull)
-  - Hard-guard RSI < 38 para SHORTs (rebote probable en sobrevendido)
-  - Hard-guard EMA200 15m: solo para SHORTs (eliminado en LONGs — redundante con EMA200 1h)
-  - _ema: guard lista vacía → devuelve [] en lugar de IndexError — FIX BUG
-  - _volume_ok: excluye vela evaluada (candles[-2]) del cálculo de la media — FIX BUG
-  - Volumen: bonus +8→+10, penalización -5 si volumen bajo (<0.8×media)
-  - Filtro pullback EMA20_15m: ±1.5%
-  - HIGH_BIAS_HOURS: añadida hora 13 UTC (pre-NY / máx volumen europeo)
-  - Log señal: añade margin= y pullback_dist= para diagnóstico en producción
+  Bear → SOLO SHORT. Bull → SOLO LONG. Sin contra-tendencia.
 """
 from __future__ import annotations
 import logging
@@ -78,21 +56,29 @@ log = logging.getLogger("signals")
 EMA200_MIN_DIST     = 0.003
 NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
-VOLUME_WEAK         = 0.8   # por debajo → penalización
+VOLUME_WEAK         = 0.8
 MIN_SCORE           = config.MIN_SCORE
 
-# Margen pullback EMA20_15m: ±1.5% sobre la EMA20.
 PULLBACK_EMA20_DIST = 0.015
 
-REGIME_CONFIRM_BARS   = 3   # exige 4 velas 1h consecutivas del mismo régimen
-SHORT_MIN_SCORE_EXTRA = 8   # umbral short = MIN_SCORE + 8
+REGIME_CONFIRM_BARS   = 3
+SHORT_MIN_SCORE_EXTRA = 8
 ATR_VOLATILE_PCT      = 0.035
+ADX_15M_MIN           = 20
 
-# ADX mínimo 15m para operar — subido a 20 para evitar laterales
-ADX_15M_MIN = 20
-
-HIGH_BIAS_HOURS = {8, 9, 10, 13, 14, 15, 16, 20, 21}   # 13 UTC = pre-NY / máx vol EU
+HIGH_BIAS_HOURS = {8, 9, 10, 13, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
+
+# ── Nuevos umbrales v2 ────────────────────────────────────────────────
+# Estructura de precio: ventana de velas 1h para detectar HH/HL o LH/LL
+STRUCTURE_LOOKBACK    = 6    # velas 1h
+# Contexto diario: bloquear si vela diaria va >X% contra el trade
+DAILY_CANDLE_BLOCK    = 0.015  # 1.5%
+DAILY_CANDLE_PENALTY  = 0.025  # 2.5% → penalización -10
+DAILY_CANDLE_GUARD    = 0.040  # 4.0% → hard-guard
+# Liquidez mínima del par: volumen medio por vela 1h (en USDT notional aprox)
+# Pares con volumen < este umbral tienen spreads y spikes impredecibles
+MIN_HOURLY_VOLUME     = 500_000   # 500k USDT/hora → ~12M/día
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────
@@ -180,10 +166,6 @@ def _adx(candles: list[dict], period: int = 14) -> float:
 
 
 def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
-    """Detecta divergencia RSI-precio en la ventana reciente.
-
-    Recibe listas ya recortadas (vela en curso excluida).
-    """
     if len(closes) < lookback + 14 or len(candles) < lookback + 1:
         return None
     rsi_series     = _rsi(closes, 14)
@@ -194,10 +176,6 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
     avg_vol  = sum(c["volume"] for c in recent_candles[:-1]) / max(1, len(recent_candles) - 1)
     last_vol = recent_candles[-1].get("volume", 0.0)
     if avg_vol > 0 and last_vol < avg_vol * 0.6:
-        log.debug(
-            "_rsi_divergence descartada: volumen bajo (%.2f < 60%% de media %.2f)",
-            last_vol, avg_vol,
-        )
         return None
 
     try:
@@ -239,6 +217,94 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     return "range", adx
 
 
+def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK) -> str:
+    """Detecta estructura de precio en las últimas N velas 1h cerradas.
+
+    Devuelve 'bull' si hay HH+HL, 'bear' si hay LH+LL, 'range' si no hay estructura clara.
+    Usa los highs y lows de las velas, no solo los closes.
+    """
+    closed = candles_1h[:-1]  # excluir vela en curso
+    if len(closed) < lookback + 1:
+        return "range"
+
+    recent = closed[-(lookback + 1):]
+    highs  = [c["high"]  for c in recent]
+    lows   = [c["low"]   for c in recent]
+
+    # Comparar primera mitad vs segunda mitad de la ventana
+    mid = len(recent) // 2
+    avg_high_prev = sum(highs[:mid]) / mid
+    avg_high_curr = sum(highs[mid:]) / (len(highs) - mid)
+    avg_low_prev  = sum(lows[:mid])  / mid
+    avg_low_curr  = sum(lows[mid:])  / (len(lows) - mid)
+
+    hh = avg_high_curr > avg_high_prev * 1.001   # máximos creciendo
+    hl = avg_low_curr  > avg_low_prev  * 1.001   # mínimos creciendo
+    lh = avg_high_curr < avg_high_prev * 0.999   # máximos cayendo
+    ll = avg_low_curr  < avg_low_prev  * 0.999   # mínimos cayendo
+
+    if hh and hl:
+        return "bull"
+    if lh and ll:
+        return "bear"
+    if hh and ll:
+        return "range"   # expansión: volatilidad sin dirección
+    if lh and hl:
+        return "range"   # contracción: rango apretándose
+    return "range"
+
+
+def _daily_candle_context(candles_1h: list[dict]) -> tuple[float, float]:
+    """Calcula la vela diaria sintética desde medianoche UTC con las velas 1h.
+
+    Devuelve (open_price, move_pct) donde move_pct es positivo si sube, negativo si baja.
+    Si no hay suficientes datos devuelve (0, 0).
+    """
+    now_utc    = datetime.datetime.now(timezone.utc)
+    midnight   = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight_ts = midnight.timestamp() * 1000  # ms
+
+    # Filtrar velas 1h cerradas del día actual
+    today_candles = [
+        c for c in candles_1h[:-1]
+        if c.get("ts", 0) >= midnight_ts
+    ]
+
+    if len(today_candles) < 2:
+        return 0.0, 0.0
+
+    open_price  = today_candles[0]["open"]
+    close_price = today_candles[-1]["close"]
+
+    if open_price <= 0:
+        return 0.0, 0.0
+
+    move_pct = (close_price - open_price) / open_price
+    return open_price, move_pct
+
+
+def _hourly_liquidity(candles_1h: list[dict], window: int = 24) -> float:
+    """Calcula el volumen medio por vela 1h en las últimas N velas cerradas.
+
+    Usa quote_volume si está disponible (USDT), si no usa volume * close como aproximación.
+    """
+    closed = candles_1h[:-1]
+    recent = closed[-window:] if len(closed) >= window else closed
+    if not recent:
+        return 0.0
+
+    vols = []
+    for c in recent:
+        qv = c.get("quote_volume") or c.get("quoteVolume") or 0.0
+        if qv > 0:
+            vols.append(float(qv))
+        else:
+            # fallback: volume * close
+            vols.append(float(c.get("volume", 0)) * float(c.get("close", 0)))
+
+    return sum(vols) / len(vols) if vols else 0.0
+
+
 def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
     if len(candles_1h) < 200 + n + 1:
         return "range", 0.0
@@ -276,7 +342,6 @@ def _volume_ok(candles: list[dict], window: int = 20) -> bool:
 
 
 def _volume_weak(candles: list[dict], window: int = 20) -> bool:
-    """Devuelve True si el volumen de la vela evaluada es débil (<0.8× media)."""
     if len(candles) < window + 2:
         return False
     recent   = candles[-(window + 2):-2]
@@ -304,13 +369,9 @@ def evaluate(
     candles_4h:  list[dict] | None = None,
     min_score:   int = MIN_SCORE,
 ) -> tuple[str | None, int, str | None]:
-    """Evalúa señal con scoring 0-100.
+    """Evalúa señal con scoring estructural.
 
     Devuelve (signal, score, regime) o (None, score, None).
-
-    REGLA FUNDAMENTAL DE DIRECCIÓN:
-      - Régimen BEAR → SOLO SHORT. Nunca LONG en bear.
-      - Régimen BULL → SOLO LONG.  Nunca SHORT en bull.
     """
 
     # ── 0. Datos mínimos ──────────────────────────────────────────────────
@@ -321,23 +382,70 @@ def evaluate(
     candle     = candles_15m[-2]
     closes_15m = [c["close"] for c in candles_15m]
 
-    # ── 2. Régimen de mercado ─────────────────────────────────────────────
+    # ── 2. Régimen de mercado (EMAs) ──────────────────────────────────────
     regime, adx_1h = _regime_confirmed(candles_1h)
     if regime == "range":
         return None, 0, regime
 
-    # REGLA FUNDAMENTAL: el régimen dicta la dirección sin excepciones.
-    # Bear → SHORT siempre. Bull → LONG siempre.
-    if regime == "bear":
-        direction = "short"
-    else:
-        direction = "long"
+    # REGLA FUNDAMENTAL: régimen dicta dirección.
+    direction = "short" if regime == "bear" else "long"
+
+    # ── 2b. NUEVO: Estructura de precio 1h (HH/HL vs LH/LL) ───────────────
+    structure = _price_structure(candles_1h)
+    if structure != "range" and structure != regime:
+        # El régimen dice bull pero la estructura dice bear (o viceversa)
+        # → contradicción, el mercado está girando. No entrar.
+        log.info(
+            "[structure] Régimen %s contradice estructura de precio %s — señal descartada",
+            regime, structure,
+        )
+        return None, 0, regime
+
+    # ── 2c. NUEVO: Filtro de liquidez del par ──────────────────────────────
+    hourly_vol = _hourly_liquidity(candles_1h)
+    if hourly_vol > 0 and hourly_vol < MIN_HOURLY_VOLUME:
+        log.info(
+            "[liquidity] Par bloqueado: volumen medio 1h = %.0f USDT < mínimo %.0f — par ilíquido",
+            hourly_vol, MIN_HOURLY_VOLUME,
+        )
+        return None, 0, regime
 
     # ── 3. Score base ─────────────────────────────────────────────────────
     score = 20
 
+    # Bonus si estructura confirma régimen (+8)
+    if structure == regime:
+        score += 8
+        log.debug("[structure] Confirmada: %s +8pts", structure)
+
     # ── 4. Macro 4h ───────────────────────────────────────────────────────
     score += _macro_pts(candles_4h, direction)
+
+    # ── 4b. NUEVO: Contexto de vela diaria ────────────────────────────────
+    daily_open, daily_move = _daily_candle_context(candles_1h)
+    if daily_open > 0:
+        # move positivo = precio subió hoy, negativo = bajó
+        # Para LONG: malo si el día ya baja mucho (daily_move muy negativo)
+        # Para SHORT: malo si el día ya sube mucho (daily_move muy positivo)
+        move_against = -daily_move if direction == "long" else daily_move
+
+        if move_against > DAILY_CANDLE_GUARD:
+            log.info(
+                "[daily] Hard-guard: vela diaria %+.2f%% contra el trade (%s) — el move ya ocurrió",
+                move_against * 100, direction,
+            )
+            return None, score, regime
+
+        if move_against > DAILY_CANDLE_PENALTY:
+            score -= 10
+            log.debug("[daily] Penalización -10: vela diaria %+.2f%% contra el trade", move_against * 100)
+        elif move_against > DAILY_CANDLE_BLOCK:
+            score -= 5
+            log.debug("[daily] Penalización -5: vela diaria %+.2f%% contra el trade", move_against * 100)
+        elif move_against < -DAILY_CANDLE_BLOCK:
+            # El día ya va a favor del trade → momentum adicional
+            score += 5
+            log.debug("[daily] Bonus +5: vela diaria %+.2f%% a favor del trade", abs(move_against) * 100)
 
     # ── 5. EMA200 1h hard-guard ───────────────────────────────────────────
     closes_1h_closed = [c["close"] for c in candles_1h[:-1]]
@@ -349,49 +457,38 @@ def evaluate(
     if direction == "short" and price > ema200_1h * (1 + EMA200_MIN_DIST):
         return None, score, regime
 
-    # ── 5b. EMA200 15m hard-guard — solo SHORTs ───────────────────────────
+    # ── 5b. EMA200 15m hard-guard (solo SHORTs) ───────────────────────────
     if len(closes_15m) >= 202:
         ema200_15m = _ema(closes_15m[:-1], 200)[-1]
         if direction == "short" and price > ema200_15m * 1.002:
-            log.debug(
-                "Hard-guard EMA200 15m: precio %.6f > EMA200_15m %.6f — SHORT bloqueado",
-                price, ema200_15m,
-            )
             return None, score, regime
 
-    # ── 5c. Guard ATR volátil ─────────────────────────────────────────────
+    # ── 5c. ATR volátil ───────────────────────────────────────────────────
     atr_15m_raw = _atr(candles_15m[:-1])
     if price > 0 and atr_15m_raw / price > ATR_VOLATILE_PCT:
         log.info(
-            "Hard-guard ATR volátil: atr_pct=%.2f%% > %.1f%% — mercado en evento, señal descartada",
-            atr_15m_raw / price * 100, ATR_VOLATILE_PCT * 100,
+            "Hard-guard ATR volátil: atr_pct=%.2f%% — mercado en evento",
+            atr_15m_raw / price * 100,
         )
         return None, score, regime
 
     # ── 6. ADX 15m ────────────────────────────────────────────────────────
     adx_15m = _adx(candles_15m[:-1], 14)
-
     if adx_15m < ADX_15M_MIN:
-        log.debug("Hard-guard ADX 15m insuficiente: %.1f < %d — señal descartada", adx_15m, ADX_15M_MIN)
         return None, score, regime
 
     if   adx_15m > 35: score += 12
     elif adx_15m > 25: score += 6
-    else:              score -= 6   # zona 20-25: tendencia mediocre, penaliza
+    else:              score -= 6
 
     # ── 7. ADX 1h ─────────────────────────────────────────────────────────
     if   adx_1h > 25: score += 5
     elif adx_1h < 18: score -= 5
 
-    # Hard-guard SHORT: bear sin tendencia 1h = rebote choppy
     if direction == "short" and adx_1h < 18:
-        log.debug(
-            "Hard-guard short: regime=bear pero adx_1h=%.1f — mercado rebotando sin tendencia",
-            adx_1h,
-        )
         return None, score, regime
 
-    # ── 8. Volumen ────────────────────────────────────────────────────────
+    # ── 8. Volumen 15m ─────────────────────────────────────────────────────
     vol_strong = _volume_ok(candles_15m)
     vol_weak   = _volume_weak(candles_15m)
     if   vol_strong: score += 10
@@ -403,10 +500,6 @@ def evaluate(
     rsi_prev = rsi_vals[-2] if len(rsi_vals) > 1 else rsi_now
 
     if direction == "short" and rsi_now < 38:
-        log.debug(
-            "Hard-guard SHORT: RSI sobrevendido %.1f < 38 — rebote probable, señal descartada",
-            rsi_now,
-        )
         return None, score, regime
 
     if direction == "long":
@@ -428,7 +521,6 @@ def evaluate(
     # ── 10. MACD 15m + 1h ─────────────────────────────────────────────────
     hist_15m = _macd_histogram(closes_15m[:-1])
     h_now    = hist_15m[-1]
-
     if direction == "long":
         if   h_now > 0: score += 10
         elif h_now < 0: score -= 5
@@ -461,46 +553,38 @@ def evaluate(
     if   hour in HIGH_BIAS_HOURS: score += 8
     elif hour in LOW_BIAS_HOURS:  score -= 10
 
-    # ── 13. Filtro no-chase (rango vela) ─────────────────────────────────
+    # ── 13. No-chase ────────────────────────────────────────────────────────
     candle_rng = candle["high"] - candle["low"]
     if atr_15m_raw > 0 and candle_rng > NO_CHASE_MULT * atr_15m_raw:
-        log.debug("No-chase: rng=%.4f > %.1f×ATR=%.4f", candle_rng, NO_CHASE_MULT, atr_15m_raw)
         return None, score, regime
 
-    # ── 14. Filtro pullback EMA20_15m ─────────────────────────────────────
+    # ── 14. Pullback EMA20_15m ──────────────────────────────────────────────
     pullback_dist = None
     if len(closes_15m) >= 22:
-        ema20_15m    = _ema(closes_15m[:-1], 20)[-1]
+        ema20_15m     = _ema(closes_15m[:-1], 20)[-1]
         pullback_dist = (price - ema20_15m) / ema20_15m
         if direction == "long" and price > ema20_15m * (1 + PULLBACK_EMA20_DIST):
-            log.debug(
-                "Pullback-guard LONG: precio %.6f > EMA20_15m*%.3f %.6f — sobreextendido, esperar",
-                price, 1 + PULLBACK_EMA20_DIST, ema20_15m * (1 + PULLBACK_EMA20_DIST),
-            )
             return None, score, regime
         if direction == "short" and price < ema20_15m * (1 - PULLBACK_EMA20_DIST):
-            log.debug(
-                "Pullback-guard SHORT: precio %.6f < EMA20_15m*%.3f %.6f — sobreextendido, esperar",
-                price, 1 - PULLBACK_EMA20_DIST, ema20_15m * (1 - PULLBACK_EMA20_DIST),
-            )
             return None, score, regime
 
-    # ── 15. Score mínimo (direccional) ───────────────────────────────────
+    # ── 15. Score mínimo ───────────────────────────────────────────────────
     min_score_directional = min_score + SHORT_MIN_SCORE_EXTRA if direction == "short" else min_score
     if score < min_score_directional:
         log.debug(
-            "Score insuficiente: %d < %d (%s, extra=%d)",
-            score, min_score_directional, direction,
-            SHORT_MIN_SCORE_EXTRA if direction == "short" else 0,
+            "Score insuficiente: %d < %d (%s)", score, min_score_directional, direction,
         )
         return None, score, regime
 
     log.info(
-        "✅ SEÑAL %s | score=%d (min=%d, margin=%+d) | regime=%s "
+        "✅ SEÑAL %s | score=%d (min=%d, margin=%+d) | regime=%s structure=%s "
         "adx1h=%.1f adx15m=%.1f rsi=%.1f macd15=%+.4f macd1h=%+.4f "
-        "vol=%s div=%s pullback_dist=%s",
+        "daily_move=%+.2f%% vol_1h=%.0fk vol=%s div=%s pb=%s",
         direction.upper(), score, min_score_directional, score - min_score_directional,
-        regime, adx_1h, adx_15m, rsi_now, h_now, h1_now,
+        regime, structure,
+        adx_1h, adx_15m, rsi_now, h_now, h1_now,
+        daily_move * 100 if daily_open > 0 else 0.0,
+        hourly_vol / 1000,
         "strong" if vol_strong else ("weak" if vol_weak else "normal"),
         div,
         f"{pullback_dist:+.3%}" if pullback_dist is not None else "n/a",
