@@ -9,6 +9,9 @@ API_SECRET = os.environ["BINGX_API_SECRET"]
 BASE_URL   = "https://open-api.bingx.com"
 
 # Pares verificados en BingX perpetual futures (top market cap, junio 2026)
+# Eliminados: PENGU-USDT, NOT-USDT, LISTA-USDT, MANTA-USDT
+# → spreads/spikes impredecibles, el filtro de liquidez los rechazaba en runtime
+#   pero seguían consumiendo conexiones WebSocket y ciclos de loop.
 SYMBOLS = [
     # --- Top 10 ---
     "BTC-USDT",  "ETH-USDT",  "BNB-USDT",  "XRP-USDT",  "SOL-USDT",
@@ -21,15 +24,19 @@ SYMBOLS = [
     "VET-USDT",  "STX-USDT",  "ATOM-USDT", "TAO-USDT",  "WLD-USDT",
     # --- 31-40 ---
     "ONDO-USDT", "MNT-USDT",  "FET-USDT",  "OP-USDT",   "POL-USDT",
-    "HYPE-USDT", "JUP-USDT",  "PENGU-USDT","TIA-USDT",
+    "HYPE-USDT", "JUP-USDT",  "TIA-USDT",
     # --- 41+ ---
-    "RENDER-USDT","SEI-USDT", "NOT-USDT",
-    "ZK-USDT",   "EIGEN-USDT","LISTA-USDT","MANTA-USDT","AERO-USDT",
+    "RENDER-USDT", "SEI-USDT",
+    "ZK-USDT",   "EIGEN-USDT", "AERO-USDT",
 ]
 
 # Pares en modo alerta manual (no se tradean automáticamente)
 MANUAL_ALERT_SYMBOLS: set[str] = set()
 
+# Grupos de correlación.
+# Regla: pares del mismo grupo compiten por MAX_CORR_PER_GROUP slots.
+# IMPORTANTE: mezclar memes con legacy coins (BCH/LTC/ETC) era incorrecto
+# porque no están correlacionados entre sí. Ahora tienen grupos separados.
 CORR_GROUPS: list[set[str]] = [
     {"BTC-USDT", "ETH-USDT", "BNB-USDT"},
     {"SOL-USDT", "AVAX-USDT", "APT-USDT", "SUI-USDT", "NEAR-USDT", "TIA-USDT"},
@@ -37,10 +44,13 @@ CORR_GROUPS: list[set[str]] = [
     {"LINK-USDT", "UNI-USDT", "AERO-USDT", "JUP-USDT", "ONDO-USDT"},
     {"XRP-USDT", "XLM-USDT", "TRX-USDT", "HBAR-USDT", "ADA-USDT"},
     {"FIL-USDT", "RENDER-USDT", "TAO-USDT", "EIGEN-USDT", "FET-USDT", "WLD-USDT"},
-    {"ATOM-USDT", "INJ-USDT", "SEI-USDT", "MANTA-USDT"},
-    {"DOGE-USDT", "SHIB-USDT", "NOT-USDT", "PENGU-USDT",
-     "VET-USDT",  "STX-USDT",  "LISTA-USDT",
-     "BCH-USDT",  "LTC-USDT",  "ETC-USDT"},
+    {"ATOM-USDT", "INJ-USDT", "SEI-USDT"},
+    # Memes puros — alta correlación entre sí en días de risk-on
+    {"DOGE-USDT", "SHIB-USDT"},
+    # Legacy PoW/fork coins — correlacionadas entre sí, NO con memes
+    {"BCH-USDT", "LTC-USDT", "ETC-USDT"},
+    # Misc sin correlación clara entre sí — grupo propio para limitar exposición
+    {"VET-USDT", "STX-USDT"},
     {"HYPE-USDT", "MNT-USDT"},
 ]
 MAX_CORR_PER_GROUP = int(os.getenv("MAX_CORR_PER_GROUP", "2"))
@@ -63,8 +73,12 @@ MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS", "7"))
 LEVERAGE       = int(os.getenv("LEVERAGE", "10"))
 MARGIN_USDT    = float(os.getenv("MARGIN_USDT", "20"))
 
-SL_PCT         = float(os.getenv("SL_PCT", "1.5"))
-TP_PCT         = float(os.getenv("TP_PCT", "3.0"))
+# LEGACY — no usados por risk.py en condiciones normales.
+# risk.py calcula SL desde ATR 1h × 1.2 directamente.
+# SL_PCT solo actúa como fallback de emergencia cuando ATR=0 (caso excepcional).
+# No ajustar estos valores esperando cambiar el SL/TP real del bot.
+SL_PCT         = float(os.getenv("SL_PCT", "1.5"))   # fallback ATR=0 únicamente
+TP_PCT         = float(os.getenv("TP_PCT", "3.0"))   # no utilizado actualmente
 
 TIMEFRAME           = os.getenv("TIMEFRAME", "15m")
 LOOP_SLEEP          = int(os.getenv("LOOP_SLEEP", "20"))
