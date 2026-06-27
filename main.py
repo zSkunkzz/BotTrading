@@ -752,9 +752,13 @@ def run() -> None:
                             continue
 
                         price  = exchange.get_price(symbol)
+                        # FIX: pasar candles_1h a risk.calc para que el SL se calcule
+                        # sobre ATR 1h en lugar de ATR 15m. Los trades duran horas y el
+                        # SL debe calibrarse sobre el rango real del timeframe del trade.
                         params = risk.calc(
                             signal, price, candles_15m,
                             score=score, symbol=symbol, regime=regime,
+                            candles_1h=candles_1h,
                         )
 
                         if is_manual:
