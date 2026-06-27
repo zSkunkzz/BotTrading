@@ -14,7 +14,6 @@ Filtros:
                           >35 +12, >25 +6, >20 -6 (penaliza ADX mediocre)
   8. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
                           hard-guard short: bear + adx_1h < 18 → no entrar (rebote choppy)
-                          hard-guard long:  bear + adx_1h < 22 → no entrar (contra-tendencia débil)
   9. RSI 15m            : cruce 50 +15, extremo >58/<42 +8, direccional +4,
                           contrario -5
                           hard-guard short: RSI < 38 → rebote probable, no entrar
@@ -27,6 +26,11 @@ Filtros:
   15. Filtro pullback   : precio dentro del 1.5% de EMA20_15m — evita entrar en
                           sobreextensión.
   16. Score direccional : SHORTs requieren min_score+8 (default 86 vs 78 para LONGs)
+
+REGLA FUNDAMENTAL:
+  - Régimen BEAR  → SOLO SHORTs. LONGs en bear bloqueados siempre.
+  - Régimen BULL  → SOLO LONGs.  SHORTs en bull bloqueados siempre.
+  El régimen determina la dirección. No hay contra-tendencia.
 
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
@@ -49,7 +53,9 @@ FIXES aplicados:
   - REGIME_CONFIRM_BARS: 2 → 3 (exige 4 velas consecutivas de mismo régimen)
   - MIN_SCORE: 72 → 78 (filtrar señales borderline y reducir trades en choppy)
   - SHORT_MIN_SCORE_EXTRA: +5 → +8 (umbral short 86 vs 78 para LONGs)
-  - Hard-guard LONG en régimen bear: adx_1h < 22 → bloqueado (contra-tendencia sin fuerza)
+  - ELIMINADO hard-guard LONG bear con adx_1h < 22 — sustituido por bloqueo total
+  - NUEVO: régimen bear → dirección forzada a SHORT siempre (no hay LONGs en bear)
+  - NUEVO: régimen bull → dirección forzada a LONG siempre (no hay SHORTs en bull)
   - Hard-guard RSI < 38 para SHORTs (rebote probable en sobrevendido)
   - Hard-guard EMA200 15m: solo para SHORTs (eliminado en LONGs — redundante con EMA200 1h)
   - _ema: guard lista vacía → devuelve [] en lugar de IndexError — FIX BUG
@@ -84,8 +90,6 @@ ATR_VOLATILE_PCT      = 0.035
 
 # ADX mínimo 15m para operar — subido a 20 para evitar laterales
 ADX_15M_MIN = 20
-# ADX mínimo 1h para LONGs en régimen bear (contra-tendencia sin fuerza = no entrar)
-ADX_1H_LONG_BEAR_MIN = 22
 
 HIGH_BIAS_HOURS = {8, 9, 10, 13, 14, 15, 16, 20, 21}   # 13 UTC = pre-NY / máx vol EU
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
@@ -180,7 +184,6 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
 
     Recibe listas ya recortadas (vela en curso excluida).
     """
-    # Guard: necesitamos al menos lookback + period para RSI fiable
     if len(closes) < lookback + 14 or len(candles) < lookback + 1:
         return None
     rsi_series     = _rsi(closes, 14)
@@ -188,7 +191,6 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
     recent_rsi     = rsi_series[-lookback:]
     recent_candles = candles[-lookback:]
 
-    # Validación de volumen: la última vela evaluada debe tener volumen decente
     avg_vol  = sum(c["volume"] for c in recent_candles[:-1]) / max(1, len(recent_candles) - 1)
     last_vol = recent_candles[-1].get("volume", 0.0)
     if avg_vol > 0 and last_vol < avg_vol * 0.6:
@@ -223,7 +225,6 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     ema20  = _ema(closes_closed, 20)[-1]
     ema50  = _ema(closes_closed, 50)[-1]
     ema200 = _ema(closes_closed, 200)[-1]
-    # FIX: ADX calculado sobre velas cerradas para excluir la vela 1h en curso
     adx    = _adx(candles_1h[:-1], 14)
     price  = closes[-2] if len(closes) >= 2 else closes[-1]
 
@@ -306,6 +307,10 @@ def evaluate(
     """Evalúa señal con scoring 0-100.
 
     Devuelve (signal, score, regime) o (None, score, None).
+
+    REGLA FUNDAMENTAL DE DIRECCIÓN:
+      - Régimen BEAR → SOLO SHORT. Nunca LONG en bear.
+      - Régimen BULL → SOLO LONG.  Nunca SHORT en bull.
     """
 
     # ── 0. Datos mínimos ──────────────────────────────────────────────────
@@ -321,7 +326,12 @@ def evaluate(
     if regime == "range":
         return None, 0, regime
 
-    direction = "long" if regime == "bull" else "short"
+    # REGLA FUNDAMENTAL: el régimen dicta la dirección sin excepciones.
+    # Bear → SHORT siempre. Bull → LONG siempre.
+    if regime == "bear":
+        direction = "short"
+    else:
+        direction = "long"
 
     # ── 3. Score base ─────────────────────────────────────────────────────
     score = 20
@@ -378,14 +388,6 @@ def evaluate(
         log.debug(
             "Hard-guard short: regime=bear pero adx_1h=%.1f — mercado rebotando sin tendencia",
             adx_1h,
-        )
-        return None, score, regime
-
-    # Hard-guard LONG en régimen bear: contra-tendencia sin fuerza = no entrar
-    if direction == "long" and regime == "bear" and adx_1h < ADX_1H_LONG_BEAR_MIN:
-        log.info(
-            "Hard-guard LONG contra-tendencia: regime=bear adx_1h=%.1f < %d — señal descartada",
-            adx_1h, ADX_1H_LONG_BEAR_MIN,
         )
         return None, score, regime
 
