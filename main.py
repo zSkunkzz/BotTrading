@@ -1,4 +1,11 @@
-"""main.py — Loop principal con trailing stop, break-even lock y TP dinámico."""
+"""main.py — Loop principal con trailing stop, break-even lock, TP dinámico y cooldown inteligente.
+
+v4: Cooldown diferenciado por calidad de señal.
+  - SL en los primeros SMART_COOLDOWN_FAST_WINDOW segundos con score >= SMART_COOLDOWN_HIGH_SCORE
+    → cooldown reducido a COOLDOWN_SL_FAST (probablemente ruido puntual, no tendencia)
+  - Resto de SLs → COOLDOWN_SL normal (60min)
+  - TPs → COOLDOWN_TP (30min, sin cambios)
+"""
 import logging
 import sys
 import time
@@ -22,16 +29,22 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 _cooldown: dict[str, float] = {}
-_cooldown_reason: dict[str, str] = {}   # 'tp' | 'sl'
+_cooldown_reason: dict[str, str] = {}   # 'tp' | 'sl' | 'sl_fast'
 _manual_alert_cooldown: dict[str, float] = {}
 
-COOLDOWN_SL           = 60 * 60
-COOLDOWN_TP           = 30 * 60
+COOLDOWN_SL           = 60 * 60       # 60 min — SL normal
+COOLDOWN_SL_FAST      = 15 * 60       # 15 min — SL rápido (score alto + cierre temprano)
+COOLDOWN_TP           = 30 * 60       # 30 min — TP
 MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
 TP_EXTEND_THRESH       = 0.015
 MIN_HOLD_SECS          = 90
+
+# v4: Smart cooldown — si el SL ocurre antes de este tiempo (segundos desde apertura)
+# Y el score era alto, es probablemente ruido puntual → cooldown reducido.
+SMART_COOLDOWN_FAST_WINDOW     = 15 * 60   # 15 min desde apertura
+SMART_COOLDOWN_HIGH_SCORE      = 85        # score mínimo para activar smart cooldown
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -55,7 +68,11 @@ def _is_weekend() -> bool:
 
 def _cooldown_for(symbol: str) -> int:
     reason = _cooldown_reason.get(symbol, "sl")
-    return COOLDOWN_TP if reason == "tp" else COOLDOWN_SL
+    if reason == "tp":
+        return COOLDOWN_TP
+    if reason == "sl_fast":
+        return COOLDOWN_SL_FAST
+    return COOLDOWN_SL
 
 
 def _corr_group_for(symbol: str) -> int | None:
@@ -113,7 +130,6 @@ def _sync_entry_from_exchange(symbol: str, local_price: float, side: str) -> flo
 
 
 def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
-    """Intenta activar el break-even lock. Si se activa, actualiza el SL en exchange."""
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -121,7 +137,6 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
     if not activated:
         return
 
-    # SL ya fue actualizado en pos por check_breakeven
     new_sl = pos["sl"]
     side   = pos["side"]
     try:
@@ -136,9 +151,8 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
         )
     except Exception as e:
         log.warning("[%s] Error actualizando SL break-even en exchange: %s", symbol, e)
-        # Revertir flag para reintentar en el siguiente loop
         pos["be_locked"] = False
-        pos["sl"]        = pos.get("be_trigger", new_sl)  # restaurar SL anterior aprox
+        pos["sl"]        = pos.get("be_trigger", new_sl)
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
@@ -446,9 +460,23 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
         symbol, p["side"], p["entry"], exit_price, reason, pnl_pct, pnl_usdt,
     )
 
-    _cooldown[symbol]        = time.time()
-    _cooldown_reason[symbol] = "tp" if reason == "TP" else "sl"
-    cd_mins = (COOLDOWN_TP if reason == "TP" else COOLDOWN_SL) // 60
+    # v4: Smart cooldown — SL en los primeros 15min con score alto → cooldown corto
+    if reason == "SL":
+        hold_secs  = time.time() - p.get("open_ts", 0)
+        trade_score = p.get("score", 0)
+        if hold_secs <= SMART_COOLDOWN_FAST_WINDOW and trade_score >= SMART_COOLDOWN_HIGH_SCORE:
+            _cooldown_reason[symbol] = "sl_fast"
+            log.info(
+                "[%s] Smart cooldown: SL rápido (hold=%.0fs score=%d) → cooldown %dmin",
+                symbol, hold_secs, trade_score, COOLDOWN_SL_FAST // 60,
+            )
+        else:
+            _cooldown_reason[symbol] = "sl"
+    else:
+        _cooldown_reason[symbol] = "tp"
+
+    _cooldown[symbol] = time.time()
+    cd_mins = _cooldown_for(symbol) // 60
     log.info("[%s] Cooldown %dm activado tras %s", symbol, cd_mins, reason)
 
     _missing_count.pop(symbol, None)
@@ -529,7 +557,6 @@ def _calc_trail_step_from_atr(symbol: str, feed, sl: float | None, entry: float)
 def _calc_be_levels_from_atr(
     symbol: str, feed, side: str, entry: float
 ) -> tuple[float | None, float | None]:
-    """Recalcula be_trigger y be_sl desde ATR 15m para posiciones sincronizadas."""
     try:
         candles_15m = feed.get(symbol, "15m")
         if candles_15m and len(candles_15m) >= 15:
@@ -678,7 +705,6 @@ def run() -> None:
                         "trail_low":     synced_entry,
                         "score":         getattr(config, "WEEKDAY_MIN_SCORE", 70),
                         "open_ts":       real_open_ts,
-                        # Break-even lock (recalculado desde ATR 15m)
                         "be_trigger":    be_trigger,
                         "be_sl":         be_sl,
                         "be_locked":     False,
@@ -713,7 +739,6 @@ def run() -> None:
             for symbol, pos in list(positions.items()):
                 try:
                     price = exchange.get_price(symbol)
-                    # Orden: break-even lock PRIMERO, luego trailing
                     _apply_breakeven(symbol, pos, price)
                     _update_trailing(symbol, pos, price)
                     _check_tp_extension(symbol, pos, price, feed, effective_min_score)
@@ -863,7 +888,6 @@ def run() -> None:
                             "trail_low":     real_entry,
                             "score":         score,
                             "open_ts":       time.time(),
-                            # Break-even lock
                             "be_trigger":    params.get("be_trigger"),
                             "be_sl":         params.get("be_sl"),
                             "be_locked":     False,

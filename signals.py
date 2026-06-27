@@ -1,23 +1,38 @@
-"""signals.py — Sistema de señales con estructura de precio real.
+"""signals.py — Sistema de señales v4.
 
-Mejoras estructurales v3:
+Nuevas mejoras v4:
+  A. Proto-bull / proto-bear detection
+     El bot ya no espera a que las EMAs estén completamente ordenadas para
+     detectar un cambio de régimen. Si la estructura de swings confirma bull
+     (2 HH+HL) Y el precio está por encima de la EMA200_1h Y el ADX_1h >= 22,
+     se declara régimen 'proto_bull' (análogo para 'proto_bear').
+     Captura entradas al INICIO de tendencia, no cuando ya ha corrido varios %.
+
+     proto_bull: estructura=bull, precio > EMA200_1h, ADX_1h >= 22
+                 (las EMAs aún no están en orden price>20>50>200)
+     proto_bear: estructura=bear, precio < EMA200_1h, ADX_1h >= 22
+
+     El proto-régimen penaliza -4 puntos en scoring (menos convicción),
+     y exige score mínimo +4 extra para compensar.
+
+  B. Score mínimo dinámico por volatilidad (ATR)
+     En días de alta volatilidad (ATR_1h > 2% del precio) el MIN_SCORE
+     sube automáticamente +8 puntos. Reduce SLs en días difíciles.
+     En días de muy baja volatilidad (ATR_1h < 0.5%) sube +4 (mercado
+     adormecido → señales falsas frecuentes).
+
+  C. Penalización contradicción mantenida en -12 (v3)
+
+Mejoras estructurales v3 (heredadas):
   A. Estructura de precio 1h con swing highs/lows reales
-     Detecta pivots locales (máximo/mínimo local en ventana ±2 velas).
-     Requiere 2 HH+HL para confirmar bull, 2 LH+LL para bear.
-     Mucho más preciso que comparar medias — elimina falsos positivos en rango ancho.
-
   B. Hard-guard ADX en rango lateral
-     Si la estructura de precio es 'range' Y el ADX_1h < 25 → descartar señal.
-     Evita entrar en tendencias falsas donde las EMAs están ordenadas pero el
-     mercado no tiene momentum real (típico en rangos laterales con poca volatilidad).
-
-  C. Contexto de vela diaria (heredado v2)
-  D. Filtro de liquidez del par (heredado v2)
-  E. Penalización por alejamiento del open diario (heredado v2)
+  C. Contexto de vela diaria
+  D. Filtro de liquidez del par
+  E. Penalización por alejamiento del open diario
 
 Filtros heredados:
   1. Vela cerrada       : penúltima vela (ya cerrada)
-  2. Régimen de mercado : EMAs 1h + estructura HH/HL (swings reales)
+  2. Régimen de mercado : EMAs 1h + estructura HH/HL (swings reales) + proto-bull/bear
   3. Macro 4h           : EMA50 en 4h
   4. EMA200 1h          : hard-guard de dirección
   5. EMA200 15m         : hard-guard en SHORTs
@@ -31,10 +46,10 @@ Filtros heredados:
   13. Sesgo horario     : scoring
   14. No-chase          : hard-guard rango vela
   15. Pullback EMA20    : hard-guard sobreextensión 15m
-  16. Score mínimo      : LONGs ≥ MIN_SCORE, SHORTs ≥ MIN_SCORE+8
+  16. Score mínimo      : LONGs >= MIN_SCORE (dinámico), SHORTs >= MIN_SCORE+8
 
 REGLA FUNDAMENTAL:
-  Bear → SOLO SHORT. Bull → SOLO LONG. Sin contra-tendencia.
+  Bear/proto_bear → SOLO SHORT. Bull/proto_bull → SOLO LONG. Sin contra-tendencia.
 """
 from __future__ import annotations
 import logging
@@ -63,18 +78,28 @@ HIGH_BIAS_HOURS = {8, 9, 10, 13, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
 
 # ── Umbrales v2 ───────────────────────────────────────────────────────────
-STRUCTURE_LOOKBACK    = 8    # velas 1h para detectar swings (aumentado de 6 a 8)
+STRUCTURE_LOOKBACK    = 8
 DAILY_CANDLE_BLOCK    = 0.015
 DAILY_CANDLE_PENALTY  = 0.025
 DAILY_CANDLE_GUARD    = 0.040
 MIN_HOURLY_VOLUME     = 1_000_000
 
 # ── Umbrales v3 ───────────────────────────────────────────────────────────
-# ADX mínimo en 1h para confirmar que el régimen no es rango lateral disfrazado.
-# Si ADX_1h < umbral Y structure != regime → hard-guard.
-ADX_1H_STRUCTURE_MIN  = 25   # debajo de esto, si structure='range' → no entrar
-# Número mínimo de swings HH+HL (o LH+LL) consecutivos para confirmar estructura
+ADX_1H_STRUCTURE_MIN  = 25
 SWING_CONFIRM_COUNT   = 2
+
+# ── Umbrales v4 (nuevos) ──────────────────────────────────────────────────
+# Proto-régimen: umbral ADX 1h más bajo que el régimen completo
+# permite detectar cambios de tendencia antes de que las EMAs confirmen.
+PROTO_ADX_MIN         = 22   # ADX mínimo para proto-bull/bear
+PROTO_SCORE_PENALTY   = 4    # penalización en scoring por usar proto-régimen
+PROTO_MIN_SCORE_EXTRA = 4    # score mínimo extra para proto-régimen
+
+# Score dinámico por volatilidad ATR 1h (% del precio)
+ATR_HIGH_VOL_PCT      = 0.020  # > 2% ATR_1h/precio → mercado muy volátil → +8 min_score
+ATR_LOW_VOL_PCT       = 0.005  # < 0.5% ATR_1h/precio → mercado adormecido → +4 min_score
+ATR_HIGH_VOL_BUMP     = 8
+ATR_LOW_VOL_BUMP      = 4
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────
@@ -194,6 +219,14 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
 
 
 def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
+    """Detecta régimen de mercado.
+
+    v4: Devuelve 'proto_bull' o 'proto_bear' cuando la estructura de swings
+    confirma la dirección pero las EMAs aún no están completamente ordenadas.
+    Esto permite capturar entradas al inicio de tendencia.
+
+    Valores posibles: 'bull', 'bear', 'proto_bull', 'proto_bear', 'range'
+    """
     closes        = [c["close"] for c in candles_1h]
     closes_closed = closes[:-1]
     ema20  = _ema(closes_closed, 20)[-1]
@@ -202,6 +235,7 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     adx    = _adx(candles_1h[:-1], 14)
     price  = closes[-2] if len(closes) >= 2 else closes[-1]
 
+    # Régimen completo (EMAs en orden perfecto)
     if price > ema20 > ema50 > ema200:
         return "bull", adx
     if price < ema20 < ema50 < ema200:
@@ -210,11 +244,29 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
         return "bull", adx
     if price < ema200 and price < ema50 and ema20 < ema200:
         return "bear", adx
+
+    # v4: Proto-régimen — estructura de swings confirma dirección,
+    # pero EMAs aún no están completamente ordenadas.
+    # Solo se activa si ADX >= PROTO_ADX_MIN (hay momentum real).
+    if adx >= PROTO_ADX_MIN:
+        structure = _price_structure(candles_1h)
+        if structure == "bull" and price > ema200:
+            log.debug(
+                "[regime] proto_bull detectado (structure=bull price=%.6f > EMA200=%.6f adx=%.1f)",
+                price, ema200, adx,
+            )
+            return "proto_bull", adx
+        if structure == "bear" and price < ema200:
+            log.debug(
+                "[regime] proto_bear detectado (structure=bear price=%.6f < EMA200=%.6f adx=%.1f)",
+                price, ema200, adx,
+            )
+            return "proto_bear", adx
+
     return "range", adx
 
 
 def _find_swing_highs(highs: list[float], wing: int = 2) -> list[int]:
-    """Devuelve índices donde hay un pivot high local (máximo local con 'wing' velas a cada lado)."""
     pivots = []
     for i in range(wing, len(highs) - wing):
         if all(highs[i] >= highs[i - j] for j in range(1, wing + 1)) and \
@@ -224,7 +276,6 @@ def _find_swing_highs(highs: list[float], wing: int = 2) -> list[int]:
 
 
 def _find_swing_lows(lows: list[float], wing: int = 2) -> list[int]:
-    """Devuelve índices donde hay un pivot low local (mínimo local con 'wing' velas a cada lado)."""
     pivots = []
     for i in range(wing, len(lows) - wing):
         if all(lows[i] <= lows[i - j] for j in range(1, wing + 1)) and \
@@ -234,41 +285,32 @@ def _find_swing_lows(lows: list[float], wing: int = 2) -> list[int]:
 
 
 def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK) -> str:
-    """Detecta estructura de precio real usando swing highs/lows en las últimas N velas 1h cerradas.
-
-    v3: Usa pivots locales reales (no medias). Requiere SWING_CONFIRM_COUNT swings
-    consecutivos alcistas (HH+HL) o bajistas (LH+LL) para confirmar dirección.
-    Un solo swing en la dirección correcta no es suficiente para confirmar estructura.
-    """
-    closed = candles_1h[:-1]  # excluir vela en curso
-    if len(closed) < lookback + 4:  # necesitamos margen para los wings
+    """Detecta estructura de precio real usando swing highs/lows en las últimas N velas 1h cerradas."""
+    closed = candles_1h[:-1]
+    if len(closed) < lookback + 4:
         return "range"
 
-    recent = closed[-(lookback + 4):]  # buffer extra para los wings de los extremos
+    recent = closed[-(lookback + 4):]
     highs  = [c["high"]  for c in recent]
     lows   = [c["low"]   for c in recent]
 
     swing_high_idxs = _find_swing_highs(highs, wing=2)
     swing_low_idxs  = _find_swing_lows(lows,  wing=2)
 
-    # Necesitamos al menos 2 pivots de cada tipo para evaluar la tendencia
     if len(swing_high_idxs) < 2 or len(swing_low_idxs) < 2:
         return "range"
 
     swing_high_vals = [highs[i] for i in swing_high_idxs]
     swing_low_vals  = [lows[i]  for i in swing_low_idxs]
 
-    # Contar cuántos swings consecutivos son HH (máximo mayor al anterior)
     hh_count = sum(
         1 for i in range(1, len(swing_high_vals))
         if swing_high_vals[i] > swing_high_vals[i - 1] * 1.001
     )
-    # Contar cuántos swings consecutivos son HL (mínimo mayor al anterior)
     hl_count = sum(
         1 for i in range(1, len(swing_low_vals))
         if swing_low_vals[i] > swing_low_vals[i - 1] * 1.001
     )
-    # Contar LH y LL
     lh_count = sum(
         1 for i in range(1, len(swing_high_vals))
         if swing_high_vals[i] < swing_high_vals[i - 1] * 0.999
@@ -284,27 +326,20 @@ def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK)
         return "bull"
     if lh_count >= n and ll_count >= n:
         return "bear"
-    # Estructura mixta o insuficiente → rango
     return "range"
 
 
 def _daily_candle_context(candles_1h: list[dict]) -> tuple[float, float]:
-    """Calcula la vela diaria sintética (desde medianoche UTC) usando las velas 1h disponibles.
-
-    Devuelve (open_daily, close_actual) para evaluar si el día va a favor o en contra.
-    """
     now_utc     = datetime.datetime.now(timezone.utc)
     midnight    = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    midnight_ts = midnight.timestamp() * 1000  # ms
+    midnight_ts = midnight.timestamp() * 1000
 
-    # Velas 1h cerradas a partir de medianoche UTC
     today_candles = [
-        c for c in candles_1h[:-1]  # excluir vela en curso
+        c for c in candles_1h[:-1]
         if c.get("open_time", 0) >= midnight_ts
     ]
 
     if not today_candles:
-        # Fallback: usar la última vela 1h cerrada
         if len(candles_1h) >= 2:
             c = candles_1h[-2]
             return c["open"], c["close"]
@@ -316,12 +351,38 @@ def _daily_candle_context(candles_1h: list[dict]) -> tuple[float, float]:
 
 
 def _liquidity_ok(candles_1h: list[dict]) -> bool:
-    """Comprueba que el par tiene suficiente liquidez (volumen medio por vela 1h)."""
-    recent = candles_1h[-25:-1]  # últimas 24 velas cerradas
+    recent = candles_1h[-25:-1]
     if not recent:
         return False
     avg_vol = sum(c.get("volume", 0.0) for c in recent) / len(recent)
     return avg_vol >= MIN_HOURLY_VOLUME
+
+
+def _dynamic_min_score_bump(candles_1h: list[dict], price: float) -> int:
+    """Calcula el bump extra al score mínimo según volatilidad ATR 1h.
+
+    v4: En días muy volátiles (ATR_1h > 2%) el bot exige más convicción.
+    En días adormecidos (ATR_1h < 0.5%) también, porque las señales son frágiles.
+    """
+    if price <= 0 or len(candles_1h) < 16:
+        return 0
+    atr_1h = _atr(candles_1h[:-1], period=14)
+    if atr_1h <= 0:
+        return 0
+    atr_pct = atr_1h / price
+    if atr_pct > ATR_HIGH_VOL_PCT:
+        log.debug(
+            "[vol] ATR_1h=%.4f%% > %.1f%% → min_score +%d (alta volatilidad)",
+            atr_pct * 100, ATR_HIGH_VOL_PCT * 100, ATR_HIGH_VOL_BUMP,
+        )
+        return ATR_HIGH_VOL_BUMP
+    if atr_pct < ATR_LOW_VOL_PCT:
+        log.debug(
+            "[vol] ATR_1h=%.4f%% < %.1f%% → min_score +%d (baja volatilidad)",
+            atr_pct * 100, ATR_LOW_VOL_PCT * 100, ATR_LOW_VOL_BUMP,
+        )
+        return ATR_LOW_VOL_BUMP
+    return 0
 
 
 def evaluate(
@@ -332,15 +393,12 @@ def evaluate(
 ) -> tuple[str | None, int, str | None]:
     """Evalúa si hay señal de entrada. Devuelve (side, score, regime) o (None, score, None)."""
 
-    # ── Datos mínimos ────────────────────────────────────────────────────
     if len(candles_15m) < 50 or len(candles_1h) < 220:
         return None, 0, None
 
-    # ── Liquidez ─────────────────────────────────────────────────────────
     if not _liquidity_ok(candles_1h):
         return None, 0, None
 
-    # ── Vela cerrada (penúltima) ──────────────────────────────────────────
     closed  = candles_15m[-2]
     c_open  = closed["open"]
     c_close = closed["close"]
@@ -348,46 +406,50 @@ def evaluate(
     c_low   = closed["low"]
     bullish_candle = c_close > c_open
 
-    # ── Régimen de mercado 1h ────────────────────────────────────────────
+    # ── Régimen de mercado 1h (v4: incluye proto_bull/proto_bear) ────────
     regime, adx_1h = _market_regime(candles_1h)
 
-    # ── Estructura de precio 1h (v3: swings reales) ───────────────────────
+    # Normalizar: proto_bull/bear actúan como bull/bear para filtros,
+    # pero con penalización de score.
+    is_proto = regime in ("proto_bull", "proto_bear")
+    effective_regime = "bull" if regime in ("bull", "proto_bull") else (
+        "bear" if regime in ("bear", "proto_bear") else "range"
+    )
+
+    if effective_regime == "range":
+        return None, 0, None
+
+    # ── Estructura de precio 1h ────────────────────────────────────────
     structure = _price_structure(candles_1h)
 
-    # Hard-guard v3: si structure='range' y ADX_1h bajo → mercado lateral confirmado
+    # Hard-guard v3: structure='range' + ADX bajo
     if structure == "range" and adx_1h < ADX_1H_STRUCTURE_MIN:
         log.debug(
-            "[structure] range + ADX_1h=%.1f < %d → hard-guard (sin momentum)",
+            "[structure] range + ADX_1h=%.1f < %d → hard-guard",
             adx_1h, ADX_1H_STRUCTURE_MIN,
         )
         return None, 0, None
 
-    # Si las EMAs dicen bull/bear pero la estructura de swings dice range:
-    # solo se permite entrar si el ADX 1h es suficientemente fuerte
-    if regime != "range" and structure == "range" and adx_1h < ADX_1H_STRUCTURE_MIN:
+    if effective_regime != "range" and structure == "range" and adx_1h < ADX_1H_STRUCTURE_MIN:
         log.debug(
             "[structure] Régimen %s pero structure=range + ADX_1h=%.1f → hard-guard",
             regime, adx_1h,
         )
         return None, 0, None
 
-    # Si regime es rango, no hay señal
-    if regime == "range":
-        return None, 0, None
-
-    # ── Macro 4h ─────────────────────────────────────────────────────────
+    # ── Macro 4h ──────────────────────────────────────────────────────
     if candles_4h and len(candles_4h) >= 55:
         closes_4h = [c["close"] for c in candles_4h[:-1]]
         ema50_4h  = _ema(closes_4h, 50)[-1]
         price_4h  = closes_4h[-1]
-        if regime == "bull" and price_4h < ema50_4h:
+        if effective_regime == "bull" and price_4h < ema50_4h:
             return None, 0, None
-        if regime == "bear" and price_4h > ema50_4h:
+        if effective_regime == "bear" and price_4h > ema50_4h:
             return None, 0, None
 
-    # ── Indicadores 15m ──────────────────────────────────────────────────
+    # ── Indicadores 15m ───────────────────────────────────────────────
     closes_15m = [c["close"] for c in candles_15m]
-    price      = closes_15m[-2]  # precio de la vela cerrada
+    price      = closes_15m[-2]
 
     ema20_15m  = _ema(closes_15m[:-1], 20)[-1]
     ema200_15m = _ema(closes_15m[:-1], 200)[-1]
@@ -400,42 +462,40 @@ def evaluate(
     avg_vol    = sum(volumes[-21:-1]) / 20
     last_vol   = volumes[-2]
 
-    # ── Hard-guards ───────────────────────────────────────────────────────
-
-    # ATR volátil
+    # ── Hard-guards ───────────────────────────────────────────────────
     if price > 0 and atr_15m / price > ATR_VOLATILE_PCT:
         return None, 0, None
 
-    # ADX 15m demasiado débil
     if adx_15m < ADX_15M_MIN:
         return None, 0, None
 
-    # EMA200 1h
     closes_1h  = [c["close"] for c in candles_1h]
     ema200_1h  = _ema(closes_1h[:-1], 200)[-1]
-    if regime == "bull" and price < ema200_1h * (1 - EMA200_MIN_DIST):
+    if effective_regime == "bull" and price < ema200_1h * (1 - EMA200_MIN_DIST):
         return None, 0, None
-    if regime == "bear" and price > ema200_1h * (1 + EMA200_MIN_DIST):
-        return None, 0, None
-
-    # EMA200 15m — hard-guard en SHORTs
-    if regime == "bear" and price < ema200_15m * (1 - EMA200_MIN_DIST):
+    if effective_regime == "bear" and price > ema200_1h * (1 + EMA200_MIN_DIST):
         return None, 0, None
 
-    # No-chase: rango de la vela cerrada
+    if effective_regime == "bear" and price < ema200_15m * (1 - EMA200_MIN_DIST):
+        return None, 0, None
+
     candle_range = c_high - c_low
     if candle_range > 0 and atr_15m > 0:
         if candle_range > NO_CHASE_MULT * atr_15m:
             return None, 0, None
 
-    # Pullback EMA20 (sobreextensión)
     if price > 0 and ema20_15m > 0:
         dist_ema20 = abs(price - ema20_15m) / price
         if dist_ema20 > PULLBACK_EMA20_DIST:
-            if regime == "bull" and price > ema20_15m:
+            if effective_regime == "bull" and price > ema20_15m:
                 return None, 0, None
-            if regime == "bear" and price < ema20_15m:
+            if effective_regime == "bear" and price < ema20_15m:
                 return None, 0, None
+
+    # ── Score mínimo dinámico por volatilidad (v4) ───────────────────
+    vol_bump   = _dynamic_min_score_bump(candles_1h, price)
+    proto_bump = PROTO_MIN_SCORE_EXTRA if is_proto else 0
+    min_required_base = min_score + vol_bump + proto_bump
 
     # Contexto vela diaria
     open_daily, close_today = _daily_candle_context(candles_1h)
@@ -443,41 +503,43 @@ def evaluate(
 
     if open_daily > 0:
         daily_move = (close_today - open_daily) / open_daily
-        if regime == "bull" and daily_move < -DAILY_CANDLE_BLOCK:
+        if effective_regime == "bull" and daily_move < -DAILY_CANDLE_BLOCK:
             return None, score, None
-        if regime == "bear" and daily_move > DAILY_CANDLE_BLOCK:
+        if effective_regime == "bear" and daily_move > DAILY_CANDLE_BLOCK:
             return None, score, None
 
         abs_move = abs(daily_move)
         if abs_move > DAILY_CANDLE_GUARD:
-            # Hard-guard: el move del día ya ocurrió
-            if (regime == "bull" and daily_move > 0) or (regime == "bear" and daily_move < 0):
+            if (effective_regime == "bull" and daily_move > 0) or (effective_regime == "bear" and daily_move < 0):
                 return None, score, None
         elif abs_move > DAILY_CANDLE_PENALTY:
             score -= 10
 
-    # ── Scoring ───────────────────────────────────────────────────────────
+    # ── Scoring ───────────────────────────────────────────────────────
+
+    # Penalización proto-régimen (menos convicción que régimen completo)
+    if is_proto:
+        score -= PROTO_SCORE_PENALTY
 
     # Dirección de vela cerrada
-    if regime == "bull" and bullish_candle:
+    if effective_regime == "bull" and bullish_candle:
         score += 8
-    elif regime == "bear" and not bullish_candle:
+    elif effective_regime == "bear" and not bullish_candle:
         score += 8
 
     # RSI
-    if regime == "bull":
+    if effective_regime == "bull":
         if 45 <= rsi <= 65:
             score += 8
         elif rsi > 70:
-            score -= 8  # sobrecompra
+            score -= 8
             if rsi > 80:
-                return None, score, None  # hard-guard SHORT sobrevendido no aplica aquí,
-                                          # pero en bull con RSI>80 es sobreextensión
-    else:  # bear
+                return None, score, None
+    else:
         if 35 <= rsi <= 55:
             score += 8
         elif rsi < 30:
-            return None, score, None  # sobrevendido en SHORT
+            return None, score, None
 
     # ADX 1h
     if adx_1h >= 30:
@@ -486,22 +548,21 @@ def evaluate(
         score += 8
     elif adx_1h >= 20:
         score += 4
-    # hard-guard SHORT con ADX 1h débil
-    if regime == "bear" and adx_1h < 22:
+    if effective_regime == "bear" and adx_1h < 22:
         return None, score, None
 
     # MACD 15m
-    if regime == "bull" and macd_hist > 0:
+    if effective_regime == "bull" and macd_hist > 0:
         score += 8
-    elif regime == "bear" and macd_hist < 0:
+    elif effective_regime == "bear" and macd_hist < 0:
         score += 8
 
     # MACD 1h
     closes_1h_closed = closes_1h[:-1]
     macd_1h = _macd_histogram(closes_1h_closed)[-1]
-    if regime == "bull" and macd_1h > 0:
+    if effective_regime == "bull" and macd_1h > 0:
         score += 8
-    elif regime == "bear" and macd_1h < 0:
+    elif effective_regime == "bear" and macd_1h < 0:
         score += 8
 
     # Volumen
@@ -520,32 +581,39 @@ def evaluate(
 
     # Divergencia RSI
     div = _rsi_divergence(closes_15m[:-1], candles_15m[:-1])
-    if regime == "bull" and div == "bullish":
+    if effective_regime == "bull" and div == "bullish":
         score += 8
-    elif regime == "bear" and div == "bearish":
+    elif effective_regime == "bear" and div == "bearish":
         score += 8
 
-    # Estructura de precio vs régimen (v3: bonus si estructura confirma)
-    if structure == regime:
-        score += 8  # consenso completo EMA + swings
-    elif structure != "range" and structure != regime:
-        # Contradicción estructural — penalización más fuerte en v3
+    # Estructura de precio vs régimen
+    if structure == effective_regime:
+        score += 8  # consenso completo
+    elif structure != "range" and structure != effective_regime:
         score -= 12
         log.debug(
             "[structure] Régimen %s contradice estructura %s (adx_1h=%.1f) — penalización -12",
             regime, structure, adx_1h,
         )
 
-    # ── Score mínimo ──────────────────────────────────────────────────────
-    min_required = min_score + (SHORT_MIN_SCORE_EXTRA if regime == "bear" else 0)
+    # ── Score mínimo ──────────────────────────────────────────────────
+    min_required = min_required_base + (SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0)
     if score < min_required:
+        log.debug(
+            "[score] %s score=%d < min_required=%d (base=%d vol_bump=%d proto_bump=%d short_extra=%d)",
+            regime, score, min_required, min_score, vol_bump, proto_bump,
+            SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0,
+        )
         return None, score, None
 
-    side = "long" if regime == "bull" else "short"
+    side = "long" if effective_regime == "bull" else "short"
     log.info(
-        "✅ SEÑAL %s | score=%d | regime=%s structure=%s adx1h=%.1f adx15m=%.1f "
-        "rsi=%.1f macd_hist=%.5f vol_ratio=%.2f",
-        side.upper(), score, regime, structure, adx_1h, adx_15m,
-        rsi, macd_hist, last_vol / avg_vol if avg_vol else 0,
+        "✅ SEÑAL %s | score=%d (min=%d) | regime=%s structure=%s "
+        "adx1h=%.1f adx15m=%.1f rsi=%.1f macd_hist=%.5f vol_ratio=%.2f"
+        "%s",
+        side.upper(), score, min_required, regime, structure,
+        adx_1h, adx_15m, rsi, macd_hist,
+        last_vol / avg_vol if avg_vol else 0,
+        " [PROTO]" if is_proto else "",
     )
     return side, score, regime
