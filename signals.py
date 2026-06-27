@@ -10,10 +10,11 @@ Filtros:
   5. EMA200 15m         : hard-guard de dirección en SHORTs únicamente
   6. ATR volátil        : hard-guard — si atr_pct > 3.5% mercado en evento/noticia,
                           SL real desborda el cap de 2.5% → no entrar
-  7. ADX 15m            : hard-guard <15 (sin tendencia suficiente, no operar)
-                          >35 +12, >25 +6, >18 neutro, 15-18 -8
+  7. ADX 15m            : hard-guard <20 (sin tendencia suficiente, no operar)
+                          >35 +12, >25 +6, >20 -6 (penaliza ADX mediocre)
   8. ADX 1h             : >25 +5, <18 -5 (fuerza de tendencia en marco superior)
                           hard-guard short: bear + adx_1h < 18 → no entrar (rebote choppy)
+                          hard-guard long:  bear + adx_1h < 22 → no entrar (contra-tendencia débil)
   9. RSI 15m            : cruce 50 +15, extremo >58/<42 +8, direccional +4,
                           contrario -5
                           hard-guard short: RSI < 38 → rebote probable, no entrar
@@ -25,12 +26,12 @@ Filtros:
   14. Filtro no-chase   : rango vela ≤2×ATR (hard-guard)
   15. Filtro pullback   : precio dentro del 1.5% de EMA20_15m — evita entrar en
                           sobreextensión.
-  16. Score direccional : SHORTs requieren min_score+5 (default 77 vs 72 para LONGs)
+  16. Score direccional : SHORTs requieren min_score+8 (default 86 vs 78 para LONGs)
 
 Score base: 20 pts (por superar hard-guards)
 Macro 4h:  +15 a favor | 0 si sin datos | -10 en contra
-Sizing en risk.py: mult=1.0 (score 72-84) | 1.4 (≥85)
-MIN_SCORE configurable via env var MIN_SCORE (default 72)
+Sizing en risk.py: mult=1.0 (score 78-84) | 1.4 (≥85)
+MIN_SCORE configurable via env var MIN_SCORE (default 78)
 
 FIXES aplicados:
   - _market_regime: usa closes[-2] (vela 1h cerrada) para price, no closes[-1]
@@ -43,17 +44,18 @@ FIXES aplicados:
   - _rsi_divergence: protegido max() sobre generador vacío con try/except — FIX BUG
   - rsi_dir: añadido umbral de zona (LONG>45, SHORT<55) para evitar +4 en territorio contrario
   - rsi_ext LONG: umbral 55→58 (zona 55-58 no es momentum confirmado)
-  - ADX hard-guard bajado de <18 a <15 (zona 15-18 = neutro, no bloqueado)
-  - evaluate(): devuelve (signal, score, regime) para que main.py no recalcule régimen
-  - REGIME_CONFIRM_BARS: 4 → 2 (3 velas consecutivas en vez de 5)
-  - SHORT_MIN_SCORE_EXTRA: +10 → +5 (umbral short 82 → 77)
+  - ADX hard-guard subido de <15 a <20 (zona 15-20 lateral — no operar)
+  - ADX zona 18-25: scoring 0 → -6 (penaliza ADX mediocre más agresivamente)
+  - REGIME_CONFIRM_BARS: 2 → 3 (exige 4 velas consecutivas de mismo régimen)
+  - MIN_SCORE: 72 → 78 (filtrar señales borderline y reducir trades en choppy)
+  - SHORT_MIN_SCORE_EXTRA: +5 → +8 (umbral short 86 vs 78 para LONGs)
+  - Hard-guard LONG en régimen bear: adx_1h < 22 → bloqueado (contra-tendencia sin fuerza)
   - Hard-guard RSI < 38 para SHORTs (rebote probable en sobrevendido)
   - Hard-guard EMA200 15m: solo para SHORTs (eliminado en LONGs — redundante con EMA200 1h)
   - _ema: guard lista vacía → devuelve [] en lugar de IndexError — FIX BUG
   - _volume_ok: excluye vela evaluada (candles[-2]) del cálculo de la media — FIX BUG
   - Volumen: bonus +8→+10, penalización -5 si volumen bajo (<0.8×media)
   - Filtro pullback EMA20_15m: ±1.5%
-  - MIN_SCORE subido de 70 → 72 para filtrar señales borderline
   - HIGH_BIAS_HOURS: añadida hora 13 UTC (pre-NY / máx volumen europeo)
   - Log señal: añade margin= y pullback_dist= para diagnóstico en producción
 """
@@ -76,9 +78,14 @@ MIN_SCORE           = config.MIN_SCORE
 # Margen pullback EMA20_15m: ±1.5% sobre la EMA20.
 PULLBACK_EMA20_DIST = 0.015
 
-REGIME_CONFIRM_BARS   = 2
-SHORT_MIN_SCORE_EXTRA = 5
+REGIME_CONFIRM_BARS   = 3   # exige 4 velas 1h consecutivas del mismo régimen
+SHORT_MIN_SCORE_EXTRA = 8   # umbral short = MIN_SCORE + 8
 ATR_VOLATILE_PCT      = 0.035
+
+# ADX mínimo 15m para operar — subido a 20 para evitar laterales
+ADX_15M_MIN = 20
+# ADX mínimo 1h para LONGs en régimen bear (contra-tendencia sin fuerza = no entrar)
+ADX_1H_LONG_BEAR_MIN = 22
 
 HIGH_BIAS_HOURS = {8, 9, 10, 13, 14, 15, 16, 20, 21}   # 13 UTC = pre-NY / máx vol EU
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
@@ -333,7 +340,6 @@ def evaluate(
         return None, score, regime
 
     # ── 5b. EMA200 15m hard-guard — solo SHORTs ───────────────────────────
-    # En LONGs es redundante con EMA200 1h. En SHORTs añade capa extra útil.
     if len(closes_15m) >= 202:
         ema200_15m = _ema(closes_15m[:-1], 200)[-1]
         if direction == "short" and price > ema200_15m * 1.002:
@@ -355,23 +361,31 @@ def evaluate(
     # ── 6. ADX 15m ────────────────────────────────────────────────────────
     adx_15m = _adx(candles_15m[:-1], 14)
 
-    if adx_15m < 15:
-        log.debug("Hard-guard ADX 15m insuficiente: %.1f — señal descartada", adx_15m)
+    if adx_15m < ADX_15M_MIN:
+        log.debug("Hard-guard ADX 15m insuficiente: %.1f < %d — señal descartada", adx_15m, ADX_15M_MIN)
         return None, score, regime
 
     if   adx_15m > 35: score += 12
     elif adx_15m > 25: score += 6
-    elif adx_15m > 18: score += 0   # zona media: neutro
-    else:              score -= 8   # zona 15-18: penaliza pero no bloquea
+    else:              score -= 6   # zona 20-25: tendencia mediocre, penaliza
 
     # ── 7. ADX 1h ─────────────────────────────────────────────────────────
     if   adx_1h > 25: score += 5
     elif adx_1h < 18: score -= 5
 
+    # Hard-guard SHORT: bear sin tendencia 1h = rebote choppy
     if direction == "short" and adx_1h < 18:
         log.debug(
             "Hard-guard short: regime=bear pero adx_1h=%.1f — mercado rebotando sin tendencia",
             adx_1h,
+        )
+        return None, score, regime
+
+    # Hard-guard LONG en régimen bear: contra-tendencia sin fuerza = no entrar
+    if direction == "long" and regime == "bear" and adx_1h < ADX_1H_LONG_BEAR_MIN:
+        log.info(
+            "Hard-guard LONG contra-tendencia: regime=bear adx_1h=%.1f < %d — señal descartada",
+            adx_1h, ADX_1H_LONG_BEAR_MIN,
         )
         return None, score, regime
 
@@ -395,12 +409,12 @@ def evaluate(
 
     if direction == "long":
         rsi_cross = rsi_prev < 50 <= rsi_now
-        rsi_ext   = rsi_now > 58          # FIX: 55→58, zona 55-58 no es momentum confirmado
+        rsi_ext   = rsi_now > 58
         rsi_dir   = rsi_now > rsi_prev and rsi_now > 45
         rsi_bad   = rsi_now < 45
     else:
         rsi_cross = rsi_prev > 50 >= rsi_now
-        rsi_ext   = rsi_now < 42          # simétrico: <42 en vez de <45
+        rsi_ext   = rsi_now < 42
         rsi_dir   = rsi_now < rsi_prev and rsi_now < 55
         rsi_bad   = rsi_now > 60
 
@@ -455,7 +469,7 @@ def evaluate(
     pullback_dist = None
     if len(closes_15m) >= 22:
         ema20_15m    = _ema(closes_15m[:-1], 20)[-1]
-        pullback_dist = (price - ema20_15m) / ema20_15m  # positivo = precio sobre EMA20
+        pullback_dist = (price - ema20_15m) / ema20_15m
         if direction == "long" and price > ema20_15m * (1 + PULLBACK_EMA20_DIST):
             log.debug(
                 "Pullback-guard LONG: precio %.6f > EMA20_15m*%.3f %.6f — sobreextendido, esperar",
