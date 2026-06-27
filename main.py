@@ -1,4 +1,4 @@
-"""main.py — Loop principal con trailing stop y TP dinámico (extend_tp)."""
+"""main.py — Loop principal con trailing stop, break-even lock y TP dinámico."""
 import logging
 import sys
 import time
@@ -31,16 +31,11 @@ MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
 TP_EXTEND_THRESH       = 0.015
-# FIX: reducido de 300 a 90 s. Con 300s el bot no podía extender TPs ni mover
-# el trailing en los primeros 5 minutos, perdiendo ventanas de momentum en
-# altcoins volátiles que tocan el TP en los primeros 2-3 loops (velas 15m).
 MIN_HOLD_SECS          = 90
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
 
-# FIX: leer MIN_SCORE desde config para que los cambios en config.py
-# surtan efecto sin necesidad de tocar main.py.
 WEEKDAY_MIN_SCORE = int(getattr(config, "WEEKDAY_MIN_SCORE", 70))
 WEEKEND_MIN_SCORE = int(getattr(config, "WEEKEND_MIN_SCORE", 90))
 
@@ -51,7 +46,6 @@ _missing_count: dict[str, int] = {}
 
 _weekend_notified_day: int = -1
 
-# ── Guard de exposición direccional ──────────────────────────────────────────
 MAX_SAME_SIDE = int(getattr(config, "MAX_SAME_SIDE", 4))
 
 
@@ -65,7 +59,6 @@ def _cooldown_for(symbol: str) -> int:
 
 
 def _corr_group_for(symbol: str) -> int | None:
-    """Devuelve el índice del grupo de correlación al que pertenece el símbolo, o None."""
     for idx, group in enumerate(config.CORR_GROUPS):
         if symbol in group:
             return idx
@@ -73,7 +66,6 @@ def _corr_group_for(symbol: str) -> int | None:
 
 
 def _check_directional_guard(signal: str, positions: dict, symbol: str) -> bool:
-    """Devuelve True si se puede abrir la posición según los guards direccionales."""
     same_side_count = sum(1 for p in positions.values() if p["side"] == signal)
     if same_side_count >= MAX_SAME_SIDE:
         log.debug(
@@ -100,7 +92,6 @@ def _check_directional_guard(signal: str, positions: dict, symbol: str) -> bool:
 
 
 def _sync_entry_from_exchange(symbol: str, local_price: float, side: str) -> float:
-    """Lee el precio de fill real desde BingX tras abrir una orden."""
     try:
         pos_live = exchange.get_position(symbol)
         if pos_live and pos_live.get("side") == side:
@@ -119,6 +110,35 @@ def _sync_entry_from_exchange(symbol: str, local_price: float, side: str) -> flo
             symbol, exc,
         )
     return local_price
+
+
+def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
+    """Intenta activar el break-even lock. Si se activa, actualiza el SL en exchange."""
+    if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
+        return
+
+    activated = risk.check_breakeven(symbol, pos, current_price)
+    if not activated:
+        return
+
+    # SL ya fue actualizado en pos por check_breakeven
+    new_sl = pos["sl"]
+    side   = pos["side"]
+    try:
+        exchange.cancel_all_orders(symbol)
+        exchange.place_stop_order(symbol, side, pos["qty"], new_sl)
+        exchange.place_tp_order(symbol, side, pos["qty"], pos["tp"])
+        telegram.notify(
+            f"\U0001f512 <b>Break-even activado</b>\n"
+            f"{symbol} {side.upper()}\n"
+            f"SL movido a entry+buffer: <code>{new_sl:.6f}</code>\n"
+            f"Trade gratuito desde aquí."
+        )
+    except Exception as e:
+        log.warning("[%s] Error actualizando SL break-even en exchange: %s", symbol, e)
+        # Revertir flag para reintentar en el siguiente loop
+        pos["be_locked"] = False
+        pos["sl"]        = pos.get("be_trigger", new_sl)  # restaurar SL anterior aprox
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
@@ -480,7 +500,6 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
 
 
 def _calc_trail_step_from_atr(symbol: str, feed, sl: float | None, entry: float) -> float:
-    """Recalcula trail_step desde ATR cuando se sincroniza una posición tras reinicio."""
     try:
         candles_15m = feed.get(symbol, "15m")
         if candles_15m and len(candles_15m) >= 15:
@@ -507,14 +526,30 @@ def _calc_trail_step_from_atr(symbol: str, feed, sl: float | None, entry: float)
     return 0.0
 
 
-def _get_position_open_ts(symbol: str, pos_ex: dict) -> float:
-    """Intenta obtener el timestamp real de apertura desde el historial de órdenes.
+def _calc_be_levels_from_atr(
+    symbol: str, feed, side: str, entry: float
+) -> tuple[float | None, float | None]:
+    """Recalcula be_trigger y be_sl desde ATR 15m para posiciones sincronizadas."""
+    try:
+        candles_15m = feed.get(symbol, "15m")
+        if candles_15m and len(candles_15m) >= 15:
+            trs = []
+            for i in range(1, len(candles_15m)):
+                h  = candles_15m[i]["high"]
+                l  = candles_15m[i]["low"]
+                pc = candles_15m[i - 1]["close"]
+                trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+            atr = sum(trs[-14:]) / min(14, len(trs))
+            if atr > 0 and entry > 0:
+                be_trigger = (entry + risk.BE_ATR_MULT * atr) if side == "long" else (entry - risk.BE_ATR_MULT * atr)
+                be_sl      = (entry + risk.BE_BUFFER_MULT * atr) if side == "long" else (entry - risk.BE_BUFFER_MULT * atr)
+                return round(be_trigger, 8), round(be_sl, 8)
+    except Exception as exc:
+        log.debug("[%s] No se pudo calcular be_levels tras sync: %s", symbol, exc)
+    return None, None
 
-    FIX: con time.time() en el sync, MIN_HOLD_SECS se reiniciaba en cada restart
-    aunque la posición llevase horas abierta. Ahora buscamos la orden de apertura
-    real en el historial de órdenes cerradas. Si no encontramos nada usamos
-    time.time() como fallback (comportamiento anterior, conservador).
-    """
+
+def _get_position_open_ts(symbol: str, pos_ex: dict) -> float:
     try:
         side         = pos_ex.get("side", "long")
         open_bx_side = "BUY" if side == "long" else "SELL"
@@ -626,9 +661,8 @@ def run() -> None:
                     synced_sl    = pos_ex.get("sl")
                     synced_entry = pos_ex["entry"]
                     trail_step   = _calc_trail_step_from_atr(symbol, feed, synced_sl, synced_entry)
-                    # FIX: recuperar el open_ts real desde el historial de órdenes
-                    # para no reiniciar MIN_HOLD_SECS en cada restart del bot.
                     real_open_ts = _get_position_open_ts(symbol, pos_ex)
+                    be_trigger, be_sl = _calc_be_levels_from_atr(symbol, feed, ex_side, synced_entry)
 
                     positions[symbol] = {
                         "side":          ex_side,
@@ -642,14 +676,20 @@ def run() -> None:
                         "trail_step":    trail_step,
                         "trail_high":    synced_entry,
                         "trail_low":     synced_entry,
-                        # FIX: usar config.WEEKDAY_MIN_SCORE como score base en posiciones
-                        # sincronizadas desde el exchange, en vez del 70 hardcodeado.
                         "score":         getattr(config, "WEEKDAY_MIN_SCORE", 70),
                         "open_ts":       real_open_ts,
+                        # Break-even lock (recalculado desde ATR 15m)
+                        "be_trigger":    be_trigger,
+                        "be_sl":         be_sl,
+                        "be_locked":     False,
                     }
-                    log.info("[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s trail=%.8f open_ts=%.0f)",
-                             symbol, ex_side, synced_entry,
-                             synced_sl, pos_ex["tp"], trail_step, real_open_ts)
+                    log.info(
+                        "[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s trail=%.8f be_trigger=%s open_ts=%.0f)",
+                        symbol, ex_side, synced_entry,
+                        synced_sl, pos_ex["tp"], trail_step,
+                        f"{be_trigger:.6f}" if be_trigger else "N/A",
+                        real_open_ts,
+                    )
 
             open_count = len(positions)
 
@@ -673,6 +713,8 @@ def run() -> None:
             for symbol, pos in list(positions.items()):
                 try:
                     price = exchange.get_price(symbol)
+                    # Orden: break-even lock PRIMERO, luego trailing
+                    _apply_breakeven(symbol, pos, price)
                     _update_trailing(symbol, pos, price)
                     _check_tp_extension(symbol, pos, price, feed, effective_min_score)
                 except Exception as e:
@@ -752,9 +794,6 @@ def run() -> None:
                             continue
 
                         price  = exchange.get_price(symbol)
-                        # FIX: pasar candles_1h a risk.calc para que el SL se calcule
-                        # sobre ATR 1h en lugar de ATR 15m. Los trades duran horas y el
-                        # SL debe calibrarse sobre el rango real del timeframe del trade.
                         params = risk.calc(
                             signal, price, candles_15m,
                             score=score, symbol=symbol, regime=regime,
@@ -778,15 +817,13 @@ def run() -> None:
 
                         log.info(
                             "[%s] SEÑAL %s | regime=%s RR=%.1f | "
-                            "entry=%.6f sl=%.6f tp=%.6f qty=%.8f score=%d",
+                            "entry=%.6f sl=%.6f tp=%.6f be_trigger=%s qty=%.8f score=%d",
                             symbol, signal.upper(), regime, params["tp_rr"],
-                            price, params["sl"], params["tp"], params["qty"], score,
+                            price, params["sl"], params["tp"],
+                            f"{params['be_trigger']:.6f}" if params.get("be_trigger") else "N/A",
+                            params["qty"], score,
                         )
 
-                        # FIX: envolver open_order en try/except para hacer rollback
-                        # si la orden de mercado se abre pero falla place_stop_order
-                        # o place_tp_order. Sin esto la posición quedaba registrada
-                        # localmente sin SL/TP y el trailing la ignoraba indefinidamente.
                         try:
                             exchange.open_order(
                                 side   = signal,
@@ -826,6 +863,10 @@ def run() -> None:
                             "trail_low":     real_entry,
                             "score":         score,
                             "open_ts":       time.time(),
+                            # Break-even lock
+                            "be_trigger":    params.get("be_trigger"),
+                            "be_sl":         params.get("be_sl"),
+                            "be_locked":     False,
                         }
                         open_count = len(positions)
 
