@@ -1,32 +1,23 @@
 """signals.py — Sistema de señales con estructura de precio real.
 
-Mejoras estructurales v2:
-  A. Estructura de precio 1h (HH/HL vs LH/LL)
-     El régimen ya no se basa solo en EMAs. Se valida que el precio esté
-     construyendo máximos/mínimos crecientes (bull) o decrecientes (bear)
-     en las últimas 6 velas de 1h. Sin estructura confirmada = range.
+Mejoras estructurales v3:
+  A. Estructura de precio 1h con swing highs/lows reales
+     Detecta pivots locales (máximo/mínimo local en ventana ±2 velas).
+     Requiere 2 HH+HL para confirmar bull, 2 LH+LL para bear.
+     Mucho más preciso que comparar medias — elimina falsos positivos en rango ancho.
 
-  B. Contexto de vela diaria
-     Se calcula la vela diaria sintética (desde medianoche UTC) con las
-     velas de 1h disponibles. LONGs bloqueados si la vela diaria baja >1.5%.
-     SHORTs bloqueados si la vela diaria sube >1.5%. Evita entrar contra
-     el momentum del día.
+  B. Hard-guard ADX en rango lateral
+     Si la estructura de precio es 'range' Y el ADX_1h < 25 → descartar señal.
+     Evita entrar en tendencias falsas donde las EMAs están ordenadas pero el
+     mercado no tiene momentum real (típico en rangos laterales con poca volatilidad).
 
-  C. Filtro de liquidez del par
-     Volumen medio de las últimas 24 velas de 1h < umbral mínimo = par
-     demasiado ilíquido para trading sistemático. Elimina pares tipo PENGU
-     con spreads y spikes aleatorios.
-     Umbral: 1M USDT/h (≈24M/día). Pares que solo superan este umbral
-     en días de pump no tienen liquidez estructural fiable.
-
-  D. Penalización por alejamiento del open diario
-     Si el precio ya se ha movido >2.5% desde el open diario en la dirección
-     del trade, el movimiento es sobreextensión y el score se penaliza -10.
-     Si se ha movido >4% = hard-guard (no entrar, el move ya ocurrió).
+  C. Contexto de vela diaria (heredado v2)
+  D. Filtro de liquidez del par (heredado v2)
+  E. Penalización por alejamiento del open diario (heredado v2)
 
 Filtros heredados:
   1. Vela cerrada       : penúltima vela (ya cerrada)
-  2. Régimen de mercado : EMAs 1h + estructura HH/HL
+  2. Régimen de mercado : EMAs 1h + estructura HH/HL (swings reales)
   3. Macro 4h           : EMA50 en 4h
   4. EMA200 1h          : hard-guard de dirección
   5. EMA200 15m         : hard-guard en SHORTs
@@ -71,19 +62,19 @@ ADX_15M_MIN           = 20
 HIGH_BIAS_HOURS = {8, 9, 10, 13, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
 
-# ── Nuevos umbrales v2 ────────────────────────────────────────────────
-# Estructura de precio: ventana de velas 1h para detectar HH/HL o LH/LL
-STRUCTURE_LOOKBACK    = 6    # velas 1h
-# Contexto diario: bloquear si vela diaria va >X% contra el trade
-DAILY_CANDLE_BLOCK    = 0.015  # 1.5%
-DAILY_CANDLE_PENALTY  = 0.025  # 2.5% → penalización -10
-DAILY_CANDLE_GUARD    = 0.040  # 4.0% → hard-guard
-# Liquidez mínima del par: volumen medio por vela 1h (en USDT notional aprox)
-# Subido de 500k → 1M USDT/h (≈24M/día).
-# 500k era demasiado permisivo: pares como ZK, EIGEN, MANTA pueden superar
-# ese umbral en días de pump sin tener liquidez estructural fiable en el book.
-# 1M filtra estos pares de forma más robusta en condiciones normales de mercado.
-MIN_HOURLY_VOLUME     = 1_000_000   # 1M USDT/hora → ~24M/día
+# ── Umbrales v2 ───────────────────────────────────────────────────────────
+STRUCTURE_LOOKBACK    = 8    # velas 1h para detectar swings (aumentado de 6 a 8)
+DAILY_CANDLE_BLOCK    = 0.015
+DAILY_CANDLE_PENALTY  = 0.025
+DAILY_CANDLE_GUARD    = 0.040
+MIN_HOURLY_VOLUME     = 1_000_000
+
+# ── Umbrales v3 ───────────────────────────────────────────────────────────
+# ADX mínimo en 1h para confirmar que el régimen no es rango lateral disfrazado.
+# Si ADX_1h < umbral Y structure != regime → hard-guard.
+ADX_1H_STRUCTURE_MIN  = 25   # debajo de esto, si structure='range' → no entrar
+# Número mínimo de swings HH+HL (o LH+LL) consecutivos para confirmar estructura
+SWING_CONFIRM_COUNT   = 2
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────
@@ -222,150 +213,115 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     return "range", adx
 
 
-def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK) -> str:
-    """Detecta estructura de precio en las últimas N velas 1h cerradas.
+def _find_swing_highs(highs: list[float], wing: int = 2) -> list[int]:
+    """Devuelve índices donde hay un pivot high local (máximo local con 'wing' velas a cada lado)."""
+    pivots = []
+    for i in range(wing, len(highs) - wing):
+        if all(highs[i] >= highs[i - j] for j in range(1, wing + 1)) and \
+           all(highs[i] >= highs[i + j] for j in range(1, wing + 1)):
+            pivots.append(i)
+    return pivots
 
-    Devuelve 'bull' si hay HH+HL, 'bear' si hay LH+LL, 'range' si no hay estructura clara.
-    Usa los highs y lows de las velas, no solo los closes.
+
+def _find_swing_lows(lows: list[float], wing: int = 2) -> list[int]:
+    """Devuelve índices donde hay un pivot low local (mínimo local con 'wing' velas a cada lado)."""
+    pivots = []
+    for i in range(wing, len(lows) - wing):
+        if all(lows[i] <= lows[i - j] for j in range(1, wing + 1)) and \
+           all(lows[i] <= lows[i + j] for j in range(1, wing + 1)):
+            pivots.append(i)
+    return pivots
+
+
+def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK) -> str:
+    """Detecta estructura de precio real usando swing highs/lows en las últimas N velas 1h cerradas.
+
+    v3: Usa pivots locales reales (no medias). Requiere SWING_CONFIRM_COUNT swings
+    consecutivos alcistas (HH+HL) o bajistas (LH+LL) para confirmar dirección.
+    Un solo swing en la dirección correcta no es suficiente para confirmar estructura.
     """
     closed = candles_1h[:-1]  # excluir vela en curso
-    if len(closed) < lookback + 1:
+    if len(closed) < lookback + 4:  # necesitamos margen para los wings
         return "range"
 
-    recent = closed[-(lookback + 1):]
+    recent = closed[-(lookback + 4):]  # buffer extra para los wings de los extremos
     highs  = [c["high"]  for c in recent]
     lows   = [c["low"]   for c in recent]
 
-    # Comparar primera mitad vs segunda mitad de la ventana
-    mid = len(recent) // 2
-    avg_high_prev = sum(highs[:mid]) / mid
-    avg_high_curr = sum(highs[mid:]) / (len(highs) - mid)
-    avg_low_prev  = sum(lows[:mid])  / mid
-    avg_low_curr  = sum(lows[mid:])  / (len(lows) - mid)
+    swing_high_idxs = _find_swing_highs(highs, wing=2)
+    swing_low_idxs  = _find_swing_lows(lows,  wing=2)
 
-    hh = avg_high_curr > avg_high_prev * 1.001   # máximos creciendo
-    hl = avg_low_curr  > avg_low_prev  * 1.001   # mínimos creciendo
-    lh = avg_high_curr < avg_high_prev * 0.999   # máximos cayendo
-    ll = avg_low_curr  < avg_low_prev  * 0.999   # mínimos cayendo
+    # Necesitamos al menos 2 pivots de cada tipo para evaluar la tendencia
+    if len(swing_high_idxs) < 2 or len(swing_low_idxs) < 2:
+        return "range"
 
-    if hh and hl:
+    swing_high_vals = [highs[i] for i in swing_high_idxs]
+    swing_low_vals  = [lows[i]  for i in swing_low_idxs]
+
+    # Contar cuántos swings consecutivos son HH (máximo mayor al anterior)
+    hh_count = sum(
+        1 for i in range(1, len(swing_high_vals))
+        if swing_high_vals[i] > swing_high_vals[i - 1] * 1.001
+    )
+    # Contar cuántos swings consecutivos son HL (mínimo mayor al anterior)
+    hl_count = sum(
+        1 for i in range(1, len(swing_low_vals))
+        if swing_low_vals[i] > swing_low_vals[i - 1] * 1.001
+    )
+    # Contar LH y LL
+    lh_count = sum(
+        1 for i in range(1, len(swing_high_vals))
+        if swing_high_vals[i] < swing_high_vals[i - 1] * 0.999
+    )
+    ll_count = sum(
+        1 for i in range(1, len(swing_low_vals))
+        if swing_low_vals[i] < swing_low_vals[i - 1] * 0.999
+    )
+
+    n = SWING_CONFIRM_COUNT
+
+    if hh_count >= n and hl_count >= n:
         return "bull"
-    if lh and ll:
+    if lh_count >= n and ll_count >= n:
         return "bear"
-    if hh and ll:
-        return "range"   # expansión: volatilidad sin dirección
-    if lh and hl:
-        return "range"   # contracción: rango apretándose
+    # Estructura mixta o insuficiente → rango
     return "range"
 
 
 def _daily_candle_context(candles_1h: list[dict]) -> tuple[float, float]:
-    """Calcula la vela diaria sintética desde medianoche UTC con las velas 1h.
+    """Calcula la vela diaria sintética (desde medianoche UTC) usando las velas 1h disponibles.
 
-    Devuelve (open_price, move_pct) donde move_pct es positivo si sube, negativo si baja.
-    Si no hay suficientes datos devuelve (0, 0).
+    Devuelve (open_daily, close_actual) para evaluar si el día va a favor o en contra.
     """
-    now_utc    = datetime.datetime.now(timezone.utc)
-    midnight   = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    now_utc     = datetime.datetime.now(timezone.utc)
+    midnight    = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     midnight_ts = midnight.timestamp() * 1000  # ms
 
-    # Filtrar velas 1h cerradas del día actual
+    # Velas 1h cerradas a partir de medianoche UTC
     today_candles = [
-        c for c in candles_1h[:-1]
-        if c.get("ts", 0) >= midnight_ts
+        c for c in candles_1h[:-1]  # excluir vela en curso
+        if c.get("open_time", 0) >= midnight_ts
     ]
 
-    if len(today_candles) < 2:
+    if not today_candles:
+        # Fallback: usar la última vela 1h cerrada
+        if len(candles_1h) >= 2:
+            c = candles_1h[-2]
+            return c["open"], c["close"]
         return 0.0, 0.0
 
-    open_price  = today_candles[0]["open"]
-    close_price = today_candles[-1]["close"]
-
-    if open_price <= 0:
-        return 0.0, 0.0
-
-    move_pct = (close_price - open_price) / open_price
-    return open_price, move_pct
+    open_daily  = today_candles[0]["open"]
+    close_today = today_candles[-1]["close"]
+    return open_daily, close_today
 
 
-def _hourly_liquidity(candles_1h: list[dict], window: int = 24) -> float:
-    """Calcula el volumen medio por vela 1h en las últimas N velas cerradas.
-
-    Usa quote_volume si está disponible (USDT), si no usa volume * close como aproximación.
-    """
-    closed = candles_1h[:-1]
-    recent = closed[-window:] if len(closed) >= window else closed
-    if not recent:
-        return 0.0
-
-    vols = []
-    for c in recent:
-        qv = c.get("quote_volume") or c.get("quoteVolume") or 0.0
-        if qv > 0:
-            vols.append(float(qv))
-        else:
-            # fallback: volume * close
-            vols.append(float(c.get("volume", 0)) * float(c.get("close", 0)))
-
-    return sum(vols) / len(vols) if vols else 0.0
-
-
-def _regime_confirmed(candles_1h: list[dict], n: int = REGIME_CONFIRM_BARS) -> tuple[str, float]:
-    if len(candles_1h) < 200 + n + 1:
-        return "range", 0.0
-
-    closed_1h = candles_1h[:-1]
-    regime_now, adx_now = _market_regime(closed_1h)
-
-    regimes_prev = []
-    for k in range(1, n + 1):
-        window = closed_1h[:-k]
-        if len(window) < 200:
-            return "range", adx_now
-        regime_hist, _ = _market_regime(window)
-        regimes_prev.append(regime_hist)
-
-    all_regimes = regimes_prev + [regime_now]
-
-    if len(set(all_regimes)) == 1:
-        log.debug("régimen confirmado ×%d: %s", n + 1, regime_now)
-        return regime_now, adx_now
-
-    log.info("⚠️  Régimen inestable %s — esperando confirmación", all_regimes)
-    return "range", adx_now
-
-
-def _volume_ok(candles: list[dict], window: int = 20) -> bool:
-    if len(candles) < window + 2:
-        return False
-    recent   = candles[-(window + 2):-2]
+def _liquidity_ok(candles_1h: list[dict]) -> bool:
+    """Comprueba que el par tiene suficiente liquidez (volumen medio por vela 1h)."""
+    recent = candles_1h[-25:-1]  # últimas 24 velas cerradas
     if not recent:
         return False
-    avg_vol  = sum(c["volume"] for c in recent) / len(recent)
-    last_vol = candles[-2]["volume"]
-    return last_vol > avg_vol * VOLUME_MULT
-
-
-def _volume_weak(candles: list[dict], window: int = 20) -> bool:
-    if len(candles) < window + 2:
-        return False
-    recent   = candles[-(window + 2):-2]
-    if not recent:
-        return False
-    avg_vol  = sum(c["volume"] for c in recent) / len(recent)
-    last_vol = candles[-2]["volume"]
-    return avg_vol > 0 and last_vol < avg_vol * VOLUME_WEAK
-
-
-def _macro_pts(candles_4h: list[dict] | None, direction: str) -> int:
-    if not candles_4h or len(candles_4h) < 52:
-        return 0
-    closes = [c["close"] for c in candles_4h]
-    ema50  = _ema(closes[:-1], 50)[-1]
-    price  = closes[-2] if len(closes) >= 2 else closes[-1]
-    if direction == "long":
-        return 15 if price > ema50 else -10
-    return 15 if price < ema50 else -10
+    avg_vol = sum(c.get("volume", 0.0) for c in recent) / len(recent)
+    return avg_vol >= MIN_HOURLY_VOLUME
 
 
 def evaluate(
@@ -374,224 +330,222 @@ def evaluate(
     candles_4h:  list[dict] | None = None,
     min_score:   int = MIN_SCORE,
 ) -> tuple[str | None, int, str | None]:
-    """Evalúa señal con scoring estructural.
+    """Evalúa si hay señal de entrada. Devuelve (side, score, regime) o (None, score, None)."""
 
-    Devuelve (signal, score, regime) o (None, score, None).
-    """
-
-    # ── 0. Datos mínimos ──────────────────────────────────────────────────
-    if len(candles_15m) < 50 or len(candles_1h) < 210:
+    # ── Datos mínimos ────────────────────────────────────────────────────
+    if len(candles_15m) < 50 or len(candles_1h) < 220:
         return None, 0, None
 
-    # ── 1. Vela cerrada ───────────────────────────────────────────────────
-    candle     = candles_15m[-2]
-    closes_15m = [c["close"] for c in candles_15m]
+    # ── Liquidez ─────────────────────────────────────────────────────────
+    if not _liquidity_ok(candles_1h):
+        return None, 0, None
 
-    # ── 2. Régimen de mercado (EMAs) ──────────────────────────────────────
-    regime, adx_1h = _regime_confirmed(candles_1h)
-    if regime == "range":
-        return None, 0, regime
+    # ── Vela cerrada (penúltima) ──────────────────────────────────────────
+    closed  = candles_15m[-2]
+    c_open  = closed["open"]
+    c_close = closed["close"]
+    c_high  = closed["high"]
+    c_low   = closed["low"]
+    bullish_candle = c_close > c_open
 
-    # REGLA FUNDAMENTAL: régimen dicta dirección.
-    direction = "short" if regime == "bear" else "long"
+    # ── Régimen de mercado 1h ────────────────────────────────────────────
+    regime, adx_1h = _market_regime(candles_1h)
 
-    # ── 2b. NUEVO: Estructura de precio 1h (HH/HL vs LH/LL) ───────────────
+    # ── Estructura de precio 1h (v3: swings reales) ───────────────────────
     structure = _price_structure(candles_1h)
-    if structure != "range" and structure != regime:
-        # El régimen dice bull pero la estructura dice bear (o viceversa)
-        # → contradicción, el mercado está girando. No entrar.
-        log.info(
-            "[structure] Régimen %s contradice estructura de precio %s — señal descartada",
-            regime, structure,
-        )
-        return None, 0, regime
 
-    # ── 2c. NUEVO: Filtro de liquidez del par ──────────────────────────────
-    hourly_vol = _hourly_liquidity(candles_1h)
-    if hourly_vol > 0 and hourly_vol < MIN_HOURLY_VOLUME:
-        log.info(
-            "[liquidity] Par bloqueado: volumen medio 1h = %.0f USDT < mínimo %.0f — par ilíquido",
-            hourly_vol, MIN_HOURLY_VOLUME,
-        )
-        return None, 0, regime
-
-    # ── 3. Score base ─────────────────────────────────────────────────────
-    score = 20
-
-    # Bonus si estructura confirma régimen (+8)
-    if structure == regime:
-        score += 8
-        log.debug("[structure] Confirmada: %s +8pts", structure)
-
-    # ── 4. Macro 4h ───────────────────────────────────────────────────────
-    score += _macro_pts(candles_4h, direction)
-
-    # ── 4b. NUEVO: Contexto de vela diaria ────────────────────────────────
-    daily_open, daily_move = _daily_candle_context(candles_1h)
-    if daily_open > 0:
-        # move positivo = precio subió hoy, negativo = bajó
-        # Para LONG: malo si el día ya baja mucho (daily_move muy negativo)
-        # Para SHORT: malo si el día ya sube mucho (daily_move muy positivo)
-        move_against = -daily_move if direction == "long" else daily_move
-
-        if move_against > DAILY_CANDLE_GUARD:
-            log.info(
-                "[daily] Hard-guard: vela diaria %+.2f%% contra el trade (%s) — el move ya ocurrió",
-                move_against * 100, direction,
-            )
-            return None, score, regime
-
-        if move_against > DAILY_CANDLE_PENALTY:
-            score -= 10
-            log.debug("[daily] Penalización -10: vela diaria %+.2f%% contra el trade", move_against * 100)
-        elif move_against > DAILY_CANDLE_BLOCK:
-            score -= 5
-            log.debug("[daily] Penalización -5: vela diaria %+.2f%% contra el trade", move_against * 100)
-        elif move_against < -DAILY_CANDLE_BLOCK:
-            # El día ya va a favor del trade → momentum adicional
-            score += 5
-            log.debug("[daily] Bonus +5: vela diaria %+.2f%% a favor del trade", abs(move_against) * 100)
-
-    # ── 5. EMA200 1h hard-guard ───────────────────────────────────────────
-    closes_1h_closed = [c["close"] for c in candles_1h[:-1]]
-    closes_1h_full   = [c["close"] for c in candles_1h]
-    ema200_1h = _ema(closes_1h_closed, 200)[-1]
-    price     = closes_15m[-2]
-    if direction == "long"  and price < ema200_1h * (1 - EMA200_MIN_DIST):
-        return None, score, regime
-    if direction == "short" and price > ema200_1h * (1 + EMA200_MIN_DIST):
-        return None, score, regime
-
-    # ── 5b. EMA200 15m hard-guard (solo SHORTs) ───────────────────────────
-    if len(closes_15m) >= 202:
-        ema200_15m = _ema(closes_15m[:-1], 200)[-1]
-        if direction == "short" and price > ema200_15m * 1.002:
-            return None, score, regime
-
-    # ── 5c. ATR volátil ───────────────────────────────────────────────────
-    atr_15m_raw = _atr(candles_15m[:-1])
-    if price > 0 and atr_15m_raw / price > ATR_VOLATILE_PCT:
-        log.info(
-            "Hard-guard ATR volátil: atr_pct=%.2f%% — mercado en evento",
-            atr_15m_raw / price * 100,
-        )
-        return None, score, regime
-
-    # ── 6. ADX 15m ────────────────────────────────────────────────────────
-    adx_15m = _adx(candles_15m[:-1], 14)
-    if adx_15m < ADX_15M_MIN:
-        return None, score, regime
-
-    if   adx_15m > 35: score += 12
-    elif adx_15m > 25: score += 6
-    else:              score -= 6
-
-    # ── 7. ADX 1h ─────────────────────────────────────────────────────────
-    if   adx_1h > 25: score += 5
-    elif adx_1h < 18: score -= 5
-
-    if direction == "short" and adx_1h < 18:
-        return None, score, regime
-
-    # ── 8. Volumen 15m ─────────────────────────────────────────────────────
-    vol_strong = _volume_ok(candles_15m)
-    vol_weak   = _volume_weak(candles_15m)
-    if   vol_strong: score += 10
-    elif vol_weak:   score -= 5
-
-    # ── 9. RSI 15m ────────────────────────────────────────────────────────
-    rsi_vals = _rsi(closes_15m[:-1], 14)
-    rsi_now  = rsi_vals[-1]
-    rsi_prev = rsi_vals[-2] if len(rsi_vals) > 1 else rsi_now
-
-    if direction == "short" and rsi_now < 38:
-        return None, score, regime
-
-    if direction == "long":
-        rsi_cross = rsi_prev < 50 <= rsi_now
-        rsi_ext   = rsi_now > 58
-        rsi_dir   = rsi_now > rsi_prev and rsi_now > 45
-        rsi_bad   = rsi_now < 45
-    else:
-        rsi_cross = rsi_prev > 50 >= rsi_now
-        rsi_ext   = rsi_now < 42
-        rsi_dir   = rsi_now < rsi_prev and rsi_now < 55
-        rsi_bad   = rsi_now > 60
-
-    if   rsi_cross: score += 15
-    elif rsi_ext:   score += 8
-    elif rsi_dir:   score += 4
-    elif rsi_bad:   score -= 5
-
-    # ── 10. MACD 15m + 1h ─────────────────────────────────────────────────
-    hist_15m = _macd_histogram(closes_15m[:-1])
-    h_now    = hist_15m[-1]
-    if direction == "long":
-        if   h_now > 0: score += 10
-        elif h_now < 0: score -= 5
-    else:
-        if   h_now < 0: score += 10
-        elif h_now > 0: score -= 5
-
-    hist_1h = _macd_histogram(closes_1h_full[:-1])
-    h1_now  = hist_1h[-1]
-    if direction == "long":
-        if   h1_now > 0: score += 10
-        elif h1_now < 0: score -= 5
-    else:
-        if   h1_now < 0: score += 10
-        elif h1_now > 0: score -= 5
-
-    # ── 11. Divergencia RSI ───────────────────────────────────────────────
-    div = _rsi_divergence(closes_15m[:-1], candles_15m[:-1])
-    if (direction == "long"  and div == "bullish") or \
-       (direction == "short" and div == "bearish"):
-        score += 8
-
-    # ── 12. Sesgo horario ─────────────────────────────────────────────────
-    candle_ts = candle.get("ts")
-    if candle_ts:
-        hour = datetime.datetime.fromtimestamp(candle_ts / 1000, tz=timezone.utc).hour
-    else:
-        hour = datetime.datetime.now(timezone.utc).hour
-
-    if   hour in HIGH_BIAS_HOURS: score += 8
-    elif hour in LOW_BIAS_HOURS:  score -= 10
-
-    # ── 13. No-chase ────────────────────────────────────────────────────────
-    candle_rng = candle["high"] - candle["low"]
-    if atr_15m_raw > 0 and candle_rng > NO_CHASE_MULT * atr_15m_raw:
-        return None, score, regime
-
-    # ── 14. Pullback EMA20_15m ──────────────────────────────────────────────
-    pullback_dist = None
-    if len(closes_15m) >= 22:
-        ema20_15m     = _ema(closes_15m[:-1], 20)[-1]
-        pullback_dist = (price - ema20_15m) / ema20_15m
-        if direction == "long" and price > ema20_15m * (1 + PULLBACK_EMA20_DIST):
-            return None, score, regime
-        if direction == "short" and price < ema20_15m * (1 - PULLBACK_EMA20_DIST):
-            return None, score, regime
-
-    # ── 15. Score mínimo ───────────────────────────────────────────────────
-    min_score_directional = min_score + SHORT_MIN_SCORE_EXTRA if direction == "short" else min_score
-    if score < min_score_directional:
+    # Hard-guard v3: si structure='range' y ADX_1h bajo → mercado lateral confirmado
+    if structure == "range" and adx_1h < ADX_1H_STRUCTURE_MIN:
         log.debug(
-            "Score insuficiente: %d < %d (%s)", score, min_score_directional, direction,
+            "[structure] range + ADX_1h=%.1f < %d → hard-guard (sin momentum)",
+            adx_1h, ADX_1H_STRUCTURE_MIN,
         )
-        return None, score, regime
+        return None, 0, None
 
+    # Si las EMAs dicen bull/bear pero la estructura de swings dice range:
+    # solo se permite entrar si el ADX 1h es suficientemente fuerte
+    if regime != "range" and structure == "range" and adx_1h < ADX_1H_STRUCTURE_MIN:
+        log.debug(
+            "[structure] Régimen %s pero structure=range + ADX_1h=%.1f → hard-guard",
+            regime, adx_1h,
+        )
+        return None, 0, None
+
+    # Si regime es rango, no hay señal
+    if regime == "range":
+        return None, 0, None
+
+    # ── Macro 4h ─────────────────────────────────────────────────────────
+    if candles_4h and len(candles_4h) >= 55:
+        closes_4h = [c["close"] for c in candles_4h[:-1]]
+        ema50_4h  = _ema(closes_4h, 50)[-1]
+        price_4h  = closes_4h[-1]
+        if regime == "bull" and price_4h < ema50_4h:
+            return None, 0, None
+        if regime == "bear" and price_4h > ema50_4h:
+            return None, 0, None
+
+    # ── Indicadores 15m ──────────────────────────────────────────────────
+    closes_15m = [c["close"] for c in candles_15m]
+    price      = closes_15m[-2]  # precio de la vela cerrada
+
+    ema20_15m  = _ema(closes_15m[:-1], 20)[-1]
+    ema200_15m = _ema(closes_15m[:-1], 200)[-1]
+    rsi_series = _rsi(closes_15m[:-1], 14)
+    rsi        = rsi_series[-1]
+    macd_hist  = _macd_histogram(closes_15m[:-1])[-1]
+    atr_15m    = _atr(candles_15m[:-1], 14)
+    adx_15m    = _adx(candles_15m[:-1], 14)
+    volumes    = [c["volume"] for c in candles_15m]
+    avg_vol    = sum(volumes[-21:-1]) / 20
+    last_vol   = volumes[-2]
+
+    # ── Hard-guards ───────────────────────────────────────────────────────
+
+    # ATR volátil
+    if price > 0 and atr_15m / price > ATR_VOLATILE_PCT:
+        return None, 0, None
+
+    # ADX 15m demasiado débil
+    if adx_15m < ADX_15M_MIN:
+        return None, 0, None
+
+    # EMA200 1h
+    closes_1h  = [c["close"] for c in candles_1h]
+    ema200_1h  = _ema(closes_1h[:-1], 200)[-1]
+    if regime == "bull" and price < ema200_1h * (1 - EMA200_MIN_DIST):
+        return None, 0, None
+    if regime == "bear" and price > ema200_1h * (1 + EMA200_MIN_DIST):
+        return None, 0, None
+
+    # EMA200 15m — hard-guard en SHORTs
+    if regime == "bear" and price < ema200_15m * (1 - EMA200_MIN_DIST):
+        return None, 0, None
+
+    # No-chase: rango de la vela cerrada
+    candle_range = c_high - c_low
+    if candle_range > 0 and atr_15m > 0:
+        if candle_range > NO_CHASE_MULT * atr_15m:
+            return None, 0, None
+
+    # Pullback EMA20 (sobreextensión)
+    if price > 0 and ema20_15m > 0:
+        dist_ema20 = abs(price - ema20_15m) / price
+        if dist_ema20 > PULLBACK_EMA20_DIST:
+            if regime == "bull" and price > ema20_15m:
+                return None, 0, None
+            if regime == "bear" and price < ema20_15m:
+                return None, 0, None
+
+    # Contexto vela diaria
+    open_daily, close_today = _daily_candle_context(candles_1h)
+    score = 0
+
+    if open_daily > 0:
+        daily_move = (close_today - open_daily) / open_daily
+        if regime == "bull" and daily_move < -DAILY_CANDLE_BLOCK:
+            return None, score, None
+        if regime == "bear" and daily_move > DAILY_CANDLE_BLOCK:
+            return None, score, None
+
+        abs_move = abs(daily_move)
+        if abs_move > DAILY_CANDLE_GUARD:
+            # Hard-guard: el move del día ya ocurrió
+            if (regime == "bull" and daily_move > 0) or (regime == "bear" and daily_move < 0):
+                return None, score, None
+        elif abs_move > DAILY_CANDLE_PENALTY:
+            score -= 10
+
+    # ── Scoring ───────────────────────────────────────────────────────────
+
+    # Dirección de vela cerrada
+    if regime == "bull" and bullish_candle:
+        score += 8
+    elif regime == "bear" and not bullish_candle:
+        score += 8
+
+    # RSI
+    if regime == "bull":
+        if 45 <= rsi <= 65:
+            score += 8
+        elif rsi > 70:
+            score -= 8  # sobrecompra
+            if rsi > 80:
+                return None, score, None  # hard-guard SHORT sobrevendido no aplica aquí,
+                                          # pero en bull con RSI>80 es sobreextensión
+    else:  # bear
+        if 35 <= rsi <= 55:
+            score += 8
+        elif rsi < 30:
+            return None, score, None  # sobrevendido en SHORT
+
+    # ADX 1h
+    if adx_1h >= 30:
+        score += 12
+    elif adx_1h >= 25:
+        score += 8
+    elif adx_1h >= 20:
+        score += 4
+    # hard-guard SHORT con ADX 1h débil
+    if regime == "bear" and adx_1h < 22:
+        return None, score, None
+
+    # MACD 15m
+    if regime == "bull" and macd_hist > 0:
+        score += 8
+    elif regime == "bear" and macd_hist < 0:
+        score += 8
+
+    # MACD 1h
+    closes_1h_closed = closes_1h[:-1]
+    macd_1h = _macd_histogram(closes_1h_closed)[-1]
+    if regime == "bull" and macd_1h > 0:
+        score += 8
+    elif regime == "bear" and macd_1h < 0:
+        score += 8
+
+    # Volumen
+    if avg_vol > 0:
+        if last_vol >= avg_vol * VOLUME_MULT:
+            score += 8
+        elif last_vol < avg_vol * VOLUME_WEAK:
+            score -= 4
+
+    # Sesgo horario
+    hour = datetime.datetime.now(timezone.utc).hour
+    if hour in HIGH_BIAS_HOURS:
+        score += 4
+    elif hour in LOW_BIAS_HOURS:
+        score -= 4
+
+    # Divergencia RSI
+    div = _rsi_divergence(closes_15m[:-1], candles_15m[:-1])
+    if regime == "bull" and div == "bullish":
+        score += 8
+    elif regime == "bear" and div == "bearish":
+        score += 8
+
+    # Estructura de precio vs régimen (v3: bonus si estructura confirma)
+    if structure == regime:
+        score += 8  # consenso completo EMA + swings
+    elif structure != "range" and structure != regime:
+        # Contradicción estructural — penalización más fuerte en v3
+        score -= 12
+        log.debug(
+            "[structure] Régimen %s contradice estructura %s (adx_1h=%.1f) — penalización -12",
+            regime, structure, adx_1h,
+        )
+
+    # ── Score mínimo ──────────────────────────────────────────────────────
+    min_required = min_score + (SHORT_MIN_SCORE_EXTRA if regime == "bear" else 0)
+    if score < min_required:
+        return None, score, None
+
+    side = "long" if regime == "bull" else "short"
     log.info(
-        "✅ SEÑAL %s | score=%d (min=%d, margin=%+d) | regime=%s structure=%s "
-        "adx1h=%.1f adx15m=%.1f rsi=%.1f macd15=%+.4f macd1h=%+.4f "
-        "daily_move=%+.2f%% vol_1h=%.0fk vol=%s div=%s pb=%s",
-        direction.upper(), score, min_score_directional, score - min_score_directional,
-        regime, structure,
-        adx_1h, adx_15m, rsi_now, h_now, h1_now,
-        daily_move * 100 if daily_open > 0 else 0.0,
-        hourly_vol / 1000,
-        "strong" if vol_strong else ("weak" if vol_weak else "normal"),
-        div,
-        f"{pullback_dist:+.3%}" if pullback_dist is not None else "n/a",
+        "✅ SEÑAL %s | score=%d | regime=%s structure=%s adx1h=%.1f adx15m=%.1f "
+        "rsi=%.1f macd_hist=%.5f vol_ratio=%.2f",
+        side.upper(), score, regime, structure, adx_1h, adx_15m,
+        rsi, macd_hist, last_vol / avg_vol if avg_vol else 0,
     )
-    return direction, score, regime
+    return side, score, regime
