@@ -50,6 +50,13 @@ Filtros heredados:
 
 REGLA FUNDAMENTAL:
   Bear/proto_bear → SOLO SHORT. Bull/proto_bull → SOLO LONG. Sin contra-tendencia.
+
+Fixes aplicados:
+  - Bug 1: Eliminado hard-guard duplicado (segundo if nunca alcanzable)
+  - Bug 2: _find_swing_highs/_find_swing_lows usan > / < estrictos para evitar
+           contar plateaus (velas con mismo high/low) como swings válidos
+  - Bug 3: DAILY_CANDLE_GUARD no bloquea días muy fuertes en dirección del régimen;
+           en su lugar aplica penalización -10 (igual que DAILY_CANDLE_PENALTY)
 """
 from __future__ import annotations
 import logging
@@ -267,19 +274,25 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
 
 def _find_swing_highs(highs: list[float], wing: int = 2) -> list[int]:
+    """Swing highs estrictos: el pivot debe ser MAYOR (no igual) que sus vecinos.
+    Evita contar plateaus como pivots válidos (fix Bug 2).
+    """
     pivots = []
     for i in range(wing, len(highs) - wing):
-        if all(highs[i] >= highs[i - j] for j in range(1, wing + 1)) and \
-           all(highs[i] >= highs[i + j] for j in range(1, wing + 1)):
+        if all(highs[i] > highs[i - j] for j in range(1, wing + 1)) and \
+           all(highs[i] > highs[i + j] for j in range(1, wing + 1)):
             pivots.append(i)
     return pivots
 
 
 def _find_swing_lows(lows: list[float], wing: int = 2) -> list[int]:
+    """Swing lows estrictos: el pivot debe ser MENOR (no igual) que sus vecinos.
+    Evita contar plateaus como pivots válidos (fix Bug 2).
+    """
     pivots = []
     for i in range(wing, len(lows) - wing):
-        if all(lows[i] <= lows[i - j] for j in range(1, wing + 1)) and \
-           all(lows[i] <= lows[i + j] for j in range(1, wing + 1)):
+        if all(lows[i] < lows[i - j] for j in range(1, wing + 1)) and \
+           all(lows[i] < lows[i + j] for j in range(1, wing + 1)):
             pivots.append(i)
     return pivots
 
@@ -422,18 +435,12 @@ def evaluate(
     # ── Estructura de precio 1h ────────────────────────────────────────
     structure = _price_structure(candles_1h)
 
-    # Hard-guard v3: structure='range' + ADX bajo
+    # Hard-guard: structure=range + ADX bajo → mercado sin dirección clara
+    # (fix Bug 1: eliminado el guard duplicado que nunca era alcanzable)
     if structure == "range" and adx_1h < ADX_1H_STRUCTURE_MIN:
         log.debug(
             "[structure] range + ADX_1h=%.1f < %d → hard-guard",
             adx_1h, ADX_1H_STRUCTURE_MIN,
-        )
-        return None, 0, None
-
-    if effective_regime != "range" and structure == "range" and adx_1h < ADX_1H_STRUCTURE_MIN:
-        log.debug(
-            "[structure] Régimen %s pero structure=range + ADX_1h=%.1f → hard-guard",
-            regime, adx_1h,
         )
         return None, 0, None
 
@@ -509,11 +516,14 @@ def evaluate(
             return None, score, None
 
         abs_move = abs(daily_move)
-        if abs_move > DAILY_CANDLE_GUARD:
-            if (effective_regime == "bull" and daily_move > 0) or (effective_regime == "bear" and daily_move < 0):
-                return None, score, None
-        elif abs_move > DAILY_CANDLE_PENALTY:
+        # fix Bug 3: ya no bloqueamos días muy fuertes en la dirección del régimen;
+        # aplicamos penalización -10 en todos los casos de sobreextensión diaria.
+        if abs_move > DAILY_CANDLE_PENALTY:
             score -= 10
+            log.debug(
+                "[daily] abs_move=%.2f%% > %.1f%% → penalización -10",
+                abs_move * 100, DAILY_CANDLE_PENALTY * 100,
+            )
 
     # ── Scoring ───────────────────────────────────────────────────────
 
