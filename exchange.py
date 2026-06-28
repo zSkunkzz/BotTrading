@@ -30,6 +30,16 @@ FIXES aplicados:
      - Endpoint v3: /openApi/swap/v3/user/balance
      - data es un ARRAY de objetos, no un dict — se filtra por asset=USDT
      - Campos: equity (balance + unrealizedPnL), balance, availableMargin
+ 11. FIX A — place_stop_order / place_tp_order:
+     quantity + closePosition="true" juntos → BingX rechaza con error 101400.
+     Doc oficial: "closePosition cannot be used with quantity".
+     Eliminado el campo quantity cuando closePosition=true está presente.
+ 12. FIX B — get_closed_orders: parseo de respuesta corregido.
+     Doc oficial: data es directamente un array de órdenes, sin wrapping.
+     Eliminado el bloque isinstance(raw, dict) con .orders/.list inexistentes.
+ 13. FIX C — get_closed_orders: añadidos startTime/endTime obligatorios.
+     Doc oficial: sin rango temporal BingX puede devolver error 109400.
+     Se incluye startTime=ahora-7d, endTime=ahora en cada llamada.
 """
 import hashlib
 import hmac
@@ -356,7 +366,13 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
 
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
-    """Coloca (o reemplaza) la stop-loss order. Usada también por el trailing."""
+    """Coloca (o reemplaza) la stop-loss order. Usada también por el trailing.
+
+    FIX A — doc oficial BingX: closePosition y quantity son mutuamente excluyentes.
+    "closePosition=true: all position squaring after triggering — cannot be used
+    with quantity." (error 101400 si se envían juntos).
+    Se usa closePosition=true sin quantity para cerrar la posición completa.
+    """
     sl_side  = "SELL" if side == "long" else "BUY"
     pos_side = "LONG" if side == "long" else "SHORT"
     _post("/openApi/swap/v2/trade/order", {
@@ -365,14 +381,19 @@ def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> N
         "positionSide":  pos_side,
         "type":          "STOP_MARKET",
         "stopPrice":     stop_price,
-        "quantity":      qty,
         "closePosition": "true",
     })
     log.info("SL colocado en %.6f (%s %s)", stop_price, side.upper(), symbol)
 
 
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
-    """Coloca la take-profit order."""
+    """Coloca la take-profit order.
+
+    FIX A — doc oficial BingX: closePosition y quantity son mutuamente excluyentes.
+    "closePosition=true: all position squaring after triggering — cannot be used
+    with quantity." (error 101400 si se envían juntos).
+    Se usa closePosition=true sin quantity para cerrar la posición completa.
+    """
     sl_side  = "SELL" if side == "long" else "BUY"
     pos_side = "LONG" if side == "long" else "SHORT"
     _post("/openApi/swap/v2/trade/order", {
@@ -381,7 +402,6 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
         "positionSide":  pos_side,
         "type":          "TAKE_PROFIT_MARKET",
         "stopPrice":     tp_price,
-        "quantity":      qty,
         "closePosition": "true",
     })
     log.info("TP colocado en %.6f (%s %s)", tp_price, side.upper(), symbol)
@@ -417,25 +437,40 @@ def cancel_all_orders(symbol: str = None) -> None:
 
 # ── Historial de órdenes cerradas ─────────────────────────────────────────────────────────────
 
-def get_closed_orders(symbol: str = None, limit: int = 10) -> list[dict]:
-    """FIX #2: Devuelve órdenes ejecutadas/cerradas del símbolo para obtener el
-    precio real de salida. Antes esta función no existía, causando AttributeError
-    silenciado en _get_real_exit_price() y precios de cierre siempre estimados.
+def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
+    """Devuelve órdenes ejecutadas/cerradas del símbolo para obtener el precio real
+    de salida en _get_real_exit_price().
 
-    BingX endpoint: GET /openApi/swap/v2/trade/allOrders
-    Se filtran solo las órdenes en estado terminal (FILLED / CANCELED / etc.).
-    Si el endpoint falla o devuelve vacío, _get_real_exit_price() usa el fallback.
+    FIX B — parseo corregido según doc oficial BingX:
+      GET /openApi/swap/v2/trade/allOrders → data es directamente un array de
+      órdenes. No existe ningún campo .orders ni .list en la respuesta de este
+      endpoint. El bloque isinstance(raw, dict) anterior era incorrecto y se ha
+      eliminado.
+
+    FIX C — startTime/endTime obligatorios según doc oficial:
+      Sin rango temporal BingX puede devolver error 109400. Se incluyen
+      startTime=ahora-7d y endTime=ahora en cada llamada. El rango máximo
+      permitido es 7 días; nunca se supera.
+
+    limit es obligatorio (doc oficial); valor por defecto elevado a 20 para
+    mayor cobertura en _get_real_exit_price() y _get_position_open_ts().
     """
     symbol = symbol or config.SYMBOL
+    now_ms   = int(time.time() * 1000)
+    start_ms = now_ms - 7 * 24 * 60 * 60 * 1000  # 7 días atrás
     try:
-        data = _get("/openApi/swap/v2/trade/allOrders", {"symbol": symbol, "limit": limit})
+        data = _get("/openApi/swap/v2/trade/allOrders", {
+            "symbol":    symbol,
+            "limit":     limit,
+            "startTime": start_ms,
+            "endTime":   now_ms,
+        })
     except Exception as exc:
         log.debug("[%s] get_closed_orders falló: %s", symbol, exc)
         return []
 
+    # data es directamente un array — doc oficial BingX allOrders v2
     raw = data.get("data") or []
-    if isinstance(raw, dict):
-        raw = raw.get("orders") or raw.get("list") or []
 
     terminal = {"FILLED", "CANCELED", "PARTIALLY_FILLED", "PARTIALLY_CANCELED"}
     return [o for o in raw if str(o.get("status", "")).upper() in terminal]
