@@ -15,9 +15,8 @@ Cambios v2:
   SL sobre ATR 1h (no 15m). Ver docstring v2 para detalles.
 
 Sizing:
-  base_margin = MARGIN_USDT
-  score 78-84  →  1.0× base_margin
-  score ≥ 85   →  1.4× base_margin
+  Fijo: MARGIN_USDT (20 USDT) para todas las señales.
+  Sin multiplicador dinámico por score.
 
 SL / TP:
   sl_pct = clamp(ATR_1h / entry × 1.2, SL_MIN_PCT, SL_MAX_PCT)
@@ -62,12 +61,6 @@ def _atr(candles: list[dict], period: int = 14) -> float:
         h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / min(period, len(trs)) if trs else 0.0
-
-
-def _size_multiplier(score: int) -> float:
-    if score >= 85:
-        return 1.4
-    return 1.0
 
 
 def calc(side: str, entry: float, candles: list[dict], score: int = 78,
@@ -118,9 +111,9 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
         be_trigger = None
         be_sl      = None
 
-    mult_size = _size_multiplier(score)
-    margin    = config.MARGIN_USDT * mult_size
-    raw_qty   = (margin * config.LEVERAGE) / entry
+    # Sizing fijo: MARGIN_USDT para todas las señales
+    margin  = config.MARGIN_USDT
+    raw_qty = (margin * config.LEVERAGE) / entry
 
     step = 0.001
     if symbol:
@@ -138,10 +131,10 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
     trail_step = round(max(raw_trail, step), 8)
 
     log.info(
-        "[%s] score=%d regime=%s RR=%.1f mult=%.1f margin=%.2f "
+        "[%s] score=%d regime=%s RR=%.1f margin=%.2f "
         "ATR_%s=%.6f atr_pct=%.3f%% sl_pct=%.3f%% tp_pct=%.3f%% "
         "SL=%.6f TP=%.6f be_trigger=%s be_sl=%s qty=%.8f trail=%.8f",
-        side.upper(), score, regime, rr, mult_size, margin,
+        side.upper(), score, regime, rr, margin,
         source, atr, atr_pct * 100, sl_pct * 100, tp_pct * 100,
         sl, tp,
         f"{be_trigger:.6f}" if be_trigger else "N/A",

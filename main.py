@@ -5,6 +5,12 @@ v4: Cooldown diferenciado por calidad de señal.
     → cooldown reducido a COOLDOWN_SL_FAST (probablemente ruido puntual, no tendencia)
   - Resto de SLs → COOLDOWN_SL normal (60min)
   - TPs → COOLDOWN_TP (30min, sin cambios)
+
+fix trailing SL:
+  trail_high/trail_low se actualizan SIEMPRE que el precio supera el pico,
+  independientemente de si new_sl mejora el SL actual.
+  Antes el trailing quedaba congelado después de un break-even lock si el precio
+  seguía subiendo pero new_sl <= pos['sl'] (ya movido por el lock).
 """
 import logging
 import sys
@@ -169,11 +175,13 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     if side == "long":
         peak = pos.get("trail_high", pos["entry"])
         if current_price > peak + trail_step:
+            # Siempre actualizar el pico aunque SL no mejore
+            # (e.g. tras break-even lock el SL ya está más arriba que new_sl calculado)
+            pos["trail_high"] = current_price
             new_sl = round(current_price - 1.5 * trail_step, 6)
             if new_sl > pos["sl"]:
                 log.info("[%s] Trailing SL: %.4f → %.4f", symbol, pos["sl"], new_sl)
-                pos["trail_high"] = current_price
-                pos["sl"]         = new_sl
+                pos["sl"] = new_sl
                 try:
                     exchange.cancel_all_orders(symbol)
                     exchange.place_stop_order(symbol, "long", pos["qty"], new_sl)
@@ -184,11 +192,12 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     else:
         trough = pos.get("trail_low", pos["entry"])
         if current_price < trough - trail_step:
+            # Siempre actualizar el mínimo aunque SL no mejore
+            pos["trail_low"] = current_price
             new_sl = round(current_price + 1.5 * trail_step, 6)
             if new_sl < pos["sl"]:
                 log.info("[%s] Trailing SL: %.4f → %.4f", symbol, pos["sl"], new_sl)
-                pos["trail_low"] = current_price
-                pos["sl"]        = new_sl
+                pos["sl"] = new_sl
                 try:
                     exchange.cancel_all_orders(symbol)
                     exchange.place_stop_order(symbol, "short", pos["qty"], new_sl)
