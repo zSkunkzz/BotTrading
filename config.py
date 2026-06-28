@@ -8,10 +8,12 @@ API_KEY    = os.environ["BINGX_API_KEY"]
 API_SECRET = os.environ["BINGX_API_SECRET"]
 BASE_URL   = "https://open-api.bingx.com"
 
-# Pares verificados en BingX perpetual futures (top market cap, junio 2026)
-# Eliminados: PENGU-USDT, NOT-USDT, LISTA-USDT, MANTA-USDT
-# → spreads/spikes impredecibles, el filtro de liquidez los rechazaba en runtime
-#   pero seguían consumiendo conexiones WebSocket y ciclos de loop.
+# Pares verificados en BingX perpetual futures (top 100 CMC, junio 2026)
+# Criterios: perp activo en BingX + spread limpio + liquidez >= media.
+# Excluidos explícitamente:
+#   PENGU-USDT, NOT-USDT, LISTA-USDT, MANTA-USDT
+#   -> spreads/spikes impredecibles, el filtro de liquidez los rechazaba
+#      en runtime pero consumían conexiones WS y ciclos de loop.
 SYMBOLS = [
     # --- Top 10 ---
     "BTC-USDT",  "ETH-USDT",  "BNB-USDT",  "XRP-USDT",  "SOL-USDT",
@@ -25,9 +27,17 @@ SYMBOLS = [
     # --- 31-40 ---
     "ONDO-USDT", "MNT-USDT",  "FET-USDT",  "OP-USDT",   "POL-USDT",
     "HYPE-USDT", "JUP-USDT",  "TIA-USDT",
-    # --- 41+ ---
+    # --- 41-45 ---
     "RENDER-USDT", "SEI-USDT",
     "ZK-USDT",   "EIGEN-USDT", "AERO-USDT",
+    # --- 46-50 (nuevos, top 100 CMC verificados BingX) ---
+    "AAVE-USDT",  # #47 CMC — DeFi blue chip, spread limpio
+    "GRT-USDT",   # #55 CMC — The Graph, DeFi infra
+    "LDO-USDT",   # #58 CMC — Lido DAO, liquid staking
+    "ENA-USDT",   # #63 CMC — Ethena, DeFi yield
+    "ALGO-USDT",  # #66 CMC — Algorand, L1
+    "DYDX-USDT",  # #68 CMC — dYdX, DeFi exchange
+    "RUNE-USDT",  # #72 CMC — THORChain, cross-chain
 ]
 
 # Pares en modo alerta manual (no se tradean automáticamente)
@@ -35,21 +45,20 @@ MANUAL_ALERT_SYMBOLS: set[str] = set()
 
 # Grupos de correlación.
 # Regla: pares del mismo grupo compiten por MAX_CORR_PER_GROUP slots.
-# IMPORTANTE: mezclar memes con legacy coins (BCH/LTC/ETC) era incorrecto
-# porque no están correlacionados entre sí. Ahora tienen grupos separados.
 CORR_GROUPS: list[set[str]] = [
-    {"BTC-USDT", "ETH-USDT", "BNB-USDT"},
+    {"BTC-USDT", "ETH-USDT", "BNB-USDT", "LDO-USDT"},
     {"SOL-USDT", "AVAX-USDT", "APT-USDT", "SUI-USDT", "NEAR-USDT", "TIA-USDT"},
-    {"ARB-USDT", "OP-USDT", "DOT-USDT", "ICP-USDT", "POL-USDT", "ZK-USDT"},
-    {"LINK-USDT", "UNI-USDT", "AERO-USDT", "JUP-USDT", "ONDO-USDT"},
-    {"XRP-USDT", "XLM-USDT", "TRX-USDT", "HBAR-USDT", "ADA-USDT"},
+    {"ARB-USDT", "OP-USDT", "DOT-USDT", "ICP-USDT", "POL-USDT", "ZK-USDT", "DYDX-USDT"},
+    {"LINK-USDT", "UNI-USDT", "AERO-USDT", "JUP-USDT", "ONDO-USDT", "AAVE-USDT", "GRT-USDT"},
+    {"XRP-USDT", "XLM-USDT", "TRX-USDT", "HBAR-USDT", "ADA-USDT", "ALGO-USDT"},
     {"FIL-USDT", "RENDER-USDT", "TAO-USDT", "EIGEN-USDT", "FET-USDT", "WLD-USDT"},
-    {"ATOM-USDT", "INJ-USDT", "SEI-USDT"},
-    # Memes puros — alta correlación entre sí en días de risk-on
+    {"ATOM-USDT", "INJ-USDT", "SEI-USDT", "RUNE-USDT"},
+    {"ONDO-USDT", "AAVE-USDT", "ENA-USDT"},
+    # Memes puros — alta correlación en días de risk-on
     {"DOGE-USDT", "SHIB-USDT"},
     # Legacy PoW/fork coins — correlacionadas entre sí, NO con memes
     {"BCH-USDT", "LTC-USDT", "ETC-USDT"},
-    # Misc sin correlación clara entre sí — grupo propio para limitar exposición
+    # Misc sin correlación clara — grupo propio para limitar exposición
     {"VET-USDT", "STX-USDT"},
     {"HYPE-USDT", "MNT-USDT"},
 ]
@@ -76,17 +85,11 @@ MARGIN_USDT    = float(os.getenv("MARGIN_USDT", "20"))
 # LEGACY — no usados por risk.py en condiciones normales.
 # risk.py calcula SL desde ATR 1h × 1.2 directamente.
 # SL_PCT solo actúa como fallback de emergencia cuando ATR=0 (caso excepcional).
-# No ajustar estos valores esperando cambiar el SL/TP real del bot.
 SL_PCT         = float(os.getenv("SL_PCT", "1.5"))   # fallback ATR=0 únicamente
 TP_PCT         = float(os.getenv("TP_PCT", "3.0"))   # no utilizado actualmente
 
 TIMEFRAME           = os.getenv("TIMEFRAME", "15m")
 LOOP_SLEEP          = int(os.getenv("LOOP_SLEEP", "20"))
-# MIN_SCORE subido de 70 → 72.
-# Con 70 los trades borderline (score exactamente 70) tenían winrate bajo.
-# 72 filtra esas señales débiles sin reducir significativamente la frecuencia
-# ya que la diferencia de 2 puntos equivale a no tener rsi_dir (+4) o
-# no tener volumen ok (+8) — señales que ya eran débiles de por sí.
 WEEKDAY_MIN_SCORE   = int(os.getenv("WEEKDAY_MIN_SCORE", os.getenv("MIN_SCORE", "72")))
 WEEKEND_MIN_SCORE   = int(os.getenv("WEEKEND_MIN_SCORE", "90"))
 MIN_SCORE           = WEEKDAY_MIN_SCORE
