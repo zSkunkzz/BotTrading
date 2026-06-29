@@ -248,6 +248,7 @@ def _check_tp_extension(
             signal, score, _ = signals.evaluate(
                 candles_15m, candles_1h, candles_4h,
                 min_score=effective_min_score,
+                symbol=symbol,
             )
         except Exception as e:
             log.warning("[%s] Error evaluando señal para extend_tp: %s", symbol, e)
@@ -811,6 +812,7 @@ def run() -> None:
                         signal, score, regime = signals.evaluate(
                             candles_15m, candles_1h, candles_4h,
                             min_score=effective_min_score,
+                            symbol=symbol,
                         )
 
                         if not signal or signal not in VALID_SIDES:
