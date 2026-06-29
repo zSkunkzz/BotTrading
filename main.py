@@ -13,6 +13,7 @@ fix trailing SL:
   seguía subiendo pero new_sl <= pos['sl'] (ya movido por el lock).
 """
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -27,12 +28,19 @@ import tg_commands
 import trade_logger
 from ws_feed import KlineFeed
 
+# ── Log level configurable ────────────────────────────────────────────────
+# Establecer LOG_LEVEL=DEBUG en las variables de entorno para activar logs detallados.
+# Por defecto se usa INFO en producción.
+_LOG_LEVEL_STR = os.environ.get("LOG_LEVEL", "INFO").upper()
+_LOG_LEVEL = getattr(logging, _LOG_LEVEL_STR, logging.INFO)
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=_LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     stream=sys.stdout,
 )
 log = logging.getLogger("main")
+log.info("Log level activo: %s", _LOG_LEVEL_STR)
 
 _cooldown: dict[str, float] = {}
 _cooldown_reason: dict[str, str] = {}   # 'tp' | 'sl' | 'sl_fast'
@@ -786,7 +794,7 @@ def run() -> None:
                         except Exception:
                             pass
                     if regime_summary:
-                        log.info("[regímenes] %s", "  \t".join(regime_summary))
+                        log.info("[regímenes] %s", "\t".join(regime_summary))
 
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
