@@ -96,15 +96,12 @@ ADX_1H_STRUCTURE_MIN  = 25
 SWING_CONFIRM_COUNT   = 2
 
 # ── Umbrales v4 (nuevos) ──────────────────────────────────────────────────
-# Proto-régimen: umbral ADX 1h más bajo que el régimen completo
-# permite detectar cambios de tendencia antes de que las EMAs confirmen.
-PROTO_ADX_MIN         = 22   # ADX mínimo para proto-bull/bear
-PROTO_SCORE_PENALTY   = 4    # penalización en scoring por usar proto-régimen
-PROTO_MIN_SCORE_EXTRA = 4    # score mínimo extra para proto-régimen
+PROTO_ADX_MIN         = 22
+PROTO_SCORE_PENALTY   = 4
+PROTO_MIN_SCORE_EXTRA = 4
 
-# Score dinámico por volatilidad ATR 1h (% del precio)
-ATR_HIGH_VOL_PCT      = 0.020  # > 2% ATR_1h/precio → mercado muy volátil → +8 min_score
-ATR_LOW_VOL_PCT       = 0.005  # < 0.5% ATR_1h/precio → mercado adormecido → +4 min_score
+ATR_HIGH_VOL_PCT      = 0.020
+ATR_LOW_VOL_PCT       = 0.005
 ATR_HIGH_VOL_BUMP     = 8
 ATR_LOW_VOL_BUMP      = 4
 
@@ -230,9 +227,6 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
     v4: Devuelve 'proto_bull' o 'proto_bear' cuando la estructura de swings
     confirma la dirección pero las EMAs aún no están completamente ordenadas.
-    Esto permite capturar entradas al inicio de tendencia.
-
-    Valores posibles: 'bull', 'bear', 'proto_bull', 'proto_bear', 'range'
     """
     closes        = [c["close"] for c in candles_1h]
     closes_closed = closes[:-1]
@@ -242,7 +236,6 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     adx    = _adx(candles_1h[:-1], 14)
     price  = closes[-2] if len(closes) >= 2 else closes[-1]
 
-    # Régimen completo (EMAs en orden perfecto)
     if price > ema20 > ema50 > ema200:
         return "bull", adx
     if price < ema20 < ema50 < ema200:
@@ -252,9 +245,6 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
     if price < ema200 and price < ema50 and ema20 < ema200:
         return "bear", adx
 
-    # v4: Proto-régimen — estructura de swings confirma dirección,
-    # pero EMAs aún no están completamente ordenadas.
-    # Solo se activa si ADX >= PROTO_ADX_MIN (hay momentum real).
     if adx >= PROTO_ADX_MIN:
         structure = _price_structure(candles_1h)
         if structure == "bull" and price > ema200:
@@ -274,9 +264,6 @@ def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
 
 
 def _find_swing_highs(highs: list[float], wing: int = 2) -> list[int]:
-    """Swing highs estrictos: el pivot debe ser MAYOR (no igual) que sus vecinos.
-    Evita contar plateaus como pivots válidos (fix Bug 2).
-    """
     pivots = []
     for i in range(wing, len(highs) - wing):
         if all(highs[i] > highs[i - j] for j in range(1, wing + 1)) and \
@@ -286,9 +273,6 @@ def _find_swing_highs(highs: list[float], wing: int = 2) -> list[int]:
 
 
 def _find_swing_lows(lows: list[float], wing: int = 2) -> list[int]:
-    """Swing lows estrictos: el pivot debe ser MENOR (no igual) que sus vecinos.
-    Evita contar plateaus como pivots válidos (fix Bug 2).
-    """
     pivots = []
     for i in range(wing, len(lows) - wing):
         if all(lows[i] < lows[i - j] for j in range(1, wing + 1)) and \
@@ -298,7 +282,6 @@ def _find_swing_lows(lows: list[float], wing: int = 2) -> list[int]:
 
 
 def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK) -> str:
-    """Detecta estructura de precio real usando swing highs/lows en las últimas N velas 1h cerradas."""
     closed = candles_1h[:-1]
     if len(closed) < lookback + 4:
         return "range"
@@ -372,11 +355,6 @@ def _liquidity_ok(candles_1h: list[dict]) -> bool:
 
 
 def _dynamic_min_score_bump(candles_1h: list[dict], price: float) -> int:
-    """Calcula el bump extra al score mínimo según volatilidad ATR 1h.
-
-    v4: En días muy volátiles (ATR_1h > 2%) el bot exige más convicción.
-    En días adormecidos (ATR_1h < 0.5%) también, porque las señales son frágiles.
-    """
     if price <= 0 or len(candles_1h) < 16:
         return 0
     atr_1h = _atr(candles_1h[:-1], period=14)
@@ -403,13 +381,16 @@ def evaluate(
     candles_1h:  list[dict],
     candles_4h:  list[dict] | None = None,
     min_score:   int = MIN_SCORE,
+    symbol:      str = "???",
 ) -> tuple[str | None, int, str | None]:
     """Evalúa si hay señal de entrada. Devuelve (side, score, regime) o (None, score, None)."""
 
     if len(candles_15m) < 50 or len(candles_1h) < 220:
+        log.debug("[%s] skip: candles insuficientes (15m=%d 1h=%d)", symbol, len(candles_15m), len(candles_1h))
         return None, 0, None
 
     if not _liquidity_ok(candles_1h):
+        log.debug("[%s] skip: liquidez insuficiente (avg_vol_1h < %d)", symbol, MIN_HOURLY_VOLUME)
         return None, 0, None
 
     closed  = candles_15m[-2]
@@ -419,28 +400,25 @@ def evaluate(
     c_low   = closed["low"]
     bullish_candle = c_close > c_open
 
-    # ── Régimen de mercado 1h (v4: incluye proto_bull/proto_bear) ────────
+    # ── Régimen de mercado 1h ────────────────────────────────────────
     regime, adx_1h = _market_regime(candles_1h)
 
-    # Normalizar: proto_bull/bear actúan como bull/bear para filtros,
-    # pero con penalización de score.
     is_proto = regime in ("proto_bull", "proto_bear")
     effective_regime = "bull" if regime in ("bull", "proto_bull") else (
         "bear" if regime in ("bear", "proto_bear") else "range"
     )
 
     if effective_regime == "range":
+        log.debug("[%s] skip: régimen=range adx_1h=%.1f", symbol, adx_1h)
         return None, 0, None
 
     # ── Estructura de precio 1h ────────────────────────────────────────
     structure = _price_structure(candles_1h)
 
-    # Hard-guard: structure=range + ADX bajo → mercado sin dirección clara
-    # (fix Bug 1: eliminado el guard duplicado que nunca era alcanzable)
     if structure == "range" and adx_1h < ADX_1H_STRUCTURE_MIN:
         log.debug(
-            "[structure] range + ADX_1h=%.1f < %d → hard-guard",
-            adx_1h, ADX_1H_STRUCTURE_MIN,
+            "[%s] skip: structure=range + ADX_1h=%.1f < %d → hard-guard",
+            symbol, adx_1h, ADX_1H_STRUCTURE_MIN,
         )
         return None, 0, None
 
@@ -450,8 +428,10 @@ def evaluate(
         ema50_4h  = _ema(closes_4h, 50)[-1]
         price_4h  = closes_4h[-1]
         if effective_regime == "bull" and price_4h < ema50_4h:
+            log.debug("[%s] skip: macro 4h bearish (precio=%.6f < EMA50_4h=%.6f)", symbol, price_4h, ema50_4h)
             return None, 0, None
         if effective_regime == "bear" and price_4h > ema50_4h:
+            log.debug("[%s] skip: macro 4h bullish (precio=%.6f > EMA50_4h=%.6f)", symbol, price_4h, ema50_4h)
             return None, 0, None
 
     # ── Indicadores 15m ───────────────────────────────────────────────
@@ -468,35 +448,65 @@ def evaluate(
     volumes    = [c["volume"] for c in candles_15m]
     avg_vol    = sum(volumes[-21:-1]) / 20
     last_vol   = volumes[-2]
+    vol_ratio  = last_vol / avg_vol if avg_vol else 0.0
+
+    closes_1h        = [c["close"] for c in candles_1h]
+    ema200_1h        = _ema(closes_1h[:-1], 200)[-1]
+    closes_1h_closed = closes_1h[:-1]
+    macd_1h          = _macd_histogram(closes_1h_closed)[-1]
+    atr_1h_val       = _atr(candles_1h[:-1], 14)
+    atr_1h_pct       = atr_1h_val / price if price > 0 else 0.0
+
+    # Log de estado completo para diagnóstico
+    log.debug(
+        "[%s] régimen=%s structure=%s | ADX_1h=%.1f ADX_15m=%.1f | "
+        "RSI=%.1f MACD_15m=%.5f MACD_1h=%.5f | "
+        "vol_ratio=%.2f (last=%.0f avg=%.0f) | "
+        "ATR_15m=%.4f%% ATR_1h=%.4f%% | "
+        "precio=%.6f EMA200_1h=%.6f EMA20_15m=%.6f",
+        symbol, regime, structure,
+        adx_1h, adx_15m,
+        rsi, macd_hist, macd_1h,
+        vol_ratio, last_vol, avg_vol,
+        (atr_15m / price * 100) if price > 0 else 0,
+        atr_1h_pct * 100,
+        price, ema200_1h, ema20_15m,
+    )
 
     # ── Hard-guards ───────────────────────────────────────────────────
     if price > 0 and atr_15m / price > ATR_VOLATILE_PCT:
+        log.debug("[%s] skip: ATR_15m=%.4f%% > %.1f%% (demasiado volátil)", symbol, atr_15m / price * 100, ATR_VOLATILE_PCT * 100)
         return None, 0, None
 
     if adx_15m < ADX_15M_MIN:
+        log.debug("[%s] skip: ADX_15m=%.1f < %d (lateral 15m)", symbol, adx_15m, ADX_15M_MIN)
         return None, 0, None
 
-    closes_1h  = [c["close"] for c in candles_1h]
-    ema200_1h  = _ema(closes_1h[:-1], 200)[-1]
     if effective_regime == "bull" and price < ema200_1h * (1 - EMA200_MIN_DIST):
+        log.debug("[%s] skip: bull pero precio=%.6f < EMA200_1h=%.6f", symbol, price, ema200_1h)
         return None, 0, None
     if effective_regime == "bear" and price > ema200_1h * (1 + EMA200_MIN_DIST):
+        log.debug("[%s] skip: bear pero precio=%.6f > EMA200_1h=%.6f", symbol, price, ema200_1h)
         return None, 0, None
 
     if effective_regime == "bear" and price < ema200_15m * (1 - EMA200_MIN_DIST):
+        log.debug("[%s] skip: bear pero precio=%.6f < EMA200_15m=%.6f (sobreextendido)", symbol, price, ema200_15m)
         return None, 0, None
 
     candle_range = c_high - c_low
     if candle_range > 0 and atr_15m > 0:
         if candle_range > NO_CHASE_MULT * atr_15m:
+            log.debug("[%s] skip: no-chase rango_vela=%.6f > %.1f*ATR=%.6f", symbol, candle_range, NO_CHASE_MULT, atr_15m)
             return None, 0, None
 
     if price > 0 and ema20_15m > 0:
         dist_ema20 = abs(price - ema20_15m) / price
         if dist_ema20 > PULLBACK_EMA20_DIST:
             if effective_regime == "bull" and price > ema20_15m:
+                log.debug("[%s] skip: sobreextendido sobre EMA20_15m dist=%.2f%%", symbol, dist_ema20 * 100)
                 return None, 0, None
             if effective_regime == "bear" and price < ema20_15m:
+                log.debug("[%s] skip: sobreextendido bajo EMA20_15m dist=%.2f%%", symbol, dist_ema20 * 100)
                 return None, 0, None
 
     # ── Score mínimo dinámico por volatilidad (v4) ───────────────────
@@ -511,109 +521,138 @@ def evaluate(
     if open_daily > 0:
         daily_move = (close_today - open_daily) / open_daily
         if effective_regime == "bull" and daily_move < -DAILY_CANDLE_BLOCK:
+            log.debug("[%s] skip: daily_move=%.2f%% < -%.1f%% en régimen bull", symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100)
             return None, score, None
         if effective_regime == "bear" and daily_move > DAILY_CANDLE_BLOCK:
+            log.debug("[%s] skip: daily_move=%.2f%% > +%.1f%% en régimen bear", symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100)
             return None, score, None
 
         abs_move = abs(daily_move)
-        # fix Bug 3: ya no bloqueamos días muy fuertes en la dirección del régimen;
-        # aplicamos penalización -10 en todos los casos de sobreextensión diaria.
         if abs_move > DAILY_CANDLE_PENALTY:
             score -= 10
             log.debug(
-                "[daily] abs_move=%.2f%% > %.1f%% → penalización -10",
-                abs_move * 100, DAILY_CANDLE_PENALTY * 100,
+                "[%s] daily abs_move=%.2f%% > %.1f%% → penalización -10 (score=%d)",
+                symbol, abs_move * 100, DAILY_CANDLE_PENALTY * 100, score,
             )
 
     # ── Scoring ───────────────────────────────────────────────────────
 
-    # Penalización proto-régimen (menos convicción que régimen completo)
     if is_proto:
         score -= PROTO_SCORE_PENALTY
+        log.debug("[%s] proto-régimen → -4 (score=%d)", symbol, score)
 
-    # Dirección de vela cerrada
     if effective_regime == "bull" and bullish_candle:
         score += 8
+        log.debug("[%s] vela alcista en bull → +8 (score=%d)", symbol, score)
     elif effective_regime == "bear" and not bullish_candle:
         score += 8
+        log.debug("[%s] vela bajista en bear → +8 (score=%d)", symbol, score)
+    else:
+        log.debug("[%s] vela contraria al régimen → +0 (score=%d)", symbol, score)
 
-    # RSI
     if effective_regime == "bull":
         if 45 <= rsi <= 65:
             score += 8
+            log.debug("[%s] RSI=%.1f en zona ideal bull → +8 (score=%d)", symbol, rsi, score)
         elif rsi > 70:
             score -= 8
+            log.debug("[%s] RSI=%.1f sobrecomprado → -8 (score=%d)", symbol, rsi, score)
             if rsi > 80:
+                log.debug("[%s] skip: RSI=%.1f > 80 (sobrecomprado extremo)", symbol, rsi)
                 return None, score, None
+        else:
+            log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
     else:
         if 35 <= rsi <= 55:
             score += 8
+            log.debug("[%s] RSI=%.1f en zona ideal bear → +8 (score=%d)", symbol, rsi, score)
         elif rsi < 30:
+            log.debug("[%s] skip: RSI=%.1f < 30 (sobrevendido en bear)", symbol, rsi)
             return None, score, None
+        else:
+            log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
 
-    # ADX 1h
     if adx_1h >= 30:
         score += 12
+        log.debug("[%s] ADX_1h=%.1f >= 30 → +12 (score=%d)", symbol, adx_1h, score)
     elif adx_1h >= 25:
         score += 8
+        log.debug("[%s] ADX_1h=%.1f >= 25 → +8 (score=%d)", symbol, adx_1h, score)
     elif adx_1h >= 20:
         score += 4
+        log.debug("[%s] ADX_1h=%.1f >= 20 → +4 (score=%d)", symbol, adx_1h, score)
+    else:
+        log.debug("[%s] ADX_1h=%.1f < 20 → +0 (score=%d)", symbol, adx_1h, score)
+
     if effective_regime == "bear" and adx_1h < 22:
+        log.debug("[%s] skip: bear + ADX_1h=%.1f < 22 → hard-guard short", symbol, adx_1h)
         return None, score, None
 
-    # MACD 15m
     if effective_regime == "bull" and macd_hist > 0:
         score += 8
+        log.debug("[%s] MACD_15m=%.5f positivo en bull → +8 (score=%d)", symbol, macd_hist, score)
     elif effective_regime == "bear" and macd_hist < 0:
         score += 8
+        log.debug("[%s] MACD_15m=%.5f negativo en bear → +8 (score=%d)", symbol, macd_hist, score)
+    else:
+        log.debug("[%s] MACD_15m=%.5f contrario al régimen → +0 (score=%d)", symbol, macd_hist, score)
 
-    # MACD 1h
-    closes_1h_closed = closes_1h[:-1]
-    macd_1h = _macd_histogram(closes_1h_closed)[-1]
     if effective_regime == "bull" and macd_1h > 0:
         score += 8
+        log.debug("[%s] MACD_1h=%.5f positivo en bull → +8 (score=%d)", symbol, macd_1h, score)
     elif effective_regime == "bear" and macd_1h < 0:
         score += 8
+        log.debug("[%s] MACD_1h=%.5f negativo en bear → +8 (score=%d)", symbol, macd_1h, score)
+    else:
+        log.debug("[%s] MACD_1h=%.5f contrario al régimen → +0 (score=%d)", symbol, macd_1h, score)
 
-    # Volumen
     if avg_vol > 0:
         if last_vol >= avg_vol * VOLUME_MULT:
             score += 8
+            log.debug("[%s] vol_ratio=%.2f >= %.1f → +8 (score=%d)", symbol, vol_ratio, VOLUME_MULT, score)
         elif last_vol < avg_vol * VOLUME_WEAK:
             score -= 4
+            log.debug("[%s] vol_ratio=%.2f < %.1f → -4 (score=%d)", symbol, vol_ratio, VOLUME_WEAK, score)
+        else:
+            log.debug("[%s] vol_ratio=%.2f normal → +0 (score=%d)", symbol, vol_ratio, score)
 
-    # Sesgo horario
     hour = datetime.datetime.now(timezone.utc).hour
     if hour in HIGH_BIAS_HOURS:
         score += 4
+        log.debug("[%s] hora=%d en HIGH_BIAS_HOURS → +4 (score=%d)", symbol, hour, score)
     elif hour in LOW_BIAS_HOURS:
         score -= 4
+        log.debug("[%s] hora=%d en LOW_BIAS_HOURS → -4 (score=%d)", symbol, hour, score)
 
-    # Divergencia RSI
     div = _rsi_divergence(closes_15m[:-1], candles_15m[:-1])
     if effective_regime == "bull" and div == "bullish":
         score += 8
+        log.debug("[%s] divergencia RSI bullish → +8 (score=%d)", symbol, score)
     elif effective_regime == "bear" and div == "bearish":
         score += 8
+        log.debug("[%s] divergencia RSI bearish → +8 (score=%d)", symbol, score)
 
-    # Estructura de precio vs régimen
     if structure == effective_regime:
-        score += 8  # consenso completo
+        score += 8
+        log.debug("[%s] structure=%s == régimen → +8 (score=%d)", symbol, structure, score)
     elif structure != "range" and structure != effective_regime:
         score -= 12
         log.debug(
-            "[structure] Régimen %s contradice estructura %s (adx_1h=%.1f) — penalización -12",
-            regime, structure, adx_1h,
+            "[%s] structure=%s contradice régimen=%s → -12 (score=%d)",
+            symbol, structure, regime, score,
         )
 
     # ── Score mínimo ──────────────────────────────────────────────────
     min_required = min_required_base + (SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0)
+    log.debug(
+        "[%s] SCORE FINAL=%d | min_required=%d (base=%d vol_bump=%d proto_bump=%d short_extra=%d) | "
+        "ADX_1h=%.1f ADX_15m=%.1f vol_ratio=%.2f ATR_1h=%.4f%%",
+        symbol, score, min_required, min_score, vol_bump, proto_bump,
+        SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0,
+        adx_1h, adx_15m, vol_ratio, atr_1h_pct * 100,
+    )
+
     if score < min_required:
-        log.debug(
-            "[score] %s score=%d < min_required=%d (base=%d vol_bump=%d proto_bump=%d short_extra=%d)",
-            regime, score, min_required, min_score, vol_bump, proto_bump,
-            SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0,
-        )
         return None, score, None
 
     side = "long" if effective_regime == "bull" else "short"
@@ -623,7 +662,7 @@ def evaluate(
         "%s",
         side.upper(), score, min_required, regime, structure,
         adx_1h, adx_15m, rsi, macd_hist,
-        last_vol / avg_vol if avg_vol else 0,
+        vol_ratio,
         " [PROTO]" if is_proto else "",
     )
     return side, score, regime
