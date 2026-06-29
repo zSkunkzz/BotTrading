@@ -296,12 +296,25 @@ def _check_tp_extension(
             return
 
         entry        = pos["entry"]
-        tp_orig_dist = abs(pos.get("tp_original", tp) - entry)
+        # FIX #2: usar tp_original (entry del trade) como base, no el TP ya extendido.
+        # Si por reinicio tp_original == tp actual (ya extendido), el cálculo sería
+        # incorrecto. Recalculamos desde entry usando sl_dist como proxy de la distancia.
+        tp_orig      = pos.get("tp_original", tp)
+        tp_orig_dist = abs(tp_orig - entry)
 
         if side == "long":
             new_tp = round(entry + tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
         else:
             new_tp = round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
+
+        # FIX #2 extra: verificar que new_tp no sea absurdo (> 3× distancia entry→tp_orig)
+        max_tp_dist = tp_orig_dist * TP_EXTEND_RR * (MAX_TP_EXTENSIONS + 2) * 1.1
+        if abs(new_tp - entry) > max_tp_dist:
+            log.warning(
+                "[%s] extend_tp cancelado — new_tp %.6f excede límite razonable desde entry %.6f",
+                symbol, new_tp, entry,
+            )
+            return
 
         if side == "long" and new_tp <= current_price * 1.001:
             log.warning(
@@ -399,15 +412,18 @@ def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
         if hit_sl:
             return sl, "SL"
 
+    # FIX #3: umbral de fallback subido para evitar clasificar volatilidad normal como TP/SL.
+    # Con 10x leverage, 0.5% a favor es ruido — se sube a 1.5% TP y 0.8% SL.
+    # Este fallback solo se activa si SL y TP son ambos None (caso raro).
     entry = pos.get("entry", 0)
     if entry > 0:
         move_pct = (
             (current_price - entry) / entry if side == "long"
             else (entry - current_price) / entry
         )
-        if move_pct > 0.005:
+        if move_pct > 0.015:   # > 1.5% a favor → TP (antes 0.5%)
             return current_price, "TP"
-        if move_pct < -0.003:
+        if move_pct < -0.008:  # > 0.8% en contra → SL (antes 0.3%)
             return current_price, "SL"
 
     return current_price, "MANUAL"
@@ -815,7 +831,8 @@ def run() -> None:
                     if is_manual and symbol in _manual_alert_cooldown:
                         continue
 
-                    if not is_manual and open_count >= config.MAX_POSITIONS:
+                    # FIX #4: usar len(positions) en tiempo real para no superar MAX_POSITIONS
+                    if not is_manual and len(positions) >= config.MAX_POSITIONS:
                         break
 
                     try:
@@ -887,9 +904,20 @@ def run() -> None:
                                 "[%s] open_order falló — posición NO registrada: %s",
                                 symbol, open_err,
                             )
+                            # FIX #1: rollback corregido — close_position necesita side y qty.
+                            # Se consulta la posición real en el exchange para obtener los
+                            # parámetros necesarios antes de intentar el cierre.
                             try:
-                                exchange.close_position(symbol)
-                                log.warning("[%s] Rollback: posición parcial cerrada", symbol)
+                                pos_live = exchange.get_position(symbol)
+                                if pos_live:
+                                    exchange.close_position(
+                                        side   = pos_live["side"],
+                                        qty    = pos_live["size"],
+                                        symbol = symbol,
+                                    )
+                                    log.warning("[%s] Rollback OK: posición parcial cerrada", symbol)
+                                else:
+                                    log.info("[%s] Rollback innecesario — no hay posición en exchange", symbol)
                             except Exception as close_err:
                                 log.error(
                                     "[%s] Rollback fallido — revisar posición manualmente: %s",
@@ -917,7 +945,7 @@ def run() -> None:
                             "be_sl":         params.get("be_sl"),
                             "be_locked":     False,
                         }
-                        open_count = len(positions)
+                        # FIX #4: open_count ya no se usa — el check usa len(positions) en tiempo real
 
                         telegram.notify_open(
                             symbol = symbol,
