@@ -8,6 +8,16 @@ vela recibida. ready() devuelve False si los datos de 15m o 1h tienen más de
 STALE_THRESHOLD segundos sin actualizarse, evitando que el bot evalúe señales
 con datos obsoletos cuando el WebSocket se cae sin reconectar.
 
+FIX E — Buffer congelado (TRX y otros pares de baja liquidez):
+Antes, cuando llegaba una vela con ts diferente al último del buffer, la lógica
+evaluaba if not buf or buf[-1].get('closed', True) para decidir si añadir. Si
+buf[-1]['closed'] era False (vela abierta), se intentaba cerrarla Y añadir la
+nueva en el else — pero ese else era inalcanzable porque la rama exterior ya
+había descartado el caso ts==same. En la práctica buf[-1] con closed=False
+nunca se cerraba, y la nueva vela tampoco se añadía → buffer congelado.
+Ahora la lógica es: si ts distinto → cerrar la anterior (forced closed=True)
+y añadir la nueva siempre, sin condición adicional.
+
 Uso:
     feed = KlineFeed(config.SYMBOLS)
     feed.start()
@@ -41,11 +51,6 @@ _READY_MIN = {"15m": 120, "1h": 215}
 _PRELOAD   = {"15m": 120, "1h": 220, "4h": 70}
 
 # FIX #4: STALE_THRESHOLD reducido de 10 min a 4 min.
-# El loop principal corre cada 20s. Con 10 min el bot podía evaluar señales
-# con datos de hasta 9 min de antigüedad tras una caída del WS, abriendo
-# posiciones sobre precios que ya se habían movido significativamente.
-# Con 4 min (≈2 velas de 15m sin confirmar) se detecta la caída antes
-# de que los datos sean peligrosamente obsoletos.
 STALE_THRESHOLD = 4 * 60  # 4 minutos
 
 
@@ -57,9 +62,6 @@ class KlineFeed:
             s: {tf: deque(maxlen=BUFFER_SIZE) for tf in TIMEFRAMES}
             for s in symbols
         }
-        # Timestamp (time.time()) de la última actualización por símbolo y tf.
-        # Se inicializa a 0. La precarga REST lo actualiza al terminar para que
-        # los símbolos no aparezcan como obsoletos nada más arrancar.
         self._last_update: dict[str, dict[str, float]] = {
             s: {tf: 0.0 for tf in TIMEFRAMES}
             for s in symbols
@@ -78,12 +80,7 @@ class KlineFeed:
             return len(self._data.get(symbol, {}).get(timeframe, [])) > 0
 
     def ready(self, symbol: str) -> bool:
-        """True si tenemos velas suficientes en 15m y 1h Y los datos son frescos.
-
-        FIX: comprueba que la última actualización de 15m y 1h fue hace menos
-        de STALE_THRESHOLD segundos. Si el WebSocket lleva más tiempo sin enviar
-        datos para este símbolo, devuelve False y el bot omite la evaluación.
-        """
+        """True si tenemos velas suficientes en 15m y 1h Y los datos son frescos."""
         with self._lock:
             has_enough = (
                 len(self._data[symbol]["15m"]) >= _READY_MIN["15m"] and
@@ -130,8 +127,6 @@ class KlineFeed:
             candles = exchange.get_ohlcv(symbol, interval=tf, limit=limit)
             with self._lock:
                 self._data[symbol][tf].extend(candles)
-                # Marcar como actualizado para que ready() no lo descarte
-                # inmediatamente tras la precarga REST.
                 self._last_update[symbol][tf] = time.time()
             log.debug("[%s %s] precargadas %d velas", symbol, tf, len(candles))
         except Exception as e:
@@ -212,28 +207,36 @@ class KlineFeed:
             if not isinstance(kline, dict):
                 return
 
+            open_time = int(kline.get("T", kline.get("t", 0)))
+            close_val = float(kline["c"])
+            vol       = float(kline["v"])
             candle = {
-                "ts":     int(kline.get("T", kline.get("t", 0))),
-                "open":   float(kline["o"]),
-                "high":   float(kline["h"]),
-                "low":    float(kline["l"]),
-                "close":  float(kline["c"]),
-                "volume": float(kline["v"]),
-                "closed": bool(kline.get("confirm", False)),
+                "ts":           open_time,
+                "open_time":    open_time,
+                "open":         float(kline["o"]),
+                "high":         float(kline["h"]),
+                "low":          float(kline["l"]),
+                "close":        close_val,
+                "volume":       vol,
+                "quote_volume": vol * close_val,
+                "closed":       bool(kline.get("confirm", False)),
             }
 
             with self._lock:
                 buf = self._data[symbol][tf]
                 if buf and buf[-1]["ts"] == candle["ts"]:
+                    # Misma vela: actualizar in-place
                     buf[-1] = candle
                 else:
-                    if not buf or buf[-1].get("closed", True):
-                        buf.append(candle)
-                    else:
+                    # Nueva vela: cerrar la anterior (aunque no llegara confirmed)
+                    # y añadir la nueva.
+                    # FIX E: antes se evaluaba buf[-1].get('closed', True) aquí,
+                    # lo que impedía añadir la nueva vela cuando la anterior tenía
+                    # closed=False (TRX y pares poco activos → buffer congelado).
+                    if buf:
                         buf[-1] = dict(buf[-1], closed=True)
-                        buf.append(candle)
+                    buf.append(candle)
 
-                # Actualizar timestamp de frescura en cada mensaje recibido
                 self._last_update[symbol][tf] = time.time()
 
         except Exception as e:

@@ -12,8 +12,9 @@ FIXES aplicados:
   4. calc_qty() aplica floor al step size de cada símbolo para no enviar qty
      que BingX rechaza por precisión decimal.
   5. cancel_all_orders usa DELETE (no POST) — BingX exige DELETE para este endpoint.
-  6. get_ohlcv incluye el timestamp 'ts' en cada vela para que ws_feed pueda
-     deduplicar correctamente al mezclar velas REST con las del WebSocket.
+  6. get_ohlcv incluye el timestamp 'ts' y 'open_time' en cada vela para que ws_feed
+     pueda deduplicar correctamente al mezclar velas REST con las del WebSocket.
+     También incluye 'quote_volume' (volumen en USDT) para el filtro de liquidez.
   7. get_all_positions() obtiene TODAS las posiciones abiertas en 1 sola llamada
      (sin 'symbol'), reduciendo 74 llamadas por loop a 1.
      FIX: si la llamada falla, lanza excepción en vez de devolver {} silencioso
@@ -40,6 +41,11 @@ FIXES aplicados:
  13. FIX C — get_closed_orders: añadidos startTime/endTime obligatorios.
      Doc oficial: sin rango temporal BingX puede devolver error 109400.
      Se incluye startTime=ahora-7d, endTime=ahora en cada llamada.
+ 14. FIX D — get_ohlcv: añadidos 'open_time' y 'quote_volume'.
+     'open_time' = timestamp de apertura de vela en ms (campo 'time'/'t' de BingX).
+     'quote_volume' = volumen en USDT = volume * close (BingX no siempre lo devuelve
+     como campo separado). Necesario para _liquidity_ok (signals.py) y
+     _daily_candle_context (signals.py).
 """
 import hashlib
 import hmac
@@ -170,10 +176,19 @@ def get_price(symbol: str = None) -> float:
 # ── OHLCV ──────────────────────────────────────────────────────────────────────────────────
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
-    """Devuelve lista de velas [{ts, open, high, low, close, volume}] más reciente al final.
+    """Devuelve lista de velas [{ts, open_time, open, high, low, close, volume,
+    quote_volume, closed}] más reciente al final.
 
-    FIX: se incluye 'ts' (timestamp en ms) para que ws_feed pueda deduplicar
-    correctamente las velas precargadas REST con las que llegan por WebSocket.
+    FIX D:
+    - 'open_time': timestamp de apertura de la vela en ms. Necesario para que
+      _daily_candle_context() en signals.py pueda filtrar las velas del día actual.
+      Antes las velas REST no tenían este campo → contexto diario siempre vacío.
+    - 'quote_volume': volumen en USDT (= volume * close). BingX devuelve 'volume'
+      en unidades de la moneda base (ej: BTC), que para BTC es ~0.1-5 por vela —
+      muy por debajo del umbral MIN_HOURLY_VOLUME=1_000_000 USDT. _liquidity_ok()
+      en signals.py ahora usa quote_volume para la comparación correcta.
+    - 'ts' sigue siendo el timestamp de apertura (mismo que open_time) para
+      compatibilidad con ws_feed.py.
     """
     symbol   = symbol or config.SYMBOL
     interval = interval or config.TIMEFRAME
@@ -184,14 +199,19 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
     })
     candles = []
     for c in data["data"]:
+        open_time = int(c.get("time", c.get("t", 0)))
+        vol       = float(c["volume"])
+        close     = float(c["close"])
         candles.append({
-            "ts":     int(c.get("time", c.get("t", 0))),
-            "open":   float(c["open"]),
-            "high":   float(c["high"]),
-            "low":    float(c["low"]),
-            "close":  float(c["close"]),
-            "volume": float(c["volume"]),
-            "closed": True,
+            "ts":           open_time,
+            "open_time":    open_time,
+            "open":         float(c["open"]),
+            "high":         float(c["high"]),
+            "low":          float(c["low"]),
+            "close":        close,
+            "volume":       vol,
+            "quote_volume": float(c.get("quoteVolume", c.get("quote_volume", vol * close))),
+            "closed":       True,
         })
     return candles
 
@@ -249,18 +269,7 @@ _POSITION_SIDE_MAP = {
 
 
 def _parse_position(p: dict) -> dict | None:
-    """Convierte un objeto de posición raw de BingX al formato interno del bot.
-
-    BingX hedge mode devuelve siempre positionSide="LONG"|"SHORT" — este campo
-    es el indicador canónico del lado de la posición y se usa con prioridad.
-
-    En one-way mode positionSide puede venir como "BOTH" o ausente; en ese caso
-    se infiere el lado por el signo de positionAmt (positivo → long, negativo → short).
-
-    Si ninguna de las dos fuentes produce un side válido, se devuelve None y
-    la posición se descarta con un warning — esto evita que un payload malformado
-    de BingX inyecte un side incorrecto en el estado del bot.
-    """
+    """Convierte un objeto de posición raw de BingX al formato interno del bot."""
     raw_side     = str(p.get("positionSide") or "").upper()
     position_amt = float(p.get("positionAmt") or 0)
 
@@ -369,9 +378,6 @@ def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> N
     """Coloca (o reemplaza) la stop-loss order. Usada también por el trailing.
 
     FIX A — doc oficial BingX: closePosition y quantity son mutuamente excluyentes.
-    "closePosition=true: all position squaring after triggering — cannot be used
-    with quantity." (error 101400 si se envían juntos).
-    Se usa closePosition=true sin quantity para cerrar la posición completa.
     """
     sl_side  = "SELL" if side == "long" else "BUY"
     pos_side = "LONG" if side == "long" else "SHORT"
@@ -390,9 +396,6 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
     """Coloca la take-profit order.
 
     FIX A — doc oficial BingX: closePosition y quantity son mutuamente excluyentes.
-    "closePosition=true: all position squaring after triggering — cannot be used
-    with quantity." (error 101400 si se envían juntos).
-    Se usa closePosition=true sin quantity para cerrar la posición completa.
     """
     sl_side  = "SELL" if side == "long" else "BUY"
     pos_side = "LONG" if side == "long" else "SHORT"
@@ -427,9 +430,7 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
 # ── Cancelar órdenes abiertas ─────────────────────────────────────────────────────────────────
 
 def cancel_all_orders(symbol: str = None) -> None:
-    """FIX: BingX exige DELETE (no POST) para cancelar todas las órdenes abiertas.
-    Con POST la API devuelve 405 silencioso, dejando SL/TP duplicados en el exchange.
-    """
+    """FIX: BingX exige DELETE (no POST) para cancelar todas las órdenes abiertas."""
     symbol = symbol or config.SYMBOL
     _delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
     log.info("Órdenes canceladas para %s", symbol)
@@ -438,22 +439,10 @@ def cancel_all_orders(symbol: str = None) -> None:
 # ── Historial de órdenes cerradas ─────────────────────────────────────────────────────────────
 
 def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
-    """Devuelve órdenes ejecutadas/cerradas del símbolo para obtener el precio real
-    de salida en _get_real_exit_price().
+    """Devuelve órdenes ejecutadas/cerradas del símbolo.
 
-    FIX B — parseo corregido según doc oficial BingX:
-      GET /openApi/swap/v2/trade/allOrders → data es directamente un array de
-      órdenes. No existe ningún campo .orders ni .list en la respuesta de este
-      endpoint. El bloque isinstance(raw, dict) anterior era incorrecto y se ha
-      eliminado.
-
-    FIX C — startTime/endTime obligatorios según doc oficial:
-      Sin rango temporal BingX puede devolver error 109400. Se incluyen
-      startTime=ahora-7d y endTime=ahora en cada llamada. El rango máximo
-      permitido es 7 días; nunca se supera.
-
-    limit es obligatorio (doc oficial); valor por defecto elevado a 20 para
-    mayor cobertura en _get_real_exit_price() y _get_position_open_ts().
+    FIX B — parseo corregido: data es directamente un array.
+    FIX C — startTime/endTime obligatorios (doc BingX).
     """
     symbol = symbol or config.SYMBOL
     now_ms   = int(time.time() * 1000)
@@ -469,8 +458,6 @@ def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
         log.debug("[%s] get_closed_orders falló: %s", symbol, exc)
         return []
 
-    # data es directamente un array — doc oficial BingX allOrders v2
     raw = data.get("data") or []
-
     terminal = {"FILLED", "CANCELED", "PARTIALLY_FILLED", "PARTIALLY_CANCELED"}
     return [o for o in raw if str(o.get("status", "")).upper() in terminal]
