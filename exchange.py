@@ -12,8 +12,12 @@ FIXES aplicados:
   4. calc_qty() aplica floor al step size de cada símbolo para no enviar qty
      que BingX rechaza por precisión decimal.
   5. cancel_all_orders usa DELETE (no POST) — BingX exige DELETE para este endpoint.
-  6. get_ohlcv incluye el timestamp 'ts' en cada vela para que ws_feed pueda
-     deduplicar correctamente al mezclar velas REST con las del WebSocket.
+  6. get_ohlcv: el endpoint /openApi/swap/v3/quote/klines devuelve cada vela como un
+     ARRAY de 11 elementos (doc oficial BingX):
+       [0]=open_time [1]=open [2]=high [3]=low [4]=close [5]=volume
+       [6]=close_time [7]=quote_vol [8]=trades [9]=taker_buy_base [10]=taker_buy_quote
+     Antes se accedía a c["open"] etc. como si fuera un dict → KeyError silenciado.
+     Ahora se parsea por índice. Se incluye 'ts' (= c[0]) para deduplicación en ws_feed.
   7. get_all_positions() obtiene TODAS las posiciones abiertas en 1 sola llamada
      (sin 'symbol'), reduciendo 74 llamadas por loop a 1.
      FIX: si la llamada falla, lanza excepción en vez de devolver {} silencioso
@@ -40,6 +44,12 @@ FIXES aplicados:
  13. FIX C — get_closed_orders: añadidos startTime/endTime obligatorios.
      Doc oficial: sin rango temporal BingX puede devolver error 109400.
      Se incluye startTime=ahora-7d, endTime=ahora en cada llamada.
+ 14. FIX D — get_ohlcv: velas son arrays, no dicts.
+     Doc oficial GET /openApi/swap/v3/quote/klines: cada vela es un array de 11
+     elementos indexados por posición, NO un objeto con claves "open"/"high"/etc.
+     Se parsea ahora por índice: c[0]=ts, c[1]=open, c[2]=high, c[3]=low, c[4]=close,
+     c[5]=volume. Esto afectaba a TODO el bot (signals, risk, trailing, BE) porque
+     ninguna vela tenía datos reales — todas las velas eran dicts vacíos.
 """
 import hashlib
 import hmac
@@ -141,7 +151,6 @@ def get_balance() -> float:
     try:
         resp = _get("/openApi/swap/v3/user/balance", {})
         items = resp.get("data") or []
-        # Buscar el asset USDT; si solo hay uno, usarlo directamente
         usdt = next(
             (x for x in items if str(x.get("asset", "")).upper() == "USDT"),
             items[0] if items else None,
@@ -172,8 +181,23 @@ def get_price(symbol: str = None) -> float:
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
     """Devuelve lista de velas [{ts, open, high, low, close, volume}] más reciente al final.
 
-    FIX: se incluye 'ts' (timestamp en ms) para que ws_feed pueda deduplicar
-    correctamente las velas precargadas REST con las que llegan por WebSocket.
+    FIX D — Doc oficial BingX GET /openApi/swap/v3/quote/klines:
+    Cada vela es un ARRAY de 11 elementos indexados por posición:
+      c[0] = open time (ms)
+      c[1] = open price
+      c[2] = high price
+      c[3] = low price
+      c[4] = close price
+      c[5] = volume (base asset)
+      c[6] = close time (ms)
+      c[7] = quote asset volume
+      c[8] = number of trades
+      c[9] = taker buy base asset volume
+      c[10]= taker buy quote asset volume
+
+    Antes se accedía a c["open"], c["high"]... como si fuera un dict.
+    Ese error hacía que todas las velas tuvieran campos con valor 0 (KeyError silenciado),
+    rompiendo silenciosamente signals, risk, trailing y break-even.
     """
     symbol   = symbol or config.SYMBOL
     interval = interval or config.TIMEFRAME
@@ -183,16 +207,20 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
         "limit":    limit,
     })
     candles = []
-    for c in data["data"]:
-        candles.append({
-            "ts":     int(c.get("time", c.get("t", 0))),
-            "open":   float(c["open"]),
-            "high":   float(c["high"]),
-            "low":    float(c["low"]),
-            "close":  float(c["close"]),
-            "volume": float(c["volume"]),
-            "closed": True,
-        })
+    for c in (data.get("data") or []):
+        # c es una lista: [open_time, open, high, low, close, volume, close_time, ...]
+        try:
+            candles.append({
+                "ts":     int(c[0]),
+                "open":   float(c[1]),
+                "high":   float(c[2]),
+                "low":    float(c[3]),
+                "close":  float(c[4]),
+                "volume": float(c[5]),
+                "closed": True,
+            })
+        except (IndexError, TypeError, ValueError) as exc:
+            log.warning("get_ohlcv: vela malformada ignorada: %s — %s", c, exc)
     return candles
 
 
@@ -409,16 +437,29 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
 
 # ── Cerrar posición ────────────────────────────────────────────────────────────────────────────
 
-def close_position(side: str, qty: float, symbol: str = None) -> dict:
-    symbol   = symbol or config.SYMBOL
+def close_position(side: str = None, qty: float = None, symbol: str = None) -> dict:
+    """Cierra la posición abierta del símbolo con una orden MARKET.
+
+    Acepta side/qty opcionales para compatibilidad con el rollback en main.py,
+    pero usa closePosition=true para garantizar el cierre completo independientemente
+    de la qty exacta (evita errores por qty desactualizada).
+    """
+    symbol = symbol or config.SYMBOL
+    if side is None:
+        pos = get_position(symbol)
+        if pos is None:
+            log.info("close_position: no hay posición abierta en %s", symbol)
+            return {}
+        side = pos["side"]
+
     bx_side  = "SELL" if side == "long" else "BUY"
     pos_side = "LONG" if side == "long" else "SHORT"
     resp = _post("/openApi/swap/v2/trade/order", {
-        "symbol":       symbol,
-        "side":         bx_side,
-        "positionSide": pos_side,
-        "type":         "MARKET",
-        "quantity":     qty,
+        "symbol":        symbol,
+        "side":          bx_side,
+        "positionSide":  pos_side,
+        "type":          "MARKET",
+        "closePosition": "true",
     })
     log.info("Posición cerrada: %s %s", side.upper(), symbol)
     return resp
