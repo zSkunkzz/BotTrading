@@ -90,7 +90,7 @@ TP_PCT         = float(os.getenv("TP_PCT", "3.0"))   # no utilizado actualmente
 
 TIMEFRAME           = os.getenv("TIMEFRAME", "15m")
 LOOP_SLEEP          = int(os.getenv("LOOP_SLEEP", "20"))
-WEEKDAY_MIN_SCORE   = int(os.getenv("WEEKDAY_MIN_SCORE", os.getenv("MIN_SCORE", "72")))
+WEEKDAY_MIN_SCORE   = int(os.getenv("WEEKDAY_MIN_SCORE", os.getenv("MIN_SCORE", "70")))
 WEEKEND_MIN_SCORE   = int(os.getenv("WEEKEND_MIN_SCORE", "90"))
 MIN_SCORE           = WEEKDAY_MIN_SCORE
 

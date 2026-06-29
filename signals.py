@@ -46,7 +46,7 @@ Filtros heredados:
   13. Sesgo horario     : scoring
   14. No-chase          : hard-guard rango vela
   15. Pullback EMA20    : hard-guard sobreextensión 15m
-  16. Score mínimo      : LONGs >= MIN_SCORE (dinámico), SHORTs >= MIN_SCORE+8
+  16. Score mínimo      : LONGs >= MIN_SCORE (dinámico), SHORTs >= MIN_SCORE+SHORT_EXTRA
 
 REGLA FUNDAMENTAL:
   Bear/proto_bear → SOLO SHORT. Bull/proto_bull → SOLO LONG. Sin contra-tendencia.
@@ -57,6 +57,12 @@ Fixes aplicados:
            contar plateaus (velas con mismo high/low) como swings válidos
   - Bug 3: DAILY_CANDLE_GUARD no bloquea días muy fuertes en dirección del régimen;
            en su lugar aplica penalización -10 (igual que DAILY_CANDLE_PENALTY)
+
+Pesos v5 (scorer rebalanceado):
+  Checks de alta predictividad reciben mayor peso.
+  Checks de bajo valor informativo reducidos.
+  Nuevo máximo teórico: ~80 puntos.
+  MIN_SCORE semana=70, SHORT_MIN_SCORE_EXTRA=6.
 """
 from __future__ import annotations
 import logging
@@ -77,7 +83,7 @@ MIN_SCORE           = config.MIN_SCORE
 PULLBACK_EMA20_DIST = 0.015
 
 REGIME_CONFIRM_BARS   = 3
-SHORT_MIN_SCORE_EXTRA = 8
+SHORT_MIN_SCORE_EXTRA = 6
 ATR_VOLATILE_PCT      = 0.035
 ADX_15M_MIN           = 20
 
@@ -104,6 +110,27 @@ ATR_HIGH_VOL_PCT      = 0.020
 ATR_LOW_VOL_PCT       = 0.005
 ATR_HIGH_VOL_BUMP     = 8
 ATR_LOW_VOL_BUMP      = 4
+
+# ── Pesos del scorer (v5) ─────────────────────────────────────────────────
+# Alta predictividad — pesos subidos
+W_ADX_1H_30    = 15   # antes 12
+W_ADX_1H_25    = 10   # antes  8
+W_ADX_1H_20    =  6   # antes  4
+W_MACD_1H      = 12   # antes  8
+W_RSI_IDEAL    = 10   # antes  8
+W_STRUCTURE    = 12   # antes  8  (penalización -12 sin cambio)
+# Bajo valor informativo — pesos bajados
+W_VELA         =  5   # antes  8
+W_DIVERGENCIA  =  5   # antes  8
+W_HORA_HIGH    =  3   # antes  4
+# Sin cambio
+W_MACD_15M     =  8
+W_VOLUME_HIGH  =  8
+W_VOLUME_LOW   = -4
+W_HORA_LOW     = -4
+W_RSI_SOBRE    = -8
+# Máximo teórico: 15+10+12+10+12+5+5+3+8+8 = 88 (sin penalizaciones)
+# Máximo realista (sin divergencia ni hora): ~75-80
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────
@@ -538,24 +565,26 @@ def evaluate(
 
     if is_proto:
         score -= PROTO_SCORE_PENALTY
-        log.debug("[%s] proto-régimen → -4 (score=%d)", symbol, score)
+        log.debug("[%s] proto-régimen → -%d (score=%d)", symbol, PROTO_SCORE_PENALTY, score)
 
+    # Vela alineada con régimen (+5, antes +8)
     if effective_regime == "bull" and bullish_candle:
-        score += 8
-        log.debug("[%s] vela alcista en bull → +8 (score=%d)", symbol, score)
+        score += W_VELA
+        log.debug("[%s] vela alcista en bull → +%d (score=%d)", symbol, W_VELA, score)
     elif effective_regime == "bear" and not bullish_candle:
-        score += 8
-        log.debug("[%s] vela bajista en bear → +8 (score=%d)", symbol, score)
+        score += W_VELA
+        log.debug("[%s] vela bajista en bear → +%d (score=%d)", symbol, W_VELA, score)
     else:
         log.debug("[%s] vela contraria al régimen → +0 (score=%d)", symbol, score)
 
+    # RSI (+10, antes +8)
     if effective_regime == "bull":
         if 45 <= rsi <= 65:
-            score += 8
-            log.debug("[%s] RSI=%.1f en zona ideal bull → +8 (score=%d)", symbol, rsi, score)
+            score += W_RSI_IDEAL
+            log.debug("[%s] RSI=%.1f en zona ideal bull → +%d (score=%d)", symbol, rsi, W_RSI_IDEAL, score)
         elif rsi > 70:
-            score -= 8
-            log.debug("[%s] RSI=%.1f sobrecomprado → -8 (score=%d)", symbol, rsi, score)
+            score += W_RSI_SOBRE
+            log.debug("[%s] RSI=%.1f sobrecomprado → %d (score=%d)", symbol, rsi, W_RSI_SOBRE, score)
             if rsi > 80:
                 log.info("[%s] skip: RSI=%.1f > 80 (sobrecomprado extremo)", symbol, rsi)
                 return None, score, None
@@ -563,23 +592,24 @@ def evaluate(
             log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
     else:
         if 35 <= rsi <= 55:
-            score += 8
-            log.debug("[%s] RSI=%.1f en zona ideal bear → +8 (score=%d)", symbol, rsi, score)
+            score += W_RSI_IDEAL
+            log.debug("[%s] RSI=%.1f en zona ideal bear → +%d (score=%d)", symbol, rsi, W_RSI_IDEAL, score)
         elif rsi < 30:
             log.info("[%s] skip: RSI=%.1f < 30 (sobrevendido en bear)", symbol, rsi)
             return None, score, None
         else:
             log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
 
+    # ADX_1h (+15/+10/+6, antes +12/+8/+4)
     if adx_1h >= 30:
-        score += 12
-        log.debug("[%s] ADX_1h=%.1f >= 30 → +12 (score=%d)", symbol, adx_1h, score)
+        score += W_ADX_1H_30
+        log.debug("[%s] ADX_1h=%.1f >= 30 → +%d (score=%d)", symbol, adx_1h, W_ADX_1H_30, score)
     elif adx_1h >= 25:
-        score += 8
-        log.debug("[%s] ADX_1h=%.1f >= 25 → +8 (score=%d)", symbol, adx_1h, score)
+        score += W_ADX_1H_25
+        log.debug("[%s] ADX_1h=%.1f >= 25 → +%d (score=%d)", symbol, adx_1h, W_ADX_1H_25, score)
     elif adx_1h >= 20:
-        score += 4
-        log.debug("[%s] ADX_1h=%.1f >= 20 → +4 (score=%d)", symbol, adx_1h, score)
+        score += W_ADX_1H_20
+        log.debug("[%s] ADX_1h=%.1f >= 20 → +%d (score=%d)", symbol, adx_1h, W_ADX_1H_20, score)
     else:
         log.debug("[%s] ADX_1h=%.1f < 20 → +0 (score=%d)", symbol, adx_1h, score)
 
@@ -587,53 +617,59 @@ def evaluate(
         log.info("[%s] skip: bear + ADX_1h=%.1f < 22 → hard-guard short", symbol, adx_1h)
         return None, score, None
 
+    # MACD_15m (+8, sin cambio)
     if effective_regime == "bull" and macd_hist > 0:
-        score += 8
-        log.debug("[%s] MACD_15m=%.5f positivo en bull → +8 (score=%d)", symbol, macd_hist, score)
+        score += W_MACD_15M
+        log.debug("[%s] MACD_15m=%.5f positivo en bull → +%d (score=%d)", symbol, macd_hist, W_MACD_15M, score)
     elif effective_regime == "bear" and macd_hist < 0:
-        score += 8
-        log.debug("[%s] MACD_15m=%.5f negativo en bear → +8 (score=%d)", symbol, macd_hist, score)
+        score += W_MACD_15M
+        log.debug("[%s] MACD_15m=%.5f negativo en bear → +%d (score=%d)", symbol, macd_hist, W_MACD_15M, score)
     else:
         log.debug("[%s] MACD_15m=%.5f contrario al régimen → +0 (score=%d)", symbol, macd_hist, score)
 
+    # MACD_1h (+12, antes +8)
     if effective_regime == "bull" and macd_1h > 0:
-        score += 8
-        log.debug("[%s] MACD_1h=%.5f positivo en bull → +8 (score=%d)", symbol, macd_1h, score)
+        score += W_MACD_1H
+        log.debug("[%s] MACD_1h=%.5f positivo en bull → +%d (score=%d)", symbol, macd_1h, W_MACD_1H, score)
     elif effective_regime == "bear" and macd_1h < 0:
-        score += 8
-        log.debug("[%s] MACD_1h=%.5f negativo en bear → +8 (score=%d)", symbol, macd_1h, score)
+        score += W_MACD_1H
+        log.debug("[%s] MACD_1h=%.5f negativo en bear → +%d (score=%d)", symbol, macd_1h, W_MACD_1H, score)
     else:
         log.debug("[%s] MACD_1h=%.5f contrario al régimen → +0 (score=%d)", symbol, macd_1h, score)
 
+    # Volumen (+8/-4, sin cambio)
     if avg_vol > 0:
         if last_vol >= avg_vol * VOLUME_MULT:
-            score += 8
-            log.debug("[%s] vol_ratio=%.2f >= %.1f → +8 (score=%d)", symbol, vol_ratio, VOLUME_MULT, score)
+            score += W_VOLUME_HIGH
+            log.debug("[%s] vol_ratio=%.2f >= %.1f → +%d (score=%d)", symbol, vol_ratio, VOLUME_MULT, W_VOLUME_HIGH, score)
         elif last_vol < avg_vol * VOLUME_WEAK:
-            score -= 4
-            log.debug("[%s] vol_ratio=%.2f < %.1f → -4 (score=%d)", symbol, vol_ratio, VOLUME_WEAK, score)
+            score += W_VOLUME_LOW
+            log.debug("[%s] vol_ratio=%.2f < %.1f → %d (score=%d)", symbol, vol_ratio, VOLUME_WEAK, W_VOLUME_LOW, score)
         else:
             log.debug("[%s] vol_ratio=%.2f normal → +0 (score=%d)", symbol, vol_ratio, score)
 
+    # Hora (+3, antes +4)
     hour = datetime.datetime.now(timezone.utc).hour
     if hour in HIGH_BIAS_HOURS:
-        score += 4
-        log.debug("[%s] hora=%d en HIGH_BIAS_HOURS → +4 (score=%d)", symbol, hour, score)
+        score += W_HORA_HIGH
+        log.debug("[%s] hora=%d en HIGH_BIAS_HOURS → +%d (score=%d)", symbol, hour, W_HORA_HIGH, score)
     elif hour in LOW_BIAS_HOURS:
-        score -= 4
-        log.debug("[%s] hora=%d en LOW_BIAS_HOURS → -4 (score=%d)", symbol, hour, score)
+        score += W_HORA_LOW
+        log.debug("[%s] hora=%d en LOW_BIAS_HOURS → %d (score=%d)", symbol, hour, W_HORA_LOW, score)
 
+    # Divergencia RSI (+5, antes +8)
     div = _rsi_divergence(closes_15m[:-1], candles_15m[:-1])
     if effective_regime == "bull" and div == "bullish":
-        score += 8
-        log.debug("[%s] divergencia RSI bullish → +8 (score=%d)", symbol, score)
+        score += W_DIVERGENCIA
+        log.debug("[%s] divergencia RSI bullish → +%d (score=%d)", symbol, W_DIVERGENCIA, score)
     elif effective_regime == "bear" and div == "bearish":
-        score += 8
-        log.debug("[%s] divergencia RSI bearish → +8 (score=%d)", symbol, score)
+        score += W_DIVERGENCIA
+        log.debug("[%s] divergencia RSI bearish → +%d (score=%d)", symbol, W_DIVERGENCIA, score)
 
+    # Structure (+12, antes +8 / penalización -12 sin cambio)
     if structure == effective_regime:
-        score += 8
-        log.debug("[%s] structure=%s == régimen → +8 (score=%d)", symbol, structure, score)
+        score += W_STRUCTURE
+        log.debug("[%s] structure=%s == régimen → +%d (score=%d)", symbol, structure, W_STRUCTURE, score)
     elif structure != "range" and structure != effective_regime:
         score -= 12
         log.debug(
@@ -656,7 +692,7 @@ def evaluate(
 
     side = "long" if effective_regime == "bull" else "short"
     log.info(
-        "✅ SEÑAL %s | score=%d (min=%d) | regime=%s structure=%s "
+        "\u2705 SEÑAL %s | score=%d (min=%d) | regime=%s structure=%s "
         "adx1h=%.1f adx15m=%.1f rsi=%.1f macd_hist=%.5f vol_ratio=%.2f"
         "%s",
         side.upper(), score, min_required, regime, structure,
