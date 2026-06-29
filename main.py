@@ -42,6 +42,12 @@ logging.basicConfig(
 log = logging.getLogger("main")
 log.info("Log level activo: %s", _LOG_LEVEL_STR)
 
+# ── Silenciar librerías de terceros (siempre WARNING, independiente de LOG_LEVEL) ──
+# httpcore y httpx son extremadamente verbosos en DEBUG (10+ líneas por request).
+# Esto hace que DEBUG muestre SOLO los logs de nuestros módulos.
+for _noisy_logger in ("httpcore", "httpx", "websockets", "asyncio"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
+
 _cooldown: dict[str, float] = {}
 _cooldown_reason: dict[str, str] = {}   # 'tp' | 'sl' | 'sl_fast'
 _manual_alert_cooldown: dict[str, float] = {}
