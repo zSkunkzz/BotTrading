@@ -11,8 +11,14 @@ fix trailing SL:
   independientemente de si new_sl mejora el SL actual.
   Antes el trailing quedaba congelado después de un break-even lock si el precio
   seguía subiendo pero new_sl <= pos['sl'] (ya movido por el lock).
+
+v4.1:
+  - evaluate() devuelve 4 valores: (side, score, regime, metrics)
+  - Se loguea ADX_1h, ADX_15m y vol_ratio en nivel INFO con cada señal evaluada.
+  - Nivel de log configurable via env LOG_LEVEL (default INFO).
 """
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -27,8 +33,9 @@ import tg_commands
 import trade_logger
 from ws_feed import KlineFeed
 
+_log_level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     stream=sys.stdout,
 )
@@ -175,8 +182,6 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     if side == "long":
         peak = pos.get("trail_high", pos["entry"])
         if current_price > peak + trail_step:
-            # Siempre actualizar el pico aunque SL no mejore
-            # (e.g. tras break-even lock el SL ya está más arriba que new_sl calculado)
             pos["trail_high"] = current_price
             new_sl = round(current_price - 1.5 * trail_step, 6)
             if new_sl > pos["sl"]:
@@ -192,7 +197,6 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     else:
         trough = pos.get("trail_low", pos["entry"])
         if current_price < trough - trail_step:
-            # Siempre actualizar el mínimo aunque SL no mejore
             pos["trail_low"] = current_price
             new_sl = round(current_price + 1.5 * trail_step, 6)
             if new_sl < pos["sl"]:
@@ -245,10 +249,11 @@ def _check_tp_extension(
             candles_15m = feed.get(symbol, "15m")
             candles_1h  = feed.get(symbol, "1h")
             candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
-            signal, score, _ = signals.evaluate(
+            result = signals.evaluate(
                 candles_15m, candles_1h, candles_4h,
                 min_score=effective_min_score,
             )
+            signal, score = result[0], result[1]
         except Exception as e:
             log.warning("[%s] Error evaluando señal para extend_tp: %s", symbol, e)
             return
@@ -469,7 +474,6 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
         symbol, p["side"], p["entry"], exit_price, reason, pnl_pct, pnl_usdt,
     )
 
-    # v4: Smart cooldown — SL en los primeros 15min con score alto → cooldown corto
     if reason == "SL":
         hold_secs  = time.time() - p.get("open_ts", 0)
         trade_score = p.get("score", 0)
@@ -808,10 +812,33 @@ def run() -> None:
                         candles_1h  = feed.get(symbol, "1h")
                         candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
 
-                        signal, score, regime = signals.evaluate(
+                        result = signals.evaluate(
                             candles_15m, candles_1h, candles_4h,
                             min_score=effective_min_score,
                         )
+                        # evaluate() devuelve (side, score, regime, metrics)
+                        # metrics puede no existir en versiones antiguas → desempaquetar con seguridad
+                        signal  = result[0]
+                        score   = result[1]
+                        regime  = result[2] if len(result) > 2 else None
+                        metrics = result[3] if len(result) > 3 else {}
+
+                        # ── Log de estado siempre visible (INFO) ─────────────────────
+                        adx_1h    = metrics.get("adx_1h", 0.0)
+                        adx_15m   = metrics.get("adx_15m", 0.0)
+                        vol_ratio = metrics.get("vol_ratio", 0.0)
+                        atr_pct   = metrics.get("atr_1h_pct", 0.0)
+                        rsi       = metrics.get("rsi", 0.0)
+                        log.info(
+                            "[%s] scan | regime=%s signal=%s score=%d | "
+                            "ADX_1h=%.1f ADX_15m=%.1f vol_ratio=%.2f ATR_1h=%.2f%% RSI=%.1f",
+                            symbol,
+                            regime or "—",
+                            signal or "none",
+                            score,
+                            adx_1h, adx_15m, vol_ratio, atr_pct * 100, rsi,
+                        )
+                        # ─────────────────────────────────────────────────────────────
 
                         if not signal or signal not in VALID_SIDES:
                             if signal is not None:
