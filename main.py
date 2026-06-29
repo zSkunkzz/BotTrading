@@ -16,6 +16,12 @@ v4.1:
   - evaluate() devuelve 4 valores: (side, score, regime, metrics)
   - Se loguea ADX_1h, ADX_15m y vol_ratio en nivel INFO con cada señal evaluada.
   - Nivel de log configurable via env LOG_LEVEL (default INFO).
+
+BUG-5 fix:
+  _update_trailing() llamaba telegram.notify() en cada tick que movía el SL.
+  Con LOOP_SLEEP=20s y un rally fuerte podía enviar 100+ mensajes/hora.
+  Fix: _trailing_notified dict + TRAILING_NOTIFY_COOLDOWN (300s) por símbolo.
+  El log INFO sigue escribiéndose en cada tick; solo el Telegram está rate-limitado.
 """
 import logging
 import os
@@ -44,6 +50,11 @@ log = logging.getLogger("main")
 _cooldown: dict[str, float] = {}
 _cooldown_reason: dict[str, str] = {}   # 'tp' | 'sl' | 'sl_fast'
 _manual_alert_cooldown: dict[str, float] = {}
+
+# BUG-5 FIX: rate-limit de notificaciones Telegram para trailing SL.
+# Evita spam de 100+ mensajes/hora en rallies fuertes.
+_trailing_notified: dict[str, float] = {}   # symbol → timestamp última notificación
+TRAILING_NOTIFY_COOLDOWN = 5 * 60          # 5 minutos entre notificaciones por símbolo
 
 COOLDOWN_SL           = 60 * 60       # 60 min — SL normal
 COOLDOWN_SL_FAST      = 15 * 60       # 15 min — SL rápido (score alto + cierre temprano)
@@ -191,7 +202,11 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                     exchange.cancel_all_orders(symbol)
                     exchange.place_stop_order(symbol, "long", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "long", pos["qty"], pos["tp"])
-                    telegram.notify(f"\U0001f53c Trailing SL movido\n{symbol} LONG\nNuevo SL: <code>{new_sl:.6f}</code>")
+                    # BUG-5 FIX: solo notificar si pasaron >5 min desde la última notificación
+                    now = time.time()
+                    if now - _trailing_notified.get(symbol, 0) >= TRAILING_NOTIFY_COOLDOWN:
+                        _trailing_notified[symbol] = now
+                        telegram.notify(f"\U0001f53c Trailing SL movido\n{symbol} LONG\nNuevo SL: <code>{new_sl:.6f}</code>")
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
     else:
@@ -206,7 +221,11 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                     exchange.cancel_all_orders(symbol)
                     exchange.place_stop_order(symbol, "short", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "short", pos["qty"], pos["tp"])
-                    telegram.notify(f"\U0001f53d Trailing SL movido\n{symbol} SHORT\nNuevo SL: <code>{new_sl:.6f}</code>")
+                    # BUG-5 FIX: solo notificar si pasaron >5 min desde la última notificación
+                    now = time.time()
+                    if now - _trailing_notified.get(symbol, 0) >= TRAILING_NOTIFY_COOLDOWN:
+                        _trailing_notified[symbol] = now
+                        telegram.notify(f"\U0001f53d Trailing SL movido\n{symbol} SHORT\nNuevo SL: <code>{new_sl:.6f}</code>")
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
 
