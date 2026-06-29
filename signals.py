@@ -61,6 +61,12 @@ Fixes aplicados:
            → cambiado a c.get('ts', c.get('open_time', 0))
   - Bug 5: guard len(candles_1h) < 220 era incoherente con _READY_MIN['1h']=215;
            bajado a 216 para evitar que el bot nunca evalúe señales
+  - BUG-8: DAILY_CANDLE_GUARD (0.040) estaba definido pero nunca se usaba.
+           En días de movimiento extremo (>4%) el bot entraba sin penalización.
+           Fix: score -= 20 cuando abs_move > DAILY_CANDLE_GUARD.
+  - BUG-10: _rsi_divergence usaba max(i for i, v ...) → tomaba el ÚLTIMO índice
+            igual al pivot, dando divergencias falsas en consolidaciones.
+            Fix: cambiado a min(i for i, v ...) para tomar el primer índice real.
 
 v4.1:
   - evaluate() devuelve 4 valores: (side, score, regime, metrics)
@@ -200,6 +206,14 @@ def _adx(candles: list[dict], period: int = 14) -> float:
 
 
 def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
+    """Detecta divergencias RSI en la ventana de lookback.
+
+    BUG-10 FIX: se usaba max(i for i, v ...) para encontrar el índice del pivot,
+    lo que tomaba el ÚLTIMO índice con ese valor en consolidaciones donde varios
+    cierres tienen el mismo mínimo/máximo → divergencias falsas.
+    Corregido a min(i for i, v ...) para tomar el PRIMER índice del pivot,
+    que es la referencia correcta para medir la divergencia desde el swing real.
+    """
     if len(closes) < lookback + 14 or len(candles) < lookback + 1:
         return None
     rsi_series     = _rsi(closes, 14)
@@ -214,7 +228,8 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
 
     try:
         lo_val = min(recent_closes[:-1])
-        lo_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == lo_val)
+        # BUG-10 FIX: min() en lugar de max() para tomar el primer índice del pivot
+        lo_idx = min(i for i, v in enumerate(recent_closes[:-1]) if v == lo_val)
         if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
             return "bullish"
     except (ValueError, IndexError):
@@ -222,7 +237,8 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
 
     try:
         hi_val = max(recent_closes[:-1])
-        hi_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == hi_val)
+        # BUG-10 FIX: min() en lugar de max() para tomar el primer índice del pivot
+        hi_idx = min(i for i, v in enumerate(recent_closes[:-1]) if v == hi_val)
         if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
             return "bearish"
     except (ValueError, IndexError):
@@ -415,8 +431,6 @@ def evaluate(
     # La precarga trae 220 velas (incluyendo la vela en curso no cerrada).
     # evaluate() trabaja sobre closes[:-1] → necesita 215 velas cerradas + 1 en curso = 216.
     # _READY_MIN["1h"] = 215, coherente con este guard de 216.
-    # El guard anterior de 220 hacía que el bot nunca evaluara señales durante
-    # los primeros ciclos tras el arranque (buffer tenía 215-219 velas).
     if len(candles_15m) < 50 or len(candles_1h) < 216:
         log.debug("[%s] skip: candles insuficientes (15m=%d 1h=%d)", symbol, len(candles_15m), len(candles_1h))
         return None, 0, None, _empty_metrics
@@ -499,7 +513,6 @@ def evaluate(
         "last_vol":  last_vol,
     }
 
-    # Log de estado completo para diagnóstico
     log.debug(
         "[%s] régimen=%s structure=%s | ADX_1h=%.1f ADX_15m=%.1f | "
         "RSI=%.1f MACD_15m=%.5f MACD_1h=%.5f | "
@@ -570,7 +583,17 @@ def evaluate(
             return None, score, None, metrics
 
         abs_move = abs(daily_move)
-        if abs_move > DAILY_CANDLE_PENALTY:
+        if abs_move > DAILY_CANDLE_GUARD:
+            # BUG-8 FIX: penalización severa en días de movimiento extremo (>4%).
+            # DAILY_CANDLE_GUARD estaba definido pero nunca se usaba — el bot
+            # entraba en días de +4% sin ninguna penalización adicional.
+            # -20 es acumulativo con -10 de DAILY_CANDLE_PENALTY si abs_move > PENALTY.
+            score -= 20
+            log.debug(
+                "[%s] daily abs_move=%.2f%% > %.1f%% (GUARD) → penalización -20 (score=%d)",
+                symbol, abs_move * 100, DAILY_CANDLE_GUARD * 100, score,
+            )
+        elif abs_move > DAILY_CANDLE_PENALTY:
             score -= 10
             log.debug(
                 "[%s] daily abs_move=%.2f%% > %.1f%% → penalización -10 (score=%d)",
