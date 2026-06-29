@@ -54,6 +54,11 @@ FIXES aplicados:
      PARTIALLY_FILLED aparecía antes que FILLED en el historial de órdenes. Si
      _get_real_exit_price() lo encontraba primero, calculaba el PnL con precio
      parcial incorrecto. Solo FILLED es ejecución completa válida.
+ 16. BUG-14 FIX — open_order: set_leverage() como safety-net.
+     open_order() llama set_leverage() antes de enviar la orden de mercado.
+     Si falla (leverage ya configurado, error temporal) solo loguea WARNING
+     y continúa — no bloquea la apertura. Cubre reinicios parciales del bot
+     en los que el loop de startup no alcanzó a setear el leverage del símbolo.
 """
 import hashlib
 import hmac
@@ -372,6 +377,15 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     symbol   = symbol or config.SYMBOL
     bx_side  = "BUY"  if side == "long" else "SELL"
     pos_side = "LONG" if side == "long" else "SHORT"
+
+    # BUG-14 FIX: safety-net de leverage antes de abrir la orden.
+    # Cubre reinicios parciales en los que el loop de startup no llegó a setear
+    # el leverage del símbolo. Si falla (ya configurado, error temporal) solo
+    # loguea WARNING y continúa — no bloquea la apertura.
+    try:
+        set_leverage(symbol)
+    except Exception as lev_exc:
+        log.warning("[%s] set_leverage en open_order falló (no crítico): %s", symbol, lev_exc)
 
     info = _get_contract_info(symbol)
     qty  = floor_qty(qty, info["stepSize"])
