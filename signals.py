@@ -57,6 +57,10 @@ Fixes aplicados:
            contar plateaus (velas con mismo high/low) como swings válidos
   - Bug 3: DAILY_CANDLE_GUARD no bloquea días muy fuertes en dirección del régimen;
            en su lugar aplica penalización -10 (igual que DAILY_CANDLE_PENALTY)
+  - Bug 4: _daily_candle_context usaba 'open_time' pero las velas solo tienen 'ts'
+           → cambiado a c.get('ts', c.get('open_time', 0))
+  - Bug 5: guard len(candles_1h) < 220 era incoherente con _READY_MIN['1h']=215;
+           bajado a 216 para evitar que el bot nunca evalúe señales
 
 v4.1:
   - evaluate() devuelve 4 valores: (side, score, regime, metrics)
@@ -331,13 +335,19 @@ def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK)
 
 
 def _daily_candle_context(candles_1h: list[dict]) -> tuple[float, float]:
+    """Devuelve (open_diario, close_actual) usando las velas de 1h.
+
+    FIX Bug4: las velas usan el campo 'ts' (timestamp de apertura en ms),
+    NO 'open_time'. Se busca con c.get('ts', c.get('open_time', 0))
+    para mantener compatibilidad con cualquier fuente de velas.
+    """
     now_utc     = datetime.datetime.now(timezone.utc)
     midnight    = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     midnight_ts = midnight.timestamp() * 1000
 
     today_candles = [
         c for c in candles_1h[:-1]
-        if c.get("open_time", 0) >= midnight_ts
+        if c.get("ts", c.get("open_time", 0)) >= midnight_ts
     ]
 
     if not today_candles:
@@ -401,7 +411,13 @@ def evaluate(
         "atr_1h_pct": 0.0, "rsi": 0.0, "avg_vol": 0.0, "last_vol": 0.0,
     }
 
-    if len(candles_15m) < 50 or len(candles_1h) < 220:
+    # FIX Bug5: guard bajado de 220 a 216.
+    # La precarga trae 220 velas (incluyendo la vela en curso no cerrada).
+    # evaluate() trabaja sobre closes[:-1] → necesita 215 velas cerradas + 1 en curso = 216.
+    # _READY_MIN["1h"] = 215, coherente con este guard de 216.
+    # El guard anterior de 220 hacía que el bot nunca evaluara señales durante
+    # los primeros ciclos tras el arranque (buffer tenía 215-219 velas).
+    if len(candles_15m) < 50 or len(candles_1h) < 216:
         log.debug("[%s] skip: candles insuficientes (15m=%d 1h=%d)", symbol, len(candles_15m), len(candles_1h))
         return None, 0, None, _empty_metrics
 
