@@ -40,20 +40,27 @@ SYMBOLS = [
     "RUNE-USDT",  # #72 CMC — THORChain, cross-chain
 ]
 
+# BUG-22 FIX: SYMBOL singular para compatibilidad con exchange.py y otros módulos
+# que usan `symbol = symbol or config.SYMBOL` como fallback.
+SYMBOL = SYMBOLS[0]
+
 # Pares en modo alerta manual (no se tradean automáticamente)
 MANUAL_ALERT_SYMBOLS: set[str] = set()
 
 # Grupos de correlación.
 # Regla: pares del mismo grupo compiten por MAX_CORR_PER_GROUP slots.
+#
+# BUG-21 FIX: ONDO-USDT y AAVE-USDT aparecían en grupos 3 Y 7.
+# _corr_group_for() devuelve solo el primer grupo → el guard no cubría el grupo 7.
+# Fix: ENA-USDT añadida al grupo 3 (DeFi/oracle tokens); grupo 7 eliminado.
 CORR_GROUPS: list[set[str]] = [
     {"BTC-USDT", "ETH-USDT", "BNB-USDT", "LDO-USDT"},
     {"SOL-USDT", "AVAX-USDT", "APT-USDT", "SUI-USDT", "NEAR-USDT", "TIA-USDT"},
     {"ARB-USDT", "OP-USDT", "DOT-USDT", "ICP-USDT", "POL-USDT", "ZK-USDT", "DYDX-USDT"},
-    {"LINK-USDT", "UNI-USDT", "AERO-USDT", "JUP-USDT", "ONDO-USDT", "AAVE-USDT", "GRT-USDT"},
+    {"LINK-USDT", "UNI-USDT", "AERO-USDT", "JUP-USDT", "ONDO-USDT", "AAVE-USDT", "GRT-USDT", "ENA-USDT"},
     {"XRP-USDT", "XLM-USDT", "TRX-USDT", "HBAR-USDT", "ADA-USDT", "ALGO-USDT"},
     {"FIL-USDT", "RENDER-USDT", "TAO-USDT", "EIGEN-USDT", "FET-USDT", "WLD-USDT"},
     {"ATOM-USDT", "INJ-USDT", "SEI-USDT", "RUNE-USDT"},
-    {"ONDO-USDT", "AAVE-USDT", "ENA-USDT"},
     # Memes puros — alta correlación en días de risk-on
     {"DOGE-USDT", "SHIB-USDT"},
     # Legacy PoW/fork coins — correlacionadas entre sí, NO con memes
