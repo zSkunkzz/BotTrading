@@ -409,14 +409,14 @@ def evaluate(
     )
 
     if effective_regime == "range":
-        log.debug("[%s] skip: régimen=range adx_1h=%.1f", symbol, adx_1h)
+        log.info("[%s] skip: régimen=range adx_1h=%.1f", symbol, adx_1h)
         return None, 0, None
 
     # ── Estructura de precio 1h ────────────────────────────────────────
     structure = _price_structure(candles_1h)
 
     if structure == "range" and adx_1h < ADX_1H_STRUCTURE_MIN:
-        log.debug(
+        log.info(
             "[%s] skip: structure=range + ADX_1h=%.1f < %d → hard-guard",
             symbol, adx_1h, ADX_1H_STRUCTURE_MIN,
         )
@@ -428,10 +428,10 @@ def evaluate(
         ema50_4h  = _ema(closes_4h, 50)[-1]
         price_4h  = closes_4h[-1]
         if effective_regime == "bull" and price_4h < ema50_4h:
-            log.debug("[%s] skip: macro 4h bearish (precio=%.6f < EMA50_4h=%.6f)", symbol, price_4h, ema50_4h)
+            log.info("[%s] skip: macro 4h bearish (precio=%.6f < EMA50_4h=%.6f)", symbol, price_4h, ema50_4h)
             return None, 0, None
         if effective_regime == "bear" and price_4h > ema50_4h:
-            log.debug("[%s] skip: macro 4h bullish (precio=%.6f > EMA50_4h=%.6f)", symbol, price_4h, ema50_4h)
+            log.info("[%s] skip: macro 4h bullish (precio=%.6f > EMA50_4h=%.6f)", symbol, price_4h, ema50_4h)
             return None, 0, None
 
     # ── Indicadores 15m ───────────────────────────────────────────────
@@ -457,7 +457,6 @@ def evaluate(
     atr_1h_val       = _atr(candles_1h[:-1], 14)
     atr_1h_pct       = atr_1h_val / price if price > 0 else 0.0
 
-    # Log de estado completo para diagnóstico
     log.debug(
         "[%s] régimen=%s structure=%s | ADX_1h=%.1f ADX_15m=%.1f | "
         "RSI=%.1f MACD_15m=%.5f MACD_1h=%.5f | "
@@ -475,38 +474,38 @@ def evaluate(
 
     # ── Hard-guards ───────────────────────────────────────────────────
     if price > 0 and atr_15m / price > ATR_VOLATILE_PCT:
-        log.debug("[%s] skip: ATR_15m=%.4f%% > %.1f%% (demasiado volátil)", symbol, atr_15m / price * 100, ATR_VOLATILE_PCT * 100)
+        log.info("[%s] skip: ATR_15m=%.4f%% > %.1f%% (demasiado volátil)", symbol, atr_15m / price * 100, ATR_VOLATILE_PCT * 100)
         return None, 0, None
 
     if adx_15m < ADX_15M_MIN:
-        log.debug("[%s] skip: ADX_15m=%.1f < %d (lateral 15m)", symbol, adx_15m, ADX_15M_MIN)
+        log.info("[%s] skip: ADX_15m=%.1f < %d (lateral 15m)", symbol, adx_15m, ADX_15M_MIN)
         return None, 0, None
 
     if effective_regime == "bull" and price < ema200_1h * (1 - EMA200_MIN_DIST):
-        log.debug("[%s] skip: bull pero precio=%.6f < EMA200_1h=%.6f", symbol, price, ema200_1h)
+        log.info("[%s] skip: bull pero precio=%.6f < EMA200_1h=%.6f", symbol, price, ema200_1h)
         return None, 0, None
     if effective_regime == "bear" and price > ema200_1h * (1 + EMA200_MIN_DIST):
-        log.debug("[%s] skip: bear pero precio=%.6f > EMA200_1h=%.6f", symbol, price, ema200_1h)
+        log.info("[%s] skip: bear pero precio=%.6f > EMA200_1h=%.6f", symbol, price, ema200_1h)
         return None, 0, None
 
     if effective_regime == "bear" and price < ema200_15m * (1 - EMA200_MIN_DIST):
-        log.debug("[%s] skip: bear pero precio=%.6f < EMA200_15m=%.6f (sobreextendido)", symbol, price, ema200_15m)
+        log.info("[%s] skip: bear pero precio=%.6f < EMA200_15m=%.6f (sobreextendido)", symbol, price, ema200_15m)
         return None, 0, None
 
     candle_range = c_high - c_low
     if candle_range > 0 and atr_15m > 0:
         if candle_range > NO_CHASE_MULT * atr_15m:
-            log.debug("[%s] skip: no-chase rango_vela=%.6f > %.1f*ATR=%.6f", symbol, candle_range, NO_CHASE_MULT, atr_15m)
+            log.info("[%s] skip: no-chase rango_vela=%.6f > %.1f*ATR=%.6f", symbol, candle_range, NO_CHASE_MULT, atr_15m)
             return None, 0, None
 
     if price > 0 and ema20_15m > 0:
         dist_ema20 = abs(price - ema20_15m) / price
         if dist_ema20 > PULLBACK_EMA20_DIST:
             if effective_regime == "bull" and price > ema20_15m:
-                log.debug("[%s] skip: sobreextendido sobre EMA20_15m dist=%.2f%%", symbol, dist_ema20 * 100)
+                log.info("[%s] skip: sobreextendido sobre EMA20_15m dist=%.2f%%", symbol, dist_ema20 * 100)
                 return None, 0, None
             if effective_regime == "bear" and price < ema20_15m:
-                log.debug("[%s] skip: sobreextendido bajo EMA20_15m dist=%.2f%%", symbol, dist_ema20 * 100)
+                log.info("[%s] skip: sobreextendido bajo EMA20_15m dist=%.2f%%", symbol, dist_ema20 * 100)
                 return None, 0, None
 
     # ── Score mínimo dinámico por volatilidad (v4) ───────────────────
@@ -521,10 +520,10 @@ def evaluate(
     if open_daily > 0:
         daily_move = (close_today - open_daily) / open_daily
         if effective_regime == "bull" and daily_move < -DAILY_CANDLE_BLOCK:
-            log.debug("[%s] skip: daily_move=%.2f%% < -%.1f%% en régimen bull", symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100)
+            log.info("[%s] skip: daily_move=%.2f%% < -%.1f%% en régimen bull", symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100)
             return None, score, None
         if effective_regime == "bear" and daily_move > DAILY_CANDLE_BLOCK:
-            log.debug("[%s] skip: daily_move=%.2f%% > +%.1f%% en régimen bear", symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100)
+            log.info("[%s] skip: daily_move=%.2f%% > +%.1f%% en régimen bear", symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100)
             return None, score, None
 
         abs_move = abs(daily_move)
@@ -558,7 +557,7 @@ def evaluate(
             score -= 8
             log.debug("[%s] RSI=%.1f sobrecomprado → -8 (score=%d)", symbol, rsi, score)
             if rsi > 80:
-                log.debug("[%s] skip: RSI=%.1f > 80 (sobrecomprado extremo)", symbol, rsi)
+                log.info("[%s] skip: RSI=%.1f > 80 (sobrecomprado extremo)", symbol, rsi)
                 return None, score, None
         else:
             log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
@@ -567,7 +566,7 @@ def evaluate(
             score += 8
             log.debug("[%s] RSI=%.1f en zona ideal bear → +8 (score=%d)", symbol, rsi, score)
         elif rsi < 30:
-            log.debug("[%s] skip: RSI=%.1f < 30 (sobrevendido en bear)", symbol, rsi)
+            log.info("[%s] skip: RSI=%.1f < 30 (sobrevendido en bear)", symbol, rsi)
             return None, score, None
         else:
             log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
@@ -585,7 +584,7 @@ def evaluate(
         log.debug("[%s] ADX_1h=%.1f < 20 → +0 (score=%d)", symbol, adx_1h, score)
 
     if effective_regime == "bear" and adx_1h < 22:
-        log.debug("[%s] skip: bear + ADX_1h=%.1f < 22 → hard-guard short", symbol, adx_1h)
+        log.info("[%s] skip: bear + ADX_1h=%.1f < 22 → hard-guard short", symbol, adx_1h)
         return None, score, None
 
     if effective_regime == "bull" and macd_hist > 0:
@@ -644,7 +643,7 @@ def evaluate(
 
     # ── Score mínimo ──────────────────────────────────────────────────
     min_required = min_required_base + (SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0)
-    log.debug(
+    log.info(
         "[%s] SCORE FINAL=%d | min_required=%d (base=%d vol_bump=%d proto_bump=%d short_extra=%d) | "
         "ADX_1h=%.1f ADX_15m=%.1f vol_ratio=%.2f ATR_1h=%.4f%%",
         symbol, score, min_required, min_score, vol_bump, proto_bump,
