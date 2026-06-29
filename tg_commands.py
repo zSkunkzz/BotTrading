@@ -20,8 +20,6 @@ FIX: _cmd_posiciones formatea sl/tp con fallback 'N/A' si son None (posición
      abierta sin SL/TP colocado por error en exchange).
 FIX: _poll strip del sufijo @botname en comandos (e.g. /status@MiBot).
 FIX: pop_manual_signal añadida — referenciada en main.py pero no existía.
-FIX BUG-18: edited_message ignorado — procesar solo 'message', no mensajes
-     editados. Editar un /long o /short antiguo NO relanza la orden.
 """
 import csv
 import logging
@@ -287,9 +285,7 @@ def _poll() -> None:
             )
             for update in resp.json().get("result", []):
                 _offset = update["update_id"] + 1
-                # FIX BUG-18: ignorar edited_message — editar un /long o /short
-                # antiguo NO debe relanzar la orden. Solo procesar 'message'.
-                msg = update.get("message")
+                msg  = update.get("message") or update.get("edited_message")
                 if not msg:
                     continue
                 parts   = msg.get("text", "").strip().split()

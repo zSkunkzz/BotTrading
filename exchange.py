@@ -12,12 +12,8 @@ FIXES aplicados:
   4. calc_qty() aplica floor al step size de cada símbolo para no enviar qty
      que BingX rechaza por precisión decimal.
   5. cancel_all_orders usa DELETE (no POST) — BingX exige DELETE para este endpoint.
-  6. get_ohlcv: el endpoint /openApi/swap/v3/quote/klines devuelve cada vela como un
-     ARRAY de 11 elementos (doc oficial BingX):
-       [0]=open_time [1]=open [2]=high [3]=low [4]=close [5]=volume
-       [6]=close_time [7]=quote_vol [8]=trades [9]=taker_buy_base [10]=taker_buy_quote
-     Antes se accedía a c["open"] etc. como si fuera un dict → KeyError silenciado.
-     Ahora se parsea por índice. Se incluye 'ts' (= c[0]) para deduplicación en ws_feed.
+  6. get_ohlcv incluye el timestamp 'ts' en cada vela para que ws_feed pueda
+     deduplicar correctamente al mezclar velas REST con las del WebSocket.
   7. get_all_positions() obtiene TODAS las posiciones abiertas en 1 sola llamada
      (sin 'symbol'), reduciendo 74 llamadas por loop a 1.
      FIX: si la llamada falla, lanza excepción en vez de devolver {} silencioso
@@ -44,21 +40,6 @@ FIXES aplicados:
  13. FIX C — get_closed_orders: añadidos startTime/endTime obligatorios.
      Doc oficial: sin rango temporal BingX puede devolver error 109400.
      Se incluye startTime=ahora-7d, endTime=ahora en cada llamada.
- 14. FIX D — get_ohlcv: velas son arrays, no dicts.
-     Doc oficial GET /openApi/swap/v3/quote/klines: cada vela es un array de 11
-     elementos indexados por posición, NO un objeto con claves "open"/"high"/etc.
-     Se parsea ahora por índice: c[0]=ts, c[1]=open, c[2]=high, c[3]=low, c[4]=close,
-     c[5]=volume. Esto afectaba a TODO el bot (signals, risk, trailing, BE) porque
-     ninguna vela tenía datos reales — todas las velas eran dicts vacíos.
- 15. BUG-13 FIX — get_closed_orders: eliminado PARTIALLY_FILLED del set terminal.
-     PARTIALLY_FILLED aparecía antes que FILLED en el historial de órdenes. Si
-     _get_real_exit_price() lo encontraba primero, calculaba el PnL con precio
-     parcial incorrecto. Solo FILLED es ejecución completa válida.
- 16. BUG-14 FIX — open_order: set_leverage() como safety-net.
-     open_order() llama set_leverage() antes de enviar la orden de mercado.
-     Si falla (leverage ya configurado, error temporal) solo loguea WARNING
-     y continúa — no bloquea la apertura. Cubre reinicios parciales del bot
-     en los que el loop de startup no alcanzó a setear el leverage del símbolo.
 """
 import hashlib
 import hmac
@@ -72,7 +53,7 @@ import config
 
 log = logging.getLogger("exchange")
 
-# ── Firma ────────────────────────────────────────────────────────────────────────────────────────
+# ── Firma ─────────────────────────────────────────────────────────────────────────────────
 
 def _sign(params: dict) -> str:
     """Firma la query string tal como la construye urllib / BingX."""
@@ -88,7 +69,7 @@ def _headers() -> dict:
     return {"X-BX-APIKEY": config.API_KEY}
 
 
-# ── HTTP helpers con reintentos ────────────────────────────────────────────
+# ── HTTP helpers con reintentos ────────────────────────────────────────────────
 
 _RETRIES    = 3
 _RETRY_WAIT = 1.0
@@ -143,7 +124,7 @@ def _delete(path: str, params: dict = None) -> dict:
     return _request("DELETE", path, params or {})
 
 
-# ── Balance real ───────────────────────────────────────────────────────────────────
+# ── Balance real ───────────────────────────────────────────────────────────────
 
 def get_balance() -> float:
     """Devuelve el equity real (balance + PnL no realizado) de la cuenta USDT.
@@ -160,6 +141,7 @@ def get_balance() -> float:
     try:
         resp = _get("/openApi/swap/v3/user/balance", {})
         items = resp.get("data") or []
+        # Buscar el asset USDT; si solo hay uno, usarlo directamente
         usdt = next(
             (x for x in items if str(x.get("asset", "")).upper() == "USDT"),
             items[0] if items else None,
@@ -177,7 +159,7 @@ def get_balance() -> float:
         return 0.0
 
 
-# ── Precio ────────────────────────────────────────────────────────────────────────────────────────
+# ── Precio ─────────────────────────────────────────────────────────────────────────────────
 
 def get_price(symbol: str = None) -> float:
     symbol = symbol or config.SYMBOL
@@ -185,28 +167,13 @@ def get_price(symbol: str = None) -> float:
     return float(data["data"]["price"])
 
 
-# ── OHLCV ──────────────────────────────────────────────────────────────────────────────────────────
+# ── OHLCV ──────────────────────────────────────────────────────────────────────────────────
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
     """Devuelve lista de velas [{ts, open, high, low, close, volume}] más reciente al final.
 
-    FIX D — Doc oficial BingX GET /openApi/swap/v3/quote/klines:
-    Cada vela es un ARRAY de 11 elementos indexados por posición:
-      c[0] = open time (ms)
-      c[1] = open price
-      c[2] = high price
-      c[3] = low price
-      c[4] = close price
-      c[5] = volume (base asset)
-      c[6] = close time (ms)
-      c[7] = quote asset volume
-      c[8] = number of trades
-      c[9] = taker buy base asset volume
-      c[10]= taker buy quote asset volume
-
-    Antes se accedía a c["open"], c["high"]... como si fuera un dict.
-    Ese error hacía que todas las velas tuvieran campos con valor 0 (KeyError silenciado),
-    rompiendo silenciosamente signals, risk, trailing y break-even.
+    FIX: se incluye 'ts' (timestamp en ms) para que ws_feed pueda deduplicar
+    correctamente las velas precargadas REST con las que llegan por WebSocket.
     """
     symbol   = symbol or config.SYMBOL
     interval = interval or config.TIMEFRAME
@@ -216,24 +183,20 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
         "limit":    limit,
     })
     candles = []
-    for c in (data.get("data") or []):
-        # c es una lista: [open_time, open, high, low, close, volume, close_time, ...]
-        try:
-            candles.append({
-                "ts":     int(c[0]),
-                "open":   float(c[1]),
-                "high":   float(c[2]),
-                "low":    float(c[3]),
-                "close":  float(c[4]),
-                "volume": float(c[5]),
-                "closed": True,
-            })
-        except (IndexError, TypeError, ValueError) as exc:
-            log.warning("get_ohlcv: vela malformada ignorada: %s — %s", c, exc)
+    for c in data["data"]:
+        candles.append({
+            "ts":     int(c.get("time", c.get("t", 0))),
+            "open":   float(c["open"]),
+            "high":   float(c["high"]),
+            "low":    float(c["low"]),
+            "close":  float(c["close"]),
+            "volume": float(c["volume"]),
+            "closed": True,
+        })
     return candles
 
 
-# ── Info de contrato (step size / min qty) ──────────────────────────────────────────────
+# ── Info de contrato (step size / min qty) ────────────────────────────────────────────
 
 _contract_info_cache: dict[str, dict] = {}
 
@@ -274,7 +237,7 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
     return (qty * price) >= min_usdt
 
 
-# ── Posiciones ──────────────────────────────────────────────────────────────────────────────────────────
+# ── Posiciones ─────────────────────────────────────────────────────────────────────────────
 
 # Mapa de positionSide (hedge mode) a valor interno del bot
 _POSITION_SIDE_MAP = {
@@ -353,7 +316,7 @@ def get_position(symbol: str = None) -> dict | None:
     return None
 
 
-# ── Apalancamiento ──────────────────────────────────────────────────────────────────────────────────────────
+# ── Apalancamiento ──────────────────────────────────────────────────────────────────────────
 
 def set_leverage(symbol: str = None, leverage: int = None) -> None:
     symbol   = symbol or config.SYMBOL
@@ -371,21 +334,12 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
     log.info("Leverage seteado a %dx en %s", leverage, symbol)
 
 
-# ── Abrir orden ──────────────────────────────────────────────────────────────────────────────────────────────
+# ── Abrir orden ────────────────────────────────────────────────────────────────────────────────
 
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
     symbol   = symbol or config.SYMBOL
     bx_side  = "BUY"  if side == "long" else "SELL"
     pos_side = "LONG" if side == "long" else "SHORT"
-
-    # BUG-14 FIX: safety-net de leverage antes de abrir la orden.
-    # Cubre reinicios parciales en los que el loop de startup no llegó a setear
-    # el leverage del símbolo. Si falla (ya configurado, error temporal) solo
-    # loguea WARNING y continúa — no bloquea la apertura.
-    try:
-        set_leverage(symbol)
-    except Exception as lev_exc:
-        log.warning("[%s] set_leverage en open_order falló (no crítico): %s", symbol, lev_exc)
 
     info = _get_contract_info(symbol)
     qty  = floor_qty(qty, info["stepSize"])
@@ -453,37 +407,24 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
     log.info("TP colocado en %.6f (%s %s)", tp_price, side.upper(), symbol)
 
 
-# ── Cerrar posición ────────────────────────────────────────────────────────────────────────────────────────────
+# ── Cerrar posición ────────────────────────────────────────────────────────────────────────────
 
-def close_position(side: str = None, qty: float = None, symbol: str = None) -> dict:
-    """Cierra la posición abierta del símbolo con una orden MARKET.
-
-    Acepta side/qty opcionales para compatibilidad con el rollback en main.py,
-    pero usa closePosition=true para garantizar el cierre completo independientemente
-    de la qty exacta (evita errores por qty desactualizada).
-    """
-    symbol = symbol or config.SYMBOL
-    if side is None:
-        pos = get_position(symbol)
-        if pos is None:
-            log.info("close_position: no hay posición abierta en %s", symbol)
-            return {}
-        side = pos["side"]
-
+def close_position(side: str, qty: float, symbol: str = None) -> dict:
+    symbol   = symbol or config.SYMBOL
     bx_side  = "SELL" if side == "long" else "BUY"
     pos_side = "LONG" if side == "long" else "SHORT"
     resp = _post("/openApi/swap/v2/trade/order", {
-        "symbol":        symbol,
-        "side":          bx_side,
-        "positionSide":  pos_side,
-        "type":          "MARKET",
-        "closePosition": "true",
+        "symbol":       symbol,
+        "side":         bx_side,
+        "positionSide": pos_side,
+        "type":         "MARKET",
+        "quantity":     qty,
     })
     log.info("Posición cerrada: %s %s", side.upper(), symbol)
     return resp
 
 
-# ── Cancelar órdenes abiertas ────────────────────────────────────────────────────────────────────────────────
+# ── Cancelar órdenes abiertas ─────────────────────────────────────────────────────────────────
 
 def cancel_all_orders(symbol: str = None) -> None:
     """FIX: BingX exige DELETE (no POST) para cancelar todas las órdenes abiertas.
@@ -494,7 +435,7 @@ def cancel_all_orders(symbol: str = None) -> None:
     log.info("Órdenes canceladas para %s", symbol)
 
 
-# ── Historial de órdenes cerradas ────────────────────────────────────────────────────────────────────────────
+# ── Historial de órdenes cerradas ─────────────────────────────────────────────────────────────
 
 def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
     """Devuelve órdenes ejecutadas/cerradas del símbolo para obtener el precio real
@@ -510,12 +451,6 @@ def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
       Sin rango temporal BingX puede devolver error 109400. Se incluyen
       startTime=ahora-7d y endTime=ahora en cada llamada. El rango máximo
       permitido es 7 días; nunca se supera.
-
-    BUG-13 FIX — eliminado PARTIALLY_FILLED del set terminal.
-      PARTIALLY_FILLED aparecía antes que FILLED en el historial. Si
-      _get_real_exit_price() lo encontraba primero, calculaba el PnL con
-      precio parcial incorrecto. Solo FILLED es ejecución completa válida
-      para calcular precio de salida real.
 
     limit es obligatorio (doc oficial); valor por defecto elevado a 20 para
     mayor cobertura en _get_real_exit_price() y _get_position_open_ts().
@@ -537,7 +472,5 @@ def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
     # data es directamente un array — doc oficial BingX allOrders v2
     raw = data.get("data") or []
 
-    # BUG-13 FIX: PARTIALLY_FILLED eliminado — solo FILLED es ejecución completa válida.
-    # PARTIALLY_CANCELED mantenido porque indica cierre parcial + cancelación del resto.
-    terminal = {"FILLED", "CANCELED", "PARTIALLY_CANCELED"}
+    terminal = {"FILLED", "CANCELED", "PARTIALLY_FILLED", "PARTIALLY_CANCELED"}
     return [o for o in raw if str(o.get("status", "")).upper() in terminal]

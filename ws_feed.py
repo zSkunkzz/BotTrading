@@ -3,22 +3,10 @@
 Suscribe todos los pares a streams de klines 15m, 1h y 4h.
 Mantiene un buffer de velas en memoria que signals.py consume.
 
-FIX Bug3: Las velas precargadas por REST y las recibidas por WS ahora incluyen
-siempre el campo 'open_time' (alias de 'ts') para que signals._daily_candle_context
-pueda filtrar las velas del día actual correctamente. Sin este fix, el contexto
-diario nunca funcionaba porque buscaba 'open_time' y las velas solo tenían 'ts'.
-
-FIX Bug4: STALE check diferenciado por timeframe:
-  - 15m: STALE_THRESHOLD_15M = 4 min (si el WS no manda nada en 4 min, hay problema)
-  - 1h:  STALE_THRESHOLD_1H  = 6 min (WS reenvía vela 1h en curso cada ~5s con movimiento;
-          en mercados quietos puede tardar más, 6 min da margen suficiente)
-  - 4h:  SIN stale check (emite vela nueva cada 4 horas; cualquier umbral de minutos
-          haría que ready() devuelva False permanentemente)
-
-FIX BUG-16: La vela anterior se marca closed=True SOLO cuando kline.confirm=True
-  en el mensaje WS, no por simple cambio de timestamp. Previene que el último
-  tick de una vela se marque incorrectamente cerrado antes de que BingX confirme
-  el cierre oficial.
+FIX: se añade _last_update[symbol][tf] que registra el timestamp de la última
+vela recibida. ready() devuelve False si los datos de 15m o 1h tienen más de
+STALE_THRESHOLD segundos sin actualizarse, evitando que el bot evalúe señales
+con datos obsoletos cuando el WebSocket se cae sin reconectar.
 
 Uso:
     feed = KlineFeed(config.SYMBOLS)
@@ -52,11 +40,13 @@ PRELOAD_WORKERS = 8
 _READY_MIN = {"15m": 120, "1h": 215}
 _PRELOAD   = {"15m": 120, "1h": 220, "4h": 70}
 
-# FIX Bug4: umbrales de frescura diferenciados por timeframe.
-# 4h NO tiene stale check: las velas de 4h solo se emiten cada 4 horas,
-# cualquier umbral en minutos descartaría todos los símbolos permanentemente.
-STALE_THRESHOLD_15M = 4 * 60   # 4 minutos
-STALE_THRESHOLD_1H  = 6 * 60   # 6 minutos
+# FIX #4: STALE_THRESHOLD reducido de 10 min a 4 min.
+# El loop principal corre cada 20s. Con 10 min el bot podía evaluar señales
+# con datos de hasta 9 min de antigüedad tras una caída del WS, abriendo
+# posiciones sobre precios que ya se habían movido significativamente.
+# Con 4 min (≈2 velas de 15m sin confirmar) se detecta la caída antes
+# de que los datos sean peligrosamente obsoletos.
+STALE_THRESHOLD = 4 * 60  # 4 minutos
 
 
 class KlineFeed:
@@ -68,7 +58,8 @@ class KlineFeed:
             for s in symbols
         }
         # Timestamp (time.time()) de la última actualización por símbolo y tf.
-        # Inicializado a 0; la precarga REST lo actualiza al terminar.
+        # Se inicializa a 0. La precarga REST lo actualiza al terminar para que
+        # los símbolos no aparezcan como obsoletos nada más arrancar.
         self._last_update: dict[str, dict[str, float]] = {
             s: {tf: 0.0 for tf in TIMEFRAMES}
             for s in symbols
@@ -89,8 +80,9 @@ class KlineFeed:
     def ready(self, symbol: str) -> bool:
         """True si tenemos velas suficientes en 15m y 1h Y los datos son frescos.
 
-        FIX Bug4: stale check solo para 15m y 1h, con umbrales distintos.
-        El timeframe 4h no tiene stale check (velas cada 4 horas).
+        FIX: comprueba que la última actualización de 15m y 1h fue hace menos
+        de STALE_THRESHOLD segundos. Si el WebSocket lleva más tiempo sin enviar
+        datos para este símbolo, devuelve False y el bot omite la evaluación.
         """
         with self._lock:
             has_enough = (
@@ -104,21 +96,13 @@ class KlineFeed:
             age_15m = now - self._last_update[symbol]["15m"]
             age_1h  = now - self._last_update[symbol]["1h"]
 
-            if age_15m > STALE_THRESHOLD_15M:
+            if age_15m > STALE_THRESHOLD or age_1h > STALE_THRESHOLD:
                 log.warning(
-                    "[%s] Datos 15m obsoletos: %.0fs sin actualizar (umbral %ds)",
-                    symbol, age_15m, STALE_THRESHOLD_15M,
+                    "[%s] Datos obsoletos: 15m=%.0fs 1h=%.0fs sin actualizar (umbral %ds)",
+                    symbol, age_15m, age_1h, STALE_THRESHOLD,
                 )
                 return False
 
-            if age_1h > STALE_THRESHOLD_1H:
-                log.warning(
-                    "[%s] Datos 1h obsoletos: %.0fs sin actualizar (umbral %ds)",
-                    symbol, age_1h, STALE_THRESHOLD_1H,
-                )
-                return False
-
-            # 4h: sin stale check
             return True
 
     def ready_count(self) -> int:
@@ -144,15 +128,9 @@ class KlineFeed:
     def _preload_one(self, symbol: str, tf: str, limit: int) -> None:
         try:
             candles = exchange.get_ohlcv(symbol, interval=tf, limit=limit)
-            # FIX Bug3: añadir 'open_time' = 'ts' para que signals._daily_candle_context
-            # filtre las velas del día actual. exchange.get_ohlcv() solo emite 'ts';
-            # 'open_time' es el campo que buscaba signals y devolvía 0 siempre.
-            for c in candles:
-                if "open_time" not in c:
-                    c["open_time"] = c.get("ts", 0)
             with self._lock:
                 self._data[symbol][tf].extend(candles)
-                # Marcar como actualizado para que ready() no descarte los datos
+                # Marcar como actualizado para que ready() no lo descarte
                 # inmediatamente tras la precarga REST.
                 self._last_update[symbol][tf] = time.time()
             log.debug("[%s %s] precargadas %d velas", symbol, tf, len(candles))
@@ -234,36 +212,26 @@ class KlineFeed:
             if not isinstance(kline, dict):
                 return
 
-            confirmed = bool(kline.get("confirm", False))
-            ts = int(kline.get("T", kline.get("t", 0)))
             candle = {
-                "ts":        ts,
-                "open_time": ts,   # FIX Bug3: alias para signals._daily_candle_context
-                "open":      float(kline["o"]),
-                "high":      float(kline["h"]),
-                "low":       float(kline["l"]),
-                "close":     float(kline["c"]),
-                "volume":    float(kline["v"]),
-                # FIX BUG-16: closed=True solo cuando BingX confirma el cierre
-                # de la vela (confirm=True). No marcar cerrada por cambio de ts.
-                "closed":    confirmed,
+                "ts":     int(kline.get("T", kline.get("t", 0))),
+                "open":   float(kline["o"]),
+                "high":   float(kline["h"]),
+                "low":    float(kline["l"]),
+                "close":  float(kline["c"]),
+                "volume": float(kline["v"]),
+                "closed": bool(kline.get("confirm", False)),
             }
 
             with self._lock:
                 buf = self._data[symbol][tf]
                 if buf and buf[-1]["ts"] == candle["ts"]:
-                    # Misma vela: actualizar in-place
                     buf[-1] = candle
                 else:
-                    # Nueva vela: la anterior solo se marca closed si BingX la confirmó
-                    if buf and not buf[-1].get("closed", False):
-                        if confirmed:
-                            # El mensaje de apertura de nueva vela a veces lleva
-                            # confirm=True de la anterior; marcamos la anterior cerrada.
-                            buf[-1] = dict(buf[-1], closed=True)
-                        # Si confirmed=False, dejamos la anterior sin marcar cerrada
-                        # hasta que llegue su propio confirm=True.
-                    buf.append(candle)
+                    if not buf or buf[-1].get("closed", True):
+                        buf.append(candle)
+                    else:
+                        buf[-1] = dict(buf[-1], closed=True)
+                        buf.append(candle)
 
                 # Actualizar timestamp de frescura en cada mensaje recibido
                 self._last_update[symbol][tf] = time.time()
