@@ -132,3 +132,563 @@ def _rsi(closes: list[float], period: int = 14) -> list[float]:
     avg_loss = sum(-d for d in deltas[:period] if d < 0) / period
     for i in range(period, len(closes)):
         delta = deltas[i - 1]
+        avg_gain = (avg_gain * (period - 1) + max(delta, 0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-delta, 0)) / period
+        rs = avg_gain / avg_loss if avg_loss else float("inf")
+        rsi[i] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + rs))
+    return rsi
+
+
+def _macd_histogram(closes: list[float], fast=12, slow=26, signal=9) -> list[float]:
+    ema_fast  = _ema(closes, fast)
+    ema_slow  = _ema(closes, slow)
+    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+    sig_line  = _ema(macd_line, signal)
+    return [m - s for m, s in zip(macd_line, sig_line)]
+
+
+def _atr(candles: list[dict], period: int = 14) -> float:
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-period:]) / min(period, len(trs)) if trs else 0.0
+
+
+def _adx(candles: list[dict], period: int = 14) -> float:
+    if len(candles) < period + 2:
+        return 0.0
+    plus_dm, minus_dm, tr_list = [], [], []
+    for i in range(1, len(candles)):
+        h, l   = candles[i]["high"],   candles[i]["low"]
+        ph, pl = candles[i-1]["high"], candles[i-1]["low"]
+        pc     = candles[i-1]["close"]
+        up, down = h - ph, pl - l
+        plus_dm.append(up   if up > down and up > 0   else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+        tr_list.append(max(h - l, abs(h - pc), abs(l - pc)))
+
+    def _smooth(lst):
+        s = sum(lst[:period])
+        out = [s]
+        for v in lst[period:]:
+            s = s - s / period + v
+            out.append(s)
+        return out
+
+    atr_s = _smooth(tr_list)
+    pdm_s = _smooth(plus_dm)
+    mdm_s = _smooth(minus_dm)
+    dx_vals = []
+    for a, p, m in zip(atr_s, pdm_s, mdm_s):
+        if a == 0:
+            dx_vals.append(0.0)
+            continue
+        pdi = 100 * p / a
+        mdi = 100 * m / a
+        dx_vals.append(100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0.0)
+    if len(dx_vals) < period:
+        return 0.0
+    adx = sum(dx_vals[:period]) / period
+    for dx in dx_vals[period:]:
+        adx = (adx * (period - 1) + dx) / period
+    return adx
+
+
+def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
+    if len(closes) < lookback + 14 or len(candles) < lookback + 1:
+        return None
+    rsi_series     = _rsi(closes, 14)
+    recent_closes  = closes[-lookback:]
+    recent_rsi     = rsi_series[-lookback:]
+    recent_candles = candles[-lookback:]
+
+    avg_vol  = sum(c["volume"] for c in recent_candles[:-1]) / max(1, len(recent_candles) - 1)
+    last_vol = recent_candles[-1].get("volume", 0.0)
+    if avg_vol > 0 and last_vol < avg_vol * 0.6:
+        return None
+
+    try:
+        lo_val = min(recent_closes[:-1])
+        lo_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == lo_val)
+        if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
+            return "bullish"
+    except (ValueError, IndexError):
+        pass
+
+    try:
+        hi_val = max(recent_closes[:-1])
+        hi_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == hi_val)
+        if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
+            return "bearish"
+    except (ValueError, IndexError):
+        pass
+
+    return None
+
+
+def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
+    """Detecta régimen de mercado.
+
+    v4: Devuelve 'proto_bull' o 'proto_bear' cuando la estructura de swings
+    confirma la dirección pero las EMAs aún no están completamente ordenadas.
+    """
+    closes        = [c["close"] for c in candles_1h]
+    closes_closed = closes[:-1]
+    ema20  = _ema(closes_closed, 20)[-1]
+    ema50  = _ema(closes_closed, 50)[-1]
+    ema200 = _ema(closes_closed, 200)[-1]
+    adx    = _adx(candles_1h[:-1], 14)
+    price  = closes[-2] if len(closes) >= 2 else closes[-1]
+
+    if price > ema20 > ema50 > ema200:
+        return "bull", adx
+    if price < ema20 < ema50 < ema200:
+        return "bear", adx
+    if price > ema200 and price > ema50 and ema20 > ema200:
+        return "bull", adx
+    if price < ema200 and price < ema50 and ema20 < ema200:
+        return "bear", adx
+
+    if adx >= PROTO_ADX_MIN:
+        structure = _price_structure(candles_1h)
+        if structure == "bull" and price > ema200:
+            log.debug(
+                "[regime] proto_bull detectado (structure=bull price=%.6f > EMA200=%.6f adx=%.1f)",
+                price, ema200, adx,
+            )
+            return "proto_bull", adx
+        if structure == "bear" and price < ema200:
+            log.debug(
+                "[regime] proto_bear detectado (structure=bear price=%.6f < EMA200=%.6f adx=%.1f)",
+                price, ema200, adx,
+            )
+            return "proto_bear", adx
+
+    return "range", adx
+
+
+def _find_swing_highs(highs: list[float], wing: int = 2) -> list[int]:
+    pivots = []
+    for i in range(wing, len(highs) - wing):
+        if all(highs[i] > highs[i - j] for j in range(1, wing + 1)) and \
+           all(highs[i] > highs[i + j] for j in range(1, wing + 1)):
+            pivots.append(i)
+    return pivots
+
+
+def _find_swing_lows(lows: list[float], wing: int = 2) -> list[int]:
+    pivots = []
+    for i in range(wing, len(lows) - wing):
+        if all(lows[i] < lows[i - j] for j in range(1, wing + 1)) and \
+           all(lows[i] < lows[i + j] for j in range(1, wing + 1)):
+            pivots.append(i)
+    return pivots
+
+
+def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK) -> str:
+    closed = candles_1h[:-1]
+    if len(closed) < lookback + 4:
+        return "range"
+
+    recent = closed[-(lookback + 4):]
+    highs  = [c["high"]  for c in recent]
+    lows   = [c["low"]   for c in recent]
+
+    swing_high_idxs = _find_swing_highs(highs, wing=2)
+    swing_low_idxs  = _find_swing_lows(lows,  wing=2)
+
+    if len(swing_high_idxs) < 2 or len(swing_low_idxs) < 2:
+        return "range"
+
+    swing_high_vals = [highs[i] for i in swing_high_idxs]
+    swing_low_vals  = [lows[i]  for i in swing_low_idxs]
+
+    hh_count = sum(
+        1 for i in range(1, len(swing_high_vals))
+        if swing_high_vals[i] > swing_high_vals[i - 1] * 1.001
+    )
+    hl_count = sum(
+        1 for i in range(1, len(swing_low_vals))
+        if swing_low_vals[i] > swing_low_vals[i - 1] * 1.001
+    )
+    lh_count = sum(
+        1 for i in range(1, len(swing_high_vals))
+        if swing_high_vals[i] < swing_high_vals[i - 1] * 0.999
+    )
+    ll_count = sum(
+        1 for i in range(1, len(swing_low_vals))
+        if swing_low_vals[i] < swing_low_vals[i - 1] * 0.999
+    )
+
+    n = SWING_CONFIRM_COUNT
+
+    if hh_count >= n and hl_count >= n:
+        return "bull"
+    if lh_count >= n and ll_count >= n:
+        return "bear"
+    return "range"
+
+
+def _daily_candle_context(candles_1h: list[dict]) -> tuple[float, float]:
+    now_utc     = datetime.datetime.now(timezone.utc)
+    midnight    = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight_ts = midnight.timestamp() * 1000
+
+    today_candles = [
+        c for c in candles_1h[:-1]
+        if c.get("open_time", 0) >= midnight_ts
+    ]
+
+    if not today_candles:
+        if len(candles_1h) >= 2:
+            c = candles_1h[-2]
+            return c["open"], c["close"]
+        return 0.0, 0.0
+
+    open_daily  = today_candles[0]["open"]
+    close_today = today_candles[-1]["close"]
+    return open_daily, close_today
+
+
+def _liquidity_ok(candles_1h: list[dict]) -> bool:
+    recent = candles_1h[-25:-1]
+    if not recent:
+        return False
+    avg_vol = sum(c.get("volume", 0.0) for c in recent) / len(recent)
+    return avg_vol >= MIN_HOURLY_VOLUME
+
+
+def _dynamic_min_score_bump(candles_1h: list[dict], price: float) -> int:
+    if price <= 0 or len(candles_1h) < 16:
+        return 0
+    atr_1h = _atr(candles_1h[:-1], period=14)
+    if atr_1h <= 0:
+        return 0
+    atr_pct = atr_1h / price
+    if atr_pct > ATR_HIGH_VOL_PCT:
+        log.debug(
+            "[vol] ATR_1h=%.4f%% > %.1f%% → min_score +%d (alta volatilidad)",
+            atr_pct * 100, ATR_HIGH_VOL_PCT * 100, ATR_HIGH_VOL_BUMP,
+        )
+        return ATR_HIGH_VOL_BUMP
+    if atr_pct < ATR_LOW_VOL_PCT:
+        log.debug(
+            "[vol] ATR_1h=%.4f%% < %.1f%% → min_score +%d (baja volatilidad)",
+            atr_pct * 100, ATR_LOW_VOL_PCT * 100, ATR_LOW_VOL_BUMP,
+        )
+        return ATR_LOW_VOL_BUMP
+    return 0
+
+
+def evaluate(
+    candles_15m: list[dict],
+    candles_1h:  list[dict],
+    candles_4h:  list[dict] | None = None,
+    min_score:   int = MIN_SCORE,
+    symbol:      str = "???",
+) -> tuple:
+    """Evalúa si hay señal de entrada.
+
+    Devuelve (side, score, regime, metrics) donde:
+      side    : 'long' | 'short' | None
+      score   : int
+      regime  : str | None
+      metrics : dict con adx_1h, adx_15m, vol_ratio, atr_1h_pct, rsi, avg_vol, last_vol
+    """
+    _empty_metrics: dict = {
+        "adx_1h": 0.0, "adx_15m": 0.0, "vol_ratio": 0.0,
+        "atr_1h_pct": 0.0, "rsi": 0.0, "avg_vol": 0.0, "last_vol": 0.0,
+    }
+
+    if len(candles_15m) < 50 or len(candles_1h) < 220:
+        log.debug("[%s] skip: candles insuficientes (15m=%d 1h=%d)", symbol, len(candles_15m), len(candles_1h))
+        return None, 0, None, _empty_metrics
+
+    if not _liquidity_ok(candles_1h):
+        log.debug("[%s] skip: liquidez insuficiente (avg_vol_1h < %d)", symbol, MIN_HOURLY_VOLUME)
+        return None, 0, None, _empty_metrics
+
+    closed  = candles_15m[-2]
+    c_open  = closed["open"]
+    c_close = closed["close"]
+    c_high  = closed["high"]
+    c_low   = closed["low"]
+    bullish_candle = c_close > c_open
+
+    # ── Régimen de mercado 1h ────────────────────────────────────────
+    regime, adx_1h = _market_regime(candles_1h)
+
+    is_proto = regime in ("proto_bull", "proto_bear")
+    effective_regime = "bull" if regime in ("bull", "proto_bull") else (
+        "bear" if regime in ("bear", "proto_bear") else "range"
+    )
+
+    if effective_regime == "range":
+        log.debug("[%s] skip: régimen=range adx_1h=%.1f", symbol, adx_1h)
+        return None, 0, None, _empty_metrics
+
+    # ── Estructura de precio 1h ────────────────────────────────────────
+    structure = _price_structure(candles_1h)
+
+    if structure == "range" and adx_1h < ADX_1H_STRUCTURE_MIN:
+        log.debug(
+            "[%s] skip: structure=range + ADX_1h=%.1f < %d → hard-guard",
+            symbol, adx_1h, ADX_1H_STRUCTURE_MIN,
+        )
+        return None, 0, None, _empty_metrics
+
+    # ── Macro 4h ──────────────────────────────────────────────────────
+    if candles_4h and len(candles_4h) >= 55:
+        closes_4h = [c["close"] for c in candles_4h[:-1]]
+        ema50_4h  = _ema(closes_4h, 50)[-1]
+        price_4h  = closes_4h[-1]
+        if effective_regime == "bull" and price_4h < ema50_4h:
+            log.debug("[%s] skip: macro 4h bearish (precio=%.6f < EMA50_4h=%.6f)", symbol, price_4h, ema50_4h)
+            return None, 0, None, _empty_metrics
+        if effective_regime == "bear" and price_4h > ema50_4h:
+            log.debug("[%s] skip: macro 4h bullish (precio=%.6f > EMA50_4h=%.6f)", symbol, price_4h, ema50_4h)
+            return None, 0, None, _empty_metrics
+
+    # ── Indicadores 15m ───────────────────────────────────────────────
+    closes_15m = [c["close"] for c in candles_15m]
+    price      = closes_15m[-2]
+
+    ema20_15m  = _ema(closes_15m[:-1], 20)[-1]
+    ema200_15m = _ema(closes_15m[:-1], 200)[-1]
+    rsi_series = _rsi(closes_15m[:-1], 14)
+    rsi        = rsi_series[-1]
+    macd_hist  = _macd_histogram(closes_15m[:-1])[-1]
+    atr_15m    = _atr(candles_15m[:-1], 14)
+    adx_15m    = _adx(candles_15m[:-1], 14)
+    volumes    = [c["volume"] for c in candles_15m]
+    avg_vol    = sum(volumes[-21:-1]) / 20
+    last_vol   = volumes[-2]
+    vol_ratio  = last_vol / avg_vol if avg_vol else 0.0
+
+    closes_1h        = [c["close"] for c in candles_1h]
+    ema200_1h        = _ema(closes_1h[:-1], 200)[-1]
+    closes_1h_closed = closes_1h[:-1]
+    macd_1h          = _macd_histogram(closes_1h_closed)[-1]
+    atr_1h_val       = _atr(candles_1h[:-1], 14)
+    atr_1h_pct       = atr_1h_val / price if price > 0 else 0.0
+
+    metrics = {
+        "adx_1h":    adx_1h,
+        "adx_15m":   adx_15m,
+        "vol_ratio": vol_ratio,
+        "atr_1h_pct": atr_1h_pct,
+        "rsi":       rsi,
+        "avg_vol":   avg_vol,
+        "last_vol":  last_vol,
+    }
+
+    # Log de estado completo para diagnóstico
+    log.debug(
+        "[%s] régimen=%s structure=%s | ADX_1h=%.1f ADX_15m=%.1f | "
+        "RSI=%.1f MACD_15m=%.5f MACD_1h=%.5f | "
+        "vol_ratio=%.2f (last=%.0f avg=%.0f) | "
+        "ATR_15m=%.4f%% ATR_1h=%.4f%% | "
+        "precio=%.6f EMA200_1h=%.6f EMA20_15m=%.6f",
+        symbol, regime, structure,
+        adx_1h, adx_15m,
+        rsi, macd_hist, macd_1h,
+        vol_ratio, last_vol, avg_vol,
+        (atr_15m / price * 100) if price > 0 else 0,
+        atr_1h_pct * 100,
+        price, ema200_1h, ema20_15m,
+    )
+
+    # ── Hard-guards ───────────────────────────────────────────────────
+    if price > 0 and atr_15m / price > ATR_VOLATILE_PCT:
+        log.debug("[%s] skip: ATR_15m=%.4f%% > %.1f%% (demasiado volátil)", symbol, atr_15m / price * 100, ATR_VOLATILE_PCT * 100)
+        return None, 0, None, metrics
+
+    if adx_15m < ADX_15M_MIN:
+        log.debug("[%s] skip: ADX_15m=%.1f < %d (lateral 15m)", symbol, adx_15m, ADX_15M_MIN)
+        return None, 0, None, metrics
+
+    if effective_regime == "bull" and price < ema200_1h * (1 - EMA200_MIN_DIST):
+        log.debug("[%s] skip: bull pero precio=%.6f < EMA200_1h=%.6f", symbol, price, ema200_1h)
+        return None, 0, None, metrics
+    if effective_regime == "bear" and price > ema200_1h * (1 + EMA200_MIN_DIST):
+        log.debug("[%s] skip: bear pero precio=%.6f > EMA200_1h=%.6f", symbol, price, ema200_1h)
+        return None, 0, None, metrics
+
+    if effective_regime == "bear" and price < ema200_15m * (1 - EMA200_MIN_DIST):
+        log.debug("[%s] skip: bear pero precio=%.6f < EMA200_15m=%.6f (sobreextendido)", symbol, price, ema200_15m)
+        return None, 0, None, metrics
+
+    candle_range = c_high - c_low
+    if candle_range > 0 and atr_15m > 0:
+        if candle_range > NO_CHASE_MULT * atr_15m:
+            log.debug("[%s] skip: no-chase rango_vela=%.6f > %.1f*ATR=%.6f", symbol, candle_range, NO_CHASE_MULT, atr_15m)
+            return None, 0, None, metrics
+
+    if price > 0 and ema20_15m > 0:
+        dist_ema20 = abs(price - ema20_15m) / price
+        if dist_ema20 > PULLBACK_EMA20_DIST:
+            if effective_regime == "bull" and price > ema20_15m:
+                log.debug("[%s] skip: sobreextendido sobre EMA20_15m dist=%.2f%%", symbol, dist_ema20 * 100)
+                return None, 0, None, metrics
+            if effective_regime == "bear" and price < ema20_15m:
+                log.debug("[%s] skip: sobreextendido bajo EMA20_15m dist=%.2f%%", symbol, dist_ema20 * 100)
+                return None, 0, None, metrics
+
+    # ── Score mínimo dinámico por volatilidad (v4) ───────────────────
+    vol_bump   = _dynamic_min_score_bump(candles_1h, price)
+    proto_bump = PROTO_MIN_SCORE_EXTRA if is_proto else 0
+    min_required_base = min_score + vol_bump + proto_bump
+
+    # Contexto vela diaria
+    open_daily, close_today = _daily_candle_context(candles_1h)
+    score = 0
+
+    if open_daily > 0:
+        daily_move = (close_today - open_daily) / open_daily
+        if effective_regime == "bull" and daily_move < -DAILY_CANDLE_BLOCK:
+            log.debug("[%s] skip: daily_move=%.2f%% < -%.1f%% en régimen bull", symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100)
+            return None, score, None, metrics
+        if effective_regime == "bear" and daily_move > DAILY_CANDLE_BLOCK:
+            log.debug("[%s] skip: daily_move=%.2f%% > +%.1f%% en régimen bear", symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100)
+            return None, score, None, metrics
+
+        abs_move = abs(daily_move)
+        if abs_move > DAILY_CANDLE_PENALTY:
+            score -= 10
+            log.debug(
+                "[%s] daily abs_move=%.2f%% > %.1f%% → penalización -10 (score=%d)",
+                symbol, abs_move * 100, DAILY_CANDLE_PENALTY * 100, score,
+            )
+
+    # ── Scoring ───────────────────────────────────────────────────────
+
+    if is_proto:
+        score -= PROTO_SCORE_PENALTY
+        log.debug("[%s] proto-régimen → -4 (score=%d)", symbol, score)
+
+    if effective_regime == "bull" and bullish_candle:
+        score += 8
+        log.debug("[%s] vela alcista en bull → +8 (score=%d)", symbol, score)
+    elif effective_regime == "bear" and not bullish_candle:
+        score += 8
+        log.debug("[%s] vela bajista en bear → +8 (score=%d)", symbol, score)
+    else:
+        log.debug("[%s] vela contraria al régimen → +0 (score=%d)", symbol, score)
+
+    if effective_regime == "bull":
+        if 45 <= rsi <= 65:
+            score += 8
+            log.debug("[%s] RSI=%.1f en zona ideal bull → +8 (score=%d)", symbol, rsi, score)
+        elif rsi > 70:
+            score -= 8
+            log.debug("[%s] RSI=%.1f sobrecomprado → -8 (score=%d)", symbol, rsi, score)
+            if rsi > 80:
+                log.debug("[%s] skip: RSI=%.1f > 80 (sobrecomprado extremo)", symbol, rsi)
+                return None, score, None, metrics
+        else:
+            log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
+    else:
+        if 35 <= rsi <= 55:
+            score += 8
+            log.debug("[%s] RSI=%.1f en zona ideal bear → +8 (score=%d)", symbol, rsi, score)
+        elif rsi < 30:
+            log.debug("[%s] skip: RSI=%.1f < 30 (sobrevendido en bear)", symbol, rsi)
+            return None, score, None, metrics
+        else:
+            log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
+
+    if adx_1h >= 30:
+        score += 12
+        log.debug("[%s] ADX_1h=%.1f >= 30 → +12 (score=%d)", symbol, adx_1h, score)
+    elif adx_1h >= 25:
+        score += 8
+        log.debug("[%s] ADX_1h=%.1f >= 25 → +8 (score=%d)", symbol, adx_1h, score)
+    elif adx_1h >= 20:
+        score += 4
+        log.debug("[%s] ADX_1h=%.1f >= 20 → +4 (score=%d)", symbol, adx_1h, score)
+    else:
+        log.debug("[%s] ADX_1h=%.1f < 20 → +0 (score=%d)", symbol, adx_1h, score)
+
+    if effective_regime == "bear" and adx_1h < 22:
+        log.debug("[%s] skip: bear + ADX_1h=%.1f < 22 → hard-guard short", symbol, adx_1h)
+        return None, score, None, metrics
+
+    if effective_regime == "bull" and macd_hist > 0:
+        score += 8
+        log.debug("[%s] MACD_15m=%.5f positivo en bull → +8 (score=%d)", symbol, macd_hist, score)
+    elif effective_regime == "bear" and macd_hist < 0:
+        score += 8
+        log.debug("[%s] MACD_15m=%.5f negativo en bear → +8 (score=%d)", symbol, macd_hist, score)
+    else:
+        log.debug("[%s] MACD_15m=%.5f contrario al régimen → +0 (score=%d)", symbol, macd_hist, score)
+
+    if effective_regime == "bull" and macd_1h > 0:
+        score += 8
+        log.debug("[%s] MACD_1h=%.5f positivo en bull → +8 (score=%d)", symbol, macd_1h, score)
+    elif effective_regime == "bear" and macd_1h < 0:
+        score += 8
+        log.debug("[%s] MACD_1h=%.5f negativo en bear → +8 (score=%d)", symbol, macd_1h, score)
+    else:
+        log.debug("[%s] MACD_1h=%.5f contrario al régimen → +0 (score=%d)", symbol, macd_1h, score)
+
+    if avg_vol > 0:
+        if last_vol >= avg_vol * VOLUME_MULT:
+            score += 8
+            log.debug("[%s] vol_ratio=%.2f >= %.1f → +8 (score=%d)", symbol, vol_ratio, VOLUME_MULT, score)
+        elif last_vol < avg_vol * VOLUME_WEAK:
+            score -= 4
+            log.debug("[%s] vol_ratio=%.2f < %.1f → -4 (score=%d)", symbol, vol_ratio, VOLUME_WEAK, score)
+        else:
+            log.debug("[%s] vol_ratio=%.2f normal → +0 (score=%d)", symbol, vol_ratio, score)
+
+    hour = datetime.datetime.now(timezone.utc).hour
+    if hour in HIGH_BIAS_HOURS:
+        score += 4
+        log.debug("[%s] hora=%d en HIGH_BIAS_HOURS → +4 (score=%d)", symbol, hour, score)
+    elif hour in LOW_BIAS_HOURS:
+        score -= 4
+        log.debug("[%s] hora=%d en LOW_BIAS_HOURS → -4 (score=%d)", symbol, hour, score)
+
+    div = _rsi_divergence(closes_15m[:-1], candles_15m[:-1])
+    if effective_regime == "bull" and div == "bullish":
+        score += 8
+        log.debug("[%s] divergencia RSI bullish → +8 (score=%d)", symbol, score)
+    elif effective_regime == "bear" and div == "bearish":
+        score += 8
+        log.debug("[%s] divergencia RSI bearish → +8 (score=%d)", symbol, score)
+
+    if structure == effective_regime:
+        score += 8
+        log.debug("[%s] structure=%s == régimen → +8 (score=%d)", symbol, structure, score)
+    elif structure != "range" and structure != effective_regime:
+        score -= 12
+        log.debug(
+            "[%s] structure=%s contradice régimen=%s → -12 (score=%d)",
+            symbol, structure, regime, score,
+        )
+
+    # ── Score mínimo ──────────────────────────────────────────────────
+    min_required = min_required_base + (SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0)
+    log.debug(
+        "[%s] SCORE FINAL=%d | min_required=%d (base=%d vol_bump=%d proto_bump=%d short_extra=%d) | "
+        "ADX_1h=%.1f ADX_15m=%.1f vol_ratio=%.2f ATR_1h=%.4f%%",
+        symbol, score, min_required, min_score, vol_bump, proto_bump,
+        SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0,
+        adx_1h, adx_15m, vol_ratio, atr_1h_pct * 100,
+    )
+
+    if score < min_required:
+        return None, score, None, metrics
+
+    side = "long" if effective_regime == "bull" else "short"
+    log.info(
+        "✅ SEÑAL %s | score=%d (min=%d) | regime=%s structure=%s "
+        "adx1h=%.1f adx15m=%.1f rsi=%.1f macd_hist=%.5f vol_ratio=%.2f"
+        "%s",
+        side.upper(), score, min_required, regime, structure,
+        adx_1h, adx_15m, rsi, macd_hist,
+        vol_ratio,
+        " [PROTO]" if is_proto else "",
+    )
+    return side, score, regime, metrics
