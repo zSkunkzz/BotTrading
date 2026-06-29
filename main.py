@@ -22,6 +22,18 @@ BUG-5 fix:
   Con LOOP_SLEEP=20s y un rally fuerte podía enviar 100+ mensajes/hora.
   Fix: _trailing_notified dict + TRAILING_NOTIFY_COOLDOWN (300s) por símbolo.
   El log INFO sigue escribiéndose en cada tick; solo el Telegram está rate-limitado.
+
+BUG-3 fix:
+  _exit_price_for usaba umbrales de 0.5% (0.995/1.005) para detectar TP/SL.
+  Con TP a 2×RR y SL a 1× producía falsos positivos — el bot registraba
+  TP o SL cuando el precio aún estaba hasta 0.4% lejos del nivel real.
+  Reducido a 0.1% (0.999/1.001) en los cuatro checks.
+
+BUG-4 fix:
+  open_ts se fijaba siempre con time.time() del loop, varios segundos
+  posterior a la ejecución real. Ahora se llama _get_position_open_ts()
+  tras open_order() para obtener el timestamp real desde el historial BingX.
+  Fallback a time.time() si la llamada falla.
 """
 import logging
 import os
@@ -378,32 +390,39 @@ def _wait_feed_ready(feed: KlineFeed) -> None:
 
 
 def _exit_price_for(pos: dict, current_price: float) -> tuple[float, str]:
+    """Estima el precio y motivo de cierre a partir del precio actual.
+
+    BUG-3 FIX: umbrales reducidos de 0.5% (0.995/1.005) a 0.1% (0.999/1.001).
+    Con TP a 2×RR y SL a 1× el umbral de 0.5% producía falsos positivos:
+    el bot registraba TP o SL cuando el precio aún estaba hasta 0.4% lejos
+    del nivel real ejecutado por BingX.
+    """
     side = pos["side"]
     tp   = pos.get("tp")
     sl   = pos.get("sl")
 
     if tp is not None and sl is not None:
         if side == "long":
-            if current_price >= tp * 0.995:
+            if current_price >= tp * 0.999:   # BUG-3: era 0.995
                 return tp, "TP"
-            if current_price <= sl * 1.005:
+            if current_price <= sl * 1.001:   # BUG-3: era 1.005
                 return sl, "SL"
         else:
-            if current_price <= tp * 1.005:
+            if current_price <= tp * 1.001:   # BUG-3: era 1.005
                 return tp, "TP"
-            if current_price >= sl * 0.995:
+            if current_price >= sl * 0.999:   # BUG-3: era 0.995
                 return sl, "SL"
     elif tp is not None:
         hit_tp = (
-            (side == "long"  and current_price >= tp * 0.995) or
-            (side == "short" and current_price <= tp * 1.005)
+            (side == "long"  and current_price >= tp * 0.999) or
+            (side == "short" and current_price <= tp * 1.001)
         )
         if hit_tp:
             return tp, "TP"
     elif sl is not None:
         hit_sl = (
-            (side == "long"  and current_price <= sl * 1.005) or
-            (side == "short" and current_price >= sl * 0.995)
+            (side == "long"  and current_price <= sl * 1.001) or
+            (side == "short" and current_price >= sl * 0.999)
         )
         if hit_sl:
             return sl, "SL"
@@ -929,6 +948,15 @@ def run() -> None:
 
                         real_entry = _sync_entry_from_exchange(symbol, price, signal)
 
+                        # BUG-4 FIX: sincronizar open_ts real desde historial BingX.
+                        # Antes se usaba time.time() del loop, que puede ser varios segundos
+                        # posterior a la ejecución real de la orden de entrada.
+                        # _get_position_open_ts() consulta get_closed_orders() para leer
+                        # el timestamp real; fallback a time.time() si falla.
+                        real_open_ts = _get_position_open_ts(
+                            symbol, {"side": signal, "entry": real_entry}
+                        )
+
                         positions[symbol] = {
                             "side":          signal,
                             "entry":         real_entry,
@@ -942,7 +970,7 @@ def run() -> None:
                             "trail_high":    real_entry,
                             "trail_low":     real_entry,
                             "score":         score,
-                            "open_ts":       time.time(),
+                            "open_ts":       real_open_ts,  # BUG-4 FIX
                             "be_trigger":    params.get("be_trigger"),
                             "be_sl":         params.get("be_sl"),
                             "be_locked":     False,
