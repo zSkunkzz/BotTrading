@@ -15,6 +15,11 @@ FIX Bug4: STALE check diferenciado por timeframe:
   - 4h:  SIN stale check (emite vela nueva cada 4 horas; cualquier umbral de minutos
           haría que ready() devuelva False permanentemente)
 
+FIX BUG-16: La vela anterior se marca closed=True SOLO cuando kline.confirm=True
+  en el mensaje WS, no por simple cambio de timestamp. Previene que el último
+  tick de una vela se marque incorrectamente cerrado antes de que BingX confirme
+  el cierre oficial.
+
 Uso:
     feed = KlineFeed(config.SYMBOLS)
     feed.start()
@@ -229,6 +234,7 @@ class KlineFeed:
             if not isinstance(kline, dict):
                 return
 
+            confirmed = bool(kline.get("confirm", False))
             ts = int(kline.get("T", kline.get("t", 0)))
             candle = {
                 "ts":        ts,
@@ -238,19 +244,26 @@ class KlineFeed:
                 "low":       float(kline["l"]),
                 "close":     float(kline["c"]),
                 "volume":    float(kline["v"]),
-                "closed":    bool(kline.get("confirm", False)),
+                # FIX BUG-16: closed=True solo cuando BingX confirma el cierre
+                # de la vela (confirm=True). No marcar cerrada por cambio de ts.
+                "closed":    confirmed,
             }
 
             with self._lock:
                 buf = self._data[symbol][tf]
                 if buf and buf[-1]["ts"] == candle["ts"]:
+                    # Misma vela: actualizar in-place
                     buf[-1] = candle
                 else:
-                    if not buf or buf[-1].get("closed", True):
-                        buf.append(candle)
-                    else:
-                        buf[-1] = dict(buf[-1], closed=True)
-                        buf.append(candle)
+                    # Nueva vela: la anterior solo se marca closed si BingX la confirmó
+                    if buf and not buf[-1].get("closed", False):
+                        if confirmed:
+                            # El mensaje de apertura de nueva vela a veces lleva
+                            # confirm=True de la anterior; marcamos la anterior cerrada.
+                            buf[-1] = dict(buf[-1], closed=True)
+                        # Si confirmed=False, dejamos la anterior sin marcar cerrada
+                        # hasta que llegue su propio confirm=True.
+                    buf.append(candle)
 
                 # Actualizar timestamp de frescura en cada mensaje recibido
                 self._last_update[symbol][tf] = time.time()

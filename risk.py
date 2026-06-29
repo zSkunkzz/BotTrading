@@ -28,6 +28,7 @@ SL / TP:
   TP_RR dinámico:
     score ≥ 85  →  2.5×
     score ≥ 78  →  2.0×
+    proto_bull / proto_bear → RR × 0.8 (FIX BUG-11)
 
 Break-even lock:
   be_trigger = entry ± 1.0 × ATR_1h   (± según side)
@@ -48,11 +49,25 @@ SL_MAX_PCT = 0.030   # 3.0%
 BE_ATR_MULT    = 1.0   # 1× ATR → activar break-even
 BE_BUFFER_MULT = 0.1   # buffer 0.1× ATR por encima del entry (cubre comisiones ~0.04%×2)
 
+# FIX BUG-11: regímenes proto reducen el RR para ser más conservadores
+_PROTO_REGIMES = {"proto_bull", "proto_bear"}
+_PROTO_RR_MULT = 0.8
+
 
 def _tp_rr(score: int, regime: str) -> float:
+    """RR dinámico según score y régimen.
+
+    FIX BUG-11: los regímenes 'proto_bull' y 'proto_bear' aplican un
+    multiplicador de 0.8 sobre el RR base, forzando objetivos más cercanos
+    y reduciendo el tiempo de exposición en tendencias no confirmadas.
+    """
     if score >= 85:
-        return 2.5
-    return 2.0
+        rr = 2.5
+    else:
+        rr = 2.0
+    if regime in _PROTO_REGIMES:
+        rr *= _PROTO_RR_MULT
+    return round(rr, 4)
 
 
 def _atr(candles: list[dict], period: int = 14) -> float:
@@ -71,6 +86,10 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
 
     candles_1h: si se pasan, el SL se basa en ATR 1h (preferido).
                 Si no se pasan, fallback a ATR 15m (compatibilidad).
+
+    FIX BUG-7: el dict devuelto incluye 'tp_original' con el TP calculado
+    en el momento de apertura. main.py debe guardar este valor en el dict de
+    posición para que las extensiones de TP calculen la distancia correctamente.
     """
     # ── ATR: usar 1h si está disponible ──────────────────────────────────────
     if candles_1h and len(candles_1h) >= 16:
@@ -130,8 +149,10 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
     raw_trail = 0.3 * sl_dist
     trail_step = round(max(raw_trail, step), 8)
 
+    tp_rounded = round(tp, 8)
+
     log.info(
-        "[%s] score=%d regime=%s RR=%.1f margin=%.2f "
+        "[%s] score=%d regime=%s RR=%.2f margin=%.2f "
         "ATR_%s=%.6f atr_pct=%.3f%% sl_pct=%.3f%% tp_pct=%.3f%% "
         "SL=%.6f TP=%.6f be_trigger=%s be_sl=%s qty=%.8f trail=%.8f",
         side.upper(), score, regime, rr, margin,
@@ -143,15 +164,16 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
     )
 
     return {
-        "qty":        qty,
-        "sl":         round(sl, 8),
-        "tp":         round(tp, 8),
-        "atr":        round(atr, 8),
-        "trail_step": trail_step,
-        "score":      score,
-        "tp_rr":      rr,
-        "be_trigger": round(be_trigger, 8) if be_trigger else None,
-        "be_sl":      round(be_sl, 8) if be_sl else None,
+        "qty":         qty,
+        "sl":          round(sl, 8),
+        "tp":          tp_rounded,
+        "tp_original": tp_rounded,   # FIX BUG-7: guardar TP inicial para extensiones
+        "atr":         round(atr, 8),
+        "trail_step":  trail_step,
+        "score":       score,
+        "tp_rr":       rr,
+        "be_trigger":  round(be_trigger, 8) if be_trigger else None,
+        "be_sl":       round(be_sl, 8) if be_sl else None,
     }
 
 
