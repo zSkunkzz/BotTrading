@@ -1,463 +1,394 @@
-"""exchange.py — Cliente BingX Perpetual Futures (swap v2).
+"""exchange.py — Cliente Hyperliquid Perpetual Futures.
 
-FIXES aplicados:
-  1. _post() enviaba params en el body (data=); BingX los exige en la query string.
-     Ahora tanto GET como POST usan params= (query string), que es lo que BingX firma.
-  2. La firma se calcula sobre la query string real (urllib.parse.urlencode sin sorted),
-     igual que lo hace BingX internamente, evitando "signature does not match".
-  3. Reintentos automáticos (3 intentos, backoff 1s) para RemoteProtocolError y
-     timeouts intermitentes que estaban silenciando órdenes.
-     FIX: timestamp y firma se renuevan en CADA intento para evitar que un timeout
-     de 10s deje el segundo reintento con un timestamp ya expirado (BingX rechaza >5s).
-  4. calc_qty() aplica floor al step size de cada símbolo para no enviar qty
-     que BingX rechaza por precisión decimal.
-  5. cancel_all_orders usa DELETE (no POST) — BingX exige DELETE para este endpoint.
-  6. get_ohlcv incluye el timestamp 'ts' y 'open_time' en cada vela para que ws_feed
-     pueda deduplicar correctamente al mezclar velas REST con las del WebSocket.
-     También incluye 'quote_volume' (volumen en USDT) para el filtro de liquidez.
-  7. get_all_positions() obtiene TODAS las posiciones abiertas en 1 sola llamada
-     (sin 'symbol'), reduciendo 74 llamadas por loop a 1.
-     FIX: si la llamada falla, lanza excepción en vez de devolver {} silencioso
-     para evitar que main.py interprete todas las posiciones como cerradas.
-  8. _parse_position() prioriza positionSide (campo explícito en hedge mode) sobre
-     la inferencia por signo de positionAmt. En hedge mode BingX siempre devuelve
-     positionSide="LONG"|"SHORT"; positionAmt puede ser negativo o transitoriamente
-     cero en LONG si la orden aún no está completamente liquidada.
-     Fallback a positionAmt si positionSide no está disponible (one-way mode).
-  9. FIX #2: get_closed_orders() implementada — antes no existía, causando
-     AttributeError silenciado en _get_real_exit_price() y precios de cierre
-     siempre estimados. Ahora consulta /openApi/swap/v2/trade/allOrders.
- 10. get_balance() corregida según doc oficial BingX (BingX-API/api-ai-skills):
-     - Endpoint v3: /openApi/swap/v3/user/balance
-     - data es un ARRAY de objetos, no un dict — se filtra por asset=USDT
-     - Campos: equity (balance + unrealizedPnL), balance, availableMargin
- 11. FIX A — place_stop_order / place_tp_order:
-     quantity + closePosition="true" juntos → BingX rechaza con error 101400.
-     Doc oficial: "closePosition cannot be used with quantity".
-     Eliminado el campo quantity cuando closePosition=true está presente.
- 12. FIX B — get_closed_orders: parseo de respuesta corregido.
-     Doc oficial: data es directamente un array de órdenes, sin wrapping.
-     Eliminado el bloque isinstance(raw, dict) con .orders/.list inexistentes.
- 13. FIX C — get_closed_orders: añadidos startTime/endTime obligatorios.
-     Doc oficial: sin rango temporal BingX puede devolver error 109400.
-     Se incluye startTime=ahora-7d, endTime=ahora en cada llamada.
- 14. FIX D — get_ohlcv: añadidos 'open_time' y 'quote_volume'.
-     'open_time' = timestamp de apertura de vela en ms (campo 'time'/'t' de BingX).
-     'quote_volume' = volumen en USDT = volume * close (BingX no siempre lo devuelve
-     como campo separado). Necesario para _liquidity_ok (signals.py) y
-     _daily_candle_context (signals.py).
+Reemplaza la implementación BingX por Hyperliquid usando el SDK oficial.
+Hyperliquid es un DEX L1 sin KYC/restricciones geográficas (compatible con MiCA).
+
+Dependencias:
+    pip install hyperliquid-python-sdk
+
+Autenticación:
+    Requiere HYPERLIQUID_PRIVATE_KEY (clave privada EVM, hex con o sin 0x)
+    y opcionalmente HYPERLIQUID_WALLET_ADDRESS (si no se pone, se deriva de la pk).
+
+Nombres de símbolos:
+    Hyperliquid usa el token base sin quote ni guión: "BTC", "ETH", "SOL".
+    Las funciones públicas aceptan tanto "BTC-USDT" como "BTC" — se normaliza
+    internamente con _hl_symbol().
+
+Diferencias respecto a BingX:
+    - No hay concepto de positionSide (LONG/SHORT) independiente; cada coin
+      tiene una sola posición neta (long positivo, short negativo).
+    - El apalancamiento se setea por coin en el momento de abrir la posición
+      (isolated margin por defecto).
+    - SL y TP se colocan como órdenes separadas de tipo trigger (stop-market).
+    - Los precios de órdenes cerradas se obtienen del historial de fills.
 """
-import hashlib
-import hmac
-import time
-import urllib.parse
 import logging
-
-import httpx
+import os
+import time
+from typing import Optional
 
 import config
 
 log = logging.getLogger("exchange")
 
-# ── Firma ─────────────────────────────────────────────────────────────────────────────────
+# ── Importar SDK ──────────────────────────────────────────────────────────────
+try:
+    import eth_account
+    from hyperliquid.info import Info
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.utils import constants as hl_constants
+except ImportError as _e:
+    raise ImportError(
+        "SDK de Hyperliquid no instalado. Ejecuta: pip install hyperliquid-python-sdk"
+    ) from _e
 
-def _sign(params: dict) -> str:
-    """Firma la query string tal como la construye urllib / BingX."""
-    payload = urllib.parse.urlencode(params)
-    return hmac.new(
-        config.API_SECRET.encode(),
-        payload.encode(),
-        hashlib.sha256,
-    ).hexdigest()
+# ── Inicializar clientes ──────────────────────────────────────────────────────
 
+_PRIVATE_KEY = os.environ["HYPERLIQUID_PRIVATE_KEY"]
+if not _PRIVATE_KEY.startswith("0x"):
+    _PRIVATE_KEY = "0x" + _PRIVATE_KEY
 
-def _headers() -> dict:
-    return {"X-BX-APIKEY": config.API_KEY}
+_account = eth_account.Account.from_key(_PRIVATE_KEY)
+_WALLET_ADDRESS = os.environ.get("HYPERLIQUID_WALLET_ADDRESS") or _account.address
 
+# mainnet=True para produccion, False para testnet
+_MAINNET = os.environ.get("HL_MAINNET", "true").lower() == "true"
+_HL_URL   = hl_constants.MAINNET_API_URL if _MAINNET else hl_constants.TESTNET_API_URL
 
-# ── HTTP helpers con reintentos ────────────────────────────────────────────────
+_info     = Info(_HL_URL, skip_ws=True)
+_exchange = Exchange(_account, _HL_URL, account_address=_WALLET_ADDRESS)
 
-_RETRIES    = 3
-_RETRY_WAIT = 1.0
-
-
-def _request(method: str, path: str, params: dict) -> dict:
-    """GET, POST o DELETE enviando siempre los parámetros en la query string (BingX V2).
-
-    FIX: timestamp y firma se renuevan en cada intento para que un timeout en el
-    primer intento no deje el segundo con un timestamp expirado (BingX rechaza >5s).
-    """
-    base_params = {k: v for k, v in params.items() if k not in ("timestamp", "signature")}
-    url = config.BASE_URL + path
-
-    last_exc: Exception | None = None
-    for attempt in range(1, _RETRIES + 1):
-        signed = dict(base_params)
-        signed["timestamp"] = int(time.time() * 1000)
-        signed["signature"] = _sign(signed)
-
-        try:
-            r = httpx.request(
-                method,
-                url,
-                params=signed,
-                headers=_headers(),
-                timeout=10,
-            )
-            r.raise_for_status()
-            return r.json()
-        except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectError) as exc:
-            last_exc = exc
-            log.warning("Intento %d/%d fallido para %s: %s", attempt, _RETRIES, path, exc)
-            if attempt < _RETRIES:
-                time.sleep(_RETRY_WAIT)
-        except httpx.HTTPStatusError as exc:
-            log.error("HTTP %s en %s: %s", exc.response.status_code, path, exc.response.text)
-            raise
-
-    raise last_exc
+log.info("Hyperliquid cliente inicializado | wallet=%s | mainnet=%s",
+         _WALLET_ADDRESS, _MAINNET)
 
 
-def _get(path: str, params: dict = None) -> dict:
-    return _request("GET", path, params or {})
+# ── Utilidades de símbolo ────────────────────────────────────────────────────
+
+def _hl_symbol(symbol: str) -> str:
+    """Convierte 'BTC-USDT' o 'BTC' a 'BTC' (formato Hyperliquid)."""
+    return symbol.split("-")[0].replace("1000SHIB", "1000SHIB")
 
 
-def _post(path: str, params: dict = None) -> dict:
-    return _request("POST", path, params or {})
+# ── Meta-info de contratos (sz_decimals, tick_size) ───────────────────────────
+
+_meta_cache: dict = {}
+
+def _get_meta() -> dict:
+    global _meta_cache
+    if not _meta_cache:
+        meta = _info.meta()
+        for asset in meta.get("universe", []):
+            name = asset["name"]
+            _meta_cache[name] = asset
+    return _meta_cache
 
 
-def _delete(path: str, params: dict = None) -> dict:
-    return _request("DELETE", path, params or {})
+def _asset_info(symbol: str) -> dict:
+    sym = _hl_symbol(symbol)
+    meta = _get_meta()
+    return meta.get(sym, {"szDecimals": 3, "maxLeverage": 50})
 
 
-# ── Balance real ───────────────────────────────────────────────────────────────
-
-def get_balance() -> float:
-    """Devuelve el equity real (balance + PnL no realizado) de la cuenta USDT.
-
-    Endpoint oficial: GET /openApi/swap/v3/user/balance
-    Respuesta: { "data": [ { "asset": "USDT", "equity": "196.74", ... } ] }
-
-    data es un ARRAY — se busca el objeto con asset=USDT y se lee 'equity'.
-    Fallback: 'balance' si no existe 'equity'. Devuelve 0.0 si falla la llamada
-    para que bot_state.py use el capital ficticio como backup.
-
-    Fuente: BingX-API/api-ai-skills/skills/swap-account/api-reference.md
-    """
-    try:
-        resp = _get("/openApi/swap/v3/user/balance", {})
-        items = resp.get("data") or []
-        # Buscar el asset USDT; si solo hay uno, usarlo directamente
-        usdt = next(
-            (x for x in items if str(x.get("asset", "")).upper() == "USDT"),
-            items[0] if items else None,
-        )
-        if usdt is None:
-            log.warning("get_balance: payload vacío de BingX: %s", resp)
-            return 0.0
-        val = usdt.get("equity") or usdt.get("balance") or usdt.get("availableMargin")
-        if val is not None:
-            return float(val)
-        log.warning("get_balance: ningún campo de balance en: %s", usdt)
-        return 0.0
-    except Exception as exc:
-        log.warning("get_balance falló: %s — se usará capital ficticio como fallback", exc)
-        return 0.0
+def _sz_decimals(symbol: str) -> int:
+    return int(_asset_info(symbol).get("szDecimals", 3))
 
 
-# ── Precio ─────────────────────────────────────────────────────────────────────────────────
-
-def get_price(symbol: str = None) -> float:
-    symbol = symbol or config.SYMBOL
-    data = _get("/openApi/swap/v2/quote/price", {"symbol": symbol})
-    return float(data["data"]["price"])
-
-
-# ── OHLCV ──────────────────────────────────────────────────────────────────────────────────
-
-def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
-    """Devuelve lista de velas [{ts, open_time, open, high, low, close, volume,
-    quote_volume, closed}] más reciente al final.
-
-    FIX D:
-    - 'open_time': timestamp de apertura de la vela en ms. Necesario para que
-      _daily_candle_context() en signals.py pueda filtrar las velas del día actual.
-      Antes las velas REST no tenían este campo → contexto diario siempre vacío.
-    - 'quote_volume': volumen en USDT (= volume * close). BingX devuelve 'volume'
-      en unidades de la moneda base (ej: BTC), que para BTC es ~0.1-5 por vela —
-      muy por debajo del umbral MIN_HOURLY_VOLUME=1_000_000 USDT. _liquidity_ok()
-      en signals.py ahora usa quote_volume para la comparación correcta.
-    - 'ts' sigue siendo el timestamp de apertura (mismo que open_time) para
-      compatibilidad con ws_feed.py.
-    """
-    symbol   = symbol or config.SYMBOL
-    interval = interval or config.TIMEFRAME
-    data = _get("/openApi/swap/v3/quote/klines", {
-        "symbol":   symbol,
-        "interval": interval,
-        "limit":    limit,
-    })
-    candles = []
-    for c in data["data"]:
-        open_time = int(c.get("time", c.get("t", 0)))
-        vol       = float(c["volume"])
-        close     = float(c["close"])
-        candles.append({
-            "ts":           open_time,
-            "open_time":    open_time,
-            "open":         float(c["open"]),
-            "high":         float(c["high"]),
-            "low":          float(c["low"]),
-            "close":        close,
-            "volume":       vol,
-            "quote_volume": float(c.get("quoteVolume", c.get("quote_volume", vol * close))),
-            "closed":       True,
-        })
-    return candles
-
-
-# ── Info de contrato (step size / min qty) ────────────────────────────────────────────
-
-_contract_info_cache: dict[str, dict] = {}
-
-def _get_contract_info(symbol: str) -> dict:
-    """Devuelve stepSize y minQty para el símbolo. Cachéa para no repetir llamadas."""
-    if symbol in _contract_info_cache:
-        return _contract_info_cache[symbol]
-    try:
-        data = _get("/openApi/swap/v2/quote/contracts", {"symbol": symbol})
-        contracts = data.get("data") or []
-        for c in contracts:
-            if c.get("symbol") == symbol:
-                info = {
-                    "stepSize": float(c.get("tradeMinQuantity", 0.001)),
-                    "minQty":   float(c.get("tradeMinQuantity", 0.001)),
-                    "pricePrecision": int(c.get("pricePrecision", 6)),
-                }
-                _contract_info_cache[symbol] = info
-                return info
-    except Exception as exc:
-        log.warning("No se pudo obtener info contrato %s: %s", symbol, exc)
-
-    default = {"stepSize": 0.001, "minQty": 0.001, "pricePrecision": 6}
-    _contract_info_cache[symbol] = default
-    return default
-
-
-def floor_qty(qty: float, step: float) -> float:
-    """Redondea qty hacia abajo al step size del contrato."""
-    if step <= 0:
-        return qty
-    factor = 1.0 / step
+def floor_qty(qty: float, symbol: str) -> float:
+    """Redondea qty hacia abajo según szDecimals del contrato."""
+    dec = _sz_decimals(symbol)
+    factor = 10 ** dec
     return int(qty * factor) / factor
 
 
-def min_notional_ok(qty: float, price: float, min_usdt: float = 5.0) -> bool:
-    """Verifica que el valor nocional sea ≥ min_usdt (BingX exige mínimo ~5 USDT)."""
+def min_notional_ok(qty: float, price: float, min_usdt: float = 10.0) -> bool:
     return (qty * price) >= min_usdt
 
 
-# ── Posiciones ─────────────────────────────────────────────────────────────────────────────
+# ── Balance ───────────────────────────────────────────────────────────────────
 
-# Mapa de positionSide (hedge mode) a valor interno del bot
-_POSITION_SIDE_MAP = {
-    "LONG":  "long",
-    "SHORT": "short",
-    "long":  "long",
-    "short": "short",
+def get_balance() -> float:
+    """Devuelve el equity total en USDT (marginSummary.accountValue)."""
+    try:
+        state = _info.user_state(_WALLET_ADDRESS)
+        val = float(state.get("marginSummary", {}).get("accountValue", 0))
+        return val
+    except Exception as exc:
+        log.warning("get_balance fallu00f3: %s", exc)
+        return 0.0
+
+
+# ── Precio ────────────────────────────────────────────────────────────────────
+
+def get_price(symbol: str = None) -> float:
+    sym = _hl_symbol(symbol or config.SYMBOLS[0])
+    try:
+        all_mids = _info.all_mids()
+        return float(all_mids[sym])
+    except Exception as exc:
+        log.warning("get_price(%s) fallu00f3: %s", sym, exc)
+        # Fallback: L2 orderbook mid
+        book = _info.l2_snapshot(sym)
+        bid  = float(book["levels"][0][0]["px"])
+        ask  = float(book["levels"][1][0]["px"])
+        return (bid + ask) / 2
+
+
+# ── OHLCV ─────────────────────────────────────────────────────────────────────
+
+# Mapeo de timeframes del bot a intervalos Hyperliquid
+_TF_MAP = {
+    "1m":  "1m",
+    "5m":  "5m",
+    "15m": "15m",
+    "1h":  "1h",
+    "4h":  "4h",
+    "1d":  "1d",
 }
 
 
-def _parse_position(p: dict) -> dict | None:
-    """Convierte un objeto de posición raw de BingX al formato interno del bot."""
-    raw_side     = str(p.get("positionSide") or "").upper()
-    position_amt = float(p.get("positionAmt") or 0)
+def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
+    """Devuelve velas OHLCV en el mismo formato que la implementación BingX."""
+    sym = _hl_symbol(symbol or config.SYMBOLS[0])
+    interval = interval or config.TIMEFRAME
+    hl_interval = _TF_MAP.get(interval, interval)
 
-    if raw_side in ("LONG", "SHORT"):
-        side = _POSITION_SIDE_MAP[raw_side]
-    elif position_amt > 0:
-        side = "long"
-    elif position_amt < 0:
-        side = "short"
-    else:
-        log.warning(
-            "Posición descartada — positionSide=%r positionAmt=%s (símbolo=%s)",
-            p.get("positionSide"), p.get("positionAmt"), p.get("symbol"),
-        )
+    # Calcular rango temporal para cubrir 'limit' velas
+    tf_seconds = {
+        "1m": 60, "5m": 300, "15m": 900,
+        "1h": 3600, "4h": 14400, "1d": 86400,
+    }
+    tf_secs  = tf_seconds.get(interval, 900)
+    end_ms   = int(time.time() * 1000)
+    start_ms = end_ms - tf_secs * limit * 1000
+
+    try:
+        raw = _info.candles_snapshot(sym, hl_interval, start_ms, end_ms)
+    except Exception as exc:
+        log.warning("get_ohlcv(%s, %s) fallu00f3: %s", sym, interval, exc)
+        return []
+
+    candles = []
+    for c in raw:
+        open_time    = int(c["t"])
+        vol          = float(c.get("v", 0))
+        close        = float(c["c"])
+        quote_volume = float(c.get("vw", vol * close))  # valor nocional
+        candles.append({
+            "ts":           open_time,
+            "open_time":    open_time,
+            "open":         float(c["o"]),
+            "high":         float(c["h"]),
+            "low":          float(c["l"]),
+            "close":        close,
+            "volume":       vol,
+            "quote_volume": quote_volume,
+            "closed":       True,
+        })
+    # Devolver las últimas 'limit' velas, más reciente al final
+    return candles[-limit:]
+
+
+# ── Posiciones ────────────────────────────────────────────────────────────────
+
+def _parse_hl_position(pos: dict, symbol_raw: str) -> dict | None:
+    """Convierte una posición Hyperliquid al formato interno del bot."""
+    szi = float(pos.get("szi", 0))
+    if szi == 0:
         return None
-
+    side = "long" if szi > 0 else "short"
     return {
         "side":  side,
-        "entry": float(p.get("avgPrice") or 0),
-        "size":  abs(position_amt),
-        "sl":    float(p.get("stopLossPrice") or 0) or None,
-        "tp":    float(p.get("takeProfitPrice") or 0) or None,
+        "entry": float(pos.get("entryPx") or 0),
+        "size":  abs(szi),
+        "sl":    float(pos.get("stopLossPx") or 0) or None,
+        "tp":    float(pos.get("takeProfitPx") or 0) or None,
     }
 
 
 def get_all_positions() -> dict[str, dict]:
-    """BATCH: devuelve {symbol: pos_dict} para todas las posiciones abiertas.
+    """Devuelve {symbol_bot: pos_dict} para todas las posiciones abiertas."""
+    state   = _info.user_state(_WALLET_ADDRESS)
+    result  = {}
+    meta    = _get_meta()
+    # Construir mapa inverso: nombre_hl -> symbol_bot
+    hl_to_bot: dict[str, str] = {}
+    for sym_bot in config.SYMBOLS:
+        hl_to_bot[_hl_symbol(sym_bot)] = sym_bot
 
-    FIX: ya no captura la excepción silenciosamente. Si la llamada falla, lanza
-    la excepción para que main.py la capture en su try/except de loop y salte
-    la iteración completa, evitando que un {} vacío provoque el cierre falso
-    de todas las posiciones rastreadas.
-    """
-    data = _get("/openApi/swap/v2/user/positions", {})
-    result: dict[str, dict] = {}
-    for p in (data.get("data") or []):
-        if float(p.get("positionAmt", 0)) == 0:
+    for pos_entry in state.get("assetPositions", []):
+        pos      = pos_entry.get("position", {})
+        coin     = pos.get("coin", "")
+        sym_bot  = hl_to_bot.get(coin)
+        if sym_bot is None:
             continue
-        parsed = _parse_position(p)
-        if parsed is not None:
-            result[p["symbol"]] = parsed
+        parsed = _parse_hl_position(pos, sym_bot)
+        if parsed:
+            result[sym_bot] = parsed
     return result
 
 
 def get_position(symbol: str = None) -> dict | None:
-    """Consulta individual por símbolo. Mantenida para compatibilidad."""
-    symbol = symbol or config.SYMBOL
-    data = _get("/openApi/swap/v2/user/positions", {"symbol": symbol})
-    positions = data.get("data") or []
-    for p in positions:
-        if float(p.get("positionAmt", 0)) != 0:
-            return _parse_position(p)
-    return None
+    symbol = symbol or config.SYMBOLS[0]
+    all_pos = get_all_positions()
+    return all_pos.get(symbol)
 
 
-# ── Apalancamiento ──────────────────────────────────────────────────────────────────────────
+# ── Apalancamiento ────────────────────────────────────────────────────────────
 
 def set_leverage(symbol: str = None, leverage: int = None) -> None:
-    symbol   = symbol or config.SYMBOL
+    sym      = _hl_symbol(symbol or config.SYMBOLS[0])
     leverage = leverage or config.LEVERAGE
-    _post("/openApi/swap/v2/trade/leverage", {
-        "symbol":   symbol,
-        "side":     "LONG",
-        "leverage": leverage,
-    })
-    _post("/openApi/swap/v2/trade/leverage", {
-        "symbol":   symbol,
-        "side":     "SHORT",
-        "leverage": leverage,
-    })
-    log.info("Leverage seteado a %dx en %s", leverage, symbol)
+    try:
+        resp = _exchange.update_leverage(leverage, sym, is_cross=False)
+        if resp.get("status") == "ok":
+            log.info("Leverage seteado a %dx en %s", leverage, sym)
+        else:
+            log.warning("set_leverage(%s): respuesta inesperada: %s", sym, resp)
+    except Exception as exc:
+        log.warning("set_leverage(%s) fallu00f3: %s", sym, exc)
 
 
-# ── Abrir orden ────────────────────────────────────────────────────────────────────────────────
+# ── Abrir orden ───────────────────────────────────────────────────────────────
 
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
-    symbol   = symbol or config.SYMBOL
-    bx_side  = "BUY"  if side == "long" else "SELL"
-    pos_side = "LONG" if side == "long" else "SHORT"
+    sym_bot  = symbol or config.SYMBOLS[0]
+    sym_hl   = _hl_symbol(sym_bot)
+    is_buy   = side == "long"
 
-    info = _get_contract_info(symbol)
-    qty  = floor_qty(qty, info["stepSize"])
-
-    if qty <= 0 or not min_notional_ok(qty, get_price(symbol)):
+    qty = floor_qty(qty, sym_bot)
+    if qty <= 0 or not min_notional_ok(qty, get_price(sym_bot)):
         raise ValueError(
-            f"qty={qty} inválido para {symbol} (step={info['stepSize']}). "
+            f"qty={qty} inválido para {sym_bot}. "
             "Aumenta MARGIN_USDT o reduce el número de pares."
         )
 
-    resp = _post("/openApi/swap/v2/trade/order", {
-        "symbol":       symbol,
-        "side":         bx_side,
-        "positionSide": pos_side,
-        "type":         "MARKET",
-        "quantity":     qty,
-    })
-    log.info("Orden abierta: %s %s qty=%.4f", side.upper(), symbol, qty)
+    # Setear leverage antes de abrir
+    set_leverage(sym_bot, config.LEVERAGE)
 
-    place_stop_order(symbol, side, qty, sl)
-    place_tp_order(symbol, side, qty, tp)
+    # Orden de mercado
+    resp = _exchange.market_open(sym_hl, is_buy, qty)
+    if resp.get("status") != "ok":
+        raise RuntimeError(f"open_order {sym_hl} fallida: {resp}")
+    log.info("Orden abierta: %s %s qty=%.4f", side.upper(), sym_hl, qty)
+
+    # Colocar SL y TP
+    place_stop_order(sym_bot, side, qty, sl)
+    place_tp_order(sym_bot, side, qty, tp)
 
     return resp
 
 
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
-    """Coloca (o reemplaza) la stop-loss order. Usada también por el trailing.
-
-    FIX A — doc oficial BingX: closePosition y quantity son mutuamente excluyentes.
-    """
-    sl_side  = "SELL" if side == "long" else "BUY"
-    pos_side = "LONG" if side == "long" else "SHORT"
-    _post("/openApi/swap/v2/trade/order", {
-        "symbol":        symbol,
-        "side":          sl_side,
-        "positionSide":  pos_side,
-        "type":          "STOP_MARKET",
-        "stopPrice":     stop_price,
-        "closePosition": "true",
-    })
-    log.info("SL colocado en %.6f (%s %s)", stop_price, side.upper(), symbol)
+    """Coloca una stop-loss order (trigger reduce-only)."""
+    sym_hl  = _hl_symbol(symbol)
+    is_buy  = side == "short"  # para cerrar un long hay que vender, y viceversa
+    trigger = {
+        "triggerPx": str(round(stop_price, 6)),
+        "isMarket":  True,
+        "tpsl":      "sl",
+    }
+    try:
+        resp = _exchange.order(
+            sym_hl, is_buy, qty,
+            None,           # price=None para market
+            {"trigger": trigger},
+            reduce_only=True,
+        )
+        if resp.get("status") == "ok":
+            log.info("SL colocado en %.6f (%s %s)", stop_price, side.upper(), sym_hl)
+        else:
+            log.warning("place_stop_order(%s): %s", sym_hl, resp)
+    except Exception as exc:
+        log.warning("place_stop_order(%s) fallu00f3: %s", sym_hl, exc)
 
 
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
-    """Coloca la take-profit order.
+    """Coloca una take-profit order (trigger reduce-only)."""
+    sym_hl  = _hl_symbol(symbol)
+    is_buy  = side == "short"
+    trigger = {
+        "triggerPx": str(round(tp_price, 6)),
+        "isMarket":  True,
+        "tpsl":      "tp",
+    }
+    try:
+        resp = _exchange.order(
+            sym_hl, is_buy, qty,
+            None,
+            {"trigger": trigger},
+            reduce_only=True,
+        )
+        if resp.get("status") == "ok":
+            log.info("TP colocado en %.6f (%s %s)", tp_price, side.upper(), sym_hl)
+        else:
+            log.warning("place_tp_order(%s): %s", sym_hl, resp)
+    except Exception as exc:
+        log.warning("place_tp_order(%s) fallu00f3: %s", sym_hl, exc)
 
-    FIX A — doc oficial BingX: closePosition y quantity son mutuamente excluyentes.
-    """
-    sl_side  = "SELL" if side == "long" else "BUY"
-    pos_side = "LONG" if side == "long" else "SHORT"
-    _post("/openApi/swap/v2/trade/order", {
-        "symbol":        symbol,
-        "side":          sl_side,
-        "positionSide":  pos_side,
-        "type":          "TAKE_PROFIT_MARKET",
-        "stopPrice":     tp_price,
-        "closePosition": "true",
-    })
-    log.info("TP colocado en %.6f (%s %s)", tp_price, side.upper(), symbol)
 
-
-# ── Cerrar posición ────────────────────────────────────────────────────────────────────────────
+# ── Cerrar posición ───────────────────────────────────────────────────────────
 
 def close_position(side: str, qty: float, symbol: str = None) -> dict:
-    symbol   = symbol or config.SYMBOL
-    bx_side  = "SELL" if side == "long" else "BUY"
-    pos_side = "LONG" if side == "long" else "SHORT"
-    resp = _post("/openApi/swap/v2/trade/order", {
-        "symbol":       symbol,
-        "side":         bx_side,
-        "positionSide": pos_side,
-        "type":         "MARKET",
-        "quantity":     qty,
-    })
-    log.info("Posición cerrada: %s %s", side.upper(), symbol)
+    sym_hl = _hl_symbol(symbol or config.SYMBOLS[0])
+    is_buy = side == "short"  # cerrar short = comprar
+    resp   = _exchange.market_close(sym_hl, qty)
+    log.info("Posición cerrada: %s %s", side.upper(), sym_hl)
     return resp
 
 
-# ── Cancelar órdenes abiertas ─────────────────────────────────────────────────────────────────
+# ── Cancelar órdenes abiertas ─────────────────────────────────────────────────
 
 def cancel_all_orders(symbol: str = None) -> None:
-    """FIX: BingX exige DELETE (no POST) para cancelar todas las órdenes abiertas."""
-    symbol = symbol or config.SYMBOL
-    _delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
-    log.info("Órdenes canceladas para %s", symbol)
+    sym_hl = _hl_symbol(symbol or config.SYMBOLS[0])
+    try:
+        open_orders = _info.open_orders(_WALLET_ADDRESS)
+        oids_to_cancel = [
+            {"coin": o["coin"], "oid": o["oid"]}
+            for o in open_orders
+            if o["coin"] == sym_hl
+        ]
+        if oids_to_cancel:
+            resp = _exchange.cancel(sym_hl, [o["oid"] for o in oids_to_cancel])
+            log.info("Órdenes canceladas para %s (%d)", sym_hl, len(oids_to_cancel))
+        else:
+            log.debug("cancel_all_orders(%s): no había órdenes abiertas", sym_hl)
+    except Exception as exc:
+        log.warning("cancel_all_orders(%s) fallu00f3: %s", sym_hl, exc)
 
 
-# ── Historial de órdenes cerradas ─────────────────────────────────────────────────────────────
+# ── Historial de fills (sustituye a get_closed_orders) ────────────────────────
 
 def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
-    """Devuelve órdenes ejecutadas/cerradas del símbolo.
+    """Devuelve fills recientes del símbolo en formato compatible con main.py.
 
-    FIX B — parseo corregido: data es directamente un array.
-    FIX C — startTime/endTime obligatorios (doc BingX).
+    Hyperliquid no tiene concept de 'closed orders' como BingX — se usan fills.
+    Se normaliza el output para que main.py pueda extraer avgPrice, side y type.
     """
-    symbol = symbol or config.SYMBOL
-    now_ms   = int(time.time() * 1000)
-    start_ms = now_ms - 7 * 24 * 60 * 60 * 1000  # 7 días atrás
+    sym_hl = _hl_symbol(symbol or config.SYMBOLS[0])
     try:
-        data = _get("/openApi/swap/v2/trade/allOrders", {
-            "symbol":    symbol,
-            "limit":     limit,
-            "startTime": start_ms,
-            "endTime":   now_ms,
-        })
+        fills = _info.user_fills(_WALLET_ADDRESS)
     except Exception as exc:
-        log.debug("[%s] get_closed_orders falló: %s", symbol, exc)
+        log.debug("get_closed_orders(%s) fallu00f3: %s", sym_hl, exc)
         return []
 
-    raw = data.get("data") or []
-    terminal = {"FILLED", "CANCELED", "PARTIALLY_FILLED", "PARTIALLY_CANCELED"}
-    return [o for o in raw if str(o.get("status", "")).upper() in terminal]
+    result = []
+    for f in fills:
+        if f.get("coin") != sym_hl:
+            continue
+        # Normalizar al formato que espera main.py
+        side_hl  = f.get("side", "")  # "B" buy / "A" ask/sell
+        bx_side  = "BUY" if side_hl == "B" else "SELL"
+        # Inferir tipo por dir campo 'liquidation' o 'crossed'
+        order_type = "STOP_MARKET" if f.get("crossed", False) else "TAKE_PROFIT_MARKET"
+        result.append({
+            "side":       bx_side,
+            "type":       order_type,
+            "avgPrice":   str(f.get("px", 0)),
+            "time":       int(f.get("time", 0)),
+            "updateTime": int(f.get("time", 0)),
+            "status":     "FILLED",
+        })
+        if len(result) >= limit:
+            break
+    return result
