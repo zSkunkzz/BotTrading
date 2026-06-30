@@ -89,6 +89,12 @@ Fixes v5.2:
   - W_VELA: 0 → 4 (confirmación de vela devuelta parcialmente)
   - RSI zona ideal: bull 45-65 → 40-68 / bear 35-55 → 32-58
 
+Fixes v5.3:
+  - MIN_HOURLY_VOLUME: 1_000_000 → 500_000 USDT
+    Con posiciones de 20 USDT × 10x = 200 USDT, un volumen 1h de 500K
+    es más que suficiente para entrar/salir sin deslizamiento.
+    El umbral de 1M excluía pares líquidos como LINK, NEAR, 1KSHIB.
+
 Structure lookback v5.1:
   - STRUCTURE_LOOKBACK: 8 → 12 (más ventana para confirmar HH+HL)
     Con 8 velas, tendencias de 6-7h perdían sus swings más antiguos
@@ -131,7 +137,7 @@ DAILY_CANDLE_BLOCK    = 0.015
 DAILY_CANDLE_PENALTY  = 0.025
 DAILY_CANDLE_GUARD    = 0.040
 DAILY_CANDLE_BLOCK_PEN = 6
-MIN_HOURLY_VOLUME     = 1_000_000
+MIN_HOURLY_VOLUME     = 500_000   # era 1_000_000 — v5.3
 
 # ── Umbrales v3 ───────────────────────────────────────────────────────────
 ADX_1H_STRUCTURE_MIN  = 25
