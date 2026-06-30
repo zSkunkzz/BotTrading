@@ -14,13 +14,14 @@ BASE_URL   = "https://open-api.bingx.com"
 #   PENGU-USDT, NOT-USDT, LISTA-USDT, MANTA-USDT
 #   -> spreads/spikes impredecibles, el filtro de liquidez los rechazaba
 #      en runtime pero consumían conexiones WS y ciclos de loop.
+# Nota: SHIB cotiza en BingX como 1000SHIB-USDT (precio por 1000 tokens).
 SYMBOLS = [
     # --- Top 10 ---
     "BTC-USDT",  "ETH-USDT",  "BNB-USDT",  "XRP-USDT",  "SOL-USDT",
     "TRX-USDT",  "DOGE-USDT", "XLM-USDT",  "ADA-USDT",  "LINK-USDT",
     # --- 11-20 ---
     "BCH-USDT",  "HBAR-USDT", "LTC-USDT",  "SUI-USDT",  "AVAX-USDT",
-    "NEAR-USDT", "SHIB-USDT", "DOT-USDT",  "UNI-USDT",  "ICP-USDT",
+    "NEAR-USDT", "1000SHIB-USDT", "DOT-USDT",  "UNI-USDT",  "ICP-USDT",
     # --- 21-30 ---
     "ETC-USDT",  "FIL-USDT",  "INJ-USDT",  "APT-USDT",  "ARB-USDT",
     "VET-USDT",  "STX-USDT",  "ATOM-USDT", "TAO-USDT",  "WLD-USDT",
@@ -38,6 +39,10 @@ SYMBOLS = [
     "ALGO-USDT",  # #66 CMC — Algorand, L1
     "DYDX-USDT",  # #68 CMC — dYdX, DeFi exchange
     "RUNE-USDT",  # #72 CMC — THORChain, cross-chain
+    # --- Nuevos (memes/narrativa) ---
+    "PUMP-USDT",  # pump.fun token
+    "ASTER-USDT", # Aster
+    "ANSEM-USDT", # Ansem
 ]
 
 # Pares en modo alerta manual (no se tradean automáticamente)
@@ -55,12 +60,14 @@ CORR_GROUPS: list[set[str]] = [
     {"ATOM-USDT", "INJ-USDT", "SEI-USDT", "RUNE-USDT"},
     {"ONDO-USDT", "AAVE-USDT", "ENA-USDT"},
     # Memes puros — alta correlación en días de risk-on
-    {"DOGE-USDT", "SHIB-USDT"},
+    {"DOGE-USDT", "1000SHIB-USDT", "PUMP-USDT", "ANSEM-USDT"},
     # Legacy PoW/fork coins — correlacionadas entre sí, NO con memes
     {"BCH-USDT", "LTC-USDT", "ETC-USDT"},
     # Misc sin correlación clara — grupo propio para limitar exposición
     {"VET-USDT", "STX-USDT"},
     {"HYPE-USDT", "MNT-USDT"},
+    # Nuevos narrativa/misc
+    {"ASTER-USDT"},
 ]
 MAX_CORR_PER_GROUP = int(os.getenv("MAX_CORR_PER_GROUP", "2"))
 
