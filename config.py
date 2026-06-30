@@ -3,18 +3,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# BingX
-API_KEY    = os.environ["BINGX_API_KEY"]
-API_SECRET = os.environ["BINGX_API_SECRET"]
-BASE_URL   = "https://open-api.bingx.com"
+# ── Hyperliquid ────────────────────────────────────────────────────────────────
+# HYPERLIQUID_PRIVATE_KEY : clave privada EVM en hex (con o sin 0x)
+# HYPERLIQUID_WALLET_ADDRESS : opcional, se deriva de la pk si no se pone
+# HL_MAINNET : "true" para mainnet (producción), "false" para testnet
+# Las variables se leen directamente en exchange.py para no exponerlas aquí.
 
-# Pares verificados en BingX perpetual futures (top 100 CMC, junio 2026)
-# Criterios: perp activo en BingX + spread limpio + liquidez >= media.
+# Pares verificados en Hyperliquid perpetual futures
+# Hyperliquid usa el token base sin "-USDT": "BTC", "ETH", etc.
+# Las funciones de exchange.py normalizan automáticamente "BTC-USDT" → "BTC".
 # Excluidos explícitamente:
-#   PENGU-USDT, NOT-USDT, LISTA-USDT, MANTA-USDT
-#   -> spreads/spikes impredecibles, el filtro de liquidez los rechazaba
-#      en runtime pero consumían conexiones WS y ciclos de loop.
-# Nota: SHIB cotiza en BingX como 1000SHIB-USDT (precio por 1000 tokens).
+#   PENGU, NOT, LISTA, MANTA → spreads/spikes impredecibles
+# Nota: 1000SHIB cotiza igual en Hyperliquid (precio por 1000 tokens).
 SYMBOLS = [
     # --- Top 10 ---
     "BTC-USDT",  "ETH-USDT",  "BNB-USDT",  "XRP-USDT",  "SOL-USDT",
@@ -31,18 +31,18 @@ SYMBOLS = [
     # --- 41-45 ---
     "RENDER-USDT", "SEI-USDT",
     "ZK-USDT",   "EIGEN-USDT", "AERO-USDT",
-    # --- 46-50 (nuevos, top 100 CMC verificados BingX) ---
-    "AAVE-USDT",  # #47 CMC — DeFi blue chip, spread limpio
-    "GRT-USDT",   # #55 CMC — The Graph, DeFi infra
-    "LDO-USDT",   # #58 CMC — Lido DAO, liquid staking
-    "ENA-USDT",   # #63 CMC — Ethena, DeFi yield
-    "ALGO-USDT",  # #66 CMC — Algorand, L1
-    "DYDX-USDT",  # #68 CMC — dYdX, DeFi exchange
-    "RUNE-USDT",  # #72 CMC — THORChain, cross-chain
-    # --- Nuevos (memes/narrativa) ---
-    "PUMP-USDT",  # pump.fun token
-    "ASTER-USDT", # Aster
-    "ANSEM-USDT", # Ansem
+    # --- 46-50 ---
+    "AAVE-USDT",
+    "GRT-USDT",
+    "LDO-USDT",
+    "ENA-USDT",
+    "ALGO-USDT",
+    "DYDX-USDT",
+    "RUNE-USDT",
+    # --- Memes/narrativa ---
+    "PUMP-USDT",
+    "ASTER-USDT",
+    "ANSEM-USDT",
 ]
 
 # Pares en modo alerta manual (no se tradean automáticamente)
@@ -61,9 +61,9 @@ CORR_GROUPS: list[set[str]] = [
     {"ONDO-USDT", "AAVE-USDT", "ENA-USDT"},
     # Memes puros — alta correlación en días de risk-on
     {"DOGE-USDT", "1000SHIB-USDT", "PUMP-USDT", "ANSEM-USDT"},
-    # Legacy PoW/fork coins — correlacionadas entre sí, NO con memes
+    # Legacy PoW/fork coins
     {"BCH-USDT", "LTC-USDT", "ETC-USDT"},
-    # Misc sin correlación clara — grupo propio para limitar exposición
+    # Misc sin correlación clara
     {"VET-USDT", "STX-USDT"},
     {"HYPE-USDT", "MNT-USDT"},
     # Nuevos narrativa/misc
@@ -89,11 +89,9 @@ MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS", "7"))
 LEVERAGE       = int(os.getenv("LEVERAGE", "10"))
 MARGIN_USDT    = float(os.getenv("MARGIN_USDT", "20"))
 
-# LEGACY — no usados por risk.py en condiciones normales.
-# risk.py calcula SL desde ATR 1h × 1.2 directamente.
-# SL_PCT solo actúa como fallback de emergencia cuando ATR=0 (caso excepcional).
-SL_PCT         = float(os.getenv("SL_PCT", "1.5"))   # fallback ATR=0 únicamente
-TP_PCT         = float(os.getenv("TP_PCT", "3.0"))   # no utilizado actualmente
+# LEGACY — SL_PCT solo actúa como fallback de emergencia cuando ATR=0.
+SL_PCT         = float(os.getenv("SL_PCT", "1.5"))
+TP_PCT         = float(os.getenv("TP_PCT", "3.0"))
 
 TIMEFRAME           = os.getenv("TIMEFRAME", "15m")
 LOOP_SLEEP          = int(os.getenv("LOOP_SLEEP", "20"))
