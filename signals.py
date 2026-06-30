@@ -68,7 +68,13 @@ Fixes aplicados:
 
 Pesos v5 (scorer rebalanceado):
   Checks de alta predictividad reciben mayor peso.
-  Checks de bajo valor informativo reducidos.
+  Checks de bajo valor informativo reducidos o eliminados.
+  - W_RSI_IDEAL   : 10 → 12
+  - W_STRUCTURE   : 12 →  8 (menos bloqueante cuando swings no confirmados)
+  - W_VOLUME_HIGH :  8 → 10
+  - W_VELA        :  5 →  0 (eliminado del score, demasiado binario)
+  - W_HORA_HIGH   :  3 →  5
+  - W_DIVERGENCIA :  5 →  8 (señal rara pero muy predictiva)
   Nuevo máximo teórico: ~80 puntos.
   MIN_SCORE semana=70, SHORT_MIN_SCORE_EXTRA=6.
 
@@ -124,18 +130,18 @@ ATR_LOW_VOL_PCT       = 0.005
 ATR_HIGH_VOL_BUMP     = 8
 ATR_LOW_VOL_BUMP      = 4
 
-# ── Pesos del scorer (v5) ─────────────────────────────────────────────────
+# ── Pesos del scorer (v5 rebalanceado) ────────────────────────────────────
 W_ADX_1H_30    = 15
 W_ADX_1H_25    = 10
 W_ADX_1H_20    =  6
 W_MACD_1H      = 12
-W_RSI_IDEAL    = 10
-W_STRUCTURE    = 12
-W_VELA         =  5
-W_DIVERGENCIA  =  5
-W_HORA_HIGH    =  3
+W_RSI_IDEAL    = 12   # era 10 — señal limpia merece más peso
+W_STRUCTURE    =  8   # era 12 — demasiado bloqueante cuando swings no confirmados
+W_VELA         =  0   # era  5 — eliminado: demasiado binario y poco predictivo
+W_DIVERGENCIA  =  8   # era  5 — señal rara pero muy predictiva cuando aparece
+W_HORA_HIGH    =  5   # era  3 — si tiene valor que pese algo
 W_MACD_15M     =  8
-W_VOLUME_HIGH  =  8
+W_VOLUME_HIGH  = 10   # era  8 — volumen real es señal predictiva
 W_VOLUME_LOW   = -4
 W_HORA_LOW     = -4
 W_RSI_SOBRE    = -8
@@ -597,12 +603,11 @@ def evaluate(
         score -= PROTO_SCORE_PENALTY
         log.debug("[%s] proto-régimen → -%d (score=%d)", symbol, PROTO_SCORE_PENALTY, score)
 
+    # W_VELA = 0: la vela se registra en log pero ya no puntúa
     if effective_regime == "bull" and bullish_candle:
-        score += W_VELA
-        log.debug("[%s] vela alcista en bull → +%d (score=%d)", symbol, W_VELA, score)
+        log.debug("[%s] vela alcista en bull → +0 (score=%d) [W_VELA eliminado]", symbol, score)
     elif effective_regime == "bear" and not bullish_candle:
-        score += W_VELA
-        log.debug("[%s] vela bajista en bear → +%d (score=%d)", symbol, W_VELA, score)
+        log.debug("[%s] vela bajista en bear → +0 (score=%d) [W_VELA eliminado]", symbol, score)
     else:
         log.debug("[%s] vela contraria al régimen → +0 (score=%d)", symbol, score)
 
