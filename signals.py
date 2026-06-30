@@ -79,6 +79,12 @@ Pesos v5 (scorer rebalanceado + ajuste fino):
   Nuevo máximo teórico: ~78 puntos.
   MIN_SCORE semana=70, SHORT_MIN_SCORE_EXTRA=6.
 
+Structure lookback v5.1:
+  - STRUCTURE_LOOKBACK: 8 → 12 (más ventana para confirmar 2 HH+HL)
+    Con 8 velas, tendencias de 6-7h perdían sus swings más antiguos
+    y volvían a 'range' aunque la tendencia siguiera activa.
+    SWING_CONFIRM_COUNT=2 sin cambios — no se baja el criterio de calidad.
+
 Logs:
   - skip rutinarios (range, hard-guard, sobreextendido) → DEBUG
     (no aparecen en producción con nivel INFO)
@@ -111,7 +117,7 @@ HIGH_BIAS_HOURS = {8, 9, 10, 13, 14, 15, 16, 20, 21}
 LOW_BIAS_HOURS  = {2, 3, 4, 5}
 
 # ── Umbrales v2 ───────────────────────────────────────────────────────────
-STRUCTURE_LOOKBACK    = 8
+STRUCTURE_LOOKBACK    = 12   # era 8 — más ventana para confirmar 2 HH+HL
 DAILY_CANDLE_BLOCK    = 0.015
 DAILY_CANDLE_PENALTY  = 0.025
 DAILY_CANDLE_GUARD    = 0.040
