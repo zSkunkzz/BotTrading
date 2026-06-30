@@ -65,6 +65,9 @@ Fixes aplicados:
            día actual. Antes usaba 'open_time' pero las velas REST no incluían ese
            campo → contexto diario siempre vacío. exchange.py (FIX D) garantiza
            que todas las velas (REST y WS) incluyan 'open_time'.
+  - Bug 6: daily_move convertido de hard-guard a penalización (-6).
+           Un pullback intradía de 1.5-2.5% en bull fuerte es una entrada
+           potencial. El scorer decide si el setup sigue siendo válido.
 
 Pesos v5 (scorer rebalanceado + ajuste fino):
   - W_RSI_IDEAL   : 10 → 12
@@ -118,9 +121,10 @@ LOW_BIAS_HOURS  = {2, 3, 4, 5}
 
 # ── Umbrales v2 ───────────────────────────────────────────────────────────
 STRUCTURE_LOOKBACK    = 12   # era 8 — más ventana para confirmar 2 HH+HL
-DAILY_CANDLE_BLOCK    = 0.015
+DAILY_CANDLE_BLOCK    = 0.015   # pullback contra régimen → penalización (era hard-guard)
 DAILY_CANDLE_PENALTY  = 0.025
 DAILY_CANDLE_GUARD    = 0.040
+DAILY_CANDLE_BLOCK_PEN = 6      # penalización por daily_move contra régimen
 MIN_HOURLY_VOLUME     = 1_000_000
 
 # ── Umbrales v3 ───────────────────────────────────────────────────────────
@@ -577,14 +581,23 @@ def evaluate(
 
     if open_daily > 0:
         daily_move = (close_today - open_daily) / open_daily
-        if effective_regime == "bull" and daily_move < -DAILY_CANDLE_BLOCK:
-            log.debug("[%s] skip: daily_move=%.2f%% < -%.1f%% en régimen bull", symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100)
-            return None, score, None
-        if effective_regime == "bear" and daily_move > DAILY_CANDLE_BLOCK:
-            log.debug("[%s] skip: daily_move=%.2f%% > +%.1f%% en régimen bear", symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100)
-            return None, score, None
+        abs_move   = abs(daily_move)
 
-        abs_move = abs(daily_move)
+        # Penalización por pullback contra el régimen (antes era hard-guard)
+        if effective_regime == "bull" and daily_move < -DAILY_CANDLE_BLOCK:
+            score -= DAILY_CANDLE_BLOCK_PEN
+            log.debug(
+                "[%s] daily_move=%.2f%% < -%.1f%% en bull → -%d (score=%d)",
+                symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100, DAILY_CANDLE_BLOCK_PEN, score,
+            )
+        elif effective_regime == "bear" and daily_move > DAILY_CANDLE_BLOCK:
+            score -= DAILY_CANDLE_BLOCK_PEN
+            log.debug(
+                "[%s] daily_move=%.2f%% > +%.1f%% en bear → -%d (score=%d)",
+                symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100, DAILY_CANDLE_BLOCK_PEN, score,
+            )
+
+        # Penalización adicional por movimiento diario muy grande (en cualquier dirección)
         if abs_move > DAILY_CANDLE_PENALTY:
             score -= 10
             log.debug(
