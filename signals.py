@@ -17,11 +17,11 @@ Nuevas mejoras v4:
 
   B. Score mínimo dinámico por volatilidad (ATR)
      En días de alta volatilidad (ATR_1h > 2% del precio) el MIN_SCORE
-     sube automáticamente +8 puntos. Reduce SLs en días difíciles.
+     sube automáticamente +5 puntos (era +8, reducido para no ser prohibitivo).
      En días de muy baja volatilidad (ATR_1h < 0.5%) sube +4 (mercado
      adormecido → señales falsas frecuentes).
 
-  C. Penalización contradicción mantenida en -12 (v3)
+  C. Penalización contradicción estructura: -8 (simétrica con W_STRUCTURE=+8)
 
 Mejoras estructurales v3 (heredadas):
   A. Estructura de precio 1h con swing highs/lows reales
@@ -66,16 +66,17 @@ Fixes aplicados:
            campo → contexto diario siempre vacío. exchange.py (FIX D) garantiza
            que todas las velas (REST y WS) incluyan 'open_time'.
 
-Pesos v5 (scorer rebalanceado):
-  Checks de alta predictividad reciben mayor peso.
-  Checks de bajo valor informativo reducidos o eliminados.
+Pesos v5 (scorer rebalanceado + ajuste fino):
   - W_RSI_IDEAL   : 10 → 12
   - W_STRUCTURE   : 12 →  8 (menos bloqueante cuando swings no confirmados)
   - W_VOLUME_HIGH :  8 → 10
-  - W_VELA        :  5 →  0 (eliminado del score, demasiado binario)
+  - W_VELA        :  5 →  0 (eliminado: demasiado binario y poco predictivo)
   - W_HORA_HIGH   :  3 →  5
   - W_DIVERGENCIA :  5 →  8 (señal rara pero muy predictiva)
-  Nuevo máximo teórico: ~80 puntos.
+  - W_ADX_1H_20   :  6 →  3 (ADX 20-25 es señal débil)
+  - ATR_HIGH_VOL_BUMP: 8 → 5 (mínimo 78 era inalcanzable, ahora 75)
+  - Penalización structure contraria: -12 → -8 (simétrica con W_STRUCTURE)
+  Nuevo máximo teórico: ~78 puntos.
   MIN_SCORE semana=70, SHORT_MIN_SCORE_EXTRA=6.
 
 Logs:
@@ -127,13 +128,13 @@ PROTO_MIN_SCORE_EXTRA = 4
 
 ATR_HIGH_VOL_PCT      = 0.020
 ATR_LOW_VOL_PCT       = 0.005
-ATR_HIGH_VOL_BUMP     = 8
+ATR_HIGH_VOL_BUMP     = 5   # era 8 — mínimo 78 era inalcanzable, ahora 75
 ATR_LOW_VOL_BUMP      = 4
 
-# ── Pesos del scorer (v5 rebalanceado) ────────────────────────────────────
+# ── Pesos del scorer (v5 rebalanceado + ajuste fino) ──────────────────────
 W_ADX_1H_30    = 15
 W_ADX_1H_25    = 10
-W_ADX_1H_20    =  6
+W_ADX_1H_20    =  3   # era 6 — ADX 20-25 es señal débil, no merece más
 W_MACD_1H      = 12
 W_RSI_IDEAL    = 12   # era 10 — señal limpia merece más peso
 W_STRUCTURE    =  8   # era 12 — demasiado bloqueante cuando swings no confirmados
@@ -145,6 +146,7 @@ W_VOLUME_HIGH  = 10   # era  8 — volumen real es señal predictiva
 W_VOLUME_LOW   = -4
 W_HORA_LOW     = -4
 W_RSI_SOBRE    = -8
+W_STRUCTURE_CONTRA = -8  # era -12 — simétrico con W_STRUCTURE=+8
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────
@@ -367,13 +369,7 @@ def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK)
 
 
 def _daily_candle_context(candles_1h: list[dict]) -> tuple[float, float]:
-    """Devuelve (open_diario, close_actual) usando velas del día UTC actual.
-
-    FIX Bug 5: usa 'open_time' (garantizado por exchange.py FIX D y ws_feed.py
-    FIX E) para filtrar las velas del día. Antes las velas REST no incluían
-    'open_time' → today_candles siempre vacío → contexto diario siempre (0, 0)
-    → penalización daily_candle_context inutilizada.
-    """
+    """Devuelve (open_diario, close_actual) usando velas del día UTC actual."""
     now_utc     = datetime.datetime.now(timezone.utc)
     midnight    = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     midnight_ts = midnight.timestamp() * 1000
@@ -395,14 +391,7 @@ def _daily_candle_context(candles_1h: list[dict]) -> tuple[float, float]:
 
 
 def _liquidity_ok(candles_1h: list[dict]) -> bool:
-    """Verifica que el par tenga volumen USDT suficiente en 1h.
-
-    FIX Bug 4: usaba 'volume' (unidades base: BTC, ETH, TRX…). Para BTC el
-    volumen por vela es ~0.1-5 BTC, muy por debajo del umbral de 1_000_000 USDT
-    → todos los pares fallaban el filtro incluso con alta liquidez real.
-    Ahora usa 'quote_volume' (volumen en USDT = volume * close), que es el
-    valor correcto para comparar contra MIN_HOURLY_VOLUME expresado en USDT.
-    """
+    """Verifica que el par tenga volumen USDT suficiente en 1h."""
     recent = candles_1h[-25:-1]
     if not recent:
         return False
@@ -697,10 +686,10 @@ def evaluate(
         score += W_STRUCTURE
         log.debug("[%s] structure=%s == régimen → +%d (score=%d)", symbol, structure, W_STRUCTURE, score)
     elif structure != "range" and structure != effective_regime:
-        score -= 12
+        score += W_STRUCTURE_CONTRA
         log.debug(
-            "[%s] structure=%s contradice régimen=%s → -12 (score=%d)",
-            symbol, structure, regime, score,
+            "[%s] structure=%s contradice régimen=%s → %d (score=%d)",
+            symbol, structure, regime, W_STRUCTURE_CONTRA, score,
         )
 
     # ── Score mínimo ──────────────────────────────────────────────────────
