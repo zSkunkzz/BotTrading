@@ -61,7 +61,7 @@ ADX_15M_MIN           = 18
 
 # ── Umbrales estructura ───────────────────────────────────────────────────
 STRUCTURE_LOOKBACK    = 12
-MIN_HOURLY_VOLUME     = 500_000   # USDT
+MIN_HOURLY_VOLUME     = 150_000   # USDT — bajado de 500k; HL tiene menor volumen que CEX
 
 # ── Umbrales proto-régimen ────────────────────────────────────────────────
 PROTO_ADX_MIN         = 18   # era 22 — simplificado
