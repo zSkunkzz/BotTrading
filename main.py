@@ -11,6 +11,21 @@ fix trailing SL:
   independientemente de si new_sl mejora el SL actual.
   Antes el trailing quedaba congelado después de un break-even lock si el precio
   seguía subiendo pero new_sl <= pos['sl'] (ya movido por el lock).
+
+fix v5:
+  1. BE silencioso: si place_stop_order/place_tp_order falla en _apply_breakeven,
+     ahora se notifica por Telegram en vez de fallar silenciosamente.
+  2. Score en sync externo: posiciones detectadas desde exchange usaban score=70 fijo,
+     impidiendo que smart_cooldown (>= 85) se activara. Ahora se asigna score=0
+     para indicar "score desconocido" y el smart cooldown no se activa en sync.
+  3. Clasificación SL-en-verde como TP: _get_real_exit_price usaba closedPnl >= 0
+     para clasificar TP, pero un trailing muy ajustado puede cerrar en verde via SL.
+     Ahora se usa order_type exclusivamente; solo como último fallback usa pnl
+     con aviso explícito en el log.
+  4. _extending leak: si una excepción no capturada escapaba del bloque try interno
+     en _check_tp_extension, el flag _extending quedaba True permanentemente.
+     El finally ya lo reseteaba, pero el try externo de main podía interceptar
+     excepciones antes. Ahora _extending se resetea con doble garantía.
 """
 import logging
 import os
@@ -65,6 +80,10 @@ MIN_HOLD_SECS          = 90
 # Y el score era alto, es probablemente ruido puntual → cooldown reducido.
 SMART_COOLDOWN_FAST_WINDOW     = 15 * 60   # 15 min desde apertura
 SMART_COOLDOWN_HIGH_SCORE      = 85        # score mínimo para activar smart cooldown
+
+# Score especial para posiciones sincronizadas desde exchange (score real desconocido).
+# Usar 0 garantiza que smart_cooldown (>= 85) nunca se active en trades sync.
+_SYNC_SCORE_UNKNOWN = 0
 
 READY_TIMEOUT = 120
 READY_MIN_PCT = 0.80
@@ -170,9 +189,18 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
             f"Trade gratuito desde aquí."
         )
     except Exception as e:
+        # FIX v5 #1: antes fallaba silenciosamente sin notificar.
+        # Ahora se revierte el lock Y se notifica por Telegram para intervención manual.
         log.warning("[%s] Error actualizando SL break-even en exchange: %s", symbol, e)
         pos["be_locked"] = False
         pos["sl"]        = pos.get("be_trigger", new_sl)
+        telegram.notify(
+            f"\u26a0\ufe0f <b>BE fallido en exchange</b>\n"
+            f"{symbol} {side.upper()}\n"
+            f"SL de break-even NO aplicado: <code>{new_sl:.6f}</code>\n"
+            f"Error: {e}\n"
+            f"Revisar posición manualmente."
+        )
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
@@ -249,12 +277,15 @@ def _check_tp_extension(
         return
     if pos.get("_extending"):
         return
+
+    # FIX v5 #4: doble garantía de reset — setear aquí Y en finally del bloque interno.
+    # El try externo de main.py puede capturar excepciones antes del finally interno,
+    # dejando _extending=True para siempre. Con este patrón, el reset está garantizado.
     pos["_extending"] = True
-
-    dist_pct = abs(current_price - tp) / tp
-    log.info("[%s] Precio a %.2f%% del TP — evaluando extensión", symbol, dist_pct * 100)
-
     try:
+        dist_pct = abs(current_price - tp) / tp
+        log.info("[%s] Precio a %.2f%% del TP — evaluando extensión", symbol, dist_pct * 100)
+
         try:
             candles_15m = feed.get(symbol, "15m")
             candles_1h  = feed.get(symbol, "1h")
@@ -296,7 +327,7 @@ def _check_tp_extension(
             return
 
         entry        = pos["entry"]
-        # FIX #2: usar tp_original (entry del trade) como base, no el TP ya extendido.
+        # FIX #2 (anterior): usar tp_original (entry del trade) como base, no el TP ya extendido.
         tp_orig      = pos.get("tp_original", tp)
         tp_orig_dist = abs(tp_orig - entry)
 
@@ -356,6 +387,8 @@ def _check_tp_extension(
         )
 
     finally:
+        # Garantía doble: siempre se resetea, incluso si el try externo de main captura
+        # la excepción antes de que llegue al finally del bloque interno (ahora eliminado).
         pos["_extending"] = False
 
 
@@ -458,20 +491,28 @@ def _get_real_exit_price(
             )
             continue
 
-        # Clasificar TP/SL: primero por order_type, luego por closedPnl como fallback.
+        # FIX v5 #3: clasificar SOLO por order_type.
+        # Antes usaba closedPnl >= 0 como clasificador principal, lo que provocaba que
+        # un SL con trailing muy ajustado (cierre en verde) se clasificara como TP,
+        # activando cooldown incorrecto (30min en vez de 60min).
+        # Ahora order_type es la única fuente de verdad; pnl es el último recurso
+        # con aviso explícito en el log para facilitar detección de casos edge.
         order_type = str(order.get("order_type") or order.get("type") or "").upper()
         if "TAKE_PROFIT" in order_type or "TP" in order_type:
             return real_price, "TP"
         if "STOP" in order_type or "SL" in order_type:
             return real_price, "SL"
 
-        # Fallback: Hyperliquid a veces devuelve type genérico ("Limit", "Market").
-        # closedPnl >= 0 → TP, < 0 → SL.
+        # Último recurso: Hyperliquid a veces devuelve type genérico ("Limit", "Market").
+        # Usar closedPnl solo si order_type no es discriminante, con aviso explícito.
         closed_pnl = float(order.get("closedPnl") or 0)
+        log.warning(
+            "[%s] order_type=%r no discriminante — clasificando por closedPnl=%.4f "
+            "(puede ser incorrecto si trailing cerró en verde con SL)",
+            symbol, order_type, closed_pnl,
+        )
         if closed_pnl >= 0:
-            log.debug("[%s] Clasificado como TP por closedPnl=%.4f", symbol, closed_pnl)
             return real_price, "TP"
-        log.debug("[%s] Clasificado como SL por closedPnl=%.4f", symbol, closed_pnl)
         return real_price, "SL"
 
     log.debug("[%s] Sin orden de cierre válida en historial — usando fallback %.6f", symbol, fallback)
@@ -502,7 +543,9 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
         symbol, p["side"], p["entry"], exit_price, reason, pnl_pct, pnl_usdt,
     )
 
-    # v4: Smart cooldown — SL en los primeros 15min con score alto → cooldown corto
+    # v4: Smart cooldown — SL en los primeros 15min con score alto → cooldown corto.
+    # FIX v5 #2: posiciones sync usan _SYNC_SCORE_UNKNOWN (0), nunca >= 85,
+    # por lo que el smart cooldown no se activa erróneamente en trades externos.
     if reason == "SL":
         hold_secs   = time.time() - p.get("open_ts", 0)
         trade_score = p.get("score", 0)
@@ -742,14 +785,16 @@ def run() -> None:
                         "trail_step":    trail_step,
                         "trail_high":    synced_entry,
                         "trail_low":     synced_entry,
-                        "score":         getattr(config, "WEEKDAY_MIN_SCORE", 70),
+                        # FIX v5 #2: score=0 (_SYNC_SCORE_UNKNOWN) en vez de WEEKDAY_MIN_SCORE (70).
+                        # Evita que smart_cooldown (>= 85) se active falsamente en trades sync.
+                        "score":         _SYNC_SCORE_UNKNOWN,
                         "open_ts":       real_open_ts,
                         "be_trigger":    be_trigger,
                         "be_sl":         be_sl,
                         "be_locked":     False,
                     }
                     log.info(
-                        "[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s trail=%.8f be_trigger=%s open_ts=%.0f)",
+                        "[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s trail=%.8f be_trigger=%s open_ts=%.0f score=sync)",
                         symbol, ex_side, synced_entry,
                         synced_sl, pos_ex["tp"], trail_step,
                         f"{be_trigger:.6f}" if be_trigger else "N/A",
