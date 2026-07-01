@@ -3,7 +3,7 @@
 Migrado desde BingX. Hyperliquid es un DEX L1 sin KYC/restricciones MiCA.
 
 Dependencias:
-    pip install hyperliquid-python-sdk eth-account
+    pip install hyperliquid-python-sdk eth-account httpx
 
 Variables de entorno:
     HYPERLIQUID_PRIVATE_KEY  : clave privada EVM en hex (con o sin 0x)
@@ -15,7 +15,7 @@ Nombres de símbolos:
     Todas las funciones públicas aceptan tanto "BTC-USDT" como "BTC".
     _hl_symbol() normaliza internamente.
 
-BUGS corregidos respecto a la versión inicial:
+BUGS corregidos respecto a la versión BingX original:
   1. Exchange.__init__ requiere account, base_url y wallet_address en ese orden.
      La signatura correcta es Exchange(account, base_url, account_address=...).
   2. market_open/market_close NO existen en el SDK oficial. La API correcta es
@@ -35,6 +35,9 @@ BUGS corregidos respecto a la versión inicial:
   8. floor_qty ahora recibe symbol y calcula sz_decimals desde el SDK.
   9. Info(skip_ws=True) es correcto para no abrir WS desde el hilo principal
      (ws_feed.py gestiona su propio WS de forma independiente).
+ 10. get_closed_orders: usa fill['dir'] ('Close Long'/'Close Short') para
+     clasificar SL vs TP en lugar de la heurística 'crossed' (incorrecta).
+     'crossed' indica si la orden cruzó el book, no si es stop o tp trigger.
 """
 import logging
 import os
@@ -382,7 +385,19 @@ def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
       coin, closedPnl, crossed, dir, hash, oid, px, side, startPosition, sz, time
 
     side: 'B' (buy) | 'A' (ask/sell)
-    dir: texto como 'Open Long', 'Close Long', etc.
+    dir:  texto descriptivo: 'Open Long', 'Close Long', 'Open Short', 'Close Short'
+
+    BUG 10 fix: clasificar SL vs TP usando dir, NO usando 'crossed'.
+    'crossed' solo indica si la orden cruzó el book (market vs limit),
+    no si fue un stop-loss o un take-profit.
+
+    Mapeo dir → tipo de cierre:
+      'Close Long'  con side='A' (sell) → puede ser SL (long) o TP (long)
+      'Close Short' con side='B' (buy)  → puede ser SL (short) o TP (short)
+    Como HL no diferencia SL/TP en el fill, usamos closedPnl:
+      closedPnl < 0 → SL (perdiendo)
+      closedPnl >= 0 → TP (ganando)
+    Esto es una heurística razonable; el precio real (px) es lo que importa.
     """
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
     try:
@@ -397,15 +412,34 @@ def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
     for f in fills:
         if f.get("coin") != coin:
             continue
-        bx_side    = "BUY" if f.get("side") == "B" else "SELL"
-        order_type = "STOP_MARKET" if f.get("crossed", False) else "TAKE_PROFIT_MARKET"
+
+        fill_dir = f.get("dir", "")
+
+        # Solo nos interesan fills de cierre
+        if "Close" not in fill_dir:
+            continue
+
+        # Determinar side de la operación original (long o short que se cerró)
+        # 'Close Long'  → se cerró una posición long  → el fill fue SELL
+        # 'Close Short' → se cerró una posición short → el fill fue BUY
+        if "Long" in fill_dir:
+            normalized_side = "SELL"   # cierre de long
+        else:
+            normalized_side = "BUY"    # cierre de short
+
+        # Clasificar SL vs TP por closedPnl
+        closed_pnl = float(f.get("closedPnl", 0))
+        order_type = "STOP_MARKET" if closed_pnl < 0 else "TAKE_PROFIT_MARKET"
+
         result.append({
-            "side":       bx_side,
+            "side":       normalized_side,
             "type":       order_type,
             "avgPrice":   str(f.get("px", 0)),
             "time":       int(f.get("time", 0)),
             "updateTime": int(f.get("time", 0)),
             "status":     "FILLED",
+            "dir":        fill_dir,          # campo extra para debug
+            "closedPnl":  closed_pnl,
         })
         if len(result) >= limit:
             break

@@ -1,4 +1,6 @@
 python-dotenv
-websocket-client
 hyperliquid-python-sdk
 eth-account
+httpx
+websockets
+schedule

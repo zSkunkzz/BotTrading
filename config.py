@@ -9,12 +9,17 @@ load_dotenv()
 # HL_MAINNET : "true" para mainnet (producción), "false" para testnet
 # Las variables se leen directamente en exchange.py para no exponerlas aquí.
 
-# Pares verificados en Hyperliquid perpetual futures
+# Pares verificados en Hyperliquid perpetual futures (julio 2026)
 # Hyperliquid usa el token base sin "-USDT": "BTC", "ETH", etc.
 # Las funciones de exchange.py normalizan automáticamente "BTC-USDT" → "BTC".
-# Excluidos explícitamente:
-#   PENGU, NOT, LISTA, MANTA → spreads/spikes impredecibles
-# Nota: 1000SHIB cotiza igual en Hyperliquid (precio por 1000 tokens).
+#
+# Eliminados en esta revisión:
+#   ZK-USDT    → baja liquidez / delisted en HL perps
+#   EIGEN-USDT → baja liquidez / delisted en HL perps
+#   AERO-USDT  → no disponible en HL perpetuals
+#   PUMP-USDT  → no listado en HL perpetuals
+#   ASTER-USDT → no listado en HL perpetuals
+#   ANSEM-USDT → no listado en HL perpetuals
 SYMBOLS = [
     # --- Top 10 ---
     "BTC-USDT",  "ETH-USDT",  "BNB-USDT",  "XRP-USDT",  "SOL-USDT",
@@ -28,10 +33,8 @@ SYMBOLS = [
     # --- 31-40 ---
     "ONDO-USDT", "MNT-USDT",  "FET-USDT",  "OP-USDT",   "POL-USDT",
     "HYPE-USDT", "JUP-USDT",  "TIA-USDT",
-    # --- 41-45 ---
+    # --- 41-46 ---
     "RENDER-USDT", "SEI-USDT",
-    "ZK-USDT",   "EIGEN-USDT", "AERO-USDT",
-    # --- 46-50 ---
     "AAVE-USDT",
     "GRT-USDT",
     "LDO-USDT",
@@ -39,10 +42,6 @@ SYMBOLS = [
     "ALGO-USDT",
     "DYDX-USDT",
     "RUNE-USDT",
-    # --- Memes/narrativa ---
-    "PUMP-USDT",
-    "ASTER-USDT",
-    "ANSEM-USDT",
 ]
 
 # Pares en modo alerta manual (no se tradean automáticamente)
@@ -53,21 +52,19 @@ MANUAL_ALERT_SYMBOLS: set[str] = set()
 CORR_GROUPS: list[set[str]] = [
     {"BTC-USDT", "ETH-USDT", "BNB-USDT", "LDO-USDT"},
     {"SOL-USDT", "AVAX-USDT", "APT-USDT", "SUI-USDT", "NEAR-USDT", "TIA-USDT"},
-    {"ARB-USDT", "OP-USDT", "DOT-USDT", "ICP-USDT", "POL-USDT", "ZK-USDT", "DYDX-USDT"},
-    {"LINK-USDT", "UNI-USDT", "AERO-USDT", "JUP-USDT", "ONDO-USDT", "AAVE-USDT", "GRT-USDT"},
+    {"ARB-USDT", "OP-USDT", "DOT-USDT", "ICP-USDT", "POL-USDT", "DYDX-USDT"},
+    {"LINK-USDT", "UNI-USDT", "JUP-USDT", "ONDO-USDT", "AAVE-USDT", "GRT-USDT"},
     {"XRP-USDT", "XLM-USDT", "TRX-USDT", "HBAR-USDT", "ADA-USDT", "ALGO-USDT"},
-    {"FIL-USDT", "RENDER-USDT", "TAO-USDT", "EIGEN-USDT", "FET-USDT", "WLD-USDT"},
+    {"FIL-USDT", "RENDER-USDT", "TAO-USDT", "FET-USDT", "WLD-USDT"},
     {"ATOM-USDT", "INJ-USDT", "SEI-USDT", "RUNE-USDT"},
     {"ONDO-USDT", "AAVE-USDT", "ENA-USDT"},
     # Memes puros — alta correlación en días de risk-on
-    {"DOGE-USDT", "1000SHIB-USDT", "PUMP-USDT", "ANSEM-USDT"},
+    {"DOGE-USDT", "1000SHIB-USDT"},
     # Legacy PoW/fork coins
     {"BCH-USDT", "LTC-USDT", "ETC-USDT"},
     # Misc sin correlación clara
     {"VET-USDT", "STX-USDT"},
     {"HYPE-USDT", "MNT-USDT"},
-    # Nuevos narrativa/misc
-    {"ASTER-USDT"},
 ]
 MAX_CORR_PER_GROUP = int(os.getenv("MAX_CORR_PER_GROUP", "2"))
 
