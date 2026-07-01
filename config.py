@@ -9,39 +9,41 @@ load_dotenv()
 # HL_MAINNET : "true" para mainnet (producción), "false" para testnet
 # Las variables se leen directamente en exchange.py para no exponerlas aquí.
 
-# Pares verificados en Hyperliquid perpetual futures (verificado 2026-07-01).
+# Pares seleccionados por volumen real 24h en Hyperliquid perpetual futures
+# (datos consultados 2026-07-01). Ordenados de mayor a menor vol.
 # Hyperliquid usa el token base sin "-USDT": "BTC", "ETH", etc.
 # Las funciones de exchange.py normalizan automáticamente "BTC-USDT" → "BTC".
 #
-# Historial de cambios respecto a BingX:
-#   1000SHIB-USDT → kSHIB-USDT  (nombre oficial en HL perpetuals)
-#   VET-USDT      → ELIMINADO   (no listado en HL)
-#   GRT-USDT      → ELIMINADO   (no listado en HL)
-#   ZK-USDT       → ELIMINADO   (baja liquidez en HL)
-#   EIGEN-USDT    → ELIMINADO   (baja liquidez en HL)
-#   AERO-USDT     → ELIMINADO   (no disponible en HL)
-#   PUMP-USDT     → ELIMINADO
-#   ASTER-USDT    → ELIMINADO
-#   ANSEM-USDT    → ELIMINADO
-#
-# Excluidos explícitamente:
-#   PENGU, NOT, LISTA, MANTA → spreads/spikes impredecibles
+# Excluidos explícitamente (motivo):
+#   PUMP-USDT    → token meme con spreads impredecibles
+#   PAXG-USDT    → pegged a oro, no tendencial
+#   FARTCOIN     → meme puro, sin estructura técnica
+#   SPX-USDT     → liquidez concentrada en eventos puntuales
+#   XPL-USDT     → muy nuevo, sin histórico suficiente
+#   MON-USDT     → muy nuevo, sin histórico suficiente
+#   MET-USDT     → muy nuevo, sin histórico suficiente
+#   PENGU-USDT   → spreads/spikes impredecibles
+#   RESOLV-USDT  → muy nuevo, sin histórico suficiente
+#   WLFI-USDT    → token político, alta correlación con TRUMP
 SYMBOLS = [
-    # --- Top 10 ---
-    "BTC-USDT",  "ETH-USDT",  "BNB-USDT",  "XRP-USDT",  "SOL-USDT",
-    "TRX-USDT",  "DOGE-USDT", "XLM-USDT",  "ADA-USDT",  "LINK-USDT",
-    # --- 11-20 ---
-    "BCH-USDT",  "HBAR-USDT", "LTC-USDT",  "SUI-USDT",  "AVAX-USDT",
-    "NEAR-USDT", "kSHIB-USDT", "DOT-USDT",  "UNI-USDT",  "ICP-USDT",
-    # --- 21-30 ---
-    "ETC-USDT",  "FIL-USDT",  "INJ-USDT",  "APT-USDT",  "ARB-USDT",
-    "STX-USDT",  "ATOM-USDT", "TAO-USDT",  "WLD-USDT",  "ONDO-USDT",
-    # --- 31-39 ---
-    "MNT-USDT",  "FET-USDT",  "OP-USDT",   "POL-USDT",  "HYPE-USDT",
-    "JUP-USDT",  "TIA-USDT",  "RENDER-USDT", "SEI-USDT",
-    # --- 40-47 ---
-    "AAVE-USDT", "LDO-USDT",  "ENA-USDT",
-    "ALGO-USDT", "DYDX-USDT", "RUNE-USDT",
+    # --- Top por vol (>100M USD/24h) ---
+    "BTC-USDT",   "ETH-USDT",   "HYPE-USDT",  "SOL-USDT",
+    # --- Alto vol (10M-100M USD/24h) ---
+    "ZEC-USDT",   "LIT-USDT",   "WLD-USDT",   "VVV-USDT",
+    "XRP-USDT",   "NEAR-USDT",  "MORPHO-USDT","DYDX-USDT",
+    "AAVE-USDT",  "DOGE-USDT",  "kPEPE-USDT", "JTO-USDT",
+    "XLM-USDT",   "SUI-USDT",   "ADA-USDT",   "ENA-USDT",
+    "TAO-USDT",   "JUP-USDT",   "BNB-USDT",
+    # --- Vol medio (2M-10M USD/24h) ---
+    "BCH-USDT",   "XMR-USDT",   "TRUMP-USDT", "AVAX-USDT",
+    "UNI-USDT",   "CRV-USDT",   "ARB-USDT",   "ZRO-USDT",
+    "LINK-USDT",  "ONDO-USDT",  "PYTH-USDT",  "LTC-USDT",
+    "APT-USDT",   "WIF-USDT",   "DOT-USDT",   "kBONK-USDT",
+    "GRASS-USDT", "AERO-USDT",  "FET-USDT",   "TRX-USDT",
+    # --- Vol bajo-medio (700k-2M USD/24h) ---
+    "HBAR-USDT",  "VIRTUAL-USDT","EIGEN-USDT", "OP-USDT",
+    "PENDLE-USDT","INJ-USDT",   "kSHIB-USDT", "SEI-USDT",
+    "TIA-USDT",   "LDO-USDT",
 ]
 
 # Pares en modo alerta manual (no se tradean automáticamente)
@@ -50,21 +52,35 @@ MANUAL_ALERT_SYMBOLS: set[str] = set()
 # Grupos de correlación.
 # Regla: pares del mismo grupo compiten por MAX_CORR_PER_GROUP slots.
 CORR_GROUPS: list[set[str]] = [
-    {"BTC-USDT", "ETH-USDT", "BNB-USDT", "LDO-USDT"},
-    {"SOL-USDT", "AVAX-USDT", "APT-USDT", "SUI-USDT", "NEAR-USDT", "TIA-USDT"},
-    {"ARB-USDT", "OP-USDT", "DOT-USDT", "ICP-USDT", "POL-USDT", "DYDX-USDT"},
-    {"LINK-USDT", "UNI-USDT", "JUP-USDT", "ONDO-USDT", "AAVE-USDT"},
-    {"XRP-USDT", "XLM-USDT", "TRX-USDT", "HBAR-USDT", "ADA-USDT", "ALGO-USDT"},
-    {"FIL-USDT", "RENDER-USDT", "TAO-USDT", "FET-USDT", "WLD-USDT"},
-    {"ATOM-USDT", "INJ-USDT", "SEI-USDT", "RUNE-USDT"},
-    {"ONDO-USDT", "AAVE-USDT", "ENA-USDT"},
-    # Memes puros — alta correlación en días de risk-on
-    {"DOGE-USDT", "kSHIB-USDT"},
-    # Legacy PoW/fork coins
-    {"BCH-USDT", "LTC-USDT", "ETC-USDT"},
-    # Misc
-    {"STX-USDT"},
-    {"HYPE-USDT", "MNT-USDT"},
+    # BTC / ETH y derivados de staking
+    {"BTC-USDT", "ETH-USDT", "LDO-USDT", "EIGEN-USDT"},
+    # Ecosistema Solana
+    {"SOL-USDT", "JUP-USDT", "JTO-USDT", "WIF-USDT", "kBONK-USDT", "kPEPE-USDT",
+     "kSHIB-USDT", "PYTH-USDT", "GRASS-USDT"},
+    # L1 alternativas (Avalanche, Near, Aptos, Sui)
+    {"AVAX-USDT", "NEAR-USDT", "APT-USDT", "SUI-USDT", "TIA-USDT"},
+    # L2 Ethereum
+    {"ARB-USDT", "OP-USDT", "DYDX-USDT", "ZRO-USDT"},
+    # DeFi blue chips
+    {"AAVE-USDT", "UNI-USDT", "CRV-USDT", "PENDLE-USDT", "MORPHO-USDT"},
+    # Oráculos y datos on-chain
+    {"LINK-USDT", "ONDO-USDT", "FET-USDT", "VIRTUAL-USDT"},
+    # Pagos / XRP-esfera
+    {"XRP-USDT", "XLM-USDT", "TRX-USDT", "HBAR-USDT", "ADA-USDT"},
+    # Interoperabilidad / Cosmos
+    {"DOT-USDT", "INJ-USDT", "SEI-USDT", "TAO-USDT"},
+    # AI / Compute
+    {"WLD-USDT", "AERO-USDT", "LIT-USDT"},
+    # Memes puros
+    {"DOGE-USDT", "TRUMP-USDT"},
+    # Legacy PoW / fork coins
+    {"BCH-USDT", "LTC-USDT", "ZEC-USDT", "XMR-USDT"},
+    # Misc / standalone
+    {"BNB-USDT"},
+    {"HYPE-USDT"},
+    {"ENA-USDT"},
+    {"VVV-USDT"},
+    {"JTO-USDT"},
 ]
 MAX_CORR_PER_GROUP = int(os.getenv("MAX_CORR_PER_GROUP", "2"))
 
