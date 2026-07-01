@@ -111,24 +111,25 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
         be_trigger = None
         be_sl      = None
 
-    # Sizing fijo: MARGIN_USDT para todas las señales
+    # Sizing fijo: MARGIN_USDT para todas las señales.
+    # floor_qty(qty, symbol) — firma actualizada para Hyperliquid SDK.
     margin  = config.MARGIN_USDT
     raw_qty = (margin * config.LEVERAGE) / entry
 
-    step = 0.001
     if symbol:
         try:
-            info = _exchange._get_contract_info(symbol)
-            step = info["stepSize"]
-            qty  = _exchange.floor_qty(raw_qty, step)
+            qty = _exchange.floor_qty(raw_qty, symbol)
         except Exception as exc:
-            log.warning("No se pudo obtener step-size para %s: %s — usando 3 dec", symbol, exc)
+            log.warning("No se pudo calcular floor_qty para %s: %s — truncando a 3 dec", symbol, exc)
             qty = math.floor(raw_qty * 1000) / 1000
     else:
         qty = math.floor(raw_qty * 1000) / 1000
 
-    raw_trail = 0.3 * sl_dist
-    trail_step = round(max(raw_trail, step), 8)
+    # trail_step: 30% del SL distance, mínimo 1 unidad de la precisión del exchange
+    dec        = _exchange._sz_decimals(symbol) if symbol else 3
+    min_step   = 10 ** (-dec)
+    raw_trail  = 0.3 * sl_dist
+    trail_step = round(max(raw_trail, min_step), 8)
 
     log.info(
         "[%s] score=%d regime=%s RR=%.1f margin=%.2f "
@@ -198,6 +199,6 @@ def check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
         "[%s] 🔒 Break-even lock activado | precio=%.6f trigger=%.6f be_sl=%.6f (antes sl=%.6f)",
         symbol, current_price, be_trigger, be_sl, current_sl or 0,
     )
-    pos["sl"]       = round(be_sl, 8)
+    pos["sl"]        = round(be_sl, 8)
     pos["be_locked"] = True
     return True

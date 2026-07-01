@@ -6,7 +6,7 @@ sus propios contadores de PnL diario.
 
 FIX capital real: _get_capital() consulta exchange.get_balance() para obtener
 el equity real de la cuenta. El capital ficticio (MARGIN_USDT × MAX_POSITIONS)
-se usa solo si BingX no responde. El valor se cachea 5 minutos para no
+se usa solo si Hyperliquid no responde. El valor se cachea 5 minutos para no
 spammear la API en cada trade.
 
 FIX DAILY_MAX_LOSS_PCT: se fuerza a negativo. Si el usuario pone 10 o -10
