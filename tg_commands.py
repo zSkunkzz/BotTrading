@@ -20,6 +20,7 @@ FIX: _cmd_posiciones formatea sl/tp con fallback 'N/A' si son None (posición
      abierta sin SL/TP colocado por error en exchange).
 FIX: _poll strip del sufijo @botname en comandos (e.g. /status@MiBot).
 FIX: pop_manual_signal añadida — referenciada en main.py pero no existía.
+FIX #6: _cmd_status muestra PnL del día y estado de pausa por drawdown diario.
 """
 import csv
 import logging
@@ -208,6 +209,12 @@ def _cmd_posiciones() -> str:
 
 
 def _cmd_status() -> str:
+    """fix #6: muestra PnL del día y si el bot está pausado por drawdown diario.
+
+    Antes solo mostraba pausa manual. Si el bot se pausaba automáticamente por
+    pérdidas (is_daily_limit_hit), /status no lo reflejaba — el usuario no
+    sabía por qué el bot no abría posiciones.
+    """
     uptime_s   = int(time.time() - _start_ts)
     h, rem     = divmod(uptime_s, 3600)
     m, s       = divmod(rem, 60)
@@ -215,8 +222,19 @@ def _cmd_status() -> str:
     feed_info  = ""
     if _feed:
         feed_info = f"Feed:        <code>{_feed.ready_count()}/{len(config.SYMBOLS)} pares</code>\n"
-    csv_trades  = len(_fetch_trade_history())
-    paused_str  = "🛑 <b>PAUSADO</b> — no se abrirán posiciones nuevas\n" if bot_state.is_paused() else ""
+    csv_trades = len(_fetch_trade_history())
+    daily_pnl  = bot_state.get_daily_pnl()
+    capital    = float(getattr(config, "MARGIN_USDT", 0)) * int(getattr(config, "MAX_POSITIONS", 1))
+    daily_pct  = (daily_pnl / capital * 100) if capital else 0.0
+
+    # fix #6: distinguir pausa manual de pausa por drawdown
+    if bot_state.is_daily_limit_hit():
+        paused_str = "🛑 <b>PAUSADO por drawdown diario</b> — no se abrirán posiciones nuevas\n"
+    elif bot_state.is_paused():
+        paused_str = "🛑 <b>PAUSADO manualmente</b> — no se abrirán posiciones nuevas\n"
+    else:
+        paused_str = ""
+
     return (
         f"🤖 <b>Estado del bot</b>\n\n"
         f"{paused_str}"
@@ -224,6 +242,7 @@ def _cmd_status() -> str:
         f"{feed_info}"
         f"Posiciones:  <code>{len(positions)}/{config.MAX_POSITIONS}</code>\n"
         f"Trades total: <code>{csv_trades}</code>\n"
+        f"PnL hoy:     <code>{daily_pnl:+.2f} USDT</code> (<code>{daily_pct:+.2f}%</code>)\n"
         f"Hora:        <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</code>"
     )
 

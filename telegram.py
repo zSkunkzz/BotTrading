@@ -1,4 +1,12 @@
-"""telegram.py — Notificaciones Telegram."""
+"""telegram.py — Notificaciones Telegram.
+
+fix #4: notify_open incluye el régimen de mercado (bull/bear/proto-bull/proto-bear)
+        para que el usuario vea en Telegram si la señal es confirmada o provisional.
+fix #5: notify_close distingue trailing SL en verde de un stop loss real:
+        si reason=='SL' y pnl_usdt>0 → label 'TRAILING SL (verde)' con icono ✅.
+fix #8: _calc_pnl_net aplica descuento estimado de comisiones taker Hyperliquid
+        (~0.04% × 2 lados) para que el PnL mostrado sea neto real, no optimista.
+"""
 import logging
 import time
 from datetime import datetime, timezone
@@ -10,6 +18,8 @@ import config
 log = logging.getLogger("telegram")
 
 BASE_URL = f"https://api.telegram.org/bot{config.TG_TOKEN}"
+
+TAKER_FEE_RATE = 0.0004  # 0.04% por lado × 2 lados = 0.08% total por trade
 
 
 class _RedactTokenFilter(logging.Filter):
@@ -54,23 +64,32 @@ def notify(text: str) -> None:
 
 
 def notify_open(
-    symbol: str,
-    price:  float,
-    side:   str,
-    qty:    float,
-    sl:     float,
-    tp:     float,
-    score:  int,
-    tp_rr:  float,
+    symbol:  str,
+    price:   float,
+    side:    str,
+    qty:     float,
+    sl:      float,
+    tp:      float,
+    score:   int,
+    tp_rr:   float,
+    regime:  str = "",
 ) -> None:
+    """fix #4: muestra el régimen de mercado en la notificación de apertura.
+
+    El régimen (bull / bear / proto-bull / proto-bear) indica si la señal
+    es de tendencia confirmada (ADX fuerte) o proto-señal en desarrollo.
+    Ayuda a calibrar la cautela en cada trade sin cambiar la lógica.
+    """
     side_icon = "\U0001f7e2" if side == "long" else "\U0001f534"
     arrow     = "\U0001f4c8" if side == "long" else "\U0001f4c9"
     sl_pct    = abs(price - sl) / price * 100
     tp_pct    = abs(tp - price) / price * 100
+    regime_line = f"Régimen: <code>{regime}</code>\n" if regime else ""
     notify(
         f"{side_icon} <b>NUEVA POSICIÓN</b> {arrow}\n"
         f"Par: <b>{symbol}</b>\n"
         f"Dirección: <b>{side.upper()}</b>\n"
+        f"{regime_line}"
         f"Entrada: <code>{price:.6f}</code>\n"
         f"SL: <code>{sl:.6f}</code> (-{sl_pct:.2f}%)\n"
         f"TP: <code>{tp:.6f}</code> (+{tp_pct:.2f}%)\n"
@@ -90,6 +109,12 @@ def notify_close(
     open_ts:   float,
     daily_pnl: float = 0.0,
 ) -> None:
+    """fix #5: trailing SL en verde no se muestra como ❌ STOP LOSS.
+
+    Si reason=='SL' pero pnl_usdt>0, fue un trailing SL que cerró en verde
+    (el SL se movió por encima del entry). Se muestra como ✅ TRAILING SL (verde)
+    para distinguirlo visualmente de un stop loss en pérdidas.
+    """
     duration_min = (time.time() - open_ts) / 60 if open_ts else 0
     if duration_min < 60:
         dur_str = f"{duration_min:.0f}m"
@@ -97,13 +122,18 @@ def notify_close(
         dur_str = f"{duration_min/60:.1f}h"
 
     if reason == "TP":
-        icon = "\u2705"
+        icon  = "\u2705"
         label = "TAKE PROFIT"
     elif reason == "SL":
-        icon = "\u274c"
-        label = "STOP LOSS"
+        if pnl_usdt > 0:
+            # fix #5: trailing SL cerrado en verde — no confundir con pérdida
+            icon  = "\u2705"
+            label = "TRAILING SL (verde)"
+        else:
+            icon  = "\u274c"
+            label = "STOP LOSS"
     else:
-        icon = "\U0001f7e1"
+        icon  = "\U0001f7e1"
         label = "CIERRE MANUAL"
 
     pnl_sign = "+" if pnl_usdt >= 0 else ""
