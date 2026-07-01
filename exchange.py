@@ -38,6 +38,8 @@ BUGS corregidos respecto a la versión BingX original:
  10. get_closed_orders: usa fill['dir'] ('Close Long'/'Close Short') para
      clasificar SL vs TP en lugar de la heurística 'crossed' (incorrecta).
      'crossed' indica si la orden cruzó el book, no si es stop o tp trigger.
+ 11. set_leverage: leverage se capa a MAX_LEVERAGE (10x) como máximo para
+     proteger contra configuraciones de entorno incorrectas o llamadas externas.
 """
 import logging
 import os
@@ -47,6 +49,9 @@ from typing import Optional
 import config
 
 log = logging.getLogger("exchange")
+
+# Apalancamiento máximo permitido — nunca superar este valor aunque config lo indique
+MAX_LEVERAGE = 10
 
 # ── SDK imports ──────────────────────────────────────────────────────────────
 try:
@@ -257,8 +262,10 @@ def get_position(symbol: str = None) -> dict | None:
 
 def set_leverage(symbol: str = None, leverage: int = None) -> None:
     # BUG 3 fix: update_leverage(leverage, coin, is_cross) — is_cross=False = isolated
+    # BUG 11 fix: cap a MAX_LEVERAGE (10x) — nunca enviar un valor superior al exchange
     coin     = _hl_symbol(symbol or config.SYMBOLS[0])
     leverage = leverage or config.LEVERAGE
+    leverage = min(int(leverage), MAX_LEVERAGE)
     try:
         resp = _exchange.update_leverage(leverage, coin, is_cross=False)
         if resp.get("status") == "ok":
