@@ -1,109 +1,41 @@
-"""signals.py — Sistema de señales v4.
+"""signals.py — Sistema de señales v6.
 
-Nuevas mejoras v4:
-  A. Proto-bull / proto-bear detection
-     El bot ya no espera a que las EMAs estén completamente ordenadas para
-     detectar un cambio de régimen. Si la estructura de swings confirma bull
-     (2 HH+HL) Y el precio está por encima de la EMA200_1h Y el ADX_1h >= 22,
-     se declara régimen 'proto_bull' (análogo para 'proto_bear').
-     Captura entradas al INICIO de tendencia, no cuando ya ha corrido varios %.
+v6 — Techo ~96, MIN_SCORE=70 fijo
+  - Máximo teórico ~96 sin divergencia ~86; MIN_SCORE=70 = 73% del techo práctico
+  - Régimen simplificado: price vs EMA200 + EMA50 vs EMA200 + proto si ADX>=18
+  - Hard-guards macro 4h, structure-range+ADX, bear+ADX<22, bear EMA200_15m
+    convertidos en penalizaciones suaves (no matan la señal)
+  - Eliminado sesgo horario del scoring
+  - Eliminadas penalizaciones de vela diaria del scoring
+  - PROTO_SCORE_PENALTY eliminado (la condición de proto ya implica menos alineación)
+  - Pesos rebalanceados para techo ~96:
+      W_ADX_1H_30=20, W_ADX_1H_25=14, W_ADX_1H_20=5
+      W_MACD_1H=14, W_RSI_IDEAL=13, W_MACD_15M=12
+      W_VOLUME_HIGH=11, W_STRUCTURE=10, W_DIVERGENCIA=10, W_VELA=6
+  - Penalizaciones soft: W_MACRO_CONTRA=-8, W_BEAR_EMA200_15M=-6,
+      W_VOLUME_LOW=-4, W_RSI_SOBRE=-8, W_STRUCTURE_CONTRA=-8
 
-     proto_bull: estructura=bull, precio > EMA200_1h, ADX_1h >= 22
-                 (las EMAs aún no están en orden price>20>50>200)
-     proto_bear: estructura=bear, precio < EMA200_1h, ADX_1h >= 22
+Techo real por ruta:
+  ADX_1H>=30 (20) + MACD_1H (14) + RSI_IDEAL (13) + MACD_15M (12)
+  + VOLUME_HIGH (11) + STRUCTURE (10) + VELA (6) = 86 sin divergencia
+  + DIVERGENCIA (10) = 96 con divergencia
 
-     El proto-régimen penaliza -4 puntos en scoring (menos convicción).
-     PROTO_MIN_SCORE_EXTRA eliminado (era doble penalización).
-
-  B. Score mínimo dinámico por volatilidad (ATR)
-     En días de alta volatilidad (ATR_1h > 2% del precio) el MIN_SCORE
-     sube automáticamente +5 puntos (era +8, reducido para no ser prohibitivo).
-     En días de muy baja volatilidad (ATR_1h < 0.5%) sube +4 (mercado
-     adormecido → señales falsas frecuentes).
-
-  C. Penalización contradicción estructura: -8 (simétrica con W_STRUCTURE=+8)
-
-Mejoras estructurales v3 (heredadas):
-  A. Estructura de precio 1h con swing highs/lows reales
-  B. Hard-guard ADX en rango lateral
-  C. Contexto de vela diaria
-  D. Filtro de liquidez del par
-  E. Penalización por alejamiento del open diario
-
-Filtros heredados:
-  1. Vela cerrada       : penúltima vela (ya cerrada)
-  2. Régimen de mercado : EMAs 1h + estructura HH/HL (swings reales) + proto-bull/bear
-  3. Macro 4h           : EMA50 en 4h
-  4. EMA200 1h          : hard-guard de dirección
-  5. EMA200 15m         : hard-guard en SHORTs
-  6. ATR volátil        : hard-guard >3.5%
-  7. ADX 15m            : hard-guard <18 (era <20)
-  8. ADX 1h             : scoring + hard-guard SHORT
-  9. RSI 15m            : scoring + hard-guard SHORT sobrevendido
-  10. MACD 15m + 1h     : scoring
-  11. Volumen 15m       : scoring
-  12. Divergencia RSI   : scoring
-  13. Sesgo horario     : scoring
-  14. No-chase          : hard-guard rango vela
-  15. Pullback EMA20    : hard-guard sobreextensión 15m
-  16. Score mínimo      : LONGs >= MIN_SCORE (dinámico), SHORTs >= MIN_SCORE+SHORT_EXTRA
+Filtros activos:
+  1. Vela cerrada        : penúltima vela
+  2. Régimen simplificado: price/EMA200 + EMA50/EMA200 + proto si ADX>=18
+  3. Macro 4h            : penalización suave si contradice (no hard-guard)
+  4. EMA200 1h           : hard-guard dirección (mantenido)
+  5. EMA200 15m bear     : penalización suave (no hard-guard)
+  6. ATR volátil         : hard-guard >3.5%
+  7. ADX 15m             : hard-guard <18
+  8. No-chase            : hard-guard rango vela
+  9. Pullback EMA20 15m  : hard-guard sobreextensión
+  10. Structure range    : penalización en vez de bloqueo
+  11. Bear ADX_1h<22     : penalización en vez de bloqueo
+  12. Score mínimo       : LONGs >= MIN_SCORE, SHORTs >= MIN_SCORE+SHORT_EXTRA
 
 REGLA FUNDAMENTAL:
-  Bear/proto_bear → SOLO SHORT. Bull/proto_bull → SOLO LONG. Sin contra-tendencia.
-
-Fixes aplicados:
-  - Bug 1: Eliminado hard-guard duplicado (segundo if nunca alcanzable)
-  - Bug 2: _find_swing_highs/_find_swing_lows usan > / < estrictos para evitar
-           contar plateaus (velas con mismo high/low) como swings válidos
-  - Bug 3: DAILY_CANDLE_GUARD no bloquea días muy fuertes en dirección del régimen;
-           en su lugar aplica penalización -10 (igual que DAILY_CANDLE_PENALTY)
-  - Bug 4: _liquidity_ok ahora usa 'quote_volume' (volumen en USDT) en lugar de
-           'volume' (unidades base). Para BTC, 'volume' es ~0.1-5 por vela, muy
-           por debajo del umbral de 1_000_000 USDT → todos los pares fallaban el
-           filtro de liquidez. quote_volume = volume * close en USDT.
-  - Bug 5: _daily_candle_context ahora usa 'open_time' para filtrar las velas del
-           día actual. Antes usaba 'open_time' pero las velas REST no incluían ese
-           campo → contexto diario siempre vacío. exchange.py (FIX D) garantiza
-           que todas las velas (REST y WS) incluyan 'open_time'.
-  - Bug 6: daily_move convertido de hard-guard a penalización (-6).
-           Un pullback intradía de 1.5-2.5% en bull fuerte es una entrada
-           potencial. El scorer decide si el setup sigue siendo válido.
-
-Pesos v5.2 (scorer rebalanceado + fixes anti-sequía):
-  - W_RSI_IDEAL   : 10 → 12
-  - W_STRUCTURE   : 12 →  8 (menos bloqueante cuando swings no confirmados)
-  - W_VOLUME_HIGH :  8 → 10
-  - W_VELA        :  5 →  4 (devuelto parcialmente; confirmación de alineación)
-  - W_HORA_HIGH   :  3 →  5
-  - W_DIVERGENCIA :  5 →  8 (señal rara pero muy predictiva)
-  - W_ADX_1H_20   :  6 →  3 (ADX 20-25 es señal débil)
-  - ATR_HIGH_VOL_BUMP: 8 → 5 (mínimo 75 es alcanzable)
-  - Penalización structure contraria: -12 → -8 (simétrico con W_STRUCTURE)
-  Nuevo máximo teórico: ~82 puntos.
-  MIN_SCORE semana=70, SHORT_MIN_SCORE_EXTRA=6.
-
-Fixes v5.2:
-  - PROTO_MIN_SCORE_EXTRA: 4 → 0 (doble penalización eliminada)
-  - ADX_15M_MIN: 20 → 18 (hard-guard menos agresivo)
-  - SWING_CONFIRM_COUNT: 2 → 1 (estructura detecta tendencias más tempranas)
-  - W_VELA: 0 → 4 (confirmación de vela devuelta parcialmente)
-  - RSI zona ideal: bull 45-65 → 40-68 / bear 35-55 → 32-58
-
-Fixes v5.3:
-  - MIN_HOURLY_VOLUME: 1_000_000 → 500_000 USDT
-    Con posiciones de 20 USDT × 10x = 200 USDT, un volumen 1h de 500K
-    es más que suficiente para entrar/salir sin deslizamiento.
-    El umbral de 1M excluía pares líquidos como LINK, NEAR, 1KSHIB.
-
-Structure lookback v5.1:
-  - STRUCTURE_LOOKBACK: 8 → 12 (más ventana para confirmar HH+HL)
-    Con 8 velas, tendencias de 6-7h perdían sus swings más antiguos
-    y volvían a 'range' aunque la tendencia siguiera activa.
-
-Logs:
-  - skip rutinarios (range, hard-guard, sobreextendido) → DEBUG
-    (no aparecen en producción con nivel INFO)
-  - SCORE FINAL y SEÑAL confirmada → INFO siempre
+  Bear/proto_bear → SOLO SHORT. Bull/proto_bull → SOLO LONG.
 """
 from __future__ import annotations
 import logging
@@ -123,52 +55,42 @@ MIN_SCORE           = config.MIN_SCORE
 
 PULLBACK_EMA20_DIST = 0.015
 
-REGIME_CONFIRM_BARS   = 3
 SHORT_MIN_SCORE_EXTRA = 6
 ATR_VOLATILE_PCT      = 0.035
-ADX_15M_MIN           = 18   # era 20 — hard-guard menos agresivo
+ADX_15M_MIN           = 18
 
-HIGH_BIAS_HOURS = {8, 9, 10, 13, 14, 15, 16, 20, 21}
-LOW_BIAS_HOURS  = {2, 3, 4, 5}
-
-# ── Umbrales v2 ───────────────────────────────────────────────────────────
+# ── Umbrales estructura ───────────────────────────────────────────────────
 STRUCTURE_LOOKBACK    = 12
-DAILY_CANDLE_BLOCK    = 0.015
-DAILY_CANDLE_PENALTY  = 0.025
-DAILY_CANDLE_GUARD    = 0.040
-DAILY_CANDLE_BLOCK_PEN = 6
-MIN_HOURLY_VOLUME     = 500_000   # era 1_000_000 — v5.3
+MIN_HOURLY_VOLUME     = 500_000   # USDT
 
-# ── Umbrales v3 ───────────────────────────────────────────────────────────
-ADX_1H_STRUCTURE_MIN  = 25
-SWING_CONFIRM_COUNT   = 1   # era 2 — detecta tendencias más tempranas
+# ── Umbrales proto-régimen ────────────────────────────────────────────────
+PROTO_ADX_MIN         = 18   # era 22 — simplificado
 
-# ── Umbrales v4 (nuevos) ──────────────────────────────────────────────────
-PROTO_ADX_MIN         = 22
-PROTO_SCORE_PENALTY   = 4
-PROTO_MIN_SCORE_EXTRA = 0   # era 4 — doble penalización eliminada (ya penalizado en score)
-
+# ── Volatilidad dinámica ──────────────────────────────────────────────────
 ATR_HIGH_VOL_PCT      = 0.020
 ATR_LOW_VOL_PCT       = 0.005
 ATR_HIGH_VOL_BUMP     = 5
 ATR_LOW_VOL_BUMP      = 4
 
-# ── Pesos del scorer (v5.2) ───────────────────────────────────────────────
-W_ADX_1H_30    = 15
-W_ADX_1H_25    = 10
-W_ADX_1H_20    =  3
-W_MACD_1H      = 12
-W_RSI_IDEAL    = 12
-W_STRUCTURE    =  8
-W_VELA         =  4   # era 0 — devuelto parcialmente como confirmación de alineación
-W_DIVERGENCIA  =  8
-W_HORA_HIGH    =  5
-W_MACD_15M     =  8
-W_VOLUME_HIGH  = 10
-W_VOLUME_LOW   = -4
-W_HORA_LOW     = -4
-W_RSI_SOBRE    = -8
-W_STRUCTURE_CONTRA = -8
+# ── Pesos del scorer v6 — techo ~96 ──────────────────────────────────────
+W_ADX_1H_30        = 20
+W_ADX_1H_25        = 14
+W_ADX_1H_20        =  5
+W_MACD_1H          = 14
+W_RSI_IDEAL        = 13
+W_MACD_15M         = 12
+W_VOLUME_HIGH      = 11
+W_STRUCTURE        = 10
+W_DIVERGENCIA      = 10
+W_VELA             =  6
+
+# Penalizaciones suaves
+W_VOLUME_LOW        = -4
+W_RSI_SOBRE         = -8
+W_STRUCTURE_CONTRA  = -8
+W_MACRO_CONTRA      = -8   # macro 4h contradice → penalización (no hard-guard)
+W_BEAR_EMA200_15M   = -6   # bear sobreextendido bajo EMA200_15m
+W_BEAR_LOW_ADX      = -5   # bear con ADX_1h < 22 (era hard-guard, ahora penalización)
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────
@@ -288,42 +210,37 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
 
 
 def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
-    """Detecta régimen de mercado.
+    """Detecta régimen de mercado — v6 simplificado.
 
-    v4: Devuelve 'proto_bull' o 'proto_bear' cuando la estructura de swings
-    confirma la dirección pero las EMAs aún no están completamente ordenadas.
+    bull:       price > EMA200 y EMA50 > EMA200
+    bear:       price < EMA200 y EMA50 < EMA200
+    proto_bull: price > EMA200 y ADX >= PROTO_ADX_MIN (EMA50 aún no ordenada)
+    proto_bear: price < EMA200 y ADX >= PROTO_ADX_MIN
+    range:      resto
     """
     closes        = [c["close"] for c in candles_1h]
     closes_closed = closes[:-1]
-    ema20  = _ema(closes_closed, 20)[-1]
     ema50  = _ema(closes_closed, 50)[-1]
     ema200 = _ema(closes_closed, 200)[-1]
     adx    = _adx(candles_1h[:-1], 14)
     price  = closes[-2] if len(closes) >= 2 else closes[-1]
 
-    if price > ema20 > ema50 > ema200:
+    if price > ema200 and ema50 > ema200:
         return "bull", adx
-    if price < ema20 < ema50 < ema200:
+    if price < ema200 and ema50 < ema200:
         return "bear", adx
-    if price > ema200 and price > ema50 and ema20 > ema200:
-        return "bull", adx
-    if price < ema200 and price < ema50 and ema20 < ema200:
-        return "bear", adx
-
-    if adx >= PROTO_ADX_MIN:
-        structure = _price_structure(candles_1h)
-        if structure == "bull" and price > ema200:
-            log.debug(
-                "[regime] proto_bull detectado (structure=bull price=%.6f > EMA200=%.6f adx=%.1f)",
-                price, ema200, adx,
-            )
-            return "proto_bull", adx
-        if structure == "bear" and price < ema200:
-            log.debug(
-                "[regime] proto_bear detectado (structure=bear price=%.6f < EMA200=%.6f adx=%.1f)",
-                price, ema200, adx,
-            )
-            return "proto_bear", adx
+    if price > ema200 and adx >= PROTO_ADX_MIN:
+        log.debug(
+            "[regime] proto_bull (price=%.6f > EMA200=%.6f adx=%.1f)",
+            price, ema200, adx,
+        )
+        return "proto_bull", adx
+    if price < ema200 and adx >= PROTO_ADX_MIN:
+        log.debug(
+            "[regime] proto_bear (price=%.6f < EMA200=%.6f adx=%.1f)",
+            price, ema200, adx,
+        )
+        return "proto_bear", adx
 
     return "range", adx
 
@@ -381,35 +298,12 @@ def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK)
         if swing_low_vals[i] < swing_low_vals[i - 1] * 0.999
     )
 
-    n = SWING_CONFIRM_COUNT  # era 2, ahora 1
-
+    n = 1
     if hh_count >= n and hl_count >= n:
         return "bull"
     if lh_count >= n and ll_count >= n:
         return "bear"
     return "range"
-
-
-def _daily_candle_context(candles_1h: list[dict]) -> tuple[float, float]:
-    """Devuelve (open_diario, close_actual) usando velas del día UTC actual."""
-    now_utc     = datetime.datetime.now(timezone.utc)
-    midnight    = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    midnight_ts = midnight.timestamp() * 1000
-
-    today_candles = [
-        c for c in candles_1h[:-1]
-        if c.get("open_time", 0) >= midnight_ts
-    ]
-
-    if not today_candles:
-        if len(candles_1h) >= 2:
-            c = candles_1h[-2]
-            return c["open"], c["close"]
-        return 0.0, 0.0
-
-    open_daily  = today_candles[0]["open"]
-    close_today = today_candles[-1]["close"]
-    return open_daily, close_today
 
 
 def _liquidity_ok(candles_1h: list[dict]) -> bool:
@@ -489,25 +383,6 @@ def evaluate(
     # ── Estructura de precio 1h ──────────────────────────────────────────
     structure = _price_structure(candles_1h)
 
-    if structure == "range" and adx_1h < ADX_1H_STRUCTURE_MIN:
-        log.debug(
-            "[%s] skip: structure=range ADX_1h=%.1f < %d (hard-guard)",
-            symbol, adx_1h, ADX_1H_STRUCTURE_MIN,
-        )
-        return None, 0, None
-
-    # ── Macro 4h ─────────────────────────────────────────────────────────
-    if candles_4h and len(candles_4h) >= 55:
-        closes_4h = [c["close"] for c in candles_4h[:-1]]
-        ema50_4h  = _ema(closes_4h, 50)[-1]
-        price_4h  = closes_4h[-1]
-        if effective_regime == "bull" and price_4h < ema50_4h:
-            log.debug("[%s] skip: macro 4h bearish (precio=%.6f < EMA50_4h=%.6f)", symbol, price_4h, ema50_4h)
-            return None, 0, None
-        if effective_regime == "bear" and price_4h > ema50_4h:
-            log.debug("[%s] skip: macro 4h bullish (precio=%.6f > EMA50_4h=%.6f)", symbol, price_4h, ema50_4h)
-            return None, 0, None
-
     # ── Indicadores 15m ──────────────────────────────────────────────────
     closes_15m = [c["close"] for c in candles_15m]
     price      = closes_15m[-2]
@@ -546,7 +421,7 @@ def evaluate(
         price, ema200_1h, ema20_15m,
     )
 
-    # ── Hard-guards ───────────────────────────────────────────────────────
+    # ── Hard-guards (mínimos no negociables) ─────────────────────────────
     if price > 0 and atr_15m / price > ATR_VOLATILE_PCT:
         log.debug("[%s] skip: ATR_15m=%.4f%% > %.1f%% (demasiado volátil)", symbol, atr_15m / price * 100, ATR_VOLATILE_PCT * 100)
         return None, 0, None
@@ -560,10 +435,6 @@ def evaluate(
         return None, 0, None
     if effective_regime == "bear" and price > ema200_1h * (1 + EMA200_MIN_DIST):
         log.debug("[%s] skip: bear pero precio=%.6f > EMA200_1h=%.6f", symbol, price, ema200_1h)
-        return None, 0, None
-
-    if effective_regime == "bear" and price < ema200_15m * (1 - EMA200_MIN_DIST):
-        log.debug("[%s] skip: bear pero precio=%.6f < EMA200_15m=%.6f (sobreextendido)", symbol, price, ema200_15m)
         return None, 0, None
 
     candle_range = c_high - c_low
@@ -582,59 +453,46 @@ def evaluate(
                 log.debug("[%s] skip: sobreextendido bajo EMA20_15m dist=%.2f%%", symbol, dist_ema20 * 100)
                 return None, 0, None
 
-    # ── Score mínimo dinámico por volatilidad (v4) ───────────────────────
-    vol_bump   = _dynamic_min_score_bump(candles_1h, price)
-    proto_bump = PROTO_MIN_SCORE_EXTRA if is_proto else 0  # = 0 en v5.2
-    min_required_base = min_score + vol_bump + proto_bump
-
-    # Contexto vela diaria
-    open_daily, close_today = _daily_candle_context(candles_1h)
-    score = 0
-
-    if open_daily > 0:
-        daily_move = (close_today - open_daily) / open_daily
-        abs_move   = abs(daily_move)
-
-        # Penalización por pullback contra el régimen
-        if effective_regime == "bull" and daily_move < -DAILY_CANDLE_BLOCK:
-            score -= DAILY_CANDLE_BLOCK_PEN
-            log.debug(
-                "[%s] daily_move=%.2f%% < -%.1f%% en bull → -%d (score=%d)",
-                symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100, DAILY_CANDLE_BLOCK_PEN, score,
-            )
-        elif effective_regime == "bear" and daily_move > DAILY_CANDLE_BLOCK:
-            score -= DAILY_CANDLE_BLOCK_PEN
-            log.debug(
-                "[%s] daily_move=%.2f%% > +%.1f%% en bear → -%d (score=%d)",
-                symbol, daily_move * 100, DAILY_CANDLE_BLOCK * 100, DAILY_CANDLE_BLOCK_PEN, score,
-            )
-
-        # Penalización adicional por movimiento diario muy grande
-        if abs_move > DAILY_CANDLE_PENALTY:
-            score -= 10
-            log.debug(
-                "[%s] daily abs_move=%.2f%% > %.1f%% → penalización -10 (score=%d)",
-                symbol, abs_move * 100, DAILY_CANDLE_PENALTY * 100, score,
-            )
+    # ── Score mínimo dinámico por volatilidad ────────────────────────────
+    vol_bump        = _dynamic_min_score_bump(candles_1h, price)
+    min_required_base = min_score + vol_bump
 
     # ── Scoring ───────────────────────────────────────────────────────────
+    score = 0
 
-    if is_proto:
-        score -= PROTO_SCORE_PENALTY
-        log.debug("[%s] proto-régimen → -%d (score=%d)", symbol, PROTO_SCORE_PENALTY, score)
+    # Macro 4h — penalización suave (no hard-guard)
+    if candles_4h and len(candles_4h) >= 55:
+        closes_4h = [c["close"] for c in candles_4h[:-1]]
+        ema50_4h  = _ema(closes_4h, 50)[-1]
+        price_4h  = closes_4h[-1]
+        if effective_regime == "bull" and price_4h < ema50_4h:
+            score += W_MACRO_CONTRA
+            log.debug("[%s] macro 4h bearish en bull → %d (score=%d)", symbol, W_MACRO_CONTRA, score)
+        elif effective_regime == "bear" and price_4h > ema50_4h:
+            score += W_MACRO_CONTRA
+            log.debug("[%s] macro 4h bullish en bear → %d (score=%d)", symbol, W_MACRO_CONTRA, score)
 
-    # W_VELA = 4: confirmación de alineación de la vela con el régimen
+    # Bear sobreextendido bajo EMA200_15m — penalización suave
+    if effective_regime == "bear" and price < ema200_15m * (1 - EMA200_MIN_DIST):
+        score += W_BEAR_EMA200_15M
+        log.debug("[%s] bear sobreextendido bajo EMA200_15m → %d (score=%d)", symbol, W_BEAR_EMA200_15M, score)
+
+    # Bear con ADX_1h bajo — penalización suave (era hard-guard)
+    if effective_regime == "bear" and adx_1h < 22:
+        score += W_BEAR_LOW_ADX
+        log.debug("[%s] bear + ADX_1h=%.1f < 22 → %d (score=%d)", symbol, adx_1h, W_BEAR_LOW_ADX, score)
+
+    # Vela alineada con régimen
     if effective_regime == "bull" and bullish_candle:
         score += W_VELA
         log.debug("[%s] vela alcista en bull → +%d (score=%d)", symbol, W_VELA, score)
     elif effective_regime == "bear" and not bullish_candle:
         score += W_VELA
         log.debug("[%s] vela bajista en bear → +%d (score=%d)", symbol, W_VELA, score)
-    else:
-        log.debug("[%s] vela contraria al régimen → +0 (score=%d)", symbol, score)
 
+    # RSI
     if effective_regime == "bull":
-        if 40 <= rsi <= 68:   # era 45-65
+        if 40 <= rsi <= 68:
             score += W_RSI_IDEAL
             log.debug("[%s] RSI=%.1f en zona ideal bull → +%d (score=%d)", symbol, rsi, W_RSI_IDEAL, score)
         elif rsi > 70:
@@ -646,7 +504,7 @@ def evaluate(
         else:
             log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
     else:
-        if 32 <= rsi <= 58:   # era 35-55
+        if 32 <= rsi <= 58:
             score += W_RSI_IDEAL
             log.debug("[%s] RSI=%.1f en zona ideal bear → +%d (score=%d)", symbol, rsi, W_RSI_IDEAL, score)
         elif rsi < 30:
@@ -655,6 +513,7 @@ def evaluate(
         else:
             log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
 
+    # ADX 1h
     if adx_1h >= 30:
         score += W_ADX_1H_30
         log.debug("[%s] ADX_1h=%.1f >= 30 → +%d (score=%d)", symbol, adx_1h, W_ADX_1H_30, score)
@@ -667,10 +526,7 @@ def evaluate(
     else:
         log.debug("[%s] ADX_1h=%.1f < 20 → +0 (score=%d)", symbol, adx_1h, score)
 
-    if effective_regime == "bear" and adx_1h < 22:
-        log.debug("[%s] skip: bear + ADX_1h=%.1f < 22 (hard-guard short)", symbol, adx_1h)
-        return None, score, None
-
+    # MACD 15m
     if effective_regime == "bull" and macd_hist > 0:
         score += W_MACD_15M
         log.debug("[%s] MACD_15m=%.5f positivo en bull → +%d (score=%d)", symbol, macd_hist, W_MACD_15M, score)
@@ -680,6 +536,7 @@ def evaluate(
     else:
         log.debug("[%s] MACD_15m=%.5f contrario al régimen → +0 (score=%d)", symbol, macd_hist, score)
 
+    # MACD 1h
     if effective_regime == "bull" and macd_1h > 0:
         score += W_MACD_1H
         log.debug("[%s] MACD_1h=%.5f positivo en bull → +%d (score=%d)", symbol, macd_1h, W_MACD_1H, score)
@@ -689,6 +546,7 @@ def evaluate(
     else:
         log.debug("[%s] MACD_1h=%.5f contrario al régimen → +0 (score=%d)", symbol, macd_1h, score)
 
+    # Volumen
     if avg_vol > 0:
         if last_vol >= avg_vol * VOLUME_MULT:
             score += W_VOLUME_HIGH
@@ -699,14 +557,7 @@ def evaluate(
         else:
             log.debug("[%s] vol_ratio=%.2f normal → +0 (score=%d)", symbol, vol_ratio, score)
 
-    hour = datetime.datetime.now(timezone.utc).hour
-    if hour in HIGH_BIAS_HOURS:
-        score += W_HORA_HIGH
-        log.debug("[%s] hora=%d en HIGH_BIAS_HOURS → +%d (score=%d)", symbol, hour, W_HORA_HIGH, score)
-    elif hour in LOW_BIAS_HOURS:
-        score += W_HORA_LOW
-        log.debug("[%s] hora=%d en LOW_BIAS_HOURS → %d (score=%d)", symbol, hour, W_HORA_LOW, score)
-
+    # Divergencia RSI (bonus raro pero fiable)
     div = _rsi_divergence(closes_15m[:-1], candles_15m[:-1])
     if effective_regime == "bull" and div == "bullish":
         score += W_DIVERGENCIA
@@ -715,6 +566,7 @@ def evaluate(
         score += W_DIVERGENCIA
         log.debug("[%s] divergencia RSI bearish → +%d (score=%d)", symbol, W_DIVERGENCIA, score)
 
+    # Estructura
     if structure == effective_regime:
         score += W_STRUCTURE
         log.debug("[%s] structure=%s == régimen → +%d (score=%d)", symbol, structure, W_STRUCTURE, score)
@@ -724,6 +576,7 @@ def evaluate(
             "[%s] structure=%s contradice régimen=%s → %d (score=%d)",
             symbol, structure, regime, W_STRUCTURE_CONTRA, score,
         )
+    # structure==range: sin penalización (era hard-guard en v5, ahora neutro)
 
     # ── Score mínimo ──────────────────────────────────────────────────────
     min_required = min_required_base + (SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0)
