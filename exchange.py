@@ -20,7 +20,7 @@ BUGS corregidos respecto a la versión BingX original:
      La signatura correcta es Exchange(account, base_url, account_address=...).
   2. market_open/market_close NO existen en el SDK oficial. La API correcta es
      _exchange.order() con orderType={"market": {}} o {"trigger": {...}}.
-     Se usa slippage=0.05 (5%) como precio límite para market orders.
+     Se usa slippage=0.005 (0.5%) como precio límite para market IOC orders.
   3. update_leverage() en el SDK se llama con (leverage, coin, is_cross).
      is_cross=False = isolated (correcto para este bot).
   4. cancel() del SDK requiere (coin, oids: list[int]), no lista de dicts.
@@ -40,6 +40,15 @@ BUGS corregidos respecto a la versión BingX original:
      'crossed' indica si la orden cruzó el book, no si es stop o tp trigger.
  11. set_leverage: leverage se capa a MAX_LEVERAGE (10x) como máximo para
      proteger contra configuraciones de entorno incorrectas o llamadas externas.
+ 12. open_order: se valida statuses[0] de la respuesta HL para detectar rechazos
+     internos (IocCancel, MinTradeNtl, BadTriggerPx, PerpMargin...) que llegan
+     con status='ok' en el nivel superior pero con error en statuses.
+ 13. get_fills(): nueva función que expone los fills con only_close=False para
+     recuperar aperturas (dir='Open Long/Short'), usada en _get_position_open_ts.
+     El campo de precio se expone tanto como 'px' como 'avgPrice' para
+     compatibilidad con _get_real_exit_price en main.py.
+ 14. closedPnl > 0 → TP (antes >= 0 clasificaba trades flat como TP).
+ 15. _MARKET_SLIPPAGE: reducido de 5% a 0.5% (5% era excesivo para IOC).
 """
 import logging
 import os
@@ -112,11 +121,12 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 10.0) -> bool:
 
 
 # ── Precio límite para órdenes de mercado (slippage permitido) ────────────────
-# BUG 2 fix: market_open/close no existen — simular con limit + slippage
-_MARKET_SLIPPAGE = 0.05  # 5% de slippage máximo (igual que el SDK internamente)
+# BUG 2+15 fix: market_open/close no existen — simular con limit IOC + 0.5% slippage
+# 0.5% es suficiente para garantizar fill en líquidos sin desperdiciar precio.
+_MARKET_SLIPPAGE = 0.005  # 0.5% de slippage máximo para market IOC
 
 def _market_price(coin: str, is_buy: bool) -> float:
-    """Devuelve precio límite para market order con slippage de 5%."""
+    """Devuelve precio límite para market IOC con slippage de 0.5%."""
     mids = _info.all_mids()
     mid  = float(mids.get(coin, 0))
     if mid <= 0:
@@ -278,6 +288,40 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
 
 # ── Abrir orden ───────────────────────────────────────────────────────────────
 
+def _check_order_response(resp: dict, context: str) -> None:
+    """Valida la respuesta de _exchange.order() a nivel de statuses.
+
+    BUG 12 fix: Hyperliquid devuelve status='ok' en el nivel superior incluso
+    cuando la orden ha sido rechazada internamente. El error real aparece en:
+      resp['response']['data']['statuses'][0] == {'error': 'IocCancel'} (u otro)
+
+    Códigos de rechazo habituales según doc oficial:
+      IocCancel      — IOC sin fill (liquidez insuficiente al precio límite)
+      MinTradeNtl    — notional < mínimo ($10 en perpetuos)
+      PerpMargin     — margen insuficiente
+      BadTriggerPx   — precio de trigger inválido para SL/TP
+      ReductionOnly  — reduce_only rechazado (no hay posición que reducir)
+    """
+    status = resp.get("status")
+    if status != "ok":
+        raise RuntimeError(f"{context}: status={status!r} — {resp}")
+
+    statuses = (
+        ((resp.get("response") or {})
+         .get("data") or {})
+        .get("statuses") or []
+    )
+    if not statuses:
+        # Sin statuses no podemos validar más — asumir OK
+        return
+
+    first = statuses[0]
+    if "error" in first:
+        raise RuntimeError(f"{context} rechazada por HL: {first['error']} — {resp}")
+    if not any(k in first for k in ("filled", "resting")):
+        raise RuntimeError(f"{context}: respuesta sin filled/resting — {resp}")
+
+
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
     sym_bot = symbol or config.SYMBOLS[0]
     coin    = _hl_symbol(sym_bot)
@@ -293,15 +337,14 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
     set_leverage(sym_bot, config.LEVERAGE)
 
-    # BUG 2 fix: usar order() con orderType market (precio límite con slippage)
+    # BUG 2 fix: usar order() con IOC (Immediate-Or-Cancel = market order)
     limit_px = _market_price(coin, is_buy)
     resp = _exchange.order(
         coin, is_buy, qty, limit_px,
-        {"limit": {"tif": "Ioc"}},  # IOC = Immediate-Or-Cancel, ejecuta como market
+        {"limit": {"tif": "Ioc"}},
     )
-    status = resp.get("status")
-    if status != "ok":
-        raise RuntimeError(f"open_order {coin} fallida: {resp}")
+    # BUG 12 fix: validar statuses internos, no solo status=='ok'
+    _check_order_response(resp, f"open_order {side.upper()} {coin} qty={qty}")
     log.info("Orden abierta: %s %s qty=%.4f @ ~%.4f", side.upper(), coin, qty, limit_px)
 
     place_stop_order(sym_bot, side, qty, sl)
@@ -382,72 +425,88 @@ def cancel_all_orders(symbol: str = None) -> None:
         log.warning("cancel_all_orders(%s) falló: %s", coin, exc)
 
 
-# ── Historial de fills ───────────────────────────────────────────────────────────
+# ── Historial de fills ────────────────────────────────────────────────────────
 
-def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
-    """Devuelve fills recientes del símbolo normalizados para main.py.
+def _normalize_fill(f: dict) -> dict:
+    """Normaliza un fill de Hyperliquid al formato interno del bot.
 
-    Hyperliquid no tiene 'closed orders'; usa fills.
     Campos del fill según doc oficial:
       coin, closedPnl, crossed, dir, hash, oid, px, side, startPosition, sz, time
 
     side: 'B' (buy) | 'A' (ask/sell)
-    dir:  texto descriptivo: 'Open Long', 'Close Long', 'Open Short', 'Close Short'
+    dir:  'Open Long' | 'Close Long' | 'Open Short' | 'Close Short'
 
-    BUG 10 fix: clasificar SL vs TP usando dir, NO usando 'crossed'.
-    'crossed' solo indica si la orden cruzó el book (market vs limit),
-    no si fue un stop-loss o un take-profit.
+    BUG 13 fix: el precio se expone como 'px' Y 'avgPrice' para compatibilidad
+    con _get_real_exit_price en main.py (que lee order['px']).
 
-    Mapeo dir → tipo de cierre:
-      'Close Long'  con side='A' (sell) → puede ser SL (long) o TP (long)
-      'Close Short' con side='B' (buy)  → puede ser SL (short) o TP (short)
-    Como HL no diferencia SL/TP en el fill, usamos closedPnl:
-      closedPnl < 0 → SL (perdiendo)
-      closedPnl >= 0 → TP (ganando)
-    Esto es una heurística razonable; el precio real (px) es lo que importa.
+    BUG 14 fix: closedPnl > 0 → TP, <= 0 → SL
+    (antes >= 0 clasificaba trades flat como TP, lo que es incorrecto).
+    """
+    fill_dir = f.get("dir", "")
+    if "Long" in fill_dir:
+        normalized_side = "SELL"   # cierre/apertura de long
+    else:
+        normalized_side = "BUY"    # cierre/apertura de short
+
+    closed_pnl = float(f.get("closedPnl") or 0)
+    # BUG 14: > 0 para TP, cualquier otro caso (incluido 0 flat) → SL
+    order_type = "TAKE_PROFIT_MARKET" if closed_pnl > 0 else "STOP_MARKET"
+
+    px_str = str(f.get("px", 0))
+    return {
+        "side":       normalized_side,
+        "type":       order_type,
+        "px":         px_str,       # BUG 13 fix: campo 'px' que lee main.py
+        "avgPrice":   px_str,       # alias para compatibilidad
+        "time":       int(f.get("time", 0)),
+        "updateTime": int(f.get("time", 0)),
+        "status":     "FILLED",
+        "dir":        fill_dir,
+        "closedPnl":  closed_pnl,
+    }
+
+
+def get_fills(
+    symbol: str = None,
+    limit: int = 20,
+    only_close: bool = True,
+) -> list[dict]:
+    """Devuelve fills recientes del símbolo normalizados.
+
+    BUG 13 fix: nueva función que acepta only_close=False para recuperar
+    aperturas ('Open Long'/'Open Short'), necesario en _get_position_open_ts
+    de main.py. get_closed_orders() delega en esta función con only_close=True.
+
+    Filtra TODOS los fills del símbolo antes de aplicar el límite para evitar
+    que fills de otros pares acaparen el slice y oculten los del par buscado.
     """
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
     try:
         now_ms   = int(time.time() * 1000)
         start_ms = now_ms - 7 * 24 * 60 * 60 * 1000
-        fills    = _info.user_fills_by_time(_WALLET_ADDRESS, start_ms, now_ms)
+        raw_fills = _info.user_fills_by_time(_WALLET_ADDRESS, start_ms, now_ms)
     except Exception as exc:
-        log.debug("get_closed_orders(%s) falló: %s", coin, exc)
+        log.debug("get_fills(%s) falló: %s", coin, exc)
         return []
 
     result = []
-    for f in fills:
+    for f in raw_fills:
         if f.get("coin") != coin:
             continue
-
         fill_dir = f.get("dir", "")
-
-        # Solo nos interesan fills de cierre
-        if "Close" not in fill_dir:
+        if only_close and "Close" not in fill_dir:
             continue
-
-        # Determinar side de la operación original (long o short que se cerró)
-        # 'Close Long'  → se cerró una posición long  → el fill fue SELL
-        # 'Close Short' → se cerró una posición short → el fill fue BUY
-        if "Long" in fill_dir:
-            normalized_side = "SELL"   # cierre de long
-        else:
-            normalized_side = "BUY"    # cierre de short
-
-        # Clasificar SL vs TP por closedPnl
-        closed_pnl = float(f.get("closedPnl", 0))
-        order_type = "STOP_MARKET" if closed_pnl < 0 else "TAKE_PROFIT_MARKET"
-
-        result.append({
-            "side":       normalized_side,
-            "type":       order_type,
-            "avgPrice":   str(f.get("px", 0)),
-            "time":       int(f.get("time", 0)),
-            "updateTime": int(f.get("time", 0)),
-            "status":     "FILLED",
-            "dir":        fill_dir,          # campo extra para debug
-            "closedPnl":  closed_pnl,
-        })
+        result.append(_normalize_fill(f))
         if len(result) >= limit:
             break
+
     return result
+
+
+def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
+    """Devuelve fills de cierre recientes del símbolo normalizados para main.py.
+
+    Delega en get_fills(only_close=True). Mantenido por compatibilidad con
+    las llamadas existentes en main.py y tg_commands.py.
+    """
+    return get_fills(symbol=symbol, limit=limit, only_close=True)
