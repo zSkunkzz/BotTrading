@@ -13,6 +13,15 @@ Cambios respecto a la implementación BingX:
 
 El formato interno del buffer es idéntico al de la implementación BingX
 para no romper nada en signals.py ni main.py.
+
+v2 — Fix 429 precarga:
+  PRELOAD_WORKERS reducido de 8 → 3 para no saturar el rate limit de
+  Hyperliquid/CloudFront al arranque. Con 53 pares × 3 TF = 159 requests;
+  con 8 workers se lanzan ~80 simultáneos → 429 garantizado.
+  Con 3 workers el throughput cae de ~8 req/s a ~3 req/s, aceptable porque
+  la precarga ocurre una sola vez al inicio y el WS toma el relevo.
+  Además se añade un delay de PRELOAD_BATCH_DELAY entre lotes de
+  PRELOAD_BATCH_SIZE requests para suavizar el burst inicial.
 """
 import json
 import logging
@@ -32,7 +41,12 @@ WS_URL        = "wss://api.hyperliquid.xyz/ws"
 BUFFER_SIZE   = 300
 TIMEFRAMES    = ["15m", "1h", "4h"]
 PING_INTERVAL = 30
-PRELOAD_WORKERS = 8
+
+# Fix 429: bajado de 8 → 3 workers para no saturar CloudFront al arranque
+PRELOAD_WORKERS    = 3
+# Pausa entre lotes de requests durante la precarga (segundos)
+PRELOAD_BATCH_SIZE  = 6   # requests por lote (2 pares × 3 TF)
+PRELOAD_BATCH_DELAY = 0.8 # segundos entre lotes
 
 _READY_MIN = {"15m": 120, "1h": 215}
 _PRELOAD   = {"15m": 120, "1h": 220, "4h": 70}
@@ -109,7 +123,7 @@ class KlineFeed:
         if self._ws:
             self._ws.close()
 
-    # ── Precarga REST en paralelo ─────────────────────────────────────────────────
+    # ── Precarga REST en paralelo ─────────────────────────────────────────────
 
     def _preload_one(self, symbol: str, tf: str, limit: int) -> None:
         try:
@@ -122,21 +136,38 @@ class KlineFeed:
             log.warning("[%s %s] error precarga: %s", symbol, tf, e)
 
     def _preload_parallel(self) -> None:
+        """Precarga velas en batches para no saturar el rate limit de Hyperliquid.
+
+        Con PRELOAD_WORKERS=3 y PRELOAD_BATCH_DELAY=0.8s entre lotes de
+        PRELOAD_BATCH_SIZE=6 requests, el throughput máximo es ~3.75 req/s,
+        muy por debajo del límite de HL (~10 req/s para /info).
+        """
         tasks = [
             (symbol, tf, limit)
             for symbol in self._symbols
             for tf, limit in _PRELOAD.items()
         ]
-        with ThreadPoolExecutor(max_workers=PRELOAD_WORKERS) as ex:
-            futures = {ex.submit(self._preload_one, s, tf, lim): (s, tf)
-                       for s, tf, lim in tasks}
-            done = 0
-            for f in as_completed(futures):
-                done += 1
-                if done % 20 == 0 or done == len(tasks):
-                    log.info("Precarga: %d/%d completadas", done, len(tasks))
 
-    # ── WebSocket ──────────────────────────────────────────────────────────────────────
+        # Dividir en lotes y procesarlos con pausa entre cada uno
+        batch_num = 0
+        for i in range(0, len(tasks), PRELOAD_BATCH_SIZE):
+            batch = tasks[i:i + PRELOAD_BATCH_SIZE]
+            batch_num += 1
+
+            with ThreadPoolExecutor(max_workers=PRELOAD_WORKERS) as ex:
+                futures = {ex.submit(self._preload_one, s, tf, lim): (s, tf)
+                           for s, tf, lim in batch}
+                for f in as_completed(futures):
+                    pass  # errores ya logueados en _preload_one
+
+            done = min(i + PRELOAD_BATCH_SIZE, len(tasks))
+            log.info("Precarga: %d/%d completadas (lote %d)", done, len(tasks), batch_num)
+
+            # Pausa entre lotes excepto tras el último
+            if done < len(tasks):
+                time.sleep(PRELOAD_BATCH_DELAY)
+
+    # ── WebSocket ──────────────────────────────────────────────────────────────
 
     def _run_forever(self) -> None:
         while self._running:
@@ -155,7 +186,6 @@ class KlineFeed:
             on_close   = self._on_close,
         )
         self._ws = ws
-        # Hyperliquid no requiere ping manual; el servidor gestiona keepalive
         ws.run_forever(ping_interval=PING_INTERVAL, ping_timeout=10)
 
     def _on_open(self, ws) -> None:
@@ -164,7 +194,6 @@ class KlineFeed:
         for symbol in self._symbols:
             coin = _hl_coin(symbol)
             for tf in TIMEFRAMES:
-                # Protocolo Hyperliquid WS (doc oficial)
                 ws.send(json.dumps({
                     "method": "subscribe",
                     "subscription": {
@@ -176,10 +205,8 @@ class KlineFeed:
 
     def _on_message(self, ws, raw) -> None:
         try:
-            # Hyperliquid envía JSON puro, no gzip
             msg = json.loads(raw)
 
-            # Solo procesar mensajes de canal 'candle'
             if msg.get("channel") != "candle":
                 return
 
@@ -187,9 +214,8 @@ class KlineFeed:
             if not isinstance(kline, dict):
                 return
 
-            # Hyperliquid candle fields: t, T, o, h, l, c, v, n, s, i
-            coin = kline.get("s", "")  # symbol (e.g. 'BTC')
-            tf   = kline.get("i", "")  # interval (e.g. '15m')
+            coin = kline.get("s", "")
+            tf   = kline.get("i", "")
 
             symbol = self._coin_to_sym.get(coin)
             if symbol is None or tf not in TIMEFRAMES:
@@ -208,8 +234,6 @@ class KlineFeed:
                 "close":        close_val,
                 "volume":       vol,
                 "quote_volume": vol * close_val,
-                # Hyperliquid no tiene campo 'confirm';
-                # una vela se considera cerrada cuando llega con T (close_time) < ahora
                 "closed":       int(kline.get("T", 0)) < int(time.time() * 1000),
             }
 
@@ -218,7 +242,6 @@ class KlineFeed:
                 if buf and buf[-1]["ts"] == candle["ts"]:
                     buf[-1] = candle
                 else:
-                    # Nueva vela: cerrar la anterior y añadir
                     if buf:
                         buf[-1] = dict(buf[-1], closed=True)
                     buf.append(candle)

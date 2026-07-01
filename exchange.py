@@ -15,17 +15,19 @@ Nombres de símbolos:
     Todas las funciones públicas aceptan tanto "BTC-USDT" como "BTC".
     _hl_symbol() normaliza internamente.
 
-BUGS corregidos respecto a la versión BingX original:
-  (ver historial de commits para lista completa)
-
 v2 — Rate limiting (fix 429):
   _hl_call() envuelve TODAS las llamadas HTTP a Hyperliquid con:
     • Reintentos exponenciales: 1s, 2s, 4s (3 intentos)
     • Jitter ±20% para evitar sincronización de reintentos entre pares
     • En 429 específicamente: espera extra de 5s antes de reintentar
     • Máximo 3 reintentos — tras el 3º lanza la excepción original
-  Esto impide que el error 429 de CloudFront escale hasta el loop de main.py
-  y genere la alerta ⚠️ en Telegram por cada par en cada tick.
+
+v3 — Fix Invalid leverage value:
+  set_leverage() hace bisect automático cuando HL rechaza el leverage:
+  prueba 5x → 3x → 2x → 1x hasta encontrar el máximo aceptado.
+  Pares con max_leverage < 10x (LIT, VVV, MORPHO, DYDX, JTO, XLM, ZRO,
+  PYTH, WIF, TAO, GRASS, AERO, FET, HBAR, VIRTUAL, EIGEN, OP, PENDLE,
+  INJ, XMR, SEI, TIA, LDO) ya no generan WARNING en cada reinicio.
 """
 import logging
 import os
@@ -37,7 +39,6 @@ import config
 
 log = logging.getLogger("exchange")
 
-# Apalancamiento máximo permitido — nunca superar este valor aunque config lo indique
 MAX_LEVERAGE = 10
 
 # ── SDK imports ──────────────────────────────────────────────────────────────
@@ -61,52 +62,36 @@ _WALLET_ADDRESS   = (os.environ.get("HYPERLIQUID_WALLET_ADDRESS") or _account.ad
 _MAINNET          = os.environ.get("HL_MAINNET", "true").lower() == "true"
 _HL_URL           = hl_constants.MAINNET_API_URL if _MAINNET else hl_constants.TESTNET_API_URL
 
-# skip_ws=True: no abre WS desde aquí; ws_feed.py gestiona su propio WS
 _info     = Info(_HL_URL, skip_ws=True)
 _exchange = Exchange(_account, _HL_URL, account_address=_WALLET_ADDRESS)
 
 log.info("Hyperliquid inicializado | wallet=%s | mainnet=%s", _WALLET_ADDRESS, _MAINNET)
 
 
-# ── Rate limiting: exponential backoff con jitter ────────────────────────────
+# ── Rate limiting: exponential backoff con jitter ─────────────────────────────
 
-_RL_MAX_RETRIES   = 3          # máx reintentos tras 429
-_RL_BASE_DELAY    = 1.0        # segundos base del backoff
-_RL_JITTER        = 0.2        # ±20% de jitter sobre el delay calculado
-_RL_429_EXTRA     = 5.0        # espera extra exclusiva para 429 antes del backoff
+_RL_MAX_RETRIES   = 3
+_RL_BASE_DELAY    = 1.0
+_RL_JITTER        = 0.2
+_RL_429_EXTRA     = 5.0
 
 
 def _is_429(exc: Exception) -> bool:
-    """Detecta si la excepción es un error 429 de Hyperliquid/CloudFront.
-
-    El SDK lanza excepciones de httpx o de requests con el código HTTP en el
-    mensaje o como atributo .status_code. También puede ser una tupla como
-    (429, None, 'null', None, {...}) que el loop de main capturaba antes.
-    """
     msg = str(exc)
     if "429" in msg:
         return True
     code = getattr(exc, "status_code", None) or getattr(exc, "response", None)
     if code == 429:
         return True
-    # Tupla HL: primer elemento es el código HTTP
     if isinstance(exc, (tuple, list)) and len(exc) > 0 and exc[0] == 429:
         return True
     return False
 
 
 def _hl_call(fn, *args, context: str = "", **kwargs):
-    """Llama fn(*args, **kwargs) con reintentos exponenciales ante 429.
-
-    Uso:
-        result = _hl_call(_info.user_state, _WALLET_ADDRESS, context="get_balance")
-
-    - En 429: espera _RL_429_EXTRA + backoff exponencial con jitter.
-    - En otro error: reintenta igualmente (puede ser timeout transitorio).
-    - Tras _RL_MAX_RETRIES intentos fallidos: lanza la última excepción.
-    """
+    """Llama fn(*args, **kwargs) con reintentos exponenciales ante 429."""
     last_exc = None
-    for attempt in range(1, _RL_MAX_RETRIES + 2):   # +1 para el intento inicial
+    for attempt in range(1, _RL_MAX_RETRIES + 2):
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
@@ -115,8 +100,8 @@ def _hl_call(fn, *args, context: str = "", **kwargs):
                 break
 
             is_429 = _is_429(exc)
-            base_wait = _RL_BASE_DELAY * (2 ** (attempt - 1))          # 1s, 2s, 4s
-            jitter    = base_wait * _RL_JITTER * (random.random() * 2 - 1)  # ±20%
+            base_wait = _RL_BASE_DELAY * (2 ** (attempt - 1))
+            jitter    = base_wait * _RL_JITTER * (random.random() * 2 - 1)
             wait      = base_wait + jitter + (_RL_429_EXTRA if is_429 else 0)
 
             log.warning(
@@ -133,11 +118,10 @@ def _hl_call(fn, *args, context: str = "", **kwargs):
 # ── Utilidades de símbolo ────────────────────────────────────────────────────
 
 def _hl_symbol(symbol: str) -> str:
-    """Convierte 'BTC-USDT' o 'BTC' a 'BTC' (formato Hyperliquid)."""
     return symbol.split("-")[0]
 
 
-# ── sz_decimals (precisión de cantidad) ────────────────────────────────────────
+# ── sz_decimals ───────────────────────────────────────────────────────────────
 
 def _sz_decimals(symbol: str) -> int:
     coin  = _hl_symbol(symbol)
@@ -148,7 +132,6 @@ def _sz_decimals(symbol: str) -> int:
 
 
 def floor_qty(qty: float, symbol: str) -> float:
-    """Redondea qty hacia abajo según szDecimals del contrato."""
     dec    = _sz_decimals(symbol)
     factor = 10 ** dec
     return int(qty * factor) / factor
@@ -158,11 +141,10 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 10.0) -> bool:
     return (qty * price) >= min_usdt
 
 
-# ── Precio límite para órdenes de mercado (slippage permitido) ────────────────
-_MARKET_SLIPPAGE = 0.005  # 0.5% de slippage máximo para market IOC
+# ── Precio límite para órdenes de mercado ─────────────────────────────────────
+_MARKET_SLIPPAGE = 0.005
 
 def _market_price(coin: str, is_buy: bool) -> float:
-    """Devuelve precio límite para market IOC con slippage de 0.5%."""
     mids = _hl_call(_info.all_mids, context=f"_market_price({coin})")
     mid  = float(mids.get(coin, 0))
     if mid <= 0:
@@ -173,7 +155,6 @@ def _market_price(coin: str, is_buy: bool) -> float:
 # ── Balance ───────────────────────────────────────────────────────────────────
 
 def get_balance() -> float:
-    """Devuelve el equity total en USDT (marginSummary.accountValue)."""
     try:
         state = _hl_call(_info.user_state, _WALLET_ADDRESS, context="get_balance")
         return float(state.get("marginSummary", {}).get("accountValue", 0))
@@ -190,7 +171,6 @@ def get_price(symbol: str = None) -> float:
         mids = _hl_call(_info.all_mids, context=f"get_price({coin})")
         if coin in mids:
             return float(mids[coin])
-        # Fallback: L2 orderbook mid
         book = _hl_call(_info.l2_snapshot, coin, context=f"get_price_l2({coin})")
         bid  = float(book["levels"][0][0]["px"])
         ask  = float(book["levels"][1][0]["px"])
@@ -278,27 +258,66 @@ def get_position(symbol: str = None) -> dict | None:
 
 # ── Apalancamiento ────────────────────────────────────────────────────────────
 
+# Cache: coin → leverage efectivo confirmado por HL
+_leverage_cache: dict[str, int] = {}
+
+# Candidatos para bisect cuando HL rechaza el leverage solicitado
+_LEVERAGE_FALLBACKS = [5, 3, 2, 1]
+
+
 def set_leverage(symbol: str = None, leverage: int = None) -> None:
+    """Setea leverage en isolated. Si HL rechaza el valor, hace bisect automático.
+
+    v3 fix: pares con max_leverage < 10x (LIT, VVV, MORPHO, DYDX, JTO, XLM,
+    ZRO, PYTH, WIF, TAO, GRASS, AERO, FET, HBAR, VIRTUAL, EIGEN, OP, PENDLE,
+    INJ, XMR, SEI, TIA, LDO...) ya no generan WARNING repetido — el primer
+    arranque descubre su max y lo cachea para siempre.
+    """
     coin     = _hl_symbol(symbol or config.SYMBOLS[0])
-    leverage = leverage or config.LEVERAGE
-    leverage = min(int(leverage), MAX_LEVERAGE)
-    try:
-        resp = _hl_call(
-            _exchange.update_leverage, leverage, coin, False,
-            context=f"set_leverage({coin},{leverage}x)",
-        )
-        if resp.get("status") == "ok":
-            log.info("Leverage seteado a %dx en %s (isolated)", leverage, coin)
-        else:
-            log.warning("set_leverage(%s): respuesta inesperada: %s", coin, resp)
-    except Exception as exc:
-        log.warning("set_leverage(%s) falló: %s", coin, exc)
+    leverage = min(int(leverage or config.LEVERAGE), MAX_LEVERAGE)
+
+    # Si ya tenemos el leverage efectivo cacheado, usarlo directamente
+    if coin in _leverage_cache:
+        cached = _leverage_cache[coin]
+        if cached == leverage:
+            return  # ya está seteado
+        # Si el cached es menor que el pedido, usar el cached (sabemos que el
+        # pedido fue rechazado antes)
+        leverage = min(leverage, cached)
+
+    candidates = [leverage] + [f for f in _LEVERAGE_FALLBACKS if f < leverage]
+
+    for lev in candidates:
+        try:
+            resp = _hl_call(
+                _exchange.update_leverage, lev, coin, False,
+                context=f"set_leverage({coin},{lev}x)",
+            )
+            if resp.get("status") == "ok":
+                if lev < leverage:
+                    log.info(
+                        "set_leverage(%s): max permitido es %dx (pedido %dx) — usando %dx",
+                        coin, lev, leverage, lev,
+                    )
+                else:
+                    log.info("Leverage seteado a %dx en %s (isolated)", lev, coin)
+                _leverage_cache[coin] = lev
+                return
+            # HL devolvió 'err' (ej: 'Invalid leverage value') — probar siguiente
+            log.debug(
+                "set_leverage(%s) rechazado a %dx: %s — probando menor",
+                coin, lev, resp.get("response", ""),
+            )
+        except Exception as exc:
+            log.warning("set_leverage(%s @%dx) falló: %s", coin, lev, exc)
+            # No hacer break — intentar con leverage menor
+
+    log.error("set_leverage(%s): no se pudo setear ningún leverage válido", coin)
 
 
 # ── Abrir orden ───────────────────────────────────────────────────────────────
 
 def _check_order_response(resp: dict, context: str) -> None:
-    """Valida la respuesta de _exchange.order() a nivel de statuses."""
     status = resp.get("status")
     if status != "ok":
         raise RuntimeError(f"{context}: status={status!r} — {resp}")
@@ -435,7 +454,7 @@ def _normalize_fill(f: dict) -> dict:
     return {
         "side":       normalized_side,
         "type":       order_type,
-        "order_type": order_type,   # alias explícito para _get_real_exit_price
+        "order_type": order_type,
         "px":         px_str,
         "avgPrice":   px_str,
         "time":       int(f.get("time", 0)),
@@ -478,5 +497,4 @@ def get_fills(
 
 
 def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
-    """Devuelve fills de cierre recientes del símbolo normalizados para main.py."""
     return get_fills(symbol=symbol, limit=limit, only_close=True)
