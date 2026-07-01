@@ -216,7 +216,7 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                     exchange.cancel_all_orders(symbol)
                     exchange.place_stop_order(symbol, "short", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "short", pos["qty"], pos["tp"])
-                    telegram.notify(f"\U0001f53d Trailing SL movido\n{symbol} SHORT\nNuevo SL: <code>{new_sl:.6f}</code>")
+                    telegram.notify(f"\U0001f53d Trailing SL movido\n{symbol} SHORT\nNuevo SL: <code>{new_sq:.6f}</code>")
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
 
@@ -283,7 +283,7 @@ def _check_tp_extension(
 
         if pos_live is None:
             log.info(
-                "[%s] Posición ya cerrada en BingX — extend_tp cancelado (TP original ejecutado)",
+                "[%s] Posición ya cerrada en el exchange — extend_tp cancelado (TP original ejecutado)",
                 symbol,
             )
             return
@@ -617,21 +617,37 @@ def _calc_be_levels_from_atr(
 
 
 def _get_position_open_ts(symbol: str, pos_ex: dict) -> float:
+    """Recupera el timestamp real de apertura desde los fills de Hyperliquid.
+
+    Hyperliquid no tiene 'orders' con type MARKET/LIMIT en historial;
+    usa fills con campo 'dir': 'Open Long' | 'Open Short'.
+    Se busca el fill de apertura más reciente (el más alto en tiempo) del side correcto.
+    """
     try:
         side         = pos_ex.get("side", "long")
-        open_bx_side = "BUY" if side == "long" else "SELL"
+        open_dir_key = "Open Long" if side == "long" else "Open Short"
         closed = exchange.get_closed_orders(symbol, limit=20)
-        for order in closed:
-            if str(order.get("side", "")).upper() != open_bx_side:
+        # get_closed_orders filtra fills de cierre ("Close" en dir);
+        # necesitamos fills de apertura, así que consultamos fills directamente.
+        # Como get_closed_orders ya está disponible y limita por símbolo,
+        # usamos el campo 'dir' del fill para filtrar aperturas.
+        # NOTA: get_closed_orders solo retorna fills con 'Close' en dir —
+        # para aperturas consultamos exchange directamente con user_fills_by_time.
+        import exchange as _ex  # alias para acceder a _info y _WALLET_ADDRESS
+        import time as _time
+        now_ms   = int(_time.time() * 1000)
+        start_ms = now_ms - 7 * 24 * 60 * 60 * 1000
+        coin = _ex._hl_symbol(symbol)
+        fills = _ex._info.user_fills_by_time(_ex._WALLET_ADDRESS, start_ms, now_ms)
+        for fill in reversed(fills):  # más reciente primero
+            if fill.get("coin") != coin:
                 continue
-            order_type = str(order.get("type", "")).upper()
-            if "MARKET" not in order_type and "LIMIT" not in order_type:
-                continue
-            ts_ms = int(order.get("time") or order.get("updateTime") or 0)
-            if ts_ms > 0:
-                ts = ts_ms / 1000.0
-                log.info("[%s] open_ts real recuperado desde historial: %.0f", symbol, ts)
-                return ts
+            if open_dir_key in fill.get("dir", ""):
+                ts_ms = int(fill.get("time", 0))
+                if ts_ms > 0:
+                    ts = ts_ms / 1000.0
+                    log.info("[%s] open_ts real recuperado desde fill: %.0f", symbol, ts)
+                    return ts
     except Exception as exc:
         log.debug("[%s] No se pudo recuperar open_ts real: %s — usando time.time()", symbol, exc)
     return time.time()
