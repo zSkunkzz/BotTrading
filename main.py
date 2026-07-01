@@ -283,7 +283,7 @@ def _check_tp_extension(
 
         if pos_live is None:
             log.info(
-                "[%s] Posición ya cerrada en el exchange — extend_tp cancelado (TP original ejecutado)",
+                "[%s] Posición ya cerrada — extend_tp cancelado (TP original ejecutado)",
                 symbol,
             )
             return
@@ -435,13 +435,12 @@ def _get_real_exit_price(
     fallback: float,
     fallback_reason: str,
 ) -> tuple[float, str]:
-    side     = pos.get("side", "long")
-    entry    = pos.get("entry", 0.0)
-    open_ts  = pos.get("open_ts", 0.0)
-    open_ms  = int(open_ts * 1000)
+    side    = pos.get("side", "long")
+    entry   = pos.get("entry", 0.0)
+    open_ts = pos.get("open_ts", 0.0)
+    open_ms = int(open_ts * 1000)
 
-    close_bx_side = "SELL" if side == "long" else "BUY"
-    CLOSE_TYPES = {"STOP_MARKET", "TAKE_PROFIT_MARKET"}
+    hl_close_dir = "Close Long" if side == "long" else "Close Short"
 
     try:
         closed_orders = exchange.get_closed_orders(symbol, limit=20)
@@ -450,15 +449,12 @@ def _get_real_exit_price(
         return fallback, fallback_reason
 
     for order in closed_orders:
-        if str(order.get("side", "")).upper() != close_bx_side:
+        if order.get("dir") != hl_close_dir:
             continue
-        order_type = str(order.get("type", "")).upper()
-        if order_type not in CLOSE_TYPES:
-            continue
-        order_time = int(order.get("time") or order.get("updateTime") or 0)
+        order_time = int(order.get("time") or 0)
         if order_time > 0 and order_time < open_ms:
             continue
-        real_price = float(order.get("avgPrice") or order.get("price") or 0)
+        real_price = float(order.get("px") or order.get("price") or 0)
         if real_price <= 0:
             continue
         if entry > 0 and abs(real_price - entry) / entry > 0.30:
@@ -467,10 +463,10 @@ def _get_real_exit_price(
                 symbol, real_price, entry,
             )
             continue
-        if "TAKE_PROFIT" in order_type:
+        order_type = str(order.get("order_type") or order.get("type") or "").upper()
+        if "TAKE_PROFIT" in order_type or "TP" in order_type:
             return real_price, "TP"
-        if "STOP" in order_type:
-            return real_price, "SL"
+        return real_price, "SL"
 
     log.debug("[%s] Sin orden de cierre válida en historial — usando fallback %.6f", symbol, fallback)
     return fallback, fallback_reason
@@ -502,7 +498,7 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
 
     # v4: Smart cooldown — SL en los primeros 15min con score alto → cooldown corto
     if reason == "SL":
-        hold_secs  = time.time() - p.get("open_ts", 0)
+        hold_secs   = time.time() - p.get("open_ts", 0)
         trade_score = p.get("score", 0)
         if hold_secs <= SMART_COOLDOWN_FAST_WINDOW and trade_score >= SMART_COOLDOWN_HIGH_SCORE:
             _cooldown_reason[symbol] = "sl_fast"
@@ -565,3 +561,405 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
         open_ts   = p.get("open_ts", 0.0),
         daily_pnl = daily_pnl,
     )
+
+
+def _calc_trail_step_from_atr(symbol: str, feed, sl: float | None, entry: float) -> float:
+    try:
+        candles_15m = feed.get(symbol, "15m")
+        if candles_15m and len(candles_15m) >= 15:
+            trs = []
+            for i in range(1, len(candles_15m)):
+                h  = candles_15m[i]["high"]
+                l  = candles_15m[i]["low"]
+                pc = candles_15m[i - 1]["close"]
+                trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+            atr  = sum(trs[-14:]) / min(14, len(trs))
+            step = round(max(0.3 * atr, atr * 0.05), 8)
+            log.info("[%s] trail_step recalculado desde ATR tras sync: %.8f", symbol, step)
+            return step
+    except Exception as exc:
+        log.debug("[%s] No se pudo recalcular trail_step desde ATR: %s", symbol, exc)
+
+    if sl is not None and entry > 0:
+        sl_dist = abs(entry - sl)
+        if sl_dist > 0:
+            step = round(0.3 * sl_dist, 8)
+            log.info("[%s] trail_step recalculado desde SL-dist tras sync: %.8f", symbol, step)
+            return step
+
+    return 0.0
+
+
+def _calc_be_levels_from_atr(
+    symbol: str, feed, side: str, entry: float
+) -> tuple[float | None, float | None]:
+    try:
+        candles_15m = feed.get(symbol, "15m")
+        if candles_15m and len(candles_15m) >= 15:
+            trs = []
+            for i in range(1, len(candles_15m)):
+                h  = candles_15m[i]["high"]
+                l  = candles_15m[i]["low"]
+                pc = candles_15m[i - 1]["close"]
+                trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+            atr = sum(trs[-14:]) / min(14, len(trs))
+            if atr > 0 and entry > 0:
+                be_trigger = (entry + risk.BE_ATR_MULT * atr) if side == "long" else (entry - risk.BE_ATR_MULT * atr)
+                be_sl      = (entry + risk.BE_BUFFER_MULT * atr) if side == "long" else (entry - risk.BE_BUFFER_MULT * atr)
+                return round(be_trigger, 8), round(be_sl, 8)
+    except Exception as exc:
+        log.debug("[%s] No se pudo calcular be_levels tras sync: %s", symbol, exc)
+    return None, None
+
+
+def _get_position_open_ts(symbol: str, pos_ex: dict) -> float:
+    try:
+        side         = pos_ex.get("side", "long")
+        hl_open_dir  = "Open Long" if side == "long" else "Open Short"
+        closed = exchange.get_closed_orders(symbol, limit=20)
+        for order in closed:
+            if order.get("dir") != hl_open_dir:
+                continue
+            ts_ms = int(order.get("time") or 0)
+            if ts_ms > 0:
+                ts = ts_ms / 1000.0
+                log.info("[%s] open_ts real recuperado desde historial: %.0f", symbol, ts)
+                return ts
+    except Exception as exc:
+        log.debug("[%s] No se pudo recuperar open_ts real: %s — usando time.time()", symbol, exc)
+    return time.time()
+
+
+def run() -> None:
+    global _weekend_notified_day
+
+    log.info(
+        "Bot iniciado | %d pares | lev=%dx | margin=%s USDT | max=%d posiciones | max_same_side=%d",
+        len(config.SYMBOLS), config.LEVERAGE, config.MARGIN_USDT,
+        config.MAX_POSITIONS, MAX_SAME_SIDE,
+    )
+
+    for symbol in config.SYMBOLS:
+        try:
+            exchange.set_leverage(symbol)
+        except Exception as e:
+            log.warning("No se pudo setear leverage en %s: %s", symbol, e)
+
+    telegram.notify(
+        f"\U0001f916 Bot iniciado — {len(config.SYMBOLS)} pares | "
+        f"{config.LEVERAGE}x | max {config.MAX_POSITIONS} posiciones"
+    )
+
+    feed = KlineFeed(config.SYMBOLS)
+    feed.start()
+    _wait_feed_ready(feed)
+
+    positions: dict = {}
+    tg_commands.start(get_positions_fn=lambda: positions, feed=feed)
+    trade_logger.start_scheduler()
+
+    loop_count = 0
+
+    while True:
+        try:
+            loop_count += 1
+
+            if bot_state.reset_daily_if_new_day():
+                log.info("[drawdown] Nuevo día UTC — bot reactivado")
+                telegram.notify("\U0001f305 Nuevo día UTC — límite de pérdidas reseteado. Bot activo.")
+
+            weekend = _is_weekend()
+            effective_min_score = WEEKEND_MIN_SCORE if weekend else WEEKDAY_MIN_SCORE
+
+            all_ex_positions = exchange.get_all_positions()
+
+            for symbol in list(positions.keys()):
+                pos_ex = all_ex_positions.get(symbol)
+                if pos_ex:
+                    _missing_count.pop(symbol, None)
+                    continue
+
+                _missing_count[symbol] = _missing_count.get(symbol, 0) + 1
+                absent = _missing_count[symbol]
+
+                if absent < CLOSE_CONFIRM_LOOPS:
+                    log.debug(
+                        "[%s] No vista en exchange (intento %d/%d) — esperando confirmación",
+                        symbol, absent, CLOSE_CONFIRM_LOOPS,
+                    )
+                    continue
+
+                p = positions.pop(symbol)
+                _declare_closed(symbol, p, positions)
+
+            expired = [
+                sym for sym, ts in _cooldown.items()
+                if time.time() - ts >= _cooldown_for(sym)
+            ]
+            for sym in expired:
+                _cooldown.pop(sym, None)
+                _cooldown_reason.pop(sym, None)
+                log.info("[%s] Cooldown expirado — símbolo disponible", sym)
+
+            expired_alerts = [
+                sym for sym, ts in _manual_alert_cooldown.items()
+                if time.time() - ts >= MANUAL_ALERT_COOLDOWN
+            ]
+            for sym in expired_alerts:
+                _manual_alert_cooldown.pop(sym, None)
+
+            for symbol, pos_ex in all_ex_positions.items():
+                if symbol not in positions:
+                    ex_side = pos_ex.get("side")
+                    if ex_side not in VALID_SIDES:
+                        log.warning(
+                            "[%s] Posición ignorada en sync — side inválido del exchange: %r",
+                            symbol, ex_side,
+                        )
+                        continue
+
+                    synced_sl    = pos_ex.get("sl")
+                    synced_entry = pos_ex["entry"]
+                    trail_step   = _calc_trail_step_from_atr(symbol, feed, synced_sl, synced_entry)
+                    real_open_ts = _get_position_open_ts(symbol, pos_ex)
+                    be_trigger, be_sl = _calc_be_levels_from_atr(symbol, feed, ex_side, synced_entry)
+
+                    positions[symbol] = {
+                        "side":          ex_side,
+                        "entry":         synced_entry,
+                        "qty":           pos_ex["size"],
+                        "sl":            synced_sl,
+                        "tp":            pos_ex["tp"],
+                        "tp_original":   pos_ex["tp"],
+                        "tp_extensions": 0,
+                        "_extending":    False,
+                        "trail_step":    trail_step,
+                        "trail_high":    synced_entry,
+                        "trail_low":     synced_entry,
+                        "score":         getattr(config, "WEEKDAY_MIN_SCORE", 70),
+                        "open_ts":       real_open_ts,
+                        "be_trigger":    be_trigger,
+                        "be_sl":         be_sl,
+                        "be_locked":     False,
+                    }
+                    log.info(
+                        "[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s trail=%.8f be_trigger=%s open_ts=%.0f)",
+                        symbol, ex_side, synced_entry,
+                        synced_sl, pos_ex["tp"], trail_step,
+                        f"{be_trigger:.6f}" if be_trigger else "N/A",
+                        real_open_ts,
+                    )
+
+            open_count = len(positions)
+
+            if loop_count % 10 == 1:
+                daily_pnl  = bot_state.get_daily_pnl()
+                paused_str = (
+                    "PAUSADO(drawdown)" if bot_state.is_daily_limit_hit()
+                    else ("PAUSADO" if bot_state.is_paused() else "activo")
+                )
+                long_count  = sum(1 for p in positions.values() if p["side"] == "long")
+                short_count = sum(1 for p in positions.values() if p["side"] == "short")
+                log.info(
+                    "[loop #%d] Posiciones: %d/%d (L:%d S:%d) | Feed: %d/%d | "
+                    "Cooldowns: %d | Estado: %s | PnL hoy: %+.2f USDT",
+                    loop_count, open_count, config.MAX_POSITIONS,
+                    long_count, short_count,
+                    feed.ready_count(), len(config.SYMBOLS), len(_cooldown),
+                    paused_str, daily_pnl,
+                )
+
+            for symbol, pos in list(positions.items()):
+                try:
+                    price = exchange.get_price(symbol)
+                    _apply_breakeven(symbol, pos, price)
+                    _update_trailing(symbol, pos, price)
+                    _check_tp_extension(symbol, pos, price, feed, effective_min_score)
+                except Exception as e:
+                    log.warning("[%s] Error gestión posición: %s", symbol, e)
+
+            if weekend:
+                today = datetime.now(timezone.utc).weekday()
+                if today != _weekend_notified_day:
+                    _weekend_notified_day = today
+                    day_name = "Sábado" if today == 5 else "Domingo"
+                    log.info("Modo fin de semana activo (%s UTC) — score mínimo %d",
+                             day_name, WEEKEND_MIN_SCORE)
+                    telegram.notify(
+                        f"\U0001f6ab Modo fin de semana ({day_name})\n"
+                        f"No se abrirán posiciones nuevas salvo score ≥ {WEEKEND_MIN_SCORE}.\n"
+                        f"Posiciones actuales siguen gestionándose con normalidad."
+                    )
+
+            if bot_state.is_paused() or bot_state.is_daily_limit_hit():
+                if bot_state.is_daily_limit_hit():
+                    log.debug("Bot pausado por drawdown diario — saltando búsqueda de señales")
+                else:
+                    log.debug("Bot pausado manualmente — saltando búsqueda de señales")
+            else:
+                if loop_count % 10 == 1:
+                    regime_summary = []
+                    for sym in config.SYMBOLS:
+                        if not feed.ready(sym):
+                            continue
+                        try:
+                            c1h = feed.get(sym, "1h")
+                            reg, adx = signals._market_regime(c1h)
+                            regime_summary.append(f"{sym.split('-')[0]}:{reg[0].upper()}{adx:.0f}")
+                        except Exception:
+                            pass
+                    if regime_summary:
+                        log.info("[regímenes] %s", "\t".join(regime_summary))
+
+                for symbol in config.SYMBOLS:
+                    if symbol in positions:
+                        continue
+                    if not feed.ready(symbol):
+                        continue
+                    if symbol in _cooldown:
+                        continue
+
+                    is_manual = symbol in config.MANUAL_ALERT_SYMBOLS
+
+                    if is_manual and symbol in _manual_alert_cooldown:
+                        continue
+
+                    # FIX #4: usar len(positions) en tiempo real para no superar MAX_POSITIONS
+                    if not is_manual and len(positions) >= config.MAX_POSITIONS:
+                        break
+
+                    try:
+                        candles_15m = feed.get(symbol, "15m")
+                        candles_1h  = feed.get(symbol, "1h")
+                        candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
+
+                        signal, score, regime = signals.evaluate(
+                            candles_15m, candles_1h, candles_4h,
+                            min_score=effective_min_score,
+                            symbol=symbol,
+                        )
+
+                        if not signal or signal not in VALID_SIDES:
+                            if signal is not None:
+                                log.warning(
+                                    "[%s] Señal ignorada — side inválido: %r (score=%d)",
+                                    symbol, signal, score,
+                                )
+                            continue
+
+                        if not regime:
+                            regime = "bull" if signal == "long" else "bear"
+
+                        if not is_manual and not _check_directional_guard(signal, positions, symbol):
+                            continue
+
+                        price  = exchange.get_price(symbol)
+                        params = risk.calc(
+                            signal, price, candles_15m,
+                            score=score, symbol=symbol, regime=regime,
+                            candles_1h=candles_1h,
+                        )
+
+                        if is_manual:
+                            _manual_alert_cooldown[symbol] = time.time()
+                            side_icon = "\U0001f7e1" if signal == "long" else "\U0001f534"
+                            telegram.notify(
+                                f"\U0001f6a8 <b>Alerta manual — {symbol}</b>\n\n"
+                                f"{side_icon} Dirección: <b>{signal.upper()}</b>\n"
+                                f"Precio actual: <code>{price:.6f}</code>\n"
+                                f"SL sugerido:   <code>{params['sl']:.6f}</code>\n"
+                                f"TP sugerido:   <code>{params['tp']:.6f}</code>\n"
+                                f"Score: <b>{score}</b>\n\n"
+                                f"⚠️ <i>Operación NO abierta automáticamente.</i>"
+                            )
+                            log.info("[%s] ALERTA MANUAL enviada | %s score=%d", symbol, signal.upper(), score)
+                            continue
+
+                        log.info(
+                            "[%s] SEÑAL %s | regime=%s RR=%.1f | "
+                            "entry=%.6f sl=%.6f tp=%.6f be_trigger=%s qty=%.8f score=%d",
+                            symbol, signal.upper(), regime, params["tp_rr"],
+                            price, params["sl"], params["tp"],
+                            f"{params['be_trigger']:.6f}" if params.get("be_trigger") else "N/A",
+                            params["qty"], score,
+                        )
+
+                        try:
+                            exchange.open_order(
+                                side   = signal,
+                                qty    = params["qty"],
+                                sl     = params["sl"],
+                                tp     = params["tp"],
+                                symbol = symbol,
+                            )
+                        except Exception as open_err:
+                            log.error(
+                                "[%s] open_order falló — posición NO registrada: %s",
+                                symbol, open_err,
+                            )
+                            # FIX #1: rollback corregido — close_position necesita side y qty.
+                            # Se consulta la posición real en el exchange para obtener los
+                            # parámetros necesarios antes de intentar el cierre.
+                            try:
+                                pos_live = exchange.get_position(symbol)
+                                if pos_live:
+                                    exchange.close_position(
+                                        side   = pos_live["side"],
+                                        qty    = pos_live["size"],
+                                        symbol = symbol,
+                                    )
+                                    log.warning("[%s] Rollback OK: posición parcial cerrada", symbol)
+                                else:
+                                    log.info("[%s] Rollback innecesario — no hay posición en exchange", symbol)
+                            except Exception as close_err:
+                                log.error(
+                                    "[%s] Rollback fallido — revisar posición manualmente: %s",
+                                    symbol, close_err,
+                                )
+                            continue
+
+                        real_entry = _sync_entry_from_exchange(symbol, price, signal)
+
+                        positions[symbol] = {
+                            "side":          signal,
+                            "entry":         real_entry,
+                            "qty":           params["qty"],
+                            "sl":            params["sl"],
+                            "tp":            params["tp"],
+                            "tp_original":   params["tp"],
+                            "tp_extensions": 0,
+                            "_extending":    False,
+                            "trail_step":    params["trail_step"],
+                            "trail_high":    real_entry,
+                            "trail_low":     real_entry,
+                            "score":         score,
+                            "open_ts":       time.time(),
+                            "be_trigger":    params.get("be_trigger"),
+                            "be_sl":         params.get("be_sl"),
+                            "be_locked":     False,
+                        }
+                        # FIX #4: open_count ya no se usa — el check usa len(positions) en tiempo real
+
+                        telegram.notify_open(
+                            symbol = symbol,
+                            price  = real_entry,
+                            side   = signal,
+                            qty    = params["qty"],
+                            sl     = params["sl"],
+                            tp     = params["tp"],
+                            score  = score,
+                            tp_rr  = params["tp_rr"],
+                        )
+
+                    except Exception as e:
+                        log.error("[%s] Error: %s", symbol, e, exc_info=True)
+
+        except Exception as e:
+            log.error("Error en loop: %s", e, exc_info=True)
+            telegram.notify(f"\u26a0\ufe0f Error en bot: {e}")
+
+        time.sleep(config.LOOP_SLEEP)
+
+
+if __name__ == "__main__":
+    run()
