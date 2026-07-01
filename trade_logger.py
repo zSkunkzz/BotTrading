@@ -6,6 +6,8 @@ y llama a bot_state.record_trade() para actualizar el PnL.
 
 FIX: _cache protegido con _cache_lock (threading.Lock) para evitar race conditions.
 FIX: PnL neto real — ganancias y pérdidas se acumulan algebraicamente.
+FIX: send_daily_summary limpia solo trades del día anterior, nunca los del día nuevo,
+     evitando huecos de contabilidad si hay posiciones abiertas en medianoche.
 
 GIST: Si GIST_TOKEN y GIST_ID están configurados en variables de entorno,
       trades.csv se sincroniza con un Gist de GitHub tras cada trade y al arrancar.
@@ -308,13 +310,30 @@ def is_daily_limit_hit() -> bool:
 # ── Resumen diario ──────────────────────────────────────────────────────────────────
 
 def send_daily_summary() -> None:
+    """Envía resumen de la sesión pasada y limpia SOLO los trades del día anterior.
+
+    FIX: el clear() original borraba TODO _cache a medianoche, incluyendo trades
+    del día nuevo que ya hubieran cerrado mientras había posiciones abiertas.
+    Ahora se limpia por fecha: solo se eliminan entradas con date < today_utc(),
+    preservando cualquier trade que ya pertenezca al nuevo día.
+    """
     try:
         import telegram as _tg
     except Exception:
         return
 
+    today = _today_utc()
+
     with _cache_lock:
-        snapshot = list(_cache)
+        # Separar trades de ayer (o anteriores) de los del día nuevo
+        yesterday_trades = [t for t in _cache if not t["date"].startswith(today)]
+        today_trades     = [t for t in _cache if t["date"].startswith(today)]
+
+        snapshot = list(yesterday_trades)  # solo enviamos los de ayer
+
+        # Limpiar solo los del día anterior; los del día nuevo permanecen
+        _cache.clear()
+        _cache.extend(today_trades)
 
     if not snapshot:
         _tg.notify("📊 <b>Resumen del día</b>\nSin trades en esta sesión.")
@@ -335,11 +354,12 @@ def send_daily_summary() -> None:
             f"{icon} {t['symbol']} {t['side'].upper()} "
             f"{t['pnl_pct']:+.2f}% ({t['pnl_usdt']:+.2f} USDT)"
         )
+    if today_trades:
+        lines.append(
+            f"\n<i>ℹ️ {len(today_trades)} trade(s) del nuevo día ya en cache.</i>"
+        )
 
     _tg.notify("\n".join(lines))
-
-    with _cache_lock:
-        _cache.clear()
 
 
 def _daily_summary_scheduler() -> None:

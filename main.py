@@ -26,6 +26,18 @@ fix v5:
      en _check_tp_extension, el flag _extending quedaba True permanentemente.
      El finally ya lo reseteaba, pero el try externo de main podía interceptar
      excepciones antes. Ahora _extending se resetea con doble garantía.
+
+fix v6:
+  5. _check_tp_extension: usaba effective_min_score (90 en fin de semana) para evaluar
+     si extender el TP de una posición YA abierta. Un trade válido con score 80 no
+     podía extender su TP en sábado/domingo. Fix: extensiones siempre usan
+     WEEKDAY_MIN_SCORE (70); el umbral de fin de semana es solo para señales NUEVAS.
+  6. Señales manuales /long /short: pop_manual_signal estaba definida en tg_commands
+     pero nunca se consumía en el loop — las señales se perdían silenciosamente.
+     Fix: al inicio de cada ciclo de señales se itera config.SYMBOLS y se inyectan
+     señales manuales pendientes respetando MAX_POSITIONS, cooldown y drawdown.
+  7. Contabilidad medianoche: send_daily_summary en trade_logger ya no borra trades
+     del día nuevo (fix en trade_logger.py).
 """
 import logging
 import os
@@ -254,8 +266,15 @@ def _check_tp_extension(
     pos: dict,
     current_price: float,
     feed,
-    effective_min_score: int,
+    effective_min_score: int,  # mantenido para compatibilidad de firma; NO se usa aquí
 ) -> None:
+    """Evalúa si extender el TP de una posición ya abierta.
+
+    FIX v6 #5: siempre usa WEEKDAY_MIN_SCORE (70) para la evaluación de señal,
+    NO effective_min_score. El umbral de fin de semana (90) aplica solo a señales
+    NUEVAS; una posición ya abierta con score válido no debe quedar bloqueada el
+    fin de semana sin poder extender su TP.
+    """
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -279,8 +298,6 @@ def _check_tp_extension(
         return
 
     # FIX v5 #4: doble garantía de reset — setear aquí Y en finally del bloque interno.
-    # El try externo de main.py puede capturar excepciones antes del finally interno,
-    # dejando _extending=True para siempre. Con este patrón, el reset está garantizado.
     pos["_extending"] = True
     try:
         dist_pct = abs(current_price - tp) / tp
@@ -290,9 +307,12 @@ def _check_tp_extension(
             candles_15m = feed.get(symbol, "15m")
             candles_1h  = feed.get(symbol, "1h")
             candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
+            # FIX v6 #5: extensiones de TP usan WEEKDAY_MIN_SCORE, no effective_min_score.
+            # Una posición ya validada y abierta no debe ver bloqueada su extensión
+            # solo porque sea fin de semana.
             signal, score, _ = signals.evaluate(
                 candles_15m, candles_1h, candles_4h,
-                min_score=effective_min_score,
+                min_score=WEEKDAY_MIN_SCORE,
                 symbol=symbol,
             )
         except Exception as e:
@@ -327,7 +347,6 @@ def _check_tp_extension(
             return
 
         entry        = pos["entry"]
-        # FIX #2 (anterior): usar tp_original (entry del trade) como base, no el TP ya extendido.
         tp_orig      = pos.get("tp_original", tp)
         tp_orig_dist = abs(tp_orig - entry)
 
@@ -387,8 +406,6 @@ def _check_tp_extension(
         )
 
     finally:
-        # Garantía doble: siempre se resetea, incluso si el try externo de main captura
-        # la excepción antes de que llegue al finally del bloque interno (ahora eliminado).
         pos["_extending"] = False
 
 
@@ -492,19 +509,12 @@ def _get_real_exit_price(
             continue
 
         # FIX v5 #3: clasificar SOLO por order_type.
-        # Antes usaba closedPnl >= 0 como clasificador principal, lo que provocaba que
-        # un SL con trailing muy ajustado (cierre en verde) se clasificara como TP,
-        # activando cooldown incorrecto (30min en vez de 60min).
-        # Ahora order_type es la única fuente de verdad; pnl es el último recurso
-        # con aviso explícito en el log para facilitar detección de casos edge.
         order_type = str(order.get("order_type") or order.get("type") or "").upper()
         if "TAKE_PROFIT" in order_type or "TP" in order_type:
             return real_price, "TP"
         if "STOP" in order_type or "SL" in order_type:
             return real_price, "SL"
 
-        # Último recurso: Hyperliquid a veces devuelve type genérico ("Limit", "Market").
-        # Usar closedPnl solo si order_type no es discriminante, con aviso explícito.
         closed_pnl = float(order.get("closedPnl") or 0)
         log.warning(
             "[%s] order_type=%r no discriminante — clasificando por closedPnl=%.4f "
@@ -543,9 +553,6 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
         symbol, p["side"], p["entry"], exit_price, reason, pnl_pct, pnl_usdt,
     )
 
-    # v4: Smart cooldown — SL en los primeros 15min con score alto → cooldown corto.
-    # FIX v5 #2: posiciones sync usan _SYNC_SCORE_UNKNOWN (0), nunca >= 85,
-    # por lo que el smart cooldown no se activa erróneamente en trades externos.
     if reason == "SL":
         hold_secs   = time.time() - p.get("open_ts", 0)
         trade_score = p.get("score", 0)
@@ -679,6 +686,98 @@ def _get_position_open_ts(symbol: str, pos_ex: dict) -> float:
     return time.time()
 
 
+def _open_position(
+    symbol: str,
+    signal: str,
+    score: int,
+    regime: str,
+    price: float,
+    candles_15m: list,
+    candles_1h: list,
+    positions: dict,
+) -> None:
+    """Encapsula la lógica de apertura de posición (usada tanto por señales
+    automáticas como por señales manuales de Telegram /long /short).
+    """
+    params = risk.calc(
+        signal, price, candles_15m,
+        score=score, symbol=symbol, regime=regime,
+        candles_1h=candles_1h,
+    )
+
+    log.info(
+        "[%s] SEÑAL %s | regime=%s RR=%.1f | "
+        "entry=%.6f sl=%.6f tp=%.6f be_trigger=%s qty=%.8f score=%d",
+        symbol, signal.upper(), regime, params["tp_rr"],
+        price, params["sl"], params["tp"],
+        f"{params['be_trigger']:.6f}" if params.get("be_trigger") else "N/A",
+        params["qty"], score,
+    )
+
+    try:
+        exchange.open_order(
+            side   = signal,
+            qty    = params["qty"],
+            sl     = params["sl"],
+            tp     = params["tp"],
+            symbol = symbol,
+        )
+    except Exception as open_err:
+        log.error(
+            "[%s] open_order falló — posición NO registrada: %s",
+            symbol, open_err,
+        )
+        try:
+            pos_live = exchange.get_position(symbol)
+            if pos_live:
+                exchange.close_position(
+                    side   = pos_live["side"],
+                    qty    = pos_live["size"],
+                    symbol = symbol,
+                )
+                log.warning("[%s] Rollback OK: posición parcial cerrada", symbol)
+            else:
+                log.info("[%s] Rollback innecesario — no hay posición en exchange", symbol)
+        except Exception as close_err:
+            log.error(
+                "[%s] Rollback fallido — revisar posición manualmente: %s",
+                symbol, close_err,
+            )
+        return
+
+    real_entry = _sync_entry_from_exchange(symbol, price, signal)
+
+    positions[symbol] = {
+        "side":          signal,
+        "entry":         real_entry,
+        "qty":           params["qty"],
+        "sl":            params["sl"],
+        "tp":            params["tp"],
+        "tp_original":   params["tp"],
+        "tp_extensions": 0,
+        "_extending":    False,
+        "trail_step":    params["trail_step"],
+        "trail_high":    real_entry,
+        "trail_low":     real_entry,
+        "score":         score,
+        "open_ts":       time.time(),
+        "be_trigger":    params.get("be_trigger"),
+        "be_sl":         params.get("be_sl"),
+        "be_locked":     False,
+    }
+
+    telegram.notify_open(
+        symbol = symbol,
+        price  = real_entry,
+        side   = signal,
+        qty    = params["qty"],
+        sl     = params["sl"],
+        tp     = params["tp"],
+        score  = score,
+        tp_rr  = params["tp_rr"],
+    )
+
+
 def run() -> None:
     global _weekend_notified_day
 
@@ -785,8 +884,6 @@ def run() -> None:
                         "trail_step":    trail_step,
                         "trail_high":    synced_entry,
                         "trail_low":     synced_entry,
-                        # FIX v5 #2: score=0 (_SYNC_SCORE_UNKNOWN) en vez de WEEKDAY_MIN_SCORE (70).
-                        # Evita que smart_cooldown (>= 85) se active falsamente en trades sync.
                         "score":         _SYNC_SCORE_UNKNOWN,
                         "open_ts":       real_open_ts,
                         "be_trigger":    be_trigger,
@@ -862,6 +959,67 @@ def run() -> None:
                     if regime_summary:
                         log.info("[regímenes] %s", "\t".join(regime_summary))
 
+                # ── FIX v6 #6: Señales manuales Telegram (/long /short) ───────────
+                # pop_manual_signal estaba definida pero nunca consumida → señales
+                # encoladas se perdían en silencio. Ahora se procesan aquí antes
+                # del bucle de señales automáticas, respetando todos los guards.
+                for symbol in list(config.SYMBOLS):
+                    manual_side = tg_commands.pop_manual_signal(symbol)
+                    if not manual_side:
+                        continue
+                    if symbol in positions:
+                        telegram.notify(
+                            f"⚠️ Señal manual {symbol} {manual_side.upper()} ignorada "
+                            f"— ya hay posición abierta."
+                        )
+                        continue
+                    if symbol in _cooldown:
+                        telegram.notify(
+                            f"⚠️ Señal manual {symbol} {manual_side.upper()} ignorada "
+                            f"— símbolo en cooldown."
+                        )
+                        continue
+                    if len(positions) >= config.MAX_POSITIONS:
+                        telegram.notify(
+                            f"⚠️ Señal manual {symbol} {manual_side.upper()} ignorada "
+                            f"— posiciones máximas alcanzadas ({config.MAX_POSITIONS})."
+                        )
+                        continue
+                    if not feed.ready(symbol):
+                        telegram.notify(
+                            f"⚠️ Señal manual {symbol} {manual_side.upper()} ignorada "
+                            f"— feed no listo para este par."
+                        )
+                        continue
+                    if not _check_directional_guard(manual_side, positions, symbol):
+                        telegram.notify(
+                            f"⚠️ Señal manual {symbol} {manual_side.upper()} ignorada "
+                            f"— MAX_SAME_SIDE o grupo correlación alcanzado."
+                        )
+                        continue
+                    try:
+                        candles_15m = feed.get(symbol, "15m")
+                        candles_1h  = feed.get(symbol, "1h")
+                        price       = exchange.get_price(symbol)
+                        # Las señales manuales usan score=100 (override total del usuario)
+                        # y régimen inferido de la dirección pedida.
+                        regime = "bull" if manual_side == "long" else "bear"
+                        log.info(
+                            "[%s] SEÑAL MANUAL %s vía Telegram — ejecutando",
+                            symbol, manual_side.upper(),
+                        )
+                        _open_position(
+                            symbol, manual_side, score=100, regime=regime,
+                            price=price, candles_15m=candles_15m,
+                            candles_1h=candles_1h, positions=positions,
+                        )
+                    except Exception as e:
+                        log.error("[%s] Error ejecutando señal manual: %s", symbol, e)
+                        telegram.notify(
+                            f"❌ Error ejecutando señal manual {symbol} {manual_side.upper()}: {e}"
+                        )
+
+                # ── Señales automáticas ───────────────────────────────────────────
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
                         continue
@@ -904,11 +1062,6 @@ def run() -> None:
                             continue
 
                         price  = exchange.get_price(symbol)
-                        params = risk.calc(
-                            signal, price, candles_15m,
-                            score=score, symbol=symbol, regime=regime,
-                            candles_1h=candles_1h,
-                        )
 
                         if is_manual:
                             _manual_alert_cooldown[symbol] = time.time()
@@ -925,76 +1078,10 @@ def run() -> None:
                             log.info("[%s] ALERTA MANUAL enviada | %s score=%d", symbol, signal.upper(), score)
                             continue
 
-                        log.info(
-                            "[%s] SEÑAL %s | regime=%s RR=%.1f | "
-                            "entry=%.6f sl=%.6f tp=%.6f be_trigger=%s qty=%.8f score=%d",
-                            symbol, signal.upper(), regime, params["tp_rr"],
-                            price, params["sl"], params["tp"],
-                            f"{params['be_trigger']:.6f}" if params.get("be_trigger") else "N/A",
-                            params["qty"], score,
-                        )
-
-                        try:
-                            exchange.open_order(
-                                side   = signal,
-                                qty    = params["qty"],
-                                sl     = params["sl"],
-                                tp     = params["tp"],
-                                symbol = symbol,
-                            )
-                        except Exception as open_err:
-                            log.error(
-                                "[%s] open_order falló — posición NO registrada: %s",
-                                symbol, open_err,
-                            )
-                            try:
-                                pos_live = exchange.get_position(symbol)
-                                if pos_live:
-                                    exchange.close_position(
-                                        side   = pos_live["side"],
-                                        qty    = pos_live["size"],
-                                        symbol = symbol,
-                                    )
-                                    log.warning("[%s] Rollback OK: posición parcial cerrada", symbol)
-                                else:
-                                    log.info("[%s] Rollback innecesario — no hay posición en exchange", symbol)
-                            except Exception as close_err:
-                                log.error(
-                                    "[%s] Rollback fallido — revisar posición manualmente: %s",
-                                    symbol, close_err,
-                                )
-                            continue
-
-                        real_entry = _sync_entry_from_exchange(symbol, price, signal)
-
-                        positions[symbol] = {
-                            "side":          signal,
-                            "entry":         real_entry,
-                            "qty":           params["qty"],
-                            "sl":            params["sl"],
-                            "tp":            params["tp"],
-                            "tp_original":   params["tp"],
-                            "tp_extensions": 0,
-                            "_extending":    False,
-                            "trail_step":    params["trail_step"],
-                            "trail_high":    real_entry,
-                            "trail_low":     real_entry,
-                            "score":         score,
-                            "open_ts":       time.time(),
-                            "be_trigger":    params.get("be_trigger"),
-                            "be_sl":         params.get("be_sl"),
-                            "be_locked":     False,
-                        }
-
-                        telegram.notify_open(
-                            symbol = symbol,
-                            price  = real_entry,
-                            side   = signal,
-                            qty    = params["qty"],
-                            sl     = params["sl"],
-                            tp     = params["tp"],
-                            score  = score,
-                            tp_rr  = params["tp_rr"],
+                        _open_position(
+                            symbol, signal, score=score, regime=regime,
+                            price=price, candles_15m=candles_15m,
+                            candles_1h=candles_1h, positions=positions,
                         )
 
                     except Exception as e:
