@@ -13,6 +13,11 @@ v7 — Fix "Order has invalid price" en SL/TP:
   y redondea al número correcto de decimales antes de cada place_stop_order
   y place_tp_order. Cache en _tick_decimals para no consultar meta en cada
   orden.
+v8 — Fix "Order has invalid price" en open_order (entrada IOC):
+  _market_price() devuelve mid * (1 ± slippage) sin redondear, lo que
+  genera precios como 0.3371775 o 0.33712222499999994 que HL rechaza.
+  Fix: aplicar _round_price(coin, limit_px) antes del order() de entrada,
+  igual que ya se hacía en SL/TP.
 """
 import logging
 import math
@@ -173,7 +178,8 @@ def _market_price(coin: str, is_buy: bool) -> float:
     mid  = float(mids.get(coin, 0))
     if mid <= 0:
         raise ValueError(f"No se pudo obtener precio para {coin}")
-    return mid * (1 + _MARKET_SLIPPAGE) if is_buy else mid * (1 - _MARKET_SLIPPAGE)
+    raw = mid * (1 + _MARKET_SLIPPAGE) if is_buy else mid * (1 - _MARKET_SLIPPAGE)
+    return _round_price(coin, raw)  # v8: redondear aquí para que open_order y close_position usen precio limpio
 
 
 # ── Balance ───────────────────────────────────────────────────────────────────
@@ -356,6 +362,7 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
     set_leverage(sym_bot, config.LEVERAGE)
 
+    # v8: _market_price ya aplica _round_price internamente → limit_px siempre tiene tickSize válido
     limit_px = _market_price(coin, is_buy)
     resp = _hl_call(
         _exchange.order,
@@ -410,7 +417,7 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
 def close_position(side: str, qty: float, symbol: str = None) -> dict:
     coin     = _hl_symbol(symbol or config.SYMBOLS[0])
     is_buy   = side == "short"
-    limit_px = _market_price(coin, is_buy)
+    limit_px = _market_price(coin, is_buy)  # v8: ya redondeado
     resp = _hl_call(
         _exchange.order,
         coin, is_buy, qty, limit_px,
