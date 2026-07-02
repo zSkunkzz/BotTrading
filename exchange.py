@@ -18,12 +18,21 @@ v8 — Fix "Order has invalid price" en open_order (entrada IOC):
   genera precios como 0.3371775 o 0.33712222499999994 que HL rechaza.
   Fix: aplicar _round_price(coin, limit_px) antes del order() de entrada,
   igual que ya se hacía en SL/TP.
+v9 — Fix "floattowire causes rounding":
+  El SDK serializa el precio vía floattowire y rechaza cualquier float que
+  no sea exactamente representable con los decimales del tickSize.
+  round() en Python puede dejar residuos de punto flotante
+  (ej: round(0.33767..., 4) → 0.3377000000000001).
+  Fix: usar Decimal con quantize() para obtener una representación exacta,
+  y convertir a float solo al final. Aplica en _round_price() para cubrir
+  _market_price, place_stop_order y place_tp_order.
 """
 import logging
 import math
 import os
 import random
 import time
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 import config
@@ -165,9 +174,13 @@ def _get_tick_decimals(coin: str) -> int:
 
 
 def _round_price(coin: str, price: float) -> float:
-    """Redondea `price` al tickSize del par para que HL no rechace la orden."""
+    """Redondea `price` al tickSize del par usando Decimal para evitar
+    residuos de punto flotante que el SDK rechaza en floattowire."""
     dec = _get_tick_decimals(coin)
-    return round(price, dec)
+    # Usar Decimal con quantize garantiza representación exacta
+    quantizer = Decimal(10) ** -dec  # ej: dec=4 → Decimal('0.0001')
+    rounded = Decimal(str(price)).quantize(quantizer, rounding=ROUND_HALF_UP)
+    return float(rounded)
 
 
 # ── Precio límite para órdenes de mercado ─────────────────────────────────────────
@@ -179,7 +192,7 @@ def _market_price(coin: str, is_buy: bool) -> float:
     if mid <= 0:
         raise ValueError(f"No se pudo obtener precio para {coin}")
     raw = mid * (1 + _MARKET_SLIPPAGE) if is_buy else mid * (1 - _MARKET_SLIPPAGE)
-    return _round_price(coin, raw)  # v8: redondear aquí para que open_order y close_position usen precio limpio
+    return _round_price(coin, raw)  # v8+v9: Decimal rounding
 
 
 # ── Balance ───────────────────────────────────────────────────────────────────
@@ -362,7 +375,7 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
     set_leverage(sym_bot, config.LEVERAGE)
 
-    # v8: _market_price ya aplica _round_price internamente → limit_px siempre tiene tickSize válido
+    # v8+v9: _market_price usa Decimal rounding → floattowire no puede quejarse
     limit_px = _market_price(coin, is_buy)
     resp = _hl_call(
         _exchange.order,
@@ -381,7 +394,7 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
     coin       = _hl_symbol(symbol)
     is_buy     = side == "short"  # cerrar long → sell; cerrar short → buy
-    stop_price = _round_price(coin, stop_price)  # v7: respetar tickSize
+    stop_price = _round_price(coin, stop_price)  # v7+v9: Decimal rounding
     order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
     try:
         resp = _hl_call(
@@ -398,7 +411,7 @@ def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> N
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
     coin       = _hl_symbol(symbol)
     is_buy     = side == "short"  # cerrar long → sell; cerrar short → buy
-    tp_price   = _round_price(coin, tp_price)  # v7: respetar tickSize
+    tp_price   = _round_price(coin, tp_price)  # v7+v9: Decimal rounding
     order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
     try:
         resp = _hl_call(
@@ -417,7 +430,7 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
 def close_position(side: str, qty: float, symbol: str = None) -> dict:
     coin     = _hl_symbol(symbol or config.SYMBOLS[0])
     is_buy   = side == "short"
-    limit_px = _market_price(coin, is_buy)  # v8: ya redondeado
+    limit_px = _market_price(coin, is_buy)  # v8+v9: Decimal rounding
     resp = _hl_call(
         _exchange.order,
         coin, is_buy, qty, limit_px,
