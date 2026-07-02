@@ -28,6 +28,14 @@ v3 — Fix Invalid leverage value:
   Pares con max_leverage < 10x (LIT, VVV, MORPHO, DYDX, JTO, XLM, ZRO,
   PYTH, WIF, TAO, GRASS, AERO, FET, HBAR, VIRTUAL, EIGEN, OP, PENDLE,
   INJ, XMR, SEI, TIA, LDO) ya no generan WARNING en cada reinicio.
+
+v4 — Fix cancel_all_orders:
+  El SDK de Hyperliquid expone cancel(coin, oid) aceptando UN SOLO oid int.
+  La versión anterior pasaba una lista entera → TypeError silencioso en
+  _hl_call → las órdenes de SL/TP anteriores nunca se cancelaban →
+  al colocar nuevas se acumulaban duplicados → trailing, BE y extend_tp
+  no funcionaban.
+  Fix: iterar la lista de oids y llamar cancel() uno por uno.
 """
 import logging
 import os
@@ -41,7 +49,7 @@ log = logging.getLogger("exchange")
 
 MAX_LEVERAGE = 10
 
-# ── SDK imports ──────────────────────────────────────────────────────────────
+# ── SDK imports ─────────────────────────────────────────────────────────
 try:
     import eth_account
     from hyperliquid.info import Info
@@ -52,7 +60,7 @@ except ImportError as _e:
         "SDK de Hyperliquid no instalado. Ejecuta: pip install hyperliquid-python-sdk eth-account"
     ) from _e
 
-# ── Inicializar clientes ─────────────────────────────────────────────────────
+# ── Inicializar clientes ───────────────────────────────────────────────────────────
 _pk = os.environ["HYPERLIQUID_PRIVATE_KEY"]
 if not _pk.startswith("0x"):
     _pk = "0x" + _pk
@@ -68,7 +76,7 @@ _exchange = Exchange(_account, _HL_URL, account_address=_WALLET_ADDRESS)
 log.info("Hyperliquid inicializado | wallet=%s | mainnet=%s", _WALLET_ADDRESS, _MAINNET)
 
 
-# ── Rate limiting: exponential backoff con jitter ─────────────────────────────
+# ── Rate limiting: exponential backoff con jitter ───────────────────────────────────
 
 _RL_MAX_RETRIES   = 3
 _RL_BASE_DELAY    = 1.0
@@ -115,13 +123,13 @@ def _hl_call(fn, *args, context: str = "", **kwargs):
     raise last_exc
 
 
-# ── Utilidades de símbolo ────────────────────────────────────────────────────
+# ── Utilidades de símbolo ───────────────────────────────────────────────────────────
 
 def _hl_symbol(symbol: str) -> str:
     return symbol.split("-")[0]
 
 
-# ── sz_decimals ───────────────────────────────────────────────────────────────
+# ── sz_decimals ────────────────────────────────────────────────────────────────
 
 def _sz_decimals(symbol: str) -> int:
     coin  = _hl_symbol(symbol)
@@ -141,7 +149,7 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 10.0) -> bool:
     return (qty * price) >= min_usdt
 
 
-# ── Precio límite para órdenes de mercado ─────────────────────────────────────
+# ── Precio límite para órdenes de mercado ─────────────────────────────────────────
 _MARKET_SLIPPAGE = 0.005
 
 def _market_price(coin: str, is_buy: bool) -> float:
@@ -163,7 +171,7 @@ def get_balance() -> float:
         return 0.0
 
 
-# ── Precio ────────────────────────────────────────────────────────────────────
+# ── Precio ──────────────────────────────────────────────────────────────────────
 
 def get_price(symbol: str = None) -> float:
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
@@ -180,7 +188,7 @@ def get_price(symbol: str = None) -> float:
         return 0.0
 
 
-# ── OHLCV ─────────────────────────────────────────────────────────────────────
+# ── OHLCV ───────────────────────────────────────────────────────────────────────
 
 _TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
@@ -220,7 +228,7 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
     return candles[-limit:]
 
 
-# ── Posiciones ────────────────────────────────────────────────────────────────
+# ── Posiciones ────────────────────────────────────────────────────────────────────
 
 def _parse_hl_position(pos: dict) -> dict | None:
     szi = float(pos.get("szi", 0))
@@ -256,7 +264,7 @@ def get_position(symbol: str = None) -> dict | None:
     return get_all_positions().get(symbol)
 
 
-# ── Apalancamiento ────────────────────────────────────────────────────────────
+# ── Apalancamiento ────────────────────────────────────────────────────────────────
 
 # Cache: coin → leverage efectivo confirmado por HL
 _leverage_cache: dict[str, int] = {}
@@ -315,7 +323,7 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
     log.error("set_leverage(%s): no se pudo setear ningún leverage válido", coin)
 
 
-# ── Abrir orden ───────────────────────────────────────────────────────────────
+# ── Abrir orden ──────────────────────────────────────────────────────────────────
 
 def _check_order_response(resp: dict, context: str) -> None:
     status = resp.get("status")
@@ -369,7 +377,7 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
     coin   = _hl_symbol(symbol)
-    is_buy = side == "short"
+    is_buy = side == "short"  # para cerrar un long → sell (not is_buy); para cerrar un short → buy
     try:
         resp = _hl_call(
             _exchange.order,
@@ -388,7 +396,7 @@ def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> N
 
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
     coin   = _hl_symbol(symbol)
-    is_buy = side == "short"
+    is_buy = side == "short"  # para cerrar un long → sell; para cerrar un short → buy
     try:
         resp = _hl_call(
             _exchange.order,
@@ -405,7 +413,7 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
         log.warning("place_tp_order(%s) falló: %s", coin, exc)
 
 
-# ── Cerrar posición ───────────────────────────────────────────────────────────
+# ── Cerrar posición ──────────────────────────────────────────────────────────────────
 
 def close_position(side: str, qty: float, symbol: str = None) -> dict:
     coin     = _hl_symbol(symbol or config.SYMBOLS[0])
@@ -422,23 +430,40 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
     return resp
 
 
-# ── Cancelar órdenes abiertas ─────────────────────────────────────────────────
+# ── Cancelar órdenes abiertas ──────────────────────────────────────────────────────────
 
 def cancel_all_orders(symbol: str = None) -> None:
+    """Cancela todas las órdenes abiertas para el símbolo dado.
+
+    FIX v4: el SDK de HL expone cancel(coin, oid) con UN SOLO oid (int).
+    La versión anterior llamaba _exchange.cancel(coin, [oid1, oid2, ...])
+    pasando una lista entera como segundo argumento — TypeError silencioso
+    dentro de _hl_call → las órdenes nunca se cancelaban → se acumulaban
+    duplicados de SL/TP → trailing, BE y extend_tp fallíaban silenciosamente.
+    """
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
     try:
         orders = _hl_call(_info.open_orders, _WALLET_ADDRESS, context=f"open_orders({coin})")
         oids   = [o["oid"] for o in orders if o["coin"] == coin]
-        if oids:
-            _hl_call(_exchange.cancel, coin, oids, context=f"cancel_all_orders({coin})")
-            log.info("Órdenes canceladas para %s (%d)", coin, len(oids))
-        else:
+        if not oids:
             log.debug("cancel_all_orders(%s): no había órdenes abiertas", coin)
+            return
+        cancelled = 0
+        for oid in oids:
+            try:
+                _hl_call(
+                    _exchange.cancel, coin, oid,
+                    context=f"cancel_order({coin},{oid})",
+                )
+                cancelled += 1
+            except Exception as exc:
+                log.warning("cancel_order(%s, %s) falló: %s", coin, oid, exc)
+        log.info("Órdenes canceladas para %s (%d/%d)", coin, cancelled, len(oids))
     except Exception as exc:
         log.warning("cancel_all_orders(%s) falló: %s", coin, exc)
 
 
-# ── Historial de fills ────────────────────────────────────────────────────────
+# ── Historial de fills ────────────────────────────────────────────────────────────────
 
 def _normalize_fill(f: dict) -> dict:
     fill_dir = f.get("dir", "")
