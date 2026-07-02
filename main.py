@@ -1,50 +1,15 @@
 """main.py — Loop principal con trailing stop, break-even lock, TP dinámico y cooldown inteligente.
 
 v4: Cooldown diferenciado por calidad de señal.
-  - SL en los primeros SMART_COOLDOWN_FAST_WINDOW segundos con score >= SMART_COOLDOWN_HIGH_SCORE
-    → cooldown reducido a COOLDOWN_SL_FAST (probablemente ruido puntual, no tendencia)
-  - Resto de SLs → COOLDOWN_SL normal (60min)
-  - TPs → COOLDOWN_TP (30min, sin cambios)
-
-fix trailing SL:
-  trail_high/trail_low se actualizan SIEMPRE que el precio supera el pico,
-  independientemente de si new_sl mejora el SL actual.
-  Antes el trailing quedaba congelado después de un break-even lock si el precio
-  seguía subiendo pero new_sl <= pos['sl'] (ya movido por el lock).
-
-fix v5:
-  1. BE silencioso: si place_stop_order/place_tp_order falla en _apply_breakeven,
-     ahora se notifica por Telegram en vez de fallar silenciosamente.
-  2. Score en sync externo: posiciones detectadas desde exchange usaban score=70 fijo,
-     impidiendo que smart_cooldown (>= 85) se activara. Ahora se asigna score=0
-     para indicar "score desconocido" y el smart cooldown no se activa en sync.
-  3. Clasificación SL-en-verde como TP: _get_real_exit_price usaba closedPnl >= 0
-     para clasificar TP, pero un trailing muy ajustado puede cerrar en verde via SL.
-     Ahora se usa order_type exclusivamente; solo como último fallback usa pnl
-     con aviso explícito en el log.
-  4. _extending leak: si una excepción no capturada escapaba del bloque try interno
-     en _check_tp_extension, el flag _extending quedaba True permanentemente.
-     El finally ya lo reseteaba, pero el try externo de main podía interceptar
-     excepciones antes. Ahora _extending se resetea con doble garantía.
-
-fix v6:
-  5. _check_tp_extension: usaba effective_min_score (90 en fin de semana) para evaluar
-     si extender el TP de una posición YA abierta. Un trade válido con score 80 no
-     podía extender su TP en sábado/domingo. Fix: extensiones siempre usan
-     WEEKDAY_MIN_SCORE (70); el umbral de fin de semana es solo para señales NUEVAS.
-  6. Señales manuales /long /short: pop_manual_signal estaba definida en tg_commands
-     pero nunca se consumía en el loop — las señales se perdían silenciosamente.
-     Fix: al inicio de cada ciclo de señales se itera config.SYMBOLS y se inyectan
-     señales manuales pendientes respetando MAX_POSITIONS, cooldown y drawdown.
-  7. Contabilidad medianoche: send_daily_summary en trade_logger ya no borra trades
-     del día nuevo (fix en trade_logger.py).
-
-fix v7:
-  8. SL/TP perdidos tras reinicio: al sincronizar una posición desde el exchange,
-     Hyperliquid no devuelve SL/TP en assetPositions. El bot reregistraba la posición
-     con sl=None y tp=None, sin colocar las órdenes protectoras. Ahora, si la posición
-     sincronizada no tiene SL o TP, se recalculan desde risk.calc() y se colocan
-     inmediatamente va exchange.place_stop_order() / place_tp_order().
+v5: BE silencioso notificado, score sync=0, clasificación SL/TP por order_type, _extending leak fix.
+v6: _check_tp_extension usa WEEKDAY_MIN_SCORE, señales manuales consumidas, contabilidad medianoche.
+v7: SL/TP restaurados tras reinicio si Hyperliquid no los devuelve.
+v8:
+  - _update_trailing: _round_price en new_sl, debounce 5 min por par, notificación enriquecida
+    con PnL latente y distancia al TP.
+  - _check_tp_extension: fórmula lineal (entry + tp_orig_dist × (n+1)) en lugar de
+    multiplicador acumulativo que escalaba demasiado. _round_price en new_tp.
+  - _open_position: regime pasado a notify_open (antes siempre llegaba vacío).
 """
 import logging
 import os
@@ -62,9 +27,6 @@ import tg_commands
 import trade_logger
 from ws_feed import KlineFeed
 
-# ── Log level configurable ────────────────────────────────────────────────
-# Establecer LOG_LEVEL=DEBUG en las variables de entorno para activar logs detallados.
-# Por defecto se usa INFO en producción.
 _LOG_LEVEL_STR = os.environ.get("LOG_LEVEL", "INFO").upper()
 _LOG_LEVEL = getattr(logging, _LOG_LEVEL_STR, logging.INFO)
 
@@ -76,32 +38,28 @@ logging.basicConfig(
 log = logging.getLogger("main")
 log.info("Log level activo: %s", _LOG_LEVEL_STR)
 
-# ── Silenciar librerías de terceros (siempre WARNING, independiente de LOG_LEVEL) ──
-# httpcore y httpx son extremadamente verbosos en DEBUG (10+ líneas por request).
-# Esto hace que DEBUG muestre SOLO los logs de nuestros módulos.
 for _noisy_logger in ("httpcore", "httpx", "websockets", "asyncio"):
     logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
 _cooldown: dict[str, float] = {}
-_cooldown_reason: dict[str, str] = {}   # 'tp' | 'sl' | 'sl_fast'
+_cooldown_reason: dict[str, str] = {}
 _manual_alert_cooldown: dict[str, float] = {}
+# v8: debounce para notificaciones de trailing (ts del último envío por símbolo)
+_trailing_notify_ts: dict[str, float] = {}
+TRAILING_NOTIFY_DEBOUNCE = 5 * 60  # 5 min entre notificaciones trailing del mismo par
 
-COOLDOWN_SL           = 60 * 60       # 60 min — SL normal
-COOLDOWN_SL_FAST      = 15 * 60       # 15 min — SL rápido (score alto + cierre temprano)
-COOLDOWN_TP           = 30 * 60       # 30 min — TP
+COOLDOWN_SL           = 60 * 60
+COOLDOWN_SL_FAST      = 15 * 60
+COOLDOWN_TP           = 30 * 60
 MANUAL_ALERT_COOLDOWN  = 60 * 60
 MAX_TP_EXTENSIONS      = 3
 TP_EXTEND_RR           = 1.5
 TP_EXTEND_THRESH       = 0.015
 MIN_HOLD_SECS          = 90
 
-# v4: Smart cooldown — si el SL ocurre antes de este tiempo (segundos desde apertura)
-# Y el score era alto, es probablemente ruido puntual → cooldown reducido.
-SMART_COOLDOWN_FAST_WINDOW     = 15 * 60   # 15 min desde apertura
-SMART_COOLDOWN_HIGH_SCORE      = 85        # score mínimo para activar smart cooldown
+SMART_COOLDOWN_FAST_WINDOW     = 15 * 60
+SMART_COOLDOWN_HIGH_SCORE      = 85
 
-# Score especial para posiciones sincronizadas desde exchange (score real desconocido).
-# Usar 0 garantiza que smart_cooldown (>= 85) nunca se active en trades sync.
 _SYNC_SCORE_UNKNOWN = 0
 
 READY_TIMEOUT = 120
@@ -208,8 +166,6 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
             f"Trade gratuito desde aquí."
         )
     except Exception as e:
-        # FIX v5 #1: antes fallaba silenciosamente sin notificar.
-        # Ahora se revierte el lock Y se notifica por Telegram para intervención manual.
         log.warning("[%s] Error actualizando SL break-even en exchange: %s", symbol, e)
         pos["be_locked"] = False
         pos["sl"]        = pos.get("be_trigger", new_sl)
@@ -223,6 +179,12 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
+    """v8: _round_price en new_sl + debounce de notificaciones (5 min/par).
+
+    El trailing se actualiza en cada loop (lógica interna sin cambios).
+    La NOTIFICACIÓN se suprime si ya se envió una en los últimos 5 minutos
+    para evitar spam cuando el precio sigue subiendo tick a tick.
+    """
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -236,36 +198,53 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
     if side == "long":
         peak = pos.get("trail_high", pos["entry"])
         if current_price > peak + trail_step:
-            # Siempre actualizar el pico aunque SL no mejore
-            # (e.g. tras break-even lock el SL ya está más arriba que new_sl calculado)
             pos["trail_high"] = current_price
-            new_sl = round(current_price - 1.5 * trail_step, 6)
+            # v8: round al tickSize real en lugar de 6 decimales fijos
+            coin   = exchange._hl_symbol(symbol)
+            new_sl = exchange._round_price(coin, current_price - 1.5 * trail_step)
             if new_sl > pos["sl"]:
-                log.info("[%s] Trailing SL: %.4f → %.4f", symbol, pos["sl"], new_sl)
+                log.info("[%s] Trailing SL: %.6f → %.6f", symbol, pos["sl"], new_sl)
                 pos["sl"] = new_sl
                 try:
                     exchange.cancel_all_orders(symbol)
                     exchange.place_stop_order(symbol, "long", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "long", pos["qty"], pos["tp"])
-                    telegram.notify(f"\U0001f53c Trailing SL movido\n{symbol} LONG\nNuevo SL: <code>{new_sl:.6f}</code>")
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
+                    return
+                # v8: debounce notificación
+                now = time.time()
+                if now - _trailing_notify_ts.get(symbol, 0) >= TRAILING_NOTIFY_DEBOUNCE:
+                    _trailing_notify_ts[symbol] = now
+                    telegram.notify_trailing(
+                        symbol=symbol, side="long",
+                        entry=pos["entry"], current_price=current_price,
+                        new_sl=new_sl, tp=pos["tp"],
+                    )
     else:
         trough = pos.get("trail_low", pos["entry"])
         if current_price < trough - trail_step:
-            # Siempre actualizar el mínimo aunque SL no mejore
             pos["trail_low"] = current_price
-            new_sl = round(current_price + 1.5 * trail_step, 6)
+            coin   = exchange._hl_symbol(symbol)
+            new_sl = exchange._round_price(coin, current_price + 1.5 * trail_step)
             if new_sl < pos["sl"]:
-                log.info("[%s] Trailing SL: %.4f → %.4f", symbol, pos["sl"], new_sl)
+                log.info("[%s] Trailing SL: %.6f → %.6f", symbol, pos["sl"], new_sl)
                 pos["sl"] = new_sl
                 try:
                     exchange.cancel_all_orders(symbol)
                     exchange.place_stop_order(symbol, "short", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "short", pos["qty"], pos["tp"])
-                    telegram.notify(f"\U0001f53d Trailing SL movido\n{symbol} SHORT\nNuevo SL: <code>{new_sl:.6f}</code>")
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
+                    return
+                now = time.time()
+                if now - _trailing_notify_ts.get(symbol, 0) >= TRAILING_NOTIFY_DEBOUNCE:
+                    _trailing_notify_ts[symbol] = now
+                    telegram.notify_trailing(
+                        symbol=symbol, side="short",
+                        entry=pos["entry"], current_price=current_price,
+                        new_sl=new_sl, tp=pos["tp"],
+                    )
 
 
 def _check_tp_extension(
@@ -273,14 +252,15 @@ def _check_tp_extension(
     pos: dict,
     current_price: float,
     feed,
-    effective_min_score: int,  # mantenido para compatibilidad de firma; NO se usa aquí
+    effective_min_score: int,
 ) -> None:
-    """Evalúa si extender el TP de una posición ya abierta.
+    """v8: fórmula de new_tp lineal (entry + tp_orig_dist × (n+1)) y _round_price.
 
-    FIX v6 #5: siempre usa WEEKDAY_MIN_SCORE (70) para la evaluación de señal,
-    NO effective_min_score. El umbral de fin de semana (90) aplica solo a señales
-    NUEVAS; una posición ya abierta con score válido no debe quedar bloqueada el
-    fin de semana sin poder extender su TP.
+    Antes: entry + tp_orig_dist × TP_EXTEND_RR × (extensions+2)
+      → extensión 1: 3× orig_dist, extensión 3: 6× orig_dist (demasiado)
+    Ahora: entry + tp_orig_dist × (extensions+2)
+      → extensión 1: 2× orig_dist, extensión 2: 3×, extensión 3: 4× (lineal)
+    Sigue siendo ambicioso pero alcanzable.
     """
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
@@ -304,7 +284,6 @@ def _check_tp_extension(
     if pos.get("_extending"):
         return
 
-    # FIX v5 #4: doble garantía de reset — setear aquí Y en finally del bloque interno.
     pos["_extending"] = True
     try:
         dist_pct = abs(current_price - tp) / tp
@@ -314,9 +293,6 @@ def _check_tp_extension(
             candles_15m = feed.get(symbol, "15m")
             candles_1h  = feed.get(symbol, "1h")
             candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
-            # FIX v6 #5: extensiones de TP usan WEEKDAY_MIN_SCORE, no effective_min_score.
-            # Una posición ya validada y abierta no debe ver bloqueada su extensión
-            # solo porque sea fin de semana.
             signal, score, _ = signals.evaluate(
                 candles_15m, candles_1h, candles_4h,
                 min_score=WEEKDAY_MIN_SCORE,
@@ -357,12 +333,16 @@ def _check_tp_extension(
         tp_orig      = pos.get("tp_original", tp)
         tp_orig_dist = abs(tp_orig - entry)
 
+        # v8: fórmula lineal — cada extensión añade 1× tp_orig_dist adicional
+        # extensión 1: entry + 2×dist, extensión 2: entry + 3×dist, extensión 3: entry + 4×dist
+        n = extensions + 2  # factor: empieza en 2 en la 1ª extensión
+        coin = exchange._hl_symbol(symbol)
         if side == "long":
-            new_tp = round(entry + tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
+            new_tp = exchange._round_price(coin, entry + tp_orig_dist * n)
         else:
-            new_tp = round(entry - tp_orig_dist * TP_EXTEND_RR * (extensions + 2), 6)
+            new_tp = exchange._round_price(coin, entry - tp_orig_dist * n)
 
-        max_tp_dist = tp_orig_dist * TP_EXTEND_RR * (MAX_TP_EXTENSIONS + 2) * 1.1
+        max_tp_dist = tp_orig_dist * (MAX_TP_EXTENSIONS + 2) * 1.1
         if abs(new_tp - entry) > max_tp_dist:
             log.warning(
                 "[%s] extend_tp cancelado — new_tp %.6f excede límite razonable desde entry %.6f",
@@ -407,7 +387,7 @@ def _check_tp_extension(
             f"\U0001f4c8 TP Extendido #{extensions + 1}\n"
             f"{symbol} {side.upper()}\n"
             f"TP anterior: <code>{old_tp:.6f}</code>\n"
-            f"Nuevo TP: <code>{new_tp:.6f}</code>\n"
+            f"Nuevo TP: <code>{new_tp:.6f}</code> (+{abs(new_tp - entry)/entry*100:.2f}% desde entry)\n"
             f"SL sin cambios: <code>{current_sl:.6f}</code>\n"
             f"Score: {score}"
         )
@@ -515,7 +495,6 @@ def _get_real_exit_price(
             )
             continue
 
-        # FIX v5 #3: clasificar SOLO por order_type.
         order_type = str(order.get("order_type") or order.get("type") or "").upper()
         if "TAKE_PROFIT" in order_type or "TP" in order_type:
             return real_price, "TP"
@@ -579,6 +558,7 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
     log.info("[%s] Cooldown %dm activado tras %s", symbol, cd_mins, reason)
 
     _missing_count.pop(symbol, None)
+    _trailing_notify_ts.pop(symbol, None)  # limpiar debounce al cerrar
 
     limit_hit = bot_state.record_trade(pnl_usdt)
     daily_pnl = bot_state.get_daily_pnl()
@@ -698,19 +678,12 @@ def _restore_sl_tp_on_sync(
     pos: dict,
     feed,
 ) -> None:
-    """FIX v7 #8: Si una posición sincronizada no tiene SL y/o TP (Hyperliquid no
-    los devuelve en assetPositions), recalcularlos con risk.calc() y colocarlos
-    inmediatamente en el exchange.
-
-    Esta función se llama una sola vez justo después de registrar la posición en
-    el bloque de sync. Si tanto sl como tp ya están presentes, es un no-op.
-    """
     sl   = pos.get("sl")
     tp   = pos.get("tp")
     side = pos["side"]
 
     if sl is not None and tp is not None:
-        return  # ya tiene órdenes protectoras
+        return
 
     entry = pos.get("entry", 0.0)
     qty   = pos.get("qty", 0.0)
@@ -729,7 +702,7 @@ def _restore_sl_tp_on_sync(
             side, entry, candles_15m,
             score=_SYNC_SCORE_UNKNOWN,
             symbol=symbol,
-            regime=side,  # bull ⇔ long, bear ⇔ short
+            regime=side,
             candles_1h=candles_1h,
         )
         new_sl = params["sl"]
@@ -742,11 +715,9 @@ def _restore_sl_tp_on_sync(
         pos["sl"]          = new_sl
         pos["tp"]          = new_tp
         pos["tp_original"] = new_tp
-        # Actualizar be_levels si no tenía
         if pos.get("be_trigger") is None:
             pos["be_trigger"] = params.get("be_trigger")
             pos["be_sl"]      = params.get("be_sl")
-        # Actualizar trail_step si era 0
         if not pos.get("trail_step"):
             pos["trail_step"] = params.get("trail_step", 0.0)
 
@@ -780,9 +751,6 @@ def _open_position(
     candles_1h: list,
     positions: dict,
 ) -> None:
-    """Encapsula la lógica de apertura de posición (usada tanto por señales
-    automáticas como por señales manuales de Telegram /long /short).
-    """
     params = risk.calc(
         signal, price, candles_15m,
         score=score, symbol=symbol, regime=regime,
@@ -850,6 +818,7 @@ def _open_position(
         "be_locked":     False,
     }
 
+    # v8: regime ahora se pasa correctamente (antes siempre llegaba vacío)
     telegram.notify_open(
         symbol = symbol,
         price  = real_entry,
@@ -859,6 +828,7 @@ def _open_position(
         tp     = params["tp"],
         score  = score,
         tp_rr  = params["tp_rr"],
+        regime = regime,
     )
 
 
@@ -982,8 +952,6 @@ def run() -> None:
                         real_open_ts,
                     )
 
-                    # FIX v7 #8: si no hay SL o TP (Hyperliquid no los devuelve en
-                    # assetPositions), recalcularlos y colocarlos ahora.
                     _restore_sl_tp_on_sync(symbol, positions[symbol], feed)
 
             open_count = len(positions)
@@ -1047,10 +1015,6 @@ def run() -> None:
                     if regime_summary:
                         log.info("[regímenes] %s", "\t".join(regime_summary))
 
-                # ── FIX v6 #6: Señales manuales Telegram (/long /short) ─────────────
-                # pop_manual_signal estaba definida pero nunca consumida → señales
-                # encoladas se perdían en silencio. Ahora se procesan aquí antes
-                # del bucle de señales automáticas, respetando todos los guards.
                 for symbol in list(config.SYMBOLS):
                     manual_side = tg_commands.pop_manual_signal(symbol)
                     if not manual_side:
@@ -1089,8 +1053,6 @@ def run() -> None:
                         candles_15m = feed.get(symbol, "15m")
                         candles_1h  = feed.get(symbol, "1h")
                         price       = exchange.get_price(symbol)
-                        # Las señales manuales usan score=100 (override total del usuario)
-                        # y régimen inferido de la dirección pedida.
                         regime = "bull" if manual_side == "long" else "bear"
                         log.info(
                             "[%s] SEÑAL MANUAL %s vía Telegram — ejecutando",
@@ -1107,7 +1069,6 @@ def run() -> None:
                             f"\u274c Error ejecutando señal manual {symbol} {manual_side.upper()}: {e}"
                         )
 
-                # ── Señales automáticas ──────────────────────────────────────────────────
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
                         continue
