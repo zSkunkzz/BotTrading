@@ -1,38 +1,31 @@
 """risk.py — Gestión de riesgo con SL calibrado en ATR 1h y break-even lock.
 
-Cambios v3:
-  Break-even lock:
-    Cuando el precio se mueve ≥ 1×ATR_1h a favor, el módulo calcula el
-    nivel de break-even (entry + 0.1×ATR para cubrir comisiones).
-    main.py llama a check_breakeven() en cada loop y aplica el lock
-    UNA sola vez por posición (flag 'be_locked' en el dict de posición).
+v3:
+  Break-even lock activado cuando precio ≥ 1×ATR_1h a favor.
+  SL movido a entry + 0.1×ATR (cubre comisiones).
 
-    Efecto: el trade se vuelve "gratis" una vez que alcanza +1R de beneficio.
-    Elimina el mayor destructor de capital: trades que llegaron a +1R
-    y acabaron en SL completo.
+v2:
+  SL sobre ATR 1h (no 15m).
 
-Cambios v2:
-  SL sobre ATR 1h (no 15m). Ver docstring v2 para detalles.
+v4 (trail_step):
+  trail_step sube de 0.3× a 0.5× sl_dist para evitar que el trailing
+  se mueva en cada tick en altcoins baratas (ONDO, PYTH, kPEPE...).
+  Un step más grueso reduce cancelaciones/recolocaciones innecesarias
+  en Hyperliquid y el spam de notificaciones Telegram.
+  Mínimo absoluto: 1 tick del par (tickSize).
 
 Sizing:
-  Fijo: MARGIN_USDT (20 USDT) para todas las señales.
-  Sin multiplicador dinámico por score.
+  Fijo: MARGIN_USDT para todas las señales.
 
 SL / TP:
   sl_pct = clamp(ATR_1h / entry × 1.2, SL_MIN_PCT, SL_MAX_PCT)
   tp_pct = sl_pct × _tp_rr(score, regime)
+  SL_MIN_PCT = 0.8% | SL_MAX_PCT = 3.0%
+  TP_RR: score ≥ 85 → 2.5× | resto → 2.0×
 
-  SL_MIN_PCT = 0.8%
-  SL_MAX_PCT = 3.0%
-
-  TP_RR dinámico:
-    score ≥ 85  →  2.5×
-    score ≥ 78  →  2.0×
-
-Break-even lock:
-  be_trigger = entry ± 1.0 × ATR_1h   (± según side)
-  be_sl      = entry ± 0.1 × ATR_1h   (buffer para comisiones)
-  Se activa UNA vez. Después el trailing sigue operando desde be_sl.
+Break-even:
+  be_trigger = entry ± 1.0 × ATR_1h
+  be_sl      = entry ± 0.1 × ATR_1h
 """
 import logging
 import math
@@ -44,9 +37,12 @@ log = logging.getLogger("risk")
 SL_MIN_PCT = 0.008   # 0.8%
 SL_MAX_PCT = 0.030   # 3.0%
 
-# Break-even: se activa cuando el precio se mueve ≥ BE_ATR_MULT × ATR a favor
-BE_ATR_MULT    = 1.0   # 1× ATR → activar break-even
-BE_BUFFER_MULT = 0.1   # buffer 0.1× ATR por encima del entry (cubre comisiones ~0.04%×2)
+BE_ATR_MULT    = 1.0
+BE_BUFFER_MULT = 0.1
+
+# trail_step: fracción del sl_dist usada como paso mínimo del trailing.
+# 0.5 (antes 0.3) reduce el número de actualizaciones en altcoins baratas.
+TRAIL_STEP_MULT = 0.5
 
 
 def _tp_rr(score: int, regime: str) -> float:
@@ -67,12 +63,11 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
          symbol: str | None = None, regime: str = "bull",
          candles_1h: list[dict] | None = None) -> dict:
     """
-    Calcula SL, TP, qty, trail_step y be_trigger (break-even lock level).
+    Calcula SL, TP, qty, trail_step y be_trigger.
 
-    candles_1h: si se pasan, el SL se basa en ATR 1h (preferido).
-                Si no se pasan, fallback a ATR 15m (compatibilidad).
+    candles_1h: si se pasan, SL se basa en ATR 1h (preferido).
+                Fallback a ATR 15m si no están disponibles.
     """
-    # ── ATR: usar 1h si está disponible ──────────────────────────────────────
     if candles_1h and len(candles_1h) >= 16:
         atr    = _atr(candles_1h[:-1], period=14)
         mult   = 1.2
@@ -101,9 +96,6 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
     sl = (entry - sl_dist) if side == "long" else (entry + sl_dist)
     tp = (entry + tp_dist) if side == "long" else (entry - tp_dist)
 
-    # ── Break-even lock levels ────────────────────────────────────────────
-    # be_trigger: precio al que se activa el lock (1× ATR a favor)
-    # be_sl: nuevo SL tras lock (entry + buffer de comisiones)
     if atr > 0:
         be_trigger = (entry + BE_ATR_MULT * atr) if side == "long" else (entry - BE_ATR_MULT * atr)
         be_sl      = (entry + BE_BUFFER_MULT * atr) if side == "long" else (entry - BE_BUFFER_MULT * atr)
@@ -111,8 +103,6 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
         be_trigger = None
         be_sl      = None
 
-    # Sizing fijo: MARGIN_USDT para todas las señales.
-    # floor_qty(qty, symbol) — firma actualizada para Hyperliquid SDK.
     margin  = config.MARGIN_USDT
     raw_qty = (margin * config.LEVERAGE) / entry
 
@@ -125,10 +115,16 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
     else:
         qty = math.floor(raw_qty * 1000) / 1000
 
-    # trail_step: 30% del SL distance, mínimo 1 unidad de la precisión del exchange
-    dec        = _exchange._sz_decimals(symbol) if symbol else 3
-    min_step   = 10 ** (-dec)
-    raw_trail  = 0.3 * sl_dist
+    # v4: trail_step = TRAIL_STEP_MULT × sl_dist (subido de 0.3 a 0.5)
+    # Mínimo: 1 tick de precio del par para no enviar órdenes sub-tick.
+    if symbol:
+        coin = _exchange._hl_symbol(symbol)
+        tick_dec = _exchange._get_tick_decimals(coin)
+        min_step = 10 ** (-tick_dec)
+    else:
+        min_step = 1e-6
+
+    raw_trail  = TRAIL_STEP_MULT * sl_dist
     trail_step = round(max(raw_trail, min_step), 8)
 
     log.info(
@@ -157,22 +153,9 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
 
 
 def check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
-    """Evalúa si el trade debe moverse a break-even. Devuelve True si se activó el lock.
-
-    Debe llamarse desde main.py en cada loop, ANTES de _update_trailing.
-    El flag 'be_locked' en el dict de posición evita activarlo más de una vez.
-
-    Parámetros:
-        symbol        : símbolo para logs
-        pos           : dict de posición local (se modifica in-place si se activa)
-        current_price : precio actual del feed
-
-    Devuelve:
-        True  → lock activado en este loop (llamador debe actualizar SL en exchange)
-        False → no activado (ya estaba activo, o precio no llegó al trigger aún)
-    """
+    """Evalúa si activar break-even lock. Devuelve True si se activó ahora."""
     if pos.get("be_locked"):
-        return False  # ya activado previamente
+        return False
 
     be_trigger = pos.get("be_trigger")
     be_sl      = pos.get("be_sl")
@@ -187,11 +170,10 @@ def check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
     if not triggered:
         return False
 
-    # Solo activar si be_sl mejora el SL actual
     current_sl = pos.get("sl")
     if current_sl is not None:
         if side == "long"  and be_sl <= current_sl:
-            return False  # el trailing ya movió el SL más lejos de entry
+            return False
         if side == "short" and be_sl >= current_sl:
             return False
 
