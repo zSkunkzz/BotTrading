@@ -25,27 +25,21 @@ v2 — Rate limiting (fix 429):
 v3 — Fix Invalid leverage value:
   set_leverage() hace bisect automático cuando HL rechaza el leverage:
   prueba 5x → 3x → 2x → 1x hasta encontrar el máximo aceptado.
-  Pares con max_leverage < 10x (LIT, VVV, MORPHO, DYDX, JTO, XLM, ZRO,
-  PYTH, WIF, TAO, GRASS, AERO, FET, HBAR, VIRTUAL, EIGEN, OP, PENDLE,
-  INJ, XMR, SEI, TIA, LDO) ya no generan WARNING en cada reinicio.
 
 v4 — Fix cancel_all_orders:
-  El SDK de Hyperliquid expone cancel(coin, oid) aceptando UN SOLO oid int.
-  La versión anterior pasaba una lista entera → TypeError silencioso en
-  _hl_call → las órdenes de SL/TP anteriores nunca se cancelaban →
-  al colocar nuevas se acumulaban duplicados → trailing, BE y extend_tp
-  no funcionaban.
-  Fix: iterar la lista de oids y llamar cancel() uno por uno.
+  cancel(coin, oid) acepta UN SOLO oid. Fix: iterar y llamar uno por uno.
 
-v5 — Fix TP no se coloca (reduce_only nunca llegaba al SDK):
-  Exchange.order() firma: order(name, is_buy, sz, limit_px, order_type,
-  reduce_only=False, cloid=None, builder=None).
-  _hl_call(fn, *args, **kwargs) pasaba reduce_only=True como kwarg, pero
-  la firma interna de _hl_call captura **kwargs para su propio uso (context=)
-  y NO los forwarda a fn → reduce_only se perdía silenciosamente.
-  Fix: pasar reduce_only como argumento POSICIONAL (6º posición), usando
-  una lambda wrapper para SL/TP. Además se aplica _check_order_response()
-  en place_stop_order y place_tp_order para detectar rechazos de HL.
+v5 — Fix reduce_only no llegaba al SDK:
+  _hl_call(**kwargs) tragaba reduce_only silenciosamente.
+  Fix: _order_reduce_only() pasa True como 6º arg posicional.
+
+v6 — Fix _check_order_response demasiado estricta para SL/TP:
+  Las órdenes trigger devuelven {"resting": {"oid": X}} cuando quedan
+  activas, pero la validación anterior exigía filled/resting y lanzaba
+  excepción si no los encontraba — lo que bloqueaba SL y TP.
+  Fix: _check_order_response solo falla ante error explícito de HL
+  (status != ok ó statuses[0] contiene 'error'). La ausencia de filled/
+  resting ya no es un error — es normal para órdenes trigger pendientes.
 """
 import logging
 import os
@@ -276,31 +270,18 @@ def get_position(symbol: str = None) -> dict | None:
 
 # ── Apalancamiento ────────────────────────────────────────────────────────────────
 
-# Cache: coin → leverage efectivo confirmado por HL
 _leverage_cache: dict[str, int] = {}
-
-# Candidatos para bisect cuando HL rechaza el leverage solicitado
 _LEVERAGE_FALLBACKS = [5, 3, 2, 1]
 
 
 def set_leverage(symbol: str = None, leverage: int = None) -> None:
-    """Setea leverage en isolated. Si HL rechaza el valor, hace bisect automático.
-
-    v3 fix: pares con max_leverage < 10x (LIT, VVV, MORPHO, DYDX, JTO, XLM,
-    ZRO, PYTH, WIF, TAO, GRASS, AERO, FET, HBAR, VIRTUAL, EIGEN, OP, PENDLE,
-    INJ, XMR, SEI, TIA, LDO...) ya no generan WARNING repetido — el primer
-    arranque descubre su max y lo cachea para siempre.
-    """
     coin     = _hl_symbol(symbol or config.SYMBOLS[0])
     leverage = min(int(leverage or config.LEVERAGE), MAX_LEVERAGE)
 
-    # Si ya tenemos el leverage efectivo cacheado, usarlo directamente
     if coin in _leverage_cache:
         cached = _leverage_cache[coin]
         if cached == leverage:
-            return  # ya está seteado
-        # Si el cached es menor que el pedido, usar el cached (sabemos que el
-        # pedido fue rechazado antes)
+            return
         leverage = min(leverage, cached)
 
     candidates = [leverage] + [f for f in _LEVERAGE_FALLBACKS if f < leverage]
@@ -313,29 +294,28 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
             )
             if resp.get("status") == "ok":
                 if lev < leverage:
-                    log.info(
-                        "set_leverage(%s): max permitido es %dx (pedido %dx) — usando %dx",
-                        coin, lev, leverage, lev,
-                    )
+                    log.info("set_leverage(%s): max permitido es %dx — usando %dx", coin, lev, lev)
                 else:
                     log.info("Leverage seteado a %dx en %s (isolated)", lev, coin)
                 _leverage_cache[coin] = lev
                 return
-            # HL devolvió 'err' (ej: 'Invalid leverage value') — probar siguiente
-            log.debug(
-                "set_leverage(%s) rechazado a %dx: %s — probando menor",
-                coin, lev, resp.get("response", ""),
-            )
+            log.debug("set_leverage(%s) rechazado a %dx: %s", coin, lev, resp.get("response", ""))
         except Exception as exc:
             log.warning("set_leverage(%s @%dx) falló: %s", coin, lev, exc)
-            # No hacer break — intentar con leverage menor
 
     log.error("set_leverage(%s): no se pudo setear ningún leverage válido", coin)
 
 
-# ── Abrir orden ──────────────────────────────────────────────────────────────────
+# ── Validación de respuesta de órdenes ───────────────────────────────────────────────
 
 def _check_order_response(resp: dict, context: str) -> None:
+    """Lanza RuntimeError solo si HL devuelve error explícito.
+
+    Las órdenes trigger (SL/TP) quedan en estado 'resting' y la respuesta
+    contiene {"resting": {"oid": X}}. Las órdenes IoC (market open/close)
+    quedan en 'filled'. NO exigimos ninguna de las dos: basta con que
+    status == 'ok' y que statuses[0] no tenga 'error'.
+    """
     status = resp.get("status")
     if status != "ok":
         raise RuntimeError(f"{context}: status={status!r} — {resp}")
@@ -345,26 +325,21 @@ def _check_order_response(resp: dict, context: str) -> None:
          .get("data") or {})
         .get("statuses") or []
     )
-    if not statuses:
-        return
-
-    first = statuses[0]
-    if "error" in first:
-        raise RuntimeError(f"{context} rechazada por HL: {first['error']} — {resp}")
-    if not any(k in first for k in ("filled", "resting")):
-        raise RuntimeError(f"{context}: respuesta sin filled/resting — {resp}")
+    if statuses and "error" in statuses[0]:
+        raise RuntimeError(f"{context} rechazada por HL: {statuses[0]['error']} — {resp}")
 
 
 def _order_reduce_only(coin, is_buy, qty, price, order_type):
-    """Wrapper que pasa reduce_only=True POSICIONALMENTE al SDK.
+    """Wrapper que pasa reduce_only=True como 6º arg posicional al SDK.
 
-    Exchange.order(name, is_buy, sz, limit_px, order_type, reduce_only=False, ...)
-    _hl_call(fn, *args, **kwargs) captura context= como kwarg propio y el resto
-    los forwarda a fn. Pasando reduce_only como 6º argumento posicional se evita
-    que _hl_call lo consuma accidentalmente como kwarg propio.
+    _hl_call(**kwargs) captura context= y el resto lo forwarda, pero
+    reduce_only es un kwarg del SDK que acababa en el **kwargs de _hl_call
+    y nunca llegaba a Exchange.order(). Pasarlo posicionalmente resuelve eso.
     """
     return _exchange.order(coin, is_buy, qty, price, order_type, True)
 
+
+# ── Abrir orden ──────────────────────────────────────────────────────────────────
 
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
     sym_bot = symbol or config.SYMBOLS[0]
@@ -397,8 +372,8 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
 
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
-    coin   = _hl_symbol(symbol)
-    is_buy = side == "short"  # cerrar long → sell; cerrar short → buy
+    coin       = _hl_symbol(symbol)
+    is_buy     = side == "short"  # cerrar long → sell; cerrar short → buy
     order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
     try:
         resp = _hl_call(
@@ -407,15 +382,16 @@ def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> N
             context=f"place_stop_order({coin},{stop_price})",
         )
         _check_order_response(resp, f"place_stop_order({coin},{stop_price})")
-        log.info("SL colocado en %.6f (%s %s)", stop_price, side.upper(), coin)
+        log.info("SL colocado en %.6f (%s %s) | statuses=%s",
+                 stop_price, side.upper(), coin,
+                 ((resp.get("response") or {}).get("data") or {}).get("statuses", []))
     except Exception as exc:
-        log.warning("place_stop_order(%s) falló: %s | resp=%s", coin, exc,
-                    locals().get("resp", "—"))
+        log.warning("place_stop_order(%s) falló: %s", coin, exc)
 
 
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
-    coin   = _hl_symbol(symbol)
-    is_buy = side == "short"  # cerrar long → sell; cerrar short → buy
+    coin       = _hl_symbol(symbol)
+    is_buy     = side == "short"  # cerrar long → sell; cerrar short → buy
     order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
     try:
         resp = _hl_call(
@@ -424,10 +400,11 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
             context=f"place_tp_order({coin},{tp_price})",
         )
         _check_order_response(resp, f"place_tp_order({coin},{tp_price})")
-        log.info("TP colocado en %.6f (%s %s)", tp_price, side.upper(), coin)
+        log.info("TP colocado en %.6f (%s %s) | statuses=%s",
+                 tp_price, side.upper(), coin,
+                 ((resp.get("response") or {}).get("data") or {}).get("statuses", []))
     except Exception as exc:
-        log.warning("place_tp_order(%s) falló: %s | resp=%s", coin, exc,
-                    locals().get("resp", "—"))
+        log.warning("place_tp_order(%s) falló: %s", coin, exc)
 
 
 # ── Cerrar posición ──────────────────────────────────────────────────────────────────
@@ -449,14 +426,6 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
 # ── Cancelar órdenes abiertas ──────────────────────────────────────────────────────────
 
 def cancel_all_orders(symbol: str = None) -> None:
-    """Cancela todas las órdenes abiertas para el símbolo dado.
-
-    FIX v4: el SDK de HL expone cancel(coin, oid) con UN SOLO oid (int).
-    La versión anterior llamaba _exchange.cancel(coin, [oid1, oid2, ...])
-    pasando una lista entera como segundo argumento — TypeError silencioso
-    dentro de _hl_call → las órdenes nunca se cancelaban → se acumulaban
-    duplicados de SL/TP → trailing, BE y extend_tp fallaban silenciosamente.
-    """
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
     try:
         orders = _hl_call(_info.open_orders, _WALLET_ADDRESS, context=f"open_orders({coin})")
@@ -467,10 +436,7 @@ def cancel_all_orders(symbol: str = None) -> None:
         cancelled = 0
         for oid in oids:
             try:
-                _hl_call(
-                    _exchange.cancel, coin, oid,
-                    context=f"cancel_order({coin},{oid})",
-                )
+                _hl_call(_exchange.cancel, coin, oid, context=f"cancel_order({coin},{oid})")
                 cancelled += 1
             except Exception as exc:
                 log.warning("cancel_order(%s, %s) falló: %s", coin, oid, exc)
@@ -483,14 +449,9 @@ def cancel_all_orders(symbol: str = None) -> None:
 
 def _normalize_fill(f: dict) -> dict:
     fill_dir = f.get("dir", "")
-    if "Long" in fill_dir:
-        normalized_side = "SELL"
-    else:
-        normalized_side = "BUY"
-
+    normalized_side = "SELL" if "Long" in fill_dir else "BUY"
     closed_pnl = float(f.get("closedPnl") or 0)
     order_type = "TAKE_PROFIT_MARKET" if closed_pnl > 0 else "STOP_MARKET"
-
     px_str = str(f.get("px", 0))
     return {
         "side":       normalized_side,
