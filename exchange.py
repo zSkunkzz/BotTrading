@@ -1,47 +1,21 @@
 """exchange.py — Cliente Hyperliquid Perpetual Futures.
 
-Migrado desde BingX. Hyperliquid es un DEX L1 sin KYC/restricciones MiCA.
-
-Dependencias:
-    pip install hyperliquid-python-sdk eth-account httpx
-
-Variables de entorno:
-    HYPERLIQUID_PRIVATE_KEY  : clave privada EVM en hex (con o sin 0x)
-    HYPERLIQUID_WALLET_ADDRESS: opcional, se deriva de la pk si no se pone
-    HL_MAINNET               : "true" prod, "false" testnet (default: true)
-
-Nombres de símbolos:
-    Hyperliquid usa el token base sin quote: "BTC", "ETH", "SOL".
-    Todas las funciones públicas aceptan tanto "BTC-USDT" como "BTC".
-    _hl_symbol() normaliza internamente.
-
-v2 — Rate limiting (fix 429):
-  _hl_call() envuelve TODAS las llamadas HTTP a Hyperliquid con:
-    • Reintentos exponenciales: 1s, 2s, 4s (3 intentos)
-    • Jitter ±20% para evitar sincronización de reintentos entre pares
-    • En 429 específicamente: espera extra de 5s antes de reintentar
-    • Máximo 3 reintentos — tras el 3º lanza la excepción original
-
-v3 — Fix Invalid leverage value:
-  set_leverage() hace bisect automático cuando HL rechaza el leverage:
-  prueba 5x → 3x → 2x → 1x hasta encontrar el máximo aceptado.
-
-v4 — Fix cancel_all_orders:
-  cancel(coin, oid) acepta UN SOLO oid. Fix: iterar y llamar uno por uno.
-
-v5 — Fix reduce_only no llegaba al SDK:
-  _hl_call(**kwargs) tragaba reduce_only silenciosamente.
-  Fix: _order_reduce_only() pasa True como 6º arg posicional.
-
-v6 — Fix _check_order_response demasiado estricta para SL/TP:
-  Las órdenes trigger devuelven {"resting": {"oid": X}} cuando quedan
-  activas, pero la validación anterior exigía filled/resting y lanzaba
-  excepción si no los encontraba — lo que bloqueaba SL y TP.
-  Fix: _check_order_response solo falla ante error explícito de HL
-  (status != ok ó statuses[0] contiene 'error'). La ausencia de filled/
-  resting ya no es un error — es normal para órdenes trigger pendientes.
+v2 — Rate limiting (fix 429)
+v3 — Fix Invalid leverage value (bisect automático)
+v4 — Fix cancel_all_orders (cancel uno por uno)
+v5 — Fix reduce_only no llegaba al SDK (arg posicional)
+v6 — Fix _check_order_response demasiado estricta para SL/TP
+v7 — Fix "Order has invalid price" en SL/TP:
+  HL exige que triggerPx respete el tickSize del activo.
+  risk.py redondea a 8 decimales, pero ONDO/PYTH/etc. tienen tickSize
+  de 4 decimales — 0.32632714 es inválido, necesita 0.3263.
+  Fix: _round_price(coin, price) lee el campo 'tickSize' del meta de HL
+  y redondea al número correcto de decimales antes de cada place_stop_order
+  y place_tp_order. Cache en _tick_decimals para no consultar meta en cada
+  orden.
 """
 import logging
+import math
 import os
 import random
 import time
@@ -151,6 +125,44 @@ def floor_qty(qty: float, symbol: str) -> float:
 
 def min_notional_ok(qty: float, price: float, min_usdt: float = 10.0) -> bool:
     return (qty * price) >= min_usdt
+
+
+# ── tickSize / price rounding ────────────────────────────────────────────────────────
+# Cache: coin → número de decimales del tickSize de precio
+_tick_decimals: dict[str, int] = {}
+
+
+def _get_tick_decimals(coin: str) -> int:
+    """Devuelve los decimales del tickSize de precio para `coin`.
+
+    Lee _info.meta (dato estático cargado en arranque) y cachea el resultado.
+    Si no encuentra la info cae a 6 decimales (seguro para cualquier par).
+    """
+    if coin in _tick_decimals:
+        return _tick_decimals[coin]
+
+    try:
+        meta = _info.meta()  # {"universe": [{"name", "szDecimals", "tickSz", ...}, ...]}
+        for asset_info in meta.get("universe", []):
+            if asset_info.get("name") == coin:
+                tick_sz = float(asset_info.get("tickSz", 0.0001))
+                # número de decimales = cuantos ceros tras el punto tiene el tickSize
+                # ej: 0.0001 -> 4, 0.001 -> 3, 0.00001 -> 5, 1 -> 0
+                dec = max(0, round(-math.log10(tick_sz)))
+                _tick_decimals[coin] = dec
+                log.debug("tick_decimals(%s): tickSz=%s → %d decimales", coin, tick_sz, dec)
+                return dec
+    except Exception as exc:
+        log.debug("_get_tick_decimals(%s) falló: %s — usando 6 dec", coin, exc)
+
+    _tick_decimals[coin] = 6  # fallback conservador
+    return 6
+
+
+def _round_price(coin: str, price: float) -> float:
+    """Redondea `price` al tickSize del par para que HL no rechace la orden."""
+    dec = _get_tick_decimals(coin)
+    return round(price, dec)
 
 
 # ── Precio límite para órdenes de mercado ─────────────────────────────────────────
@@ -309,17 +321,10 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
 # ── Validación de respuesta de órdenes ───────────────────────────────────────────────
 
 def _check_order_response(resp: dict, context: str) -> None:
-    """Lanza RuntimeError solo si HL devuelve error explícito.
-
-    Las órdenes trigger (SL/TP) quedan en estado 'resting' y la respuesta
-    contiene {"resting": {"oid": X}}. Las órdenes IoC (market open/close)
-    quedan en 'filled'. NO exigimos ninguna de las dos: basta con que
-    status == 'ok' y que statuses[0] no tenga 'error'.
-    """
+    """Lanza RuntimeError solo si HL devuelve error explícito."""
     status = resp.get("status")
     if status != "ok":
         raise RuntimeError(f"{context}: status={status!r} — {resp}")
-
     statuses = (
         ((resp.get("response") or {})
          .get("data") or {})
@@ -330,12 +335,7 @@ def _check_order_response(resp: dict, context: str) -> None:
 
 
 def _order_reduce_only(coin, is_buy, qty, price, order_type):
-    """Wrapper que pasa reduce_only=True como 6º arg posicional al SDK.
-
-    _hl_call(**kwargs) captura context= y el resto lo forwarda, pero
-    reduce_only es un kwarg del SDK que acababa en el **kwargs de _hl_call
-    y nunca llegaba a Exchange.order(). Pasarlo posicionalmente resuelve eso.
-    """
+    """Wrapper que pasa reduce_only=True como 6º arg posicional al SDK."""
     return _exchange.order(coin, is_buy, qty, price, order_type, True)
 
 
@@ -374,6 +374,7 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
     coin       = _hl_symbol(symbol)
     is_buy     = side == "short"  # cerrar long → sell; cerrar short → buy
+    stop_price = _round_price(coin, stop_price)  # v7: respetar tickSize
     order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
     try:
         resp = _hl_call(
@@ -382,9 +383,7 @@ def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> N
             context=f"place_stop_order({coin},{stop_price})",
         )
         _check_order_response(resp, f"place_stop_order({coin},{stop_price})")
-        log.info("SL colocado en %.6f (%s %s) | statuses=%s",
-                 stop_price, side.upper(), coin,
-                 ((resp.get("response") or {}).get("data") or {}).get("statuses", []))
+        log.info("SL colocado en %s (%s %s)", stop_price, side.upper(), coin)
     except Exception as exc:
         log.warning("place_stop_order(%s) falló: %s", coin, exc)
 
@@ -392,6 +391,7 @@ def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> N
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
     coin       = _hl_symbol(symbol)
     is_buy     = side == "short"  # cerrar long → sell; cerrar short → buy
+    tp_price   = _round_price(coin, tp_price)  # v7: respetar tickSize
     order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
     try:
         resp = _hl_call(
@@ -400,9 +400,7 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
             context=f"place_tp_order({coin},{tp_price})",
         )
         _check_order_response(resp, f"place_tp_order({coin},{tp_price})")
-        log.info("TP colocado en %.6f (%s %s) | statuses=%s",
-                 tp_price, side.upper(), coin,
-                 ((resp.get("response") or {}).get("data") or {}).get("statuses", []))
+        log.info("TP colocado en %s (%s %s)", tp_price, side.upper(), coin)
     except Exception as exc:
         log.warning("place_tp_order(%s) falló: %s", coin, exc)
 
