@@ -14,6 +14,12 @@ v9:
   - _open_position: guard de exchange en tiempo real antes de enviar open_order.
     Si ya existe posición para el símbolo en Hyperliquid (race condition tras reinicio),
     se aborta la apertura y se registra localmente en lugar de doblar el tamaño.
+v10:
+  - _open_position: lock en memoria (_opening set) que bloquea aperturas dobles
+    dentro del mismo proceso aunque el guard de exchange no haya visto aún la orden
+    (latencia exchange ~100-300 ms). El guard v9 se mantiene como segunda línea.
+  - Causa real: señal manual + señal automática evaluadas casi simultáneamente
+    para el mismo símbolo, o dos loops muy juntos cuando LOOP_SLEEP es bajo.
 """
 import logging
 import os
@@ -51,6 +57,10 @@ _manual_alert_cooldown: dict[str, float] = {}
 # v8: debounce para notificaciones de trailing (ts del último envío por símbolo)
 _trailing_notify_ts: dict[str, float] = {}
 TRAILING_NOTIFY_DEBOUNCE = 5 * 60  # 5 min entre notificaciones trailing del mismo par
+
+# v10: mutex en memoria — impide que dos llamadas a _open_position para el mismo
+# símbolo se solapen antes de que la primera haya registrado la posición.
+_opening: set[str] = set()
 
 COOLDOWN_SL           = 60 * 60
 COOLDOWN_SL_FAST      = 15 * 60
@@ -183,12 +193,7 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
-    """v8: _round_price en new_sl + debounce de notificaciones (5 min/par).
-
-    El trailing se actualiza en cada loop (lógica interna sin cambios).
-    La NOTIFICACIÓN se suprime si ya se envió una en los últimos 5 minutos
-    para evitar spam cuando el precio sigue subiendo tick a tick.
-    """
+    """v8: _round_price en new_sl + debounce de notificaciones (5 min/par)."""
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -203,7 +208,6 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
         peak = pos.get("trail_high", pos["entry"])
         if current_price > peak + trail_step:
             pos["trail_high"] = current_price
-            # v8: round al tickSize real en lugar de 6 decimales fijos
             coin   = exchange._hl_symbol(symbol)
             new_sl = exchange._round_price(coin, current_price - 1.5 * trail_step)
             if new_sl > pos["sl"]:
@@ -216,7 +220,6 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
                     return
-                # v8: debounce notificación
                 now = time.time()
                 if now - _trailing_notify_ts.get(symbol, 0) >= TRAILING_NOTIFY_DEBOUNCE:
                     _trailing_notify_ts[symbol] = now
@@ -258,14 +261,7 @@ def _check_tp_extension(
     feed,
     effective_min_score: int,
 ) -> None:
-    """v8: fórmula de new_tp lineal (entry + tp_orig_dist × (n+1)) y _round_price.
-
-    Antes: entry + tp_orig_dist × TP_EXTEND_RR × (extensions+2)
-      → extensión 1: 3× orig_dist, extensión 3: 6× orig_dist (demasiado)
-    Ahora: entry + tp_orig_dist × (extensions+2)
-      → extensión 1: 2× orig_dist, extensión 2: 3×, extensión 3: 4× (lineal)
-    Sigue siendo ambicioso pero alcanzable.
-    """
+    """v8: fórmula de new_tp lineal (entry + tp_orig_dist × (n+1)) y _round_price."""
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -337,9 +333,7 @@ def _check_tp_extension(
         tp_orig      = pos.get("tp_original", tp)
         tp_orig_dist = abs(tp_orig - entry)
 
-        # v8: fórmula lineal — cada extensión añade 1× tp_orig_dist adicional
-        # extensión 1: entry + 2×dist, extensión 2: entry + 3×dist, extensión 3: entry + 4×dist
-        n = extensions + 2  # factor: empieza en 2 en la 1ª extensión
+        n = extensions + 2
         coin = exchange._hl_symbol(symbol)
         if side == "long":
             new_tp = exchange._round_price(coin, entry + tp_orig_dist * n)
@@ -562,7 +556,7 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
     log.info("[%s] Cooldown %dm activado tras %s", symbol, cd_mins, reason)
 
     _missing_count.pop(symbol, None)
-    _trailing_notify_ts.pop(symbol, None)  # limpiar debounce al cerrar
+    _trailing_notify_ts.pop(symbol, None)
 
     limit_hit = bot_state.record_trade(pnl_usdt)
     daily_pnl = bot_state.get_daily_pnl()
@@ -755,111 +749,125 @@ def _open_position(
     candles_1h: list,
     positions: dict,
 ) -> None:
-    # v9: guard de exchange en tiempo real — evita posición doble tras reinicio
-    # Si el bot crasheó justo después de open_order pero antes de registrar en positions,
-    # al reiniciar el loop local no la conoce pero el exchange sí la tiene.
-    # Este check lo captura antes de enviar otra orden.
-    try:
-        pos_already = exchange.get_position(symbol)
-        if pos_already and pos_already.get("side") in VALID_SIDES:
-            log.warning(
-                "[%s] Guard exchange: ya existe posición %s @ %.6f — abortando open_order "
-                "(race condition reinicio). Se registrará en el siguiente sync.",
-                symbol, pos_already["side"], pos_already.get("entry", 0),
-            )
-            telegram.notify(
-                f"\u26a0\ufe0f <b>Posición duplicada bloqueada</b>\n"
-                f"{symbol} — ya existe {pos_already['side'].upper()} en exchange.\n"
-                f"La apertura fue ignorada. Se sincronizará en el siguiente loop."
-            )
-            return
-    except Exception as guard_exc:
-        # Si la consulta falla, continuamos — preferimos arriesgar la apertura
-        # a bloquear trades legítimos por un error de red puntual.
+    # v10: lock en memoria — primera línea de defensa contra duplicados.
+    # Impide que dos rutas (manual + automática, o dos evaluaciones solapadas)
+    # lancen open_order para el mismo símbolo antes de que la primera
+    # termine de registrar la posición en `positions`.
+    if symbol in _opening:
         log.warning(
-            "[%s] Guard exchange: no se pudo verificar posición previa (%s) — continuando apertura",
-            symbol, guard_exc,
+            "[%s] _open_position: ya hay una apertura en curso para este símbolo — abortando",
+            symbol,
+        )
+        return
+    _opening.add(symbol)
+
+    try:
+        # v9: guard de exchange — segunda línea de defensa (cubre reinicios).
+        # El lock de arriba cubre el caso intra-proceso; este cubre el caso
+        # en que el bot crasheó justo tras enviar la orden pero antes de
+        # registrarla en `positions`.
+        try:
+            pos_already = exchange.get_position(symbol)
+            if pos_already and pos_already.get("side") in VALID_SIDES:
+                log.warning(
+                    "[%s] Guard exchange: ya existe posición %s @ %.6f — abortando open_order "
+                    "(race condition reinicio). Se registrará en el siguiente sync.",
+                    symbol, pos_already["side"], pos_already.get("entry", 0),
+                )
+                telegram.notify(
+                    f"\u26a0\ufe0f <b>Posición duplicada bloqueada</b>\n"
+                    f"{symbol} — ya existe {pos_already['side'].upper()} en exchange.\n"
+                    f"La apertura fue ignorada. Se sincronizará en el siguiente loop."
+                )
+                return
+        except Exception as guard_exc:
+            log.warning(
+                "[%s] Guard exchange: no se pudo verificar posición previa (%s) — continuando apertura",
+                symbol, guard_exc,
+            )
+
+        params = risk.calc(
+            signal, price, candles_15m,
+            score=score, symbol=symbol, regime=regime,
+            candles_1h=candles_1h,
         )
 
-    params = risk.calc(
-        signal, price, candles_15m,
-        score=score, symbol=symbol, regime=regime,
-        candles_1h=candles_1h,
-    )
+        log.info(
+            "[%s] SEÑAL %s | regime=%s RR=%.1f | "
+            "entry=%.6f sl=%.6f tp=%.6f be_trigger=%s qty=%.8f score=%d",
+            symbol, signal.upper(), regime, params["tp_rr"],
+            price, params["sl"], params["tp"],
+            f"{params['be_trigger']:.6f}" if params.get("be_trigger") else "N/A",
+            params["qty"], score,
+        )
 
-    log.info(
-        "[%s] SEÑAL %s | regime=%s RR=%.1f | "
-        "entry=%.6f sl=%.6f tp=%.6f be_trigger=%s qty=%.8f score=%d",
-        symbol, signal.upper(), regime, params["tp_rr"],
-        price, params["sl"], params["tp"],
-        f"{params['be_trigger']:.6f}" if params.get("be_trigger") else "N/A",
-        params["qty"], score,
-    )
+        try:
+            exchange.open_order(
+                side   = signal,
+                qty    = params["qty"],
+                sl     = params["sl"],
+                tp     = params["tp"],
+                symbol = symbol,
+            )
+        except Exception as open_err:
+            log.error(
+                "[%s] open_order falló — posición NO registrada: %s",
+                symbol, open_err,
+            )
+            try:
+                pos_live = exchange.get_position(symbol)
+                if pos_live:
+                    exchange.close_position(
+                        side   = pos_live["side"],
+                        qty    = pos_live["size"],
+                        symbol = symbol,
+                    )
+                    log.warning("[%s] Rollback OK: posición parcial cerrada", symbol)
+                else:
+                    log.info("[%s] Rollback innecesario — no hay posición en exchange", symbol)
+            except Exception as close_err:
+                log.error(
+                    "[%s] Rollback fallido — revisar posición manualmente: %s",
+                    symbol, close_err,
+                )
+            return
 
-    try:
-        exchange.open_order(
+        real_entry = _sync_entry_from_exchange(symbol, price, signal)
+
+        positions[symbol] = {
+            "side":          signal,
+            "entry":         real_entry,
+            "qty":           params["qty"],
+            "sl":            params["sl"],
+            "tp":            params["tp"],
+            "tp_original":   params["tp"],
+            "tp_extensions": 0,
+            "_extending":    False,
+            "trail_step":    params["trail_step"],
+            "trail_high":    real_entry,
+            "trail_low":     real_entry,
+            "score":         score,
+            "open_ts":       time.time(),
+            "be_trigger":    params.get("be_trigger"),
+            "be_sl":         params.get("be_sl"),
+            "be_locked":     False,
+        }
+
+        telegram.notify_open(
+            symbol = symbol,
+            price  = real_entry,
             side   = signal,
             qty    = params["qty"],
             sl     = params["sl"],
             tp     = params["tp"],
-            symbol = symbol,
+            score  = score,
+            tp_rr  = params["tp_rr"],
+            regime = regime,
         )
-    except Exception as open_err:
-        log.error(
-            "[%s] open_order falló — posición NO registrada: %s",
-            symbol, open_err,
-        )
-        try:
-            pos_live = exchange.get_position(symbol)
-            if pos_live:
-                exchange.close_position(
-                    side   = pos_live["side"],
-                    qty    = pos_live["size"],
-                    symbol = symbol,
-                )
-                log.warning("[%s] Rollback OK: posición parcial cerrada", symbol)
-            else:
-                log.info("[%s] Rollback innecesario — no hay posición en exchange", symbol)
-        except Exception as close_err:
-            log.error(
-                "[%s] Rollback fallido — revisar posición manualmente: %s",
-                symbol, close_err,
-            )
-        return
 
-    real_entry = _sync_entry_from_exchange(symbol, price, signal)
-
-    positions[symbol] = {
-        "side":          signal,
-        "entry":         real_entry,
-        "qty":           params["qty"],
-        "sl":            params["sl"],
-        "tp":            params["tp"],
-        "tp_original":   params["tp"],
-        "tp_extensions": 0,
-        "_extending":    False,
-        "trail_step":    params["trail_step"],
-        "trail_high":    real_entry,
-        "trail_low":     real_entry,
-        "score":         score,
-        "open_ts":       time.time(),
-        "be_trigger":    params.get("be_trigger"),
-        "be_sl":         params.get("be_sl"),
-        "be_locked":     False,
-    }
-
-    # v8: regime ahora se pasa correctamente (antes siempre llegaba vacío)
-    telegram.notify_open(
-        symbol = symbol,
-        price  = real_entry,
-        side   = signal,
-        qty    = params["qty"],
-        sl     = params["sl"],
-        tp     = params["tp"],
-        score  = score,
-        tp_rr  = params["tp_rr"],
-        regime = regime,
-    )
+    finally:
+        # Siempre liberar el lock, tanto si la apertura tuvo éxito como si no.
+        _opening.discard(symbol)
 
 
 def run() -> None:
