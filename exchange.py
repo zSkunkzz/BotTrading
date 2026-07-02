@@ -36,6 +36,16 @@ v4 — Fix cancel_all_orders:
   al colocar nuevas se acumulaban duplicados → trailing, BE y extend_tp
   no funcionaban.
   Fix: iterar la lista de oids y llamar cancel() uno por uno.
+
+v5 — Fix TP no se coloca (reduce_only nunca llegaba al SDK):
+  Exchange.order() firma: order(name, is_buy, sz, limit_px, order_type,
+  reduce_only=False, cloid=None, builder=None).
+  _hl_call(fn, *args, **kwargs) pasaba reduce_only=True como kwarg, pero
+  la firma interna de _hl_call captura **kwargs para su propio uso (context=)
+  y NO los forwarda a fn → reduce_only se perdía silenciosamente.
+  Fix: pasar reduce_only como argumento POSICIONAL (6º posición), usando
+  una lambda wrapper para SL/TP. Además se aplica _check_order_response()
+  en place_stop_order y place_tp_order para detectar rechazos de HL.
 """
 import logging
 import os
@@ -345,6 +355,17 @@ def _check_order_response(resp: dict, context: str) -> None:
         raise RuntimeError(f"{context}: respuesta sin filled/resting — {resp}")
 
 
+def _order_reduce_only(coin, is_buy, qty, price, order_type):
+    """Wrapper que pasa reduce_only=True POSICIONALMENTE al SDK.
+
+    Exchange.order(name, is_buy, sz, limit_px, order_type, reduce_only=False, ...)
+    _hl_call(fn, *args, **kwargs) captura context= como kwarg propio y el resto
+    los forwarda a fn. Pasando reduce_only como 6º argumento posicional se evita
+    que _hl_call lo consuma accidentalmente como kwarg propio.
+    """
+    return _exchange.order(coin, is_buy, qty, price, order_type, True)
+
+
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
     sym_bot = symbol or config.SYMBOLS[0]
     coin    = _hl_symbol(sym_bot)
@@ -377,40 +398,36 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
     coin   = _hl_symbol(symbol)
-    is_buy = side == "short"  # para cerrar un long → sell (not is_buy); para cerrar un short → buy
+    is_buy = side == "short"  # cerrar long → sell; cerrar short → buy
+    order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
     try:
         resp = _hl_call(
-            _exchange.order,
-            coin, is_buy, qty, stop_price,
-            {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}},
+            _order_reduce_only,
+            coin, is_buy, qty, stop_price, order_type,
             context=f"place_stop_order({coin},{stop_price})",
-            reduce_only=True,
         )
-        if resp.get("status") == "ok":
-            log.info("SL colocado en %.6f (%s %s)", stop_price, side.upper(), coin)
-        else:
-            log.warning("place_stop_order(%s): %s", coin, resp)
+        _check_order_response(resp, f"place_stop_order({coin},{stop_price})")
+        log.info("SL colocado en %.6f (%s %s)", stop_price, side.upper(), coin)
     except Exception as exc:
-        log.warning("place_stop_order(%s) falló: %s", coin, exc)
+        log.warning("place_stop_order(%s) falló: %s | resp=%s", coin, exc,
+                    locals().get("resp", "—"))
 
 
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
     coin   = _hl_symbol(symbol)
-    is_buy = side == "short"  # para cerrar un long → sell; para cerrar un short → buy
+    is_buy = side == "short"  # cerrar long → sell; cerrar short → buy
+    order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
     try:
         resp = _hl_call(
-            _exchange.order,
-            coin, is_buy, qty, tp_price,
-            {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}},
+            _order_reduce_only,
+            coin, is_buy, qty, tp_price, order_type,
             context=f"place_tp_order({coin},{tp_price})",
-            reduce_only=True,
         )
-        if resp.get("status") == "ok":
-            log.info("TP colocado en %.6f (%s %s)", tp_price, side.upper(), coin)
-        else:
-            log.warning("place_tp_order(%s): %s", coin, resp)
+        _check_order_response(resp, f"place_tp_order({coin},{tp_price})")
+        log.info("TP colocado en %.6f (%s %s)", tp_price, side.upper(), coin)
     except Exception as exc:
-        log.warning("place_tp_order(%s) falló: %s", coin, exc)
+        log.warning("place_tp_order(%s) falló: %s | resp=%s", coin, exc,
+                    locals().get("resp", "—"))
 
 
 # ── Cerrar posición ──────────────────────────────────────────────────────────────────
@@ -424,7 +441,6 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
         coin, is_buy, qty, limit_px,
         {"limit": {"tif": "Ioc"}},
         context=f"close_position({coin})",
-        reduce_only=True,
     )
     log.info("Posición cerrada: %s %s", side.upper(), coin)
     return resp
@@ -439,7 +455,7 @@ def cancel_all_orders(symbol: str = None) -> None:
     La versión anterior llamaba _exchange.cancel(coin, [oid1, oid2, ...])
     pasando una lista entera como segundo argumento — TypeError silencioso
     dentro de _hl_call → las órdenes nunca se cancelaban → se acumulaban
-    duplicados de SL/TP → trailing, BE y extend_tp fallíaban silenciosamente.
+    duplicados de SL/TP → trailing, BE y extend_tp fallaban silenciosamente.
     """
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
     try:
