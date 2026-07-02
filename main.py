@@ -38,6 +38,13 @@ fix v6:
      señales manuales pendientes respetando MAX_POSITIONS, cooldown y drawdown.
   7. Contabilidad medianoche: send_daily_summary en trade_logger ya no borra trades
      del día nuevo (fix en trade_logger.py).
+
+fix v7:
+  8. SL/TP perdidos tras reinicio: al sincronizar una posición desde el exchange,
+     Hyperliquid no devuelve SL/TP en assetPositions. El bot reregistraba la posición
+     con sl=None y tp=None, sin colocar las órdenes protectoras. Ahora, si la posición
+     sincronizada no tiene SL o TP, se recalculan desde risk.calc() y se colocan
+     inmediatamente va exchange.place_stop_order() / place_tp_order().
 """
 import logging
 import os
@@ -686,6 +693,83 @@ def _get_position_open_ts(symbol: str, pos_ex: dict) -> float:
     return time.time()
 
 
+def _restore_sl_tp_on_sync(
+    symbol: str,
+    pos: dict,
+    feed,
+) -> None:
+    """FIX v7 #8: Si una posición sincronizada no tiene SL y/o TP (Hyperliquid no
+    los devuelve en assetPositions), recalcularlos con risk.calc() y colocarlos
+    inmediatamente en el exchange.
+
+    Esta función se llama una sola vez justo después de registrar la posición en
+    el bloque de sync. Si tanto sl como tp ya están presentes, es un no-op.
+    """
+    sl   = pos.get("sl")
+    tp   = pos.get("tp")
+    side = pos["side"]
+
+    if sl is not None and tp is not None:
+        return  # ya tiene órdenes protectoras
+
+    entry = pos.get("entry", 0.0)
+    qty   = pos.get("qty", 0.0)
+    if entry <= 0 or qty <= 0:
+        log.warning("[%s] _restore_sl_tp: entry=%.6f qty=%.8f inválidos — no se pueden recalcular", symbol, entry, qty)
+        return
+
+    try:
+        candles_15m = feed.get(symbol, "15m")
+        candles_1h  = feed.get(symbol, "1h")
+        if not candles_15m or not candles_1h:
+            log.warning("[%s] _restore_sl_tp: feed no listo aún — reintentando en próximo loop", symbol)
+            return
+
+        params = risk.calc(
+            side, entry, candles_15m,
+            score=_SYNC_SCORE_UNKNOWN,
+            symbol=symbol,
+            regime=side,  # bull ⇔ long, bear ⇔ short
+            candles_1h=candles_1h,
+        )
+        new_sl = params["sl"]
+        new_tp = params["tp"]
+
+        exchange.cancel_all_orders(symbol)
+        exchange.place_stop_order(symbol, side, qty, new_sl)
+        exchange.place_tp_order(symbol, side, qty, new_tp)
+
+        pos["sl"]          = new_sl
+        pos["tp"]          = new_tp
+        pos["tp_original"] = new_tp
+        # Actualizar be_levels si no tenía
+        if pos.get("be_trigger") is None:
+            pos["be_trigger"] = params.get("be_trigger")
+            pos["be_sl"]      = params.get("be_sl")
+        # Actualizar trail_step si era 0
+        if not pos.get("trail_step"):
+            pos["trail_step"] = params.get("trail_step", 0.0)
+
+        log.warning(
+            "[%s] SL/TP restaurados tras sync | side=%s entry=%.6f sl=%.6f tp=%.6f",
+            symbol, side, entry, new_sl, new_tp,
+        )
+        telegram.notify(
+            f"\U0001f527 <b>SL/TP restaurados</b> (reinicio bot)\n"
+            f"{symbol} {side.upper()}\n"
+            f"Entry: <code>{entry:.6f}</code>\n"
+            f"SL: <code>{new_sl:.6f}</code>\n"
+            f"TP: <code>{new_tp:.6f}</code>"
+        )
+    except Exception as exc:
+        log.error("[%s] _restore_sl_tp: fallo al recalcular/colocar SL/TP: %s", symbol, exc)
+        telegram.notify(
+            f"\u26a0\ufe0f <b>SL/TP NO restaurados</b>\n"
+            f"{symbol} {side.upper()} — revisar manualmente.\n"
+            f"Error: {exc}"
+        )
+
+
 def _open_position(
     symbol: str,
     signal: str,
@@ -898,6 +982,10 @@ def run() -> None:
                         real_open_ts,
                     )
 
+                    # FIX v7 #8: si no hay SL o TP (Hyperliquid no los devuelve en
+                    # assetPositions), recalcularlos y colocarlos ahora.
+                    _restore_sl_tp_on_sync(symbol, positions[symbol], feed)
+
             open_count = len(positions)
 
             if loop_count % 10 == 1:
@@ -935,7 +1023,7 @@ def run() -> None:
                              day_name, WEEKEND_MIN_SCORE)
                     telegram.notify(
                         f"\U0001f6ab Modo fin de semana ({day_name})\n"
-                        f"No se abrirán posiciones nuevas salvo score ≥ {WEEKEND_MIN_SCORE}.\n"
+                        f"No se abrirán posiciones nuevas salvo score \u2265 {WEEKEND_MIN_SCORE}.\n"
                         f"Posiciones actuales siguen gestionándose con normalidad."
                     )
 
@@ -959,7 +1047,7 @@ def run() -> None:
                     if regime_summary:
                         log.info("[regímenes] %s", "\t".join(regime_summary))
 
-                # ── FIX v6 #6: Señales manuales Telegram (/long /short) ───────────
+                # ── FIX v6 #6: Señales manuales Telegram (/long /short) ─────────────
                 # pop_manual_signal estaba definida pero nunca consumida → señales
                 # encoladas se perdían en silencio. Ahora se procesan aquí antes
                 # del bucle de señales automáticas, respetando todos los guards.
@@ -969,31 +1057,31 @@ def run() -> None:
                         continue
                     if symbol in positions:
                         telegram.notify(
-                            f"⚠️ Señal manual {symbol} {manual_side.upper()} ignorada "
+                            f"\u26a0\ufe0f Señal manual {symbol} {manual_side.upper()} ignorada "
                             f"— ya hay posición abierta."
                         )
                         continue
                     if symbol in _cooldown:
                         telegram.notify(
-                            f"⚠️ Señal manual {symbol} {manual_side.upper()} ignorada "
+                            f"\u26a0\ufe0f Señal manual {symbol} {manual_side.upper()} ignorada "
                             f"— símbolo en cooldown."
                         )
                         continue
                     if len(positions) >= config.MAX_POSITIONS:
                         telegram.notify(
-                            f"⚠️ Señal manual {symbol} {manual_side.upper()} ignorada "
+                            f"\u26a0\ufe0f Señal manual {symbol} {manual_side.upper()} ignorada "
                             f"— posiciones máximas alcanzadas ({config.MAX_POSITIONS})."
                         )
                         continue
                     if not feed.ready(symbol):
                         telegram.notify(
-                            f"⚠️ Señal manual {symbol} {manual_side.upper()} ignorada "
+                            f"\u26a0\ufe0f Señal manual {symbol} {manual_side.upper()} ignorada "
                             f"— feed no listo para este par."
                         )
                         continue
                     if not _check_directional_guard(manual_side, positions, symbol):
                         telegram.notify(
-                            f"⚠️ Señal manual {symbol} {manual_side.upper()} ignorada "
+                            f"\u26a0\ufe0f Señal manual {symbol} {manual_side.upper()} ignorada "
                             f"— MAX_SAME_SIDE o grupo correlación alcanzado."
                         )
                         continue
@@ -1016,10 +1104,10 @@ def run() -> None:
                     except Exception as e:
                         log.error("[%s] Error ejecutando señal manual: %s", symbol, e)
                         telegram.notify(
-                            f"❌ Error ejecutando señal manual {symbol} {manual_side.upper()}: {e}"
+                            f"\u274c Error ejecutando señal manual {symbol} {manual_side.upper()}: {e}"
                         )
 
-                # ── Señales automáticas ───────────────────────────────────────────
+                # ── Señales automáticas ──────────────────────────────────────────────────
                 for symbol in config.SYMBOLS:
                     if symbol in positions:
                         continue
@@ -1065,6 +1153,11 @@ def run() -> None:
 
                         if is_manual:
                             _manual_alert_cooldown[symbol] = time.time()
+                            params = risk.calc(
+                                signal, price, candles_15m,
+                                score=score, symbol=symbol, regime=regime,
+                                candles_1h=candles_1h,
+                            )
                             side_icon = "\U0001f7e1" if signal == "long" else "\U0001f534"
                             telegram.notify(
                                 f"\U0001f6a8 <b>Alerta manual — {symbol}</b>\n\n"
@@ -1073,7 +1166,7 @@ def run() -> None:
                                 f"SL sugerido:   <code>{params['sl']:.6f}</code>\n"
                                 f"TP sugerido:   <code>{params['tp']:.6f}</code>\n"
                                 f"Score: <b>{score}</b>\n\n"
-                                f"⚠️ <i>Operación NO abierta automáticamente.</i>"
+                                f"\u26a0\ufe0f <i>Operación NO abierta automáticamente.</i>"
                             )
                             log.info("[%s] ALERTA MANUAL enviada | %s score=%d", symbol, signal.upper(), score)
                             continue
