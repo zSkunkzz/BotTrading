@@ -10,6 +10,10 @@ v8:
   - _check_tp_extension: fórmula lineal (entry + tp_orig_dist × (n+1)) en lugar de
     multiplicador acumulativo que escalaba demasiado. _round_price en new_tp.
   - _open_position: regime pasado a notify_open (antes siempre llegaba vacío).
+v9:
+  - _open_position: guard de exchange en tiempo real antes de enviar open_order.
+    Si ya existe posición para el símbolo en Hyperliquid (race condition tras reinicio),
+    se aborta la apertura y se registra localmente en lugar de doblar el tamaño.
 """
 import logging
 import os
@@ -751,6 +755,32 @@ def _open_position(
     candles_1h: list,
     positions: dict,
 ) -> None:
+    # v9: guard de exchange en tiempo real — evita posición doble tras reinicio
+    # Si el bot crasheó justo después de open_order pero antes de registrar en positions,
+    # al reiniciar el loop local no la conoce pero el exchange sí la tiene.
+    # Este check lo captura antes de enviar otra orden.
+    try:
+        pos_already = exchange.get_position(symbol)
+        if pos_already and pos_already.get("side") in VALID_SIDES:
+            log.warning(
+                "[%s] Guard exchange: ya existe posición %s @ %.6f — abortando open_order "
+                "(race condition reinicio). Se registrará en el siguiente sync.",
+                symbol, pos_already["side"], pos_already.get("entry", 0),
+            )
+            telegram.notify(
+                f"\u26a0\ufe0f <b>Posición duplicada bloqueada</b>\n"
+                f"{symbol} — ya existe {pos_already['side'].upper()} en exchange.\n"
+                f"La apertura fue ignorada. Se sincronizará en el siguiente loop."
+            )
+            return
+    except Exception as guard_exc:
+        # Si la consulta falla, continuamos — preferimos arriesgar la apertura
+        # a bloquear trades legítimos por un error de red puntual.
+        log.warning(
+            "[%s] Guard exchange: no se pudo verificar posición previa (%s) — continuando apertura",
+            symbol, guard_exc,
+        )
+
     params = risk.calc(
         signal, price, candles_15m,
         score=score, symbol=symbol, regime=regime,
