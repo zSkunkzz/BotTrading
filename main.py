@@ -31,6 +31,13 @@ v11:
     del sync), se reintenta _restore_sl_tp_on_sync cada iteración hasta que
     el feed esté listo. Fix directo para HYPE (y cualquier par) abierto sin
     SL/TP tras reinicio del bot.
+v12:
+  - _apply_breakeven, _update_trailing, _check_tp_extension: sustituye el
+    patrón cancel_all_orders→place_stop→place_tp por exchange.modify_sltp_orders()
+    (batchModify in-place). Las órdenes se modifican atómicamente — si el exchange
+    las rechaza, las antiguas siguen activas sin ventana de desprotección.
+    _restore_sl_tp_on_sync mantiene cancel+place porque solo se ejecuta al
+    arrancar cuando no hay órdenes previas que modificar.
 """
 import logging
 import os
@@ -187,9 +194,8 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
     new_sl = pos["sl"]
     side   = pos["side"]
     try:
-        exchange.cancel_all_orders(symbol)
-        exchange.place_stop_order(symbol, side, pos["qty"], new_sl)
-        exchange.place_tp_order(symbol, side, pos["qty"], pos["tp"])
+        # v12: modify in-place — sin ventana de desprotección
+        exchange.modify_sltp_orders(symbol, side, pos["qty"], new_sl, pos["tp"])
         telegram.notify(
             f"\U0001f512 <b>Break-even activado</b>\n"
             f"{symbol} {side.upper()}\n"
@@ -210,7 +216,8 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
-    """v8: _round_price en new_sl + debounce de notificaciones (5 min/par)."""
+    """v8: _round_price en new_sl + debounce de notificaciones (5 min/par).
+    v12: modify_sltp_orders en lugar de cancel+place."""
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -231,9 +238,8 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                 log.info("[%s] Trailing SL: %.6f → %.6f", symbol, pos["sl"], new_sl)
                 pos["sl"] = new_sl
                 try:
-                    exchange.cancel_all_orders(symbol)
-                    exchange.place_stop_order(symbol, "long", pos["qty"], new_sl)
-                    exchange.place_tp_order(symbol, "long", pos["qty"], pos["tp"])
+                    # v12: modify in-place — sin ventana de desprotección
+                    exchange.modify_sltp_orders(symbol, "long", pos["qty"], new_sl, pos["tp"])
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
                     return
@@ -255,9 +261,8 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                 log.info("[%s] Trailing SL: %.6f → %.6f", symbol, pos["sl"], new_sl)
                 pos["sl"] = new_sl
                 try:
-                    exchange.cancel_all_orders(symbol)
-                    exchange.place_stop_order(symbol, "short", pos["qty"], new_sl)
-                    exchange.place_tp_order(symbol, "short", pos["qty"], pos["tp"])
+                    # v12: modify in-place — sin ventana de desprotección
+                    exchange.modify_sltp_orders(symbol, "short", pos["qty"], new_sl, pos["tp"])
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
                     return
@@ -278,7 +283,8 @@ def _check_tp_extension(
     feed,
     effective_min_score: int,
 ) -> None:
-    """v8: fórmula de new_tp lineal (entry + tp_orig_dist × (n+1)) y _round_price."""
+    """v8: fórmula de new_tp lineal (entry + tp_orig_dist × (n+1)) y _round_price.
+    v12: modify_sltp_orders en lugar de cancel+place."""
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -381,9 +387,8 @@ def _check_tp_extension(
         current_sl = pos["sl"]
 
         try:
-            exchange.cancel_all_orders(symbol)
-            exchange.place_stop_order(symbol, side, pos["qty"], current_sl)
-            exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
+            # v12: modify in-place — sin ventana de desprotección
+            exchange.modify_sltp_orders(symbol, side, pos["qty"], current_sl, new_tp)
         except Exception as e:
             log.warning("[%s] Error colocando órdenes en extend_tp: %s", symbol, e)
             return
@@ -723,6 +728,7 @@ def _restore_sl_tp_on_sync(
         new_sl = params["sl"]
         new_tp = params["tp"]
 
+        # cancel+place es correcto aquí: no hay órdenes previas que modificar
         exchange.cancel_all_orders(symbol)
         exchange.place_stop_order(symbol, side, qty, new_sl)
         exchange.place_tp_order(symbol, side, qty, new_tp)
