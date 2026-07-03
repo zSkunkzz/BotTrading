@@ -957,3 +957,15 @@ def get_fills(
 
 def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
     return get_fills(symbol=symbol, limit=limit, only_close=True)
+
+
+# ── Aliases públicos ────────────────────────────────────────────────────
+def get_tick_decimals(coin: str) -> int:
+    """Alias público de _get_tick_size para uso desde risk.py y otros módulos.
+    Devuelve el número de decimales del tickSz (ej: tickSz=0.0001 → 4)."""
+    tick = _get_tick_size(coin)
+    if tick <= 0:
+        return 6
+    # Número de decimales = -log10(tick), redondeado
+    import math
+    return max(0, round(-math.log10(float(tick))))
