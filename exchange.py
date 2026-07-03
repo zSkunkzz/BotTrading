@@ -73,6 +73,16 @@ v14 — Fix TPSL no se colocaba en monedas con precio > 1 USDC (3 bugs):
     órdenes duplicadas.
     Fix: usar frontend_open_orders (ya usado en get_open_trigger_orders)
     que sí incluye todas las órdenes trigger.
+
+v15 — modify_sltp_orders: batchModify atómico como primer intento:
+  Cuando existen tanto SL como TP, se intenta primero un bulk_modify_orders
+  con grouping="normalTpsl" que modifica ambas órdenes en una sola llamada
+  firmada. Esto elimina la ventana de ~100-300ms entre el modify del SL y
+  el modify del TP en que una de las dos puede quedar desactualizada si el
+  precio toca el trigger justo en ese intervalo.
+  Si bulk_modify_orders no existe en la versión instalada del SDK o HL lo
+  rechaza, cae silenciosamente al comportamiento v13/v14 (dos modify_order
+  separados + fallback cancel+place). Ninguna otra función cambia.
 """
 import logging
 import math
@@ -609,6 +619,82 @@ def _modify_single_order(
     log.info("Orden %s modificada in-place: %s oid=%s → %.6f", tpsl.upper(), coin, oid, new_px)
 
 
+def _batch_modify_sltp(
+    coin: str,
+    sl_oid: int,
+    tp_oid: int,
+    is_close_buy: bool,
+    qty: float,
+    new_sl: float,
+    new_tp: float,
+) -> bool:
+    """v15: Intenta modificar SL y TP atómicamente con bulk_modify_orders.
+
+    Envía ambas modificaciones en una sola llamada firmada con
+    grouping="normalTpsl", eliminando la ventana entre el modify del SL
+    y el del TP.
+
+    Devuelve True si ambas órdenes se modificaron correctamente,
+    False si el SDK no soporta bulk_modify_orders o HL rechazó la llamada
+    (en cuyo caso el caller cae al comportamiento v13/v14).
+    """
+    bulk_modify = getattr(_exchange, "bulk_modify_orders", None)
+    if bulk_modify is None:
+        log.debug("[%s] bulk_modify_orders no disponible en este SDK — usando modify individual", coin)
+        return False
+
+    sl_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_sl)
+    tp_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_tp)
+
+    modify_requests = [
+        {
+            "oid":        sl_oid,
+            "order": {
+                "coin":        coin,
+                "is_buy":      is_close_buy,
+                "sz":          qty,
+                "limit_px":    sl_limit_px,
+                "order_type":  {"trigger": {"triggerPx": new_sl, "isMarket": True, "tpsl": "sl"}},
+                "reduce_only": True,
+            },
+        },
+        {
+            "oid":        tp_oid,
+            "order": {
+                "coin":        coin,
+                "is_buy":      is_close_buy,
+                "sz":          qty,
+                "limit_px":    tp_limit_px,
+                "order_type":  {"trigger": {"triggerPx": new_tp, "isMarket": True, "tpsl": "tp"}},
+                "reduce_only": True,
+            },
+        },
+    ]
+
+    try:
+        resp = _hl_call(
+            bulk_modify,
+            modify_requests,
+            grouping="normalTpsl",
+            context=f"bulk_modify_orders({coin} sl={new_sl} tp={new_tp})",
+        )
+        statuses = (((resp or {}).get("response") or {}).get("data") or {}).get("statuses") or []
+        errors = [s.get("error") for s in statuses if "error" in s]
+        if errors:
+            raise RuntimeError(f"bulk_modify_orders errors: {errors}")
+        log.info(
+            "SL+TP modificados atómicamente (batchModify): %s | sl=%.6f tp=%.6f",
+            coin, new_sl, new_tp,
+        )
+        return True
+    except Exception as exc:
+        log.warning(
+            "[%s] bulk_modify_orders falló: %s — cayendo a modify individual",
+            coin, exc,
+        )
+        return False
+
+
 def modify_sltp_orders(
     symbol: str,
     side: str,
@@ -624,6 +710,11 @@ def modify_sltp_orders(
     la otra sigue activa (no hay ventana de desprotección global).
     Si no existen órdenes previas (arranque/reinicio), place directo con _place_sltp_pair.
     Fallback a cancel+place solo si modify falla y la posición sigue abierta.
+
+    v15: cuando existen ambas órdenes, intenta primero _batch_modify_sltp() que
+    las modifica atómicamente en una sola llamada firmada (grouping=normalTpsl).
+    Si bulk_modify_orders no está disponible en el SDK instalado o HL lo rechaza,
+    cae al comportamiento v13/v14 sin cambios (dos modify_order separados).
     """
     coin         = _hl_symbol(symbol)
     is_close_buy = (side == "short")  # cerrar short → buy
@@ -639,6 +730,17 @@ def modify_sltp_orders(
         log.info("[%s] modify_sltp: sin órdenes abiertas → place desde cero", coin)
         _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
         return
+
+    # v15: si existen ambas órdenes, intentar batchModify atómico primero
+    if sl_info is not None and tp_info is not None:
+        if _batch_modify_sltp(
+            coin,
+            sl_info["oid"], tp_info["oid"],
+            is_close_buy, qty,
+            new_sl_r, new_tp_r,
+        ):
+            return
+        # _batch_modify_sltp devolvió False → continuar con modify individual (v13/v14)
 
     sl_ok = False
     tp_ok = False
