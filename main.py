@@ -44,6 +44,14 @@ v13:
   - modify_sltp_orders en exchange.py: corregido para usar Exchange.modify_order()
     del SDK real (bulk_modify_orders_new no existía y siempre fallaba al fallback
     cancel+place, dejando ventana de desprotección).
+v14:
+  - _restore_sl_tp_on_sync: ya no sale en cuanto sl/tp != None en el dict local.
+    Verifica que las órdenes REALMENTE existen en HL con get_open_trigger_orders().
+    Si alguna falta (sl_real o tp_real es None), cancela todo y recoloca ambas
+    con _place_sltp_pair aunque el dict local tuviera valores de v17.
+    Causa raíz: _fetch_trigger_map() puede devolver valores stale o erróneos,
+    haciendo que _restore_sl_tp_on_sync saliera convencido de que todo estaba
+    bien cuando en HL no había ninguna orden activa.
 """
 import logging
 import os
@@ -706,23 +714,52 @@ def _restore_sl_tp_on_sync(
 ) -> None:
     """Restaura SL y TP tras reinicio cuando la posición ya existía en el exchange.
 
-    v13 FIX: usa exchange._place_sltp_pair() con grouping normalTpsl en lugar de
-    place_stop_order + place_tp_order separados.
-    HL rechaza colocar un TP independiente cuando ya existe SL activo (y viceversa).
-    _place_sltp_pair envía ambas en un solo bulk_orders con grouping=normalTpsl.
+    v14 FIX: ya no sale en cuanto sl/tp != None en el dict local.
+    Verifica que las órdenes REALMENTE existen en HL con get_open_trigger_orders().
+    Si alguna falta (sl_real o tp_real es None), cancela todo y recoloca ambas
+    con _place_sltp_pair aunque el dict local tuviera valores inyectados por v17.
+    Causa raíz: _fetch_trigger_map() puede devolver valores stale o incorrectos,
+    haciendo que la función saliera creyendo que todo estaba bien cuando en HL
+    no había ninguna orden activa.
     """
-    sl   = pos.get("sl")
-    tp   = pos.get("tp")
-    side = pos["side"]
-
-    if sl is not None and tp is not None:
-        return
-
+    side  = pos["side"]
     entry = pos.get("entry", 0.0)
     qty   = pos.get("qty", 0.0)
+
     if entry <= 0 or qty <= 0:
-        log.warning("[%s] _restore_sl_tp: entry=%.6f qty=%.8f inválidos — no se pueden recalcular", symbol, entry, qty)
+        log.warning(
+            "[%s] _restore_sl_tp: entry=%.6f qty=%.8f inválidos — no se pueden recalcular",
+            symbol, entry, qty,
+        )
         return
+
+    # v14: verificar contra HL que las órdenes trigger existen de verdad
+    try:
+        trigger = exchange.get_open_trigger_orders(symbol)
+        sl_real = trigger.get("sl")
+        tp_real = trigger.get("tp")
+    except Exception as exc:
+        log.warning("[%s] _restore_sl_tp: no se pudo leer trigger orders: %s — forzando restore", symbol, exc)
+        sl_real = None
+        tp_real = None
+
+    if sl_real is not None and tp_real is not None:
+        # Ambas órdenes existen en HL — sincronizar el dict local y salir
+        log.info(
+            "[%s] _restore_sl_tp: SL+TP ya activos en HL (sl=%.6f tp=%.6f) — sin acción",
+            symbol, sl_real["px"], tp_real["px"],
+        )
+        pos["sl"] = sl_real["px"]
+        pos["tp"] = tp_real["px"]
+        return
+
+    # Falta al menos una orden — recalcular y colocar ambas
+    log.warning(
+        "[%s] _restore_sl_tp: órdenes en HL incompletas (sl=%s tp=%s) — recalculando y recolocando",
+        symbol,
+        f"{sl_real['px']:.6f}" if sl_real else "None",
+        f"{tp_real['px']:.6f}" if tp_real else "None",
+    )
 
     try:
         candles_15m = feed.get(symbol, "15m")
@@ -741,9 +778,7 @@ def _restore_sl_tp_on_sync(
         new_sl = params["sl"]
         new_tp = params["tp"]
 
-        # Cancelar órdenes previas (por si hay alguna huérfana) y colocar
-        # SL+TP juntos con normalTpsl — fix v13: evita el error
-        # "Invalid TPSL price" al colocarlos como órdenes separadas.
+        # Cancelar órdenes previas huérfanas y colocar SL+TP juntos con normalTpsl
         exchange.cancel_all_orders(symbol)
         exchange._place_sltp_pair(symbol, side, qty, new_sl, new_tp)
 
