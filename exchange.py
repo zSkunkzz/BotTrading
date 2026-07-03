@@ -60,6 +60,21 @@ v27 — Fix definitivo: _get_tick_decimals movido ANTES de su primer uso.
   La sección '# ── Aliases públicos' al final se mantiene para
   compatibilidad pero ahora es solo un re-export explícito de lo ya
   definido.
+
+v28 — Fix "Order has invalid price" en la orden de ENTRADA (IOC limit).
+
+  open_order y close_position usaban _market_price() que devuelve float.
+  El SDK serializa ese float con floattowire() → str(round(float, 8)),
+  lo que puede generar residuos de punto flotante para monedas con tickSz
+  pequeño (GRASS, ONDO, PYTH, etc.) que HL rechaza con "invalid price".
+
+  Fix: limit_px se construye con _round_price_dec() → Decimal exacto →
+  _price_to_wire() → string sin residuo, exactamente igual que SL/TP
+  desde v24. Se elimina _market_price() de ambas funciones y se calcula
+  el precio con slippage directamente sobre el mid inline.
+
+  También se usa _hl_call_write (no _hl_call_read) en ambas funciones
+  para que solo reintente en errores de red, no en rechazos de HL.
 """
 import logging
 import math
@@ -313,11 +328,26 @@ def _trigger_limit_dec(coin: str, is_buy: bool) -> Decimal:
     return (_TRIGGER_MAX_PRICE / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
 
 
-# ── Precio límite para órdenes de mercado ───────────────────────────────
+# ── Precio límite para órdenes de mercado (solo para referencia interna) ─
 _MARKET_SLIPPAGE = 0.005
 
 
+def _market_price_wire(coin: str, is_buy: bool) -> str:
+    """
+    Devuelve el precio de mercado con slippage como string wire exacto.
+    Usa _round_price_dec + _price_to_wire para evitar residuos de float
+    que HL rechaza con 'Order has invalid price' en órdenes IOC.
+    """
+    mids = _hl_call_read(_info.all_mids, context=f"_market_price_wire({coin})")
+    mid = float(mids.get(coin, 0))
+    if mid <= 0:
+        raise ValueError(f"No se pudo obtener precio para {coin}")
+    raw = mid * (1 + _MARKET_SLIPPAGE) if is_buy else mid * (1 - _MARKET_SLIPPAGE)
+    return _price_to_wire(_round_price_dec(coin, raw))
+
+
 def _market_price(coin: str, is_buy: bool) -> float:
+    """Versión float — solo para get_price interno y compatibilidad."""
     mids = _hl_call_read(_info.all_mids, context=f"_market_price({coin})")
     mid = float(mids.get(coin, 0))
     if mid <= 0:
@@ -866,15 +896,18 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
     set_leverage(sym_bot, config.LEVERAGE)
 
-    limit_px = _market_price(coin, is_buy)
+    # v28 FIX: precio como string wire exacto para evitar residuos de float
+    # que el SDK introduce con floattowire() y que HL rechaza ("invalid price").
+    limit_px_wire = _market_price_wire(coin, is_buy)
+
     resp = _hl_call_write(
         _exchange.order,
-        coin, is_buy, qty, limit_px,
+        coin, is_buy, qty, limit_px_wire,
         {"limit": {"tif": "Ioc"}},
         context=f"open_order {side.upper()} {coin} qty={qty}",
     )
     _check_order_response(resp, f"open_order {side.upper()} {coin} qty={qty}")
-    log.info("Orden abierta: %s %s qty=%g @ ~%g", side.upper(), coin, qty, limit_px)
+    log.info("Orden abierta: %s %s qty=%g @ ~%s", side.upper(), coin, qty, limit_px_wire)
 
     _place_sltp_pair(sym_bot, side, qty, sl, tp)
     return resp
@@ -898,14 +931,17 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float, sl_price
 def close_position(side: str, qty: float, symbol: str = None) -> dict:
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
     is_buy = side == "short"
-    limit_px = _market_price(coin, is_buy)
+
+    # v28 FIX: mismo patrón que open_order — precio wire string exacto
+    limit_px_wire = _market_price_wire(coin, is_buy)
+
     resp = _hl_call_write(
         _exchange.order,
-        coin, is_buy, qty, limit_px,
+        coin, is_buy, qty, limit_px_wire,
         {"limit": {"tif": "Ioc"}},
         context=f"close_position({coin})",
     )
-    log.info("Posición cerrada: %s %s", side.upper(), coin)
+    log.info("Posición cerrada: %s %s @ ~%s", side.upper(), coin, limit_px_wire)
     return resp
 
 
