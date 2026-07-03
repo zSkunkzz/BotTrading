@@ -1065,7 +1065,7 @@ def run() -> None:
 
             for symbol, pos in list(positions.items()):
                 try:
-pr                    ice = exchange.get_price(symbol)
+                    price = exchange.get_price(symbol)
                     _apply_breakeven(symbol, pos, price)
                     _update_trailing(symbol, pos, price)
                     _check_tp_extension(symbol, pos, price, feed, effective_min_score)
