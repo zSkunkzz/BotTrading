@@ -124,6 +124,25 @@ v17 — Fix raíz: posiciones sincronizadas nunca tenían SL/TP (2 bugs):
     reintenta UNA vez sin el kwarg grouping (compatibilidad SDK < 0.9).
     Si vuelve a fallar se lanza la excepción limpia para que el caller
     (open_order, _restore_sl_tp_on_sync) la vea en logs y pueda actuar.
+
+v18 — Fix CRÍTICO modify_sltp_orders (2 bugs):
+
+  Bug #1 (_modify_single_order): los argumentos se pasaban a
+    _exchange.modify_order() en orden incorrecto. La firma real del SDK es
+    modify_order(oid, name, is_buy, sz, limit_px, order_type, reduce_only).
+    El código los pasaba como (coin, oid, is_buy, ...) — coin y oid
+    intercambiados — lo que causaba que HL rechazara todos los modifies
+    con "invalid order id" o similar.
+    Fix: reordenar a (oid, coin, is_buy, qty, limit_px, order_type, True).
+
+  Bug #2 (_batch_modify_sltp): buscaba bulk_modify_orders con
+    getattr(_exchange, "bulk_modify_orders", None) pero el SDK oficial
+    expone la función como bulk_modify_orders_new. Al no encontrarla,
+    getattr devolvía None y _batch_modify_sltp retornaba False siempre,
+    desactivando el path atómico en todos los casos.
+    Fix: buscar "bulk_modify_orders_new" y llamarla sin grouping (el SDK
+    ya construye internamente el action batchModify con los wires
+    correctos — no acepta kwarg grouping).
 """
 import logging
 import math
@@ -723,12 +742,17 @@ def _modify_single_order(
     new_px: float,
     tpsl: str,  # "sl" o "tp"
 ) -> None:
-    """Modifica una orden trigger existente usando Exchange.modify_order() del SDK."""
+    """Modifica una orden trigger existente usando Exchange.modify_order() del SDK.
+
+    v18 FIX: la firma real del SDK es modify_order(oid, name, is_buy, sz, limit_px,
+    order_type, reduce_only). Versiones anteriores pasaban los args en orden
+    incorrecto (coin, oid, ...) causando que HL rechazara todos los modifies.
+    """
     limit_px   = _trigger_market_limit_px(coin, is_buy, new_px)
     order_type = {"trigger": {"triggerPx": new_px, "isMarket": True, "tpsl": tpsl}}
     resp = _hl_call(
         _exchange.modify_order,
-        coin, oid, is_buy, qty, limit_px, order_type, True,
+        oid, coin, is_buy, qty, limit_px, order_type, True,   # v18: oid primero, luego coin
         context=f"modify_order({coin} oid={oid} {tpsl}={new_px})",
     )
     statuses = (((resp or {}).get("response") or {}).get("data") or {}).get("statuses") or []
@@ -747,15 +771,21 @@ def _batch_modify_sltp(
     new_sl: float,
     new_tp: float,
 ) -> bool:
-    """v15: Intenta modificar SL y TP atómicamente con bulk_modify_orders.
+    """v15: Intenta modificar SL y TP atómicamente con bulk_modify_orders_new.
 
     v16 FIX: aplica _round_price internamente sobre new_sl y new_tp antes de
     construir los modify_requests, para que la función sea segura ante llamadas
     directas con precios no redondeados (no depende del caller).
+
+    v18 FIX: buscaba "bulk_modify_orders" (no existe) — el SDK lo expone como
+    "bulk_modify_orders_new". Al no encontrarlo, siempre retornaba False
+    desactivando el path atómico. Corregido para buscar el nombre real.
+    Además, bulk_modify_orders_new NO acepta kwarg grouping — el SDK construye
+    internamente el action batchModify. Se elimina grouping="normalTpsl".
     """
-    bulk_modify = getattr(_exchange, "bulk_modify_orders", None)
+    bulk_modify = getattr(_exchange, "bulk_modify_orders_new", None)  # v18 FIX: nombre correcto
     if bulk_modify is None:
-        log.debug("[%s] bulk_modify_orders no disponible en este SDK — usando modify individual", coin)
+        log.debug("[%s] bulk_modify_orders_new no disponible en este SDK — usando modify individual", coin)
         return False
 
     # v16 FIX: redondear internamente
@@ -791,16 +821,16 @@ def _batch_modify_sltp(
     ]
 
     try:
+        # v18 FIX: bulk_modify_orders_new no acepta kwarg grouping
         resp = _hl_call(
             bulk_modify,
             modify_requests,
-            grouping="normalTpsl",
-            context=f"bulk_modify_orders({coin} sl={new_sl} tp={new_tp})",
+            context=f"bulk_modify_orders_new({coin} sl={new_sl} tp={new_tp})",
         )
         statuses = (((resp or {}).get("response") or {}).get("data") or {}).get("statuses") or []
         errors = [s.get("error") for s in statuses if "error" in s]
         if errors:
-            raise RuntimeError(f"bulk_modify_orders errors: {errors}")
+            raise RuntimeError(f"bulk_modify_orders_new errors: {errors}")
         log.info(
             "SL+TP modificados atómicamente (batchModify): %s | sl=%.6f tp=%.6f",
             coin, new_sl, new_tp,
@@ -808,7 +838,7 @@ def _batch_modify_sltp(
         return True
     except Exception as exc:
         log.warning(
-            "[%s] bulk_modify_orders falló: %s — cayendo a modify individual",
+            "[%s] bulk_modify_orders_new falló: %s — cayendo a modify individual",
             coin, exc,
         )
         return False
