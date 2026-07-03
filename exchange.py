@@ -37,6 +37,17 @@ v25 — Fix alias gettickdecimals para compatibilidad con risk.py.
 
   risk.py llama exchange.gettickdecimals(coin) (sin guión bajo) y la
   función no existía, causando AttributeError en runtime. Se añade alias.
+
+v26 — Fix CRÍTICO: alias _get_tick_decimals para risk.py.
+
+  risk.py línea 122 llama _exchange._get_tick_decimals(coin) (con guión
+  bajo inicial, nombre privado). En v24 esa función fue eliminada y
+  reemplazada por _get_tick_size + get_tick_decimals, pero risk.py seguía
+  llamando el nombre antiguo causando AttributeError en cada intento de
+  abrir posición.
+
+  Fix: se añade _get_tick_decimals(coin) como alias de get_tick_decimals()
+  en la sección de aliases públicos, junto al ya existente gettickdecimals.
 """
 import logging
 import math
@@ -966,6 +977,13 @@ def get_tick_decimals(coin: str) -> int:
     return max(0, round(-math.log10(float(tick))))
 
 
+# Alias privado para compatibilidad con risk.py que llama _exchange._get_tick_decimals(coin)
+def _get_tick_decimals(coin: str) -> int:
+    """Alias de get_tick_decimals — mantiene compatibilidad con llamadas internas."""
+    return get_tick_decimals(coin)
+
+
+# Alias sin guiones bajos para otras variantes de llamada
 def gettickdecimals(coin: str) -> int:
-    """Alias de get_tick_decimals para compatibilidad con risk.py."""
+    """Alias de get_tick_decimals para compatibilidad con nombres sin guiones bajos."""
     return get_tick_decimals(coin)
