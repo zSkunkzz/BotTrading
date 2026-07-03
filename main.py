@@ -20,6 +20,15 @@ v10:
     (latencia exchange ~100-300 ms). El guard v9 se mantiene como segunda línea.
   - Causa real: señal manual + señal automática evaluadas casi simultáneamente
     para el mismo símbolo, o dos loops muy juntos cuando LOOP_SLEEP es bajo.
+v11:
+  - _restore_sl_tp_on_sync: usa _place_sl_tp_bulk en lugar de place_stop_order +
+    place_tp_order separados, igual que open_order. Evita el fallo silencioso donde
+    place_stop_order tenía éxito pero place_tp_order fallaba y quedaba sin TP.
+  - _restore_sl_tp_on_sync: antes de recalcular, consulta get_open_trigger_orders
+    para ver si HL ya tiene SL y/o TP activos. Si ambos existen, los sincroniza
+    localmente en lugar de cancelar y volver a colocar innecesariamente.
+    Esto cubre el caso de reinicio donde el bot no tenía estado local pero HL
+    sí tenía las trigger orders en pie (posición abierta con TPSL desde sesión anterior).
 """
 import logging
 import os
@@ -676,26 +685,82 @@ def _restore_sl_tp_on_sync(
     pos: dict,
     feed,
 ) -> None:
-    sl   = pos.get("sl")
-    tp   = pos.get("tp")
-    side = pos["side"]
+    """v11: Restaura SL/TP en HL tras reinicio del bot.
 
-    if sl is not None and tp is not None:
-        return
+    Pasos:
+    1. Consultar get_open_trigger_orders para ver si HL ya tiene SL y/o TP activos.
+       - Si ambos existen: sincronizar localmente los valores y NO tocar el exchange.
+       - Si falta uno o los dos: recalcular desde ATR y colocar los que falten.
+    2. Usar _place_sl_tp_bulk para colocar ambos de una vez (más fiable que separados).
+    """
+    local_sl = pos.get("sl")
+    local_tp = pos.get("tp")
+    side     = pos["side"]
+    entry    = pos.get("entry", 0.0)
+    qty      = pos.get("qty", 0.0)
 
-    entry = pos.get("entry", 0.0)
-    qty   = pos.get("qty", 0.0)
     if entry <= 0 or qty <= 0:
-        log.warning("[%s] _restore_sl_tp: entry=%.6f qty=%.8f inválidos — no se pueden recalcular", symbol, entry, qty)
+        log.warning(
+            "[%s] _restore_sl_tp: entry=%.6f qty=%.8f inválidos — no se pueden recalcular",
+            symbol, entry, qty,
+        )
         return
 
+    # ── Paso 1: consultar triggers reales en HL ──────────────────────────
+    try:
+        triggers = exchange.get_open_trigger_orders(symbol)
+    except Exception as exc:
+        log.warning("[%s] _restore_sl_tp: no se pudo consultar triggers en HL: %s", symbol, exc)
+        triggers = []
+
+    hl_sl_px = None
+    hl_tp_px = None
+    for t in triggers:
+        ot = str(t.get("orderType", "")).lower()
+        px = float(t.get("triggerPx") or 0)
+        if px <= 0:
+            continue
+        if "stop" in ot:
+            hl_sl_px = px
+        elif "take profit" in ot or "tp" in ot:
+            hl_tp_px = px
+
+    # Si HL ya tiene ambos activos, solo sincronizar en local y terminar
+    if hl_sl_px is not None and hl_tp_px is not None:
+        if local_sl != hl_sl_px or local_tp != hl_tp_px:
+            log.info(
+                "[%s] _restore_sl_tp: HL ya tiene SL=%.6f TP=%.6f — sincronizando local sin tocar exchange",
+                symbol, hl_sl_px, hl_tp_px,
+            )
+            pos["sl"]          = hl_sl_px
+            pos["tp"]          = hl_tp_px
+            pos["tp_original"] = pos.get("tp_original") or hl_tp_px
+        else:
+            log.debug("[%s] _restore_sl_tp: HL tiene SL+TP coincidentes con local — nada que hacer", symbol)
+        return
+
+    # Si falta alguno, necesitamos el feed para recalcular
     try:
         candles_15m = feed.get(symbol, "15m")
         candles_1h  = feed.get(symbol, "1h")
         if not candles_15m or not candles_1h:
             log.warning("[%s] _restore_sl_tp: feed no listo aún — reintentando en próximo loop", symbol)
             return
+    except Exception as exc:
+        log.warning("[%s] _restore_sl_tp: feed no disponible: %s", symbol, exc)
+        return
 
+    # Determinar qué falta: usar valores de HL si existen, recalcular los que faltan
+    if hl_sl_px is not None or hl_tp_px is not None:
+        # Parcialmente cubierto: recalcular solo para tener ambos valores
+        log.info(
+            "[%s] _restore_sl_tp: HL tiene SL=%s TP=%s (parcial) — recalculando ambos para consistencia",
+            symbol,
+            f"{hl_sl_px:.6f}" if hl_sl_px else "None",
+            f"{hl_tp_px:.6f}" if hl_tp_px else "None",
+        )
+
+    try:
         params = risk.calc(
             side, entry, candles_15m,
             score=_SYNC_SCORE_UNKNOWN,
@@ -703,16 +768,16 @@ def _restore_sl_tp_on_sync(
             regime=side,
             candles_1h=candles_1h,
         )
-        new_sl = params["sl"]
-        new_tp = params["tp"]
+        new_sl = hl_sl_px if hl_sl_px is not None else params["sl"]
+        new_tp = hl_tp_px if hl_tp_px is not None else params["tp"]
 
+        # ── Paso 2: cancelar todo y colocar SL+TP en bulk ──────────────────
         exchange.cancel_all_orders(symbol)
-        exchange.place_stop_order(symbol, side, qty, new_sl)
-        exchange.place_tp_order(symbol, side, qty, new_tp)
+        exchange._place_sl_tp_bulk(symbol, side, qty, new_sl, new_tp)
 
         pos["sl"]          = new_sl
         pos["tp"]          = new_tp
-        pos["tp_original"] = new_tp
+        pos["tp_original"] = pos.get("tp_original") or new_tp
         if pos.get("be_trigger") is None:
             pos["be_trigger"] = params.get("be_trigger")
             pos["be_sl"]      = params.get("be_sl")
@@ -969,8 +1034,8 @@ def run() -> None:
                         "entry":         synced_entry,
                         "qty":           pos_ex["size"],
                         "sl":            synced_sl,
-                        "tp":            pos_ex["tp"],
-                        "tp_original":   pos_ex["tp"],
+                        "tp":            pos_ex.get("tp"),
+                        "tp_original":   pos_ex.get("tp"),
                         "tp_extensions": 0,
                         "_extending":    False,
                         "trail_step":    trail_step,
@@ -985,7 +1050,7 @@ def run() -> None:
                     log.info(
                         "[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s trail=%.8f be_trigger=%s open_ts=%.0f score=sync)",
                         symbol, ex_side, synced_entry,
-                        synced_sl, pos_ex["tp"], trail_step,
+                        synced_sl, pos_ex.get("tp"), trail_step,
                         f"{be_trigger:.6f}" if be_trigger else "N/A",
                         real_open_ts,
                     )
