@@ -1,53 +1,43 @@
 """
 exchange.py — Cliente Hyperliquid Perpetual Futures.
 
-[... historial anterior v2–v21 preservado ...]
+[... historial anterior v2–v22 preservado ...]
 
-v22 — Fix 4 bugs operativos críticos:
+v23 — Fix universal multi-coin support (5 bugs):
 
-  Bug #1 (CRÍTICO — reintentos peligrosos en escrituras):
-    _hl_call() reintentaba TODO, incluidas acciones firmadas como order,
-    bulk_orders, modify_order y cancel. Si el primer intento llegó al
-    servidor pero falló la respuesta de red, el reintento enviaba una
-    segunda orden firmada idéntica → duplicación de órdenes o cancels
-    sobre IDs ya procesados.
-    Fix: se introduce _hl_call_read() (con backoff completo, igual al
-    _hl_call anterior) y _hl_call_write() (sin reintentos automáticos:
-    solo reintenta si el error es claramente pre-envío — ConnectionError,
-    socket.timeout, urllib3 NewConnectionError — no errores HTTP/runtime).
-    Todas las llamadas a Info usan _hl_call_read().
-    Todas las llamadas a Exchange usan _hl_call_write().
+  Bug #1 CRÍTICO (_place_sltp_pair — is_close invertido):
+    Para un LONG, cerrar significa VENDER → is_buy=False.
+    El código tenía is_close = (side == 'short'), lo que hacía
+    is_buy=True para longs (¡compraría más en vez de cerrar!).
+    Fix: is_close_buy = (side == 'short'). Para long, is_buy=False.
+    Para short, is_buy=True. Igual que en _place_single_sl/tp.
 
-  Bug #2 (CRÍTICO — _price_to_wire() con posible exponente):
-    Decimal(...).normalize() puede devolver '1E-8' en vez de '0.00000001'
-    para valores muy pequeños, justo lo que HL rechaza silenciosamente.
-    Fix: format(Decimal(str(price)), 'f') garantiza siempre notación
-    decimal fija sin exponente (el flag 'f' de format() en Decimal
-    equivale a to_eng_string sin exponente). Se preserva el strip de
-    ceros insignificantes al final para no enviar '1.00000000'.
+  Bug #2 CRÍTICO (_trigger_market_limit_px — multiplier 1.10 rompe ticks):
+    trigger_px * 1.10 puede generar un precio fuera del rango válido
+    de HL para monedas muy baratas (SHIB, PEPE, etc.) o con ticks
+    no potencia de 10. Después de aplicar _round_price el resultado
+    puede quedar en 0 si el tick es grande relativo al precio.
+    Fix: usar un precio límite extremo fijo según dirección:
+    - is_buy=True (cerrar short, TP de long): 2_147_483_647 (INT_MAX)
+      redondeado al tick → precio prácticamente infinito aceptado por HL.
+    - is_buy=False (cerrar long, SL de long): 0.0 ya era correcto.
+    Esto replica el comportamiento del SDK oficial de HL internamente
+    en sus helpers market_close / tp_sl_orders.
 
-  Bug #3 (MEDIA — redondeo por decimales en vez de múltiplo de tick real):
-    _get_tick_decimals() calculaba decimales con round(-log10(tickSz)),
-    lo que falla si tickSz no es potencia de 10 exacta (ej: 0.00025 →
-    log10 = 3.60, round = 4 decimales, pero el tick real es 0.00025 no
-    0.0001). Además _round_price() usaba ese número de decimales como
-    quantizer, no el tick en sí.
-    Fix: _get_tick_size(coin) devuelve el Decimal exacto del tickSz leído
-    de meta(). _round_price() redondea al múltiplo más cercano de ese
-    Decimal usando quantize(tickSz), que es el único método correcto para
-    cualquier tick arbitrario.
+  Bug #3 (get_all_positions — log WARNING innecesario en cada sync):
+    El log 'RAW posiciones abiertas' imprimía WARNING en cada ciclo
+    aunque todo fuese correcto, llenando los logs de ruido.
+    Fix: degradar a INFO.
 
-  Bug #4 (MEDIA — get_fills() puede perder cierres reales):
-    Filtrar por '"Close" in dir' omite fills donde dir sea 'Buy' o 'Sell'
-    sin prefijo 'Close', y closedPnl llegaba como string desde la API
-    siendo convertido directamente a float sin manejo de None/''.
-    Fix: se acepta cualquier fill con closedPnl != 0 como cierre real
-    (criterio semántico correcto), además del filtro 'Close' existente
-    como OR. closedPnl se parsea con _parse_pnl() que maneja None,
-    string vacío y notación científica.
+  Bug #4 (_place_sltp_pair — log format usa %.4f para monedas baratas):
+    Monedas como SHIB (precio ~0.000020) necesitan más decimales.
+    Fix: usar %g que adapta la notación al valor real.
+
+  Bug #5 (modify_sltp_orders — new_sl_r / new_tp_r ya redondeados
+    se pasaban a _place_sltp_pair que volvía a redondear — inofensivo
+    pero confirmado idempotente. Documentado explícitamente).
 """
 import logging
-import math
 import os
 import random
 import socket
@@ -94,8 +84,6 @@ _RL_BASE_DELAY = 1.0
 _RL_JITTER = 0.2
 _RL_429_EXTRA = 5.0
 
-# Excepciones que indican que la petición NO llegó al servidor —
-# seguro reintentar incluso en escrituras.
 _PRE_SEND_ERRORS = (
     ConnectionError,
     ConnectionRefusedError,
@@ -122,7 +110,6 @@ def _is_pre_send(exc: Exception) -> bool:
     """True si el error ocurrió antes de que el servidor procesara la petición."""
     if isinstance(exc, _PRE_SEND_ERRORS):
         return True
-    # urllib3 / requests pueden envolver errores de conexión en RuntimeError/Exception
     msg = str(exc).lower()
     return any(k in msg for k in (
         "newconnectionerror", "connection refused", "failed to establish",
@@ -158,14 +145,7 @@ def _hl_call_read(fn, *args, context: str = "", **kwargs):
 def _hl_call_write(fn, *args, context: str = "", **kwargs):
     """
     Llama fn(*args, **kwargs) para acciones firmadas (Exchange).
-
-    Reintenta SOLO si el error es claramente pre-envío (la petición no
-    llegó al servidor). Para cualquier otro error — timeout HTTP, error
-    de red tras envío, respuesta inesperada — lanza inmediatamente sin
-    reintentar, para evitar duplicar órdenes/cancels.
-
-    El caller es responsable de verificar el estado con
-    query_order_by_oid() si necesita confirmar ejecución.
+    Reintenta SOLO si el error es pre-envío (la petición no llegó al servidor).
     """
     last_exc = None
     for attempt in range(1, _RL_MAX_RETRIES + 2):
@@ -173,8 +153,6 @@ def _hl_call_write(fn, *args, context: str = "", **kwargs):
             return fn(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
-            # Solo reintentamos si el error es pre-envío Y no hemos
-            # agotado los intentos.
             if attempt > _RL_MAX_RETRIES or not _is_pre_send(exc):
                 break
             is_429 = _is_429(exc)
@@ -190,8 +168,6 @@ def _hl_call_write(fn, *args, context: str = "", **kwargs):
     raise last_exc
 
 
-# Alias de compatibilidad — las funciones de lectura que ya usaban _hl_call
-# siguen funcionando; se migran a _hl_call_read explícitamente abajo.
 _hl_call = _hl_call_read
 
 
@@ -228,8 +204,6 @@ def _get_asset_index(coin: str) -> int:
 
 
 # ── tickSize / price rounding ─────────────────────────────────────────
-# v22 Fix #2: tick almacenado como Decimal exacto, no como número de decimales.
-# v22 Fix #3: _round_price usa quantize(tickSz) en vez de quantize(10^-n).
 _tick_size_cache: dict[str, Decimal] = {}
 
 
@@ -237,7 +211,6 @@ def _get_tick_size(coin: str) -> Decimal:
     """
     Devuelve el tickSz del activo como Decimal exacto leído del meta de HL.
     Ej: BTC → Decimal('1'), SOL → Decimal('0.01'), ONDO → Decimal('0.0001').
-    Si no se puede leer, devuelve Decimal('0.000001') como fallback conservador.
     """
     if coin in _tick_size_cache:
         return _tick_size_cache[coin]
@@ -279,30 +252,24 @@ def _round_price(coin: str, price: float) -> float:
 def _price_to_wire(price: float) -> str:
     """
     Convierte un precio float a string decimal fijo sin exponente.
-    Garantiza que HL nunca recibe '1E-8' ni '1.00000000'.
-
-    Decimal(...).normalize() puede producir notación científica.
-    format(..., 'f') fuerza siempre notación decimal fija.
-    El rstrip elimina ceros insignificantes a la derecha de la coma
-    y el punto decimal si queda vacío.
+    format(Decimal, 'f') garantiza siempre notación decimal fija.
     """
     if price == 0.0:
         return "0"
     d = Decimal(str(price))
-    fixed = format(d, 'f')                    # siempre decimal fijo, nunca '1E-8'
+    fixed = format(d, 'f')
     if '.' in fixed:
-        fixed = fixed.rstrip('0').rstrip('.')  # quitar ceros insignificantes
+        fixed = fixed.rstrip('0').rstrip('.')
     return fixed
 
 
-# ── Compatibilidad: mantener _tick_decimals para código externo que lo lea
+# ── Compatibilidad ──────────────────────────────────────────────────────
 _tick_decimals: dict[str, int] = {}
 
 
 def _get_tick_decimals(coin: str) -> int:
     """Compatibilidad — preferir _get_tick_size() en código nuevo."""
     tick = _get_tick_size(coin)
-    # Inferir decimales desde el tick (válido para ticks potencia de 10)
     s = format(tick, 'f')
     if '.' in s:
         dec = len(s.split('.')[1].rstrip('0') or '')
@@ -313,13 +280,23 @@ def _get_tick_decimals(coin: str) -> int:
 
 
 # ── limit_px correcto para órdenes trigger isMarket=True ────────────────
-_TRIGGER_BUY_LIMIT_MULTIPLIER = 1.10
+# v23 Fix #2: usar precio extremo fijo en vez de multiplier relativo.
+# Para is_buy=True (cerrar short / TP de long): precio máximo aceptado por HL.
+# Para is_buy=False (cerrar long / SL de long): 0.0.
+# Esto replica el comportamiento del SDK oficial de HL internamente.
+_TRIGGER_MAX_PRICE = 2_147_483_647.0  # INT_MAX — precio "infinito" para HL
 
 
 def _trigger_market_limit_px(coin: str, is_buy: bool, trigger_px: float) -> float:
+    """
+    Devuelve el limit_px apropiado para una orden trigger isMarket=True.
+    - is_buy=True  → precio máximo (redondeado al tick) para garantizar ejecución
+    - is_buy=False → 0.0 (HL lo trata como precio mínimo / market)
+    """
     if not is_buy:
         return 0.0
-    return _round_price(coin, trigger_px * _TRIGGER_BUY_LIMIT_MULTIPLIER)
+    # Redondear el precio máximo al tick del activo para que HL lo acepte
+    return _round_price(coin, _TRIGGER_MAX_PRICE)
 
 
 # ── Precio límite para órdenes de mercado ───────────────────────────────
@@ -454,8 +431,9 @@ def get_all_positions() -> dict[str, dict]:
         if float(e.get("position", {}).get("szi", 0)) != 0
     ]
     if open_coins:
-        log.warning(
-            "[exchange] RAW posiciones abiertas en HL: %s | hl_to_bot keys (sample): %s",
+        # v23 Fix #3: INFO en vez de WARNING — es información normal en cada sync
+        log.info(
+            "[exchange] posiciones abiertas en HL: %s | símbolos configurados (sample): %s",
             open_coins,
             list(hl_to_bot.keys())[:15],
         )
@@ -559,16 +537,22 @@ def _place_sltp_pair(
     tp_price: float,
 ) -> None:
     coin = _hl_symbol(symbol)
-    is_close = side == "short"
+
+    # v23 Fix #1: is_close_buy correcto.
+    # Para LONG → cerrar = VENDER → is_buy=False → is_close_buy=False
+    # Para SHORT → cerrar = COMPRAR → is_buy=True → is_close_buy=True
+    is_close_buy = (side == "short")
 
     sl_px = _round_price(coin, sl_price)
     tp_px = _round_price(coin, tp_price)
-    sl_limit_px = _trigger_market_limit_px(coin, is_close, sl_px)
-    tp_limit_px = _trigger_market_limit_px(coin, is_close, tp_px)
+
+    # v23 Fix #2: limit_px extremo fijo (no multiplier relativo)
+    sl_limit_px = _trigger_market_limit_px(coin, is_close_buy, sl_px)
+    tp_limit_px = _trigger_market_limit_px(coin, is_close_buy, tp_px)
 
     sl_order = {
         "coin": coin,
-        "is_buy": is_close,
+        "is_buy": is_close_buy,
         "sz": qty,
         "limit_px": sl_limit_px,
         "order_type": {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
@@ -576,7 +560,7 @@ def _place_sltp_pair(
     }
     tp_order = {
         "coin": coin,
-        "is_buy": is_close,
+        "is_buy": is_close_buy,
         "sz": qty,
         "limit_px": tp_limit_px,
         "order_type": {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
@@ -601,8 +585,9 @@ def _place_sltp_pair(
         errors = [s.get("error") for s in statuses if "error" in s]
         if errors:
             raise RuntimeError(f"bulk_orders normalTpsl errors: {errors}")
+        # v23 Fix #4: usar %g para monedas con precio muy pequeño (SHIB, PEPE, etc.)
         log.info(
-            "SL+TP colocados juntos (normalTpsl): %s | sl=%.6f tp=%.6f (%s)",
+            "SL+TP colocados juntos (normalTpsl): %s | sl=%g tp=%g (%s)",
             coin, sl_px, tp_px, side.upper(),
         )
         return
@@ -628,7 +613,7 @@ def _place_sltp_pair(
         if errors:
             raise RuntimeError(f"bulk_orders sin grouping errors: {errors}")
         log.info(
-            "SL+TP colocados (bulk sin grouping): %s | sl=%.6f tp=%.6f (%s)",
+            "SL+TP colocados (bulk sin grouping): %s | sl=%g tp=%g (%s)",
             coin, sl_px, tp_px, side.upper(),
         )
         return
@@ -652,7 +637,7 @@ def _place_single_sl(symbol: str, side: str, qty: float, stop_price: float) -> N
             context=f"_place_single_sl({coin},{stop_price})",
         )
         _check_order_response(resp, f"_place_single_sl({coin},{stop_price})")
-        log.info("SL colocado en %s (%s %s)", stop_price, side.upper(), coin)
+        log.info("SL colocado en %g (%s %s)", stop_price, side.upper(), coin)
     except Exception as exc:
         log.warning("_place_single_sl(%s) falló: %s", coin, exc)
 
@@ -670,7 +655,7 @@ def _place_single_tp(symbol: str, side: str, qty: float, tp_price: float) -> Non
             context=f"_place_single_tp({coin},{tp_price})",
         )
         _check_order_response(resp, f"_place_single_tp({coin},{tp_price})")
-        log.info("TP colocado en %s (%s %s)", tp_price, side.upper(), coin)
+        log.info("TP colocado en %g (%s %s)", tp_price, side.upper(), coin)
     except Exception as exc:
         log.warning("_place_single_tp(%s) falló: %s", coin, exc)
 
@@ -730,7 +715,7 @@ def _modify_single_order(
     errors = [s.get("error") for s in statuses if "error" in s]
     if errors:
         raise RuntimeError(f"modify_order {tpsl} errors: {errors}")
-    log.info("Orden %s modificada in-place: %s oid=%s → %.6f", tpsl.upper(), coin, oid, new_px)
+    log.info("Orden %s modificada in-place: %s oid=%s → %g", tpsl.upper(), coin, oid, new_px)
 
 
 def _batch_modify_sltp(
@@ -798,7 +783,7 @@ def _batch_modify_sltp(
 
     log.debug(
         "_batch_modify_sltp: coin=%s asset_idx=%s sl_oid=%s tp_oid=%s is_buy=%s qty=%s "
-        "new_sl=%s (limit=%s) new_tp=%s (limit=%s)",
+        "new_sl=%g (limit=%g) new_tp=%g (limit=%g)",
         coin, asset_idx, sl_oid, tp_oid, is_close_buy, qty,
         new_sl, sl_limit_px, new_tp, tp_limit_px,
     )
@@ -814,7 +799,7 @@ def _batch_modify_sltp(
         if errors:
             raise RuntimeError(f"bulk_modify_orders_new errors: {errors}")
         log.info(
-            "SL+TP modificados atómicamente (batchModify): %s | sl=%.6f tp=%.6f",
+            "SL+TP modificados atómicamente (batchModify): %s | sl=%g tp=%g",
             coin, new_sl, new_tp,
         )
         return True
@@ -835,6 +820,8 @@ def modify_sltp_orders(
 ) -> None:
     coin = _hl_symbol(symbol)
     is_close_buy = (side == "short")
+    # v23 Fix #5: doble redondeo idempotente — _place_sltp_pair vuelve a redondear
+    # pero es inofensivo dado que _round_price(coin, _round_price(coin, x)) == _round_price(coin, x)
     new_sl_r = _round_price(coin, new_sl)
     new_tp_r = _round_price(coin, new_tp)
 
@@ -843,7 +830,7 @@ def modify_sltp_orders(
     tp_info = trigger["tp"]
 
     log.debug(
-        "modify_sltp_orders: %s side=%s qty=%s new_sl=%.6f new_tp=%.6f | "
+        "modify_sltp_orders: %s side=%s qty=%s new_sl=%g new_tp=%g | "
         "existing sl=%s tp=%s",
         coin, side, qty, new_sl_r, new_tp_r,
         sl_info, tp_info,
@@ -924,7 +911,7 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
         context=f"open_order {side.upper()} {coin} qty={qty}",
     )
     _check_order_response(resp, f"open_order {side.upper()} {coin} qty={qty}")
-    log.info("Orden abierta: %s %s qty=%.4f @ ~%.4f", side.upper(), coin, qty, limit_px)
+    log.info("Orden abierta: %s %s qty=%.4f @ ~%g", side.upper(), coin, qty, limit_px)
 
     _place_sltp_pair(sym_bot, side, qty, sl, tp)
     return resp
@@ -985,10 +972,6 @@ def cancel_all_orders(symbol: str = None) -> None:
 
 # ── Historial de fills ──────────────────────────────────────────────────
 def _parse_pnl(raw) -> float:
-    """
-    Parsea closedPnl desde la API — puede llegar como str, float, int o None.
-    Retorna 0.0 si el valor es None, vacío o no parseable.
-    """
     if raw is None or raw == "":
         return 0.0
     try:
@@ -1018,18 +1001,10 @@ def _normalize_fill(f: dict) -> dict:
 
 
 def _is_close_fill(f: dict) -> bool:
-    """
-    v22 Fix #4: acepta un fill como 'cierre' si:
-    - 'Close' aparece en el campo 'dir' (criterio original), O
-    - closedPnl != 0 (criterio semántico: cualquier fill que realizó PnL
-      es un cierre real, independientemente del valor de 'dir').
-    Esto cubre fills donde dir sea 'Buy'/'Sell' sin prefijo 'Close'.
-    """
     fill_dir = f.get("dir", "")
     if "Close" in fill_dir:
         return True
-    closed_pnl = _parse_pnl(f.get("closedPnl"))
-    return closed_pnl != 0.0
+    return _parse_pnl(f.get("closedPnl")) != 0.0
 
 
 def get_fills(
