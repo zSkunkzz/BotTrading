@@ -39,6 +39,14 @@ v11 — Fix "Invalid TPSL price" al colocar SL+TP por separado:
   place_stop_order y place_tp_order mantienen su firma pública pero
   delegan en _place_sltp_pair cuando se dispone de ambos precios, o
   envían la orden individual si solo se pide una de las dos.
+v12 — Fix CRÍTICO grouping="normalTpsl" nunca se pasaba a bulk_orders:
+  La firma del SDK es bulk_orders(order_requests, builder=None, grouping="na").
+  _place_sltp_pair llamaba bulk_orders([sl, tp]) sin el kwarg grouping,
+  por lo que HL recibía siempre grouping="na" y rechazaba la segunda orden
+  como orden independiente conflictiva.
+  Fix: pasar grouping="normalTpsl" explícitamente.
+  También se corrige _restore_sl_tp_on_sync en main.py que llamaba
+  place_stop_order + place_tp_order por separado en lugar de _place_sltp_pair.
 """
 import logging
 import math
@@ -173,8 +181,6 @@ def _get_tick_decimals(coin: str) -> int:
         for asset_info in meta.get("universe", []):
             if asset_info.get("name") == coin:
                 tick_sz = float(asset_info.get("tickSz", 0.0001))
-                # número de decimales = cuantos ceros tras el punto tiene el tickSize
-                # ej: 0.0001 -> 4, 0.001 -> 3, 0.00001 -> 5, 1 -> 0
                 dec = max(0, round(-math.log10(tick_sz)))
                 _tick_decimals[coin] = dec
                 log.debug("tick_decimals(%s): tickSz=%s → %d decimales", coin, tick_sz, dec)
@@ -190,8 +196,7 @@ def _round_price(coin: str, price: float) -> float:
     """Redondea `price` al tickSize del par usando Decimal para evitar
     residuos de punto flotante que el SDK rechaza en floattowire."""
     dec = _get_tick_decimals(coin)
-    # Usar Decimal con quantize garantiza representación exacta
-    quantizer = Decimal(10) ** -dec  # ej: dec=4 → Decimal('0.0001')
+    quantizer = Decimal(10) ** -dec
     rounded = Decimal(str(price)).quantize(quantizer, rounding=ROUND_HALF_UP)
     return float(rounded)
 
@@ -205,7 +210,7 @@ def _market_price(coin: str, is_buy: bool) -> float:
     if mid <= 0:
         raise ValueError(f"No se pudo obtener precio para {coin}")
     raw = mid * (1 + _MARKET_SLIPPAGE) if is_buy else mid * (1 - _MARKET_SLIPPAGE)
-    return _round_price(coin, raw)  # v8+v9: Decimal rounding
+    return _round_price(coin, raw)
 
 
 # ── Balance ───────────────────────────────────────────────────────────────────
@@ -295,7 +300,6 @@ def get_all_positions() -> dict[str, dict]:
     state     = _hl_call(_info.user_state, _WALLET_ADDRESS, context="get_all_positions")
     hl_to_bot = {_hl_symbol(s): s for s in config.SYMBOLS}
 
-    # DIAG v10: log de todos los coins con posición abierta que devuelve HL
     asset_positions = state.get("assetPositions", [])
     open_coins = [
         (e.get("position", {}).get("coin", "?"), float(e.get("position", {}).get("szi", 0)))
@@ -393,7 +397,7 @@ def _order_reduce_only(coin, is_buy, qty, price, order_type):
     return _exchange.order(coin, is_buy, qty, price, order_type, True)
 
 
-# ── SL + TP juntos con normalTpsl (v11) ─────────────────────────────────────────────
+# ── SL + TP juntos con normalTpsl (v12 — fix grouping) ──────────────────────────────
 
 def _place_sltp_pair(
     symbol: str,
@@ -404,12 +408,13 @@ def _place_sltp_pair(
 ) -> None:
     """Envía SL y TP en una sola llamada bulk_orders con grouping='normalTpsl'.
 
-    Hyperliquid rechaza añadir TP (o SL) como orden independiente cuando ya
-    existe la orden complementaria activa sobre la misma posición. Enviarlos
-    juntos en un solo bulk evita el error 'Invalid TPSL price'.
+    v12 FIX: se pasa grouping="normalTpsl" explícitamente al SDK.
+    La firma del SDK es bulk_orders(order_requests, builder=None, grouping="na"),
+    por lo que sin este kwarg siempre se enviaba grouping="na" y HL rechazaba
+    la segunda orden como orden independiente conflictiva.
     """
     coin     = _hl_symbol(symbol)
-    is_close = side == "short"  # cerrar long → sell; cerrar short → buy
+    is_close = side == "short"  # cerrar long → sell (False); cerrar short → buy (True)
 
     sl_px = _round_price(coin, sl_price)
     tp_px = _round_price(coin, tp_price)
@@ -435,9 +440,9 @@ def _place_sltp_pair(
         resp = _hl_call(
             _exchange.bulk_orders,
             [sl_order, tp_order],
+            grouping="normalTpsl",  # v12 FIX: era "na" por defecto → HL rechazaba la 2ª orden
             context=f"_place_sltp_pair({coin} sl={sl_px} tp={tp_px})",
         )
-        # bulk_orders devuelve lista de statuses — revisar cada uno
         statuses = (
             ((resp.get("response") or {})
              .get("data") or {})
@@ -447,12 +452,11 @@ def _place_sltp_pair(
         if errors:
             raise RuntimeError(f"bulk_orders SLTP errors: {errors}")
         log.info(
-            "SL+TP colocados juntos: %s | sl=%.4f tp=%.4f (%s %s)",
+            "SL+TP colocados juntos (normalTpsl): %s | sl=%.4f tp=%.4f (%s %s)",
             coin, sl_px, tp_px, side.upper(), coin,
         )
     except Exception as exc:
         log.warning("_place_sltp_pair(%s) falló: %s — intentando órdenes separadas", coin, exc)
-        # Fallback: intentar individualmente (comportamiento anterior)
         _place_single_sl(symbol, side, qty, sl_price)
         _place_single_tp(symbol, side, qty, tp_price)
 
@@ -510,7 +514,6 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
     set_leverage(sym_bot, config.LEVERAGE)
 
-    # v8+v9: _market_price usa Decimal rounding → floattowire no puede quejarse
     limit_px = _market_price(coin, is_buy)
     resp = _hl_call(
         _exchange.order,
@@ -521,7 +524,7 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     _check_order_response(resp, f"open_order {side.upper()} {coin} qty={qty}")
     log.info("Orden abierta: %s %s qty=%.4f @ ~%.4f", side.upper(), coin, qty, limit_px)
 
-    # v11: SL+TP juntos con normalTpsl
+    # v11+v12: SL+TP juntos con normalTpsl (grouping ahora se pasa correctamente)
     _place_sltp_pair(sym_bot, side, qty, sl, tp)
     return resp
 
@@ -556,7 +559,7 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float, sl_price
 def close_position(side: str, qty: float, symbol: str = None) -> dict:
     coin     = _hl_symbol(symbol or config.SYMBOLS[0])
     is_buy   = side == "short"
-    limit_px = _market_price(coin, is_buy)  # v8+v9: Decimal rounding
+    limit_px = _market_price(coin, is_buy)
     resp = _hl_call(
         _exchange.order,
         coin, is_buy, qty, limit_px,
