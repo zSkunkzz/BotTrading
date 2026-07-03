@@ -30,6 +30,15 @@ v10-diag — Log diagnóstico en get_all_positions():
   Imprime todos los coins RAW devueltos por la API y avisa si hay
   posiciones abiertas (szi != 0) que no están mapeadas en config.SYMBOLS.
   Permite diagnosticar por qué HYPE u otros pares no se sincronizan.
+v11 — Fix "Invalid TPSL price" al colocar SL+TP por separado:
+  Hyperliquid rechaza añadir un TP como orden independiente cuando ya
+  existe un SL activo sobre la misma posición (y viceversa).
+  Fix: _place_sltp_pair() envía SL y TP juntos en una sola llamada
+  bulk_orders con grouping="normalTpsl". open_order, place_stop_order
+  y place_tp_order usan esta función internamente.
+  place_stop_order y place_tp_order mantienen su firma pública pero
+  delegan en _place_sltp_pair cuando se dispone de ambos precios, o
+  envían la orden individual si solo se pide una de las dos.
 """
 import logging
 import math
@@ -384,6 +393,106 @@ def _order_reduce_only(coin, is_buy, qty, price, order_type):
     return _exchange.order(coin, is_buy, qty, price, order_type, True)
 
 
+# ── SL + TP juntos con normalTpsl (v11) ─────────────────────────────────────────────
+
+def _place_sltp_pair(
+    symbol: str,
+    side: str,
+    qty: float,
+    sl_price: float,
+    tp_price: float,
+) -> None:
+    """Envía SL y TP en una sola llamada bulk_orders con grouping='normalTpsl'.
+
+    Hyperliquid rechaza añadir TP (o SL) como orden independiente cuando ya
+    existe la orden complementaria activa sobre la misma posición. Enviarlos
+    juntos en un solo bulk evita el error 'Invalid TPSL price'.
+    """
+    coin     = _hl_symbol(symbol)
+    is_close = side == "short"  # cerrar long → sell; cerrar short → buy
+
+    sl_px = _round_price(coin, sl_price)
+    tp_px = _round_price(coin, tp_price)
+
+    sl_order = {
+        "coin":        coin,
+        "is_buy":      is_close,
+        "sz":          qty,
+        "limit_px":    sl_px,
+        "order_type":  {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
+        "reduce_only": True,
+    }
+    tp_order = {
+        "coin":        coin,
+        "is_buy":      is_close,
+        "sz":          qty,
+        "limit_px":    tp_px,
+        "order_type":  {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
+        "reduce_only": True,
+    }
+
+    try:
+        resp = _hl_call(
+            _exchange.bulk_orders,
+            [sl_order, tp_order],
+            context=f"_place_sltp_pair({coin} sl={sl_px} tp={tp_px})",
+        )
+        # bulk_orders devuelve lista de statuses — revisar cada uno
+        statuses = (
+            ((resp.get("response") or {})
+             .get("data") or {})
+            .get("statuses") or []
+        )
+        errors = [s.get("error") for s in statuses if "error" in s]
+        if errors:
+            raise RuntimeError(f"bulk_orders SLTP errors: {errors}")
+        log.info(
+            "SL+TP colocados juntos: %s | sl=%.4f tp=%.4f (%s %s)",
+            coin, sl_px, tp_px, side.upper(), coin,
+        )
+    except Exception as exc:
+        log.warning("_place_sltp_pair(%s) falló: %s — intentando órdenes separadas", coin, exc)
+        # Fallback: intentar individualmente (comportamiento anterior)
+        _place_single_sl(symbol, side, qty, sl_price)
+        _place_single_tp(symbol, side, qty, tp_price)
+
+
+def _place_single_sl(symbol: str, side: str, qty: float, stop_price: float) -> None:
+    """Coloca solo el SL (sin TP). Uso interno como fallback."""
+    coin       = _hl_symbol(symbol)
+    is_buy     = side == "short"
+    stop_price = _round_price(coin, stop_price)
+    order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
+    try:
+        resp = _hl_call(
+            _order_reduce_only,
+            coin, is_buy, qty, stop_price, order_type,
+            context=f"_place_single_sl({coin},{stop_price})",
+        )
+        _check_order_response(resp, f"_place_single_sl({coin},{stop_price})")
+        log.info("SL colocado en %s (%s %s)", stop_price, side.upper(), coin)
+    except Exception as exc:
+        log.warning("_place_single_sl(%s) falló: %s", coin, exc)
+
+
+def _place_single_tp(symbol: str, side: str, qty: float, tp_price: float) -> None:
+    """Coloca solo el TP (sin SL). Uso interno como fallback."""
+    coin       = _hl_symbol(symbol)
+    is_buy     = side == "short"
+    tp_price   = _round_price(coin, tp_price)
+    order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
+    try:
+        resp = _hl_call(
+            _order_reduce_only,
+            coin, is_buy, qty, tp_price, order_type,
+            context=f"_place_single_tp({coin},{tp_price})",
+        )
+        _check_order_response(resp, f"_place_single_tp({coin},{tp_price})")
+        log.info("TP colocado en %s (%s %s)", tp_price, side.upper(), coin)
+    except Exception as exc:
+        log.warning("_place_single_tp(%s) falló: %s", coin, exc)
+
+
 # ── Abrir orden ──────────────────────────────────────────────────────────────────
 
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
@@ -412,43 +521,34 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     _check_order_response(resp, f"open_order {side.upper()} {coin} qty={qty}")
     log.info("Orden abierta: %s %s qty=%.4f @ ~%.4f", side.upper(), coin, qty, limit_px)
 
-    place_stop_order(sym_bot, side, qty, sl)
-    place_tp_order(sym_bot, side, qty, tp)
+    # v11: SL+TP juntos con normalTpsl
+    _place_sltp_pair(sym_bot, side, qty, sl, tp)
     return resp
 
 
-def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
-    coin       = _hl_symbol(symbol)
-    is_buy     = side == "short"  # cerrar long → sell; cerrar short → buy
-    stop_price = _round_price(coin, stop_price)  # v7+v9: Decimal rounding
-    order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
-    try:
-        resp = _hl_call(
-            _order_reduce_only,
-            coin, is_buy, qty, stop_price, order_type,
-            context=f"place_stop_order({coin},{stop_price})",
-        )
-        _check_order_response(resp, f"place_stop_order({coin},{stop_price})")
-        log.info("SL colocado en %s (%s %s)", stop_price, side.upper(), coin)
-    except Exception as exc:
-        log.warning("place_stop_order(%s) falló: %s", coin, exc)
+def place_stop_order(symbol: str, side: str, qty: float, stop_price: float, tp_price: float = None) -> None:
+    """Coloca SL (y opcionalmente TP juntos via normalTpsl).
+
+    Si se pasa tp_price, ambas órdenes se envían en un solo bulk_orders
+    con grouping normalTpsl para evitar el error 'Invalid TPSL price'.
+    Si solo se pasa stop_price, se envía como orden individual (trailing update).
+    """
+    if tp_price is not None:
+        _place_sltp_pair(symbol, side, qty, stop_price, tp_price)
+    else:
+        _place_single_sl(symbol, side, qty, stop_price)
 
 
-def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
-    coin       = _hl_symbol(symbol)
-    is_buy     = side == "short"  # cerrar long → sell; cerrar short → buy
-    tp_price   = _round_price(coin, tp_price)  # v7+v9: Decimal rounding
-    order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
-    try:
-        resp = _hl_call(
-            _order_reduce_only,
-            coin, is_buy, qty, tp_price, order_type,
-            context=f"place_tp_order({coin},{tp_price})",
-        )
-        _check_order_response(resp, f"place_tp_order({coin},{tp_price})")
-        log.info("TP colocado en %s (%s %s)", tp_price, side.upper(), coin)
-    except Exception as exc:
-        log.warning("place_tp_order(%s) falló: %s", coin, exc)
+def place_tp_order(symbol: str, side: str, qty: float, tp_price: float, sl_price: float = None) -> None:
+    """Coloca TP (y opcionalmente SL juntos via normalTpsl).
+
+    Si se pasa sl_price, ambas órdenes se envían en un solo bulk_orders.
+    Si solo se pasa tp_price, se envía como orden individual.
+    """
+    if sl_price is not None:
+        _place_sltp_pair(symbol, side, qty, sl_price, tp_price)
+    else:
+        _place_single_tp(symbol, side, qty, tp_price)
 
 
 # ── Cerrar posición ──────────────────────────────────────────────────────────────────
