@@ -143,6 +143,26 @@ v18 — Fix CRÍTICO modify_sltp_orders (2 bugs):
     Fix: buscar "bulk_modify_orders_new" y llamarla sin grouping (el SDK
     ya construye internamente el action batchModify con los wires
     correctos — no acepta kwarg grouping).
+
+v19 — Fix _batch_modify_sltp: formato ModifyRequest correcto según SDK oficial.
+
+  Confirmado leyendo el código fuente del SDK (hyperliquid-dex/hyperliquid-python-sdk):
+  bulk_modify_orders_new() espera List[ModifyRequest] donde cada ModifyRequest es:
+    {"oid": int, "order": OrderRequest}
+  y OrderRequest usa el campo "coin" (nombre del activo, ej. "BTC"), NO el asset index.
+  El SDK hace internamente name_to_asset(order["coin"]) en order_request_to_order_wire().
+
+  Bug confirmado en v18: el campo "coin" dentro de order ya era correcto (nombre string),
+  pero modify_order() del SDK llama internamente a bulk_modify_orders_new con un solo
+  elemento — por tanto _modify_single_order y _batch_modify_sltp son equivalentes en
+  cuanto a serialización. El path atómico (_batch_modify_sltp) es el preferido porque
+  envía ambas órdenes en una sola firma cryptográfica, eliminando la ventana de
+  desprotección entre el modify del SL y el del TP.
+
+  Fix adicional: se añade log.debug del modify_request completo antes de enviarlo
+  para facilitar diagnóstico futuro sin tener que añadir prints temporales.
+  Se documenta explícitamente que "coin" en OrderRequest es el nombre ("BTC"),
+  NO el asset index numérico — confusión común al leer el wire format de HL.
 """
 import logging
 import math
@@ -306,6 +326,10 @@ def _trigger_market_limit_px(coin: str, is_buy: bool, trigger_px: float) -> floa
 
     - Sell trigger (is_buy=False): limit_px = 0
     - Buy trigger  (is_buy=True):  limit_px = triggerPx * 1.10, redondeado al tickSize
+
+    Nota: el SDK de HL convierte internamente limit_px=0 al wire "0" para sells.
+    Para buys necesita un precio por encima del mercado para que no se ejecute
+    como límite inmediato — el SDK oficial usa este mismo patrón.
     """
     if not is_buy:
         return 0.0
@@ -744,15 +768,24 @@ def _modify_single_order(
 ) -> None:
     """Modifica una orden trigger existente usando Exchange.modify_order() del SDK.
 
-    v18 FIX: la firma real del SDK es modify_order(oid, name, is_buy, sz, limit_px,
-    order_type, reduce_only). Versiones anteriores pasaban los args en orden
-    incorrecto (coin, oid, ...) causando que HL rechazara todos los modifies.
+    Firma real del SDK (confirmada en código fuente oficial):
+      modify_order(oid, name, is_buy, sz, limit_px, order_type, reduce_only=False)
+    Internamente llama a bulk_modify_orders_new([{oid, order}]).
+
+    v18 FIX: reordenados args — oid primero, luego name (coin), igual que el SDK.
+    v19: new_px ya viene redondeado del caller (modify_sltp_orders), pero se
+    aplica _round_price defensivamente por si se llama directamente.
     """
+    new_px     = _round_price(coin, new_px)  # v19: defensivo
     limit_px   = _trigger_market_limit_px(coin, is_buy, new_px)
     order_type = {"trigger": {"triggerPx": new_px, "isMarket": True, "tpsl": tpsl}}
+    log.debug(
+        "_modify_single_order: coin=%s oid=%s is_buy=%s qty=%s limit_px=%s tpsl=%s triggerPx=%s",
+        coin, oid, is_buy, qty, limit_px, tpsl, new_px,
+    )
     resp = _hl_call(
         _exchange.modify_order,
-        oid, coin, is_buy, qty, limit_px, order_type, True,   # v18: oid primero, luego coin
+        oid, coin, is_buy, qty, limit_px, order_type, True,
         context=f"modify_order({coin} oid={oid} {tpsl}={new_px})",
     )
     statuses = (((resp or {}).get("response") or {}).get("data") or {}).get("statuses") or []
@@ -771,35 +804,40 @@ def _batch_modify_sltp(
     new_sl: float,
     new_tp: float,
 ) -> bool:
-    """v15: Intenta modificar SL y TP atómicamente con bulk_modify_orders_new.
+    """Modifica SL y TP atómicamente con bulk_modify_orders_new (batchModify).
 
-    v16 FIX: aplica _round_price internamente sobre new_sl y new_tp antes de
-    construir los modify_requests, para que la función sea segura ante llamadas
-    directas con precios no redondeados (no depende del caller).
+    Formato ModifyRequest confirmado en SDK oficial (hyperliquid-dex/hyperliquid-python-sdk):
+      [{"oid": int, "order": OrderRequest}, ...]
+    donde OrderRequest.coin es el NOMBRE del activo ("BTC"), NO el asset index.
+    El SDK hace name_to_asset(order["coin"]) internamente en order_request_to_order_wire().
+    bulk_modify_orders_new NO acepta kwarg grouping — construye internamente
+    el action {"type": "batchModify", "modifies": [...]}.
 
-    v18 FIX: buscaba "bulk_modify_orders" (no existe) — el SDK lo expone como
-    "bulk_modify_orders_new". Al no encontrarlo, siempre retornaba False
-    desactivando el path atómico. Corregido para buscar el nombre real.
-    Además, bulk_modify_orders_new NO acepta kwarg grouping — el SDK construye
-    internamente el action batchModify. Se elimina grouping="normalTpsl".
+    v15: path atómico inicial.
+    v16: _round_price defensivo interno.
+    v18: nombre correcto "bulk_modify_orders_new", sin kwarg grouping.
+    v19: log.debug del request completo para diagnóstico; _round_price defensivo
+         también en new_sl/new_tp antes de construir limit_px.
     """
-    bulk_modify = getattr(_exchange, "bulk_modify_orders_new", None)  # v18 FIX: nombre correcto
+    bulk_modify = getattr(_exchange, "bulk_modify_orders_new", None)
     if bulk_modify is None:
         log.debug("[%s] bulk_modify_orders_new no disponible en este SDK — usando modify individual", coin)
         return False
 
-    # v16 FIX: redondear internamente
+    # Redondear internamente — defensivo ante llamadas directas con precios crudos
     new_sl = _round_price(coin, new_sl)
     new_tp = _round_price(coin, new_tp)
 
     sl_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_sl)
     tp_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_tp)
 
+    # v19: "coin" es el nombre del activo ("BTC"), NO el asset index.
+    # El SDK llama internamente name_to_asset(order["coin"]) en order_request_to_order_wire().
     modify_requests = [
         {
-            "oid":        sl_oid,
+            "oid": sl_oid,
             "order": {
-                "coin":        coin,
+                "coin":        coin,        # nombre, ej. "BTC" — SDK convierte a asset index
                 "is_buy":      is_close_buy,
                 "sz":          qty,
                 "limit_px":    sl_limit_px,
@@ -808,7 +846,7 @@ def _batch_modify_sltp(
             },
         },
         {
-            "oid":        tp_oid,
+            "oid": tp_oid,
             "order": {
                 "coin":        coin,
                 "is_buy":      is_close_buy,
@@ -820,8 +858,14 @@ def _batch_modify_sltp(
         },
     ]
 
+    log.debug(
+        "_batch_modify_sltp: coin=%s sl_oid=%s tp_oid=%s is_buy=%s qty=%s "
+        "new_sl=%s (limit=%s) new_tp=%s (limit=%s)",
+        coin, sl_oid, tp_oid, is_close_buy, qty,
+        new_sl, sl_limit_px, new_tp, tp_limit_px,
+    )
+
     try:
-        # v18 FIX: bulk_modify_orders_new no acepta kwarg grouping
         resp = _hl_call(
             bulk_modify,
             modify_requests,
@@ -853,9 +897,13 @@ def modify_sltp_orders(
 ) -> None:
     """Modifica SL y TP in-place usando Exchange.modify_order() del SDK oficial.
 
-    v16 FIX (bug #3 — caso asimétrico):
-      Cuando solo existe SL o solo TP, cancela la existente y recoloca ambas
-      con _place_sltp_pair (grouping=normalTpsl).
+    Flujo:
+      1. get_open_trigger_orders → obtiene oid de SL y TP activos.
+      2. Si ambos existen → _batch_modify_sltp (batchModify atómico, una firma).
+         Si batch falla → _modify_single_order x2 (dos modify_order secuenciales).
+         Si algún modify individual falla → cancel_all_orders + _place_sltp_pair.
+      3. Si solo existe uno (asimétrico) → cancel + _place_sltp_pair.
+      4. Si no existe ninguno → _place_sltp_pair desde cero.
     """
     coin         = _hl_symbol(symbol)
     is_close_buy = (side == "short")  # cerrar short → buy
@@ -866,13 +914,20 @@ def modify_sltp_orders(
     sl_info = trigger["sl"]
     tp_info = trigger["tp"]
 
+    log.debug(
+        "modify_sltp_orders: %s side=%s qty=%s new_sl=%.6f new_tp=%.6f | "
+        "existing sl=%s tp=%s",
+        coin, side, qty, new_sl_r, new_tp_r,
+        sl_info, tp_info,
+    )
+
     # Sin órdenes previas → colocar desde cero
     if sl_info is None and tp_info is None:
         log.info("[%s] modify_sltp: sin órdenes abiertas → place desde cero", coin)
         _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
         return
 
-    # Ambas órdenes existen → intentar batchModify atómico (v15), luego modify individual
+    # Ambas órdenes existen → intentar batchModify atómico, luego modify individual
     if sl_info is not None and tp_info is not None:
         if _batch_modify_sltp(
             coin,
@@ -882,7 +937,7 @@ def modify_sltp_orders(
         ):
             return
 
-        # batchModify devolvió False → modify individual (v13/v14)
+        # batchModify devolvió False → modify individual (dos llamadas)
         sl_ok = False
         tp_ok = False
 
@@ -910,9 +965,9 @@ def modify_sltp_orders(
         _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
         return
 
-    # Caso asimétrico — solo existe SL o solo existe TP (v16 FIX)
-    existing_oid = (sl_info or tp_info)["oid"]
+    # Caso asimétrico — solo existe SL o solo existe TP
     existing_type = "SL" if sl_info else "TP"
+    existing_oid  = (sl_info or tp_info)["oid"]
     log.info(
         "[%s] modify_sltp: caso asimétrico — solo existe %s (oid=%s) → "
         "cancelando y recolocando ambas con normalTpsl",
