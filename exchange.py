@@ -32,6 +32,19 @@ v13 — Fix "Order has invalid price" en open_order (doble llamada de precio):
   Fix: calcular limit_px UNA SOLA VEZ con _market_price() y usar ese valor
   también para el check de notional mínimo. Se elimina la llamada separada
   a get_price() en open_order.
+v14 — Fix "Order has invalid price" en open_order (slippage demasiado alto):
+  _MARKET_SLIPPAGE=0.5% hacía que limit_px quedara ~$310 sobre el ask real
+  en BTC (precio ~62 626), lo que excede el límite de desviación que aplica
+  Hyperliquid respecto al mark price en activos muy líquidos.
+  Fix: slippage dinámico por activo en _market_price():
+    - BTC, ETH          → 0.10 %  (spread ultra-tight)
+    - HYPE, SOL, BNB,
+      XRP, DOGE, ADA,
+      AVAX, DOT, LTC,
+      LINK               → 0.20 %  (majors con alta liquidez)
+    - resto              → 0.30 %  (altcoins con spread mayor)
+  Se elimina la constante global _MARKET_SLIPPAGE y se introduce
+  _SLIPPAGE_BY_COIN (dict) + _DEFAULT_SLIPPAGE.
 """
 import logging
 import math
@@ -178,15 +191,47 @@ def _round_price(coin: str, price: float) -> float:
     return float(rounded)
 
 
+# ── Slippage dinámico por activo (v14) ──────────────────────────────────────────────
+# Hyperliquid rechaza limit_px que supere el mark price en más de ~0.3 % en activos
+# muy líquidos. Usamos un slippage mínimo en majors para evitar el rechazo y un
+# slippage ligeramente mayor en altcoins donde el spread es más amplio.
+
+_SLIPPAGE_BY_COIN: dict[str, float] = {
+    # Ultra-tight spread — 0.10 %
+    "BTC":  0.001,
+    "ETH":  0.001,
+    # Majors con alta liquidez — 0.20 %
+    "HYPE": 0.002,
+    "SOL":  0.002,
+    "BNB":  0.002,
+    "XRP":  0.002,
+    "DOGE": 0.002,
+    "ADA":  0.002,
+    "AVAX": 0.002,
+    "DOT":  0.002,
+    "LTC":  0.002,
+    "LINK": 0.002,
+    "TRX":  0.002,
+    "SUI":  0.002,
+    "TRUMP":0.002,
+}
+_DEFAULT_SLIPPAGE = 0.003  # 0.30 % para el resto de altcoins
+
+
+def _get_slippage(coin: str) -> float:
+    return _SLIPPAGE_BY_COIN.get(coin, _DEFAULT_SLIPPAGE)
+
+
 # ── Precio límite para órdenes de mercado ─────────────────────────────────────────
-_MARKET_SLIPPAGE = 0.005
 
 def _market_price(coin: str, is_buy: bool) -> float:
     mids = _hl_call(_info.all_mids, context=f"_market_price({coin})")
     mid  = float(mids.get(coin, 0))
     if mid <= 0:
         raise ValueError(f"No se pudo obtener precio para {coin}")
-    raw = mid * (1 + _MARKET_SLIPPAGE) if is_buy else mid * (1 - _MARKET_SLIPPAGE)
+    slippage = _get_slippage(coin)
+    raw = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
+    log.debug("_market_price(%s) mid=%.6f slippage=%.3f%% limit_px=%.6f", coin, mid, slippage * 100, raw)
     return _round_price(coin, raw)
 
 
@@ -472,10 +517,11 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     """Abre una posición IOC y coloca SL+TP juntos con normalTpsl.
 
     v13 FIX: se usa limit_px (de _market_price) también para el check de
-    notional mínimo, eliminando la llamada separada a get_price(). Antes se
-    hacían dos llamadas a all_mids() con 20-50ms de diferencia; si el precio
-    cambiaba entre ambas, el limit_px podía quedar fuera del ask actual y HL
-    rechazaba la orden con "Order has invalid price".
+    notional mínimo, eliminando la llamada separada a get_price().
+
+    v14 FIX: slippage dinámico por activo (_get_slippage) para que limit_px
+    nunca exceda el umbral de desviación que aplica Hyperliquid sobre el
+    mark price en activos muy líquidos (BTC/ETH usan 0.1%, resto hasta 0.3%).
     """
     sym_bot = symbol or config.SYMBOLS[0]
     coin    = _hl_symbol(sym_bot)
@@ -483,7 +529,6 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
     qty = floor_qty(qty, sym_bot)
 
-    # v13: una sola llamada de precio — se usa tanto para notional como para la orden
     limit_px = _market_price(coin, is_buy)
 
     if qty <= 0 or not min_notional_ok(qty, limit_px):
