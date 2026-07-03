@@ -14,6 +14,15 @@ v4 (trail_step):
   en Hyperliquid y el spam de notificaciones Telegram.
   Mínimo absoluto: 1 tick del par (tickSize).
 
+v5:
+  SL, TP, be_trigger y be_sl se redondean con _round_price(coin, precio)
+  en lugar de round(..., 8) fijo.
+  _round_price lee el tickSize real del par desde la API de HL (cacheado)
+  y usa Decimal.quantize para evitar residuos de punto flotante.
+  Esto asegura que precios tanto para monedas <$0.001 (PEPE, SHIB, kPEPE)
+  como para monedas >$1000 (BTC, ETH) cumplan el formato que HL exige
+  y no sean rechazados con "Order has invalid price" al colocarse.
+
 Sizing:
   Fijo: MARGIN_USDT para todas las señales.
 
@@ -59,6 +68,20 @@ def _atr(candles: list[dict], period: int = 14) -> float:
     return sum(trs[-period:]) / min(period, len(trs)) if trs else 0.0
 
 
+def _rp(coin: str | None, price: float) -> float:
+    """Redondea price al tickSize real del par (v5).
+
+    Si coin no está disponible, cae a round(..., 8) como antes.
+    _round_price usa Decimal.quantize internamente — sin residuos de float.
+    """
+    if coin:
+        try:
+            return _exchange._round_price(coin, price)
+        except Exception:
+            pass
+    return round(price, 8)
+
+
 def calc(side: str, entry: float, candles: list[dict], score: int = 78,
          symbol: str | None = None, regime: str = "bull",
          candles_1h: list[dict] | None = None) -> dict:
@@ -68,6 +91,8 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
     candles_1h: si se pasan, SL se basa en ATR 1h (preferido).
                 Fallback a ATR 15m si no están disponibles.
     """
+    coin = _exchange._hl_symbol(symbol) if symbol else None
+
     if candles_1h and len(candles_1h) >= 16:
         atr    = _atr(candles_1h[:-1], period=14)
         mult   = 1.2
@@ -93,12 +118,18 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
     sl_dist = entry * sl_pct
     tp_dist = entry * tp_pct
 
-    sl = (entry - sl_dist) if side == "long" else (entry + sl_dist)
-    tp = (entry + tp_dist) if side == "long" else (entry - tp_dist)
+    sl_raw = (entry - sl_dist) if side == "long" else (entry + sl_dist)
+    tp_raw = (entry + tp_dist) if side == "long" else (entry - tp_dist)
+
+    # v5: redondear al tickSize real del par
+    sl = _rp(coin, sl_raw)
+    tp = _rp(coin, tp_raw)
 
     if atr > 0:
-        be_trigger = (entry + BE_ATR_MULT * atr) if side == "long" else (entry - BE_ATR_MULT * atr)
-        be_sl      = (entry + BE_BUFFER_MULT * atr) if side == "long" else (entry - BE_BUFFER_MULT * atr)
+        be_trigger_raw = (entry + BE_ATR_MULT * atr)    if side == "long" else (entry - BE_ATR_MULT * atr)
+        be_sl_raw      = (entry + BE_BUFFER_MULT * atr) if side == "long" else (entry - BE_BUFFER_MULT * atr)
+        be_trigger = _rp(coin, be_trigger_raw)
+        be_sl      = _rp(coin, be_sl_raw)
     else:
         be_trigger = None
         be_sl      = None
@@ -117,10 +148,12 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
 
     # v4: trail_step = TRAIL_STEP_MULT × sl_dist (subido de 0.3 a 0.5)
     # Mínimo: 1 tick de precio del par para no enviar órdenes sub-tick.
-    if symbol:
-        coin = _exchange._hl_symbol(symbol)
-        tick_dec = _exchange._get_tick_decimals(coin)
-        min_step = 10 ** (-tick_dec)
+    if coin:
+        try:
+            tick_dec = _exchange._get_tick_decimals(coin)
+            min_step = 10 ** (-tick_dec)
+        except Exception:
+            min_step = 1e-6
     else:
         min_step = 1e-6
 
@@ -129,26 +162,26 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
 
     log.info(
         "[%s] score=%d regime=%s RR=%.1f margin=%.2f "
-        "ATR_%s=%.6f atr_pct=%.3f%% sl_pct=%.3f%% tp_pct=%.3f%% "
-        "SL=%.6f TP=%.6f be_trigger=%s be_sl=%s qty=%.8f trail=%.8f",
+        "ATR_%s=%.8f atr_pct=%.4f%% sl_pct=%.3f%% tp_pct=%.3f%% "
+        "SL=%.8f TP=%.8f be_trigger=%s be_sl=%s qty=%.8f trail=%.8f",
         side.upper(), score, regime, rr, margin,
         source, atr, atr_pct * 100, sl_pct * 100, tp_pct * 100,
         sl, tp,
-        f"{be_trigger:.6f}" if be_trigger else "N/A",
-        f"{be_sl:.6f}" if be_sl else "N/A",
+        f"{be_trigger:.8f}" if be_trigger else "N/A",
+        f"{be_sl:.8f}" if be_sl else "N/A",
         qty, trail_step,
     )
 
     return {
         "qty":        qty,
-        "sl":         round(sl, 8),
-        "tp":         round(tp, 8),
+        "sl":         sl,
+        "tp":         tp,
         "atr":        round(atr, 8),
         "trail_step": trail_step,
         "score":      score,
         "tp_rr":      rr,
-        "be_trigger": round(be_trigger, 8) if be_trigger else None,
-        "be_sl":      round(be_sl, 8) if be_sl else None,
+        "be_trigger": be_trigger,
+        "be_sl":      be_sl,
     }
 
 
@@ -178,9 +211,11 @@ def check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
             return False
 
     log.info(
-        "[%s] 🔒 Break-even lock activado | precio=%.6f trigger=%.6f be_sl=%.6f (antes sl=%.6f)",
+        "[%s] \U0001f512 Break-even lock activado | precio=%.8f trigger=%.8f be_sl=%.8f (antes sl=%.8f)",
         symbol, current_price, be_trigger, be_sl, current_sl or 0,
     )
-    pos["sl"]        = round(be_sl, 8)
+    # v5: be_sl ya viene redondeado al tickSize desde calc()
+    coin = _exchange._hl_symbol(symbol)
+    pos["sl"]        = _rp(coin, be_sl)
     pos["be_locked"] = True
     return True
