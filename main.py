@@ -36,8 +36,14 @@ v12:
     patrón cancel_all_orders→place_stop→place_tp por exchange.modify_sltp_orders()
     (batchModify in-place). Las órdenes se modifican atómicamente — si el exchange
     las rechaza, las antiguas siguen activas sin ventana de desprotección.
-    _restore_sl_tp_on_sync mantiene cancel+place porque solo se ejecuta al
-    arrancar cuando no hay órdenes previas que modificar.
+v13:
+  - _restore_sl_tp_on_sync: sustituye place_stop_order + place_tp_order separados
+    por exchange._place_sltp_pair() con grouping normalTpsl.
+    Causa: HL rechaza colocar TP como orden independiente cuando ya existe SL activo
+    (y viceversa). _place_sltp_pair envía ambas en un solo bulk_orders normalTpsl.
+  - modify_sltp_orders en exchange.py: corregido para usar Exchange.modify_order()
+    del SDK real (bulk_modify_orders_new no existía y siempre fallaba al fallback
+    cancel+place, dejando ventana de desprotección).
 """
 import logging
 import os
@@ -698,6 +704,13 @@ def _restore_sl_tp_on_sync(
     pos: dict,
     feed,
 ) -> None:
+    """Restaura SL y TP tras reinicio cuando la posición ya existía en el exchange.
+
+    v13 FIX: usa exchange._place_sltp_pair() con grouping normalTpsl en lugar de
+    place_stop_order + place_tp_order separados.
+    HL rechaza colocar un TP independiente cuando ya existe SL activo (y viceversa).
+    _place_sltp_pair envía ambas en un solo bulk_orders con grouping=normalTpsl.
+    """
     sl   = pos.get("sl")
     tp   = pos.get("tp")
     side = pos["side"]
@@ -728,10 +741,11 @@ def _restore_sl_tp_on_sync(
         new_sl = params["sl"]
         new_tp = params["tp"]
 
-        # cancel+place es correcto aquí: no hay órdenes previas que modificar
+        # Cancelar órdenes previas (por si hay alguna huérfana) y colocar
+        # SL+TP juntos con normalTpsl — fix v13: evita el error
+        # "Invalid TPSL price" al colocarlos como órdenes separadas.
         exchange.cancel_all_orders(symbol)
-        exchange.place_stop_order(symbol, side, qty, new_sl)
-        exchange.place_tp_order(symbol, side, qty, new_tp)
+        exchange._place_sltp_pair(symbol, side, qty, new_sl, new_tp)
 
         pos["sl"]          = new_sl
         pos["tp"]          = new_tp
@@ -1051,7 +1065,7 @@ def run() -> None:
 
             for symbol, pos in list(positions.items()):
                 try:
-                    price = exchange.get_price(symbol)
+pr                    ice = exchange.get_price(symbol)
                     _apply_breakeven(symbol, pos, price)
                     _update_trailing(symbol, pos, price)
                     _check_tp_extension(symbol, pos, price, feed, effective_min_score)
