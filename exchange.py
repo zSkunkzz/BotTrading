@@ -231,6 +231,40 @@ v22 — Fix 3 bugs acumulados detectados en revisión de código:
     se mantiene closedPnl como heurística secundaria pero con la nota
     de que es aproximada. El campo "dir" se preserva en el fill normalizado
     para que el caller pueda inspeccionarlo si necesita más contexto.
+
+v23 — Fix definitivo SL/TP: _batch_modify_sltp eliminada, modify simplificado.
+
+  Bug #1 (_batch_modify_sltp — ELIMINADA):
+    bulk_modify_orders_new() del SDK NO hace name_to_asset() internamente
+    (a diferencia de bulk_orders que sí lo hace). Estábamos construyendo
+    un wire format a mano con "a" = asset index que el SDK re-serializaba
+    de forma incorrecta porque sus helpers internos esperan el mismo dict
+    de alto nivel que bulk_orders. La función devolvía False en cada intento,
+    lo que forzaba siempre al path de modify individual — correcto pero
+    con doble latencia de log innecesaria.
+    Fix: modify_sltp_orders llama directamente a _modify_single_order() para
+    SL y TP. Exchange.modify_order() del SDK maneja la serialización interna
+    correctamente (igual que exchange.order() para place).
+
+  Bug #2 (_modify_single_order — order_type con floats, no strings):
+    Exchange.modify_order() del SDK hace la misma transformación interna
+    que exchange.order(): llama order_request_to_order_wire() que invoca
+    floattowire() sobre triggerPx. Si pasábamos triggerPx como string
+    (via _price_to_wire) el SDK lo intentaba convertir a float y podía
+    perder precisión. Se documenta explícitamente que triggerPx debe ser
+    float aquí (el SDK lo convierte internamente a string wire-safe).
+
+  Bug #3 (_place_sltp_pair — fallback sin grouping eliminado):
+    El segundo intento sin grouping="normalTpsl" enviaba dos órdenes TPSL
+    independientes que HL rechazaba la segunda silenciosamente.
+    Ahora si normalTpsl falla se lanza la excepción limpiamente.
+
+  Bug #4 (modify_sltp_orders — caso asimétrico mejorado):
+    Si solo existe SL, colocamos el TP faltante directamente con
+    _place_single_tp (y viceversa). El cancel previo era innecesario y
+    dejaba la posición sin protección durante ~200ms.
+    EXCEPCIÓN: si _place_single_tp/sl falla con error de "conflicting TPSL",
+    se hace fallback a cancel+_place_sltp_pair como último recurso.
 """
 import logging
 import math
@@ -387,12 +421,19 @@ def _round_price(coin: str, price: float) -> float:
 
 
 def _price_to_wire(price: float) -> str:
+    """Convierte float a string en notación decimal fija (sin notación científica).
+    Solo usar para construcción manual de wire format. Para calls al SDK usar float."""
     if price == 0.0:
         return "0"
     return str(Decimal(str(price)).normalize())
 
 
 # ── limit_px correcto para órdenes trigger isMarket=True ────────────────
+# Según docs HL y código fuente del SDK:
+# - Orden SELL trigger (SL de long, TP de short): limit_px = 0
+# - Orden BUY trigger  (SL de short, TP de long): limit_px = triggerPx * 1.10
+# Esto garantiza que la orden se ejecute a mercado sin ser rechazada como
+# "immediately executable limit order".
 _TRIGGER_BUY_LIMIT_MULTIPLIER = 1.10
 
 
@@ -637,6 +678,10 @@ def _order_reduce_only(coin, is_buy, qty, price, order_type):
 
 
 # ── SL + TP juntos con normalTpsl ───────────────────────────────────────
+# IMPORTANTE — isBuy en órdenes TPSL de cierre:
+#   Para cerrar un LONG:  necesitamos VENDER → is_buy = False → side == "long"  → is_close_buy = False
+#   Para cerrar un SHORT: necesitamos COMPRAR → is_buy = True  → side == "short" → is_close_buy = True
+#   Por tanto: is_close_buy = (side == "short") ✓
 def _place_sltp_pair(
     symbol: str,
     side: str,
@@ -645,16 +690,21 @@ def _place_sltp_pair(
     tp_price: float,
 ) -> None:
     coin = _hl_symbol(symbol)
-    is_close = side == "short"
+    # Para cerrar un LONG vendemos (is_buy=False). Para cerrar un SHORT compramos (is_buy=True).
+    is_close_buy = (side == "short")
 
     sl_px = _round_price(coin, sl_price)
     tp_px = _round_price(coin, tp_price)
-    sl_limit_px = _trigger_market_limit_px(coin, is_close, sl_px)
-    tp_limit_px = _trigger_market_limit_px(coin, is_close, tp_px)
+
+    # limit_px para trigger isMarket:
+    # - SELL trigger (SL de long, TP de short): 0
+    # - BUY trigger  (SL de short, TP de long): triggerPx * 1.10
+    sl_limit_px = _trigger_market_limit_px(coin, is_close_buy, sl_px)
+    tp_limit_px = _trigger_market_limit_px(coin, is_close_buy, tp_px)
 
     sl_order = {
         "coin": coin,
-        "is_buy": is_close,
+        "is_buy": is_close_buy,
         "sz": qty,
         "limit_px": sl_limit_px,
         "order_type": {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
@@ -662,7 +712,7 @@ def _place_sltp_pair(
     }
     tp_order = {
         "coin": coin,
-        "is_buy": is_close,
+        "is_buy": is_close_buy,
         "sz": qty,
         "limit_px": tp_limit_px,
         "order_type": {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
@@ -670,7 +720,6 @@ def _place_sltp_pair(
     }
 
     order_list = [sl_order, tp_order]
-    exc_first = None
 
     try:
         resp = _hl_call(
@@ -688,46 +737,24 @@ def _place_sltp_pair(
         if errors:
             raise RuntimeError(f"bulk_orders normalTpsl errors: {errors}")
         log.info(
-            "SL+TP colocados juntos (normalTpsl): %s | sl=%.4f tp=%.4f (%s)",
+            "SL+TP colocados juntos (normalTpsl): %s | sl=%.6f tp=%.6f (%s)",
             coin, sl_px, tp_px, side.upper(),
         )
         return
     except Exception as exc:
-        exc_first = exc
-        log.warning(
-            "_place_sltp_pair(%s) normalTpsl falló: %s — reintentando sin grouping",
-            coin, exc_first,
+        # Si normalTpsl falla, propagamos la excepción limpiamente.
+        # NO hacemos fallback a órdenes separadas porque HL rechaza
+        # la segunda orden TPSL independiente cuando ya existe la primera.
+        log.error(
+            "_place_sltp_pair(%s) normalTpsl falló — SL/TP NO colocados: %s",
+            coin, exc,
         )
-
-    try:
-        resp = _hl_call(
-            _exchange.bulk_orders,
-            order_list,
-            context=f"_place_sltp_pair_fallback({coin} sl={sl_px} tp={tp_px})",
-        )
-        statuses = (
-            ((resp.get("response") or {})
-             .get("data") or {})
-            .get("statuses") or []
-        )
-        errors = [s.get("error") for s in statuses if "error" in s]
-        if errors:
-            raise RuntimeError(f"bulk_orders sin grouping errors: {errors}")
-        log.info(
-            "SL+TP colocados (bulk sin grouping): %s | sl=%.4f tp=%.4f (%s)",
-            coin, sl_px, tp_px, side.upper(),
-        )
-        return
-    except Exception as exc_second:
-        raise RuntimeError(
-            f"_place_sltp_pair({coin}): ambos intentos fallaron. "
-            f"Primer error: {exc_first}. Segundo error: {exc_second}"
-        ) from exc_second
+        raise
 
 
 def _place_single_sl(symbol: str, side: str, qty: float, stop_price: float) -> None:
     coin = _hl_symbol(symbol)
-    is_buy = side == "short"
+    is_buy = (side == "short")  # cerrar short → comprar
     stop_price = _round_price(coin, stop_price)
     limit_px = _trigger_market_limit_px(coin, is_buy, stop_price)
     order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
@@ -741,11 +768,12 @@ def _place_single_sl(symbol: str, side: str, qty: float, stop_price: float) -> N
         log.info("SL colocado en %s (%s %s)", stop_price, side.upper(), coin)
     except Exception as exc:
         log.warning("_place_single_sl(%s) falló: %s", coin, exc)
+        raise
 
 
 def _place_single_tp(symbol: str, side: str, qty: float, tp_price: float) -> None:
     coin = _hl_symbol(symbol)
-    is_buy = side == "short"
+    is_buy = (side == "short")  # cerrar short → comprar
     tp_price = _round_price(coin, tp_price)
     limit_px = _trigger_market_limit_px(coin, is_buy, tp_price)
     order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
@@ -759,6 +787,7 @@ def _place_single_tp(symbol: str, side: str, qty: float, tp_price: float) -> Non
         log.info("TP colocado en %s (%s %s)", tp_price, side.upper(), coin)
     except Exception as exc:
         log.warning("_place_single_tp(%s) falló: %s", coin, exc)
+        raise
 
 
 # ── Órdenes trigger abiertas ────────────────────────────────────────────
@@ -800,13 +829,21 @@ def _modify_single_order(
     new_px: float,
     tpsl: str,
 ) -> None:
+    """Modifica una orden TPSL existente usando Exchange.modify_order() del SDK.
+
+    IMPORTANTE: triggerPx debe ser float (no string). El SDK llama internamente
+    a floattowire() sobre triggerPx — si pasamos string, la serialización puede
+    fallar. limit_px también float (el SDK lo convierte a wire format).
+    """
     new_px = _round_price(coin, new_px)
     limit_px = _trigger_market_limit_px(coin, is_buy, new_px)
+    # order_type con floats — el SDK hace la serialización interna correctamente
     order_type = {"trigger": {"triggerPx": new_px, "isMarket": True, "tpsl": tpsl}}
     log.debug(
         "_modify_single_order: coin=%s oid=%s is_buy=%s qty=%s limit_px=%s tpsl=%s triggerPx=%s",
         coin, oid, is_buy, qty, limit_px, tpsl, new_px,
     )
+    # Firma del SDK: modify_order(oid, name, is_buy, sz, limit_px, order_type, reduce_only)
     resp = _hl_call(
         _exchange.modify_order,
         oid, coin, is_buy, qty, limit_px, order_type, True,
@@ -819,99 +856,6 @@ def _modify_single_order(
     log.info("Orden %s modificada in-place: %s oid=%s → %.6f", tpsl.upper(), coin, oid, new_px)
 
 
-def _batch_modify_sltp(
-    coin: str,
-    sl_oid: int,
-    tp_oid: int,
-    is_close_buy: bool,
-    qty: float,
-    new_sl: float,
-    new_tp: float,
-) -> bool:
-    bulk_modify = getattr(_exchange, "bulk_modify_orders_new", None)
-    if bulk_modify is None:
-        log.debug("[%s] bulk_modify_orders_new no disponible en este SDK — usando modify individual", coin)
-        return False
-
-    new_sl = _round_price(coin, new_sl)
-    new_tp = _round_price(coin, new_tp)
-
-    try:
-        asset_idx = _get_asset_index(coin)
-    except ValueError as exc:
-        log.warning("[%s] _batch_modify_sltp: %s — fallback a modify individual", coin, exc)
-        return False
-
-    sl_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_sl)
-    tp_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_tp)
-
-    modify_requests = [
-        {
-            "oid": sl_oid,
-            "order": {
-                "a": asset_idx,
-                "b": is_close_buy,
-                "p": _price_to_wire(sl_limit_px),
-                "s": str(qty),
-                "r": True,
-                "t": {
-                    "trigger": {
-                        "triggerPx": _price_to_wire(new_sl),
-                        "isMarket": True,
-                        "tpsl": "sl",
-                    }
-                },
-            },
-        },
-        {
-            "oid": tp_oid,
-            "order": {
-                "a": asset_idx,
-                "b": is_close_buy,
-                "p": _price_to_wire(tp_limit_px),
-                "s": str(qty),
-                "r": True,
-                "t": {
-                    "trigger": {
-                        "triggerPx": _price_to_wire(new_tp),
-                        "isMarket": True,
-                        "tpsl": "tp",
-                    }
-                },
-            },
-        },
-    ]
-
-    log.debug(
-        "_batch_modify_sltp: coin=%s asset_idx=%s sl_oid=%s tp_oid=%s is_buy=%s qty=%s "
-        "new_sl=%s (limit=%s) new_tp=%s (limit=%s)",
-        coin, asset_idx, sl_oid, tp_oid, is_close_buy, qty,
-        new_sl, sl_limit_px, new_tp, tp_limit_px,
-    )
-
-    try:
-        resp = _hl_call(
-            bulk_modify,
-            modify_requests,
-            context=f"bulk_modify_orders_new({coin} sl={new_sl} tp={new_tp})",
-        )
-        statuses = (((resp or {}).get("response") or {}).get("data") or {}).get("statuses") or []
-        errors = [s.get("error") for s in statuses if "error" in s]
-        if errors:
-            raise RuntimeError(f"bulk_modify_orders_new errors: {errors}")
-        log.info(
-            "SL+TP modificados atómicamente (batchModify): %s | sl=%.6f tp=%.6f",
-            coin, new_sl, new_tp,
-        )
-        return True
-    except Exception as exc:
-        log.warning(
-            "[%s] bulk_modify_orders_new falló: %s — cayendo a modify individual",
-            coin, exc,
-        )
-        return False
-
-
 def modify_sltp_orders(
     symbol: str,
     side: str,
@@ -919,6 +863,15 @@ def modify_sltp_orders(
     new_sl: float,
     new_tp: float,
 ) -> None:
+    """Modifica SL y TP existentes in-place usando modify_order() individual.
+
+    Estrategia (v23 — sin _batch_modify_sltp):
+    1. Si existen SL y TP: modify_order individual para cada uno.
+       Si alguno falla: fallback a cancel+_place_sltp_pair.
+    2. Si solo existe uno: colocar el faltante con _place_single_sl/tp.
+       Si falla (conflicto TPSL): fallback a cancel+_place_sltp_pair.
+    3. Si ninguno existe: place desde cero con _place_sltp_pair.
+    """
     coin = _hl_symbol(symbol)
     is_close_buy = (side == "short")
     new_sl_r = _round_price(coin, new_sl)
@@ -935,20 +888,14 @@ def modify_sltp_orders(
         sl_info, tp_info,
     )
 
+    # ── Caso 0: ninguna orden existe → place desde cero ──────────────────
     if sl_info is None and tp_info is None:
         log.info("[%s] modify_sltp: sin órdenes abiertas → place desde cero", coin)
         _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
         return
 
+    # ── Caso 1: ambas órdenes existen → modify individual ────────────────
     if sl_info is not None and tp_info is not None:
-        if _batch_modify_sltp(
-            coin,
-            sl_info["oid"], tp_info["oid"],
-            is_close_buy, qty,
-            new_sl_r, new_tp_r,
-        ):
-            return
-
         sl_ok = False
         tp_ok = False
 
@@ -975,15 +922,56 @@ def modify_sltp_orders(
         _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
         return
 
-    existing_type = "SL" if sl_info else "TP"
-    existing_oid = (sl_info or tp_info)["oid"]
-    log.info(
-        "[%s] modify_sltp: caso asimétrico — solo existe %s (oid=%s) → "
-        "cancelando y recolocando ambas con normalTpsl",
-        coin, existing_type, existing_oid,
-    )
-    cancel_all_orders(symbol)
-    _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
+    # ── Caso 2: caso asimétrico — solo existe una de las dos ─────────────
+    # Intentamos colocar la orden faltante directamente.
+    # Si HL rechaza (conflicto TPSL), hacemos cancel+_place_sltp_pair.
+    if sl_info is not None and tp_info is None:
+        log.info(
+            "[%s] modify_sltp: solo existe SL (oid=%s) → modificando SL y colocando TP",
+            coin, sl_info["oid"],
+        )
+        try:
+            _modify_single_order(coin, sl_info["oid"], is_close_buy, qty, new_sl_r, "sl")
+        except Exception as exc:
+            log.warning("[%s] modify_order SL (asimétrico) falló: %s — fallback", coin, exc)
+            cancel_all_orders(symbol)
+            _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
+            return
+        try:
+            _place_single_tp(symbol, side, qty, new_tp_r)
+        except Exception as exc:
+            log.warning(
+                "[%s] _place_single_tp falló tras modify SL (conflicto TPSL?): %s — "
+                "cancelando todo y recolocando ambas",
+                coin, exc,
+            )
+            cancel_all_orders(symbol)
+            _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
+        return
+
+    if tp_info is not None and sl_info is None:
+        log.info(
+            "[%s] modify_sltp: solo existe TP (oid=%s) → modificando TP y colocando SL",
+            coin, tp_info["oid"],
+        )
+        try:
+            _modify_single_order(coin, tp_info["oid"], is_close_buy, qty, new_tp_r, "tp")
+        except Exception as exc:
+            log.warning("[%s] modify_order TP (asimétrico) falló: %s — fallback", coin, exc)
+            cancel_all_orders(symbol)
+            _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
+            return
+        try:
+            _place_single_sl(symbol, side, qty, new_sl_r)
+        except Exception as exc:
+            log.warning(
+                "[%s] _place_single_sl falló tras modify TP (conflicto TPSL?): %s — "
+                "cancelando todo y recolocando ambas",
+                coin, exc,
+            )
+            cancel_all_orders(symbol)
+            _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
+        return
 
 
 # ── Abrir orden ─────────────────────────────────────────────────────────
