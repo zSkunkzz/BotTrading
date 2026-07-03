@@ -20,10 +20,22 @@ v10:
     (latencia exchange ~100-300 ms). El guard v9 se mantiene como segunda línea.
   - Causa real: señal manual + señal automática evaluadas casi simultáneamente
     para el mismo símbolo, o dos loops muy juntos cuando LOOP_SLEEP es bajo.
+v11:
+  - _cycle_lock (threading.Lock): impide que el siguiente loop empiece antes
+    de que el anterior haya terminado. Si el loop tarda más que LOOP_SLEEP
+    los ciclos ya no se solapan — el nuevo se descarta con un WARNING.
+    Causa real: LOOP_SLEEP bajo + evaluación de ~50 pares en paralelo →
+    múltiples ciclos activos simultáneamente → señales duplicadas.
+  - _restore_sl_tp retry: si una posición sincronizada (reinicio/race) sigue
+    con sl=None o tp=None en loops posteriores (feed no listo en el momento
+    del sync), se reintenta _restore_sl_tp_on_sync cada iteración hasta que
+    el feed esté listo. Fix directo para HYPE (y cualquier par) abierto sin
+    SL/TP tras reinicio del bot.
 """
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -61,6 +73,11 @@ TRAILING_NOTIFY_DEBOUNCE = 5 * 60  # 5 min entre notificaciones trailing del mis
 # v10: mutex en memoria — impide que dos llamadas a _open_position para el mismo
 # símbolo se solapen antes de que la primera haya registrado la posición.
 _opening: set[str] = set()
+
+# v11: lock de ciclo — impide que el siguiente loop empiece antes de que el
+# anterior haya terminado. Si LOOP_SLEEP < duración real del loop, el ciclo
+# nuevo se descarta silenciosamente en lugar de ejecutarse en paralelo.
+_cycle_lock = threading.Lock()
 
 COOLDOWN_SL           = 60 * 60
 COOLDOWN_SL_FAST      = 15 * 60
@@ -901,6 +918,18 @@ def run() -> None:
     loop_count = 0
 
     while True:
+        # v11: cycle lock — si el loop anterior aún no ha terminado, saltamos
+        # este ciclo completamente en lugar de ejecutarlo en paralelo.
+        if not _cycle_lock.acquire(blocking=False):
+            log.warning(
+                "[cycle_lock] Loop anterior aún en curso — ciclo #%d descartado "
+                "(LOOP_SLEEP demasiado bajo o loop muy lento). "
+                "Considera aumentar LOOP_SLEEP.",
+                loop_count + 1,
+            )
+            time.sleep(config.LOOP_SLEEP)
+            continue
+
         try:
             loop_count += 1
 
@@ -991,6 +1020,16 @@ def run() -> None:
                     )
 
                     _restore_sl_tp_on_sync(symbol, positions[symbol], feed)
+
+            # v11: retry _restore_sl_tp para posiciones que siguen sin SL/TP
+            # (feed no estaba listo en el loop del primer sync).
+            for symbol, pos in list(positions.items()):
+                if pos.get("sl") is None or pos.get("tp") is None:
+                    log.debug(
+                        "[%s] SL/TP aún None — reintentando restore (feed no estaba listo antes)",
+                        symbol,
+                    )
+                    _restore_sl_tp_on_sync(symbol, pos, feed)
 
             open_count = len(positions)
 
@@ -1151,7 +1190,8 @@ def run() -> None:
                         price  = exchange.get_price(symbol)
 
                         if is_manual:
-                            _manual_alert_cooldown[symbol] = time.time()
+                            _manual_alert_cooldown[symbol] = time.time()\
+
                             params = risk.calc(
                                 signal, price, candles_15m,
                                 score=score, symbol=symbol, regime=regime,
@@ -1182,6 +1222,10 @@ def run() -> None:
         except Exception as e:
             log.error("Error en loop: %s", e, exc_info=True)
             telegram.notify(f"\u26a0\ufe0f Error en bot: {e}")
+
+        finally:
+            # v11: liberar el cycle lock siempre, pase lo que pase en el loop.
+            _cycle_lock.release()
 
         time.sleep(config.LOOP_SLEEP)
 
