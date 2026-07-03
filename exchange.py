@@ -163,6 +163,22 @@ v19 — Fix _batch_modify_sltp: formato ModifyRequest correcto según SDK oficia
   para facilitar diagnóstico futuro sin tener que añadir prints temporales.
   Se documenta explícitamente que "coin" en OrderRequest es el nombre ("BTC"),
   NO el asset index numérico — confusión común al leer el wire format de HL.
+
+v20 — Fix _batch_modify_sltp: wire format batchModify según docs oficiales HL.
+
+  Según la documentación oficial de Hyperliquid (exchange-endpoint#modify-multiple-orders),
+  el campo "a" en el order wire del batchModify es el ASSET INDEX numérico (igual que
+  en place order), NO el nombre del activo. bulk_modify_orders_new() del SDK construye
+  el wire directamente sin hacer name_to_asset() — a diferencia de bulk_orders() que
+  sí recibe OrderRequest con "coin" y convierte internamente.
+
+  Fix: se añade _get_asset_index(coin) helper que lee _info.coin_to_asset y devuelve
+  el índice numérico. _batch_modify_sltp usa "a" (asset index) en lugar de "coin".
+
+  También: el flag always_place ("a" en el action raíz) debe OMITIRSE si es False
+  según los docs — "actions hashed with a: false will be rejected". Se documenta
+  explícitamente este comportamiento. No incluimos always_place en nuestros modifies
+  (no lo necesitamos para TPSL), por lo que ya era correcto no incluirlo.
 """
 import logging
 import math
@@ -276,6 +292,25 @@ def floor_qty(qty: float, symbol: str) -> float:
 
 def min_notional_ok(qty: float, price: float, min_usdt: float = 10.0) -> bool:
     return (qty * price) >= min_usdt
+
+
+# ── Asset index ────────────────────────────────────────────────────────────────────
+
+def _get_asset_index(coin: str) -> int:
+    """Devuelve el asset index numérico de `coin` según el metadata de HL.
+
+    Usado en el wire format de batchModify (campo "a"), que requiere el índice
+    numérico del universo de perpetuos (docs: exchange-endpoint#modify-multiple-orders).
+    Diferente de bulk_orders() que acepta el nombre de activo en OrderRequest.
+
+    Si el coin no está en coin_to_asset (poco probable en producción), lanza ValueError
+    para que el caller haga fallback a _modify_single_order en lugar de enviar un index
+    incorrecto silenciosamente.
+    """
+    asset = _info.coin_to_asset.get(coin)
+    if asset is None:
+        raise ValueError(f"_get_asset_index: coin '{coin}' no encontrado en coin_to_asset")
+    return int(asset)
 
 
 # ── tickSize / price rounding ────────────────────────────────────────────────────────
@@ -806,18 +841,26 @@ def _batch_modify_sltp(
 ) -> bool:
     """Modifica SL y TP atómicamente con bulk_modify_orders_new (batchModify).
 
-    Formato ModifyRequest confirmado en SDK oficial (hyperliquid-dex/hyperliquid-python-sdk):
-      [{"oid": int, "order": OrderRequest}, ...]
-    donde OrderRequest.coin es el NOMBRE del activo ("BTC"), NO el asset index.
-    El SDK hace name_to_asset(order["coin"]) internamente en order_request_to_order_wire().
-    bulk_modify_orders_new NO acepta kwarg grouping — construye internamente
-    el action {"type": "batchModify", "modifies": [...]}.
+    Wire format según docs oficiales HL (exchange-endpoint#modify-multiple-orders):
+      action = {
+        "type": "batchModify",
+        "modifies": [{"oid": int, "order": {"a": asset_index, "b": bool, "p": str,
+                                             "s": str, "r": bool, "t": {...}}}, ...]
+        # "a" (always_place) OMITIDO — docs: "a: false will be rejected", no lo necesitamos
+      }
+
+    IMPORTANTE: el campo "a" DENTRO de order es el ASSET INDEX numérico (NO el nombre).
+    bulk_modify_orders_new() construye el wire directamente, a diferencia de bulk_orders()
+    que acepta "coin" (nombre) y hace name_to_asset() internamente.
 
     v15: path atómico inicial.
     v16: _round_price defensivo interno.
     v18: nombre correcto "bulk_modify_orders_new", sin kwarg grouping.
-    v19: log.debug del request completo para diagnóstico; _round_price defensivo
-         también en new_sl/new_tp antes de construir limit_px.
+    v19: log.debug del request completo para diagnóstico.
+    v20: usa asset index numérico ("a") en lugar de "coin" (nombre) en el order wire,
+         según docs oficiales HL. Se añade _get_asset_index() para obtenerlo.
+         Si _get_asset_index falla (coin desconocido), retorna False para hacer fallback
+         a _modify_single_order en lugar de enviar un index incorrecto.
     """
     bulk_modify = getattr(_exchange, "bulk_modify_orders_new", None)
     if bulk_modify is None:
@@ -828,40 +871,49 @@ def _batch_modify_sltp(
     new_sl = _round_price(coin, new_sl)
     new_tp = _round_price(coin, new_tp)
 
+    # v20: obtener asset index numérico para el wire format de batchModify
+    try:
+        asset_idx = _get_asset_index(coin)
+    except ValueError as exc:
+        log.warning("[%s] _batch_modify_sltp: %s — fallback a modify individual", coin, exc)
+        return False
+
     sl_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_sl)
     tp_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_tp)
 
-    # v19: "coin" es el nombre del activo ("BTC"), NO el asset index.
-    # El SDK llama internamente name_to_asset(order["coin"]) en order_request_to_order_wire().
+    # v20: wire format correcto — "a" es el asset index (int), no el nombre del activo.
+    # Docs HL: "a is asset" en el order wire de modify/batchModify.
     modify_requests = [
         {
             "oid": sl_oid,
             "order": {
-                "coin":        coin,        # nombre, ej. "BTC" — SDK convierte a asset index
-                "is_buy":      is_close_buy,
-                "sz":          qty,
-                "limit_px":    sl_limit_px,
-                "order_type":  {"trigger": {"triggerPx": new_sl, "isMarket": True, "tpsl": "sl"}},
-                "reduce_only": True,
+                "a":           asset_idx,        # asset index numérico (v20 fix)
+                "b":           is_close_buy,
+                "p":           str(sl_limit_px),
+                "s":           str(qty),
+                "r":           True,
+                "t":           {"trigger": {"triggerPx": str(new_sl), "isMarket": True, "tpsl": "sl"}},
             },
         },
         {
             "oid": tp_oid,
             "order": {
-                "coin":        coin,
-                "is_buy":      is_close_buy,
-                "sz":          qty,
-                "limit_px":    tp_limit_px,
-                "order_type":  {"trigger": {"triggerPx": new_tp, "isMarket": True, "tpsl": "tp"}},
-                "reduce_only": True,
+                "a":           asset_idx,        # asset index numérico (v20 fix)
+                "b":           is_close_buy,
+                "p":           str(tp_limit_px),
+                "s":           str(qty),
+                "r":           True,
+                "t":           {"trigger": {"triggerPx": str(new_tp), "isMarket": True, "tpsl": "tp"}},
             },
         },
     ]
+    # NOTA: NO incluir "a" (always_place) en el action raíz — docs: omitir si False.
+    # No necesitamos always_place=True para TPSL modifies.
 
     log.debug(
-        "_batch_modify_sltp: coin=%s sl_oid=%s tp_oid=%s is_buy=%s qty=%s "
+        "_batch_modify_sltp: coin=%s asset_idx=%s sl_oid=%s tp_oid=%s is_buy=%s qty=%s "
         "new_sl=%s (limit=%s) new_tp=%s (limit=%s)",
-        coin, sl_oid, tp_oid, is_close_buy, qty,
+        coin, asset_idx, sl_oid, tp_oid, is_close_buy, qty,
         new_sl, sl_limit_px, new_tp, tp_limit_px,
     )
 
