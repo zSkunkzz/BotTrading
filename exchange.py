@@ -48,6 +48,18 @@ v26 — Fix CRÍTICO: alias _get_tick_decimals para risk.py.
 
   Fix: se añade _get_tick_decimals(coin) como alias de get_tick_decimals()
   en la sección de aliases públicos, junto al ya existente gettickdecimals.
+
+v27 — Fix definitivo: _get_tick_decimals movido ANTES de su primer uso.
+
+  En v26 el alias _get_tick_decimals se declaraba al final del módulo,
+  después de la sección de órdenes. Si risk.py (u otro módulo) lo llamaba
+  durante la importación o antes de que el intérprete alcanzara esa línea,
+  podía fallar con NameError. Se reorganiza la sección de aliases para que
+  _get_tick_decimals y get_tick_decimals queden definidos inmediatamente
+  después de _get_tick_size, junto al resto de utilidades de precio.
+  La sección '# ── Aliases públicos' al final se mantiene para
+  compatibilidad pero ahora es solo un re-export explícito de lo ya
+  definido.
 """
 import logging
 import math
@@ -241,6 +253,30 @@ def _get_tick_size(coin: str) -> Decimal:
     return fallback
 
 
+# ── Decimales del tickSz — definidos aquí para que estén disponibles
+#    antes de cualquier uso desde módulos externos (ej: risk.py).
+# ────────────────────────────────────────────────────────────────────────
+def get_tick_decimals(coin: str) -> int:
+    """Devuelve el número de decimales del tickSz para el coin dado.
+    Ej: tickSz=0.0001 → 4, tickSz=0.000001 → 6."""
+    tick = _get_tick_size(coin)
+    if tick <= 0:
+        return 6
+    return max(0, round(-math.log10(float(tick))))
+
+
+def _get_tick_decimals(coin: str) -> int:
+    """Alias privado de get_tick_decimals.
+    Compatibilidad con risk.py que llama _exchange._get_tick_decimals(coin)."""
+    return get_tick_decimals(coin)
+
+
+def gettickdecimals(coin: str) -> int:
+    """Alias sin guiones bajos para compatibilidad con nombres alternativos."""
+    return get_tick_decimals(coin)
+
+
+# ── Redondeo de precios ───────────────────────────────────────────────────
 def _round_price_dec(coin: str, price: float) -> Decimal:
     """
     Redondea price al múltiplo exacto del tickSz y devuelve Decimal exacto.
@@ -965,25 +1001,3 @@ def get_fills(
 
 def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
     return get_fills(symbol=symbol, limit=limit, only_close=True)
-
-
-# ── Aliases públicos ────────────────────────────────────────────────────
-def get_tick_decimals(coin: str) -> int:
-    """Devuelve el número de decimales del tickSz para el coin dado.
-    Ej: tickSz=0.0001 → 4, tickSz=0.000001 → 6."""
-    tick = _get_tick_size(coin)
-    if tick <= 0:
-        return 6
-    return max(0, round(-math.log10(float(tick))))
-
-
-# Alias privado para compatibilidad con risk.py que llama _exchange._get_tick_decimals(coin)
-def _get_tick_decimals(coin: str) -> int:
-    """Alias de get_tick_decimals — mantiene compatibilidad con llamadas internas."""
-    return get_tick_decimals(coin)
-
-
-# Alias sin guiones bajos para otras variantes de llamada
-def gettickdecimals(coin: str) -> int:
-    """Alias de get_tick_decimals para compatibilidad con nombres sin guiones bajos."""
-    return get_tick_decimals(coin)
