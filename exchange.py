@@ -179,6 +179,23 @@ v20 — Fix _batch_modify_sltp: wire format batchModify según docs oficiales HL
   según los docs — "actions hashed with a: false will be rejected". Se documenta
   explícitamente este comportamiento. No incluimos always_place en nuestros modifies
   (no lo necesitamos para TPSL), por lo que ya era correcto no incluirlo.
+
+v21 — Fix notación científica en triggerPx / limit_px del wire batchModify.
+
+  Según docs oficiales HL, los campos "p" (limit_px) y "triggerPx" del wire
+  format deben ser Strings con notación decimal fija, ej. "0.00012300".
+  str(float) en Python genera notación científica para valores muy pequeños
+  (ej. str(1.23e-4) → "0.00012" OK, pero str(1.23e-8) → "1.23e-08" que HL
+  rechaza silenciosamente sin error descriptivo).
+
+  Fix: _price_to_wire(price) convierte el float a String vía Decimal para
+  garantizar notación decimal fija sin exponente, consistente con lo que el
+  SDK hace internamente con floattowire(). Aplicado en los campos "p" y
+  "triggerPx" de los modify_requests en _batch_modify_sltp.
+
+  Nota: los campos "s" (size) no tienen este problema porque los tamaños de
+  posición en perpetuos de HL son siempre >= 0.001 y str() no genera notación
+  científica en ese rango.
 """
 import logging
 import math
@@ -350,6 +367,24 @@ def _round_price(coin: str, price: float) -> float:
     quantizer = Decimal(10) ** -dec
     rounded = Decimal(str(price)).quantize(quantizer, rounding=ROUND_HALF_UP)
     return float(rounded)
+
+
+def _price_to_wire(price: float) -> str:
+    """Convierte un precio float a String con notación decimal fija (sin exponente).
+
+    v21: Hyperliquid espera strings como "0.00012300", no "1.23e-04".
+    str(float) puede generar notación científica para valores muy pequeños.
+    Usando Decimal garantizamos notación fija consistente con floattowire() del SDK.
+
+    Ejemplos:
+      _price_to_wire(0.000123)  → "0.000123"   ✓
+      _price_to_wire(1.23e-8)   → "0.0000000123"  ✓  (str() daría "1.23e-08" ✗)
+      _price_to_wire(65000.0)   → "65000"       ✓
+      _price_to_wire(0.0)       → "0"           ✓  (limit_px=0 para sell triggers)
+    """
+    if price == 0.0:
+        return "0"
+    return str(Decimal(str(price)).normalize())
 
 
 # ── v14: limit_px correcto para órdenes trigger isMarket=True ────────────────────────
@@ -849,18 +884,18 @@ def _batch_modify_sltp(
         # "a" (always_place) OMITIDO — docs: "a: false will be rejected", no lo necesitamos
       }
 
-    IMPORTANTE: el campo "a" DENTRO de order es el ASSET INDEX numérico (NO el nombre).
-    bulk_modify_orders_new() construye el wire directamente, a diferencia de bulk_orders()
-    que acepta "coin" (nombre) y hace name_to_asset() internamente.
+    IMPORTANTE:
+    - El campo "a" DENTRO de order es el ASSET INDEX numérico (NO el nombre).
+    - Los campos "p" (limit_px) y "triggerPx" deben ser strings en notación
+      decimal fija, NO científica. Se usa _price_to_wire() para garantizarlo (v21).
 
     v15: path atómico inicial.
     v16: _round_price defensivo interno.
     v18: nombre correcto "bulk_modify_orders_new", sin kwarg grouping.
     v19: log.debug del request completo para diagnóstico.
-    v20: usa asset index numérico ("a") en lugar de "coin" (nombre) en el order wire,
-         según docs oficiales HL. Se añade _get_asset_index() para obtenerlo.
-         Si _get_asset_index falla (coin desconocido), retorna False para hacer fallback
-         a _modify_single_order en lugar de enviar un index incorrecto.
+    v20: usa asset index numérico ("a") en lugar de "coin" (nombre) en el order wire.
+    v21: _price_to_wire() para "p" y "triggerPx" — evita notación científica
+         en precios muy pequeños (ej. 1.23e-08 → "0.0000000123").
     """
     bulk_modify = getattr(_exchange, "bulk_modify_orders_new", None)
     if bulk_modify is None:
@@ -881,29 +916,41 @@ def _batch_modify_sltp(
     sl_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_sl)
     tp_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_tp)
 
-    # v20: wire format correcto — "a" es el asset index (int), no el nombre del activo.
-    # Docs HL: "a is asset" en el order wire de modify/batchModify.
+    # v21: _price_to_wire() garantiza notación decimal fija (sin exponente científico).
+    # HL rechaza silenciosamente strings como "1.23e-08" en los campos "p" y "triggerPx".
     modify_requests = [
         {
             "oid": sl_oid,
             "order": {
-                "a":           asset_idx,        # asset index numérico (v20 fix)
-                "b":           is_close_buy,
-                "p":           str(sl_limit_px),
-                "s":           str(qty),
-                "r":           True,
-                "t":           {"trigger": {"triggerPx": str(new_sl), "isMarket": True, "tpsl": "sl"}},
+                "a":  asset_idx,                      # asset index numérico (v20)
+                "b":  is_close_buy,
+                "p":  _price_to_wire(sl_limit_px),    # v21: decimal fijo, no científico
+                "s":  str(qty),
+                "r":  True,
+                "t":  {
+                    "trigger": {
+                        "triggerPx": _price_to_wire(new_sl),  # v21: decimal fijo
+                        "isMarket":  True,
+                        "tpsl":      "sl",
+                    }
+                },
             },
         },
         {
             "oid": tp_oid,
             "order": {
-                "a":           asset_idx,        # asset index numérico (v20 fix)
-                "b":           is_close_buy,
-                "p":           str(tp_limit_px),
-                "s":           str(qty),
-                "r":           True,
-                "t":           {"trigger": {"triggerPx": str(new_tp), "isMarket": True, "tpsl": "tp"}},
+                "a":  asset_idx,                      # asset index numérico (v20)
+                "b":  is_close_buy,
+                "p":  _price_to_wire(tp_limit_px),    # v21: decimal fijo, no científico
+                "s":  str(qty),
+                "r":  True,
+                "t":  {
+                    "trigger": {
+                        "triggerPx": _price_to_wire(new_tp),  # v21: decimal fijo
+                        "isMarket":  True,
+                        "tpsl":      "tp",
+                    }
+                },
             },
         },
     ]
