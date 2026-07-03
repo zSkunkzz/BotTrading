@@ -5,46 +5,27 @@ v3 — Fix Invalid leverage value (bisect automático)
 v4 — Fix cancel_all_orders (cancel uno por uno)
 v5 — Fix reduce_only no llegaba al SDK (arg posicional)
 v6 — Fix _check_order_response demasiado estricta para SL/TP
-v7 — Fix "Order has invalid price" en SL/TP
-v8 — Fix "Order has invalid price" en open_order (entrada IOC)
-v9 — Fix "floattowire causes rounding"
-v10-diag — Log diagnóstico en get_all_positions()
-v11 — Fix "Invalid TPSL price" al colocar SL+TP por separado:
-  Hyperliquid rechaza añadir un TP como orden independiente cuando ya
-  existe un SL activo sobre la misma posición (y viceversa).
-  Fix: _place_sltp_pair() envía SL y TP juntos en una sola llamada
-  bulk_orders con grouping="normalTpsl". open_order, place_stop_order
-  y place_tp_order usan esta función internamente.
-v12 — Fix CRÍTICO grouping="normalTpsl" nunca se pasaba a bulk_orders:
-  La firma del SDK es bulk_orders(order_requests, builder=None, grouping="na").
-  _place_sltp_pair llamaba bulk_orders([sl, tp]) sin el kwarg grouping,
-  por lo que HL recibía siempre grouping="na" y rechazaba la segunda orden
-  como orden independiente conflictiva.
-  Fix: pasar grouping="normalTpsl" explícitamente.
-  También se corrige _restore_sl_tp_on_sync en main.py que llamaba
-  place_stop_order + place_tp_order por separado en lugar de _place_sltp_pair.
-v13 — Fix "Order has invalid price" en open_order (doble llamada de precio):
-  open_order llamaba primero get_price() para validar el notional y luego
-  _market_price() para la orden de entrada. Ambas hacen all_mids() por separado,
-  y si el precio cambia entre las dos llamadas (20-50ms de diferencia en BTC),
-  el limit_px calculado puede quedar fuera del ask en el momento de la firma,
-  generando "Order has invalid price" aunque la orden parezca válida.
-  Fix: calcular limit_px UNA SOLA VEZ con _market_price() y usar ese valor
-  también para el check de notional mínimo. Se elimina la llamada separada
-  a get_price() en open_order.
-v14 — Fix "Order has invalid price" en open_order (slippage demasiado alto):
-  _MARKET_SLIPPAGE=0.5% hacía que limit_px quedara ~$310 sobre el ask real
-  en BTC (precio ~62 626), lo que excede el límite de desviación que aplica
-  Hyperliquid respecto al mark price en activos muy líquidos.
-  Fix: slippage dinámico por activo en _market_price():
-    - BTC, ETH          → 0.10 %  (spread ultra-tight)
-    - HYPE, SOL, BNB,
-      XRP, DOGE, ADA,
-      AVAX, DOT, LTC,
-      LINK               → 0.20 %  (majors con alta liquidez)
-    - resto              → 0.30 %  (altcoins con spread mayor)
-  Se elimina la constante global _MARKET_SLIPPAGE y se introduce
-  _SLIPPAGE_BY_COIN (dict) + _DEFAULT_SLIPPAGE.
+v7 — Fix "Order has invalid price" en SL/TP:
+  HL exige que triggerPx respete el tickSize del activo.
+  risk.py redondea a 8 decimales, pero ONDO/PYTH/etc. tienen tickSize
+  de 4 decimales — 0.32632714 es inválido, necesita 0.3263.
+  Fix: _round_price(coin, price) lee el campo 'tickSize' del meta de HL
+  y redondea al número correcto de decimales antes de cada place_stop_order
+  y place_tp_order. Cache en _tick_decimals para no consultar meta en cada
+  orden.
+v8 — Fix "Order has invalid price" en open_order (entrada IOC):
+  _market_price() devuelve mid * (1 ± slippage) sin redondear, lo que
+  genera precios como 0.3371775 o 0.33712222499999994 que HL rechaza.
+  Fix: aplicar _round_price(coin, limit_px) antes del order() de entrada,
+  igual que ya se hacía en SL/TP.
+v9 — Fix "floattowire causes rounding":
+  El SDK serializa el precio vía floattowire y rechaza cualquier float que
+  no sea exactamente representable con los decimales del tickSize.
+  round() en Python puede dejar residuos de punto flotante
+  (ej: round(0.33767..., 4) → 0.3377000000000001).
+  Fix: usar Decimal con quantize() para obtener una representación exacta,
+  y convertir a float solo al final. Aplica en _round_price() para cubrir
+  _market_price, place_stop_order y place_tp_order.
 """
 import logging
 import math
@@ -161,18 +142,26 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 10.0) -> bool:
 
 
 # ── tickSize / price rounding ────────────────────────────────────────────────────────
+# Cache: coin → número de decimales del tickSize de precio
 _tick_decimals: dict[str, int] = {}
 
 
 def _get_tick_decimals(coin: str) -> int:
+    """Devuelve los decimales del tickSize de precio para `coin`.
+
+    Lee _info.meta (dato estático cargado en arranque) y cachea el resultado.
+    Si no encuentra la info cae a 6 decimales (seguro para cualquier par).
+    """
     if coin in _tick_decimals:
         return _tick_decimals[coin]
 
     try:
-        meta = _info.meta()
+        meta = _info.meta()  # {"universe": [{"name", "szDecimals", "tickSz", ...}, ...]}
         for asset_info in meta.get("universe", []):
             if asset_info.get("name") == coin:
                 tick_sz = float(asset_info.get("tickSz", 0.0001))
+                # número de decimales = cuantos ceros tras el punto tiene el tickSize
+                # ej: 0.0001 -> 4, 0.001 -> 3, 0.00001 -> 5, 1 -> 0
                 dec = max(0, round(-math.log10(tick_sz)))
                 _tick_decimals[coin] = dec
                 log.debug("tick_decimals(%s): tickSz=%s → %d decimales", coin, tick_sz, dec)
@@ -180,59 +169,30 @@ def _get_tick_decimals(coin: str) -> int:
     except Exception as exc:
         log.debug("_get_tick_decimals(%s) falló: %s — usando 6 dec", coin, exc)
 
-    _tick_decimals[coin] = 6
+    _tick_decimals[coin] = 6  # fallback conservador
     return 6
 
 
 def _round_price(coin: str, price: float) -> float:
+    """Redondea `price` al tickSize del par usando Decimal para evitar
+    residuos de punto flotante que el SDK rechaza en floattowire."""
     dec = _get_tick_decimals(coin)
-    quantizer = Decimal(10) ** -dec
+    # Usar Decimal con quantize garantiza representación exacta
+    quantizer = Decimal(10) ** -dec  # ej: dec=4 → Decimal('0.0001')
     rounded = Decimal(str(price)).quantize(quantizer, rounding=ROUND_HALF_UP)
     return float(rounded)
 
 
-# ── Slippage dinámico por activo (v14) ──────────────────────────────────────────────
-# Hyperliquid rechaza limit_px que supere el mark price en más de ~0.3 % en activos
-# muy líquidos. Usamos un slippage mínimo en majors para evitar el rechazo y un
-# slippage ligeramente mayor en altcoins donde el spread es más amplio.
-
-_SLIPPAGE_BY_COIN: dict[str, float] = {
-    # Ultra-tight spread — 0.10 %
-    "BTC":  0.001,
-    "ETH":  0.001,
-    # Majors con alta liquidez — 0.20 %
-    "HYPE": 0.002,
-    "SOL":  0.002,
-    "BNB":  0.002,
-    "XRP":  0.002,
-    "DOGE": 0.002,
-    "ADA":  0.002,
-    "AVAX": 0.002,
-    "DOT":  0.002,
-    "LTC":  0.002,
-    "LINK": 0.002,
-    "TRX":  0.002,
-    "SUI":  0.002,
-    "TRUMP":0.002,
-}
-_DEFAULT_SLIPPAGE = 0.003  # 0.30 % para el resto de altcoins
-
-
-def _get_slippage(coin: str) -> float:
-    return _SLIPPAGE_BY_COIN.get(coin, _DEFAULT_SLIPPAGE)
-
-
 # ── Precio límite para órdenes de mercado ─────────────────────────────────────────
+_MARKET_SLIPPAGE = 0.005
 
 def _market_price(coin: str, is_buy: bool) -> float:
     mids = _hl_call(_info.all_mids, context=f"_market_price({coin})")
     mid  = float(mids.get(coin, 0))
     if mid <= 0:
         raise ValueError(f"No se pudo obtener precio para {coin}")
-    slippage = _get_slippage(coin)
-    raw = mid * (1 + slippage) if is_buy else mid * (1 - slippage)
-    log.debug("_market_price(%s) mid=%.6f slippage=%.3f%% limit_px=%.6f", coin, mid, slippage * 100, raw)
-    return _round_price(coin, raw)
+    raw = mid * (1 + _MARKET_SLIPPAGE) if is_buy else mid * (1 - _MARKET_SLIPPAGE)
+    return _round_price(coin, raw)  # v8+v9: Decimal rounding
 
 
 # ── Balance ───────────────────────────────────────────────────────────────────
@@ -321,33 +281,12 @@ def _parse_hl_position(pos: dict) -> dict | None:
 def get_all_positions() -> dict[str, dict]:
     state     = _hl_call(_info.user_state, _WALLET_ADDRESS, context="get_all_positions")
     hl_to_bot = {_hl_symbol(s): s for s in config.SYMBOLS}
-
-    asset_positions = state.get("assetPositions", [])
-    open_coins = [
-        (e.get("position", {}).get("coin", "?"), float(e.get("position", {}).get("szi", 0)))
-        for e in asset_positions
-        if float(e.get("position", {}).get("szi", 0)) != 0
-    ]
-    if open_coins:
-        log.warning(
-            "[exchange] RAW posiciones abiertas en HL: %s | hl_to_bot keys (sample): %s",
-            open_coins,
-            list(hl_to_bot.keys())[:15],
-        )
-
     result: dict[str, dict] = {}
-    for entry in asset_positions:
+    for entry in state.get("assetPositions", []):
         pos     = entry.get("position", {})
         coin    = pos.get("coin", "")
-        szi     = float(pos.get("szi", 0))
         sym_bot = hl_to_bot.get(coin)
         if sym_bot is None:
-            if szi != 0:
-                log.warning(
-                    "[exchange] Posición NO mapeada ignorada: coin=%r szi=%s "
-                    "(¿falta en config.SYMBOLS o ticker distinto?)",
-                    coin, szi,
-                )
             continue
         parsed = _parse_hl_position(pos)
         if parsed:
@@ -401,6 +340,7 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
 # ── Validación de respuesta de órdenes ───────────────────────────────────────────────
 
 def _check_order_response(resp: dict, context: str) -> None:
+    """Lanza RuntimeError solo si HL devuelve error explícito."""
     status = resp.get("status")
     if status != "ok":
         raise RuntimeError(f"{context}: status={status!r} — {resp}")
@@ -414,131 +354,29 @@ def _check_order_response(resp: dict, context: str) -> None:
 
 
 def _order_reduce_only(coin, is_buy, qty, price, order_type):
+    """Wrapper que pasa reduce_only=True como 6º arg posicional al SDK."""
     return _exchange.order(coin, is_buy, qty, price, order_type, True)
-
-
-# ── SL + TP juntos con normalTpsl ───────────────────────────────────────
-
-def _place_sltp_pair(
-    symbol: str,
-    side: str,
-    qty: float,
-    sl_price: float,
-    tp_price: float,
-) -> None:
-    coin     = _hl_symbol(symbol)
-    is_close = side == "short"
-
-    sl_px = _round_price(coin, sl_price)
-    tp_px = _round_price(coin, tp_price)
-
-    sl_order = {
-        "coin":        coin,
-        "is_buy":      is_close,
-        "sz":          qty,
-        "limit_px":    sl_px,
-        "order_type":  {"trigger": {"triggerPx": sl_px, "isMarket": True, "tpsl": "sl"}},
-        "reduce_only": True,
-    }
-    tp_order = {
-        "coin":        coin,
-        "is_buy":      is_close,
-        "sz":          qty,
-        "limit_px":    tp_px,
-        "order_type":  {"trigger": {"triggerPx": tp_px, "isMarket": True, "tpsl": "tp"}},
-        "reduce_only": True,
-    }
-
-    try:
-        resp = _hl_call(
-            _exchange.bulk_orders,
-            [sl_order, tp_order],
-            grouping="normalTpsl",
-            context=f"_place_sltp_pair({coin} sl={sl_px} tp={tp_px})",
-        )
-        statuses = (
-            ((resp.get("response") or {})
-             .get("data") or {})
-            .get("statuses") or []
-        )
-        errors = [s.get("error") for s in statuses if "error" in s]
-        if errors:
-            raise RuntimeError(f"bulk_orders normalTpsl errors: {errors}")
-        log.info(
-            "SL+TP colocados juntos (normalTpsl): %s | sl=%.4f tp=%.4f (%s)",
-            coin, sl_px, tp_px, side.upper(),
-        )
-    except Exception as exc:
-        log.warning(
-            "_place_sltp_pair(%s) falló: %s — intentando órdenes separadas",
-            coin, exc,
-        )
-        _place_single_sl(symbol, side, qty, sl_price)
-        _place_single_tp(symbol, side, qty, tp_price)
-
-
-def _place_single_sl(symbol: str, side: str, qty: float, stop_price: float) -> None:
-    coin       = _hl_symbol(symbol)
-    is_buy     = side == "short"
-    stop_price = _round_price(coin, stop_price)
-    order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
-    try:
-        resp = _hl_call(
-            _order_reduce_only,
-            coin, is_buy, qty, stop_price, order_type,
-            context=f"_place_single_sl({coin},{stop_price})",
-        )
-        _check_order_response(resp, f"_place_single_sl({coin},{stop_price})")
-        log.info("SL colocado en %s (%s %s)", stop_price, side.upper(), coin)
-    except Exception as exc:
-        log.warning("_place_single_sl(%s) falló: %s", coin, exc)
-
-
-def _place_single_tp(symbol: str, side: str, qty: float, tp_price: float) -> None:
-    coin       = _hl_symbol(symbol)
-    is_buy     = side == "short"
-    tp_price   = _round_price(coin, tp_price)
-    order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
-    try:
-        resp = _hl_call(
-            _order_reduce_only,
-            coin, is_buy, qty, tp_price, order_type,
-            context=f"_place_single_tp({coin},{tp_price})",
-        )
-        _check_order_response(resp, f"_place_single_tp({coin},{tp_price})")
-        log.info("TP colocado en %s (%s %s)", tp_price, side.upper(), coin)
-    except Exception as exc:
-        log.warning("_place_single_tp(%s) falló: %s", coin, exc)
 
 
 # ── Abrir orden ──────────────────────────────────────────────────────────────────
 
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
-    """Abre una posición IOC y coloca SL+TP juntos con normalTpsl.
-
-    v13 FIX: se usa limit_px (de _market_price) también para el check de
-    notional mínimo, eliminando la llamada separada a get_price().
-
-    v14 FIX: slippage dinámico por activo (_get_slippage) para que limit_px
-    nunca exceda el umbral de desviación que aplica Hyperliquid sobre el
-    mark price en activos muy líquidos (BTC/ETH usan 0.1%, resto hasta 0.3%).
-    """
     sym_bot = symbol or config.SYMBOLS[0]
     coin    = _hl_symbol(sym_bot)
     is_buy  = side == "long"
 
-    qty = floor_qty(qty, sym_bot)
-
-    limit_px = _market_price(coin, is_buy)
-
-    if qty <= 0 or not min_notional_ok(qty, limit_px):
+    qty   = floor_qty(qty, sym_bot)
+    price = get_price(sym_bot)
+    if qty <= 0 or not min_notional_ok(qty, price):
         raise ValueError(
-            f"qty={qty} inválido para {sym_bot} (notional={qty*limit_px:.2f} USDT). "
+            f"qty={qty} inválido para {sym_bot}. "
             "Aumenta MARGIN_USDT o reduce el número de pares."
         )
 
     set_leverage(sym_bot, config.LEVERAGE)
 
+    # v8+v9: _market_price usa Decimal rounding → floattowire no puede quejarse
+    limit_px = _market_price(coin, is_buy)
     resp = _hl_call(
         _exchange.order,
         coin, is_buy, qty, limit_px,
@@ -548,22 +386,43 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     _check_order_response(resp, f"open_order {side.upper()} {coin} qty={qty}")
     log.info("Orden abierta: %s %s qty=%.4f @ ~%.4f", side.upper(), coin, qty, limit_px)
 
-    _place_sltp_pair(sym_bot, side, qty, sl, tp)
+    place_stop_order(sym_bot, side, qty, sl)
+    place_tp_order(sym_bot, side, qty, tp)
     return resp
 
 
-def place_stop_order(symbol: str, side: str, qty: float, stop_price: float, tp_price: float = None) -> None:
-    if tp_price is not None:
-        _place_sltp_pair(symbol, side, qty, stop_price, tp_price)
-    else:
-        _place_single_sl(symbol, side, qty, stop_price)
+def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
+    coin       = _hl_symbol(symbol)
+    is_buy     = side == "short"  # cerrar long → sell; cerrar short → buy
+    stop_price = _round_price(coin, stop_price)  # v7+v9: Decimal rounding
+    order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
+    try:
+        resp = _hl_call(
+            _order_reduce_only,
+            coin, is_buy, qty, stop_price, order_type,
+            context=f"place_stop_order({coin},{stop_price})",
+        )
+        _check_order_response(resp, f"place_stop_order({coin},{stop_price})")
+        log.info("SL colocado en %s (%s %s)", stop_price, side.upper(), coin)
+    except Exception as exc:
+        log.warning("place_stop_order(%s) falló: %s", coin, exc)
 
 
-def place_tp_order(symbol: str, side: str, qty: float, tp_price: float, sl_price: float = None) -> None:
-    if sl_price is not None:
-        _place_sltp_pair(symbol, side, qty, sl_price, tp_price)
-    else:
-        _place_single_tp(symbol, side, qty, tp_price)
+def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
+    coin       = _hl_symbol(symbol)
+    is_buy     = side == "short"  # cerrar long → sell; cerrar short → buy
+    tp_price   = _round_price(coin, tp_price)  # v7+v9: Decimal rounding
+    order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
+    try:
+        resp = _hl_call(
+            _order_reduce_only,
+            coin, is_buy, qty, tp_price, order_type,
+            context=f"place_tp_order({coin},{tp_price})",
+        )
+        _check_order_response(resp, f"place_tp_order({coin},{tp_price})")
+        log.info("TP colocado en %s (%s %s)", tp_price, side.upper(), coin)
+    except Exception as exc:
+        log.warning("place_tp_order(%s) falló: %s", coin, exc)
 
 
 # ── Cerrar posición ──────────────────────────────────────────────────────────────────
@@ -571,7 +430,7 @@ def place_tp_order(symbol: str, side: str, qty: float, tp_price: float, sl_price
 def close_position(side: str, qty: float, symbol: str = None) -> dict:
     coin     = _hl_symbol(symbol or config.SYMBOLS[0])
     is_buy   = side == "short"
-    limit_px = _market_price(coin, is_buy)
+    limit_px = _market_price(coin, is_buy)  # v8+v9: Decimal rounding
     resp = _hl_call(
         _exchange.order,
         coin, is_buy, qty, limit_px,

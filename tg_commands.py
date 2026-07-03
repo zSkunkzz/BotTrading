@@ -11,7 +11,6 @@ Comandos:
     /trades     — Envía el archivo trades.csv como documento descargable
     /long <SYM> — Señal manual LONG para el símbolo
     /short <SYM>— Señal manual SHORT para el símbolo
-    /sltp <SYM> <SL> <TP> — Modifica SL y TP de una posición abierta
 
 FIX: _fetch_trade_history usa trade_logger.get_cache_snapshot() en lugar de
      acceder a trade_logger._cache directamente, respetando el lock del módulo.
@@ -34,7 +33,6 @@ import httpx
 
 import bot_state
 import config
-import exchange
 import trade_logger
 
 log = logging.getLogger("tg_commands")
@@ -271,130 +269,6 @@ def _cmd_resume() -> str:
     return "▶️ <b>Bot reanudado</b>\nVolverá a buscar señales en el próximo ciclo."
 
 
-def _handle_sltp(parts: list[str], chat_id: str) -> None:
-    """Comando /sltp <SYM> <SL> <TP>
-
-    Modifica el Stop Loss y el Take Profit de una posición abierta sin
-    cerrarla. Usa exchange.modify_sltp_orders() (batchModify in-place).
-
-    Uso:
-        /sltp BTC-USDT 60000 70000
-        /sltp ETH-USDT 2800.5 3400
-
-    Reglas de validación:
-      - El símbolo debe tener una posición abierta en el bot.
-      - SL y TP deben ser números positivos.
-      - Long:  SL < entry y TP > entry
-      - Short: SL > entry y TP < entry
-    """
-    if len(parts) < 4:
-        _send(
-            "⚠️ Uso: <code>/sltp SYMBOL SL TP</code>\n"
-            "Ejemplo: <code>/sltp BTC-USDT 60000 70000</code>",
-            chat_id,
-        )
-        return
-
-    symbol = parts[1].upper()
-    try:
-        new_sl = float(parts[2])
-        new_tp = float(parts[3])
-    except ValueError:
-        _send("⚠️ SL y TP deben ser números. Ejemplo: <code>/sltp BTC-USDT 60000 70000</code>", chat_id)
-        return
-
-    if new_sl <= 0 or new_tp <= 0:
-        _send("⚠️ SL y TP deben ser mayores que 0.", chat_id)
-        return
-
-    if _get_positions is None:
-        _send("⚠️ No hay acceso a posiciones en este momento.", chat_id)
-        return
-
-    positions = dict(_get_positions())
-    if symbol not in positions:
-        open_syms = ", ".join(positions.keys()) if positions else "ninguna"
-        _send(
-            f"⚠️ No hay posición abierta para <b>{symbol}</b>.\n"
-            f"Posiciones actuales: <code>{open_syms}</code>",
-            chat_id,
-        )
-        return
-
-    pos   = positions[symbol]
-    side  = pos["side"]
-    entry = pos.get("entry", 0.0)
-    qty   = pos.get("qty", 0.0)
-
-    # Validación direccional
-    if side == "long":
-        if new_sl >= entry:
-            _send(
-                f"⚠️ Para LONG el SL debe ser menor que entry.\n"
-                f"Entry: <code>{entry:.6f}</code> | SL propuesto: <code>{new_sl}</code>",
-                chat_id,
-            )
-            return
-        if new_tp <= entry:
-            _send(
-                f"⚠️ Para LONG el TP debe ser mayor que entry.\n"
-                f"Entry: <code>{entry:.6f}</code> | TP propuesto: <code>{new_tp}</code>",
-                chat_id,
-            )
-            return
-    else:  # short
-        if new_sl <= entry:
-            _send(
-                f"⚠️ Para SHORT el SL debe ser mayor que entry.\n"
-                f"Entry: <code>{entry:.6f}</code> | SL propuesto: <code>{new_sl}</code>",
-                chat_id,
-            )
-            return
-        if new_tp >= entry:
-            _send(
-                f"⚠️ Para SHORT el TP debe ser menor que entry.\n"
-                f"Entry: <code>{entry:.6f}</code> | TP propuesto: <code>{new_tp}</code>",
-                chat_id,
-            )
-            return
-
-    old_sl = pos.get("sl")
-    old_tp = pos.get("tp")
-
-    try:
-        exchange.modify_sltp_orders(symbol, side, qty, new_sl, new_tp)
-    except Exception as exc:
-        log.error("[%s] /sltp: error en modify_sltp_orders: %s", symbol, exc)
-        _send(
-            f"❌ <b>Error al modificar SL/TP</b>\n"
-            f"{symbol} {side.upper()}\n"
-            f"Error: <code>{exc}</code>\n"
-            f"Las órdenes anteriores siguen activas.",
-            chat_id,
-        )
-        return
-
-    # Actualizar el dict local en memoria para que main.py vea los nuevos valores
-    pos["sl"] = new_sl
-    pos["tp"] = new_tp
-
-    old_sl_str = f"{old_sl:.6f}" if old_sl is not None else "N/A"
-    old_tp_str = f"{old_tp:.6f}" if old_tp is not None else "N/A"
-
-    log.info(
-        "[%s] /sltp aplicado | side=%s entry=%.6f | SL %s→%.6f | TP %s→%.6f",
-        symbol, side, entry, old_sl_str, new_sl, old_tp_str, new_tp,
-    )
-    _send(
-        f"✅ <b>SL/TP modificado</b>\n"
-        f"{symbol} {side.upper()}\n\n"
-        f"Entry:  <code>{entry:.6f}</code>\n"
-        f"SL: <code>{old_sl_str}</code> → <code>{new_sl:.6f}</code>\n"
-        f"TP: <code>{old_tp_str}</code> → <code>{new_tp:.6f}</code>",
-        chat_id,
-    )
-
-
 COMMANDS = {
     "/historial":  _cmd_historial,
     "/stats":      _cmd_stats,
@@ -413,8 +287,7 @@ COMMANDS = {
         "/stop — Pausar búsqueda de señales nuevas\n"
         "/resume — Reanudar el bot\n"
         "/long BTC-USDT — Señal manual LONG\n"
-        "/short BTC-USDT — Señal manual SHORT\n"
-        "/sltp BTC-USDT 60000 70000 — Modificar SL y TP de una posición"
+        "/short BTC-USDT — Señal manual SHORT"
     ),
 }
 
@@ -457,11 +330,6 @@ def _poll() -> None:
                         )
                         log.info("Enviando trades.csv (%d trades, %.1f KB)", len(trades), size_kb)
                         _send_document(csv_path, caption, chat_id)
-                    continue
-
-                # Comando /sltp <SYM> <SL> <TP>
-                if text == "/sltp":
-                    _handle_sltp(parts, chat_id)
                     continue
 
                 # Comandos manuales /long <SYM> y /short <SYM>

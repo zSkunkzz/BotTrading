@@ -20,43 +20,10 @@ v10:
     (latencia exchange ~100-300 ms). El guard v9 se mantiene como segunda línea.
   - Causa real: señal manual + señal automática evaluadas casi simultáneamente
     para el mismo símbolo, o dos loops muy juntos cuando LOOP_SLEEP es bajo.
-v11:
-  - _cycle_lock (threading.Lock): impide que el siguiente loop empiece antes
-    de que el anterior haya terminado. Si el loop tarda más que LOOP_SLEEP
-    los ciclos ya no se solapan — el nuevo se descarta con un WARNING.
-    Causa real: LOOP_SLEEP bajo + evaluación de ~50 pares en paralelo →
-    múltiples ciclos activos simultáneamente → señales duplicadas.
-  - _restore_sl_tp retry: si una posición sincronizada (reinicio/race) sigue
-    con sl=None o tp=None en loops posteriores (feed no listo en el momento
-    del sync), se reintenta _restore_sl_tp_on_sync cada iteración hasta que
-    el feed esté listo. Fix directo para HYPE (y cualquier par) abierto sin
-    SL/TP tras reinicio del bot.
-v12:
-  - _apply_breakeven, _update_trailing, _check_tp_extension: sustituye el
-    patrón cancel_all_orders→place_stop→place_tp por exchange.modify_sltp_orders()
-    (batchModify in-place). Las órdenes se modifican atómicamente — si el exchange
-    las rechaza, las antiguas siguen activas sin ventana de desprotección.
-v13:
-  - _restore_sl_tp_on_sync: sustituye place_stop_order + place_tp_order separados
-    por exchange._place_sltp_pair() con grouping normalTpsl.
-    Causa: HL rechaza colocar TP como orden independiente cuando ya existe SL activo
-    (y viceversa). _place_sltp_pair envía ambas en un solo bulk_orders normalTpsl.
-  - modify_sltp_orders en exchange.py: corregido para usar Exchange.modify_order()
-    del SDK real (bulk_modify_orders_new no existía y siempre fallaba al fallback
-    cancel+place, dejando ventana de desprotección).
-v14:
-  - _restore_sl_tp_on_sync: ya no sale en cuanto sl/tp != None en el dict local.
-    Verifica que las órdenes REALMENTE existen en HL con get_open_trigger_orders().
-    Si alguna falta (sl_real o tp_real es None), cancela todo y recoloca ambas
-    con _place_sltp_pair aunque el dict local tuviera valores de v17.
-    Causa raíz: _fetch_trigger_map() puede devolver valores stale o erróneos,
-    haciendo que _restore_sl_tp_on_sync saliera convencido de que todo estaba
-    bien cuando en HL no había ninguna orden activa.
 """
 import logging
 import os
 import sys
-import threading
 import time
 from datetime import datetime, timezone
 
@@ -94,11 +61,6 @@ TRAILING_NOTIFY_DEBOUNCE = 5 * 60  # 5 min entre notificaciones trailing del mis
 # v10: mutex en memoria — impide que dos llamadas a _open_position para el mismo
 # símbolo se solapen antes de que la primera haya registrado la posición.
 _opening: set[str] = set()
-
-# v11: lock de ciclo — impide que el siguiente loop empiece antes de que el
-# anterior haya terminado. Si LOOP_SLEEP < duración real del loop, el ciclo
-# nuevo se descarta silenciosamente en lugar de ejecutarse en paralelo.
-_cycle_lock = threading.Lock()
 
 COOLDOWN_SL           = 60 * 60
 COOLDOWN_SL_FAST      = 15 * 60
@@ -208,8 +170,9 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
     new_sl = pos["sl"]
     side   = pos["side"]
     try:
-        # v12: modify in-place — sin ventana de desprotección
-        exchange.modify_sltp_orders(symbol, side, pos["qty"], new_sl, pos["tp"])
+        exchange.cancel_all_orders(symbol)
+        exchange.place_stop_order(symbol, side, pos["qty"], new_sl)
+        exchange.place_tp_order(symbol, side, pos["qty"], pos["tp"])
         telegram.notify(
             f"\U0001f512 <b>Break-even activado</b>\n"
             f"{symbol} {side.upper()}\n"
@@ -230,8 +193,7 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
-    """v8: _round_price en new_sl + debounce de notificaciones (5 min/par).
-    v12: modify_sltp_orders en lugar de cancel+place."""
+    """v8: _round_price en new_sl + debounce de notificaciones (5 min/par)."""
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -252,8 +214,9 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                 log.info("[%s] Trailing SL: %.6f → %.6f", symbol, pos["sl"], new_sl)
                 pos["sl"] = new_sl
                 try:
-                    # v12: modify in-place — sin ventana de desprotección
-                    exchange.modify_sltp_orders(symbol, "long", pos["qty"], new_sl, pos["tp"])
+                    exchange.cancel_all_orders(symbol)
+                    exchange.place_stop_order(symbol, "long", pos["qty"], new_sl)
+                    exchange.place_tp_order(symbol, "long", pos["qty"], pos["tp"])
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
                     return
@@ -275,8 +238,9 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                 log.info("[%s] Trailing SL: %.6f → %.6f", symbol, pos["sl"], new_sl)
                 pos["sl"] = new_sl
                 try:
-                    # v12: modify in-place — sin ventana de desprotección
-                    exchange.modify_sltp_orders(symbol, "short", pos["qty"], new_sl, pos["tp"])
+                    exchange.cancel_all_orders(symbol)
+                    exchange.place_stop_order(symbol, "short", pos["qty"], new_sl)
+                    exchange.place_tp_order(symbol, "short", pos["qty"], pos["tp"])
                 except Exception as e:
                     log.warning("[%s] Error actualizando trailing SL: %s", symbol, e)
                     return
@@ -297,8 +261,7 @@ def _check_tp_extension(
     feed,
     effective_min_score: int,
 ) -> None:
-    """v8: fórmula de new_tp lineal (entry + tp_orig_dist × (n+1)) y _round_price.
-    v12: modify_sltp_orders en lugar de cancel+place."""
+    """v8: fórmula de new_tp lineal (entry + tp_orig_dist × (n+1)) y _round_price."""
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -401,8 +364,9 @@ def _check_tp_extension(
         current_sl = pos["sl"]
 
         try:
-            # v12: modify in-place — sin ventana de desprotección
-            exchange.modify_sltp_orders(symbol, side, pos["qty"], current_sl, new_tp)
+            exchange.cancel_all_orders(symbol)
+            exchange.place_stop_order(symbol, side, pos["qty"], current_sl)
+            exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
         except Exception as e:
             log.warning("[%s] Error colocando órdenes en extend_tp: %s", symbol, e)
             return
@@ -712,54 +676,18 @@ def _restore_sl_tp_on_sync(
     pos: dict,
     feed,
 ) -> None:
-    """Restaura SL y TP tras reinicio cuando la posición ya existía en el exchange.
+    sl   = pos.get("sl")
+    tp   = pos.get("tp")
+    side = pos["side"]
 
-    v14 FIX: ya no sale en cuanto sl/tp != None en el dict local.
-    Verifica que las órdenes REALMENTE existen en HL con get_open_trigger_orders().
-    Si alguna falta (sl_real o tp_real es None), cancela todo y recoloca ambas
-    con _place_sltp_pair aunque el dict local tuviera valores inyectados por v17.
-    Causa raíz: _fetch_trigger_map() puede devolver valores stale o incorrectos,
-    haciendo que la función saliera creyendo que todo estaba bien cuando en HL
-    no había ninguna orden activa.
-    """
-    side  = pos["side"]
+    if sl is not None and tp is not None:
+        return
+
     entry = pos.get("entry", 0.0)
     qty   = pos.get("qty", 0.0)
-
     if entry <= 0 or qty <= 0:
-        log.warning(
-            "[%s] _restore_sl_tp: entry=%.6f qty=%.8f inválidos — no se pueden recalcular",
-            symbol, entry, qty,
-        )
+        log.warning("[%s] _restore_sl_tp: entry=%.6f qty=%.8f inválidos — no se pueden recalcular", symbol, entry, qty)
         return
-
-    # v14: verificar contra HL que las órdenes trigger existen de verdad
-    try:
-        trigger = exchange.get_open_trigger_orders(symbol)
-        sl_real = trigger.get("sl")
-        tp_real = trigger.get("tp")
-    except Exception as exc:
-        log.warning("[%s] _restore_sl_tp: no se pudo leer trigger orders: %s — forzando restore", symbol, exc)
-        sl_real = None
-        tp_real = None
-
-    if sl_real is not None and tp_real is not None:
-        # Ambas órdenes existen en HL — sincronizar el dict local y salir
-        log.info(
-            "[%s] _restore_sl_tp: SL+TP ya activos en HL (sl=%.6f tp=%.6f) — sin acción",
-            symbol, sl_real["px"], tp_real["px"],
-        )
-        pos["sl"] = sl_real["px"]
-        pos["tp"] = tp_real["px"]
-        return
-
-    # Falta al menos una orden — recalcular y colocar ambas
-    log.warning(
-        "[%s] _restore_sl_tp: órdenes en HL incompletas (sl=%s tp=%s) — recalculando y recolocando",
-        symbol,
-        f"{sl_real['px']:.6f}" if sl_real else "None",
-        f"{tp_real['px']:.6f}" if tp_real else "None",
-    )
 
     try:
         candles_15m = feed.get(symbol, "15m")
@@ -778,9 +706,9 @@ def _restore_sl_tp_on_sync(
         new_sl = params["sl"]
         new_tp = params["tp"]
 
-        # Cancelar órdenes previas huérfanas y colocar SL+TP juntos con normalTpsl
         exchange.cancel_all_orders(symbol)
-        exchange._place_sltp_pair(symbol, side, qty, new_sl, new_tp)
+        exchange.place_stop_order(symbol, side, qty, new_sl)
+        exchange.place_tp_order(symbol, side, qty, new_tp)
 
         pos["sl"]          = new_sl
         pos["tp"]          = new_tp
@@ -822,6 +750,9 @@ def _open_position(
     positions: dict,
 ) -> None:
     # v10: lock en memoria — primera línea de defensa contra duplicados.
+    # Impide que dos rutas (manual + automática, o dos evaluaciones solapadas)
+    # lancen open_order para el mismo símbolo antes de que la primera
+    # termine de registrar la posición en `positions`.
     if symbol in _opening:
         log.warning(
             "[%s] _open_position: ya hay una apertura en curso para este símbolo — abortando",
@@ -832,6 +763,9 @@ def _open_position(
 
     try:
         # v9: guard de exchange — segunda línea de defensa (cubre reinicios).
+        # El lock de arriba cubre el caso intra-proceso; este cubre el caso
+        # en que el bot crasheó justo tras enviar la orden pero antes de
+        # registrarla en `positions`.
         try:
             pos_already = exchange.get_position(symbol)
             if pos_already and pos_already.get("side") in VALID_SIDES:
@@ -932,6 +866,7 @@ def _open_position(
         )
 
     finally:
+        # Siempre liberar el lock, tanto si la apertura tuvo éxito como si no.
         _opening.discard(symbol)
 
 
@@ -966,18 +901,6 @@ def run() -> None:
     loop_count = 0
 
     while True:
-        # v11: cycle lock — si el loop anterior aún no ha terminado, saltamos
-        # este ciclo completamente en lugar de ejecutarlo en paralelo.
-        if not _cycle_lock.acquire(blocking=False):
-            log.warning(
-                "[cycle_lock] Loop anterior aún en curso — ciclo #%d descartado "
-                "(LOOP_SLEEP demasiado bajo o loop muy lento). "
-                "Considera aumentar LOOP_SLEEP.",
-                loop_count + 1,
-            )
-            time.sleep(config.LOOP_SLEEP)
-            continue
-
         try:
             loop_count += 1
 
@@ -1068,16 +991,6 @@ def run() -> None:
                     )
 
                     _restore_sl_tp_on_sync(symbol, positions[symbol], feed)
-
-            # v11: retry _restore_sl_tp para posiciones que siguen sin SL/TP
-            # (feed no estaba listo en el loop del primer sync).
-            for symbol, pos in list(positions.items()):
-                if pos.get("sl") is None or pos.get("tp") is None:
-                    log.debug(
-                        "[%s] SL/TP aún None — reintentando restore (feed no estaba listo antes)",
-                        symbol,
-                    )
-                    _restore_sl_tp_on_sync(symbol, pos, feed)
 
             open_count = len(positions)
 
@@ -1239,7 +1152,6 @@ def run() -> None:
 
                         if is_manual:
                             _manual_alert_cooldown[symbol] = time.time()
-
                             params = risk.calc(
                                 signal, price, candles_15m,
                                 score=score, symbol=symbol, regime=regime,
@@ -1270,10 +1182,6 @@ def run() -> None:
         except Exception as e:
             log.error("Error en loop: %s", e, exc_info=True)
             telegram.notify(f"\u26a0\ufe0f Error en bot: {e}")
-
-        finally:
-            # v11: liberar el cycle lock siempre, pase lo que pase en el loop.
-            _cycle_lock.release()
 
         time.sleep(config.LOOP_SLEEP)
 
