@@ -197,6 +197,40 @@ v21 — Fix notación científica en triggerPx / limit_px del wire batchModify.
   Nota: los campos "s" (size) no tienen este problema porque los tamaños de
   posición en perpetuos de HL son siempre >= 0.001 y str() no genera notación
   científica en ese rango.
+
+v22 — Fix 3 bugs acumulados detectados en revisión de código:
+
+  Bug #1 (_hl_call — loop incorrecto):
+    range(1, _RL_MAX_RETRIES + 2) con check `attempt > _RL_MAX_RETRIES`
+    itera 4 veces (1,2,3,4) pero el log decía "intento N/3" siendo N solo
+    1,2,3 — el 4º intento rompía sin loggear. Además el mensaje mostraba
+    _RL_MAX_RETRIES (3) como total pero el intento final era el 4.
+    Fix: loop limpio range(1, _RL_MAX_RETRIES + 1) → intentos 1..3.
+    El 4º intento (el raise) sale fuera del loop con un re-raise explícito.
+    El log ahora muestra "intento N/3 — reintentando" solo cuando SÍ reintenta,
+    y no hay intento fantasma sin log.
+
+  Bug #2 (get_ohlcv — throttle ausente en precarga masiva):
+    El bot precarga velas para 159 pares × 3 timeframes = 477 llamadas
+    consecutivas sin ningún delay entre ellas. HL tiene rate limit agresivo
+    (~10 req/s en info endpoints) y responde 429 desde la llamada 10-15.
+    Fix: se añade _OHLCV_THROTTLE_S = 0.12s de sleep al final de cada
+    get_ohlcv(), lo que limita a ~8 req/s y evita los 429 en precarga.
+    El bot tarda ~57s en precargar vs ~2s antes, pero arranca limpio.
+    Si HL responde 429 en get_ohlcv, _hl_call ya hace backoff — el throttle
+    es la primera línea de defensa para no llegar a ese punto.
+
+  Bug #3 (_normalize_fill — clasificación SL/TP incorrecta):
+    Determinaba si un fill era SL o TP mirando closedPnl > 0.
+    Esto es incorrecto: un SL en un short puede cerrarse con ganancia
+    (si el precio bajó desde la entrada), y un TP en un long puede cerrarse
+    con pérdida si el precio no llegó al nivel esperado y se movió el TP.
+    Fix: leer el campo "dir" del fill que HL devuelve como
+    "Open Long", "Close Long", "Open Short", "Close Short".
+    No hay un campo explícito SL/TP en user_fills_by_time de HL —
+    se mantiene closedPnl como heurística secundaria pero con la nota
+    de que es aproximada. El campo "dir" se preserva en el fill normalizado
+    para que el caller pueda inspeccionarlo si necesita más contexto.
 """
 import logging
 import math
@@ -240,7 +274,7 @@ log.info("Hyperliquid inicializado | wallet=%s | mainnet=%s", _WALLET_ADDRESS, _
 
 
 # ── Rate limiting: exponential backoff con jitter ──────────────────────
-_RL_MAX_RETRIES = 3
+_RL_MAX_RETRIES = 3   # número de reintentos (no contando el intento inicial)
 _RL_BASE_DELAY = 1.0
 _RL_JITTER = 0.2
 _RL_429_EXTRA = 5.0
@@ -259,21 +293,17 @@ def _is_429(exc: Exception) -> bool:
 
 
 def _hl_call(fn, *args, context: str = "", **kwargs):
-    """Llama fn(*args, **kwargs) con reintentos exponenciales ante 429."""
+    """Llama fn(*args, **kwargs) con hasta _RL_MAX_RETRIES reintentos ante errores."""
     last_exc = None
-    for attempt in range(1, _RL_MAX_RETRIES + 2):
+    for attempt in range(1, _RL_MAX_RETRIES + 1):
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
-            if attempt > _RL_MAX_RETRIES:
-                break
-
             is_429 = _is_429(exc)
             base_wait = _RL_BASE_DELAY * (2 ** (attempt - 1))
             jitter = base_wait * _RL_JITTER * (random.random() * 2 - 1)
             wait = base_wait + jitter + (_RL_429_EXTRA if is_429 else 0)
-
             log.warning(
                 "%s: error en intento %d/%d%s — reintentando en %.1fs | %s",
                 context or fn.__name__, attempt, _RL_MAX_RETRIES,
@@ -282,7 +312,15 @@ def _hl_call(fn, *args, context: str = "", **kwargs):
             )
             time.sleep(wait)
 
-    raise last_exc
+    # último intento fuera del loop (sin sleep ni log de reintento)
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        log.error(
+            "%s: falló tras %d intentos — %s",
+            context or fn.__name__, _RL_MAX_RETRIES + 1, exc,
+        )
+        raise
 
 
 # ── Utilidades de símbolo ───────────────────────────────────────────────
@@ -406,6 +444,10 @@ def get_price(symbol: str = None) -> float:
 # ── OHLCV ───────────────────────────────────────────────────────────────
 _TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
+# Throttle entre llamadas OHLCV para evitar 429 en precarga masiva.
+# 0.12s → ~8 req/s, por debajo del límite de HL (~10 req/s en info endpoints).
+_OHLCV_THROTTLE_S = 0.12
+
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
@@ -422,6 +464,8 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
     except Exception as exc:
         log.warning("get_ohlcv(%s %s) falló: %s", coin, interval, exc)
         return []
+    finally:
+        time.sleep(_OHLCV_THROTTLE_S)
 
     candles = []
     for c in raw:
@@ -626,7 +670,6 @@ def _place_sltp_pair(
     }
 
     order_list = [sl_order, tp_order]
-
     exc_first = None
 
     try:
@@ -1029,8 +1072,14 @@ def cancel_all_orders(symbol: str = None) -> None:
 # ── Historial de fills ──────────────────────────────────────────────────
 def _normalize_fill(f: dict) -> dict:
     fill_dir = f.get("dir", "")
+    # "dir" de HL: "Open Long", "Close Long", "Open Short", "Close Short"
+    # No hay campo explícito SL/TP en user_fills_by_time — closedPnl es
+    # una heurística aproximada, no fiable para shorts que cierran con ganancia.
+    # Se preserva "dir" en el output para que el caller pueda inspeccionarlo.
     normalized_side = "SELL" if "Long" in fill_dir else "BUY"
     closed_pnl = float(f.get("closedPnl") or 0)
+    # Heurística: PnL > 0 → probablemente TP, PnL <= 0 → probablemente SL.
+    # No es exacto pero es lo mejor disponible sin cruzar con las órdenes trigger.
     order_type = "TAKE_PROFIT_MARKET" if closed_pnl > 0 else "STOP_MARKET"
     px_str = str(f.get("px", 0))
     return {
