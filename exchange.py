@@ -105,6 +105,25 @@ v16 — Fix 3 bugs en modify_sltp_orders / get_open_trigger_orders / _batch_modi
     (el mismo error que motivó v11). Fix: en el caso asimétrico se cancela
     primero la orden existente y se recolocan ambas con _place_sltp_pair,
     igual que en el fallback completo.
+
+v17 — Fix raíz: posiciones sincronizadas nunca tenían SL/TP (2 bugs):
+
+  Bug #1 (get_all_positions): _parse_hl_position devuelve siempre
+    sl=None, tp=None porque HL no incluye esos datos en el objeto de
+    posición. get_all_positions() ahora llama frontend_open_orders UNA
+    sola vez al inicio del sync y puebla sl/tp en cada posición leyendo
+    las órdenes trigger activas. Esto evita que _restore_sl_tp_on_sync
+    cancele+recoloque órdenes que ya existen en HL (el cancel previo
+    dejaba la posición desprotegida durante el bulk_orders).
+
+  Bug #2 (_place_sltp_pair — fallback silencioso): si bulk_orders con
+    normalTpsl fallaba, el código hacía _place_single_sl + _place_single_tp
+    por separado. HL rechaza el segundo, el error se tragaba, y la posición
+    quedaba con solo SL o solo TP sin que nadie lo supiera. Fix: se elimina
+    el fallback a órdenes separadas. Si bulk_orders normalTpsl falla se
+    reintenta UNA vez sin el kwarg grouping (compatibilidad SDK < 0.9).
+    Si vuelve a fallar se lanza la excepción limpia para que el caller
+    (open_order, _restore_sl_tp_on_sync) la vea en logs y pueda actuar.
 """
 import logging
 import math
@@ -260,11 +279,7 @@ def _round_price(coin: str, price: float) -> float:
 
 
 # ── v14: limit_px correcto para órdenes trigger isMarket=True ────────────────────────
-# Hyperliquid requiere que limit_px en órdenes trigger market sea un precio
-# "suficientemente favorable" — no el triggerPx — para que HL no lo confunda
-# con una orden límite ejecutable inmediatamente (que rechaza en monedas > 1 USDC).
-# Patrón documentado: sell trigger → limit_px = 0; buy trigger → precio muy alto.
-_TRIGGER_BUY_LIMIT_MULTIPLIER = 1.10  # +10% sobre el triggerPx como precio límite de compra
+_TRIGGER_BUY_LIMIT_MULTIPLIER = 1.10
 
 
 def _trigger_market_limit_px(coin: str, is_buy: bool, trigger_px: float) -> float:
@@ -373,7 +388,42 @@ def _parse_hl_position(pos: dict) -> dict | None:
     }
 
 
+def _fetch_trigger_map() -> dict[str, dict]:
+    """Devuelve un mapa coin → {sl: float|None, tp: float|None} leyendo
+    frontend_open_orders UNA sola vez. Usado por get_all_positions() para
+    poblar sl/tp sin llamar a _restore_sl_tp_on_sync innecesariamente.
+    """
+    result: dict[str, dict] = {}
+    try:
+        orders = _hl_call(
+            _info.frontend_open_orders, _WALLET_ADDRESS,
+            context="fetch_trigger_map",
+        )
+        for o in orders:
+            coin = o.get("coin", "")
+            if not coin:
+                continue
+            ot  = str(o.get("orderType", ""))
+            px = (
+                float(o["triggerPx"]) if o.get("triggerPx") not in (None, 0, "0", "") else
+                float(o["limitPx"])   if o.get("limitPx")   not in (None, 0, "0", "") else
+                float(o["px"])        if o.get("px")         not in (None, 0, "0", "") else
+                0.0
+            )
+            if coin not in result:
+                result[coin] = {"sl": None, "tp": None}
+            if "Stop" in ot and px > 0:
+                result[coin]["sl"] = px
+            elif "Take Profit" in ot and px > 0:
+                result[coin]["tp"] = px
+    except Exception as exc:
+        log.warning("_fetch_trigger_map falló: %s", exc)
+    return result
+
+
 def get_all_positions() -> dict[str, dict]:
+    """v17: puebla sl/tp desde las trigger orders activas en el mismo ciclo
+    del sync para evitar que _restore_sl_tp_on_sync cancele órdenes válidas."""
     state     = _hl_call(_info.user_state, _WALLET_ADDRESS, context="get_all_positions")
     hl_to_bot = {_hl_symbol(s): s for s in config.SYMBOLS}
 
@@ -389,6 +439,9 @@ def get_all_positions() -> dict[str, dict]:
             open_coins,
             list(hl_to_bot.keys())[:15],
         )
+
+    # v17: leer trigger orders una sola vez para poblar sl/tp
+    trigger_map = _fetch_trigger_map()
 
     result: dict[str, dict] = {}
     for entry in asset_positions:
@@ -406,6 +459,15 @@ def get_all_positions() -> dict[str, dict]:
             continue
         parsed = _parse_hl_position(pos)
         if parsed:
+            # v17: inyectar sl/tp desde trigger orders activas
+            trig = trigger_map.get(coin, {})
+            parsed["sl"] = trig.get("sl")
+            parsed["tp"] = trig.get("tp")
+            if parsed["sl"] is not None or parsed["tp"] is not None:
+                log.info(
+                    "[exchange] sync %s — sl=%s tp=%s (desde trigger orders)",
+                    coin, parsed["sl"], parsed["tp"],
+                )
             result[sym_bot] = parsed
     return result
 
@@ -483,7 +545,14 @@ def _place_sltp_pair(
     sl_price: float,
     tp_price: float,
 ) -> None:
-    """Envía SL y TP en una sola llamada bulk_orders con grouping='normalTpsl'."""
+    """Envía SL y TP en una sola llamada bulk_orders con grouping='normalTpsl'.
+
+    v17: elimina el fallback silencioso a _place_single_sl + _place_single_tp.
+    Si bulk_orders normalTpsl falla, reintenta UNA vez sin el kwarg grouping
+    (compatibilidad con versiones antiguas del SDK). Si vuelve a fallar, lanza
+    la excepción para que el caller la vea — ya no se traga el error dejando
+    la posición con solo SL o solo TP.
+    """
     coin     = _hl_symbol(symbol)
     is_close = side == "short"  # cerrar long → sell (False); cerrar short → buy (True)
 
@@ -509,10 +578,13 @@ def _place_sltp_pair(
         "reduce_only": True,
     }
 
+    order_list = [sl_order, tp_order]
+
+    # Primer intento: con grouping normalTpsl (v12+)
     try:
         resp = _hl_call(
             _exchange.bulk_orders,
-            [sl_order, tp_order],
+            order_list,
             grouping="normalTpsl",
             context=f"_place_sltp_pair({coin} sl={sl_px} tp={tp_px})",
         )
@@ -523,19 +595,49 @@ def _place_sltp_pair(
         )
         errors = [s.get("error") for s in statuses if "error" in s]
         if errors:
-            raise RuntimeError(f"bulk_orders SLTP errors: {errors}")
+            raise RuntimeError(f"bulk_orders normalTpsl errors: {errors}")
         log.info(
-            "SL+TP colocados juntos (normalTpsl): %s | sl=%.4f tp=%.4f (%s %s)",
-            coin, sl_px, tp_px, side.upper(), coin,
+            "SL+TP colocados juntos (normalTpsl): %s | sl=%.4f tp=%.4f (%s)",
+            coin, sl_px, tp_px, side.upper(),
         )
-    except Exception as exc:
-        log.warning("_place_sltp_pair(%s) falló: %s — intentando órdenes separadas", coin, exc)
-        _place_single_sl(symbol, side, qty, sl_price)
-        _place_single_tp(symbol, side, qty, tp_price)
+        return
+    except Exception as exc_first:
+        log.warning(
+            "_place_sltp_pair(%s) normalTpsl falló: %s — reintentando sin grouping",
+            coin, exc_first,
+        )
+
+    # Segundo intento: sin grouping (compatibilidad SDK < 0.9)
+    try:
+        resp = _hl_call(
+            _exchange.bulk_orders,
+            order_list,
+            context=f"_place_sltp_pair_fallback({coin} sl={sl_px} tp={tp_px})",
+        )
+        statuses = (
+            ((resp.get("response") or {})
+             .get("data") or {})
+            .get("statuses") or []
+        )
+        errors = [s.get("error") for s in statuses if "error" in s]
+        if errors:
+            raise RuntimeError(f"bulk_orders sin grouping errors: {errors}")
+        log.info(
+            "SL+TP colocados (bulk sin grouping): %s | sl=%.4f tp=%.4f (%s)",
+            coin, sl_px, tp_px, side.upper(),
+        )
+        return
+    except Exception as exc_second:
+        # v17: NO hacer fallback silencioso a órdenes separadas — HL rechazaría la segunda.
+        # Lanzar excepción para que el caller lo vea en logs.
+        raise RuntimeError(
+            f"_place_sltp_pair({coin}): ambos intentos fallaron. "
+            f"Primer error: {exc_first}. Segundo error: {exc_second}"
+        ) from exc_second
 
 
 def _place_single_sl(symbol: str, side: str, qty: float, stop_price: float) -> None:
-    """Coloca solo el SL (sin TP). Uso interno como fallback."""
+    """Coloca solo el SL (sin TP). Uso interno como fallback cuando no hay TP."""
     coin       = _hl_symbol(symbol)
     is_buy     = side == "short"
     stop_price = _round_price(coin, stop_price)
@@ -554,7 +656,7 @@ def _place_single_sl(symbol: str, side: str, qty: float, stop_price: float) -> N
 
 
 def _place_single_tp(symbol: str, side: str, qty: float, tp_price: float) -> None:
-    """Coloca solo el TP (sin SL). Uso interno como fallback."""
+    """Coloca solo el TP (sin SL). Uso interno como fallback cuando no hay SL."""
     coin     = _hl_symbol(symbol)
     is_buy   = side == "short"
     tp_price = _round_price(coin, tp_price)
@@ -596,7 +698,6 @@ def get_open_trigger_orders(symbol: str) -> dict:
                 continue
             ot  = str(o.get("orderType", ""))
             oid = o.get("oid")
-            # v16 FIX: fallback robusto para el precio de trigger
             px = (
                 float(o["triggerPx"]) if o.get("triggerPx") not in (None, 0, "0", "") else
                 float(o["limitPx"])   if o.get("limitPx")   not in (None, 0, "0", "") else
@@ -657,7 +758,7 @@ def _batch_modify_sltp(
         log.debug("[%s] bulk_modify_orders no disponible en este SDK — usando modify individual", coin)
         return False
 
-    # v16 FIX: redondear internamente, no asumir que el caller ya lo hizo
+    # v16 FIX: redondear internamente
     new_sl = _round_price(coin, new_sl)
     new_tp = _round_price(coin, new_tp)
 
@@ -723,13 +824,8 @@ def modify_sltp_orders(
     """Modifica SL y TP in-place usando Exchange.modify_order() del SDK oficial.
 
     v16 FIX (bug #3 — caso asimétrico):
-      Cuando solo existe SL o solo TP, el código anterior intentaba colocar la
-      orden faltante con _place_single_sl / _place_single_tp de forma independiente.
-      Hyperliquid rechaza colocar una orden TPSL individual cuando ya existe la
-      otra (el mismo error que motivó v11 para las colocaciones iniciales).
-      Fix: en el caso asimétrico se cancela la orden existente y se recolocan
-      ambas con _place_sltp_pair (grouping=normalTpsl), igual que en el fallback
-      completo. Esto garantiza que SL y TP siempre se envían juntos.
+      Cuando solo existe SL o solo TP, cancela la existente y recoloca ambas
+      con _place_sltp_pair (grouping=normalTpsl).
     """
     coin         = _hl_symbol(symbol)
     is_close_buy = (side == "short")  # cerrar short → buy
@@ -784,9 +880,7 @@ def modify_sltp_orders(
         _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
         return
 
-    # v16 FIX: caso asimétrico — solo existe SL o solo existe TP.
-    # HL rechaza colocar una orden TPSL individual cuando ya existe la otra.
-    # Se cancela la orden existente y se recolocan ambas juntas con normalTpsl.
+    # Caso asimétrico — solo existe SL o solo existe TP (v16 FIX)
     existing_oid = (sl_info or tp_info)["oid"]
     existing_type = "SL" if sl_info else "TP"
     log.info(
