@@ -83,6 +83,28 @@ v15 — modify_sltp_orders: batchModify atómico como primer intento:
   Si bulk_modify_orders no existe en la versión instalada del SDK o HL lo
   rechaza, cae silenciosamente al comportamiento v13/v14 (dos modify_order
   separados + fallback cancel+place). Ninguna otra función cambia.
+
+v16 — Fix 3 bugs en modify_sltp_orders / get_open_trigger_orders / _batch_modify_sltp:
+
+  Bug #1 (get_open_trigger_orders): el precio de trigger se leía de
+    o.get("triggerPx") con fallback a o.get("limitPx"). En órdenes TPSL
+    de Hyperliquid el campo canónico es "triggerPx" pero puede ser None
+    si la orden se serializó de forma distinta. Se añade fallback robusto
+    leyendo también "px" (campo genérico de precio) para garantizar que
+    siempre se obtiene un precio válido > 0.
+
+  Bug #2 (_batch_modify_sltp): los triggerPx en modify_requests no pasaban
+    por _round_price internamente — dependían de que el caller ya los
+    hubiese redondeado. Se añade _round_price explícito dentro de la función
+    para que sea segura ante llamadas directas con precios crudos.
+
+  Bug #3 (modify_sltp_orders — caso asimétrico): cuando solo existe SL o
+    solo TP, el código intentaba colocar la orden faltante con
+    _place_single_sl / _place_single_tp de forma independiente. Hyperliquid
+    rechaza colocar una orden TPSL individual cuando ya existe la otra
+    (el mismo error que motivó v11). Fix: en el caso asimétrico se cancela
+    primero la orden existente y se recolocan ambas con _place_sltp_pair,
+    igual que en el fallback completo.
 """
 import logging
 import math
@@ -452,7 +474,7 @@ def _order_reduce_only(coin, is_buy, qty, price, order_type):
     return _exchange.order(coin, is_buy, qty, price, order_type, True)
 
 
-# ── SL + TP juntos con normalTpsl (v14 — fix limit_px para monedas > 1 USDC) ─────────
+# ── SL + TP juntos con normalTpsl ─────────────────────────────────────────────────
 
 def _place_sltp_pair(
     symbol: str,
@@ -461,23 +483,14 @@ def _place_sltp_pair(
     sl_price: float,
     tp_price: float,
 ) -> None:
-    """Envía SL y TP en una sola llamada bulk_orders con grouping='normalTpsl'.
-
-    v12 FIX: se pasa grouping="normalTpsl" explícitamente al SDK.
-    v14 FIX: limit_px usa _trigger_market_limit_px() en lugar de triggerPx.
-      Para órdenes trigger isMarket=True, HL exige que limit_px sea un precio
-      favorable (0 para sell, triggerPx*1.10 para buy) — no el propio triggerPx.
-      En monedas con precio > 1 USDC (SOL, ETH, BTC...) poner limit_px=triggerPx
-      hacía que HL tratara la orden como límite ejecutable inmediatamente y la
-      rechazara.
-    """
+    """Envía SL y TP en una sola llamada bulk_orders con grouping='normalTpsl'."""
     coin     = _hl_symbol(symbol)
     is_close = side == "short"  # cerrar long → sell (False); cerrar short → buy (True)
 
     sl_px       = _round_price(coin, sl_price)
     tp_px       = _round_price(coin, tp_price)
-    sl_limit_px = _trigger_market_limit_px(coin, is_close, sl_px)  # v14
-    tp_limit_px = _trigger_market_limit_px(coin, is_close, tp_px)  # v14
+    sl_limit_px = _trigger_market_limit_px(coin, is_close, sl_px)
+    tp_limit_px = _trigger_market_limit_px(coin, is_close, tp_px)
 
     sl_order = {
         "coin":        coin,
@@ -500,7 +513,7 @@ def _place_sltp_pair(
         resp = _hl_call(
             _exchange.bulk_orders,
             [sl_order, tp_order],
-            grouping="normalTpsl",  # v12 FIX: era "na" por defecto → HL rechazaba la 2ª orden
+            grouping="normalTpsl",
             context=f"_place_sltp_pair({coin} sl={sl_px} tp={tp_px})",
         )
         statuses = (
@@ -526,7 +539,7 @@ def _place_single_sl(symbol: str, side: str, qty: float, stop_price: float) -> N
     coin       = _hl_symbol(symbol)
     is_buy     = side == "short"
     stop_price = _round_price(coin, stop_price)
-    limit_px   = _trigger_market_limit_px(coin, is_buy, stop_price)  # v14
+    limit_px   = _trigger_market_limit_px(coin, is_buy, stop_price)
     order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
     try:
         resp = _hl_call(
@@ -545,7 +558,7 @@ def _place_single_tp(symbol: str, side: str, qty: float, tp_price: float) -> Non
     coin     = _hl_symbol(symbol)
     is_buy   = side == "short"
     tp_price = _round_price(coin, tp_price)
-    limit_px = _trigger_market_limit_px(coin, is_buy, tp_price)  # v14
+    limit_px = _trigger_market_limit_px(coin, is_buy, tp_price)
     order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
     try:
         resp = _hl_call(
@@ -564,7 +577,10 @@ def _place_single_tp(symbol: str, side: str, qty: float, tp_price: float) -> Non
 def get_open_trigger_orders(symbol: str) -> dict:
     """Devuelve los oid y precio de las órdenes SL y TP abiertas para `symbol`.
 
-    Usa frontend_open_orders que incluye órdenes trigger/TPSL.
+    v16 FIX: precio de trigger con fallback robusto — lee triggerPx, luego
+    limitPx, luego el campo genérico "px". En algunos serializados de HL
+    triggerPx puede ser None aunque la orden sea trigger.
+
     Retorna: {"sl": {"oid": int, "px": float} | None,
               "tp": {"oid": int, "px": float} | None}
     """
@@ -580,7 +596,13 @@ def get_open_trigger_orders(symbol: str) -> dict:
                 continue
             ot  = str(o.get("orderType", ""))
             oid = o.get("oid")
-            px  = float(o.get("triggerPx") or o.get("limitPx") or 0)
+            # v16 FIX: fallback robusto para el precio de trigger
+            px = (
+                float(o["triggerPx"]) if o.get("triggerPx") not in (None, 0, "0", "") else
+                float(o["limitPx"])   if o.get("limitPx")   not in (None, 0, "0", "") else
+                float(o["px"])        if o.get("px")         not in (None, 0, "0", "") else
+                0.0
+            )
             if oid is None:
                 continue
             if "Stop" in ot:
@@ -600,12 +622,8 @@ def _modify_single_order(
     new_px: float,
     tpsl: str,  # "sl" o "tp"
 ) -> None:
-    """Modifica una orden trigger existente usando Exchange.modify_order() del SDK.
-
-    v14 FIX: limit_px usa _trigger_market_limit_px() — no new_px directamente.
-    Firma del SDK: modify_order(coin, oid, is_buy, sz, limit_px, order_type, reduce_only=False)
-    """
-    limit_px   = _trigger_market_limit_px(coin, is_buy, new_px)  # v14
+    """Modifica una orden trigger existente usando Exchange.modify_order() del SDK."""
+    limit_px   = _trigger_market_limit_px(coin, is_buy, new_px)
     order_type = {"trigger": {"triggerPx": new_px, "isMarket": True, "tpsl": tpsl}}
     resp = _hl_call(
         _exchange.modify_order,
@@ -630,18 +648,18 @@ def _batch_modify_sltp(
 ) -> bool:
     """v15: Intenta modificar SL y TP atómicamente con bulk_modify_orders.
 
-    Envía ambas modificaciones en una sola llamada firmada con
-    grouping="normalTpsl", eliminando la ventana entre el modify del SL
-    y el del TP.
-
-    Devuelve True si ambas órdenes se modificaron correctamente,
-    False si el SDK no soporta bulk_modify_orders o HL rechazó la llamada
-    (en cuyo caso el caller cae al comportamiento v13/v14).
+    v16 FIX: aplica _round_price internamente sobre new_sl y new_tp antes de
+    construir los modify_requests, para que la función sea segura ante llamadas
+    directas con precios no redondeados (no depende del caller).
     """
     bulk_modify = getattr(_exchange, "bulk_modify_orders", None)
     if bulk_modify is None:
         log.debug("[%s] bulk_modify_orders no disponible en este SDK — usando modify individual", coin)
         return False
+
+    # v16 FIX: redondear internamente, no asumir que el caller ya lo hizo
+    new_sl = _round_price(coin, new_sl)
+    new_tp = _round_price(coin, new_tp)
 
     sl_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_sl)
     tp_limit_px = _trigger_market_limit_px(coin, is_close_buy, new_tp)
@@ -704,17 +722,14 @@ def modify_sltp_orders(
 ) -> None:
     """Modifica SL y TP in-place usando Exchange.modify_order() del SDK oficial.
 
-    v13 FIX: bulk_modify_orders_new no existe en el SDK de Hyperliquid.
-    El SDK expone Exchange.modify_order(coin, oid, is_buy, sz, limit_px, order_type, reduce_only).
-    Se llama una vez por orden (SL y TP por separado) — si el exchange rechaza una,
-    la otra sigue activa (no hay ventana de desprotección global).
-    Si no existen órdenes previas (arranque/reinicio), place directo con _place_sltp_pair.
-    Fallback a cancel+place solo si modify falla y la posición sigue abierta.
-
-    v15: cuando existen ambas órdenes, intenta primero _batch_modify_sltp() que
-    las modifica atómicamente en una sola llamada firmada (grouping=normalTpsl).
-    Si bulk_modify_orders no está disponible en el SDK instalado o HL lo rechaza,
-    cae al comportamiento v13/v14 sin cambios (dos modify_order separados).
+    v16 FIX (bug #3 — caso asimétrico):
+      Cuando solo existe SL o solo TP, el código anterior intentaba colocar la
+      orden faltante con _place_single_sl / _place_single_tp de forma independiente.
+      Hyperliquid rechaza colocar una orden TPSL individual cuando ya existe la
+      otra (el mismo error que motivó v11 para las colocaciones iniciales).
+      Fix: en el caso asimétrico se cancela la orden existente y se recolocan
+      ambas con _place_sltp_pair (grouping=normalTpsl), igual que en el fallback
+      completo. Esto garantiza que SL y TP siempre se envían juntos.
     """
     coin         = _hl_symbol(symbol)
     is_close_buy = (side == "short")  # cerrar short → buy
@@ -731,7 +746,7 @@ def modify_sltp_orders(
         _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
         return
 
-    # v15: si existen ambas órdenes, intentar batchModify atómico primero
+    # Ambas órdenes existen → intentar batchModify atómico (v15), luego modify individual
     if sl_info is not None and tp_info is not None:
         if _batch_modify_sltp(
             coin,
@@ -740,49 +755,47 @@ def modify_sltp_orders(
             new_sl_r, new_tp_r,
         ):
             return
-        # _batch_modify_sltp devolvió False → continuar con modify individual (v13/v14)
 
-    sl_ok = False
-    tp_ok = False
+        # batchModify devolvió False → modify individual (v13/v14)
+        sl_ok = False
+        tp_ok = False
 
-    # Modificar SL
-    if sl_info:
         try:
             _modify_single_order(coin, sl_info["oid"], is_close_buy, qty, new_sl_r, "sl")
             sl_ok = True
         except Exception as exc:
             log.warning("[%s] modify_order SL falló: %s", coin, exc)
-    else:
-        # No había SL → colocar uno nuevo
-        try:
-            _place_single_sl(symbol, side, qty, new_sl_r)
-            sl_ok = True
-        except Exception as exc:
-            log.warning("[%s] _place_single_sl falló: %s", coin, exc)
 
-    # Modificar TP
-    if tp_info:
         try:
             _modify_single_order(coin, tp_info["oid"], is_close_buy, qty, new_tp_r, "tp")
             tp_ok = True
         except Exception as exc:
             log.warning("[%s] modify_order TP falló: %s", coin, exc)
-    else:
-        # No había TP → colocar uno nuevo
-        try:
-            _place_single_tp(symbol, side, qty, new_tp_r)
-            tp_ok = True
-        except Exception as exc:
-            log.warning("[%s] _place_single_tp falló: %s", coin, exc)
 
-    # Si alguna modificación falló, intentar cancel+replace completo como último recurso
-    if not sl_ok or not tp_ok:
+        if sl_ok and tp_ok:
+            return
+
+        # Algún modify falló → fallback cancel+replace completo
         log.warning(
             "[%s] modify_sltp parcialmente fallido (sl_ok=%s tp_ok=%s) → fallback cancel+place",
             coin, sl_ok, tp_ok,
         )
         cancel_all_orders(symbol)
         _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
+        return
+
+    # v16 FIX: caso asimétrico — solo existe SL o solo existe TP.
+    # HL rechaza colocar una orden TPSL individual cuando ya existe la otra.
+    # Se cancela la orden existente y se recolocan ambas juntas con normalTpsl.
+    existing_oid = (sl_info or tp_info)["oid"]
+    existing_type = "SL" if sl_info else "TP"
+    log.info(
+        "[%s] modify_sltp: caso asimétrico — solo existe %s (oid=%s) → "
+        "cancelando y recolocando ambas con normalTpsl",
+        coin, existing_type, existing_oid,
+    )
+    cancel_all_orders(symbol)
+    _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
 
 
 # ── Abrir orden ──────────────────────────────────────────────────────────────────
@@ -812,18 +825,12 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     _check_order_response(resp, f"open_order {side.upper()} {coin} qty={qty}")
     log.info("Orden abierta: %s %s qty=%.4f @ ~%.4f", side.upper(), coin, qty, limit_px)
 
-    # v11+v12: SL+TP juntos con normalTpsl (grouping ahora se pasa correctamente)
     _place_sltp_pair(sym_bot, side, qty, sl, tp)
     return resp
 
 
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float, tp_price: float = None) -> None:
-    """Coloca SL (y opcionalmente TP juntos via normalTpsl).
-
-    Si se pasa tp_price, ambas órdenes se envían en un solo bulk_orders
-    con grouping normalTpsl para evitar el error 'Invalid TPSL price'.
-    Si solo se pasa stop_price, se envía como orden individual (trailing update).
-    """
+    """Coloca SL (y opcionalmente TP juntos via normalTpsl)."""
     if tp_price is not None:
         _place_sltp_pair(symbol, side, qty, stop_price, tp_price)
     else:
@@ -831,11 +838,7 @@ def place_stop_order(symbol: str, side: str, qty: float, stop_price: float, tp_p
 
 
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float, sl_price: float = None) -> None:
-    """Coloca TP (y opcionalmente SL juntos via normalTpsl).
-
-    Si se pasa sl_price, ambas órdenes se envían en un solo bulk_orders.
-    Si solo se pasa tp_price, se envía como orden individual.
-    """
+    """Coloca TP (y opcionalmente SL juntos via normalTpsl)."""
     if sl_price is not None:
         _place_sltp_pair(symbol, side, qty, sl_price, tp_price)
     else:
@@ -861,13 +864,7 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
 # ── Cancelar órdenes abiertas (v14 — usa frontend_open_orders para incluir triggers) ──
 
 def cancel_all_orders(symbol: str = None) -> None:
-    """Cancela todas las órdenes abiertas para `symbol`, incluyendo SL/TP triggers.
-
-    v14 FIX: open_orders() de la Info API NO devuelve órdenes trigger/TPSL.
-    Se usa frontend_open_orders() que sí las incluye, igual que
-    get_open_trigger_orders(). Esto evita que el fallback cancel+place de
-    modify_sltp_orders deje SL/TP antiguos activos creando órdenes duplicadas.
-    """
+    """Cancela todas las órdenes abiertas para `symbol`, incluyendo SL/TP triggers."""
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
     try:
         orders = _hl_call(
