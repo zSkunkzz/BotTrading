@@ -32,8 +32,14 @@ v24 — Fix RAÍZ "Order has invalid price" en SL/TP para TODAS las monedas.
   El fallback "sin grouping" se elimina: si normalTpsl falla con precio
   correcto es un error real, no de formato — no tiene sentido reintentar
   con grouping="na" que HL rechaza igualmente para TPSL duales.
+
+v25 — Fix alias gettickdecimals para compatibilidad con risk.py.
+
+  risk.py llama exchange.gettickdecimals(coin) (sin guión bajo) y la
+  función no existía, causando AttributeError en runtime. Se añade alias.
 """
 import logging
+import math
 import os
 import random
 import socket
@@ -250,8 +256,6 @@ def _price_to_wire(price_dec: Decimal) -> str:
 
 
 # ── limit_px para órdenes trigger isMarket=True ──────────────────────────
-# Para LONG (is_buy=False al cerrar): limit_px = 0
-# Para SHORT (is_buy=True al cerrar): limit_px = precio máximo redondeado al tick
 _TRIGGER_MAX_PRICE = Decimal("2147483647")
 
 
@@ -502,20 +506,13 @@ def _place_sltp_pair(
     punto flotante que HL rechaza con "Order has invalid price".
     """
     coin = _hl_symbol(symbol)
-
-    # Para LONG: cerrar = vender → is_buy=False
-    # Para SHORT: cerrar = comprar → is_buy=True
     is_close_buy = (side == "short")
 
-    # Redondear al tick exacto usando Decimal — SIN convertir a float
     sl_dec = _round_price_dec(coin, sl_price)
     tp_dec = _round_price_dec(coin, tp_price)
-
-    # limit_px como Decimal exacto redondeado al tick
     sl_limit_dec = _trigger_limit_dec(coin, is_close_buy)
     tp_limit_dec = _trigger_limit_dec(coin, is_close_buy)
 
-    # Strings exactos para el wire — floattowire() del SDK NO se aplica a strings
     sl_px_wire = _price_to_wire(sl_dec)
     tp_px_wire = _price_to_wire(tp_dec)
     sl_lim_wire = _price_to_wire(sl_limit_dec)
@@ -961,11 +958,14 @@ def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
 
 # ── Aliases públicos ────────────────────────────────────────────────────
 def get_tick_decimals(coin: str) -> int:
-    """Alias público de _get_tick_size para uso desde risk.py y otros módulos.
-    Devuelve el número de decimales del tickSz (ej: tickSz=0.0001 → 4)."""
+    """Devuelve el número de decimales del tickSz para el coin dado.
+    Ej: tickSz=0.0001 → 4, tickSz=0.000001 → 6."""
     tick = _get_tick_size(coin)
     if tick <= 0:
         return 6
-    # Número de decimales = -log10(tick), redondeado
-    import math
     return max(0, round(-math.log10(float(tick))))
+
+
+def gettickdecimals(coin: str) -> int:
+    """Alias de get_tick_decimals para compatibilidad con risk.py."""
+    return get_tick_decimals(coin)
