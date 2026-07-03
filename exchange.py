@@ -39,7 +39,7 @@ v14 — Fix 4 bugs detectados comparando con documentación oficial HL:
      - Cerrar long (vender):  limit_px = 0
      - Cerrar short (comprar): limit_px = 2_147_483_647
      Pasar triggerPx como limit_px hacía que HL tratara la orden como límite
-     y la rechazaba con "Order has invalid price" en el momento del trigger.
+     y la rechazara con "Order has invalid price" en el momento del trigger.
   2. cancel_all_orders usaba open_orders() que NO devuelve trigger orders (SL/TP).
      Fix: usar frontend_open_orders() que incluye tanto órdenes límite como triggers.
      Esto era la causa real de que el trailing y breakeven acumularan SL/TP duplicados.
@@ -50,6 +50,12 @@ v14 — Fix 4 bugs detectados comparando con documentación oficial HL:
   4. Añadidas get_open_trigger_orders() y cancel_trigger_orders() para poder
      consultar y cancelar exclusivamente las trigger orders de un símbolo,
      útil para trailing y breakeven que solo necesitan reemplazar SL/TP.
+v15 — Logs detallados en _place_sl_tp_bulk:
+  - Log explícito de cada paso: cancelación, construcción de órdenes, llamada bulk.
+  - Log del response completo de HL cuando bulk falla.
+  - Log explícito cuando se entra al fallback individual (place_stop_order + place_tp_order).
+  - Log del response de cada orden individual en el fallback.
+  Esto permite saber exactamente dónde falla el restore de SL/TP tras reinicio.
 """
 import logging
 import math
@@ -391,9 +397,6 @@ def _order_reduce_only(coin, is_buy, qty, price, order_type):
 
 
 # ── Abrir orden con SL+TP en una sola llamada bulk ──────────────────────────────────
-# v14: SL y TP se envían juntos con grouping="normalTpsl" para que HL reconozca
-# la relación entre ellos. Enviarlos separados causaba "Invalid TPSL price" en
-# el segundo al no encontrar la contraparte en el mismo batch.
 
 def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) -> dict:
     sym_bot = symbol or config.SYMBOLS[0]
@@ -401,7 +404,7 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     is_buy  = side == "long"
 
     qty      = floor_qty(qty, sym_bot)
-    limit_px = _market_price(coin, is_buy)  # una sola llamada → sin race condition
+    limit_px = _market_price(coin, is_buy)
 
     if qty <= 0 or not min_notional_ok(qty, limit_px):
         raise ValueError(
@@ -411,7 +414,6 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
 
     set_leverage(sym_bot, config.LEVERAGE)
 
-    # 1) Orden de entrada IOC
     resp = _hl_call(
         _exchange.order,
         coin, is_buy, qty, limit_px,
@@ -421,7 +423,6 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     _check_order_response(resp, f"open_order {side.upper()} {coin} qty={qty}")
     log.info("Orden abierta: %s %s qty=%.4f @ ~%.4f", side.upper(), coin, qty, limit_px)
 
-    # 2) SL + TP juntos en bulk (v14)
     _place_sl_tp_bulk(sym_bot, side, qty, sl, tp)
     return resp
 
@@ -430,17 +431,20 @@ def _place_sl_tp_bulk(symbol: str, side: str, qty: float, sl: float, tp: float) 
     """Coloca SL y TP en una sola llamada bulk_orders con grouping='normalTpsl'.
 
     v14: limit_px para trigger market orders es un precio extremo (0 para vender,
-    INT_MAX para comprar), NO el triggerPx. Usar triggerPx como limit_px hacía que
-    HL tratara la orden como límite y la rechazara al momento del trigger.
+    INT_MAX para comprar), NO el triggerPx.
+    v15: logs detallados en cada paso para diagnosticar fallos de restore.
     """
     coin   = _hl_symbol(symbol)
     is_buy = side == "short"  # cerrar long → vender; cerrar short → comprar
 
     sl_px  = _round_price(coin, sl)
     tp_px  = _round_price(coin, tp)
-
-    # v14: precio extremo según dirección de cierre
     limit_px_close = _TRIGGER_MARKET_BUY_PX if is_buy else _TRIGGER_MARKET_SELL_PX
+
+    log.info(
+        "_place_sl_tp_bulk(%s): side=%s is_buy=%s sl_px=%.8f tp_px=%.8f limit_px_close=%s qty=%.8f",
+        coin, side, is_buy, sl_px, tp_px, limit_px_close, qty,
+    )
 
     sl_order = {
         "coin":        coin,
@@ -459,6 +463,9 @@ def _place_sl_tp_bulk(symbol: str, side: str, qty: float, sl: float, tp: float) 
         "reduce_only": True,
     }
 
+    log.debug("_place_sl_tp_bulk(%s): sl_order=%s", coin, sl_order)
+    log.debug("_place_sl_tp_bulk(%s): tp_order=%s", coin, tp_order)
+
     try:
         resp = _hl_call(
             _exchange.bulk_orders,
@@ -466,13 +473,26 @@ def _place_sl_tp_bulk(symbol: str, side: str, qty: float, sl: float, tp: float) 
             "normalTpsl",
             context=f"_place_sl_tp_bulk({coin} SL={sl_px} TP={tp_px})",
         )
+        log.info("_place_sl_tp_bulk(%s): respuesta HL = %s", coin, resp)
         _check_order_response(resp, f"_place_sl_tp_bulk({coin})")
-        log.info("SL+TP colocados (bulk normalTpsl): %s SL=%.6f TP=%.6f", coin, sl_px, tp_px)
+        log.info("SL+TP colocados (bulk normalTpsl): %s SL=%.8f TP=%.8f", coin, sl_px, tp_px)
     except Exception as exc:
-        log.warning("_place_sl_tp_bulk(%s) falló: %s — intentando colocación individual", coin, exc)
-        # Fallback: colocación individual si bulk falla (ej: SDK antiguo sin bulk_orders)
-        place_stop_order(symbol, side, qty, sl)
-        place_tp_order(symbol, side, qty, tp)
+        log.error(
+            "_place_sl_tp_bulk(%s) FALLÓ bulk: %s — entrando en fallback individual",
+            coin, exc,
+        )
+        # Fallback individual
+        try:
+            log.info("_place_sl_tp_bulk(%s): fallback → place_stop_order SL=%.8f", coin, sl_px)
+            place_stop_order(symbol, side, qty, sl)
+        except Exception as sl_exc:
+            log.error("_place_sl_tp_bulk(%s): fallback place_stop_order FALLÓ: %s", coin, sl_exc)
+
+        try:
+            log.info("_place_sl_tp_bulk(%s): fallback → place_tp_order TP=%.8f", coin, tp_px)
+            place_tp_order(symbol, side, qty, tp)
+        except Exception as tp_exc:
+            log.error("_place_sl_tp_bulk(%s): fallback place_tp_order FALLÓ: %s", coin, tp_exc)
 
 
 # ── SL y TP individuales (usados por trailing, breakeven, restore) ───────────────────
@@ -481,48 +501,50 @@ def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> N
     """Coloca un SL trigger market.
 
     v14: limit_px es precio extremo (0 para sell, INT_MAX para buy), NO stop_price.
-    Pasar stop_price como limit_px hacía que HL rechazara la orden al ejecutarse.
     """
     coin       = _hl_symbol(symbol)
-    is_buy     = side == "short"  # cerrar long → vender; cerrar short → comprar
+    is_buy     = side == "short"
     stop_price = _round_price(coin, stop_price)
-    # v14: precio extremo según dirección
     limit_px   = _TRIGGER_MARKET_BUY_PX if is_buy else _TRIGGER_MARKET_SELL_PX
     order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
+    log.info("place_stop_order(%s): side=%s is_buy=%s stop_price=%.8f limit_px=%s qty=%.8f",
+             coin, side, is_buy, stop_price, limit_px, qty)
     try:
         resp = _hl_call(
             _order_reduce_only,
             coin, is_buy, qty, limit_px, order_type,
             context=f"place_stop_order({coin},{stop_price})",
         )
+        log.info("place_stop_order(%s): respuesta HL = %s", coin, resp)
         _check_order_response(resp, f"place_stop_order({coin},{stop_price})")
         log.info("SL colocado en %s (%s %s)", stop_price, side.upper(), coin)
     except Exception as exc:
-        log.warning("place_stop_order(%s) falló: %s", coin, exc)
+        log.error("place_stop_order(%s) FALLÓ: %s", coin, exc)
 
 
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
     """Coloca un TP trigger market.
 
     v14: limit_px es precio extremo (0 para sell, INT_MAX para buy), NO tp_price.
-    Pasar tp_price como limit_px hacía que HL rechazara la orden al ejecutarse.
     """
     coin     = _hl_symbol(symbol)
-    is_buy   = side == "short"  # cerrar long → vender; cerrar short → comprar
+    is_buy   = side == "short"
     tp_price = _round_price(coin, tp_price)
-    # v14: precio extremo según dirección
     limit_px   = _TRIGGER_MARKET_BUY_PX if is_buy else _TRIGGER_MARKET_SELL_PX
     order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
+    log.info("place_tp_order(%s): side=%s is_buy=%s tp_price=%.8f limit_px=%s qty=%.8f",
+             coin, side, is_buy, tp_price, limit_px, qty)
     try:
         resp = _hl_call(
             _order_reduce_only,
             coin, is_buy, qty, limit_px, order_type,
             context=f"place_tp_order({coin},{tp_price})",
         )
+        log.info("place_tp_order(%s): respuesta HL = %s", coin, resp)
         _check_order_response(resp, f"place_tp_order({coin},{tp_price})")
         log.info("TP colocado en %s (%s %s)", tp_price, side.upper(), coin)
     except Exception as exc:
-        log.warning("place_tp_order(%s) falló: %s", coin, exc)
+        log.error("place_tp_order(%s) FALLÓ: %s", coin, exc)
 
 
 # ── Cerrar posición ──────────────────────────────────────────────────────────────────
@@ -542,17 +564,9 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
 
 
 # ── Cancelar órdenes abiertas ──────────────────────────────────────────────────────────
-# v14: frontend_open_orders() devuelve TODAS las órdenes del usuario (límite + trigger).
-# open_orders() solo devuelve órdenes límite — NO incluye SL/TP (trigger orders).
-# Usar open_orders() era la causa de que el trailing y breakeven acumularan
-# SL/TP duplicados: se "cancelaba" pero los triggers quedaban intactos.
 
 def get_open_trigger_orders(symbol: str) -> list[dict]:
-    """Devuelve las trigger orders (SL/TP) abiertas para un símbolo.
-
-    v14: usa frontend_open_orders que incluye trigger orders.
-    Filtra solo las que son trigger (tienen campo 'triggerPx' o 'orderType' trigger).
-    """
+    """Devuelve las trigger orders (SL/TP) abiertas para un símbolo."""
     coin = _hl_symbol(symbol)
     try:
         all_orders = _hl_call(
@@ -564,9 +578,10 @@ def get_open_trigger_orders(symbol: str) -> list[dict]:
             if o.get("coin") != coin:
                 continue
             ot = o.get("orderType", "")
-            # HL devuelve "Stop Market", "Take Profit Market", etc. para triggers
             if "stop" in ot.lower() or "take profit" in ot.lower() or o.get("triggerPx"):
                 triggers.append(o)
+        log.debug("get_open_trigger_orders(%s): encontradas %d triggers — %s",
+                  coin, len(triggers), triggers)
         return triggers
     except Exception as exc:
         log.warning("get_open_trigger_orders(%s) falló: %s", coin, exc)
@@ -574,11 +589,7 @@ def get_open_trigger_orders(symbol: str) -> list[dict]:
 
 
 def cancel_trigger_orders(symbol: str) -> None:
-    """Cancela solo las trigger orders (SL/TP) de un símbolo.
-
-    Útil para trailing y breakeven que solo necesitan reemplazar las triggers,
-    sin cancelar órdenes límite normales.
-    """
+    """Cancela solo las trigger orders (SL/TP) de un símbolo."""
     coin = _hl_symbol(symbol)
     triggers = get_open_trigger_orders(symbol)
     if not triggers:
@@ -598,11 +609,7 @@ def cancel_trigger_orders(symbol: str) -> None:
 
 
 def cancel_all_orders(symbol: str = None) -> None:
-    """Cancela todas las órdenes de un símbolo: límite Y trigger (SL/TP).
-
-    v14: usa frontend_open_orders() en vez de open_orders() para incluir
-    también las trigger orders. open_orders() solo devuelve órdenes límite.
-    """
+    """Cancela todas las órdenes de un símbolo: límite Y trigger (SL/TP)."""
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
     try:
         all_orders = _hl_call(
