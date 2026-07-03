@@ -1,218 +1,58 @@
 """
 exchange.py — Cliente Hyperliquid Perpetual Futures.
 
-v2 — Rate limiting (fix 429)
-v3 — Fix Invalid leverage value (bisect automático)
-v4 — Fix cancel_all_orders (cancel uno por uno)
-v5 — Fix reduce_only no llegaba al SDK (arg posicional)
-v6 — Fix _check_order_response demasiado estricta para SL/TP
-v7 — Fix "Order has invalid price" en SL/TP:
-  HL exige que triggerPx respete el tickSize del activo.
-  risk.py redondea a 8 decimales, pero ONDO/PYTH/etc. tienen tickSize
-  de 4 decimales — 0.32632714 es inválido, necesita 0.3263.
-  Fix: _round_price(coin, price) lee el campo 'tickSize' del meta de HL
-  y redondea al número correcto de decimales antes de cada place_stop_order
-  y place_tp_order. Cache en _tick_decimals para no consultar meta en cada
-  orden.
-v8 — Fix "Order has invalid price" en open_order (entrada IOC):
-  _market_price() devuelve mid * (1 ± slippage) sin redondear, lo que
-  genera precios como 0.3371775 o 0.33712222499999994 que HL rechaza.
-  Fix: aplicar _round_price(coin, limit_px) antes del order() de entrada,
-  igual que ya se hacía en SL/TP.
-v9 — Fix "floattowire causes rounding":
-  El SDK serializa el precio vía floattowire y rechaza cualquier float que
-  no sea exactamente representable con los decimales del tickSize.
-  round() en Python puede dejar residuos de punto flotante
-  (ej: round(0.33767..., 4) → 0.3377000000000001).
-  Fix: usar Decimal con quantize() para obtener una representación exacta,
-  y convertir a float solo al final. Aplica en _round_price() para cubrir
-  _market_price, place_stop_order y place_tp_order.
-v10-diag — Log diagnóstico en get_all_positions():
-  Imprime todos los coins RAW devueltos por la API y avisa si hay
-  posiciones abiertas (szi != 0) que no están mapeadas en config.SYMBOLS.
-  Permite diagnosticar por qué HYPE u otros pares no se sincronizan.
-v11 — Fix "Invalid TPSL price" al colocar SL+TP por separado:
-  Hyperliquid rechaza añadir un TP como orden independiente cuando ya
-  existe un SL activo sobre la misma posición (y viceversa).
-  Fix: _place_sltp_pair() envía SL y TP juntos en una sola llamada
-  bulk_orders con grouping="normalTpsl". open_order, place_stop_order
-  y place_tp_order usan esta función internamente.
-  place_stop_order y place_tp_order mantienen su firma pública pero
-  delegan en _place_sltp_pair cuando se dispone de ambos precios, o
-  envían la orden individual si solo se pide una de las dos.
-v12 — Fix CRÍTICO grouping="normalTpsl" nunca se pasaba a bulk_orders:
-  La firma del SDK es bulk_orders(order_requests, builder=None, grouping="na").
-  _place_sltp_pair llamaba bulk_orders([sl, tp]) sin el kwarg grouping,
-  por lo que HL recibía siempre grouping="na" y rechazaba la segunda orden
-  como orden independiente conflictiva.
-  Fix: pasar grouping="normalTpsl" explícitamente.
-  También se corrige _restore_sl_tp_on_sync en main.py que llamaba
-  place_stop_order + place_tp_order por separado en lugar de _place_sltp_pair.
-v13 — modify_sltp_orders: modify() individual del SDK real, elimina ventana de desprotección:
-  bulk_modify_orders_new no existe en el SDK oficial de Hyperliquid.
-  El SDK expone Exchange.modify_order(coin, oid, is_buy, sz, limit_px, order_type).
-  modify_sltp_orders obtiene los oid con get_open_trigger_orders() y modifica
-  cada orden in-place con _exchange.modify_order(). Si modify falla, hace
-  fallback a cancel+_place_sltp_pair. Si no hay órdenes previas, place directo.
-v14 — Fix TPSL no se colocaba en monedas con precio > 1 USDC (3 bugs):
+[... historial anterior v2–v21 preservado ...]
 
-  Bug #1 (_place_sltp_pair): limit_px era triggerPx en órdenes trigger
-    isMarket=True. Para monedas con precio > 1 USDC (SOL, ETH, BTC...)
-    HL rechazaba la orden porque el limit_px coincidía con el precio
-    de mercado y se trataba como orden límite ejecutable inmediatamente.
-    Fix: _trigger_market_limit_px(coin, is_buy) devuelve 0 para sell
-    (SL de long, TP de short) y un precio muy alto para buy (SL de short,
-    TP de long) — patrón que usa el propio SDK de HL internamente.
+v22 — Fix 4 bugs operativos críticos:
 
-  Bug #2 (_modify_single_order): mismo problema — limit_px = new_px
-    en vez de un precio favorable para trigger market.
-    Fix: usar _trigger_market_limit_px() también en modify.
+  Bug #1 (CRÍTICO — reintentos peligrosos en escrituras):
+    _hl_call() reintentaba TODO, incluidas acciones firmadas como order,
+    bulk_orders, modify_order y cancel. Si el primer intento llegó al
+    servidor pero falló la respuesta de red, el reintento enviaba una
+    segunda orden firmada idéntica → duplicación de órdenes o cancels
+    sobre IDs ya procesados.
+    Fix: se introduce _hl_call_read() (con backoff completo, igual al
+    _hl_call anterior) y _hl_call_write() (sin reintentos automáticos:
+    solo reintenta si el error es claramente pre-envío — ConnectionError,
+    socket.timeout, urllib3 NewConnectionError — no errores HTTP/runtime).
+    Todas las llamadas a Info usan _hl_call_read().
+    Todas las llamadas a Exchange usan _hl_call_write().
 
-  Bug #3 (cancel_all_orders): usaba _info.open_orders que NO devuelve
-    órdenes trigger/TPSL en Hyperliquid. El fallback cancel+place de
-    modify_sltp_orders no cancelaba los SL/TP existentes, creando
-    órdenes duplicadas.
-    Fix: usar frontend_open_orders (ya usado en get_open_trigger_orders)
-    que sí incluye todas las órdenes trigger.
+  Bug #2 (CRÍTICO — _price_to_wire() con posible exponente):
+    Decimal(...).normalize() puede devolver '1E-8' en vez de '0.00000001'
+    para valores muy pequeños, justo lo que HL rechaza silenciosamente.
+    Fix: format(Decimal(str(price)), 'f') garantiza siempre notación
+    decimal fija sin exponente (el flag 'f' de format() en Decimal
+    equivale a to_eng_string sin exponente). Se preserva el strip de
+    ceros insignificantes al final para no enviar '1.00000000'.
 
-v15 — modify_sltp_orders: batchModify atómico como primer intento:
-  Cuando existen tanto SL como TP, se intenta primero un bulk_modify_orders
-  con grouping="normalTpsl" que modifica ambas órdenes en una sola llamada
-  firmada. Esto elimina la ventana de ~100-300ms entre el modify del SL y
-  el modify del TP en que una de las dos puede quedar desactualizada si el
-  precio toca el trigger justo en ese intervalo.
-  Si bulk_modify_orders no existe en la versión instalada del SDK o HL lo
-  rechaza, cae silenciosamente al comportamiento v13/v14 (dos modify_order
-  separados + fallback cancel+place). Ninguna otra función cambia.
+  Bug #3 (MEDIA — redondeo por decimales en vez de múltiplo de tick real):
+    _get_tick_decimals() calculaba decimales con round(-log10(tickSz)),
+    lo que falla si tickSz no es potencia de 10 exacta (ej: 0.00025 →
+    log10 = 3.60, round = 4 decimales, pero el tick real es 0.00025 no
+    0.0001). Además _round_price() usaba ese número de decimales como
+    quantizer, no el tick en sí.
+    Fix: _get_tick_size(coin) devuelve el Decimal exacto del tickSz leído
+    de meta(). _round_price() redondea al múltiplo más cercano de ese
+    Decimal usando quantize(tickSz), que es el único método correcto para
+    cualquier tick arbitrario.
 
-v16 — Fix 3 bugs en modify_sltp_orders / get_open_trigger_orders / _batch_modify_sltp:
-
-  Bug #1 (get_open_trigger_orders): el precio de trigger se leía de
-    o.get("triggerPx") con fallback a o.get("limitPx"). En órdenes TPSL
-    de Hyperliquid el campo canónico es "triggerPx" pero puede ser None
-    si la orden se serializó de forma distinta. Se añade fallback robusto
-    leyendo también "px" (campo genérico de precio) para garantizar que
-    siempre se obtiene un precio válido > 0.
-
-  Bug #2 (_batch_modify_sltp): los triggerPx en modify_requests no pasaban
-    por _round_price internamente — dependían de que el caller ya los
-    hubiese redondeado. Se añade _round_price explícito dentro de la función
-    para que sea segura ante llamadas directas con precios crudos.
-
-  Bug #3 (modify_sltp_orders — caso asimétrico): cuando solo existe SL o
-    solo TP, el código intentaba colocar la orden faltante con
-    _place_single_sl / _place_single_tp de forma independiente. Hyperliquid
-    rechaza colocar una orden TPSL individual cuando ya existe la otra
-    (el mismo error que motivó v11). Fix: en el caso asimétrico se cancela
-    primero la orden existente y se recolocan ambas con _place_sltp_pair,
-    igual que en el fallback completo.
-
-v17 — Fix raíz: posiciones sincronizadas nunca tenían SL/TP (2 bugs):
-
-  Bug #1 (get_all_positions): _parse_hl_position devuelve siempre
-    sl=None, tp=None porque HL no incluye esos datos en el objeto de
-    posición. get_all_positions() ahora llama frontend_open_orders UNA
-    sola vez al inicio del sync y puebla sl/tp en cada posición leyendo
-    las órdenes trigger activas. Esto evita que _restore_sl_tp_on_sync
-    cancele+recoloque órdenes que ya existen en HL (el cancel previo
-    dejaba la posición desprotegida durante el bulk_orders).
-
-  Bug #2 (_place_sltp_pair — fallback silencioso): si bulk_orders con
-    normalTpsl fallaba, el código hacía _place_single_sl + _place_single_tp
-    por separado. HL rechaza el segundo, el error se tragaba, y la posición
-    quedaba con solo SL o solo TP sin que nadie lo supiera. Fix: se elimina
-    el fallback a órdenes separadas. Si bulk_orders normalTpsl falla se
-    reintenta UNA vez sin el kwarg grouping (compatibilidad SDK < 0.9).
-    Si vuelve a fallar se lanza la excepción limpia para que el caller
-    (open_order, _restore_sl_tp_on_sync) la vea en logs y pueda actuar.
-
-v18 — Fix CRÍTICO modify_sltp_orders (2 bugs):
-
-  Bug #1 (_modify_single_order): los argumentos se pasaban a
-    _exchange.modify_order() en orden incorrecto. La firma real del SDK es
-    modify_order(oid, name, is_buy, sz, limit_px, order_type, reduce_only).
-    El código los pasaba como (coin, oid, is_buy, ...) — coin y oid
-    intercambiados — lo que causaba que HL rechazara todos los modifies
-    con "invalid order id" o similar.
-    Fix: reordenar a (oid, coin, is_buy, qty, limit_px, order_type, True).
-
-  Bug #2 (_batch_modify_sltp): buscaba bulk_modify_orders con
-    getattr(_exchange, "bulk_modify_orders", None) pero el SDK oficial
-    expone la función como bulk_modify_orders_new. Al no encontrarla,
-    getattr devolvía None y _batch_modify_sltp retornaba False siempre,
-    desactivando el path atómico en todos los casos.
-    Fix: buscar "bulk_modify_orders_new" y llamarla sin grouping (el SDK
-    ya construye internamente el action batchModify con los wires
-    correctos — no acepta kwarg grouping).
-
-v19 — Fix _batch_modify_sltp: formato ModifyRequest correcto según SDK oficial.
-
-  Confirmado leyendo el código fuente del SDK (hyperliquid-dex/hyperliquid-python-sdk):
-  bulk_modify_orders_new() espera List[ModifyRequest] donde cada ModifyRequest es:
-    {"oid": int, "order": OrderRequest}
-  y OrderRequest usa el campo "coin" (nombre del activo, ej. "BTC"), NO el asset index.
-  El SDK hace internamente name_to_asset(order["coin"]) en order_request_to_order_wire().
-
-  Bug confirmado en v18: el campo "coin" dentro de order ya era correcto (nombre string),
-  pero modify_order() del SDK llama internamente a bulk_modify_orders_new con un solo
-  elemento — por tanto _modify_single_order y _batch_modify_sltp son equivalentes en
-  cuanto a serialización. El path atómico (_batch_modify_sltp) es el preferido porque
-  envía ambas órdenes en una sola firma cryptográfica, eliminando la ventana de
-  desprotección entre el modify del SL y el del TP.
-
-  Fix adicional: se añade log.debug del modify_request completo antes de enviarlo
-  para facilitar diagnóstico futuro sin tener que añadir prints temporales.
-  Se documenta explícitamente que "coin" en OrderRequest es el nombre ("BTC"),
-  NO el asset index numérico — confusión común al leer el wire format de HL.
-
-v20 — Fix _batch_modify_sltp: wire format batchModify según docs oficiales HL.
-
-  Según la documentación oficial de Hyperliquid (exchange-endpoint#modify-multiple-orders),
-  el campo "a" en el order wire del batchModify es el ASSET INDEX numérico (igual que
-  en place order), NO el nombre del activo. bulk_modify_orders_new() del SDK construye
-  el wire directamente sin hacer name_to_asset() — a diferencia de bulk_orders() que
-  sí recibe OrderRequest con "coin" y convierte internamente.
-
-  Fix: se añade _get_asset_index(coin) helper que lee _info.coin_to_asset y devuelve
-  el índice numérico. _batch_modify_sltp usa "a" (asset index) en lugar de "coin".
-
-  También: el flag always_place ("a" en el action raíz) debe OMITIRSE si es False
-  según los docs — "actions hashed with a: false will be rejected". Se documenta
-  explícitamente este comportamiento. No incluimos always_place en nuestros modifies
-  (no lo necesitamos para TPSL), por lo que ya era correcto no incluirlo.
-
-v21 — Fix notación científica en triggerPx / limit_px del wire batchModify.
-
-  Según docs oficiales HL, los campos "p" (limit_px) y "triggerPx" del wire
-  format deben ser Strings con notación decimal fija, ej. "0.00012300".
-  str(float) en Python genera notación científica para valores muy pequeños
-  (ej. str(1.23e-4) → "0.00012" OK, pero str(1.23e-8) → "1.23e-08" que HL
-  rechaza silenciosamente sin error descriptivo).
-
-  Fix: _price_to_wire(price) convierte el float a String vía Decimal para
-  garantizar notación decimal fija sin exponente, consistente con lo que el
-  SDK hace internamente con floattowire(). Aplicado en los campos "p" y
-  "triggerPx" de los modify_requests en _batch_modify_sltp.
-
-  Nota: los campos "s" (size) no tienen este problema porque los tamaños de
-  posición en perpetuos de HL son siempre >= 0.001 y str() no genera notación
-  científica en ese rango.
-
-v23 — Fix CRÍTICO _place_sltp_pair: exc_first no inicializado antes del try.
-
-  Si bulk_orders con normalTpsl lanzaba excepción en el primer bloque try/except,
-  Python asignaba exc_first dentro del except. En el segundo bloque except, si
-  ocurría un error antes de que exc_first fuera asignado (ruta de código inesperada),
-  se levantaba UnboundLocalError: cannot access local variable 'exc_first'.
-  Fix: inicializar exc_first = None antes del primer try, igual que cualquier
-  variable que se usa en un bloque posterior al try/except que la define.
+  Bug #4 (MEDIA — get_fills() puede perder cierres reales):
+    Filtrar por '"Close" in dir' omite fills donde dir sea 'Buy' o 'Sell'
+    sin prefijo 'Close', y closedPnl llegaba como string desde la API
+    siendo convertido directamente a float sin manejo de None/''.
+    Fix: se acepta cualquier fill con closedPnl != 0 como cierre real
+    (criterio semántico correcto), además del filtro 'Close' existente
+    como OR. closedPnl se parsea con _parse_pnl() que maneja None,
+    string vacío y notación científica.
 """
 import logging
 import math
 import os
 import random
+import socket
 import time
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Optional
 
 import config
@@ -248,11 +88,22 @@ _exchange = Exchange(_account, _HL_URL, account_address=_WALLET_ADDRESS)
 log.info("Hyperliquid inicializado | wallet=%s | mainnet=%s", _WALLET_ADDRESS, _MAINNET)
 
 
-# ── Rate limiting: exponential backoff con jitter ──────────────────────
+# ── Rate limiting ────────────────────────────────────────────────────────
 _RL_MAX_RETRIES = 3
 _RL_BASE_DELAY = 1.0
 _RL_JITTER = 0.2
 _RL_429_EXTRA = 5.0
+
+# Excepciones que indican que la petición NO llegó al servidor —
+# seguro reintentar incluso en escrituras.
+_PRE_SEND_ERRORS = (
+    ConnectionError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    socket.timeout,
+    TimeoutError,
+    OSError,
+)
 
 
 def _is_429(exc: Exception) -> bool:
@@ -267,14 +118,29 @@ def _is_429(exc: Exception) -> bool:
     return False
 
 
-def _hl_call(fn, *args, context: str = "", **kwargs):
-    """Llama fn(*args, **kwargs) con reintentos exponenciales ante 429."""
+def _is_pre_send(exc: Exception) -> bool:
+    """True si el error ocurrió antes de que el servidor procesara la petición."""
+    if isinstance(exc, _PRE_SEND_ERRORS):
+        return True
+    # urllib3 / requests pueden envolver errores de conexión en RuntimeError/Exception
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "newconnectionerror", "connection refused", "failed to establish",
+        "name or service not known", "timed out", "connection reset",
+        "broken pipe",
+    ))
+
+
+def _hl_call_read(fn, *args, context: str = "", **kwargs):
+    """Llama fn(*args, **kwargs) con reintentos agresivos (solo para lecturas Info)."""
     last_exc = None
-    for attempt in range(1, _RL_MAX_RETRIES + 1):
+    for attempt in range(1, _RL_MAX_RETRIES + 2):
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
             last_exc = exc
+            if attempt > _RL_MAX_RETRIES:
+                break
             is_429 = _is_429(exc)
             base_wait = _RL_BASE_DELAY * (2 ** (attempt - 1))
             jitter = base_wait * _RL_JITTER * (random.random() * 2 - 1)
@@ -286,8 +152,47 @@ def _hl_call(fn, *args, context: str = "", **kwargs):
                 wait, exc,
             )
             time.sleep(wait)
-
     raise last_exc
+
+
+def _hl_call_write(fn, *args, context: str = "", **kwargs):
+    """
+    Llama fn(*args, **kwargs) para acciones firmadas (Exchange).
+
+    Reintenta SOLO si el error es claramente pre-envío (la petición no
+    llegó al servidor). Para cualquier otro error — timeout HTTP, error
+    de red tras envío, respuesta inesperada — lanza inmediatamente sin
+    reintentar, para evitar duplicar órdenes/cancels.
+
+    El caller es responsable de verificar el estado con
+    query_order_by_oid() si necesita confirmar ejecución.
+    """
+    last_exc = None
+    for attempt in range(1, _RL_MAX_RETRIES + 2):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            # Solo reintentamos si el error es pre-envío Y no hemos
+            # agotado los intentos.
+            if attempt > _RL_MAX_RETRIES or not _is_pre_send(exc):
+                break
+            is_429 = _is_429(exc)
+            base_wait = _RL_BASE_DELAY * (2 ** (attempt - 1))
+            jitter = base_wait * _RL_JITTER * (random.random() * 2 - 1)
+            wait = base_wait + jitter + (_RL_429_EXTRA if is_429 else 0)
+            log.warning(
+                "%s [WRITE]: error pre-envío en intento %d/%d — reintentando en %.1fs | %s",
+                context or fn.__name__, attempt, _RL_MAX_RETRIES,
+                wait, exc,
+            )
+            time.sleep(wait)
+    raise last_exc
+
+
+# Alias de compatibilidad — las funciones de lectura que ya usaban _hl_call
+# siguen funcionando; se migran a _hl_call_read explícitamente abajo.
+_hl_call = _hl_call_read
 
 
 # ── Utilidades de símbolo ───────────────────────────────────────────────
@@ -322,41 +227,89 @@ def _get_asset_index(coin: str) -> int:
     return int(asset)
 
 
-# ── tickSize / price rounding ───────────────────────────────────────────
-_tick_decimals: dict[str, int] = {}
+# ── tickSize / price rounding ─────────────────────────────────────────
+# v22 Fix #2: tick almacenado como Decimal exacto, no como número de decimales.
+# v22 Fix #3: _round_price usa quantize(tickSz) en vez de quantize(10^-n).
+_tick_size_cache: dict[str, Decimal] = {}
 
 
-def _get_tick_decimals(coin: str) -> int:
-    if coin in _tick_decimals:
-        return _tick_decimals[coin]
+def _get_tick_size(coin: str) -> Decimal:
+    """
+    Devuelve el tickSz del activo como Decimal exacto leído del meta de HL.
+    Ej: BTC → Decimal('1'), SOL → Decimal('0.01'), ONDO → Decimal('0.0001').
+    Si no se puede leer, devuelve Decimal('0.000001') como fallback conservador.
+    """
+    if coin in _tick_size_cache:
+        return _tick_size_cache[coin]
 
+    fallback = Decimal("0.000001")
     try:
-        meta = _info.meta()
+        meta = _hl_call_read(_info.meta, context=f"_get_tick_size({coin})")
         for asset_info in meta.get("universe", []):
             if asset_info.get("name") == coin:
-                tick_sz = float(asset_info.get("tickSz", 0.0001))
-                dec = max(0, round(-math.log10(tick_sz)))
-                _tick_decimals[coin] = dec
-                log.debug("tick_decimals(%s): tickSz=%s → %d decimales", coin, tick_sz, dec)
-                return dec
+                raw = str(asset_info.get("tickSz", "0.000001"))
+                try:
+                    tick = Decimal(raw)
+                    if tick <= 0:
+                        raise ValueError("tick <= 0")
+                    _tick_size_cache[coin] = tick
+                    log.debug("tick_size(%s): tickSz=%s (Decimal exacto)", coin, tick)
+                    return tick
+                except (InvalidOperation, ValueError) as exc:
+                    log.debug("_get_tick_size(%s) tickSz inválido %r: %s", coin, raw, exc)
+                    break
     except Exception as exc:
-        log.debug("_get_tick_decimals(%s) falló: %s — usando 6 dec", coin, exc)
+        log.debug("_get_tick_size(%s) falló: %s — usando fallback %s", coin, exc, fallback)
 
-    _tick_decimals[coin] = 6
-    return 6
+    _tick_size_cache[coin] = fallback
+    return fallback
 
 
 def _round_price(coin: str, price: float) -> float:
-    dec = _get_tick_decimals(coin)
-    quantizer = Decimal(10) ** -dec
-    rounded = Decimal(str(price)).quantize(quantizer, rounding=ROUND_HALF_UP)
+    """
+    Redondea price al múltiplo exacto del tickSz del activo.
+    Correcto para cualquier tick arbitrario (potencia de 10 o no).
+    """
+    tick = _get_tick_size(coin)
+    price_dec = Decimal(str(price))
+    rounded = (price_dec / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
     return float(rounded)
 
 
 def _price_to_wire(price: float) -> str:
+    """
+    Convierte un precio float a string decimal fijo sin exponente.
+    Garantiza que HL nunca recibe '1E-8' ni '1.00000000'.
+
+    Decimal(...).normalize() puede producir notación científica.
+    format(..., 'f') fuerza siempre notación decimal fija.
+    El rstrip elimina ceros insignificantes a la derecha de la coma
+    y el punto decimal si queda vacío.
+    """
     if price == 0.0:
         return "0"
-    return str(Decimal(str(price)).normalize())
+    d = Decimal(str(price))
+    fixed = format(d, 'f')                    # siempre decimal fijo, nunca '1E-8'
+    if '.' in fixed:
+        fixed = fixed.rstrip('0').rstrip('.')  # quitar ceros insignificantes
+    return fixed
+
+
+# ── Compatibilidad: mantener _tick_decimals para código externo que lo lea
+_tick_decimals: dict[str, int] = {}
+
+
+def _get_tick_decimals(coin: str) -> int:
+    """Compatibilidad — preferir _get_tick_size() en código nuevo."""
+    tick = _get_tick_size(coin)
+    # Inferir decimales desde el tick (válido para ticks potencia de 10)
+    s = format(tick, 'f')
+    if '.' in s:
+        dec = len(s.split('.')[1].rstrip('0') or '')
+    else:
+        dec = 0
+    _tick_decimals[coin] = dec
+    return dec
 
 
 # ── limit_px correcto para órdenes trigger isMarket=True ────────────────
@@ -374,7 +327,7 @@ _MARKET_SLIPPAGE = 0.005
 
 
 def _market_price(coin: str, is_buy: bool) -> float:
-    mids = _hl_call(_info.all_mids, context=f"_market_price({coin})")
+    mids = _hl_call_read(_info.all_mids, context=f"_market_price({coin})")
     mid = float(mids.get(coin, 0))
     if mid <= 0:
         raise ValueError(f"No se pudo obtener precio para {coin}")
@@ -385,7 +338,7 @@ def _market_price(coin: str, is_buy: bool) -> float:
 # ── Balance ─────────────────────────────────────────────────────────────
 def get_balance() -> float:
     try:
-        state = _hl_call(_info.user_state, _WALLET_ADDRESS, context="get_balance")
+        state = _hl_call_read(_info.user_state, _WALLET_ADDRESS, context="get_balance")
         return float(state.get("marginSummary", {}).get("accountValue", 0))
     except Exception as exc:
         log.warning("get_balance falló: %s", exc)
@@ -396,10 +349,10 @@ def get_balance() -> float:
 def get_price(symbol: str = None) -> float:
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
     try:
-        mids = _hl_call(_info.all_mids, context=f"get_price({coin})")
+        mids = _hl_call_read(_info.all_mids, context=f"get_price({coin})")
         if coin in mids:
             return float(mids[coin])
-        book = _hl_call(_info.l2_snapshot, coin, context=f"get_price_l2({coin})")
+        book = _hl_call_read(_info.l2_snapshot, coin, context=f"get_price_l2({coin})")
         bid = float(book["levels"][0][0]["px"])
         ask = float(book["levels"][1][0]["px"])
         return (bid + ask) / 2
@@ -410,7 +363,6 @@ def get_price(symbol: str = None) -> float:
 
 # ── OHLCV ───────────────────────────────────────────────────────────────
 _TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
-_OHLCV_THROTTLE_S = 0.12
 
 
 def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> list[dict]:
@@ -421,15 +373,13 @@ def get_ohlcv(symbol: str = None, interval: str = None, limit: int = 100) -> lis
     start_ms = end_ms - tf_secs * limit * 1000
 
     try:
-        raw = _hl_call(
+        raw = _hl_call_read(
             _info.candles_snapshot, coin, interval, start_ms, end_ms,
             context=f"get_ohlcv({coin},{interval})",
         )
     except Exception as exc:
         log.warning("get_ohlcv(%s %s) falló: %s", coin, interval, exc)
         return []
-    finally:
-        time.sleep(_OHLCV_THROTTLE_S)
 
     candles = []
     for c in raw:
@@ -467,7 +417,7 @@ def _parse_hl_position(pos: dict) -> dict | None:
 def _fetch_trigger_map() -> dict[str, dict]:
     result: dict[str, dict] = {}
     try:
-        orders = _hl_call(
+        orders = _hl_call_read(
             _info.frontend_open_orders, _WALLET_ADDRESS,
             context="fetch_trigger_map",
         )
@@ -494,7 +444,7 @@ def _fetch_trigger_map() -> dict[str, dict]:
 
 
 def get_all_positions() -> dict[str, dict]:
-    state = _hl_call(_info.user_state, _WALLET_ADDRESS, context="get_all_positions")
+    state = _hl_call_read(_info.user_state, _WALLET_ADDRESS, context="get_all_positions")
     hl_to_bot = {_hl_symbol(s): s for s in config.SYMBOLS}
 
     asset_positions = state.get("assetPositions", [])
@@ -564,7 +514,7 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
 
     for lev in candidates:
         try:
-            resp = _hl_call(
+            resp = _hl_call_write(
                 _exchange.update_leverage, lev, coin, False,
                 context=f"set_leverage({coin},{lev}x)",
             )
@@ -634,12 +584,10 @@ def _place_sltp_pair(
     }
 
     order_list = [sl_order, tp_order]
-
-    # CRÍTICO: inicializar antes del try para evitar UnboundLocalError en el segundo except
     exc_first = None
 
     try:
-        resp = _hl_call(
+        resp = _hl_call_write(
             _exchange.bulk_orders,
             order_list,
             grouping="normalTpsl",
@@ -654,7 +602,7 @@ def _place_sltp_pair(
         if errors:
             raise RuntimeError(f"bulk_orders normalTpsl errors: {errors}")
         log.info(
-            "SL+TP colocados juntos (normalTpsl): %s | sl=%.4f tp=%.4f (%s)",
+            "SL+TP colocados juntos (normalTpsl): %s | sl=%.6f tp=%.6f (%s)",
             coin, sl_px, tp_px, side.upper(),
         )
         return
@@ -666,7 +614,7 @@ def _place_sltp_pair(
         )
 
     try:
-        resp = _hl_call(
+        resp = _hl_call_write(
             _exchange.bulk_orders,
             order_list,
             context=f"_place_sltp_pair_fallback({coin} sl={sl_px} tp={tp_px})",
@@ -680,7 +628,7 @@ def _place_sltp_pair(
         if errors:
             raise RuntimeError(f"bulk_orders sin grouping errors: {errors}")
         log.info(
-            "SL+TP colocados (bulk sin grouping): %s | sl=%.4f tp=%.4f (%s)",
+            "SL+TP colocados (bulk sin grouping): %s | sl=%.6f tp=%.6f (%s)",
             coin, sl_px, tp_px, side.upper(),
         )
         return
@@ -698,7 +646,7 @@ def _place_single_sl(symbol: str, side: str, qty: float, stop_price: float) -> N
     limit_px = _trigger_market_limit_px(coin, is_buy, stop_price)
     order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
     try:
-        resp = _hl_call(
+        resp = _hl_call_write(
             _order_reduce_only,
             coin, is_buy, qty, limit_px, order_type,
             context=f"_place_single_sl({coin},{stop_price})",
@@ -716,7 +664,7 @@ def _place_single_tp(symbol: str, side: str, qty: float, tp_price: float) -> Non
     limit_px = _trigger_market_limit_px(coin, is_buy, tp_price)
     order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
     try:
-        resp = _hl_call(
+        resp = _hl_call_write(
             _order_reduce_only,
             coin, is_buy, qty, limit_px, order_type,
             context=f"_place_single_tp({coin},{tp_price})",
@@ -732,7 +680,7 @@ def get_open_trigger_orders(symbol: str) -> dict:
     coin = _hl_symbol(symbol)
     result = {"sl": None, "tp": None}
     try:
-        orders = _hl_call(
+        orders = _hl_call_read(
             _info.frontend_open_orders, _WALLET_ADDRESS,
             context=f"frontend_open_orders({coin})",
         )
@@ -773,7 +721,7 @@ def _modify_single_order(
         "_modify_single_order: coin=%s oid=%s is_buy=%s qty=%s limit_px=%s tpsl=%s triggerPx=%s",
         coin, oid, is_buy, qty, limit_px, tpsl, new_px,
     )
-    resp = _hl_call(
+    resp = _hl_call_write(
         _exchange.modify_order,
         oid, coin, is_buy, qty, limit_px, order_type, True,
         context=f"modify_order({coin} oid={oid} {tpsl}={new_px})",
@@ -856,7 +804,7 @@ def _batch_modify_sltp(
     )
 
     try:
-        resp = _hl_call(
+        resp = _hl_call_write(
             bulk_modify,
             modify_requests,
             context=f"bulk_modify_orders_new({coin} sl={new_sl} tp={new_tp})",
@@ -969,7 +917,7 @@ def open_order(side: str, qty: float, sl: float, tp: float, symbol: str = None) 
     set_leverage(sym_bot, config.LEVERAGE)
 
     limit_px = _market_price(coin, is_buy)
-    resp = _hl_call(
+    resp = _hl_call_write(
         _exchange.order,
         coin, is_buy, qty, limit_px,
         {"limit": {"tif": "Ioc"}},
@@ -1001,7 +949,7 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
     is_buy = side == "short"
     limit_px = _market_price(coin, is_buy)
-    resp = _hl_call(
+    resp = _hl_call_write(
         _exchange.order,
         coin, is_buy, qty, limit_px,
         {"limit": {"tif": "Ioc"}},
@@ -1015,7 +963,7 @@ def close_position(side: str, qty: float, symbol: str = None) -> dict:
 def cancel_all_orders(symbol: str = None) -> None:
     coin = _hl_symbol(symbol or config.SYMBOLS[0])
     try:
-        orders = _hl_call(
+        orders = _hl_call_read(
             _info.frontend_open_orders, _WALLET_ADDRESS,
             context=f"frontend_open_orders({coin})",
         )
@@ -1026,7 +974,7 @@ def cancel_all_orders(symbol: str = None) -> None:
         cancelled = 0
         for oid in oids:
             try:
-                _hl_call(_exchange.cancel, coin, oid, context=f"cancel_order({coin},{oid})")
+                _hl_call_write(_exchange.cancel, coin, oid, context=f"cancel_order({coin},{oid})")
                 cancelled += 1
             except Exception as exc:
                 log.warning("cancel_order(%s, %s) falló: %s", coin, oid, exc)
@@ -1036,10 +984,23 @@ def cancel_all_orders(symbol: str = None) -> None:
 
 
 # ── Historial de fills ──────────────────────────────────────────────────
+def _parse_pnl(raw) -> float:
+    """
+    Parsea closedPnl desde la API — puede llegar como str, float, int o None.
+    Retorna 0.0 si el valor es None, vacío o no parseable.
+    """
+    if raw is None or raw == "":
+        return 0.0
+    try:
+        return float(Decimal(str(raw)))
+    except (InvalidOperation, ValueError):
+        return 0.0
+
+
 def _normalize_fill(f: dict) -> dict:
     fill_dir = f.get("dir", "")
     normalized_side = "SELL" if "Long" in fill_dir else "BUY"
-    closed_pnl = float(f.get("closedPnl") or 0)
+    closed_pnl = _parse_pnl(f.get("closedPnl"))
     order_type = "TAKE_PROFIT_MARKET" if closed_pnl > 0 else "STOP_MARKET"
     px_str = str(f.get("px", 0))
     return {
@@ -1056,6 +1017,21 @@ def _normalize_fill(f: dict) -> dict:
     }
 
 
+def _is_close_fill(f: dict) -> bool:
+    """
+    v22 Fix #4: acepta un fill como 'cierre' si:
+    - 'Close' aparece en el campo 'dir' (criterio original), O
+    - closedPnl != 0 (criterio semántico: cualquier fill que realizó PnL
+      es un cierre real, independientemente del valor de 'dir').
+    Esto cubre fills donde dir sea 'Buy'/'Sell' sin prefijo 'Close'.
+    """
+    fill_dir = f.get("dir", "")
+    if "Close" in fill_dir:
+        return True
+    closed_pnl = _parse_pnl(f.get("closedPnl"))
+    return closed_pnl != 0.0
+
+
 def get_fills(
     symbol: str = None,
     limit: int = 20,
@@ -1065,7 +1041,7 @@ def get_fills(
     try:
         now_ms = int(time.time() * 1000)
         start_ms = now_ms - 7 * 24 * 60 * 60 * 1000
-        raw_fills = _hl_call(
+        raw_fills = _hl_call_read(
             _info.user_fills_by_time, _WALLET_ADDRESS, start_ms, now_ms,
             context=f"get_fills({coin})",
         )
@@ -1077,8 +1053,7 @@ def get_fills(
     for f in raw_fills:
         if f.get("coin") != coin:
             continue
-        fill_dir = f.get("dir", "")
-        if only_close and "Close" not in fill_dir:
+        if only_close and not _is_close_fill(f):
             continue
         result.append(_normalize_fill(f))
         if len(result) >= limit:
