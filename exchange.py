@@ -47,14 +47,12 @@ v12 — Fix CRÍTICO grouping="normalTpsl" nunca se pasaba a bulk_orders:
   Fix: pasar grouping="normalTpsl" explícitamente.
   También se corrige _restore_sl_tp_on_sync en main.py que llamaba
   place_stop_order + place_tp_order por separado en lugar de _place_sltp_pair.
-v13 — modify_sltp_orders: batchModify in-place, elimina ventana de desprotección:
-  El patrón cancel_all_orders→place_stop→place_tp dejaba la posición sin
-  protección si el re-place fallaba por cualquier motivo (timing, rate limit,
-  validación). Con batchModify (bulk_modify_orders_new del SDK oficial) las
-  órdenes se modifican in-place usando el oid existente — si el exchange las
-  rechaza, el SL/TP antiguo sigue activo. El fallback a cancel+place solo
-  ocurre si batchModify falla completamente.
-  Nuevas funciones: get_open_trigger_orders(), modify_sltp_orders().
+v13 — modify_sltp_orders: modify() individual del SDK real, elimina ventana de desprotección:
+  bulk_modify_orders_new no existe en el SDK oficial de Hyperliquid.
+  El SDK expone Exchange.modify_order(coin, oid, is_buy, sz, limit_px, order_type).
+  modify_sltp_orders obtiene los oid con get_open_trigger_orders() y modifica
+  cada orden in-place con _exchange.modify_order(). Si modify falla, hace
+  fallback a cancel+_place_sltp_pair. Si no hay órdenes previas, place directo.
 """
 import logging
 import math
@@ -538,6 +536,31 @@ def get_open_trigger_orders(symbol: str) -> dict:
     return result
 
 
+def _modify_single_order(
+    coin: str,
+    oid: int,
+    is_buy: bool,
+    qty: float,
+    new_px: float,
+    tpsl: str,  # "sl" o "tp"
+) -> None:
+    """Modifica una orden trigger existente usando Exchange.modify_order() del SDK.
+
+    Firma del SDK: modify_order(coin, oid, is_buy, sz, limit_px, order_type, reduce_only=False)
+    """
+    order_type = {"trigger": {"triggerPx": new_px, "isMarket": True, "tpsl": tpsl}}
+    resp = _hl_call(
+        _exchange.modify_order,
+        coin, oid, is_buy, qty, new_px, order_type, True,
+        context=f"modify_order({coin} oid={oid} {tpsl}={new_px})",
+    )
+    statuses = (((resp or {}).get("response") or {}).get("data") or {}).get("statuses") or []
+    errors = [s.get("error") for s in statuses if "error" in s]
+    if errors:
+        raise RuntimeError(f"modify_order {tpsl} errors: {errors}")
+    log.info("Orden %s modificada in-place: %s oid=%s → %.6f", tpsl.upper(), coin, oid, new_px)
+
+
 def modify_sltp_orders(
     symbol: str,
     side: str,
@@ -545,12 +568,14 @@ def modify_sltp_orders(
     new_sl: float,
     new_tp: float,
 ) -> None:
-    """Modifica SL y TP in-place usando batchModify (bulk_modify_orders_new).
+    """Modifica SL y TP in-place usando Exchange.modify_order() del SDK oficial.
 
-    Si las órdenes existen, las modifica atómicamente — si el exchange las rechaza,
-    las antiguas siguen activas (sin ventana de desprotección).
-    Si no existen, las coloca desde cero con _place_sltp_pair.
-    Fallback a cancel+place solo si batchModify falla completamente.
+    v13 FIX: bulk_modify_orders_new no existe en el SDK de Hyperliquid.
+    El SDK expone Exchange.modify_order(coin, oid, is_buy, sz, limit_px, order_type, reduce_only).
+    Se llama una vez por orden (SL y TP por separado) — si el exchange rechaza una,
+    la otra sigue activa (no hay ventana de desprotección global).
+    Si no existen órdenes previas (arranque/reinicio), place directo con _place_sltp_pair.
+    Fallback a cancel+place solo si modify falla y la posición sigue abierta.
     """
     coin         = _hl_symbol(symbol)
     is_close_buy = (side == "short")  # cerrar short → buy
@@ -561,65 +586,53 @@ def modify_sltp_orders(
     sl_info = trigger["sl"]
     tp_info = trigger["tp"]
 
-    # Ninguna orden existente → colocar desde cero
+    # Sin órdenes previas → colocar desde cero
     if sl_info is None and tp_info is None:
         log.info("[%s] modify_sltp: sin órdenes abiertas → place desde cero", coin)
         _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
         return
 
-    modifies = []
-    if sl_info:
-        modifies.append({
-            "oid": sl_info["oid"],
-            "order": {
-                "coin":       coin,
-                "is_buy":     is_close_buy,
-                "sz":         qty,
-                "limit_px":   new_sl_r,
-                "order_type": {"trigger": {"triggerPx": new_sl_r,
-                                            "isMarket": True, "tpsl": "sl"}},
-                "reduce_only": True,
-            },
-        })
-    if tp_info:
-        modifies.append({
-            "oid": tp_info["oid"],
-            "order": {
-                "coin":       coin,
-                "is_buy":     is_close_buy,
-                "sz":         qty,
-                "limit_px":   new_tp_r,
-                "order_type": {"trigger": {"triggerPx": new_tp_r,
-                                            "isMarket": True, "tpsl": "tp"}},
-                "reduce_only": True,
-            },
-        })
+    sl_ok = False
+    tp_ok = False
 
-    try:
-        resp = _hl_call(
-            _exchange.bulk_modify_orders_new, modifies,
-            context=f"modify_sltp({coin} sl={new_sl_r} tp={new_tp_r})",
+    # Modificar SL
+    if sl_info:
+        try:
+            _modify_single_order(coin, sl_info["oid"], is_close_buy, qty, new_sl_r, "sl")
+            sl_ok = True
+        except Exception as exc:
+            log.warning("[%s] modify_order SL falló: %s", coin, exc)
+    else:
+        # No había SL → colocar uno nuevo
+        try:
+            _place_single_sl(symbol, side, qty, new_sl_r)
+            sl_ok = True
+        except Exception as exc:
+            log.warning("[%s] _place_single_sl falló: %s", coin, exc)
+
+    # Modificar TP
+    if tp_info:
+        try:
+            _modify_single_order(coin, tp_info["oid"], is_close_buy, qty, new_tp_r, "tp")
+            tp_ok = True
+        except Exception as exc:
+            log.warning("[%s] modify_order TP falló: %s", coin, exc)
+    else:
+        # No había TP → colocar uno nuevo
+        try:
+            _place_single_tp(symbol, side, qty, new_tp_r)
+            tp_ok = True
+        except Exception as exc:
+            log.warning("[%s] _place_single_tp falló: %s", coin, exc)
+
+    # Si alguna modificación falló, intentar cancel+replace completo como último recurso
+    if not sl_ok or not tp_ok:
+        log.warning(
+            "[%s] modify_sltp parcialmente fallido (sl_ok=%s tp_ok=%s) → fallback cancel+place",
+            coin, sl_ok, tp_ok,
         )
-        statuses = (((resp or {}).get("response") or {})
-                    .get("data") or {}).get("statuses") or []
-        errors = [s.get("error") for s in statuses if "error" in s]
-        if errors:
-            raise RuntimeError(f"batchModify errors: {errors}")
-        log.info(
-            "SL/TP modificados in-place (batchModify): %s sl=%.6f tp=%.6f",
-            coin, new_sl_r, new_tp_r,
-        )
-    except Exception as exc:
-        log.warning("[%s] batchModify falló: %s — fallback cancel+place", coin, exc)
         cancel_all_orders(symbol)
         _place_sltp_pair(symbol, side, qty, new_sl_r, new_tp_r)
-        return
-
-    # Si una de las dos no existía, colocarla suelta
-    if sl_info is None:
-        _place_single_sl(symbol, side, qty, new_sl_r)
-    if tp_info is None:
-        _place_single_tp(symbol, side, qty, new_tp_r)
 
 
 # ── Abrir orden ──────────────────────────────────────────────────────────────────
