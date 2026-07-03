@@ -26,6 +26,10 @@ v9 — Fix "floattowire causes rounding":
   Fix: usar Decimal con quantize() para obtener una representación exacta,
   y convertir a float solo al final. Aplica en _round_price() para cubrir
   _market_price, place_stop_order y place_tp_order.
+v10-diag — Log diagnóstico en get_all_positions():
+  Imprime todos los coins RAW devueltos por la API y avisa si hay
+  posiciones abiertas (szi != 0) que no están mapeadas en config.SYMBOLS.
+  Permite diagnosticar por qué HYPE u otros pares no se sincronizan.
 """
 import logging
 import math
@@ -281,12 +285,34 @@ def _parse_hl_position(pos: dict) -> dict | None:
 def get_all_positions() -> dict[str, dict]:
     state     = _hl_call(_info.user_state, _WALLET_ADDRESS, context="get_all_positions")
     hl_to_bot = {_hl_symbol(s): s for s in config.SYMBOLS}
+
+    # DIAG v10: log de todos los coins con posición abierta que devuelve HL
+    asset_positions = state.get("assetPositions", [])
+    open_coins = [
+        (e.get("position", {}).get("coin", "?"), float(e.get("position", {}).get("szi", 0)))
+        for e in asset_positions
+        if float(e.get("position", {}).get("szi", 0)) != 0
+    ]
+    if open_coins:
+        log.warning(
+            "[exchange] RAW posiciones abiertas en HL: %s | hl_to_bot keys (sample): %s",
+            open_coins,
+            list(hl_to_bot.keys())[:15],
+        )
+
     result: dict[str, dict] = {}
-    for entry in state.get("assetPositions", []):
+    for entry in asset_positions:
         pos     = entry.get("position", {})
         coin    = pos.get("coin", "")
+        szi     = float(pos.get("szi", 0))
         sym_bot = hl_to_bot.get(coin)
         if sym_bot is None:
+            if szi != 0:
+                log.warning(
+                    "[exchange] Posición NO mapeada ignorada: coin=%r szi=%s "
+                    "(¿falta en config.SYMBOLS o ticker distinto?)",
+                    coin, szi,
+                )
             continue
         parsed = _parse_hl_position(pos)
         if parsed:
