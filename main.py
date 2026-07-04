@@ -29,6 +29,12 @@ v11:
     localmente en lugar de cancelar y volver a colocar innecesariamente.
     Esto cubre el caso de reinicio donde el bot no tenía estado local pero HL
     sí tenía las trigger orders en pie (posición abierta con TPSL desde sesión anterior).
+v12:
+  - _update_trailing, _apply_breakeven, _check_tp_extension: cambiado cancel_all_orders
+    por cancel_trigger_orders. cancel_all_orders borraba TODAS las órdenes del par,
+    incluyendo SL/TP manuales colocados desde la UI de HL. cancel_trigger_orders solo
+    cancela las trigger orders (SL/TP) del bot, dejando intactas las órdenes manuales.
+  - _restore_sl_tp_on_sync: ídem, cancel_all_orders → cancel_trigger_orders.
 """
 import logging
 import os
@@ -179,7 +185,9 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
     new_sl = pos["sl"]
     side   = pos["side"]
     try:
-        exchange.cancel_all_orders(symbol)
+        # v12: cancel_trigger_orders en lugar de cancel_all_orders
+        # para no borrar SL/TP manuales colocados desde la UI de HL
+        exchange.cancel_trigger_orders(symbol)
         exchange.place_stop_order(symbol, side, pos["qty"], new_sl)
         exchange.place_tp_order(symbol, side, pos["qty"], pos["tp"])
         telegram.notify(
@@ -223,7 +231,8 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                 log.info("[%s] Trailing SL: %.6f → %.6f", symbol, pos["sl"], new_sl)
                 pos["sl"] = new_sl
                 try:
-                    exchange.cancel_all_orders(symbol)
+                    # v12: cancel_trigger_orders en lugar de cancel_all_orders
+                    exchange.cancel_trigger_orders(symbol)
                     exchange.place_stop_order(symbol, "long", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "long", pos["qty"], pos["tp"])
                 except Exception as e:
@@ -247,7 +256,8 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                 log.info("[%s] Trailing SL: %.6f → %.6f", symbol, pos["sl"], new_sl)
                 pos["sl"] = new_sl
                 try:
-                    exchange.cancel_all_orders(symbol)
+                    # v12: cancel_trigger_orders en lugar de cancel_all_orders
+                    exchange.cancel_trigger_orders(symbol)
                     exchange.place_stop_order(symbol, "short", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "short", pos["qty"], pos["tp"])
                 except Exception as e:
@@ -373,7 +383,8 @@ def _check_tp_extension(
         current_sl = pos["sl"]
 
         try:
-            exchange.cancel_all_orders(symbol)
+            # v12: cancel_trigger_orders en lugar de cancel_all_orders
+            exchange.cancel_trigger_orders(symbol)
             exchange.place_stop_order(symbol, side, pos["qty"], current_sl)
             exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
         except Exception as e:
@@ -771,8 +782,9 @@ def _restore_sl_tp_on_sync(
         new_sl = hl_sl_px if hl_sl_px is not None else params["sl"]
         new_tp = hl_tp_px if hl_tp_px is not None else params["tp"]
 
-        # ── Paso 2: cancelar todo y colocar SL+TP en bulk ──────────────────
-        exchange.cancel_all_orders(symbol)
+        # ── Paso 2: cancelar solo triggers del bot y colocar SL+TP en bulk ──
+        # v12: cancel_trigger_orders en lugar de cancel_all_orders
+        exchange.cancel_trigger_orders(symbol)
         exchange._place_sl_tp_bulk(symbol, side, qty, new_sl, new_tp)
 
         pos["sl"]          = new_sl
