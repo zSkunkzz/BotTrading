@@ -25,6 +25,11 @@ v17 — Fix raíz de "string indices must be integers":
        vía requests, sin pasar por la capa de procesamiento del SDK.
        Fix fallback individual: limit_px = triggerPx (HL rechaza 0/INT_MAX
        en llamadas individuales fuera de bulk).
+v18 — Fix "Order has invalid price" en trailing SL:
+       _get_tick_decimals buscaba "tickSz" que no existe en meta()["universe"].
+       Reemplazado por _get_price_decimals basado en szDecimals (campo real del SDK)
+       + regla oficial HL: máx 5 cifras significativas y máx (6 - szDecimals) decimales.
+       Ejemplo: BNB szDecimals=3 → máx 3 dec de precio; 572.8938 → 572.894 ✓
 """
 import json
 import logging
@@ -135,33 +140,92 @@ def min_notional_ok(qty: float, price: float, min_usdt: float = 10.0) -> bool:
     return (qty * price) >= min_usdt
 
 
-# ── tickSize / price rounding ────────────────────────────────────────────
-_tick_decimals: dict[str, int] = {}
+# ── Price rounding (v18) ─────────────────────────────────────────────────
+# HL perps aceptan precios con:
+#   - máximo 5 cifras significativas
+#   - máximo (6 - szDecimals) decimales
+# Fuente: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/tick-and-lot-size
+#
+# Nota: meta()["universe"] NO incluye "tickSz" — solo "name" y "szDecimals".
+# La versión anterior buscaba "tickSz" → siempre caía al fallback de 6 decimales,
+# lo que producía precios inválidos (ej. BNB 572.8938 con szDecimals=3 acepta máx 3 dec).
+
+_price_decimals_cache: dict[str, int] = {}
 
 
-def _get_tick_decimals(coin: str) -> int:
-    if coin in _tick_decimals:
-        return _tick_decimals[coin]
+def _get_price_decimals(coin: str) -> int:
+    """Devuelve el nº máximo de decimales permitidos para el precio de `coin` en HL perps.
+
+    Regla oficial: max_dec = max(0, 6 - szDecimals).
+    Ejemplos:
+      BTC  szDecimals=5 → max_dec=1   (ej. 61234.5)
+      ETH  szDecimals=4 → max_dec=2   (ej. 3456.78)
+      BNB  szDecimals=3 → max_dec=3   (ej. 572.894)
+      SOL  szDecimals=2 → max_dec=4   (ej. 145.6789)
+      DOGE szDecimals=0 → max_dec=6   (ej. 0.123456)
+    """
+    if coin in _price_decimals_cache:
+        return _price_decimals_cache[coin]
+
+    # Intentar leer szDecimals desde el SDK (asset_to_sz_decimals ya lo carga)
+    asset = _info.coin_to_asset.get(coin)
+    if asset is not None:
+        sz_dec = _info.asset_to_sz_decimals.get(asset)
+        if sz_dec is not None:
+            dec = max(0, 6 - int(sz_dec))
+            _price_decimals_cache[coin] = dec
+            log.debug("price_decimals(%s): szDecimals=%s → max_price_dec=%d", coin, sz_dec, dec)
+            return dec
+
+    # Fallback: leer meta() directamente
     try:
         meta = _info.meta()
         for asset_info in meta.get("universe", []):
             if asset_info.get("name") == coin:
-                tick_sz = float(asset_info.get("tickSz", 0.0001))
-                dec = max(0, round(-math.log10(tick_sz)))
-                _tick_decimals[coin] = dec
-                log.debug("tick_decimals(%s): tickSz=%s → %d decimales", coin, tick_sz, dec)
+                sz_dec = int(asset_info.get("szDecimals", 3))
+                dec = max(0, 6 - sz_dec)
+                _price_decimals_cache[coin] = dec
+                log.debug(
+                    "price_decimals(%s) [meta fallback]: szDecimals=%s → max_price_dec=%d",
+                    coin, sz_dec, dec,
+                )
                 return dec
     except Exception as exc:
-        log.debug("_get_tick_decimals(%s) falló: %s — usando 6 dec", coin, exc)
-    _tick_decimals[coin] = 6
-    return 6
+        log.warning("_get_price_decimals(%s) falló leyendo meta(): %s", coin, exc)
+
+    # Último fallback: 4 decimales (conservador, cubre la mayoría de mid-caps)
+    _price_decimals_cache[coin] = 4
+    log.warning("price_decimals(%s): usando fallback=4", coin)
+    return 4
 
 
 def _round_price(coin: str, price: float) -> float:
-    dec       = _get_tick_decimals(coin)
-    quantizer = Decimal(10) ** -dec
-    rounded   = Decimal(str(price)).quantize(quantizer, rounding=ROUND_HALF_UP)
-    return float(rounded)
+    """Redondea `price` al formato válido para HL perps:
+    - máx (6 - szDecimals) decimales
+    - máx 5 cifras significativas
+    """
+    if price <= 0:
+        return price
+
+    max_dec = _get_price_decimals(coin)
+
+    d = Decimal(str(price))
+
+    # Paso 1: truncar a max_dec decimales
+    quantizer = Decimal(10) ** -max_dec
+    d = d.quantize(quantizer, rounding=ROUND_HALF_UP)
+
+    # Paso 2: asegurar máx 5 cifras significativas (regla HL)
+    if d != 0:
+        # adjusted() = exponente base-10 del dígito más significativo
+        # ej. 572.894 → adjusted()=2, necesitamos 5 sig-figs → 5-1-2 = 2 dec
+        sig_dec = max(0, 4 - int(d.adjusted()))
+        final_dec = min(max_dec, sig_dec)
+        if final_dec != max_dec:
+            quantizer2 = Decimal(10) ** -final_dec
+            d = d.quantize(quantizer2, rounding=ROUND_HALF_UP)
+
+    return float(d)
 
 
 # ── Precio de mercado ────────────────────────────────────────────────────
