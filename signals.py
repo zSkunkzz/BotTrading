@@ -29,13 +29,26 @@ Filtros activos:
   6. ATR volátil         : hard-guard >3.5%
   7. ADX 15m             : hard-guard <18
   8. No-chase            : hard-guard rango vela
-  9. Pullback EMA20 15m  : hard-guard sobreextensión
+  9. Pullback EMA20 15m  : hard-guard sobreextensión (dinámico con ATR)
   10. Structure range    : penalización en vez de bloqueo
   11. Bear ADX_1h<22     : penalización en vez de bloqueo
   12. Score mínimo       : LONGs >= MIN_SCORE, SHORTs >= MIN_SCORE+SHORT_EXTRA
 
 REGLA FUNDAMENTAL:
   Bear/proto_bear → SOLO SHORT. Bull/proto_bull → SOLO LONG.
+
+v6.1 — Mejoras de calidad de señal:
+  - _rsi_divergence: busca el swing más reciente (último índice del extremo)
+    en vez del extremo absoluto para evitar falsas divergencias planas.
+    Además verifica que el swing previo sea estructuralmente significativo
+    (diferencia mínima del 0.5% respecto al último cierre).
+  - PULLBACK_EMA20_DIST dinámico: max(0.015, atr_15m_pct * 1.5) para escalar
+    con la volatilidad real del par y no filtrar memecoins de forma excesiva.
+  - ATR_HIGH_VOL_BUMP: reducido de 5 a 3 para no penalizar doblemente señales
+    técnicamente sólidas en entornos de alta volatilidad (el hard-guard de
+    ATR_VOLATILE_PCT=3.5% ya cubre el caso extremo).
+  - _price_structure: n=1→2, requiere mínimo 2 HH+HL o 2 LH+LL consecutivos
+    para clasificar como bull/bear, evitando falsos positivos estructurales.
 """
 from __future__ import annotations
 import logging
@@ -53,7 +66,10 @@ VOLUME_MULT         = 1.2
 VOLUME_WEAK         = 0.8
 MIN_SCORE           = config.MIN_SCORE
 
-PULLBACK_EMA20_DIST = 0.015
+# v6.1: PULLBACK_EMA20_DIST se calcula dinámicamente en evaluate()
+# usando max(PULLBACK_EMA20_DIST_BASE, atr_15m_pct * PULLBACK_ATR_MULT)
+PULLBACK_EMA20_DIST_BASE = 0.015
+PULLBACK_ATR_MULT        = 1.5
 
 SHORT_MIN_SCORE_EXTRA = 6
 ATR_VOLATILE_PCT      = 0.035
@@ -69,7 +85,7 @@ PROTO_ADX_MIN         = 18   # era 22 — simplificado
 # ── Volatilidad dinámica ──────────────────────────────────────────────────
 ATR_HIGH_VOL_PCT      = 0.020
 ATR_LOW_VOL_PCT       = 0.005
-ATR_HIGH_VOL_BUMP     = 5
+ATR_HIGH_VOL_BUMP     = 3    # v6.1: reducido de 5 a 3 (no doble penalización)
 ATR_LOW_VOL_BUMP      = 4
 
 # ── Pesos del scorer v6 — techo ~96 ──────────────────────────────────────
@@ -178,6 +194,13 @@ def _adx(candles: list[dict], period: int = 14) -> float:
 
 
 def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
+    """Detecta divergencia RSI vs precio.
+
+    v6.1: Usa el swing más reciente dentro de la ventana (no el extremo absoluto)
+    para evitar falsas divergencias planas. Requiere además que el swing previo
+    sea significativamente distinto del último cierre (>= 0.5%) para descartar
+    ruido de precios casi idénticos.
+    """
     if len(closes) < lookback + 14 or len(candles) < lookback + 1:
         return None
     rsi_series     = _rsi(closes, 14)
@@ -190,18 +213,33 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
     if avg_vol > 0 and last_vol < avg_vol * 0.6:
         return None
 
+    last_close = recent_closes[-1]
+
+    # Divergencia alcista: precio hace mínimo más bajo pero RSI hace mínimo más alto
+    # Buscamos el último mínimo local (más reciente) en la ventana previa
     try:
+        # Mínimo más bajo dentro de la ventana previa
         lo_val = min(recent_closes[:-1])
+        # índice más reciente con ese valor mínimo
         lo_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == lo_val)
-        if recent_closes[-1] < lo_val and recent_rsi[-1] > recent_rsi[lo_idx] + 2:
+        # El último cierre debe estar por debajo del mínimo previo
+        # y la diferencia debe ser significativa (>= 0.5%)
+        if (last_close < lo_val
+                and lo_val > 0
+                and abs(last_close - lo_val) / lo_val >= 0.005
+                and recent_rsi[-1] > recent_rsi[lo_idx] + 2):
             return "bullish"
     except (ValueError, IndexError):
         pass
 
+    # Divergencia bajista: precio hace máximo más alto pero RSI hace máximo más bajo
     try:
         hi_val = max(recent_closes[:-1])
         hi_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == hi_val)
-        if recent_closes[-1] > hi_val and recent_rsi[-1] < recent_rsi[hi_idx] - 2:
+        if (last_close > hi_val
+                and hi_val > 0
+                and abs(last_close - hi_val) / hi_val >= 0.005
+                and recent_rsi[-1] < recent_rsi[hi_idx] - 2):
             return "bearish"
     except (ValueError, IndexError):
         pass
@@ -264,6 +302,11 @@ def _find_swing_lows(lows: list[float], wing: int = 2) -> list[int]:
 
 
 def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK) -> str:
+    """Detecta estructura de precio (bull / bear / range).
+
+    v6.1: n=2 — requiere mínimo 2 HH+HL consecutivos para bull,
+    o 2 LH+LL para bear. Evita falsos positivos con un único swing.
+    """
     closed = candles_1h[:-1]
     if len(closed) < lookback + 4:
         return "range"
@@ -298,7 +341,8 @@ def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK)
         if swing_low_vals[i] < swing_low_vals[i - 1] * 0.999
     )
 
-    n = 1
+    # v6.1: n=2 en vez de n=1 para exigir confirmación estructural mínima
+    n = 2
     if hh_count >= n and hl_count >= n:
         return "bull"
     if lh_count >= n and ll_count >= n:
@@ -406,19 +450,23 @@ def evaluate(
     atr_1h_val       = _atr(candles_1h[:-1], 14)
     atr_1h_pct       = atr_1h_val / price if price > 0 else 0.0
 
+    # v6.1: distancia dinámica a EMA20_15m según volatilidad del par
+    atr_15m_pct = atr_15m / price if price > 0 else PULLBACK_EMA20_DIST_BASE
+    pullback_dist = max(PULLBACK_EMA20_DIST_BASE, atr_15m_pct * PULLBACK_ATR_MULT)
+
     log.debug(
         "[%s] régimen=%s structure=%s | ADX_1h=%.1f ADX_15m=%.1f | "
         "RSI=%.1f MACD_15m=%.5f MACD_1h=%.5f | "
         "vol_ratio=%.2f (last=%.0f avg=%.0f) | "
         "ATR_15m=%.4f%% ATR_1h=%.4f%% | "
-        "precio=%.6f EMA200_1h=%.6f EMA20_15m=%.6f",
+        "precio=%.6f EMA200_1h=%.6f EMA20_15m=%.6f pullback_dist=%.2f%%",
         symbol, regime, structure,
         adx_1h, adx_15m,
         rsi, macd_hist, macd_1h,
         vol_ratio, last_vol, avg_vol,
         (atr_15m / price * 100) if price > 0 else 0,
         atr_1h_pct * 100,
-        price, ema200_1h, ema20_15m,
+        price, ema200_1h, ema20_15m, pullback_dist * 100,
     )
 
     # ── Hard-guards (mínimos no negociables) ─────────────────────────────
@@ -445,12 +493,12 @@ def evaluate(
 
     if price > 0 and ema20_15m > 0:
         dist_ema20 = abs(price - ema20_15m) / price
-        if dist_ema20 > PULLBACK_EMA20_DIST:
+        if dist_ema20 > pullback_dist:
             if effective_regime == "bull" and price > ema20_15m:
-                log.debug("[%s] skip: sobreextendido sobre EMA20_15m dist=%.2f%%", symbol, dist_ema20 * 100)
+                log.debug("[%s] skip: sobreextendido sobre EMA20_15m dist=%.2f%% (umbral=%.2f%%)", symbol, dist_ema20 * 100, pullback_dist * 100)
                 return None, 0, None
             if effective_regime == "bear" and price < ema20_15m:
-                log.debug("[%s] skip: sobreextendido bajo EMA20_15m dist=%.2f%%", symbol, dist_ema20 * 100)
+                log.debug("[%s] skip: sobreextendido bajo EMA20_15m dist=%.2f%% (umbral=%.2f%%)", symbol, dist_ema20 * 100, pullback_dist * 100)
                 return None, 0, None
 
     # ── Score mínimo dinámico por volatilidad ────────────────────────────
