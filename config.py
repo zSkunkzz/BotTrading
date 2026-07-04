@@ -39,7 +39,7 @@ SYMBOLS = [
     "MORPHO-USDT","DYDX-USDT",  "AAVE-USDT",  "DOGE-USDT",
     "kPEPE-USDT", "JTO-USDT",   "XLM-USDT",   "SUI-USDT",
     "ADA-USDT",   "ENA-USDT",   "TAO-USDT",   "JUP-USDT",
-    "BNB-USDT",   "TON-USDT",
+    "BNB-USDT",   "GRAM-USDT",
     # --- Vol medio (2M-10M USD/24h) ---
     "BCH-USDT",   "XMR-USDT",   "TRUMP-USDT", "AVAX-USDT",
     "UNI-USDT",   "CRV-USDT",   "ARB-USDT",   "ZRO-USDT",
@@ -88,7 +88,7 @@ CORR_GROUPS: list[set[str]] = [
     {"BNB-USDT"},
     {"HYPE-USDT"},
     {"ENA-USDT"},
-    {"TON-USDT"},
+    {"GRAM-USDT"},
     {"JTO-USDT"},
 ]
 MAX_CORR_PER_GROUP = int(os.getenv("MAX_CORR_PER_GROUP", "2"))
