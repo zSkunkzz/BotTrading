@@ -56,6 +56,14 @@ v15 — Logs detallados en _place_sl_tp_bulk:
   - Log explícito cuando se entra al fallback individual (place_stop_order + place_tp_order).
   - Log del response de cada orden individual en el fallback.
   Esto permite saber exactamente dónde falla el restore de SL/TP tras reinicio.
+v16 — Fix "string indices must be integers" + "Order has invalid price" en fallback:
+  1. _check_order_response: statuses[0] puede ser un str (ej: "resting", "filled")
+     cuando bulk_orders devuelve statuses planos. Ahora comprueba isinstance antes
+     de acceder a s["error"], evitando TypeError.
+  2. Nueva _check_bulk_response() que parsea correctamente la respuesta de bulk_orders,
+     que puede venir como lista plana de statuses o como el dict anidado estándar.
+  3. _place_sl_tp_bulk fallback: pasaba sl/tp sin redondear a place_stop_order y
+     place_tp_order. Ahora pasa sl_px/tp_px (ya redondeados con Decimal).
 """
 import logging
 import math
@@ -378,7 +386,12 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
 # ── Validación de respuesta de órdenes ───────────────────────────────────────────────
 
 def _check_order_response(resp: dict, context: str) -> None:
-    """Lanza RuntimeError solo si HL devuelve error explícito."""
+    """Lanza RuntimeError solo si HL devuelve error explícito.
+
+    v16: statuses[0] puede ser un str (ej: "resting", "filled") cuando el SDK
+    devuelve statuses planos en bulk_orders. Comprueba isinstance antes de acceder
+    a s["error"] para evitar 'string indices must be integers'.
+    """
     status = resp.get("status")
     if status != "ok":
         raise RuntimeError(f"{context}: status={status!r} — {resp}")
@@ -387,8 +400,47 @@ def _check_order_response(resp: dict, context: str) -> None:
          .get("data") or {})
         .get("statuses") or []
     )
-    if statuses and "error" in statuses[0]:
-        raise RuntimeError(f"{context} rechazada por HL: {statuses[0]['error']} — {resp}")
+    if statuses:
+        first = statuses[0]
+        # Solo lanzar error si el status es un dict con clave "error"
+        if isinstance(first, dict) and "error" in first:
+            raise RuntimeError(f"{context} rechazada por HL: {first['error']} — {resp}")
+
+
+def _check_bulk_response(resp, context: str) -> None:
+    """Valida la respuesta de bulk_orders de HL.
+
+    bulk_orders puede devolver:
+      - dict estándar: {"status": "ok", "response": {"type": "order", "data": {"statuses": [...]}}}
+      - lista plana:   [{"resting": {...}}, {"resting": {...}}]  (algunos SDK versions)
+
+    v16: maneja ambos formatos sin lanzar TypeError.
+    """
+    if isinstance(resp, list):
+        # Formato lista plana: cada elemento es {"resting": {...}} o {"error": "..."}
+        for i, s in enumerate(resp):
+            if isinstance(s, dict) and "error" in s:
+                raise RuntimeError(f"{context} orden[{i}] rechazada: {s['error']} — {resp}")
+        log.debug("%s: bulk OK (lista plana, %d statuses)", context, len(resp))
+        return
+
+    # Formato dict estándar
+    if isinstance(resp, dict):
+        status = resp.get("status")
+        if status != "ok":
+            raise RuntimeError(f"{context}: status={status!r} — {resp}")
+        statuses = (
+            ((resp.get("response") or {})
+             .get("data") or {})
+            .get("statuses") or []
+        )
+        for i, s in enumerate(statuses):
+            if isinstance(s, dict) and "error" in s:
+                raise RuntimeError(f"{context} orden[{i}] rechazada: {s['error']} — {resp}")
+        log.debug("%s: bulk OK (dict estándar, %d statuses)", context, len(statuses))
+        return
+
+    log.warning("%s: respuesta bulk con formato desconocido: %s", context, resp)
 
 
 def _order_reduce_only(coin, is_buy, qty, price, order_type):
@@ -433,6 +485,8 @@ def _place_sl_tp_bulk(symbol: str, side: str, qty: float, sl: float, tp: float) 
     v14: limit_px para trigger market orders es un precio extremo (0 para vender,
     INT_MAX para comprar), NO el triggerPx.
     v15: logs detallados en cada paso para diagnosticar fallos de restore.
+    v16: usa _check_bulk_response() que maneja tanto lista plana como dict estándar.
+         El fallback ahora pasa sl_px/tp_px (ya redondeados) en lugar de sl/tp crudos.
     """
     coin   = _hl_symbol(symbol)
     is_buy = side == "short"  # cerrar long → vender; cerrar short → comprar
@@ -474,77 +528,83 @@ def _place_sl_tp_bulk(symbol: str, side: str, qty: float, sl: float, tp: float) 
             context=f"_place_sl_tp_bulk({coin} SL={sl_px} TP={tp_px})",
         )
         log.info("_place_sl_tp_bulk(%s): respuesta HL = %s", coin, resp)
-        _check_order_response(resp, f"_place_sl_tp_bulk({coin})")
+        _check_bulk_response(resp, f"_place_sl_tp_bulk({coin})")
         log.info("SL+TP colocados (bulk normalTpsl): %s SL=%.8f TP=%.8f", coin, sl_px, tp_px)
     except Exception as exc:
         log.error(
             "_place_sl_tp_bulk(%s) FALLÓ bulk: %s — entrando en fallback individual",
             coin, exc,
         )
-        # Fallback individual
+        # Fallback individual — usar sl_px/tp_px ya redondeados (v16)
         try:
             log.info("_place_sl_tp_bulk(%s): fallback → place_stop_order SL=%.8f", coin, sl_px)
-            place_stop_order(symbol, side, qty, sl)
+            _place_stop_order_rounded(symbol, side, qty, sl_px)
         except Exception as sl_exc:
             log.error("_place_sl_tp_bulk(%s): fallback place_stop_order FALLÓ: %s", coin, sl_exc)
 
         try:
             log.info("_place_sl_tp_bulk(%s): fallback → place_tp_order TP=%.8f", coin, tp_px)
-            place_tp_order(symbol, side, qty, tp)
+            _place_tp_order_rounded(symbol, side, qty, tp_px)
         except Exception as tp_exc:
             log.error("_place_sl_tp_bulk(%s): fallback place_tp_order FALLÓ: %s", coin, tp_exc)
 
 
 # ── SL y TP individuales (usados por trailing, breakeven, restore) ───────────────────
 
+def _place_stop_order_rounded(symbol: str, side: str, qty: float, stop_price_rounded: float) -> None:
+    """Versión interna: recibe stop_price YA redondeado (evita doble redondeo)."""
+    coin       = _hl_symbol(symbol)
+    is_buy     = side == "short"
+    limit_px   = _TRIGGER_MARKET_BUY_PX if is_buy else _TRIGGER_MARKET_SELL_PX
+    order_type = {"trigger": {"triggerPx": stop_price_rounded, "isMarket": True, "tpsl": "sl"}}
+    log.info("place_stop_order(%s): side=%s is_buy=%s stop_price=%.8f limit_px=%s qty=%.8f",
+             coin, side, is_buy, stop_price_rounded, limit_px, qty)
+    resp = _hl_call(
+        _order_reduce_only,
+        coin, is_buy, qty, limit_px, order_type,
+        context=f"place_stop_order({coin},{stop_price_rounded})",
+    )
+    log.info("place_stop_order(%s): respuesta HL = %s", coin, resp)
+    _check_order_response(resp, f"place_stop_order({coin},{stop_price_rounded})")
+    log.info("SL colocado en %s (%s %s)", stop_price_rounded, side.upper(), coin)
+
+
+def _place_tp_order_rounded(symbol: str, side: str, qty: float, tp_price_rounded: float) -> None:
+    """Versión interna: recibe tp_price YA redondeado (evita doble redondeo)."""
+    coin     = _hl_symbol(symbol)
+    is_buy   = side == "short"
+    limit_px   = _TRIGGER_MARKET_BUY_PX if is_buy else _TRIGGER_MARKET_SELL_PX
+    order_type = {"trigger": {"triggerPx": tp_price_rounded, "isMarket": True, "tpsl": "tp"}}
+    log.info("place_tp_order(%s): side=%s is_buy=%s tp_price=%.8f limit_px=%s qty=%.8f",
+             coin, side, is_buy, tp_price_rounded, limit_px, qty)
+    resp = _hl_call(
+        _order_reduce_only,
+        coin, is_buy, qty, limit_px, order_type,
+        context=f"place_tp_order({coin},{tp_price_rounded})",
+    )
+    log.info("place_tp_order(%s): respuesta HL = %s", coin, resp)
+    _check_order_response(resp, f"place_tp_order({coin},{tp_price_rounded})")
+    log.info("TP colocado en %s (%s %s)", tp_price_rounded, side.upper(), coin)
+
+
 def place_stop_order(symbol: str, side: str, qty: float, stop_price: float) -> None:
-    """Coloca un SL trigger market.
+    """Coloca un SL trigger market. Redondea stop_price al tickSize del par.
 
     v14: limit_px es precio extremo (0 para sell, INT_MAX para buy), NO stop_price.
     """
     coin       = _hl_symbol(symbol)
-    is_buy     = side == "short"
     stop_price = _round_price(coin, stop_price)
-    limit_px   = _TRIGGER_MARKET_BUY_PX if is_buy else _TRIGGER_MARKET_SELL_PX
-    order_type = {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}}
-    log.info("place_stop_order(%s): side=%s is_buy=%s stop_price=%.8f limit_px=%s qty=%.8f",
-             coin, side, is_buy, stop_price, limit_px, qty)
-    try:
-        resp = _hl_call(
-            _order_reduce_only,
-            coin, is_buy, qty, limit_px, order_type,
-            context=f"place_stop_order({coin},{stop_price})",
-        )
-        log.info("place_stop_order(%s): respuesta HL = %s", coin, resp)
-        _check_order_response(resp, f"place_stop_order({coin},{stop_price})")
-        log.info("SL colocado en %s (%s %s)", stop_price, side.upper(), coin)
-    except Exception as exc:
-        log.error("place_stop_order(%s) FALLÓ: %s", coin, exc)
+    _place_stop_order_rounded(symbol, side, qty, stop_price)
 
 
 def place_tp_order(symbol: str, side: str, qty: float, tp_price: float) -> None:
-    """Coloca un TP trigger market.
+    """Coloca un TP trigger market. Redondea tp_price al tickSize del par.
 
     v14: limit_px es precio extremo (0 para sell, INT_MAX para buy), NO tp_price.
     """
     coin     = _hl_symbol(symbol)
-    is_buy   = side == "short"
     tp_price = _round_price(coin, tp_price)
-    limit_px   = _TRIGGER_MARKET_BUY_PX if is_buy else _TRIGGER_MARKET_SELL_PX
-    order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
-    log.info("place_tp_order(%s): side=%s is_buy=%s tp_price=%.8f limit_px=%s qty=%.8f",
-             coin, side, is_buy, tp_price, limit_px, qty)
-    try:
-        resp = _hl_call(
-            _order_reduce_only,
-            coin, is_buy, qty, limit_px, order_type,
-            context=f"place_tp_order({coin},{tp_price})",
-        )
-        log.info("place_tp_order(%s): respuesta HL = %s", coin, resp)
-        _check_order_response(resp, f"place_tp_order({coin},{tp_price})")
-        log.info("TP colocado en %s (%s %s)", tp_price, side.upper(), coin)
-    except Exception as exc:
-        log.error("place_tp_order(%s) FALLÓ: %s", coin, exc)
+    _place_tp_order_rounded(symbol, side, qty, tp_price)
 
 
 # ── Cerrar posición ──────────────────────────────────────────────────────────────────
