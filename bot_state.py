@@ -4,16 +4,15 @@ AQUI vive el ÚNICO contador de drawdown diario.
 Todo el código debe usar este módulo — trade_logger y main.py NO tienen
 sus propios contadores de PnL diario.
 
-FIX capital real: _get_capital() consulta exchange.get_balance() para obtener
-el equity real de la cuenta. El capital ficticio (MARGIN_USDT × MAX_POSITIONS)
-se usa solo si Hyperliquid no responde. El valor se cachea 5 minutos para no
-spammear la API en cada trade.
+FIX capital fijo: _get_capital() usa MARGIN_USDT × MAX_POSITIONS como base
+estable para el cálculo del daily loss. El accountValue dinámico de Hyperliquid
+incluye PnL no realizado de posiciones abiertas, lo que causaba que el umbral
+saltara prematuramente cuando había posiciones en pérdida abiertas.
 
 FIX DAILY_MAX_LOSS_PCT: se fuerza a negativo. Si el usuario pone 10 o -10
 en Railway, ambos se tratan como -10. Así el bot nunca se pausa por ganancias.
 """
 import threading
-import time
 from datetime import datetime, timezone
 
 import config
@@ -21,31 +20,20 @@ import config
 _lock   = threading.Lock()
 _paused = False
 
-# ── Capital real cacheado ────────────────────────────────────────────────────
-_capital_cache: float = 0.0
-_capital_ts:    float = 0.0
-_CAPITAL_TTL:   float = 300.0
-
 
 def _get_capital() -> float:
-    global _capital_cache, _capital_ts
-    now = time.monotonic()
-    if now - _capital_ts < _CAPITAL_TTL and _capital_cache > 0:
-        return _capital_cache
+    """Capital fijo basado en la configuración del bot.
 
-    try:
-        import exchange as _ex
-        bal = _ex.get_balance()
-    except Exception:
-        bal = 0.0
+    Usa MARGIN_USDT × MAX_POSITIONS como base estable para el cálculo
+    del daily loss. Este valor representa exactamente el capital asignado
+    al bot para operar y es predecible e independiente del estado del exchange.
 
-    if bal > 0:
-        _capital_cache = bal
-        _capital_ts    = now
-        return bal
-
-    fallback = config.MARGIN_USDT * config.MAX_POSITIONS
-    return fallback if fallback > 0 else 1.0
+    El accountValue dinámico de Hyperliquid NO se usa aquí porque incluye
+    el PnL no realizado de posiciones abiertas, lo que hace fluctuar la base
+    del cálculo y dispara el límite prematuramente.
+    """
+    capital = config.MARGIN_USDT * config.MAX_POSITIONS
+    return capital if capital > 0 else 1.0
 
 
 def _get_daily_max() -> float:
@@ -70,13 +58,12 @@ def _today_utc() -> str:
 
 def _reset_if_new_day() -> None:
     """Debe llamarse dentro de _lock."""
-    global _daily_pnl_usdt, _daily_date, _daily_limit_hit, _capital_ts
+    global _daily_pnl_usdt, _daily_date, _daily_limit_hit
     today = _today_utc()
     if today != _daily_date:
         _daily_pnl_usdt  = 0.0
         _daily_date      = today
         _daily_limit_hit = False
-        _capital_ts      = 0.0
 
 
 # ── Pausa manual ────────────────────────────────────────────────────────────
@@ -108,7 +95,7 @@ def record_trade(pnl_usdt: float) -> bool:
         _daily_pnl_usdt += pnl_usdt
         if not _daily_limit_hit:
             capital   = _get_capital()
-            daily_max = _get_daily_max()  # siempre negativo, ej. -3.0
+            daily_max = _get_daily_max()  # siempre negativo, ej. -30.0
             pct = _daily_pnl_usdt / capital * 100
             if pct <= daily_max:
                 _daily_limit_hit = True
