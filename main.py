@@ -35,6 +35,13 @@ v12:
     incluyendo SL/TP manuales colocados desde la UI de HL. cancel_trigger_orders solo
     cancela las trigger orders (SL/TP) del bot, dejando intactas las órdenes manuales.
   - _restore_sl_tp_on_sync: ídem, cancel_all_orders → cancel_trigger_orders.
+v13:
+  - get_all_positions: capturado con try/except propio dentro del loop.
+    Un 429 o error puntual ya no propaga la excepción al run() ni crashea el proceso;
+    se loguea como warning, se duerme 10s adicionales y se hace continue.
+  - open_order (price snapshot): una sola llamada a _market_price usada tanto para
+    el check de min_notional como para el precio de la orden, eliminando la race
+    condition de precio entre las dos llamadas anteriores.
 """
 import logging
 import os
@@ -105,6 +112,9 @@ _missing_count: dict[str, int] = {}
 _weekend_notified_day: int = -1
 
 MAX_SAME_SIDE = int(getattr(config, "MAX_SAME_SIDE", 4))
+
+# v13: sleep extra tras error en get_all_positions (ej. 429)
+_GET_POSITIONS_ERROR_SLEEP = 10
 
 
 def _is_weekend() -> bool:
@@ -988,7 +998,20 @@ def run() -> None:
             weekend = _is_weekend()
             effective_min_score = WEEKEND_MIN_SCORE if weekend else WEEKDAY_MIN_SCORE
 
-            all_ex_positions = exchange.get_all_positions()
+            # v13: get_all_positions con su propio try/except.
+            # Un 429 o error HTTP puntual ya NO propaga la excepción al run()
+            # ni crashea el proceso; se loguea como warning, se espera
+            # _GET_POSITIONS_ERROR_SLEEP segundos adicionales y se hace
+            # continue para reintentar en el siguiente loop.
+            try:
+                all_ex_positions = exchange.get_all_positions()
+            except Exception as pos_err:
+                log.warning(
+                    "get_all_positions falló (loop #%d): %s — reintentando en %ds",
+                    loop_count, pos_err, _GET_POSITIONS_ERROR_SLEEP,
+                )
+                time.sleep(_GET_POSITIONS_ERROR_SLEEP)
+                continue
 
             for symbol in list(positions.keys()):
                 pos_ex = all_ex_positions.get(symbol)
