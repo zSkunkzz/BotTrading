@@ -46,6 +46,7 @@ SYMBOLS = [
     "LINK-USDT",  "ONDO-USDT",  "PYTH-USDT",  "LTC-USDT",
     "APT-USDT",   "WIF-USDT",   "DOT-USDT",   "kBONK-USDT",
     "FET-USDT",   "TRX-USDT",   "ATOM-USDT",  "RENDER-USDT",
+    "BERA-USDT",  "S-USDT",
     # --- Vol bajo-medio (700k-2M USD/24h) ---
     "HBAR-USDT",  "VIRTUAL-USDT","OP-USDT",   "PENDLE-USDT",
     "INJ-USDT",   "SEI-USDT",   "TIA-USDT",   "LDO-USDT",
@@ -75,6 +76,8 @@ CORR_GROUPS: list[set[str]] = [
     {"XRP-USDT", "XLM-USDT", "TRX-USDT", "HBAR-USDT", "ADA-USDT"},
     # Interoperabilidad / Cosmos
     {"DOT-USDT", "INJ-USDT", "SEI-USDT", "TAO-USDT", "ATOM-USDT"},
+    # L1 nuevas generación (Berachain, Sonic)
+    {"BERA-USDT", "S-USDT"},
     # AI / Compute
     {"WLD-USDT"},
     # Memes puros
