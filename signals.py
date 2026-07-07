@@ -49,6 +49,11 @@ v6.1 — Mejoras de calidad de señal:
     ATR_VOLATILE_PCT=3.5% ya cubre el caso extremo).
   - _price_structure: n=1→2, requiere mínimo 2 HH+HL o 2 LH+LL consecutivos
     para clasificar como bull/bear, evitando falsos positivos estructurales.
+
+v6.2 — Más oportunidades sin bajar calidad:
+  - MIN_HOURLY_VOLUME: 100k → 50k USDT (abre universo de pares con liquidez real)
+  - MACD_15m contrario al régimen: +0 → -5 (penalización leve en vez de neutro)
+  - ADX_1h tramo 15-20: nuevo nivel +3 (antes daba 0, ahora reconoce tendencia incipiente)
 """
 from __future__ import annotations
 import logging
@@ -77,7 +82,7 @@ ADX_15M_MIN           = 18
 
 # ── Umbrales estructura ───────────────────────────────────────────────────
 STRUCTURE_LOOKBACK    = 12
-MIN_HOURLY_VOLUME     = 100_000   # USDT — ajustado a liquidez real de Hyperliquid (era 150k)
+MIN_HOURLY_VOLUME     = 50_000   # v6.2: 100k → 50k USDT (más universo operativo)
 
 # ── Umbrales proto-régimen ────────────────────────────────────────────────
 PROTO_ADX_MIN         = 18   # era 22 — simplificado
@@ -92,6 +97,7 @@ ATR_LOW_VOL_BUMP      = 4
 W_ADX_1H_30        = 20
 W_ADX_1H_25        = 14
 W_ADX_1H_20        =  5
+W_ADX_1H_15        =  3   # v6.2: nuevo tramo 15-20, tendencia incipiente
 W_MACD_1H          = 14
 W_RSI_IDEAL        = 13
 W_MACD_15M         = 12
@@ -107,6 +113,7 @@ W_STRUCTURE_CONTRA  = -8
 W_MACRO_CONTRA      = -8   # macro 4h contradice → penalización (no hard-guard)
 W_BEAR_EMA200_15M   = -6   # bear sobreextendido bajo EMA200_15m
 W_BEAR_LOW_ADX      = -5   # bear con ADX_1h < 22 (era hard-guard, ahora penalización)
+W_MACD_15M_CONTRA   = -5   # v6.2: MACD_15m contrario al régimen (antes neutro +0)
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────
@@ -561,7 +568,7 @@ def evaluate(
         else:
             log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
 
-    # ADX 1h
+    # ADX 1h — v6.2: nuevo tramo 15-20 (+3)
     if adx_1h >= 30:
         score += W_ADX_1H_30
         log.debug("[%s] ADX_1h=%.1f >= 30 → +%d (score=%d)", symbol, adx_1h, W_ADX_1H_30, score)
@@ -571,10 +578,13 @@ def evaluate(
     elif adx_1h >= 20:
         score += W_ADX_1H_20
         log.debug("[%s] ADX_1h=%.1f >= 20 → +%d (score=%d)", symbol, adx_1h, W_ADX_1H_20, score)
+    elif adx_1h >= 15:
+        score += W_ADX_1H_15
+        log.debug("[%s] ADX_1h=%.1f >= 15 → +%d (score=%d)", symbol, adx_1h, W_ADX_1H_15, score)
     else:
-        log.debug("[%s] ADX_1h=%.1f < 20 → +0 (score=%d)", symbol, adx_1h, score)
+        log.debug("[%s] ADX_1h=%.1f < 15 → +0 (score=%d)", symbol, adx_1h, score)
 
-    # MACD 15m
+    # MACD 15m — v6.2: contrario al régimen aplica penalización -5
     if effective_regime == "bull" and macd_hist > 0:
         score += W_MACD_15M
         log.debug("[%s] MACD_15m=%.5f positivo en bull → +%d (score=%d)", symbol, macd_hist, W_MACD_15M, score)
@@ -582,7 +592,8 @@ def evaluate(
         score += W_MACD_15M
         log.debug("[%s] MACD_15m=%.5f negativo en bear → +%d (score=%d)", symbol, macd_hist, W_MACD_15M, score)
     else:
-        log.debug("[%s] MACD_15m=%.5f contrario al régimen → +0 (score=%d)", symbol, macd_hist, score)
+        score += W_MACD_15M_CONTRA
+        log.debug("[%s] MACD_15m=%.5f contrario al régimen → %d (score=%d)", symbol, macd_hist, W_MACD_15M_CONTRA, score)
 
     # MACD 1h
     if effective_regime == "bull" and macd_1h > 0:
