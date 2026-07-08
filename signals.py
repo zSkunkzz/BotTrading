@@ -54,6 +54,20 @@ v6.2 — Más oportunidades sin bajar calidad:
   - MIN_HOURLY_VOLUME: 100k → 50k USDT (abre universo de pares con liquidez real)
   - MACD_15m contrario al régimen: +0 → -5 (penalización leve en vez de neutro)
   - ADX_1h tramo 15-20: nuevo nivel +3 (antes daba 0, ahora reconoce tendencia incipiente)
+
+v6.3 — Rebalanceo de pesos para mercado bear/transición:
+  - W_ADX_1H_30: 20 → 15 (menos dominante; el ADX alto no debe ser condición casi obligatoria)
+  - W_ADX_1H_25: 14 → 12
+  - W_ADX_1H_20:  5 →  9 (sube; tendencia moderada también vale)
+  - W_ADX_1H_15:  3 →  6 (sube; captura inicio de tendencia)
+  - W_MACD_15M:  12 →  8 (baja; indicador rezagado con alta tasa de contradicción)
+  - W_BEAR_LOW_ADX:   -5 → -3 (el ADX bajo ya castiga vía score positivo más bajo)
+  - W_MACD_15M_CONTRA: -5 → -3 (penalización excesiva para señal que ocurre ~60% del tiempo)
+  - W_MACRO_CONTRA:    -8 → -6 (menos agresivo en fases de transición)
+  Techo teórico ajustado:
+    ADX_1H>=30 (15) + MACD_1H (14) + RSI_IDEAL (13) + MACD_15M (8)
+    + VOLUME_HIGH (11) + STRUCTURE (10) + VELA (6) = 77 sin divergencia
+    + DIVERGENCIA (10) = 87 con divergencia
 """
 from __future__ import annotations
 import logging
@@ -93,14 +107,17 @@ ATR_LOW_VOL_PCT       = 0.005
 ATR_HIGH_VOL_BUMP     = 3    # v6.1: reducido de 5 a 3 (no doble penalización)
 ATR_LOW_VOL_BUMP      = 4
 
-# ── Pesos del scorer v6 — techo ~96 ──────────────────────────────────────
-W_ADX_1H_30        = 20
-W_ADX_1H_25        = 14
-W_ADX_1H_20        =  5
-W_ADX_1H_15        =  3   # v6.2: nuevo tramo 15-20, tendencia incipiente
+# ── Pesos del scorer v6.3 — techo ~87 (sin div) / ~97 (con div) ──────────
+# v6.3: ADX distribuido más plano (menos dominancia del tramo >= 30)
+#       MACD_15M reducido (rezagado, alta tasa de contradicción)
+#       Penalizaciones suavizadas para bear/transición
+W_ADX_1H_30        = 15   # v6.3: era 20
+W_ADX_1H_25        = 12   # v6.3: era 14
+W_ADX_1H_20        =  9   # v6.3: era  5
+W_ADX_1H_15        =  6   # v6.3: era  3
 W_MACD_1H          = 14
 W_RSI_IDEAL        = 13
-W_MACD_15M         = 12
+W_MACD_15M         =  8   # v6.3: era 12
 W_VOLUME_HIGH      = 11
 W_STRUCTURE        = 10
 W_DIVERGENCIA      = 10
@@ -110,10 +127,10 @@ W_VELA             =  6
 W_VOLUME_LOW        = -4
 W_RSI_SOBRE         = -8
 W_STRUCTURE_CONTRA  = -8
-W_MACRO_CONTRA      = -8   # macro 4h contradice → penalización (no hard-guard)
+W_MACRO_CONTRA      = -6   # v6.3: era -8 (menos agresivo en fases transición)
 W_BEAR_EMA200_15M   = -6   # bear sobreextendido bajo EMA200_15m
-W_BEAR_LOW_ADX      = -5   # bear con ADX_1h < 22 (era hard-guard, ahora penalización)
-W_MACD_15M_CONTRA   = -5   # v6.2: MACD_15m contrario al régimen (antes neutro +0)
+W_BEAR_LOW_ADX      = -3   # v6.3: era -5 (ADX bajo ya penaliza vía score positivo menor)
+W_MACD_15M_CONTRA   = -3   # v6.3: era -5 (ocurre ~60% del tiempo en entradas tempranas)
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────
@@ -568,7 +585,7 @@ def evaluate(
         else:
             log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
 
-    # ADX 1h — v6.2: nuevo tramo 15-20 (+3)
+    # ADX 1h — v6.3: distribución más plana, menos dominancia del tramo >=30
     if adx_1h >= 30:
         score += W_ADX_1H_30
         log.debug("[%s] ADX_1h=%.1f >= 30 → +%d (score=%d)", symbol, adx_1h, W_ADX_1H_30, score)
@@ -584,7 +601,7 @@ def evaluate(
     else:
         log.debug("[%s] ADX_1h=%.1f < 15 → +0 (score=%d)", symbol, adx_1h, score)
 
-    # MACD 15m — v6.2: contrario al régimen aplica penalización -5
+    # MACD 15m — v6.3: peso reducido (rezagado); contrario sigue penalizando pero menos
     if effective_regime == "bull" and macd_hist > 0:
         score += W_MACD_15M
         log.debug("[%s] MACD_15m=%.5f positivo en bull → +%d (score=%d)", symbol, macd_hist, W_MACD_15M, score)
