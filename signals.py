@@ -64,10 +64,25 @@ v6.3 — Rebalanceo de pesos para mercado bear/transición:
   - W_BEAR_LOW_ADX:   -5 → -3 (el ADX bajo ya castiga vía score positivo más bajo)
   - W_MACD_15M_CONTRA: -5 → -3 (penalización excesiva para señal que ocurre ~60% del tiempo)
   - W_MACRO_CONTRA:    -8 → -6 (menos agresivo en fases de transición)
-  Techo teórico ajustado:
-    ADX_1H>=30 (15) + MACD_1H (14) + RSI_IDEAL (13) + MACD_15M (8)
-    + VOLUME_HIGH (11) + STRUCTURE (10) + VELA (6) = 77 sin divergencia
-    + DIVERGENCIA (10) = 87 con divergencia
+
+v6.4 — Techo normalizado a 100:
+  Todos los pesos escalados proporcionalmente desde v6.3 (factor ~1.15)
+  para que el techo sea exactamente 100 (con divergencia) / 89 (sin divergencia).
+  MIN_SCORE=70 representa ahora el 70% de calidad máxima teórica.
+  Penalizaciones también escaladas proporcionalmente.
+
+  Pesos v6.4:
+    W_ADX_1H_30=17, W_ADX_1H_25=14, W_ADX_1H_20=10, W_ADX_1H_15=7
+    W_MACD_1H=16, W_RSI_IDEAL=15, W_MACD_15M=9
+    W_VOLUME_HIGH=13, W_STRUCTURE=11, W_DIVERGENCIA=11, W_VELA=8
+  Penalizaciones v6.4:
+    W_MACRO_CONTRA=-7, W_BEAR_EMA200_15M=-7, W_STRUCTURE_CONTRA=-9
+    W_RSI_SOBRE=-9, W_VOLUME_LOW=-5, W_BEAR_LOW_ADX=-3, W_MACD_15M_CONTRA=-3
+
+  Techo real por ruta:
+    ADX_1H>=30 (17) + MACD_1H (16) + RSI_IDEAL (15) + MACD_15M (9)
+    + VOLUME_HIGH (13) + STRUCTURE (11) + VELA (8) = 89 sin divergencia
+    + DIVERGENCIA (11) = 100 con divergencia
 """
 from __future__ import annotations
 import logging
@@ -107,30 +122,29 @@ ATR_LOW_VOL_PCT       = 0.005
 ATR_HIGH_VOL_BUMP     = 3    # v6.1: reducido de 5 a 3 (no doble penalización)
 ATR_LOW_VOL_BUMP      = 4
 
-# ── Pesos del scorer v6.3 — techo ~87 (sin div) / ~97 (con div) ──────────
-# v6.3: ADX distribuido más plano (menos dominancia del tramo >= 30)
-#       MACD_15M reducido (rezagado, alta tasa de contradicción)
-#       Penalizaciones suavizadas para bear/transición
-W_ADX_1H_30        = 15   # v6.3: era 20
-W_ADX_1H_25        = 12   # v6.3: era 14
-W_ADX_1H_20        =  9   # v6.3: era  5
-W_ADX_1H_15        =  6   # v6.3: era  3
-W_MACD_1H          = 14
-W_RSI_IDEAL        = 13
-W_MACD_15M         =  8   # v6.3: era 12
-W_VOLUME_HIGH      = 11
-W_STRUCTURE        = 10
-W_DIVERGENCIA      = 10
-W_VELA             =  6
+# ── Pesos del scorer v6.4 — techo exacto 100 (con div) / 89 (sin div) ────
+# Escalado proporcional desde v6.3 (factor ~1.15) para techo normalizado.
+# MIN_SCORE=70 representa el 70% de calidad máxima teórica.
+W_ADX_1H_30        = 17   # v6.4: era 15
+W_ADX_1H_25        = 14   # v6.4: era 12
+W_ADX_1H_20        = 10   # v6.4: era  9
+W_ADX_1H_15        =  7   # v6.4: era  6
+W_MACD_1H          = 16   # v6.4: era 14
+W_RSI_IDEAL        = 15   # v6.4: era 13
+W_MACD_15M         =  9   # v6.4: era  8
+W_VOLUME_HIGH      = 13   # v6.4: era 11
+W_STRUCTURE        = 11   # v6.4: era 10
+W_DIVERGENCIA      = 11   # v6.4: era 10
+W_VELA             =  8   # v6.4: era  6
 
-# Penalizaciones suaves
-W_VOLUME_LOW        = -4
-W_RSI_SOBRE         = -8
-W_STRUCTURE_CONTRA  = -8
-W_MACRO_CONTRA      = -6   # v6.3: era -8 (menos agresivo en fases transición)
-W_BEAR_EMA200_15M   = -6   # bear sobreextendido bajo EMA200_15m
-W_BEAR_LOW_ADX      = -3   # v6.3: era -5 (ADX bajo ya penaliza vía score positivo menor)
-W_MACD_15M_CONTRA   = -3   # v6.3: era -5 (ocurre ~60% del tiempo en entradas tempranas)
+# Penalizaciones suaves (escaladas proporcionalmente)
+W_VOLUME_LOW        = -5   # v6.4: era -4
+W_RSI_SOBRE         = -9   # v6.4: era -8
+W_STRUCTURE_CONTRA  = -9   # v6.4: era -8
+W_MACRO_CONTRA      = -7   # v6.4: era -6
+W_BEAR_EMA200_15M   = -7   # v6.4: era -6
+W_BEAR_LOW_ADX      = -3   # sin cambio (ya era bajo en v6.3)
+W_MACD_15M_CONTRA   = -3   # sin cambio (ya era bajo en v6.3)
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────
@@ -240,14 +254,9 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
     last_close = recent_closes[-1]
 
     # Divergencia alcista: precio hace mínimo más bajo pero RSI hace mínimo más alto
-    # Buscamos el último mínimo local (más reciente) en la ventana previa
     try:
-        # Mínimo más bajo dentro de la ventana previa
         lo_val = min(recent_closes[:-1])
-        # índice más reciente con ese valor mínimo
         lo_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == lo_val)
-        # El último cierre debe estar por debajo del mínimo previo
-        # y la diferencia debe ser significativa (>= 0.5%)
         if (last_close < lo_val
                 and lo_val > 0
                 and abs(last_close - lo_val) / lo_val >= 0.005
@@ -365,7 +374,6 @@ def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK)
         if swing_low_vals[i] < swing_low_vals[i - 1] * 0.999
     )
 
-    # v6.1: n=2 en vez de n=1 para exigir confirmación estructural mínima
     n = 2
     if hh_count >= n and hl_count >= n:
         return "bull"
@@ -529,7 +537,7 @@ def evaluate(
     vol_bump        = _dynamic_min_score_bump(candles_1h, price)
     min_required_base = min_score + vol_bump
 
-    # ── Scoring ───────────────────────────────────────────────────────────
+    # ── Scoring ──────────────────────────────────────────────────────────
     score = 0
 
     # Macro 4h — penalización suave (no hard-guard)
@@ -585,7 +593,7 @@ def evaluate(
         else:
             log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
 
-    # ADX 1h — v6.3: distribución más plana, menos dominancia del tramo >=30
+    # ADX 1h — v6.4: distribución más plana, menos dominancia del tramo >=30
     if adx_1h >= 30:
         score += W_ADX_1H_30
         log.debug("[%s] ADX_1h=%.1f >= 30 → +%d (score=%d)", symbol, adx_1h, W_ADX_1H_30, score)
@@ -601,7 +609,7 @@ def evaluate(
     else:
         log.debug("[%s] ADX_1h=%.1f < 15 → +0 (score=%d)", symbol, adx_1h, score)
 
-    # MACD 15m — v6.3: peso reducido (rezagado); contrario sigue penalizando pero menos
+    # MACD 15m — v6.4: peso reducido (rezagado); contrario sigue penalizando pero menos
     if effective_regime == "bull" and macd_hist > 0:
         score += W_MACD_15M
         log.debug("[%s] MACD_15m=%.5f positivo en bull → +%d (score=%d)", symbol, macd_hist, W_MACD_15M, score)
