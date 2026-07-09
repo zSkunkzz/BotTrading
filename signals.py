@@ -83,6 +83,21 @@ v6.4 — Techo normalizado a 100:
     ADX_1H>=30 (17) + MACD_1H (16) + RSI_IDEAL (15) + MACD_15M (9)
     + VOLUME_HIGH (13) + STRUCTURE (11) + VELA (8) = 89 sin divergencia
     + DIVERGENCIA (11) = 100 con divergencia
+
+v6.5 — Fix 3 bloqueadores críticos de señales:
+  1. SHORT_MIN_SCORE_EXTRA: 6 → 0
+     El techo real de shorts es 89 (sin div). Con penalizaciones típicas en bear
+     (MACRO_CONTRA -7, STRUCTURE_CONTRA -9, BEAR_LOW_ADX -3) el máximo real caía
+     a ~70, que era INFERIOR al mínimo de 76 (70+6). El bot era físicamente
+     incapaz de entrar en short en mercado bear débil.
+  2. EMA200_MIN_DIST: 0.003 → 0.001
+     En mercado de transición el precio oscila en torno a la EMA200. El hard-guard
+     del 0.3% descartaba señales válidas constantemente cuando el precio cruzaba
+     brevemente la EMA200 por encima (en bear) o por debajo (en bull).
+  3. RSI < 30 en bear: hard-guard → penalización suave W_RSI_SOBRE
+     Bloquear shorts cuando RSI < 30 (sobrevendido) es contraproducente — es
+     precisamente cuando el precio tiene más momentum bajista. Se convierte en
+     penalización suave para no perder la señal pero reducir su score.
 """
 from __future__ import annotations
 import logging
@@ -94,7 +109,7 @@ import config
 log = logging.getLogger("signals")
 
 # ── Umbrales configurables ────────────────────────────────────────────────
-EMA200_MIN_DIST     = 0.003
+EMA200_MIN_DIST     = 0.001   # v6.5: 0.003 → 0.001 (menos restrictivo en transición)
 NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
 VOLUME_WEAK         = 0.8
@@ -105,7 +120,7 @@ MIN_SCORE           = config.MIN_SCORE
 PULLBACK_EMA20_DIST_BASE = 0.015
 PULLBACK_ATR_MULT        = 1.5
 
-SHORT_MIN_SCORE_EXTRA = 6
+SHORT_MIN_SCORE_EXTRA = 0     # v6.5: 6 → 0 (techo shorts ~89, no podían llegar a 76)
 ATR_VOLATILE_PCT      = 0.035
 ADX_15M_MIN           = 18
 
@@ -588,8 +603,10 @@ def evaluate(
             score += W_RSI_IDEAL
             log.debug("[%s] RSI=%.1f en zona ideal bear → +%d (score=%d)", symbol, rsi, W_RSI_IDEAL, score)
         elif rsi < 30:
-            log.debug("[%s] skip: RSI=%.1f < 30 (sobrevendido en bear)", symbol, rsi)
-            return None, score, None
+            # v6.5: convertido de hard-guard a penalización suave
+            # RSI sobrevendido en bear = momentum bajista fuerte, no bloquear
+            score += W_RSI_SOBRE
+            log.debug("[%s] RSI=%.1f sobrevendido en bear → %d (score=%d)", symbol, rsi, W_RSI_SOBRE, score)
         else:
             log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
 
