@@ -98,6 +98,31 @@ v6.5 — Fix 3 bloqueadores críticos de señales:
      Bloquear shorts cuando RSI < 30 (sobrevendido) es contraproducente — es
      precisamente cuando el precio tiene más momentum bajista. Se convierte en
      penalización suave para no perder la señal pero reducir su score.
+
+v6.6 — Rebalanceo pesos + contexto de mercado (funding/OI via Hyperliquid):
+  Pesos (techo=100 mantenido):
+    W_MACD_1H: 16 → 14 (menos peso a indicador rezagado sin contexto de mercado)
+    W_STRUCTURE: 11 → 12 (+1 compensación; confirmación estructural más fiable)
+    W_VELA: 8 → 9 (+1 compensación; alineación directa con régimen)
+  Penalizaciones (reducir apilamiento en bear/transición):
+    W_STRUCTURE_CONTRA: -9 → -6 (estructura tarda en actualizar, no debe bloquear)
+    W_MACRO_CONTRA: -7 → -5 (menos agresivo; 4h tarda en alinearse en transición)
+    W_BEAR_EMA200_15M: -7 → -5 (siempre apilada con otras, triple penalización excesiva)
+  Nuevo módulo market_context.py:
+    - Una sola llamada REST a metaAndAssetCtxs (caché 60s, ~3 ciclos de 20s)
+    - Funding rate: ±6 pts según sobrecarga del mercado vs dirección trade
+    - Open Interest: ±5/7 pts según si el movimiento tiene respaldo real
+    - Modificador: -15 a +15 sobre score técnico (0 si datos no disponibles)
+    - score_context() aplicado al final de evaluate(), antes del return
+
+  Techo técnico puro: 100 (sin cambios)
+  Techo con contexto favorable: 113 (100 + 6 funding + 7 OI)
+  MIN_SCORE=70 sin cambios
+
+  Verificación techo v6.6:
+    ADX_1H>=30 (17) + MACD_1H (14) + RSI_IDEAL (15) + MACD_15M (9)
+    + VOLUME_HIGH (13) + STRUCTURE (12) + VELA (9) = 89 sin divergencia
+    + DIVERGENCIA (11) = 100 con divergencia ✓
 """
 from __future__ import annotations
 import logging
@@ -105,6 +130,7 @@ import datetime
 from datetime import timezone
 
 import config
+from market_context import score_context
 
 log = logging.getLogger("signals")
 
@@ -137,29 +163,28 @@ ATR_LOW_VOL_PCT       = 0.005
 ATR_HIGH_VOL_BUMP     = 3    # v6.1: reducido de 5 a 3 (no doble penalización)
 ATR_LOW_VOL_BUMP      = 4
 
-# ── Pesos del scorer v6.4 — techo exacto 100 (con div) / 89 (sin div) ────
-# Escalado proporcional desde v6.3 (factor ~1.15) para techo normalizado.
-# MIN_SCORE=70 representa el 70% de calidad máxima teórica.
-W_ADX_1H_30        = 17   # v6.4: era 15
-W_ADX_1H_25        = 14   # v6.4: era 12
-W_ADX_1H_20        = 10   # v6.4: era  9
-W_ADX_1H_15        =  7   # v6.4: era  6
-W_MACD_1H          = 16   # v6.4: era 14
-W_RSI_IDEAL        = 15   # v6.4: era 13
-W_MACD_15M         =  9   # v6.4: era  8
-W_VOLUME_HIGH      = 13   # v6.4: era 11
-W_STRUCTURE        = 11   # v6.4: era 10
-W_DIVERGENCIA      = 11   # v6.4: era 10
-W_VELA             =  8   # v6.4: era  6
+# ── Pesos del scorer v6.6 — techo exacto 100 (con div) / 89 (sin div) ────
+# Verificación: 17+14+15+9+13+12+11+9 = 100 ✓
+W_ADX_1H_30        = 17
+W_ADX_1H_25        = 14
+W_ADX_1H_20        = 10
+W_ADX_1H_15        =  7
+W_MACD_1H          = 14   # v6.6: 16 → 14 (menos peso indicador rezagado)
+W_RSI_IDEAL        = 15
+W_MACD_15M         =  9
+W_VOLUME_HIGH      = 13
+W_STRUCTURE        = 12   # v6.6: 11 → 12 (+1 compensación)
+W_DIVERGENCIA      = 11
+W_VELA             =  9   # v6.6: 8 → 9 (+1 compensación)
 
-# Penalizaciones suaves (escaladas proporcionalmente)
-W_VOLUME_LOW        = -5   # v6.4: era -4
-W_RSI_SOBRE         = -9   # v6.4: era -8
-W_STRUCTURE_CONTRA  = -9   # v6.4: era -8
-W_MACRO_CONTRA      = -7   # v6.4: era -6
-W_BEAR_EMA200_15M   = -7   # v6.4: era -6
-W_BEAR_LOW_ADX      = -3   # sin cambio (ya era bajo en v6.3)
-W_MACD_15M_CONTRA   = -3   # sin cambio (ya era bajo en v6.3)
+# Penalizaciones suaves v6.6
+W_VOLUME_LOW        = -5
+W_RSI_SOBRE         = -9
+W_STRUCTURE_CONTRA  = -6   # v6.6: -9 → -6 (estructura rezagada, no bloquear)
+W_MACRO_CONTRA      = -5   # v6.6: -7 → -5 (menos agresivo en transición 4h)
+W_BEAR_EMA200_15M   = -5   # v6.6: -7 → -5 (siempre apilada, triple penalización)
+W_BEAR_LOW_ADX      = -3
+W_MACD_15M_CONTRA   = -3
 
 
 # ── Indicadores ──────────────────────────────────────────────────────────
@@ -549,7 +574,7 @@ def evaluate(
                 return None, 0, None
 
     # ── Score mínimo dinámico por volatilidad ────────────────────────────
-    vol_bump        = _dynamic_min_score_bump(candles_1h, price)
+    vol_bump          = _dynamic_min_score_bump(candles_1h, price)
     min_required_base = min_score + vol_bump
 
     # ── Scoring ──────────────────────────────────────────────────────────
@@ -610,7 +635,7 @@ def evaluate(
         else:
             log.debug("[%s] RSI=%.1f fuera de zona ideal → +0 (score=%d)", symbol, rsi, score)
 
-    # ADX 1h — v6.4: distribución más plana, menos dominancia del tramo >=30
+    # ADX 1h
     if adx_1h >= 30:
         score += W_ADX_1H_30
         log.debug("[%s] ADX_1h=%.1f >= 30 → +%d (score=%d)", symbol, adx_1h, W_ADX_1H_30, score)
@@ -626,7 +651,7 @@ def evaluate(
     else:
         log.debug("[%s] ADX_1h=%.1f < 15 → +0 (score=%d)", symbol, adx_1h, score)
 
-    # MACD 15m — v6.4: peso reducido (rezagado); contrario sigue penalizando pero menos
+    # MACD 15m
     if effective_regime == "bull" and macd_hist > 0:
         score += W_MACD_15M
         log.debug("[%s] MACD_15m=%.5f positivo en bull → +%d (score=%d)", symbol, macd_hist, W_MACD_15M, score)
@@ -677,24 +702,41 @@ def evaluate(
             "[%s] structure=%s contradice régimen=%s → %d (score=%d)",
             symbol, structure, regime, W_STRUCTURE_CONTRA, score,
         )
-    # structure==range: sin penalización (era hard-guard en v5, ahora neutro)
+    # structure==range: sin penalización
+
+    # ── Contexto de mercado: funding + OI via Hyperliquid (v6.6) ─────────
+    _coin = symbol.split("-")[0] if symbol and "-" in symbol else symbol or "???"
+    side  = "long" if effective_regime == "bull" else "short"
+
+    # Cambio de precio 1h: precio actual vs cierre de hace ~4 velas de 15m
+    _lookback_candles = min(4, len(candles_15m) - 1)
+    _price_1h_ago     = candles_15m[-(_lookback_candles + 1)]["close"] if _lookback_candles > 0 else price
+    _price_change_1h  = (price - _price_1h_ago) / _price_1h_ago if _price_1h_ago > 0 else 0.0
+
+    context_mod = score_context(_coin, side, _price_change_1h)
+    score += context_mod
+
+    if context_mod != 0:
+        log.info(
+            "[%s] context_modifier=%+d → score con contexto=%d",
+            symbol, context_mod, score,
+        )
 
     # ── Score mínimo ──────────────────────────────────────────────────────
     min_required = min_required_base + (SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0)
     log.info(
-        "[%s] SCORE=%d min=%d | régimen=%s adx1h=%.1f adx15m=%.1f rsi=%.1f vol=%.2f",
-        symbol, score, min_required, regime, adx_1h, adx_15m, rsi, vol_ratio,
+        "[%s] SCORE=%d min=%d | régimen=%s adx1h=%.1f adx15m=%.1f rsi=%.1f vol=%.2f ctx=%+d",
+        symbol, score, min_required, regime, adx_1h, adx_15m, rsi, vol_ratio, context_mod,
     )
 
     if score < min_required:
         return None, score, None
 
-    side = "long" if effective_regime == "bull" else "short"
     log.info(
         "✅ SEÑAL %s | score=%d (min=%d) | regime=%s structure=%s "
-        "adx1h=%.1f adx15m=%.1f rsi=%.1f macd=%.5f vol=%.2f%s",
+        "adx1h=%.1f adx15m=%.1f rsi=%.1f macd=%.5f vol=%.2f ctx=%+d%s",
         side.upper(), score, min_required, regime, structure,
-        adx_1h, adx_15m, rsi, macd_hist, vol_ratio,
+        adx_1h, adx_15m, rsi, macd_hist, vol_ratio, context_mod,
         " [PROTO]" if is_proto else "",
     )
     return side, score, regime
