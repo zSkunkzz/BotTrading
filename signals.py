@@ -18,7 +18,7 @@ v6 — Techo ~96, MIN_SCORE=70 fijo
 
 Techo real por ruta:
   ADX_1H>=30 (20) + MACD_1H (14) + RSI_IDEAL (13) + MACD_15M (12)
-  + VOLUME_HIGH (11) + STRUCTURE (10) + VELA (6) = 86 sin divergencia
+  + VOLUME_HIGH (11) + STRUCTURE (10) + VELA (6) = 86 sin diverg
   + DIVERGENCIA (10) = 96 con divergencia
 
 Filtros activos:
@@ -100,6 +100,16 @@ v6.5 — Fix 3 bloqueadores críticos de señales:
      precisamente cuando el precio tiene más momentum bajista. Se convierte en
      penalización suave para no perder la señal pero reducir su score.
 
+v6.6 — Integración market_context (funding + OI via Hyperliquid):
+  - evaluate() acepta nuevo parámetro coin: str | None = None
+  - Si coin is not None y la señal técnica supera guardia previa, se llama
+    market_context.score_context(coin, side, price_change_1h) y se suma
+    el modificador (-15..+15) al score técnico antes del chequeo MIN_SCORE.
+  - price_change_1h se calcula de candles_1h: (close[-2] - close[-62]) / close[-62]
+    usando vela cerrada vs 60 velas atrás (~1h real en TF 1h = 1 vela).
+  - Si HL no devuelve datos, score_context devuelve 0 (no bloquea la señal).
+  - El log de SEÑAL incluye el context_modifier para trazabilidad.
+
 v6.7 — Rebalanceo pesos bear/transición sin bajar MIN_SCORE:
   - W_ADX_1H_30: 17→15 (menos dominante; tendencia madura no debe ser obligatoria)
   - W_ADX_1H_25: 14→12, W_ADX_1H_20: 10→11, W_ADX_1H_15: 7→8
@@ -117,10 +127,11 @@ import datetime
 from datetime import timezone
 
 import config
+import market_context
 
 log = logging.getLogger("signals")
 
-# ── Umbrales configurables ────────────────────────────────────────────────
+# ── Umbrales configurables ────────────────────────────────────────────────────
 EMA200_MIN_DIST     = 0.001   # v6.5: 0.003 → 0.001 (menos restrictivo en transición)
 NO_CHASE_MULT       = 2.0
 VOLUME_MULT         = 1.2
@@ -136,20 +147,20 @@ SHORT_MIN_SCORE_EXTRA = 0     # v6.5: 6 → 0 (techo shorts ~89, no podían lleg
 ATR_VOLATILE_PCT      = 0.035
 ADX_15M_MIN           = 18
 
-# ── Umbrales estructura ───────────────────────────────────────────────────
+# ── Umbrales estructura ───────────────────────────────────────────────────────
 STRUCTURE_LOOKBACK    = 12
 MIN_HOURLY_VOLUME     = 50_000   # v6.2: 100k → 50k USDT (más universo operativo)
 
-# ── Umbrales proto-régimen ────────────────────────────────────────────────
+# ── Umbrales proto-régimen ────────────────────────────────────────────────────
 PROTO_ADX_MIN         = 18   # era 22 — simplificado
 
-# ── Volatilidad dinámica ──────────────────────────────────────────────────
+# ── Volatilidad dinámica ──────────────────────────────────────────────────────
 ATR_HIGH_VOL_PCT      = 0.020
 ATR_LOW_VOL_PCT       = 0.005
 ATR_HIGH_VOL_BUMP     = 3    # v6.1: reducido de 5 a 3 (no doble penalización)
 ATR_LOW_VOL_BUMP      = 4
 
-# ── Pesos del scorer v6.7 — techo exacto 100 (con div) / 90 (sin div) ────
+# ── Pesos del scorer v6.7 — techo exacto 100 (con div) / 90 (sin div) ────────
 # Rebalanceo para mercado bear/transición sin bajar MIN_SCORE.
 # Score típico bear ADX 18-22 mejora ~15-20 pts.
 W_ADX_1H_30        = 15   # v6.7: 17→15
@@ -174,7 +185,7 @@ W_BEAR_LOW_ADX      = -2   # v6.7: -3→-2
 W_MACD_15M_CONTRA   = -2   # v6.7: -3→-2
 
 
-# ── Indicadores ──────────────────────────────────────────────────────────
+# ── Indicadores ───────────────────────────────────────────────────────────────
 
 def _ema(closes: list[float], period: int) -> list[float]:
     if not closes:
@@ -447,14 +458,47 @@ def _dynamic_min_score_bump(candles_1h: list[dict], price: float) -> int:
     return 0
 
 
+def _price_change_1h(candles_1h: list[dict]) -> float:
+    """Cambio porcentual del precio en la última hora.
+
+    Usa la vela cerrada actual (índice -2) vs la vela 60 posiciones atrás
+    (índice -62). En TF 1h cada posición = 1h, así que [-62] es ~60h atrás;
+    usamos [-2] vs [-3] para el cambio de la última vela cerrada completa,
+    o bien [-2] vs el cierre de hace ~1h ([-3] en 1h = hace 1h exacto).
+
+    NOTA: En candles_1h cada vela = 1h. Vela[-2] = última cerrada.
+    Vela[-3] = la anterior = hace ~1h. Esto da el cambio de la última hora.
+    """
+    closes = [c["close"] for c in candles_1h]
+    if len(closes) < 3:
+        return 0.0
+    prev  = closes[-3]   # cierre de hace ~1h (vela anterior a la última cerrada)
+    curr  = closes[-2]   # cierre de la última vela cerrada
+    if prev <= 0:
+        return 0.0
+    return (curr - prev) / prev
+
+
 def evaluate(
     candles_15m: list[dict],
     candles_1h:  list[dict],
     candles_4h:  list[dict] | None = None,
     min_score:   int = MIN_SCORE,
     symbol:      str = "???",
+    coin:        str | None = None,
 ) -> tuple[str | None, int, str | None]:
-    """Evalúa si hay señal de entrada. Devuelve (side, score, regime) o (None, score, None)."""
+    """Evalúa si hay señal de entrada. Devuelve (side, score, regime) o (None, score, None).
+
+    Args:
+        candles_15m:  velas 15m del par (>= 50)
+        candles_1h:   velas 1h del par (>= 220)
+        candles_4h:   velas 4h opcionales para contexto macro
+        min_score:    umbral mínimo de score técnico
+        symbol:       nombre del par (ej. "BTCUSDT") — para logging
+        coin:         nombre del coin en Hyperliquid (ej. "BTC") para
+                      consultar funding+OI via market_context. Si es None
+                      se omite el modificador de contexto.
+    """
 
     if len(candles_15m) < 50 or len(candles_1h) < 220:
         log.debug("[%s] skip: candles insuficientes (15m=%d 1h=%d)", symbol, len(candles_15m), len(candles_1h))
@@ -471,7 +515,7 @@ def evaluate(
     c_low   = closed["low"]
     bullish_candle = c_close > c_open
 
-    # ── Régimen de mercado 1h ────────────────────────────────────────────
+    # ── Régimen de mercado 1h ──────────────────────────────────────────────
     regime, adx_1h = _market_regime(candles_1h)
 
     is_proto = regime in ("proto_bull", "proto_bear")
@@ -483,10 +527,10 @@ def evaluate(
         log.debug("[%s] skip: régimen=range adx_1h=%.1f", symbol, adx_1h)
         return None, 0, None
 
-    # ── Estructura de precio 1h ──────────────────────────────────────────
+    # ── Estructura de precio 1h ────────────────────────────────────────────
     structure = _price_structure(candles_1h)
 
-    # ── Indicadores 15m ──────────────────────────────────────────────────
+    # ── Indicadores 15m ───────────────────────────────────────────────────
     closes_15m = [c["close"] for c in candles_15m]
     price      = closes_15m[-2]
 
@@ -528,7 +572,7 @@ def evaluate(
         price, ema200_1h, ema20_15m, pullback_dist * 100,
     )
 
-    # ── Hard-guards (mínimos no negociables) ─────────────────────────────
+    # ── Hard-guards (mínimos no negociables) ──────────────────────────────
     if price > 0 and atr_15m / price > ATR_VOLATILE_PCT:
         log.debug("[%s] skip: ATR_15m=%.4f%% > %.1f%% (demasiado volátil)", symbol, atr_15m / price * 100, ATR_VOLATILE_PCT * 100)
         return None, 0, None
@@ -560,11 +604,11 @@ def evaluate(
                 log.debug("[%s] skip: sobreextendido bajo EMA20_15m dist=%.2f%% (umbral=%.2f%%)", symbol, dist_ema20 * 100, pullback_dist * 100)
                 return None, 0, None
 
-    # ── Score mínimo dinámico por volatilidad ────────────────────────────
+    # ── Score mínimo dinámico por volatilidad ──────────────────────────────
     vol_bump        = _dynamic_min_score_bump(candles_1h, price)
     min_required_base = min_score + vol_bump
 
-    # ── Scoring ──────────────────────────────────────────────────────────
+    # ── Scoring ────────────────────────────────────────────────────────────
     score = 0
 
     # Macro 4h — penalización suave (no hard-guard)
@@ -690,11 +734,26 @@ def evaluate(
             symbol, structure, regime, W_STRUCTURE_CONTRA, score,
         )
 
-    # ── Score mínimo ──────────────────────────────────────────────────────
+    # ── Modificador de contexto de mercado (funding + OI) — v6.6 ──────────
+    # Se aplica sobre el score técnico. Si coin es None o HL no responde,
+    # score_context devuelve 0 y no afecta al resultado.
+    context_modifier = 0
+    side_candidate = "long" if effective_regime == "bull" else "short"
+    if coin is not None:
+        price_chg_1h  = _price_change_1h(candles_1h)
+        context_modifier = market_context.score_context(coin, side_candidate, price_chg_1h)
+        if context_modifier != 0:
+            score += context_modifier
+            log.debug(
+                "[%s] market_context modifier=%+d → score=%d",
+                symbol, context_modifier, score,
+            )
+
+    # ── Score mínimo ───────────────────────────────────────────────────────
     min_required = min_required_base + (SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0)
     log.info(
-        "[%s] SCORE=%d min=%d | régimen=%s adx1h=%.1f adx15m=%.1f rsi=%.1f vol=%.2f",
-        symbol, score, min_required, regime, adx_1h, adx_15m, rsi, vol_ratio,
+        "[%s] SCORE=%d min=%d | régimen=%s adx1h=%.1f adx15m=%.1f rsi=%.1f vol=%.2f ctx=%+d",
+        symbol, score, min_required, regime, adx_1h, adx_15m, rsi, vol_ratio, context_modifier,
     )
 
     if score < min_required:
@@ -703,9 +762,9 @@ def evaluate(
     side = "long" if effective_regime == "bull" else "short"
     log.info(
         "✅ SEÑAL %s | score=%d (min=%d) | regime=%s structure=%s "
-        "adx1h=%.1f adx15m=%.1f rsi=%.1f macd=%.5f vol=%.2f%s",
+        "adx1h=%.1f adx15m=%.1f rsi=%.1f macd=%.5f vol=%.2f ctx=%+d%s",
         side.upper(), score, min_required, regime, structure,
-        adx_1h, adx_15m, rsi, macd_hist, vol_ratio,
+        adx_1h, adx_15m, rsi, macd_hist, vol_ratio, context_modifier,
         " [PROTO]" if is_proto else "",
     )
     return side, score, regime
