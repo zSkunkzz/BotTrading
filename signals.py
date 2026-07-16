@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import logging
 from datetime import timezone
-import datetime
 
 import config
 import market_context
 
 log = logging.getLogger("signals")
 
+# ── Umbrales configurables ────────────────────────────────────────────────────
 EMA200_MIN_DIST = 0.001
 NO_CHASE_MULT = 2.0
 VOLUME_MULT = 1.2
@@ -20,18 +20,24 @@ PULLBACK_ATR_MULT = 1.5
 
 SHORT_MIN_SCORE_EXTRA = 4
 ATR_VOLATILE_PCT = 0.035
-ADX_15M_MIN = 18
+ADX_15M_MIN_LONG = 18
+ADX_15M_MIN_SHORT = 20
 
+# ── Umbrales estructura ───────────────────────────────────────────────────────
 STRUCTURE_LOOKBACK = 12
 MIN_HOURLY_VOLUME = 50_000
 
-PROTO_ADX_MIN = 22
+# ── Umbrales proto-régimen ────────────────────────────────────────────────────
+PROTO_ADX_MIN = 18
+PROTO_MACD_CONFIRM_EPS = 0.0
 
+# ── Volatilidad dinámica ──────────────────────────────────────────────────────
 ATR_HIGH_VOL_PCT = 0.020
 ATR_LOW_VOL_PCT = 0.005
 ATR_HIGH_VOL_BUMP = 3
 ATR_LOW_VOL_BUMP = 4
 
+# ── Pesos del scorer ──────────────────────────────────────────────────────────
 W_ADX_1H_30 = 15
 W_ADX_1H_25 = 12
 W_ADX_1H_20 = 11
@@ -46,10 +52,10 @@ W_VELA = 8
 
 W_VOLUME_LOW = -5
 W_RSI_SOBRE = -9
-W_STRUCTURE_CONTRA = -7
-W_MACRO_CONTRA = -8
-W_BEAR_EMA200_15M = -5
-W_BEAR_LOW_ADX = -4
+W_STRUCTURE_CONTRA = -5
+W_MACRO_CONTRA = -4
+W_BEAR_EMA200_15M = -4
+W_BEAR_LOW_ADX = -2
 W_MACD_15M_CONTRA = -2
 
 
@@ -67,11 +73,9 @@ def _rsi(closes: list[float], period: int = 14) -> list[float]:
     rsi = [50.0] * len(closes)
     if len(closes) < period + 1:
         return rsi
-
     deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
     avg_gain = sum(d for d in deltas[:period] if d > 0) / period
     avg_loss = sum(-d for d in deltas[:period] if d < 0) / period
-
     for i in range(period, len(closes)):
         delta = deltas[i - 1]
         avg_gain = (avg_gain * (period - 1) + max(delta, 0)) / period
@@ -100,7 +104,6 @@ def _atr(candles: list[dict], period: int = 14) -> float:
 def _adx(candles: list[dict], period: int = 14) -> float:
     if len(candles) < period + 2:
         return 0.0
-
     plus_dm, minus_dm, tr_list = [], [], []
     for i in range(1, len(candles)):
         h, l = candles[i]["high"], candles[i]["low"]
@@ -122,7 +125,6 @@ def _adx(candles: list[dict], period: int = 14) -> float:
     atr_s = _smooth(tr_list)
     pdm_s = _smooth(plus_dm)
     mdm_s = _smooth(minus_dm)
-
     dx_vals = []
     for a, p, m in zip(atr_s, pdm_s, mdm_s):
         if a == 0:
@@ -131,10 +133,8 @@ def _adx(candles: list[dict], period: int = 14) -> float:
         pdi = 100 * p / a
         mdi = 100 * m / a
         dx_vals.append(100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0.0)
-
     if len(dx_vals) < period:
         return 0.0
-
     adx = sum(dx_vals[:period]) / period
     for dx in dx_vals[period:]:
         adx = (adx * (period - 1) + dx) / period
@@ -144,19 +144,15 @@ def _adx(candles: list[dict], period: int = 14) -> float:
 def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10) -> str | None:
     if len(closes) < lookback + 14 or len(candles) < lookback + 1:
         return None
-
     rsi_series = _rsi(closes, 14)
     recent_closes = closes[-lookback:]
     recent_rsi = rsi_series[-lookback:]
     recent_candles = candles[-lookback:]
-
     avg_vol = sum(c["volume"] for c in recent_candles[:-1]) / max(1, len(recent_candles) - 1)
     last_vol = recent_candles[-1].get("volume", 0.0)
     if avg_vol > 0 and last_vol < avg_vol * 0.6:
         return None
-
     last_close = recent_closes[-1]
-
     try:
         lo_val = min(recent_closes[:-1])
         lo_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == lo_val)
@@ -169,7 +165,6 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
             return "bullish"
     except (ValueError, IndexError):
         pass
-
     try:
         hi_val = max(recent_closes[:-1])
         hi_idx = max(i for i, v in enumerate(recent_closes[:-1]) if v == hi_val)
@@ -182,27 +177,7 @@ def _rsi_divergence(closes: list[float], candles: list[dict], lookback: int = 10
             return "bearish"
     except (ValueError, IndexError):
         pass
-
     return None
-
-
-def _market_regime(candles_1h: list[dict]) -> tuple[str, float]:
-    closes = [c["close"] for c in candles_1h]
-    closes_closed = closes[:-1]
-    ema50 = _ema(closes_closed, 50)[-1]
-    ema200 = _ema(closes_closed, 200)[-1]
-    adx = _adx(candles_1h[:-1], 14)
-    price = closes[-2] if len(closes) >= 2 else closes[-1]
-
-    if price > ema200 and ema50 > ema200:
-        return "bull", adx
-    if price < ema200 and ema50 < ema200:
-        return "bear", adx
-    if price > ema200 and adx >= PROTO_ADX_MIN:
-        return "proto_bull", adx
-    if price < ema200 and adx >= PROTO_ADX_MIN:
-        return "proto_bear", adx
-    return "range", adx
 
 
 def _find_swing_highs(highs: list[float], wing: int = 2) -> list[int]:
@@ -229,25 +204,19 @@ def _price_structure(candles_1h: list[dict], lookback: int = STRUCTURE_LOOKBACK)
     closed = candles_1h[:-1]
     if len(closed) < lookback + 4:
         return "range"
-
-    recent = closed[-(lookback + 4):]
+    recent = closed[-(lookback + 4) :]
     highs = [c["high"] for c in recent]
     lows = [c["low"] for c in recent]
-
     swing_high_idxs = _find_swing_highs(highs, wing=2)
     swing_low_idxs = _find_swing_lows(lows, wing=2)
-
     if len(swing_high_idxs) < 2 or len(swing_low_idxs) < 2:
         return "range"
-
     swing_high_vals = [highs[i] for i in swing_high_idxs]
     swing_low_vals = [lows[i] for i in swing_low_idxs]
-
     hh_count = sum(1 for i in range(1, len(swing_high_vals)) if swing_high_vals[i] > swing_high_vals[i - 1] * 1.001)
     hl_count = sum(1 for i in range(1, len(swing_low_vals)) if swing_low_vals[i] > swing_low_vals[i - 1] * 1.001)
     lh_count = sum(1 for i in range(1, len(swing_high_vals)) if swing_high_vals[i] < swing_high_vals[i - 1] * 0.999)
     ll_count = sum(1 for i in range(1, len(swing_low_vals)) if swing_low_vals[i] < swing_low_vals[i - 1] * 0.999)
-
     n = 2
     if hh_count >= n and hl_count >= n:
         return "bull"
@@ -260,12 +229,7 @@ def _liquidity_ok(candles_1h: list[dict]) -> bool:
     recent = candles_1h[-25:-1]
     if not recent:
         return False
-
-    avg_vol = sum(
-        c.get("quote_volume", c.get("volume", 0.0) * c.get("close", 1.0))
-        for c in recent
-    ) / len(recent)
-
+    avg_vol = sum(c.get("quote_volume", c.get("volume", 0.0) * c.get("close", 1.0)) for c in recent) / len(recent)
     ok = avg_vol >= MIN_HOURLY_VOLUME
     if not ok:
         log.debug("[liquidity] skip — quote_volume_avg_1h=%.0f < umbral %d USDT", avg_vol, MIN_HOURLY_VOLUME)
@@ -297,6 +261,35 @@ def _price_change_1h(candles_1h: list[dict]) -> float:
     return (curr - prev) / prev
 
 
+def _macro_alignment(candles_4h: list[dict] | None, side: str) -> bool | None:
+    if not candles_4h or len(candles_4h) < 55:
+        return None
+    closes_4h = [c["close"] for c in candles_4h[:-1]]
+    ema50_4h = _ema(closes_4h, 50)[-1]
+    price_4h = closes_4h[-1]
+    if side == "long":
+        return price_4h >= ema50_4h
+    return price_4h <= ema50_4h
+
+
+def _market_regime(candles_1h: list[dict], structure: str, macd_1h: float) -> tuple[str, float]:
+    closes = [c["close"] for c in candles_1h]
+    closes_closed = closes[:-1]
+    ema50 = _ema(closes_closed, 50)[-1]
+    ema200 = _ema(closes_closed, 200)[-1]
+    adx = _adx(candles_1h[:-1], 14)
+    price = closes[-2] if len(closes) >= 2 else closes[-1]
+    if price > ema200 and ema50 > ema200:
+        return "bull", adx
+    if price < ema200 and ema50 < ema200:
+        return "bear", adx
+    if price > ema200 and adx >= PROTO_ADX_MIN and macd_1h > PROTO_MACD_CONFIRM_EPS and structure != "bear":
+        return "proto_bull", adx
+    if price < ema200 and adx >= PROTO_ADX_MIN and macd_1h < -PROTO_MACD_CONFIRM_EPS and structure != "bull":
+        return "proto_bear", adx
+    return "range", adx
+
+
 def evaluate(
     candles_15m: list[dict],
     candles_1h: list[dict],
@@ -306,11 +299,8 @@ def evaluate(
     coin: str | None = None,
 ) -> tuple[str | None, int, str | None]:
     if len(candles_15m) < 50 or len(candles_1h) < 220:
-        log.debug("[%s] skip: candles insuficientes (15m=%d 1h=%d)", symbol, len(candles_15m), len(candles_1h))
         return None, 0, None
-
     if not _liquidity_ok(candles_1h):
-        log.debug("[%s] skip: liquidez insuficiente", symbol)
         return None, 0, None
 
     closed = candles_15m[-2]
@@ -320,47 +310,37 @@ def evaluate(
     c_low = closed["low"]
     bullish_candle = c_close > c_open
 
-    regime, adx_1h = _market_regime(candles_1h)
+    structure = _price_structure(candles_1h)
+    closes_1h = [c["close"] for c in candles_1h]
+    macd_1h = _macd_histogram(closes_1h[:-1])[-1]
+    regime, adx_1h = _market_regime(candles_1h, structure, macd_1h)
     is_proto = regime in ("proto_bull", "proto_bear")
     effective_regime = "bull" if regime in ("bull", "proto_bull") else ("bear" if regime in ("bear", "proto_bear") else "range")
-
     if effective_regime == "range":
         return None, 0, None
 
-    structure = _price_structure(candles_1h)
-
     closes_15m = [c["close"] for c in candles_15m]
     price = closes_15m[-2]
-
     ema20_15m = _ema(closes_15m[:-1], 20)[-1]
     ema200_15m = _ema(closes_15m[:-1], 200)[-1]
-    rsi_series = _rsi(closes_15m[:-1], 14)
-    rsi = rsi_series[-1]
+    rsi = _rsi(closes_15m[:-1], 14)[-1]
     macd_hist = _macd_histogram(closes_15m[:-1])[-1]
     atr_15m = _atr(candles_15m[:-1], 14)
     adx_15m = _adx(candles_15m[:-1], 14)
-
     volumes = [c["volume"] for c in candles_15m]
     avg_vol = sum(volumes[-21:-1]) / 20
     last_vol = volumes[-2]
     vol_ratio = last_vol / avg_vol if avg_vol else 0.0
-
-    closes_1h = [c["close"] for c in candles_1h]
     ema200_1h = _ema(closes_1h[:-1], 200)[-1]
-    macd_1h = _macd_histogram(closes_1h[:-1])[-1]
-
     atr_1h_val = _atr(candles_1h[:-1], 14)
-    atr_1h_pct = atr_1h_val / price if price > 0 else 0.0
-
     atr_15m_pct = atr_15m / price if price > 0 else PULLBACK_EMA20_DIST_BASE
     pullback_dist = max(PULLBACK_EMA20_DIST_BASE, atr_15m_pct * PULLBACK_ATR_MULT)
 
     if price > 0 and atr_15m / price > ATR_VOLATILE_PCT:
         return None, 0, None
-
-    if adx_15m < ADX_15M_MIN:
+    min_adx_15m = ADX_15M_MIN_SHORT if effective_regime == "bear" else ADX_15M_MIN_LONG
+    if adx_15m < min_adx_15m:
         return None, 0, None
-
     if effective_regime == "bull" and price < ema200_1h * (1 - EMA200_MIN_DIST):
         return None, 0, None
     if effective_regime == "bear" and price > ema200_1h * (1 + EMA200_MIN_DIST):
@@ -369,7 +349,6 @@ def evaluate(
     candle_range = c_high - c_low
     if candle_range > 0 and atr_15m > 0 and candle_range > NO_CHASE_MULT * atr_15m:
         return None, 0, None
-
     if price > 0 and ema20_15m > 0:
         dist_ema20 = abs(price - ema20_15m) / price
         if dist_ema20 > pullback_dist:
@@ -378,25 +357,22 @@ def evaluate(
             if effective_regime == "bear" and price < ema20_15m:
                 return None, 0, None
 
+    macro_aligned = _macro_alignment(candles_4h, "long" if effective_regime == "bull" else "short")
+    if regime == "proto_bear" and macro_aligned is False:
+        return None, 0, None
+    if regime == "proto_bull" and macro_aligned is False:
+        return None, 0, None
+
     vol_bump = _dynamic_min_score_bump(candles_1h, price)
     min_required_base = min_score + vol_bump
     score = 0
 
-    if candles_4h and len(candles_4h) >= 55:
-        closes_4h = [c["close"] for c in candles_4h[:-1]]
-        ema50_4h = _ema(closes_4h, 50)[-1]
-        price_4h = closes_4h[-1]
-        if effective_regime == "bull" and price_4h < ema50_4h:
-            score += W_MACRO_CONTRA
-        elif effective_regime == "bear" and price_4h > ema50_4h:
-            score += W_MACRO_CONTRA
-
+    if macro_aligned is False:
+        score += W_MACRO_CONTRA
     if effective_regime == "bear" and price < ema200_15m * (1 - EMA200_MIN_DIST):
         score += W_BEAR_EMA200_15M
-
     if effective_regime == "bear" and adx_1h < 22:
         score += W_BEAR_LOW_ADX
-
     if effective_regime == "bull" and bullish_candle:
         score += W_VELA
     elif effective_regime == "bear" and not bullish_candle:
@@ -459,24 +435,29 @@ def evaluate(
         price_chg_1h = _price_change_1h(candles_1h)
         context_modifier = market_context.score_context(coin, side_candidate, price_chg_1h)
         score += context_modifier
+        if effective_regime == "bear" and context_modifier <= -8:
+            return None, score, None
 
     min_required = min_required_base + (SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0)
-
-    log.info(
-        "[%s] SCORE=%d min=%d | régimen=%s adx1h=%.1f adx15m=%.1f rsi=%.1f vol=%.2f ctx=%+d",
-        symbol,
-        score,
-        min_required,
-        regime,
-        adx_1h,
-        adx_15m,
-        rsi,
-        vol_ratio,
-        context_modifier,
-    )
-
     if score < min_required:
         return None, score, None
 
     side = "long" if effective_regime == "bull" else "short"
+    log.info(
+        "[%s] SIGNAL %s score=%d min=%d regime=%s structure=%s adx1h=%.1f adx15m=%.1f rsi=%.1f macd15m=%.5f macd1h=%.5f vol=%.2f ctx=%+d%s",
+        symbol,
+        side.upper(),
+        score,
+        min_required,
+        regime,
+        structure,
+        adx_1h,
+        adx_15m,
+        rsi,
+        macd_hist,
+        macd_1h,
+        vol_ratio,
+        context_modifier,
+        " [PROTO]" if is_proto else "",
+    )
     return side, score, regime
