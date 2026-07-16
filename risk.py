@@ -23,6 +23,17 @@ v5:
   como para monedas >$1000 (BTC, ETH) cumplan el formato que HL exige
   y no sean rechazados con "Order has invalid price" al colocarse.
 
+v6 (fix R:R y BE agresivo):
+  - BE_ATR_MULT: 1.0 → 1.5
+    El break-even a 1×ATR se activaba al primer movimiento normal del
+    precio, sacando trades con casi cero ganancia (avg win real +2.18 USDT).
+    Con 1.5× el precio tiene más margen antes de bloquear en BE.
+  - _tp_rr: score 70-84 → 1.5× (antes 2.0×)
+    El TP de 2.0× nunca se alcanzaba en la práctica (R:R efectivo 0.79).
+    Con 1.5× el TP es más realista y el WR necesario baja a ~40%,
+    alineado con el 43.9% histórico observado.
+    Score >= 85 mantiene 2.5× (señales de alta convicción).
+
 Sizing:
   Fijo: MARGIN_USDT para todas las señales.
 
@@ -30,10 +41,10 @@ SL / TP:
   sl_pct = clamp(ATR_1h / entry × 1.2, SL_MIN_PCT, SL_MAX_PCT)
   tp_pct = sl_pct × _tp_rr(score, regime)
   SL_MIN_PCT = 0.8% | SL_MAX_PCT = 3.0%
-  TP_RR: score ≥ 85 → 2.5× | resto → 2.0×
+  TP_RR: score >= 85 → 2.5× | score 70-84 → 1.5×
 
 Break-even:
-  be_trigger = entry ± 1.0 × ATR_1h
+  be_trigger = entry ± 1.5 × ATR_1h  (v6: era 1.0×)
   be_sl      = entry ± 0.1 × ATR_1h
 """
 import logging
@@ -46,7 +57,7 @@ log = logging.getLogger("risk")
 SL_MIN_PCT = 0.008   # 0.8%
 SL_MAX_PCT = 0.030   # 3.0%
 
-BE_ATR_MULT    = 1.0
+BE_ATR_MULT    = 1.5   # v6: 1.0 → 1.5 (BE menos agresivo, más margen al precio)
 BE_BUFFER_MULT = 0.1
 
 # trail_step: fracción del sl_dist usada como paso mínimo del trailing.
@@ -55,9 +66,16 @@ TRAIL_STEP_MULT = 0.5
 
 
 def _tp_rr(score: int, regime: str) -> float:
+    """R:R objetivo según score.
+
+    v6: scores 70-84 usan 1.5× en vez de 2.0×.
+    El TP de 2.0× nunca se alcanzaba (R:R efectivo histórico: 0.79).
+    Con 1.5× el TP es más realista; WR mínimo para ser rentable: ~40%.
+    Score >= 85 mantiene 2.5× (alta convicción).
+    """
     if score >= 85:
         return 2.5
-    return 2.0
+    return 1.5
 
 
 def _atr(candles: list[dict], period: int = 14) -> float:
