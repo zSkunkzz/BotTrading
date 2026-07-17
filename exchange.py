@@ -30,6 +30,9 @@ v18 — Fix "Order has invalid price" en trailing SL:
        Reemplazado por _get_price_decimals basado en szDecimals (campo real del SDK)
        + regla oficial HL: máx 5 cifras significativas y máx (6 - szDecimals) decimales.
        Ejemplo: BNB szDecimals=3 → máx 3 dec de precio; 572.8938 → 572.894 ✓
+v19 — Añadida get_real_exit_classification para clasificar TP/SL por distancia real,
+       eliminando la dependencia de closedPnl que clasificaba erróneamente
+       trailing stops en verde como TP en lugar de SL.
 """
 import json
 import logging
@@ -745,3 +748,72 @@ def get_fills(symbol: str = None, limit: int = 20, only_close: bool = True) -> l
 
 def get_closed_orders(symbol: str = None, limit: int = 20) -> list[dict]:
     return get_fills(symbol=symbol, limit=limit, only_close=True)
+
+
+# ── CLASIFICACIÓN REAL DE TP/SL POR DISTANCIA (v19) ─────────────────────
+# Esta función se usa en main.py para determinar si un cierre fue por TP o SL
+# basándose en la distancia al SL/TP almacenados en pos, no en closedPnl.
+
+def get_real_exit_classification(
+    symbol: str,
+    pos: dict,
+    fallback: float,
+    fallback_reason: str,
+) -> tuple[float, str]:
+    """Clasifica la salida real comparando distancia a SL/TP almacenados.
+
+    Esta función se llama desde _declare_closed en main.py. Usa la distancia
+    relativa al SL y TP guardados en 'pos' para decidir si fue TP o SL,
+    independientemente del closedPnl. Esto corrige el problema donde un
+    trailing stop que cierra en verde se clasificaba como TP (cooldown de 30 min)
+    en lugar de SL (cooldown de 60 min).
+    """
+    side    = pos.get("side", "long")
+    entry   = pos.get("entry", 0.0)
+    open_ts = pos.get("open_ts", 0.0)
+    open_ms = int(open_ts * 1000)
+
+    hl_close_dir = "Close Long" if side == "long" else "Close Short"
+
+    try:
+        closed_orders = get_closed_orders(symbol, limit=20)
+    except Exception as exc:
+        log.debug("[%s] get_closed_orders falló: %s", symbol, exc)
+        return fallback, fallback_reason
+
+    for order in closed_orders:
+        if order.get("dir") != hl_close_dir:
+            continue
+        order_time = int(order.get("time") or 0)
+        if order_time > 0 and order_time < open_ms:
+            continue
+        real_price = float(order.get("px") or order.get("price") or 0)
+        if real_price <= 0:
+            continue
+        if entry > 0 and abs(real_price - entry) / entry > 0.30:
+            log.warning(
+                "[%s] Orden descartada — precio %.6f fuera de rango razonable (entry=%.6f)",
+                symbol, real_price, entry,
+            )
+            continue
+
+        # --- CLASIFICACIÓN POR DISTANCIA A SL/TP (v19) ---
+        sl_price = pos.get("sl")
+        tp_price = pos.get("tp")
+        assigned_reason = fallback_reason
+
+        if sl_price is not None and tp_price is not None and real_price > 0:
+            dist_sl = abs(real_price - sl_price) / sl_price
+            dist_tp = abs(real_price - tp_price) / tp_price
+            assigned_reason = "SL" if dist_sl < dist_tp else "TP"
+        elif sl_price is not None and abs(real_price - sl_price) / sl_price < 0.015:
+            assigned_reason = "SL"
+        elif tp_price is not None and abs(real_price - tp_price) / tp_price < 0.015:
+            assigned_reason = "TP"
+        # Si no se puede decidir, se usa el fallback que viene de _exit_price_for
+        # (que ya hace una estimación por precio contra TP/SL)
+
+        return real_price, assigned_reason
+
+    log.debug("[%s] Sin orden de cierre válida en historial — usando fallback %.6f", symbol, fallback)
+    return fallback, fallback_reason
