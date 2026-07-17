@@ -120,6 +120,12 @@ v6.7 — Rebalanceo pesos bear/transición sin bajar MIN_SCORE:
   - W_STRUCTURE_CONTRA: -9→-5, W_BEAR_LOW_ADX: -3→-2, W_MACD_15M_CONTRA: -3→-2
   Techo mantenido: 100 (con div) / 90 (sin div). MIN_SCORE=70 sin cambios.
   Score típico bear ADX 18-22 mejora ~15-20 pts sin sacrificar calidad de señal.
+
+v7 — Filtro anti-rango para proto-regímenes + ajustes de calidad:
+  - PROTO_ADX_MIN: 18→22 (exige más convicción para proto)
+  - SHORT_MIN_SCORE_EXTRA: 0→3 (exige 3 puntos extra para shorts)
+  - W_MACRO_CONTRA: -4→-6 (penaliza más cuando macro 4h va contra régimen)
+  - Añadido bloque que descarta proto si structure==range o EMA50 plana (<0.15% en 5h)
 """
 from __future__ import annotations
 import logging
@@ -143,7 +149,7 @@ MIN_SCORE           = config.MIN_SCORE
 PULLBACK_EMA20_DIST_BASE = 0.015
 PULLBACK_ATR_MULT        = 1.5
 
-SHORT_MIN_SCORE_EXTRA = 0     # v6.5: 6 → 0 (techo shorts ~89, no podían llegar a 76)
+SHORT_MIN_SCORE_EXTRA = 3     # v7: 0→3 (exige más calidad para shorts)
 ATR_VOLATILE_PCT      = 0.035
 ADX_15M_MIN           = 18
 
@@ -152,7 +158,7 @@ STRUCTURE_LOOKBACK    = 12
 MIN_HOURLY_VOLUME     = 50_000   # v6.2: 100k → 50k USDT (más universo operativo)
 
 # ── Umbrales proto-régimen ────────────────────────────────────────────────────
-PROTO_ADX_MIN         = 18   # era 22 — simplificado
+PROTO_ADX_MIN         = 22   # v7: 18→22 (más exigente)
 
 # ── Volatilidad dinámica ──────────────────────────────────────────────────────
 ATR_HIGH_VOL_PCT      = 0.020
@@ -175,11 +181,11 @@ W_STRUCTURE        = 13   # v6.7: 11→13
 W_DIVERGENCIA      = 10   # v6.7: 11→10
 W_VELA             =  8   # sin cambio
 
-# Penalizaciones suaves v6.7 (menos apilamiento en bear/transición)
+# Penalizaciones suaves v7
 W_VOLUME_LOW        = -5   # sin cambio
 W_RSI_SOBRE         = -9   # sin cambio
 W_STRUCTURE_CONTRA  = -5   # v6.7: -9→-5
-W_MACRO_CONTRA      = -4   # v6.7: -7→-4
+W_MACRO_CONTRA      = -6   # v7: -4→-6 (más penalización para shorts contra macro)
 W_BEAR_EMA200_15M   = -4   # v6.7: -7→-4
 W_BEAR_LOW_ADX      = -2   # v6.7: -3→-2
 W_MACD_15M_CONTRA   = -2   # v6.7: -3→-2
@@ -529,6 +535,29 @@ def evaluate(
 
     # ── Estructura de precio 1h ────────────────────────────────────────────
     structure = _price_structure(candles_1h)
+
+    # ── FILTRO ANTI-RANGO PARA PROTO-REGÍMENES (v7) ────────────────────────
+    if is_proto:
+        # 1. La estructura NO puede ser rango
+        if structure == "range":
+            log.debug(
+                "[%s] skip: proto pero structure=range — falso rompimiento",
+                symbol
+            )
+            return None, 0, None
+
+        # 2. La EMA50 debe tener pendiente mínima (no plana)
+        closes_1h_closed = [c["close"] for c in candles_1h[:-1]]
+        ema50_vals = _ema(closes_1h_closed, 50)
+        if len(ema50_vals) >= 6:
+            pendiente = (ema50_vals[-1] - ema50_vals[-6]) / ema50_vals[-6]
+            if abs(pendiente) < 0.0015:  # 0.15% en 5h
+                log.debug(
+                    "[%s] skip: proto pero EMA50 plana (pendiente=%.3f%%)",
+                    symbol, pendiente * 100
+                )
+                return None, 0, None
+    # ─────────────────────────────────────────────────────────────────────────
 
     # ── Indicadores 15m ───────────────────────────────────────────────────
     closes_15m = [c["close"] for c in candles_15m]
