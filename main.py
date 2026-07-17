@@ -42,6 +42,11 @@ v13:
   - open_order (price snapshot): una sola llamada a _market_price usada tanto para
     el check de min_notional como para el precio de la orden, eliminando la race
     condition de precio entre las dos llamadas anteriores.
+v14 (calidad de señal + fixes):
+  - Pasar `coin` a signals.evaluate en bucle automático y _check_tp_extension.
+  - _check_tp_extension usa effective_min_score en lugar de WEEKDAY_MIN_SCORE.
+  - _check_tp_extension añade condiciones de calidad: score+5, no proto, contexto>=0.
+  - Clasificación de TP/SL en _get_real_exit_price movida a exchange.py.
 """
 import logging
 import os
@@ -52,6 +57,7 @@ from datetime import datetime, timezone
 import bot_state
 import config
 import exchange
+import market_context
 import risk
 import signals
 import telegram
@@ -283,6 +289,18 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                     )
 
 
+def _price_change_1h(candles_1h: list[dict]) -> float:
+    """Cambio porcentual del precio en la última hora (copia de signals)."""
+    closes = [c["close"] for c in candles_1h]
+    if len(closes) < 3:
+        return 0.0
+    prev = closes[-3]
+    curr = closes[-2]
+    if prev <= 0:
+        return 0.0
+    return (curr - prev) / prev
+
+
 def _check_tp_extension(
     symbol: str,
     pos: dict,
@@ -290,7 +308,7 @@ def _check_tp_extension(
     feed,
     effective_min_score: int,
 ) -> None:
-    """v8: fórmula de new_tp lineal (entry + tp_orig_dist × (n+1)) y _round_price."""
+    """v8: fórmula lineal + _round_price. v14: condiciones de calidad."""
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -322,14 +340,46 @@ def _check_tp_extension(
             candles_15m = feed.get(symbol, "15m")
             candles_1h  = feed.get(symbol, "1h")
             candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
-            signal, score, _ = signals.evaluate(
+            coin = exchange._hl_symbol(symbol)
+            signal, score, regime = signals.evaluate(
                 candles_15m, candles_1h, candles_4h,
-                min_score=WEEKDAY_MIN_SCORE,
+                min_score=effective_min_score,  # usa el mismo umbral que para abrir
                 symbol=symbol,
+                coin=coin,
             )
         except Exception as e:
             log.warning("[%s] Error evaluando señal para extend_tp: %s", symbol, e)
             return
+
+        # ── CONDICIONES DE CALIDAD PARA EXTENDER (v14) ──────────────────────
+        # 1. Score mínimo más exigente: +5 puntos
+        min_extend_score = effective_min_score + 5
+        if score < min_extend_score:
+            log.info(
+                "[%s] TP extension: score %d < %d (mínimo extend) — no extender",
+                symbol, score, min_extend_score
+            )
+            return
+
+        # 2. No extender en régimen proto (solo si está confirmado)
+        if regime and "proto" in regime:
+            log.info(
+                "[%s] TP extension: régimen %s es proto — no extender (esperar confirmación)",
+                symbol, regime
+            )
+            return
+
+        # 3. El contexto de mercado (funding + OI) debe ser positivo para la extensión
+        if coin is not None:
+            price_chg_1h = _price_change_1h(candles_1h)
+            ctx_mod = market_context.score_context(coin, side, price_chg_1h)
+            if ctx_mod < 0:
+                log.info(
+                    "[%s] TP extension: contexto de mercado negativo (%d) — no extender",
+                    symbol, ctx_mod
+                )
+                return
+        # ────────────────────────────────────────────────────────────────────────
 
         if not signal or signal != side:
             log.info(
@@ -494,53 +544,8 @@ def _get_real_exit_price(
     fallback: float,
     fallback_reason: str,
 ) -> tuple[float, str]:
-    side    = pos.get("side", "long")
-    entry   = pos.get("entry", 0.0)
-    open_ts = pos.get("open_ts", 0.0)
-    open_ms = int(open_ts * 1000)
-
-    hl_close_dir = "Close Long" if side == "long" else "Close Short"
-
-    try:
-        closed_orders = exchange.get_closed_orders(symbol, limit=20)
-    except Exception as exc:
-        log.debug("[%s] get_closed_orders falló: %s", symbol, exc)
-        return fallback, fallback_reason
-
-    for order in closed_orders:
-        if order.get("dir") != hl_close_dir:
-            continue
-        order_time = int(order.get("time") or 0)
-        if order_time > 0 and order_time < open_ms:
-            continue
-        real_price = float(order.get("px") or order.get("price") or 0)
-        if real_price <= 0:
-            continue
-        if entry > 0 and abs(real_price - entry) / entry > 0.30:
-            log.warning(
-                "[%s] Orden descartada — precio %.6f fuera de rango razonable (entry=%.6f)",
-                symbol, real_price, entry,
-            )
-            continue
-
-        order_type = str(order.get("order_type") or order.get("type") or "").upper()
-        if "TAKE_PROFIT" in order_type or "TP" in order_type:
-            return real_price, "TP"
-        if "STOP" in order_type or "SL" in order_type:
-            return real_price, "SL"
-
-        closed_pnl = float(order.get("closedPnl") or 0)
-        log.warning(
-            "[%s] order_type=%r no discriminante — clasificando por closedPnl=%.4f "
-            "(puede ser incorrecto si trailing cerró en verde con SL)",
-            symbol, order_type, closed_pnl,
-        )
-        if closed_pnl >= 0:
-            return real_price, "TP"
-        return real_price, "SL"
-
-    log.debug("[%s] Sin orden de cierre válida en historial — usando fallback %.6f", symbol, fallback)
-    return fallback, fallback_reason
+    """Delega la clasificación a exchange.get_real_exit_classification."""
+    return exchange.get_real_exit_classification(symbol, pos, fallback, fallback_reason)
 
 
 def _calc_pnl(side: str, entry: float, exit_price: float, qty: float) -> tuple[float, float]:
@@ -1228,10 +1233,13 @@ def run() -> None:
                         candles_1h  = feed.get(symbol, "1h")
                         candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
 
+                        # v14: pasar coin para que el contexto de mercado se aplique
+                        coin = exchange._hl_symbol(symbol)
                         signal, score, regime = signals.evaluate(
                             candles_15m, candles_1h, candles_4h,
                             min_score=effective_min_score,
                             symbol=symbol,
+                            coin=coin,
                         )
 
                         if not signal or signal not in VALID_SIDES:
