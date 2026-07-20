@@ -34,18 +34,14 @@ v6 (fix R:R y BE agresivo):
     alineado con el 43.9% histórico observado.
     Score >= 85 mantiene 2.5× (señales de alta convicción).
 
-Sizing:
-  Fijo: MARGIN_USDT para todas las señales.
-
-SL / TP:
-  sl_pct = clamp(ATR_1h / entry × 1.2, SL_MIN_PCT, SL_MAX_PCT)
-  tp_pct = sl_pct × _tp_rr(score, regime)
-  SL_MIN_PCT = 0.8% | SL_MAX_PCT = 3.0%
-  TP_RR: score >= 85 → 2.5× | score 70-84 → 1.5×
-
-Break-even:
-  be_trigger = entry ± 1.5 × ATR_1h  (v6: era 1.0×)
-  be_sl      = entry ± 0.1 × ATR_1h
+v7 — R:R adaptativo y SL_MIN_PCT ajustado:
+  - SL_MIN_PCT: 0.008 → 0.012 (más espacio para el precio, reduce stops por ruido)
+  - _tp_rr ahora recibe adx_1h y atr_pct para ajustar RR dinámicamente:
+      * En proto-regímenes: RR reducido (1.2–1.8)
+      * Si ADX_1h < 22: RR reducido (1.0–1.8)
+      * Si volatilidad > 3%: RR reducido
+      * Score alto + tendencia fuerte: RR hasta 2.5
+  - Se añaden parámetros a calc y se pasa información desde main.
 """
 import logging
 import math
@@ -54,28 +50,47 @@ import exchange as _exchange
 
 log = logging.getLogger("risk")
 
-SL_MIN_PCT = 0.008   # 0.8%
+SL_MIN_PCT = 0.012   # 1.2% (v7: subido desde 0.8%)
 SL_MAX_PCT = 0.030   # 3.0%
 
-BE_ATR_MULT    = 1.5   # v6: 1.0 → 1.5 (BE menos agresivo, más margen al precio)
+BE_ATR_MULT    = 1.5
 BE_BUFFER_MULT = 0.1
 
-# trail_step: fracción del sl_dist usada como paso mínimo del trailing.
-# 0.5 (antes 0.3) reduce el número de actualizaciones en altcoins baratas.
 TRAIL_STEP_MULT = 0.5
 
 
-def _tp_rr(score: int, regime: str) -> float:
-    """R:R objetivo según score.
+def _tp_rr(score: int, regime: str, adx_1h: float, atr_pct: float) -> float:
+    """R:R adaptativo según calidad de señal, régimen, ADX y volatilidad.
 
-    v6: scores 70-84 usan 1.5× en vez de 2.0×.
-    El TP de 2.0× nunca se alcanzaba (R:R efectivo histórico: 0.79).
-    Con 1.5× el TP es más realista; WR mínimo para ser rentable: ~40%.
-    Score >= 85 mantiene 2.5× (alta convicción).
+    - Base: 1.5
+    - Score >= 85 y ADX >= 30 → 2.5 (tendencia fuerte + alta convicción)
+    - Score >= 80 y ADX >= 25 → 2.0
+    - Proto-regímenes: RR reducido (máx 1.8, mínimo 1.2)
+    - ADX < 22 (sin tendencia): RR reducido (máx 1.8, mínimo 1.0)
+    - Volatilidad alta (>3% ATR): RR reducido 0.3
+    - Si varias condiciones se combinan, se aplican de forma acumulativa pero nunca por debajo de 1.0.
     """
-    if score >= 85:
-        return 2.5
-    return 1.5
+    base = 1.5
+
+    # Bonos por score + tendencia
+    if score >= 85 and adx_1h >= 30:
+        base = 2.5
+    elif score >= 80 and adx_1h >= 25:
+        base = 2.0
+    elif score >= 75 and adx_1h >= 22:
+        base = 1.8
+
+    # Penalizaciones
+    if regime in ("proto_bull", "proto_bear"):
+        base = max(1.2, base - 0.4)
+
+    if adx_1h < 22:
+        base = max(1.0, base - 0.4)
+
+    if atr_pct > 0.03:
+        base = max(1.0, base - 0.3)
+
+    return round(base, 1)
 
 
 def _atr(candles: list[dict], period: int = 14) -> float:
@@ -87,11 +102,6 @@ def _atr(candles: list[dict], period: int = 14) -> float:
 
 
 def _rp(coin: str | None, price: float) -> float:
-    """Redondea price al tickSize real del par (v5).
-
-    Si coin no está disponible, cae a round(..., 8) como antes.
-    _round_price usa Decimal.quantize internamente — sin residuos de float.
-    """
     if coin:
         try:
             return _exchange._round_price(coin, price)
@@ -102,12 +112,12 @@ def _rp(coin: str | None, price: float) -> float:
 
 def calc(side: str, entry: float, candles: list[dict], score: int = 78,
          symbol: str | None = None, regime: str = "bull",
-         candles_1h: list[dict] | None = None) -> dict:
+         candles_1h: list[dict] | None = None,
+         adx_1h: float = 0.0, atr_1h_pct: float = 0.0) -> dict:
     """
     Calcula SL, TP, qty, trail_step y be_trigger.
 
-    candles_1h: si se pasan, SL se basa en ATR 1h (preferido).
-                Fallback a ATR 15m si no están disponibles.
+    Ahora recibe adx_1h y atr_1h_pct para ajustar R:R dinámicamente.
     """
     coin = _exchange._hl_symbol(symbol) if symbol else None
 
@@ -130,7 +140,8 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
     raw_sl_pct = atr_pct * mult
     sl_pct     = max(SL_MIN_PCT, min(SL_MAX_PCT, raw_sl_pct))
 
-    rr     = _tp_rr(score, regime)
+    # R:R adaptativo usando los parámetros recibidos
+    rr = _tp_rr(score, regime, adx_1h, atr_1h_pct if atr_1h_pct > 0 else atr_pct)
     tp_pct = sl_pct * rr
 
     sl_dist = entry * sl_pct
@@ -139,7 +150,6 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
     sl_raw = (entry - sl_dist) if side == "long" else (entry + sl_dist)
     tp_raw = (entry + tp_dist) if side == "long" else (entry - tp_dist)
 
-    # v5: redondear al tickSize real del par
     sl = _rp(coin, sl_raw)
     tp = _rp(coin, tp_raw)
 
@@ -164,8 +174,6 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
     else:
         qty = math.floor(raw_qty * 1000) / 1000
 
-    # v4: trail_step = TRAIL_STEP_MULT × sl_dist (subido de 0.3 a 0.5)
-    # Mínimo: 1 tick de precio del par para no enviar órdenes sub-tick.
     if coin:
         try:
             tick_dec = _exchange._get_tick_decimals(coin)
@@ -204,7 +212,6 @@ def calc(side: str, entry: float, candles: list[dict], score: int = 78,
 
 
 def check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
-    """Evalúa si activar break-even lock. Devuelve True si se activó ahora."""
     if pos.get("be_locked"):
         return False
 
@@ -232,7 +239,6 @@ def check_breakeven(symbol: str, pos: dict, current_price: float) -> bool:
         "[%s] \U0001f512 Break-even lock activado | precio=%.8f trigger=%.8f be_sl=%.8f (antes sl=%.8f)",
         symbol, current_price, be_trigger, be_sl, current_sl or 0,
     )
-    # v5: be_sl ya viene redondeado al tickSize desde calc()
     coin = _exchange._hl_symbol(symbol)
     pos["sl"]        = _rp(coin, be_sl)
     pos["be_locked"] = True
