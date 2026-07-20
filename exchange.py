@@ -377,6 +377,12 @@ def set_leverage(symbol: str = None, leverage: int = None) -> None:
     log.error("set_leverage(%s): no se pudo setear ningún leverage válido", coin)
 
 
+def get_leverage(symbol: str) -> int:
+    """Devuelve el leverage real que está usando el par (cacheado tras set_leverage)."""
+    coin = _hl_symbol(symbol)
+    return _leverage_cache.get(coin, config.LEVERAGE)
+
+
 # ── Validación respuesta individual ──────────────────────────────────────
 def _check_order_response(resp: dict, context: str) -> None:
     status = resp.get("status")
