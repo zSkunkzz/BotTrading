@@ -68,6 +68,10 @@ SYMBOLS = [
 # Pares en modo alerta manual (no se tradean automáticamente)
 MANUAL_ALERT_SYMBOLS: set[str] = set()
 
+# ── Blacklist (vacía por defecto) ───────────────────────────────────────────
+BLACKLIST_SYMBOLS = set(os.getenv("BLACKLIST_SYMBOLS", "").split(","))
+BLACKLIST_SYMBOLS = {s.strip() for s in BLACKLIST_SYMBOLS if s.strip()}
+
 # ── Grupos de correlación ────────────────────────────────────────────────────
 # Regla: dentro de cada grupo solo pueden abrirse MAX_CORR_PER_GROUP posiciones.
 # Criterio: correlación de precio alta y narrativa compartida.
@@ -195,6 +199,9 @@ WINRATE_LOOKBACK    = int(os.getenv("WINRATE_LOOKBACK", "10"))
 WINRATE_ALERT_PCT   = float(os.getenv("WINRATE_ALERT_PCT", "30"))
 
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
+
+# ── Parámetros ajustables por el optimizador ──────────────────────────────
+SHORT_MIN_SCORE_EXTRA = int(os.getenv("SHORT_MIN_SCORE_EXTRA", "0"))
 
 # Telegram
 TG_TOKEN       = os.getenv("TELEGRAM_TOKEN", "")
