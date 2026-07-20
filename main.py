@@ -47,6 +47,10 @@ v14 (calidad de señal + fixes):
   - _check_tp_extension usa effective_min_score en lugar de WEEKDAY_MIN_SCORE.
   - _check_tp_extension añade condiciones de calidad: score+5, no proto, contexto>=0.
   - Clasificación de TP/SL en _get_real_exit_price movida a exchange.py.
+v15:
+  - _open_position recalcula qty con leverage real del par tras set_leverage.
+    Así el margen usado es siempre MARGIN_USDT, independientemente del
+    leverage máximo que permita el par.
 """
 import logging
 import os
@@ -884,13 +888,28 @@ def _open_position(
             candles_1h=candles_1h,
         )
 
+        # ── NUEVO: Recalcular qty con el leverage real del par ──
+        exchange.set_leverage(symbol, config.LEVERAGE)
+        real_leverage = exchange.get_leverage(symbol)
+        qty = (config.MARGIN_USDT * real_leverage) / price
+        qty = exchange.floor_qty(qty, symbol)
+        if not exchange.min_notional_ok(qty, price):
+            log.warning(
+                "[%s] qty=%f notional=%f < 10 USDT — abortando apertura",
+                symbol, qty, qty * price
+            )
+            telegram.notify(f"⚠️ {symbol} notional demasiado bajo ({qty*price:.2f} USDT) — no se abre.")
+            return
+        params["qty"] = qty   # sobrescribe el qty calculado por risk.calc
+        # ─────────────────────────────────────────────────────────────
+
         log.info(
             "[%s] SEÑAL %s | regime=%s RR=%.1f | "
-            "entry=%.6f sl=%.6f tp=%.6f be_trigger=%s qty=%.8f score=%d",
+            "entry=%.6f sl=%.6f tp=%.6f be_trigger=%s qty=%.8f score=%d leverage_real=%dx",
             symbol, signal.upper(), regime, params["tp_rr"],
             price, params["sl"], params["tp"],
             f"{params['be_trigger']:.6f}" if params.get("be_trigger") else "N/A",
-            params["qty"], score,
+            qty, score, real_leverage,
         )
 
         try:
