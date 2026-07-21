@@ -56,12 +56,16 @@ v16:
   - Ajuste de risk.SL_MIN_PCT a 1.2% y R:R adaptativo.
   - Régimen bull/bear solo si ADX >= 22.
   - Backtesting integrado en optimizer (60 días) combinado con trades reales.
+v17:
+  - _open_position recibe breakdown y lo guarda en positions.
+  - _declare_closed pasa breakdown a trade_logger.record.
 """
 import logging
 import os
 import sys
 import time
 from datetime import datetime, timezone
+import json
 
 import bot_state
 import config
@@ -92,12 +96,9 @@ for _noisy_logger in ("httpcore", "httpx", "websockets", "asyncio"):
 _cooldown: dict[str, float] = {}
 _cooldown_reason: dict[str, str] = {}
 _manual_alert_cooldown: dict[str, float] = {}
-# v8: debounce para notificaciones de trailing (ts del último envío por símbolo)
 _trailing_notify_ts: dict[str, float] = {}
-TRAILING_NOTIFY_DEBOUNCE = 5 * 60  # 5 min entre notificaciones trailing del mismo par
+TRAILING_NOTIFY_DEBOUNCE = 5 * 60
 
-# v10: mutex en memoria — impide que dos llamadas a _open_position para el mismo
-# símbolo se solapen antes de que la primera haya registrado la posición.
 _opening: set[str] = set()
 
 COOLDOWN_SL           = 60 * 60
@@ -129,7 +130,6 @@ _weekend_notified_day: int = -1
 
 MAX_SAME_SIDE = int(getattr(config, "MAX_SAME_SIDE", 4))
 
-# v13: sleep extra tras error en get_all_positions (ej. 429)
 _GET_POSITIONS_ERROR_SLEEP = 10
 
 
@@ -211,8 +211,6 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
     new_sl = pos["sl"]
     side   = pos["side"]
     try:
-        # v12: cancel_trigger_orders en lugar de cancel_all_orders
-        # para no borrar SL/TP manuales colocados desde la UI de HL
         exchange.cancel_trigger_orders(symbol)
         exchange.place_stop_order(symbol, side, pos["qty"], new_sl)
         exchange.place_tp_order(symbol, side, pos["qty"], pos["tp"])
@@ -236,7 +234,6 @@ def _apply_breakeven(symbol: str, pos: dict, current_price: float) -> None:
 
 
 def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
-    """v8: _round_price en new_sl + debounce de notificaciones (5 min/par)."""
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -257,7 +254,6 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                 log.info("[%s] Trailing SL: %.6f → %.6f", symbol, pos["sl"], new_sl)
                 pos["sl"] = new_sl
                 try:
-                    # v12: cancel_trigger_orders en lugar de cancel_all_orders
                     exchange.cancel_trigger_orders(symbol)
                     exchange.place_stop_order(symbol, "long", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "long", pos["qty"], pos["tp"])
@@ -282,7 +278,6 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
                 log.info("[%s] Trailing SL: %.6f → %.6f", symbol, pos["sl"], new_sl)
                 pos["sl"] = new_sl
                 try:
-                    # v12: cancel_trigger_orders en lugar de cancel_all_orders
                     exchange.cancel_trigger_orders(symbol)
                     exchange.place_stop_order(symbol, "short", pos["qty"], new_sl)
                     exchange.place_tp_order(symbol, "short", pos["qty"], pos["tp"])
@@ -300,7 +295,6 @@ def _update_trailing(symbol: str, pos: dict, current_price: float) -> None:
 
 
 def _price_change_1h(candles_1h: list[dict]) -> float:
-    """Cambio porcentual del precio en la última hora (copia de signals)."""
     closes = [c["close"] for c in candles_1h]
     if len(closes) < 3:
         return 0.0
@@ -318,7 +312,6 @@ def _check_tp_extension(
     feed,
     effective_min_score: int,
 ) -> None:
-    """v8: fórmula lineal + _round_price. v14: condiciones de calidad."""
     if time.time() - pos.get("open_ts", 0) < MIN_HOLD_SECS:
         return
 
@@ -351,9 +344,9 @@ def _check_tp_extension(
             candles_1h  = feed.get(symbol, "1h")
             candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
             coin = exchange._hl_symbol(symbol)
-            signal, score, regime = signals.evaluate(
+            signal, score, regime, _ = signals.evaluate(
                 candles_15m, candles_1h, candles_4h,
-                min_score=effective_min_score,  # usa el mismo umbral que para abrir
+                min_score=effective_min_score,
                 symbol=symbol,
                 coin=coin,
             )
@@ -361,8 +354,6 @@ def _check_tp_extension(
             log.warning("[%s] Error evaluando señal para extend_tp: %s", symbol, e)
             return
 
-        # ── CONDICIONES DE CALIDAD PARA EXTENDER (v14) ──────────────────────
-        # 1. Score mínimo más exigente: +5 puntos
         min_extend_score = effective_min_score + 5
         if score < min_extend_score:
             log.info(
@@ -371,15 +362,13 @@ def _check_tp_extension(
             )
             return
 
-        # 2. No extender en régimen proto (solo si está confirmado)
         if regime and "proto" in regime:
             log.info(
-                "[%s] TP extension: régimen %s es proto — no extender (esperar confirmación)",
+                "[%s] TP extension: régimen %s es proto — no extender",
                 symbol, regime
             )
             return
 
-        # 3. El contexto de mercado (funding + OI) debe ser positivo para la extensión
         if coin is not None:
             price_chg_1h = _price_change_1h(candles_1h)
             ctx_mod = market_context.score_context(coin, side, price_chg_1h)
@@ -389,7 +378,6 @@ def _check_tp_extension(
                     symbol, ctx_mod
                 )
                 return
-        # ────────────────────────────────────────────────────────────────────────
 
         if not signal or signal != side:
             log.info(
@@ -453,7 +441,6 @@ def _check_tp_extension(
         current_sl = pos["sl"]
 
         try:
-            # v12: cancel_trigger_orders en lugar de cancel_all_orders
             exchange.cancel_trigger_orders(symbol)
             exchange.place_stop_order(symbol, side, pos["qty"], current_sl)
             exchange.place_tp_order(symbol, side, pos["qty"], new_tp)
@@ -554,7 +541,6 @@ def _get_real_exit_price(
     fallback: float,
     fallback_reason: str,
 ) -> tuple[float, str]:
-    """Delega la clasificación a exchange.get_real_exit_classification."""
     return exchange.get_real_exit_classification(symbol, pos, fallback, fallback_reason)
 
 
@@ -624,6 +610,7 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
         log.warning("[drawdown] %s", msg.replace("\n", " "))
         telegram.notify(msg)
 
+    breakdown = p.get("breakdown")
     trade_logger.record(
         symbol     = symbol,
         side       = p["side"],
@@ -634,6 +621,7 @@ def _declare_closed(symbol: str, p: dict, positions: dict) -> None:
         score      = p.get("score", 0),
         reason     = reason,
         open_ts    = p.get("open_ts", time.time()),
+        breakdown  = breakdown,
     )
 
     telegram.notify_close(
@@ -721,14 +709,6 @@ def _restore_sl_tp_on_sync(
     pos: dict,
     feed,
 ) -> None:
-    """v11: Restaura SL/TP en HL tras reinicio del bot.
-
-    Pasos:
-    1. Consultar get_open_trigger_orders para ver si HL ya tiene SL y/o TP activos.
-       - Si ambos existen: sincronizar localmente los valores y NO tocar el exchange.
-       - Si falta uno o los dos: recalcular desde ATR y colocar los que falten.
-    2. Usar _place_sl_tp_bulk para colocar ambos de una vez (más fiable que separados).
-    """
     local_sl = pos.get("sl")
     local_tp = pos.get("tp")
     side     = pos["side"]
@@ -742,7 +722,6 @@ def _restore_sl_tp_on_sync(
         )
         return
 
-    # ── Paso 1: consultar triggers reales en HL ──────────────────────────
     try:
         triggers = exchange.get_open_trigger_orders(symbol)
     except Exception as exc:
@@ -761,7 +740,6 @@ def _restore_sl_tp_on_sync(
         elif "take profit" in ot or "tp" in ot:
             hl_tp_px = px
 
-    # Si HL ya tiene ambos activos, solo sincronizar en local y terminar
     if hl_sl_px is not None and hl_tp_px is not None:
         if local_sl != hl_sl_px or local_tp != hl_tp_px:
             log.info(
@@ -775,7 +753,6 @@ def _restore_sl_tp_on_sync(
             log.debug("[%s] _restore_sl_tp: HL tiene SL+TP coincidentes con local — nada que hacer", symbol)
         return
 
-    # Si falta alguno, necesitamos el feed para recalcular
     try:
         candles_15m = feed.get(symbol, "15m")
         candles_1h  = feed.get(symbol, "1h")
@@ -785,16 +762,6 @@ def _restore_sl_tp_on_sync(
     except Exception as exc:
         log.warning("[%s] _restore_sl_tp: feed no disponible: %s", symbol, exc)
         return
-
-    # Determinar qué falta: usar valores de HL si existen, recalcular los que faltan
-    if hl_sl_px is not None or hl_tp_px is not None:
-        # Parcialmente cubierto: recalcular solo para tener ambos valores
-        log.info(
-            "[%s] _restore_sl_tp: HL tiene SL=%s TP=%s (parcial) — recalculando ambos para consistencia",
-            symbol,
-            f"{hl_sl_px:.6f}" if hl_sl_px else "None",
-            f"{hl_tp_px:.6f}" if hl_tp_px else "None",
-        )
 
     try:
         params = risk.calc(
@@ -807,8 +774,6 @@ def _restore_sl_tp_on_sync(
         new_sl = hl_sl_px if hl_sl_px is not None else params["sl"]
         new_tp = hl_tp_px if hl_tp_px is not None else params["tp"]
 
-        # ── Paso 2: cancelar solo triggers del bot y colocar SL+TP en bulk ──
-        # v12: cancel_trigger_orders en lugar de cancel_all_orders
         exchange.cancel_trigger_orders(symbol)
         exchange._place_sl_tp_bulk(symbol, side, qty, new_sl, new_tp)
 
@@ -850,11 +815,8 @@ def _open_position(
     candles_15m: list,
     candles_1h: list,
     positions: dict,
+    breakdown: dict | None = None,
 ) -> None:
-    # v10: lock en memoria — primera línea de defensa contra duplicados.
-    # Impide que dos rutas (manual + automática, o dos evaluaciones solapadas)
-    # lancen open_order para el mismo símbolo antes de que la primera
-    # termine de registrar la posición en `positions`.
     if symbol in _opening:
         log.warning(
             "[%s] _open_position: ya hay una apertura en curso para este símbolo — abortando",
@@ -864,10 +826,6 @@ def _open_position(
     _opening.add(symbol)
 
     try:
-        # v9: guard de exchange — segunda línea de defensa (cubre reinicios).
-        # El lock de arriba cubre el caso intra-proceso; este cubre el caso
-        # en que el bot crasheó justo tras enviar la orden pero antes de
-        # registrarla en `positions`.
         try:
             pos_already = exchange.get_position(symbol)
             if pos_already and pos_already.get("side") in VALID_SIDES:
@@ -888,14 +846,12 @@ def _open_position(
                 symbol, guard_exc,
             )
 
-        # ── Calcular parámetros de riesgo ────────────────────────────────────
         params = risk.calc(
             signal, price, candles_15m,
             score=score, symbol=symbol, regime=regime,
             candles_1h=candles_1h,
         )
 
-        # ── NUEVO: Recalcular qty con el leverage real del par ──
         exchange.set_leverage(symbol, config.LEVERAGE)
         real_leverage = exchange.get_leverage(symbol)
         qty = (config.MARGIN_USDT * real_leverage) / price
@@ -907,7 +863,7 @@ def _open_position(
             )
             telegram.notify(f"⚠️ {symbol} notional demasiado bajo ({qty*price:.2f} USDT) — no se abre.")
             return
-        params["qty"] = qty   # sobrescribe el qty calculado por risk.calc
+        params["qty"] = qty
 
         log.info(
             "[%s] SEÑAL %s | regime=%s RR=%.1f | "
@@ -968,6 +924,7 @@ def _open_position(
             "be_trigger":    params.get("be_trigger"),
             "be_sl":         params.get("be_sl"),
             "be_locked":     False,
+            "breakdown":     breakdown,
         }
 
         telegram.notify_open(
@@ -983,7 +940,6 @@ def _open_position(
         )
 
     finally:
-        # Siempre liberar el lock, tanto si la apertura tuvo éxito como si no.
         _opening.discard(symbol)
 
 
@@ -1026,16 +982,11 @@ def run() -> None:
                 telegram.notify("\U0001f305 Nuevo día UTC — límite de pérdidas reseteado. Bot activo.")
 
             # ── Auto‑optimizaci�n cada 72h (en hilo separado) ──
-            optimizer.run_async()  # no bloquea, comprueba internamente si toca ejecutarse
+            optimizer.run_async()
 
             weekend = _is_weekend()
             effective_min_score = WEEKEND_MIN_SCORE if weekend else WEEKDAY_MIN_SCORE
 
-            # v13: get_all_positions con su propio try/except.
-            # Un 429 o error HTTP puntual ya NO propaga la excepción al run()
-            # ni crashea el proceso; se loguea como warning, se espera
-            # _GET_POSITIONS_ERROR_SLEEP segundos adicionales y se hace
-            # continue para reintentar en el siguiente loop.
             try:
                 all_ex_positions = exchange.get_all_positions()
             except Exception as pos_err:
@@ -1114,6 +1065,7 @@ def run() -> None:
                         "be_trigger":    be_trigger,
                         "be_sl":         be_sl,
                         "be_locked":     False,
+                        "breakdown":     None,
                     }
                     log.info(
                         "[%s] Sincronizada: %s @ %.6f (sl=%s tp=%s trail=%.8f be_trigger=%s open_ts=%.0f score=sync)",
@@ -1233,6 +1185,7 @@ def run() -> None:
                             symbol, manual_side, score=100, regime=regime,
                             price=price, candles_15m=candles_15m,
                             candles_1h=candles_1h, positions=positions,
+                            breakdown=None,
                         )
                     except Exception as e:
                         log.error("[%s] Error ejecutando señal manual: %s", symbol, e)
@@ -1261,9 +1214,8 @@ def run() -> None:
                         candles_1h  = feed.get(symbol, "1h")
                         candles_4h  = feed.get(symbol, "4h") if feed.has_tf(symbol, "4h") else None
 
-                        # v14: pasar coin para que el contexto de mercado se aplique
                         coin = exchange._hl_symbol(symbol)
-                        signal, score, regime = signals.evaluate(
+                        signal, score, regime, breakdown = signals.evaluate(
                             candles_15m, candles_1h, candles_4h,
                             min_score=effective_min_score,
                             symbol=symbol,
@@ -1310,6 +1262,7 @@ def run() -> None:
                             symbol, signal, score=score, regime=regime,
                             price=price, candles_15m=candles_15m,
                             candles_1h=candles_1h, positions=positions,
+                            breakdown=breakdown,
                         )
 
                     except Exception as e:
