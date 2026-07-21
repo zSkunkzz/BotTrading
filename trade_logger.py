@@ -1,25 +1,19 @@
 """trade_logger.py — Persiste trades cerrados en CSV y restaura el estado al arrancar.
 
-NOTA: El tracking de drawdown diario vive en bot_state.py (fuente única de verdad).
-Este módulo solo persiste en CSV, mantiene _cache para el resumen diario
-y llama a bot_state.record_trade() para actualizar el PnL.
-
 FIX: _cache protegido con _cache_lock (threading.Lock) para evitar race conditions.
 FIX: PnL neto real — ganancias y pérdidas se acumulan algebraicamente.
-FIX: send_daily_summary limpia solo trades del día anterior, nunca los del día nuevo,
-     evitando huecos de contabilidad si hay posiciones abiertas en medianoche.
+FIX: send_daily_summary limpia solo trades del día anterior, nunca los del día nuevo.
 
 GIST: Si GIST_TOKEN y GIST_ID están configurados en variables de entorno,
       trades.csv se sincroniza con un Gist de GitHub tras cada trade y al arrancar.
       Esto garantiza persistencia entre reinicios del contenedor Railway.
       El CSV local se restaura desde el Gist al arrancar si está vacío.
 
-Variables de entorno necesarias para Gist:
-  GIST_TOKEN — GitHub Personal Access Token con scope 'gist'
-  GIST_ID    — ID del Gist donde guardar el CSV (crear uno vacío manualmente primero)
+v17: Añadida columna breakdown para guardar desglose de contribución de indicadores.
 """
 import csv
 import io
+import json
 import logging
 import os
 import threading
@@ -37,7 +31,7 @@ LOG_FILE   = os.getenv("TRADES_CSV", "trades.csv")
 GIST_TOKEN = os.getenv("GIST_TOKEN", "")
 GIST_ID    = os.getenv("GIST_ID", "")
 HEADER     = ["date", "symbol", "side", "entry", "exit",
-              "pnl_pct", "pnl_usdt", "score", "reason", "duration_min"]
+              "pnl_pct", "pnl_usdt", "score", "reason", "duration_min", "breakdown"]
 
 _csv_lock:   threading.Lock = threading.Lock()
 _cache_lock: threading.Lock = threading.Lock()
@@ -58,7 +52,6 @@ def _gist_configured() -> bool:
 
 
 def _gist_push(content: str) -> None:
-    """Sube el contenido CSV al Gist. Llamada en background thread para no bloquear."""
     if not _gist_configured():
         return
     try:
@@ -80,7 +73,6 @@ def _gist_push(content: str) -> None:
 
 
 def _gist_push_async() -> None:
-    """Lee el CSV local y lo sube al Gist en un thread daemon."""
     if not _gist_configured():
         return
     try:
@@ -100,7 +92,6 @@ def _gist_push_async() -> None:
 
 
 def _gist_pull() -> str | None:
-    """Descarga el contenido CSV del Gist. Devuelve el texto o None si falla."""
     if not _gist_configured():
         return None
     try:
@@ -119,7 +110,6 @@ def _gist_pull() -> str | None:
         csv_file = files.get("trades.csv")
         if not csv_file:
             return None
-        # Si el contenido está truncado, usar raw_url
         if csv_file.get("truncated"):
             raw = httpx.get(csv_file["raw_url"], timeout=15)
             return raw.text if raw.status_code == 200 else None
@@ -130,9 +120,6 @@ def _gist_pull() -> str | None:
 
 
 def _restore_from_gist() -> bool:
-    """Intenta restaurar el CSV local desde el Gist.
-    Devuelve True si se restauró contenido, False si no.
-    """
     content = _gist_pull()
     if not content or not content.strip():
         log.info("Gist vacío o no disponible — arrancando desde 0")
@@ -141,9 +128,8 @@ def _restore_from_gist() -> bool:
         with _csv_lock:
             with open(LOG_FILE, "w", newline="") as f:
                 f.write(content)
-        # Contar trades restaurados
         lines = [l for l in content.strip().splitlines() if l]
-        trade_count = max(0, len(lines) - 1)  # restar cabecera
+        trade_count = max(0, len(lines) - 1)
         log.info("CSV restaurado desde Gist: %d trades", trade_count)
         return True
     except Exception as e:
@@ -165,12 +151,10 @@ def _write_csv(row: list) -> None:
                 f.flush()
         except Exception as e:
             log.warning("CSV write error: %s", e)
-    # Sincronizar con Gist tras cada escritura (async, no bloquea el loop)
     _gist_push_async()
 
 
 def _restore_from_csv() -> None:
-    """Lee el CSV al arrancar, reconstruye _cache y restaura el PnL diario en bot_state."""
     today = _today_utc()
     if not os.path.exists(LOG_FILE):
         log.info("CSV no encontrado — arrancando desde 0")
@@ -196,6 +180,7 @@ def _restore_from_csv() -> None:
                         "score":    int(row.get("score", 0)),
                         "reason":   row["reason"],
                         "duration": float(row.get("duration_min", 0)),
+                        "breakdown": row.get("breakdown"),
                     }
                     trades_today.append(t)
                 except (ValueError, KeyError):
@@ -272,16 +257,18 @@ def record(
     score:      int,
     reason:     str,
     open_ts:    float,
+    breakdown:  dict | None = None,
 ) -> None:
-    """Persiste el trade en CSV y _cache. NO envía Telegram — eso lo hace main.py."""
     duration = round((time.time() - open_ts) / 60, 1)
     now_str  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    breakdown_json = json.dumps(breakdown) if breakdown else ""
 
     row = [
         now_str, symbol, side,
         round(entry, 8), round(exit_price, 8),
         round(pnl_pct, 2), round(pnl_usdt, 4),
-        score, reason, duration,
+        score, reason, duration, breakdown_json,
     ]
     _write_csv(row)
 
@@ -297,26 +284,19 @@ def record(
             "score":    score,
             "reason":   reason,
             "duration": duration,
+            "breakdown": breakdown,
         })
 
     _check_winrate()
 
 
 def is_daily_limit_hit() -> bool:
-    """Proxy a bot_state para compatibilidad con código existente."""
     return bot_state.is_daily_limit_hit()
 
 
 # ── Resumen diario ──────────────────────────────────────────────────────────────────
 
 def send_daily_summary() -> None:
-    """Envía resumen de la sesión pasada y limpia SOLO los trades del día anterior.
-
-    FIX: el clear() original borraba TODO _cache a medianoche, incluyendo trades
-    del día nuevo que ya hubieran cerrado mientras había posiciones abiertas.
-    Ahora se limpia por fecha: solo se eliminan entradas con date < today_utc(),
-    preservando cualquier trade que ya pertenezca al nuevo día.
-    """
     try:
         import telegram as _tg
     except Exception:
@@ -325,13 +305,9 @@ def send_daily_summary() -> None:
     today = _today_utc()
 
     with _cache_lock:
-        # Separar trades de ayer (o anteriores) de los del día nuevo
         yesterday_trades = [t for t in _cache if not t["date"].startswith(today)]
         today_trades     = [t for t in _cache if t["date"].startswith(today)]
-
-        snapshot = list(yesterday_trades)  # solo enviamos los de ayer
-
-        # Limpiar solo los del día anterior; los del día nuevo permanecen
+        snapshot = list(yesterday_trades)
         _cache.clear()
         _cache.extend(today_trades)
 
@@ -379,18 +355,14 @@ def _daily_summary_scheduler() -> None:
 
 
 def start_scheduler() -> None:
-    """Restaura el estado desde Gist/CSV y arranca el scheduler de resumen diario."""
-    # 1. Intentar restaurar desde Gist (sobrevive reinicios)
     if _gist_configured():
         log.info("Gist configurado (ID: %s...) — restaurando CSV", GIST_ID[:8])
         _restore_from_gist()
     else:
         log.info("Gist no configurado — usando CSV local únicamente")
 
-    # 2. Cargar cache y PnL desde el CSV (local o recién restaurado)
     _restore_from_csv()
 
-    # 3. Arrancar scheduler de resumen diario
     threading.Thread(
         target=_daily_summary_scheduler,
         daemon=True,
