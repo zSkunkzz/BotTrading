@@ -13,6 +13,8 @@ v6.8 — Rebalanceo de pesos y endurecimiento de régimen:
   - Ajuste de SHORT_MIN_SCORE_EXTRA a 0 (se maneja desde config)
   - Se añade soporte para sobreescribir pesos desde weights.json
   - PROTO_ADX_MIN sigue en 22 (endurecido en v7)
+v17:
+  - evaluate devuelve breakdown (dict con contribuciones de cada peso)
 """
 from __future__ import annotations
 import json
@@ -336,12 +338,12 @@ def evaluate(
     min_score:   int = MIN_SCORE,
     symbol:      str = "???",
     coin:        str | None = None,
-) -> tuple[str | None, int, str | None]:
+) -> tuple[str | None, int, str | None, dict | None]:
     if len(candles_15m) < 50 or len(candles_1h) < 220:
-        return None, 0, None
+        return None, 0, None, None
 
     if not _liquidity_ok(candles_1h):
-        return None, 0, None
+        return None, 0, None, None
 
     closed  = candles_15m[-2]
     c_open  = closed["open"]
@@ -358,22 +360,20 @@ def evaluate(
     )
 
     if effective_regime == "range":
-        return None, 0, None
+        return None, 0, None, None
 
     structure = _price_structure(candles_1h)
 
-    # Filtro anti-rango para proto (v7)
     if is_proto:
         if structure == "range":
-            return None, 0, None
+            return None, 0, None, None
         closes_1h_closed = [c["close"] for c in candles_1h[:-1]]
         ema50_vals = _ema(closes_1h_closed, 50)
         if len(ema50_vals) >= 6:
             pendiente = (ema50_vals[-1] - ema50_vals[-6]) / ema50_vals[-6]
             if abs(pendiente) < 0.0015:
-                return None, 0, None
+                return None, 0, None, None
 
-    # ── Indicadores 15m ───────────────────────────────────────────────────
     closes_15m = [c["close"] for c in candles_15m]
     price      = closes_15m[-2]
 
@@ -399,120 +399,140 @@ def evaluate(
     atr_15m_pct = atr_15m / price if price > 0 else PULLBACK_EMA20_DIST_BASE
     pullback_dist = max(PULLBACK_EMA20_DIST_BASE, atr_15m_pct * PULLBACK_ATR_MULT)
 
-    # ── Hard-guards ────────────────────────────────────────────────────────
     if price > 0 and atr_15m / price > ATR_VOLATILE_PCT:
-        return None, 0, None
+        return None, 0, None, None
 
     if adx_15m < ADX_15M_MIN:
-        return None, 0, None
+        return None, 0, None, None
 
     if effective_regime == "bull" and price < ema200_1h * (1 - EMA200_MIN_DIST):
-        return None, 0, None
+        return None, 0, None, None
     if effective_regime == "bear" and price > ema200_1h * (1 + EMA200_MIN_DIST):
-        return None, 0, None
+        return None, 0, None, None
 
     candle_range = c_high - c_low
     if candle_range > 0 and atr_15m > 0:
         if candle_range > NO_CHASE_MULT * atr_15m:
-            return None, 0, None
+            return None, 0, None, None
 
     if price > 0 and ema20_15m > 0:
         dist_ema20 = abs(price - ema20_15m) / price
         if dist_ema20 > pullback_dist:
             if effective_regime == "bull" and price > ema20_15m:
-                return None, 0, None
+                return None, 0, None, None
             if effective_regime == "bear" and price < ema20_15m:
-                return None, 0, None
+                return None, 0, None, None
 
     vol_bump        = _dynamic_min_score_bump(candles_1h, price)
     min_required_base = min_score + vol_bump
 
     # ── Scoring ────────────────────────────────────────────────────────────
     score = 0
+    breakdown = {
+        "W_ADX_1H_30": 0, "W_ADX_1H_25": 0, "W_ADX_1H_20": 0, "W_ADX_1H_15": 0,
+        "W_MACD_1H": 0, "W_RSI_IDEAL": 0, "W_MACD_15M": 0,
+        "W_VOLUME_HIGH": 0, "W_STRUCTURE": 0, "W_DIVERGENCIA": 0, "W_VELA": 0,
+        "W_VOLUME_LOW": 0, "W_RSI_SOBRE": 0, "W_STRUCTURE_CONTRA": 0,
+        "W_MACRO_CONTRA": 0, "W_BEAR_EMA200_15M": 0, "W_BEAR_LOW_ADX": 0,
+        "W_MACD_15M_CONTRA": 0,
+    }
 
-    # Macro 4h
     if candles_4h and len(candles_4h) >= 55:
         closes_4h = [c["close"] for c in candles_4h[:-1]]
         ema50_4h  = _ema(closes_4h, 50)[-1]
         price_4h  = closes_4h[-1]
         if effective_regime == "bull" and price_4h < ema50_4h:
             score += _w("W_MACRO_CONTRA")
+            breakdown["W_MACRO_CONTRA"] += _w("W_MACRO_CONTRA")
         elif effective_regime == "bear" and price_4h > ema50_4h:
             score += _w("W_MACRO_CONTRA")
+            breakdown["W_MACRO_CONTRA"] += _w("W_MACRO_CONTRA")
 
-    # Bear sobreextendido bajo EMA200_15m
     if effective_regime == "bear" and price < ema200_15m * (1 - EMA200_MIN_DIST):
         score += _w("W_BEAR_EMA200_15M")
+        breakdown["W_BEAR_EMA200_15M"] += _w("W_BEAR_EMA200_15M")
 
-    # Bear con ADX_1h bajo
     if effective_regime == "bear" and adx_1h < 22:
         score += _w("W_BEAR_LOW_ADX")
+        breakdown["W_BEAR_LOW_ADX"] += _w("W_BEAR_LOW_ADX")
 
-    # Vela
     if effective_regime == "bull" and bullish_candle:
         score += _w("W_VELA")
+        breakdown["W_VELA"] += _w("W_VELA")
     elif effective_regime == "bear" and not bullish_candle:
         score += _w("W_VELA")
+        breakdown["W_VELA"] += _w("W_VELA")
 
-    # RSI
     if effective_regime == "bull":
         if 40 <= rsi <= 68:
             score += _w("W_RSI_IDEAL")
+            breakdown["W_RSI_IDEAL"] += _w("W_RSI_IDEAL")
         elif rsi > 70:
             score += _w("W_RSI_SOBRE")
+            breakdown["W_RSI_SOBRE"] += _w("W_RSI_SOBRE")
             if rsi > 80:
-                return None, score, None
+                return None, score, None, breakdown
     else:
         if 32 <= rsi <= 58:
             score += _w("W_RSI_IDEAL")
+            breakdown["W_RSI_IDEAL"] += _w("W_RSI_IDEAL")
         elif rsi < 30:
             score += _w("W_RSI_SOBRE")
+            breakdown["W_RSI_SOBRE"] += _w("W_RSI_SOBRE")
 
-    # ADX 1h
     if adx_1h >= 30:
         score += _w("W_ADX_1H_30")
+        breakdown["W_ADX_1H_30"] += _w("W_ADX_1H_30")
     elif adx_1h >= 25:
         score += _w("W_ADX_1H_25")
+        breakdown["W_ADX_1H_25"] += _w("W_ADX_1H_25")
     elif adx_1h >= 20:
         score += _w("W_ADX_1H_20")
+        breakdown["W_ADX_1H_20"] += _w("W_ADX_1H_20")
     elif adx_1h >= 15:
         score += _w("W_ADX_1H_15")
+        breakdown["W_ADX_1H_15"] += _w("W_ADX_1H_15")
 
-    # MACD 15m
     if effective_regime == "bull" and macd_hist > 0:
         score += _w("W_MACD_15M")
+        breakdown["W_MACD_15M"] += _w("W_MACD_15M")
     elif effective_regime == "bear" and macd_hist < 0:
         score += _w("W_MACD_15M")
+        breakdown["W_MACD_15M"] += _w("W_MACD_15M")
     else:
         score += _w("W_MACD_15M_CONTRA")
+        breakdown["W_MACD_15M_CONTRA"] += _w("W_MACD_15M_CONTRA")
 
-    # MACD 1h
     if effective_regime == "bull" and macd_1h > 0:
         score += _w("W_MACD_1H")
+        breakdown["W_MACD_1H"] += _w("W_MACD_1H")
     elif effective_regime == "bear" and macd_1h < 0:
         score += _w("W_MACD_1H")
+        breakdown["W_MACD_1H"] += _w("W_MACD_1H")
 
-    # Volumen
     if avg_vol > 0:
         if last_vol >= avg_vol * VOLUME_MULT:
             score += _w("W_VOLUME_HIGH")
+            breakdown["W_VOLUME_HIGH"] += _w("W_VOLUME_HIGH")
         elif last_vol < avg_vol * VOLUME_WEAK:
             score += _w("W_VOLUME_LOW")
+            breakdown["W_VOLUME_LOW"] += _w("W_VOLUME_LOW")
 
-    # Divergencia
     div = _rsi_divergence(closes_15m[:-1], candles_15m[:-1])
     if effective_regime == "bull" and div == "bullish":
         score += _w("W_DIVERGENCIA")
+        breakdown["W_DIVERGENCIA"] += _w("W_DIVERGENCIA")
     elif effective_regime == "bear" and div == "bearish":
         score += _w("W_DIVERGENCIA")
+        breakdown["W_DIVERGENCIA"] += _w("W_DIVERGENCIA")
 
-    # Estructura
     if structure == effective_regime:
         score += _w("W_STRUCTURE")
+        breakdown["W_STRUCTURE"] += _w("W_STRUCTURE")
     elif structure != "range" and structure != effective_regime:
         score += _w("W_STRUCTURE_CONTRA")
+        breakdown["W_STRUCTURE_CONTRA"] += _w("W_STRUCTURE_CONTRA")
 
-    # Contexto de mercado
     context_modifier = 0
     side_candidate = "long" if effective_regime == "bull" else "short"
     if coin is not None:
@@ -523,7 +543,7 @@ def evaluate(
     min_required = min_required_base + (SHORT_MIN_SCORE_EXTRA if effective_regime == "bear" else 0)
 
     if score < min_required:
-        return None, score, None
+        return None, score, None, breakdown
 
     side = "long" if effective_regime == "bull" else "short"
     log.info(
@@ -533,4 +553,4 @@ def evaluate(
         adx_1h, adx_15m, rsi, macd_hist, vol_ratio, context_modifier,
         " [PROTO]" if is_proto else "",
     )
-    return side, score, regime
+    return side, score, regime, breakdown
