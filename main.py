@@ -52,9 +52,10 @@ v15:
     Así el margen usado es siempre MARGIN_USDT, independientemente del
     leverage máximo que permita el par.
 v16:
-  - Integración del optimizador automático cada 72h (optimizer.py).
+  - Integración del optimizador automático cada 72h en hilo separado (no bloquea).
   - Ajuste de risk.SL_MIN_PCT a 1.2% y R:R adaptativo.
   - Régimen bull/bear solo si ADX >= 22.
+  - Backtesting integrado en optimizer (60 días) combinado con trades reales.
 """
 import logging
 import os
@@ -888,24 +889,10 @@ def _open_position(
             )
 
         # ── Calcular parámetros de riesgo ────────────────────────────────────
-        # Extraer ADX_1h y ATR_1h_pct para pasarlos a risk.calc
-        adx_1h_val = 0.0
-        atr_1h_pct = 0.0
-        try:
-            # Intentar obtener adx_1h y atr_1h_pct desde los datos de 1h
-            if candles_1h and len(candles_1h) >= 16:
-                # Calcular ADX_1h manualmente (o usar el que ya tenemos en signals)
-                # Para simplificar, pasamos 0 y risk.calc usará fallback
-                pass
-        except:
-            pass
-
         params = risk.calc(
             signal, price, candles_15m,
             score=score, symbol=symbol, regime=regime,
             candles_1h=candles_1h,
-            adx_1h=adx_1h_val,   # 0 si no se pudo calcular
-            atr_1h_pct=atr_1h_pct,
         )
 
         # ── NUEVO: Recalcular qty con el leverage real del par ──
@@ -1038,12 +1025,8 @@ def run() -> None:
                 log.info("[drawdown] Nuevo día UTC — bot reactivado")
                 telegram.notify("\U0001f305 Nuevo día UTC — límite de pérdidas reseteado. Bot activo.")
 
-            # ── Auto‑optimizaci�n cada 72h ──
-            if optimizer.should_run():
-                try:
-                    optimizer.optimize()
-                except Exception as e:
-                    log.error("Optimizaci�n fall�: %s", e)
+            # ── Auto‑optimizaci�n cada 72h (en hilo separado) ──
+            optimizer.run_async()  # no bloquea, comprueba internamente si toca ejecutarse
 
             weekend = _is_weekend()
             effective_min_score = WEEKEND_MIN_SCORE if weekend else WEEKDAY_MIN_SCORE
