@@ -2,6 +2,7 @@
 
 Descarga velas hist�ricas, simula la estrategia en 60 d�as, combina trades
 reales (desde Gist) + simulados, calcula m�tricas y ajusta par�metros en caliente.
+Incluye optimizaci�n de pesos de indicadores por correlaci�n con PnL.
 
 Ejecuci�n en hilo separado para no bloquear el trading en vivo.
 """
@@ -157,6 +158,7 @@ class _SimulatedExchange:
             "score": pos.score,
             "reason": reason,
             "duration_min": (time.time() - pos.open_ts) / 60,
+            "breakdown": None,
         }
         self.trades.append(trade)
 
@@ -271,7 +273,7 @@ def _simulate_symbol(symbol, candles_15m, candles_1h, candles_4h, exchange_sim):
 
         effective_min_score = WEEKDAY_MIN_SCORE
 
-        signal, score, regime = signals.evaluate(
+        signal, score, regime, breakdown = signals.evaluate(
             candles_15m[:i+1],
             candles_1h[:i+1],
             candles_4h[:i+1] if candles_4h else None,
@@ -366,6 +368,7 @@ def _fetch_trades_from_gist(days: int = 90) -> list[dict]:
                 "score": int(row.get("score", 0)),
                 "reason": row["reason"],
                 "duration": float(row.get("duration_min", 0)),
+                "breakdown": row.get("breakdown"),
             })
         except (ValueError, KeyError):
             continue
@@ -429,6 +432,62 @@ def _calculate_metrics(trades: list[dict]) -> dict:
     }
 
 
+def _optimize_indicator_weights(trades: list[dict]) -> dict:
+    """Calcula correlaci�n entre cada indicador y el PnL, ajusta pesos."""
+    if len(trades) < 30:
+        return {}
+
+    # Recopilar contribuciones por indicador
+    contributions = defaultdict(list)
+    pnls = []
+
+    for t in trades:
+        breakdown = t.get("breakdown")
+        if not breakdown:
+            continue
+        # Si breakdown es string JSON, parsear
+        if isinstance(breakdown, str):
+            try:
+                breakdown = json.loads(breakdown)
+            except:
+                continue
+        if not isinstance(breakdown, dict):
+            continue
+        pnl = t["pnl_usdt"]
+        pnls.append(pnl)
+        for key, value in breakdown.items():
+            if value != 0:
+                contributions[key].append((pnl, value))
+
+    if len(pnls) < 20:
+        return {}
+
+    new_weights = {}
+    for key, values in contributions.items():
+        if len(values) < 10:
+            continue
+        # Calcular correlaci�n de Pearson entre contribuci�n y PnL
+        pnls_vals = [v[0] for v in values]
+        contrib_vals = [v[1] for v in values]
+        mean_pnl = sum(pnls_vals) / len(pnls_vals)
+        mean_contrib = sum(contrib_vals) / len(contrib_vals)
+        cov = sum((p - mean_pnl) * (c - mean_contrib) for p, c in zip(pnls_vals, contrib_vals))
+        std_pnl = (sum((p - mean_pnl) ** 2 for p in pnls_vals) / len(pnls_vals)) ** 0.5
+        std_contrib = (sum((c - mean_contrib) ** 2 for c in contrib_vals) / len(contrib_vals)) ** 0.5
+        if std_pnl > 0 and std_contrib > 0:
+            corr = cov / (std_pnl * std_contrib)
+            # Ajuste proporcional: nuevo peso = old * (1 + corr * 0.2)
+            old = DEFAULT_WEIGHTS.get(key, 0)
+            if old != 0:
+                factor = 1 + corr * 0.2
+                factor = max(0.5, min(1.5, factor))
+                new = round(old * factor)
+                new = max(-10, min(30, new))
+                new_weights[key] = new
+
+    return new_weights
+
+
 def _recommend_changes(metrics: dict) -> dict:
     recs = {}
     if not metrics:
@@ -465,18 +524,8 @@ def _recommend_changes(metrics: dict) -> dict:
     else:
         recs["SHORT_MIN_SCORE_EXTRA"] = 0
 
-    # 3. MARGIN_USDT (según Sharpe)
-    sharpe = metrics.get("sharpe", 0)
-    current_margin = float(getattr(config, "MARGIN_USDT", 20))
-    if total_n >= 20:
-        if sharpe > 1.5:
-            new_margin = min(MARGIN_MAX, current_margin * 1.08)
-            recs["MARGIN_USDT"] = round(new_margin, 1)
-        elif sharpe < 0.5:
-            new_margin = max(MARGIN_MIN, current_margin * 0.92)
-            recs["MARGIN_USDT"] = round(new_margin, 1)
-        else:
-            recs["MARGIN_USDT"] = current_margin
+    # 3. MARGIN_USDT — fijo en 20 (no ajustable)
+    recs["MARGIN_USDT"] = 20.0
 
     # 4. SL_MIN_PCT
     if total_n >= 20:
@@ -545,16 +594,16 @@ def _combine_trades(real_trades: list[dict], sim_trades: list[dict]) -> list[dic
 
 
 def optimize() -> dict:
-    """Ejecuta el flujo completo de optimización (backtest + real)."""
-    log.info("Iniciando optimización cada 72h...")
+    """Ejecuta el flujo completo de optimizaci�n (backtest + real)."""
+    log.info("Iniciando optimizaci�n cada 72h...")
 
     trades_real = _fetch_trades_from_gist(days=90)
 
-    log.info("Obteniendo trades simulados (60 días)...")
+    log.info("Obteniendo trades simulados (60 d�as)...")
     try:
         trades_sim = _run_backtest(days=60)
     except Exception as e:
-        log.error("Backtesting falló: %s", e)
+        log.error("Backtesting fall�: %s", e)
         trades_sim = []
 
     combined = _combine_trades(trades_real, trades_sim)
@@ -567,12 +616,18 @@ def optimize() -> dict:
 
     metrics = _calculate_metrics(combined)
     log.info(
-        "Métricas: %d trades | PnL=%.2f | WR=%.0f%% | Sharpe=%.2f",
+        "M�tricas: %d trades | PnL=%.2f | WR=%.0f%% | Sharpe=%.2f",
         metrics["total_trades"], metrics["total_pnl"],
         metrics["win_rate"] * 100, metrics["sharpe"],
     )
 
+    # Recomendaciones b�sicas
     recs = _recommend_changes(metrics)
+
+    # Optimizaci�n de pesos de indicadores por correlaci�n
+    weight_recs = _optimize_indicator_weights(combined)
+    recs.update(weight_recs)
+
     if recs:
         log.info("Recomendaciones generadas: %s", recs)
         _apply_weights(recs)
@@ -580,7 +635,7 @@ def optimize() -> dict:
         try:
             import telegram
             msg = (
-                f"\U0001f4ca <b>Optimización 72h + Backtesting</b>\n"
+                f"\U0001f4ca <b>Optimizaci�n 72h + Backtesting</b>\n"
                 f"Reales: <code>{len(trades_real)}</code>\n"
                 f"Simulados (60d): <code>{len(trades_sim)}</code>\n"
                 f"Total: <code>{len(combined)}</code>\n\n"
@@ -615,7 +670,7 @@ def mark_run() -> None:
 
 
 def run_async() -> None:
-    """Lanza el optimizador en un hilo separado si no está ya en ejecución."""
+    """Lanza el optimizador en un hilo separado si no est� ya en ejecuci�n."""
     global _optimizer_thread, _optimizer_running
 
     if not should_run():
@@ -624,27 +679,26 @@ def run_async() -> None:
 
     with _OPTIMIZER_LOCK:
         if _optimizer_running:
-            log.debug("Optimizador ya en ejecución, saltando...")
+            log.debug("Optimizador ya en ejecuci�n, saltando...")
             return
         _optimizer_running = True
 
     def _target():
         try:
-            log.info("Iniciando optimización en background (puede tardar varios minutos)...")
+            log.info("Iniciando optimizaci�n en background (puede tardar varios minutos)...")
             optimize()
         except Exception as e:
-            log.error("Optimización en background falló: %s", e, exc_info=True)
+            log.error("Optimizaci�n en background fall�: %s", e, exc_info=True)
         finally:
             with _OPTIMIZER_LOCK:
                 global _optimizer_running
                 _optimizer_running = False
-            log.info("Hilo de optimización finalizado.")
+            log.info("Hilo de optimizaci�n finalizado.")
 
     _optimizer_thread = threading.Thread(target=_target, daemon=True, name="optimizer-thread")
     _optimizer_thread.start()
-    log.info("Hilo de optimización lanzado (daemon)")
+    log.info("Hilo de optimizaci�n lanzado (daemon)")
 
 
 if __name__ == "__main__":
-    # Ejecución manual para pruebas
     optimize()
